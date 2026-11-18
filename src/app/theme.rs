@@ -215,7 +215,6 @@ pub mod dark {
     pub const LOADING_FILL: u32 = 0x9396f4;
     pub const SCRIM: u32 = 0x000000;
     pub const SHADOW: u32 = 0x000000;
-    pub const BRAND_END: u32 = 0xa78bfa;
     /// The terminal's selection: the accent 32% over the terminal's background.
     pub const SELECTION: u32 = 0x373859;
     /// Eight low-chroma avatar pairs (tint, initials): indigo, steel, teal, sage, moss,
@@ -286,7 +285,6 @@ pub mod light {
     pub const LOADING_FILL: u32 = 0x5252d2;
     pub const SCRIM: u32 = 0x18181b;
     pub const SHADOW: u32 = 0x000000;
-    pub const BRAND_END: u32 = 0x7c5cd6;
     /// The terminal's selection: the accent 22% over the terminal's background.
     pub const SELECTION: u32 = 0xd7d7f4;
     pub const AVATARS: [(u32, u32); 8] = [
@@ -431,8 +429,6 @@ pub mod palette {
         SCRIM;
         /// The ink of an elevation shadow.
         SHADOW;
-        /// The deeper stop of the one accent gradient, the logo's lavender tail.
-        BRAND_END;
         /// The terminal's selected cells, derived from the accent. It is resolved in the
         /// terminal's own palette, which may differ from the window's.
         SELECTION;
@@ -1668,7 +1664,7 @@ mod guard {
     use std::path::{Path, PathBuf};
 
     /// Bare `scale(<number>)` calls in the non-test source of `src/app`.
-    const SCALE_BASELINE: usize = 267;
+    const SCALE_BASELINE: usize = 220;
     /// Bare `px(<number>)` calls with a number other than zero in the non-test source
     /// of `src/app`.
     const PX_BASELINE: usize = 82;
@@ -2326,10 +2322,6 @@ mod tests {
                     "{palette_name} {name} is {value:06x}, which drifts towards cyan"
                 );
             }
-        }
-        for value in [palette::BRAND_END.dark(), palette::BRAND_END.light()] {
-            let [_, r, g, b] = value.to_be_bytes();
-            assert!(b > r && b > g, "brand end {value:06x} is not blue-led");
         }
     }
 

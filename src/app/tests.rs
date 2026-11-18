@@ -39,7 +39,7 @@ use crate::app::actions::{
 };
 use crate::app::copy::{self, CHINESE, ENGLISH, Locale, Strings};
 use crate::app::files::{FileSource, FilesStop};
-use crate::app::hosts::HostView;
+use crate::app::hosts::HomeSection;
 use crate::app::keymap::Keymap;
 use crate::app::layout::Direction;
 use crate::app::nav::{Destination, Platform};
@@ -286,7 +286,7 @@ async fn the_top_bar_and_the_home_fit_inside_the_design_window(cx: &mut TestAppC
         assert_fits_inside(bounds_of(cx, selector), viewport, selector);
     }
     assert_fits_inside(bounds_of(cx, "header.title"), viewport, "home title");
-    assert_fits_inside(bounds_of(cx, "home.quick"), viewport, "quick-connect bar");
+    assert_fits_inside(bounds_of(cx, "hosts.search"), viewport, "the page's search");
     assert_fits_inside(bounds_of(cx, "home.local"), viewport, "local terminals");
     assert_fits_inside(bounds_of(cx, "hosts.new"), viewport, "new host");
     assert_fits_inside(bounds_of(cx, "content"), viewport, "content panel");
@@ -2035,7 +2035,6 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             next_step,
             primary_hosts,
             unavailable_notice,
-            shell_default,
             shell_custom_hint,
             count_hosts,
             local_shell_fallback,
@@ -2054,14 +2053,11 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             terminal_environment_locale_replaced,
             terminal_environment_locale_added,
             terminal_copy,
-            hosts_search_placeholder,
             keys_search_placeholder,
             hosts_view_all,
-            hosts_view_groups,
             hosts_view_recent,
             hosts_recent_empty,
             hosts_no_match,
-            hosts_ungrouped,
             host_field_name,
             host_field_address,
             host_field_port,
@@ -6881,14 +6877,13 @@ async fn the_three_views_and_the_search_read_the_one_saved_book(cx: &mut TestApp
         "three hosts must not render four rows"
     );
 
-    click(cx, "hosts.view.groups");
+    // The named group is a place of the sidebar; the hosts without one are not.
+    assert!(cx.debug_bounds("hosts.tree.0").is_some());
+    assert!(cx.debug_bounds("hosts.tree.1").is_none());
+    click(cx, "hosts.tree.0");
     assert!(
-        cx.debug_bounds("hosts.group.0").is_some(),
-        "the named group has a heading"
-    );
-    assert!(
-        cx.debug_bounds("hosts.group.1").is_some(),
-        "the hosts without a group get their own heading"
+        cx.debug_bounds("hosts.list.2").is_some(),
+        "the group shows its two hosts"
     );
 
     click(cx, "hosts.view.recent");
@@ -7472,7 +7467,7 @@ async fn a_configuration_that_cannot_be_parsed_shows_the_line_and_imports_nothin
 }
 
 #[gpui::test]
-async fn the_grouped_view_gives_every_row_its_own_identity(cx: &mut TestAppContext) {
+async fn a_group_place_lists_its_hosts_each_under_its_own_identity(cx: &mut TestAppContext) {
     let dir = TempDir::new("groups-rows");
     let store = dir.store();
     seed(
@@ -7484,32 +7479,33 @@ async fn the_grouped_view_gives_every_row_its_own_identity(cx: &mut TestAppConte
         ],
     );
 
-    // The grouped view is selected before the first frame, so the flat view never
-    // draws a row: what the assertions below see is what this view rendered.
+    // The group is chosen before the first frame, so the whole list never draws a
+    // row: what the assertions below see is what this place rendered.
     let mut workspace = Workspace::new();
     workspace.select(Destination::Hosts);
     let (view, cx) =
         cx.add_window_view(move |_window, cx| ShelluneView::with_store(cx, workspace, store));
     cx.update(|_window, app| {
         view.update(app, |view, cx| {
-            view.select_host_view_for_test(HostView::Groups, cx)
+            view.show_home_section(
+                HomeSection::Group(GroupPath::parse("Prod").expect("a valid path")),
+                cx,
+            );
         });
     });
     cx.simulate_resize(design_window());
     cx.run_until_parked();
 
-    assert!(cx.debug_bounds("hosts.group.0").is_some());
-    assert!(cx.debug_bounds("hosts.group.1").is_some());
-    // The group view lists one row per host, across both groups. Which number each
-    // row is drawn under is asserted where it is computed: two rows of one list must
-    // never share an element id, and the debug selectors of this GPUI version keep
-    // the bounds of earlier frames, so counting here would prove nothing.
+    assert!(cx.debug_bounds("hosts.tree.0").is_some());
+    // The group lists one row per host and no header: the group is the place, and the
+    // rows carry its name as a tag.
     assert!(
-        cx.debug_bounds("hosts.list.3").is_some(),
-        "both groups together still list all three hosts"
+        cx.debug_bounds("hosts.list.2").is_some(),
+        "the group holds two of the three hosts"
     );
     assert!(cx.debug_bounds("hosts.row.0").is_some());
-    assert!(cx.debug_bounds("hosts.row.2").is_some());
+    assert!(cx.debug_bounds("hosts.row.1").is_some());
+    assert!(cx.debug_bounds("hosts.tag.0").is_some());
 }
 
 #[gpui::test]
@@ -16872,7 +16868,8 @@ async fn a_quick_connection_does_not_write_a_host_until_asked(cx: &mut TestAppCo
     cx.simulate_resize(design_window());
     cx.run_until_parked();
 
-    click(cx, "welcome.quick");
+    click(cx, "shell.menu");
+    click(cx, "menu.quick");
     assert!(cx.debug_bounds("quick.panel").is_some());
     type_into(cx, "quick.address", "127.0.0.1");
     clear_field(cx, "quick.port", 2);
@@ -16915,7 +16912,8 @@ async fn a_quick_connection_can_be_saved_as_a_host_afterwards(cx: &mut TestAppCo
     cx.simulate_resize(design_window());
     cx.run_until_parked();
 
-    click(cx, "welcome.quick");
+    click(cx, "shell.menu");
+    click(cx, "menu.quick");
     type_into(cx, "quick.address", "203.0.113.10");
     type_into(cx, "quick.user", "ada");
     type_into(cx, "quick.password", "s3cret-quick");
@@ -16990,7 +16988,8 @@ async fn quick_connect_names_the_field_when_input_is_rejected(cx: &mut TestAppCo
     cx.simulate_resize(design_window());
     cx.run_until_parked();
 
-    click(cx, "welcome.quick");
+    click(cx, "shell.menu");
+    click(cx, "menu.quick");
     type_into(cx, "quick.address", "example.com");
     type_into(cx, "quick.user", "ada");
     type_into(cx, "quick.password", "secret");
@@ -17120,7 +17119,8 @@ async fn quick_connect_dials_with_a_key_before_saving(cx: &mut TestAppContext) {
     cx.simulate_resize(design_window());
     cx.run_until_parked();
 
-    click(cx, "welcome.quick");
+    click(cx, "shell.menu");
+    click(cx, "menu.quick");
     assert!(cx.debug_bounds("quick.method.password").is_some());
     assert!(cx.debug_bounds("quick.method.key").is_some());
     assert!(cx.debug_bounds("quick.method.key-passphrase").is_some());
@@ -17212,7 +17212,8 @@ async fn saving_a_quick_host_shows_a_write_failure_on_the_session_bar(cx: &mut T
     cx.simulate_resize(design_window());
     cx.run_until_parked();
 
-    click(cx, "welcome.quick");
+    click(cx, "shell.menu");
+    click(cx, "menu.quick");
     type_into(cx, "quick.address", "203.0.113.20");
     type_into(cx, "quick.user", "ada");
     type_into(cx, "quick.password", "s3cret-fail");
@@ -18048,7 +18049,6 @@ fn every_token_has_a_light_value_of_its_own() {
         ("warning", palette::WARNING),
         ("danger", palette::DANGER),
         ("planned", palette::PLANNED),
-        ("brand end", palette::BRAND_END),
     ];
     for (name, token) in tokens
         .into_iter()
@@ -18338,7 +18338,7 @@ async fn nested_splits_keep_input_and_resize_on_the_active_pane(cx: &mut TestApp
     );
     assert!(
         cx.debug_bounds("home.local").is_some()
-            || cx.debug_bounds("welcome.quick").is_some()
+            || cx.debug_bounds("hosts.new").is_some()
             || cx.debug_bounds("session.tab.new").is_some(),
         "the empty state names a next step"
     );
@@ -19247,7 +19247,9 @@ async fn the_tunnel_form_names_its_fields_and_says_what_it_will_do(cx: &mut Test
         vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
     );
     let (view, cx) = hosts_view(cx, dir.store());
-    click(cx, "hosts.forwards.0");
+    // The forwards of a host are in its menu (ADR-3).
+    right_click(cx, "hosts.row.0");
+    click(cx, "host.menu.forwards");
     assert_eq!(
         cx.update(|_window, app| view.read(app).tool_for_test()),
         Some(crate::app::view::Tool::Forwards)
@@ -23715,7 +23717,9 @@ async fn stopping_or_deleting_a_tunnel_asks_first_and_the_answer_is_what_changes
         vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
     );
     let (view, cx) = hosts_view(cx, dir.store());
-    click(cx, "hosts.forwards.0");
+    // The forwards of a host are in its menu (ADR-3).
+    right_click(cx, "hosts.row.0");
+    click(cx, "host.menu.forwards");
     assert_eq!(
         cx.update(|_window, app| view.read(app).tool_for_test()),
         Some(crate::app::view::Tool::Forwards)
@@ -23829,7 +23833,9 @@ async fn the_tunnel_form_refuses_an_incomplete_endpoint_and_saves_nothing(cx: &m
         vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
     );
     let (_view, cx) = hosts_view(cx, dir.store());
-    click(cx, "hosts.forwards.0");
+    // The forwards of a host are in its menu (ADR-3).
+    right_click(cx, "hosts.row.0");
+    click(cx, "host.menu.forwards");
     click(cx, "forwards.new");
     assert!(cx.debug_bounds("forwards.form").is_some());
 
@@ -23896,8 +23902,11 @@ async fn a_list_of_five_thousand_hosts_builds_only_the_rows_the_window_shows(
     );
     let drawn = cx.update(|_window, app| view.read(app).hosts_rows_drawn());
     assert!(drawn > 0, "the list drew no row at all");
+    // The bound is a screenful, not a page of the book. The first frame is drawn at
+    // the test platform's own window size, before the resize, and the list has the
+    // page's whole height under the toolbar.
     assert!(
-        drawn <= 16,
+        drawn <= 24,
         "one frame built {drawn} rows of five thousand, so the list is not virtualized"
     );
     assert!(
@@ -23987,7 +23996,7 @@ async fn scrolling_five_thousand_hosts_brings_another_row_in_and_still_connects_
     );
     let drawn = cx.update(|_window, app| view.read(app).hosts_rows_drawn());
     assert!(
-        drawn <= 16,
+        drawn <= 24,
         "scrolling built {drawn} rows, so the list grew with the scroll"
     );
     cx.update(|_window, app| {
@@ -24013,11 +24022,13 @@ async fn the_search_the_group_and_the_status_narrow_one_result_and_say_so(cx: &m
     );
     clear_field(cx, "hosts.search", "node-0001".len());
 
-    // The wide window's tree narrows the list to a branch and everything inside it.
+    // The sidebar's tree narrows the list to a branch and everything inside it, and the
+    // page is named after it.
     click(cx, "hosts.tree.0");
-    assert!(
-        cx.debug_bounds("hosts.filter.group").is_some(),
-        "the narrowed list says which group narrows it"
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().section()),
+        HomeSection::Group(GroupPath::parse("Prod").expect("a valid path")),
+        "the list shows the group that was pressed"
     );
     let grouped = cx.update(|_window, app| {
         view.read(app)
@@ -24038,6 +24049,7 @@ async fn the_search_the_group_and_the_status_narrow_one_result_and_say_so(cx: &m
 
     // A status nobody has is a filter that keeps nothing, and it says so instead of
     // looking like an empty book.
+    click(cx, "hosts.filter");
     click(cx, "hosts.status.connected");
     assert!(
         cx.debug_bounds("hosts.list.0").is_some(),
@@ -24047,39 +24059,46 @@ async fn the_search_the_group_and_the_status_narrow_one_result_and_say_so(cx: &m
         cx.debug_bounds("hosts.nomatch").is_some(),
         "an empty result names the filters rather than looking like no host was saved"
     );
+    assert!(cx.debug_bounds("hosts.filter.status").is_some());
 
     click(cx, "hosts.filter.clear");
     assert!(
+        cx.debug_bounds("hosts.list.3000").is_some(),
+        "dropping the status brings the group's hosts back"
+    );
+    click(cx, "hosts.view.all");
+    assert!(
         cx.debug_bounds("hosts.list.5000").is_some(),
-        "dropping the filters brings every host back"
+        "every record is one press away"
     );
 }
 
 #[gpui::test]
-async fn the_narrow_window_folds_the_groups_into_a_filter(cx: &mut TestAppContext) {
+async fn the_narrow_window_folds_the_sidebar_and_still_reaches_the_groups(cx: &mut TestAppContext) {
     let dir = TempDir::new("scale-narrow");
     let store = dir.store();
     seed_many(&store, 40);
     let (view, cx) = hosts_view_at(cx, store, minimum_window());
 
     assert!(
-        !cx.update(|_window, app| view.read(app).group_column_fits()),
-        "a narrow window does not spend a column on the tree"
+        cx.update(|_window, app| view.read(app).home_sidebar_folded()),
+        "a narrow window does not spend the sidebar's words on the places"
+    );
+    let rail = bounds_of(cx, "home.sidebar.folded");
+    let row = bounds_of(cx, "hosts.row.0");
+    assert!(
+        row.left() >= rail.right() - px(0.5),
+        "the list is drawn beside the rail: {rail:?} {row:?}"
     );
     assert!(
-        cx.debug_bounds("hosts.group.chooser").is_some(),
-        "the same groups are reachable as a filter control"
-    );
-    assert!(
-        cx.debug_bounds("hosts.row.0").is_some(),
-        "the list is still drawn in the minimum window"
+        rail.contains(&bounds_of(cx, "home.sidebar.groups").center()),
+        "the groups are one folder on the rail"
     );
 
-    click(cx, "hosts.group.option.Prod");
-    assert!(
-        cx.debug_bounds("hosts.filter.group").is_some(),
-        "choosing a group on the narrow layout narrows the list"
-    );
+    // The rail's folder opens the words, where the tree is.
+    click(cx, "home.sidebar.groups");
+    assert!(!cx.update(|_window, app| view.read(app).home_sidebar_folded()));
+    click(cx, "hosts.tree.0");
     cx.update(|_window, app| {
         assert_eq!(
             view.read(app)
@@ -24090,61 +24109,100 @@ async fn the_narrow_window_folds_the_groups_into_a_filter(cx: &mut TestAppContex
             Some("Prod".to_owned())
         );
     });
+    assert!(
+        cx.debug_bounds("hosts.row.0").is_some(),
+        "the list is still drawn in the minimum window with the words open"
+    );
 }
 
 #[gpui::test]
-async fn the_status_filter_sits_with_the_groups_on_a_wide_window(cx: &mut TestAppContext) {
-    let dir = TempDir::new("status-column");
+async fn the_filter_menu_narrows_by_status_and_orders_the_list(cx: &mut TestAppContext) {
+    let dir = TempDir::new("status-menu");
     let store = dir.store();
     seed_many(&store, 12);
-    let (_view, cx) = hosts_view(cx, store);
+    let (view, cx) = hosts_view(cx, store);
 
-    // Wide: the statuses are rows of the side column, under the groups, and the
-    // toolbar keeps a single line.
-    let column = bounds_of(cx, "hosts.statuses");
-    let groups = bounds_of(cx, "hosts.groups");
-    let connected = bounds_of(cx, "hosts.status.connected");
-    assert!(
-        column.contains(&connected.center()),
-        "the status rows are drawn in the side column: {connected:?} in {column:?}"
-    );
-    assert!(
-        groups.contains(&column.center()),
-        "the statuses belong to the group column"
-    );
+    // Wide: the toolbar is one line, and the statuses and the orders are one press
+    // away under the funnel rather than a second row of controls.
     let toolbar = bounds_of(cx, "hosts.toolbar");
     let search = bounds_of(cx, "hosts.search");
     assert!(
-        toolbar.size.height < search.size.height * 1.6,
+        toolbar.size.height < search.size.height * 1.8,
         "the toolbar is one line on a wide window: {toolbar:?}"
+    );
+    assert!(toolbar.contains(&bounds_of(cx, "hosts.filter").center()));
+    click(cx, "hosts.filter");
+    for entry in [
+        "hosts.filter.menu",
+        "hosts.status.any",
+        "hosts.status.connected",
+        "hosts.status.recent",
+        "hosts.status.never",
+        "hosts.sort.saved",
+        "hosts.sort.name",
+        "hosts.sort.recent",
+    ] {
+        assert!(cx.debug_bounds(entry).is_some(), "{entry} is in the menu");
+    }
+    let menu = bounds_of(cx, "hosts.filter.menu");
+    assert!(
+        menu.top() >= bounds_of(cx, "hosts.filter").bottom(),
+        "the menu hangs under its button"
     );
 
     // The row's tools wait for the pointer; the box and the avatar share one place.
     let select = bounds_of(cx, "hosts.select.0");
     let row = bounds_of(cx, "hosts.row.0");
     assert!(row.contains(&select.center()));
+
     click(cx, "hosts.status.connected");
     assert!(
         cx.debug_bounds("hosts.nomatch").is_some(),
-        "the side column's status narrows the list like the toolbar's did"
+        "the menu's status narrows the list"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).home_menu_open()),
+        "choosing closes the menu"
+    );
+
+    click(cx, "hosts.filter");
+    click(cx, "hosts.status.any");
+    click(cx, "hosts.filter");
+    click(cx, "hosts.sort.name");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().sort()),
+        crate::app::hosts::HostSort::Name
+    );
+    assert!(
+        cx.debug_bounds("hosts.filter.sort").is_some(),
+        "an order other than the saved one is named above the list"
+    );
+    click(cx, "hosts.filter.clear");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().sort()),
+        crate::app::hosts::HostSort::Saved
     );
 }
 
 #[gpui::test]
-async fn the_narrow_window_keeps_the_status_filter_above_the_list(cx: &mut TestAppContext) {
+async fn the_minimum_window_keeps_the_filter_and_its_menu_inside(cx: &mut TestAppContext) {
     let dir = TempDir::new("status-narrow");
     let store = dir.store();
     seed_many(&store, 12);
-    let (view, cx) = hosts_view_at(cx, store, minimum_window());
-    assert!(
-        !cx.update(|_window, app| view.read(app).group_column_fits()),
-        "no side column on a narrow window"
-    );
+    let (_view, cx) = hosts_view_at(cx, store, minimum_window());
+    let viewport = cx.update(|window, _app| window.viewport_size());
     let toolbar = bounds_of(cx, "hosts.toolbar");
-    let connected = bounds_of(cx, "hosts.status.connected");
+    let filter = bounds_of(cx, "hosts.filter");
     assert!(
-        toolbar.contains(&connected.center()),
-        "the statuses are part of the toolbar there: {connected:?} in {toolbar:?}"
+        toolbar.contains(&filter.center()),
+        "the filter is part of the toolbar there: {filter:?} in {toolbar:?}"
+    );
+    assert_within_width(bounds_of(cx, "hosts.new"), viewport, "the new host button");
+    click(cx, "hosts.filter");
+    assert_fits_inside(
+        bounds_of(cx, "hosts.filter.menu"),
+        viewport,
+        "the filter menu",
     );
 }
 
@@ -24222,7 +24280,9 @@ async fn deleting_a_group_moves_its_hosts_and_never_deletes_one(cx: &mut TestApp
     seed_many(&store, 20);
     let (view, cx) = hosts_view(cx, store);
 
-    click(cx, "hosts.tree.0");
+    // A group is renamed or deleted from its own right-click menu (ADR-3).
+    right_click(cx, "hosts.tree.0");
+    assert!(cx.debug_bounds("hosts.group.menu").is_some());
     click(cx, "hosts.group.delete.open");
     assert!(
         cx.debug_bounds("hosts.group.delete").is_some(),
@@ -24259,7 +24319,7 @@ async fn renaming_a_group_moves_the_hosts_inside_it_and_the_tree_after_it(cx: &m
     seed_many(&store, 20);
     let (view, cx) = hosts_view(cx, store);
 
-    click(cx, "hosts.tree.0");
+    right_click(cx, "hosts.tree.0");
     click(cx, "hosts.group.rename.open");
     clear_field(cx, "hosts.group.name", "Prod".len());
     type_into(cx, "hosts.group.name", "Production");
@@ -26729,7 +26789,7 @@ async fn a_saved_desktop_row_only_says_connected_once_a_session_really_runs(
     // Saving a record is not starting one. The row states no session, and it does not
     // invent an "offline" either: idle is not a state a saved record has (R2).
     assert!(
-        cx.debug_bounds("hosts.connection.open.0").is_none(),
+        cx.debug_bounds("hosts.connection.state.0").is_none(),
         "a record that was never started is not drawn as connected"
     );
 
@@ -26753,7 +26813,7 @@ async fn a_saved_desktop_row_only_says_connected_once_a_session_really_runs(
     cx.run_until_parked();
     assert_eq!(destination_of(&view, cx), Destination::Hosts);
     assert!(
-        cx.debug_bounds("hosts.connection.open.0").is_some(),
+        cx.debug_bounds("hosts.connection.state.0").is_some(),
         "the row of a record with a running session says it is connected"
     );
     assert!(
@@ -30733,7 +30793,8 @@ async fn quick_connect_splits_user_host_port_on_tab_and_submits_on_enter(cx: &mu
     cx.simulate_resize(design_window());
     cx.run_until_parked();
 
-    click(cx, "welcome.quick");
+    click(cx, "shell.menu");
+    click(cx, "menu.quick");
     assert!(cx.debug_bounds("quick.panel").is_some());
     type_into(cx, "quick.address", "deploy@127.0.0.1:2222");
     // First Tab splits deploy@127.0.0.1:2222 into address/port/user and lands on port;
@@ -30774,7 +30835,8 @@ async fn quick_connect_splits_user_host_port_on_tab_and_submits_on_enter(cx: &mu
 
     // Pressing Enter inside a Quick Connect field also starts the attempt directly.
     click(cx, "nav.hosts");
-    click(cx, "welcome.quick");
+    click(cx, "shell.menu");
+    click(cx, "menu.quick");
     type_into(cx, "quick.address", "ops@127.0.0.1:1");
     cx.simulate_keystrokes("tab tab tab");
     cx.run_until_parked();
@@ -31026,7 +31088,7 @@ async fn minimum_window_at_two_hundred_percent_keeps_hosts_row_and_actions_withi
 }
 
 // ---------------------------------------------------------------------------
-// The home dashboard (R1)
+// The home page: sidebar, toolbar and one list (ADR-3)
 // ---------------------------------------------------------------------------
 
 /// Four hosts in two top-level groups and one without: three reached at different
@@ -31060,380 +31122,250 @@ fn open_form_name(cx: &mut VisualTestContext, view: &Entity<ShelluneView>) -> Op
     })
 }
 
-#[gpui::test]
-async fn the_dashboard_shows_recent_newest_first_favorites_and_groups(cx: &mut TestAppContext) {
-    let dir = TempDir::new("dashboard-cards");
-    seed_dashboard(&dir);
-    let (view, cx) = hosts_view_with_trust(cx, &dir);
-
-    for section in ["home.quick", "home.recent", "home.favorites", "home.groups"] {
-        assert!(
-            cx.debug_bounds(section).is_some(),
-            "{section} is part of the dashboard"
-        );
-    }
-    // Three reached hosts, three cards on one line, newest on the left.
-    let cards: Vec<_> = (0..3)
-        .map(|number| match number {
-            0 => bounds_of(cx, "home.recent.0"),
-            1 => bounds_of(cx, "home.recent.1"),
-            _ => bounds_of(cx, "home.recent.2"),
-        })
-        .collect();
-    assert!(
-        cards[0].left() < cards[1].left() && cards[1].left() < cards[2].left(),
-        "the recent cards sit on one line: {cards:?}"
-    );
-    assert!(
-        (cards[0].top() - cards[2].top()).abs() < px(1.0),
-        "a wide window does not stack them"
-    );
-    assert!(cx.debug_bounds("home.favorite.0").is_some());
-    assert!(
-        cx.debug_bounds("home.group.0").is_some() && cx.debug_bounds("home.group.1").is_some(),
-        "one card per top-level group: Prod and Staging"
-    );
-    assert!(
-        cx.debug_bounds("home.group.2").is_none(),
-        "a host without a group is no group card"
-    );
-    // The list stays below, with its own tools.
-    assert!(cx.debug_bounds("hosts.toolbar").is_some());
-    assert!(cx.debug_bounds("hosts.list.4").is_some());
-
-    // The newest connection is the first card, and pressing it connects to that host.
-    click(cx, "home.recent.0");
-    assert_eq!(
-        open_form_name(cx, &view).as_deref(),
-        Some("gamma"),
-        "the first recent card is the newest connection"
-    );
+/// The platform's command key with one letter: Ctrl on Windows and Linux, Cmd on macOS.
+fn command_key(letter: &str) -> String {
+    format!("{}-{letter}", Platform::current().keystroke_modifier())
 }
 
 #[gpui::test]
-async fn a_favorite_card_connects_and_a_group_card_narrows_the_list(cx: &mut TestAppContext) {
-    let dir = TempDir::new("dashboard-press");
+async fn the_home_is_a_sidebar_a_toolbar_and_one_list(cx: &mut TestAppContext) {
+    let dir = TempDir::new("home-shape");
     seed_dashboard(&dir);
-    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    let (_view, cx) = hosts_view_with_trust(cx, &dir);
 
-    click(cx, "home.group.0");
-    cx.update(|_window, app| {
-        assert_eq!(
-            view.read(app)
-                .hosts_state()
-                .filter()
-                .group()
-                .map(GroupPath::to_canonical),
-            Some("Prod".to_owned()),
-            "the group card narrows the list to its group"
-        );
-    });
+    // The sidebar: the places, the groups and the local terminal at its foot.
+    let sidebar = bounds_of(cx, "home.sidebar");
     assert!(
-        cx.debug_bounds("hosts.filter.group").is_some(),
-        "the narrowed list names the group"
+        (sidebar.size.width - Metrics::default().scale(220.0)).abs() < px(1.0),
+        "the sidebar is 220 wide on a wide window: {sidebar:?}"
+    );
+    for entry in [
+        "hosts.view.all",
+        "hosts.view.favorites",
+        "hosts.view.recent",
+        "hosts.group.new",
+        "hosts.tree.0",
+        "hosts.tree.1",
+        "home.local",
+    ] {
+        let bounds = bounds_of(cx, entry);
+        assert!(
+            sidebar.contains(&bounds.center()),
+            "{entry} is in the sidebar: {bounds:?} {sidebar:?}"
+        );
+    }
+    assert!(
+        bounds_of(cx, "home.local").top() > bounds_of(cx, "hosts.tree.1").bottom(),
+        "the local terminal sits under the groups"
+    );
+
+    // The toolbar: the place and its count, the one search, the two menus and the one
+    // primary action.
+    let toolbar = bounds_of(cx, "hosts.toolbar");
+    for part in [
+        "header.title",
+        "header.count",
+        "hosts.search",
+        "hosts.filter",
+        "hosts.more",
+        "hosts.new",
+    ] {
+        assert!(
+            toolbar.contains(&bounds_of(cx, part).center()),
+            "{part} is in the toolbar"
+        );
+    }
+    assert!(toolbar.left() >= sidebar.right() - px(0.5));
+
+    // One list of four, each row with its address, tag, time and state.
+    assert!(cx.debug_bounds("hosts.list.4").is_some());
+    let row = bounds_of(cx, "hosts.row.0");
+    for part in [
+        "hosts.tag.0",
+        "hosts.last.0",
+        "hosts.connect.0",
+        "hosts.edit.0",
+    ] {
+        assert!(
+            row.contains(&bounds_of(cx, part).center()),
+            "{part} is on the first row"
+        );
+    }
+    assert!(
+        cx.debug_bounds("hosts.last.3").is_none(),
+        "delta was never reached, so its row says no time"
+    );
+
+    // What the page no longer has: a second search, the cards, the segments and the
+    // quick-connect button.
+    for gone in [
+        "home.quick",
+        "home.dashboard",
+        "home.recent",
+        "home.groups",
+        "welcome.quick",
+        "hosts.view.groups",
+        "hosts.count",
+        "hosts.statuses",
+    ] {
+        assert!(cx.debug_bounds(gone).is_none(), "{gone} is not drawn");
+    }
+}
+
+#[gpui::test]
+async fn the_sidebar_places_narrow_the_list_and_name_the_page(cx: &mut TestAppContext) {
+    let dir = TempDir::new("home-places");
+    let ids = seed_dashboard(&dir);
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    let section = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| view.read(app).hosts_state().section())
+    };
+    assert_eq!(section(cx), HomeSection::All);
+
+    click(cx, "hosts.view.favorites");
+    assert_eq!(section(cx), HomeSection::Favorites);
+    assert!(
+        cx.debug_bounds("hosts.list.1").is_some(),
+        "only the favourite is listed"
+    );
+
+    click(cx, "hosts.view.recent");
+    assert_eq!(section(cx), HomeSection::Recent);
+    assert!(cx.debug_bounds("hosts.list.3").is_some());
+    // The newest connection is the first row, and pressing its button connects it.
+    click(cx, "hosts.connect.0");
+    assert_eq!(
+        open_form_name(cx, &view).as_deref(),
+        Some("gamma"),
+        "the recent place lists the newest connection first"
+    );
+    cx.update(|_window, app| view.update(app, |view, cx| view.hide_connection_for_test(cx)));
+    cx.run_until_parked();
+
+    click(cx, "hosts.tree.0");
+    assert_eq!(
+        section(cx),
+        HomeSection::Group(GroupPath::parse("Prod").expect("a valid path"))
     );
     assert!(
         cx.debug_bounds("hosts.list.2").is_some(),
         "Prod holds two hosts"
     );
 
-    click(cx, "home.favorite.0");
-    assert_eq!(
-        open_form_name(cx, &view).as_deref(),
-        Some("delta"),
-        "a favourite card connects to its host"
-    );
+    click(cx, "hosts.view.all");
+    assert_eq!(section(cx), HomeSection::All);
+    assert!(cx.debug_bounds("hosts.list.4").is_some());
+    assert_eq!(ids.len(), 4);
 }
 
 #[gpui::test]
-async fn an_empty_section_is_hidden_and_an_empty_book_shows_the_welcome(cx: &mut TestAppContext) {
-    let dir = TempDir::new("dashboard-empty-sections");
-    seed(
-        &dir.store(),
-        vec![stored_host("solo", "10.0.0.9", 22, "deploy", None)],
-    );
-    let (_view, cx) = hosts_view_with_trust(cx, &dir);
-    assert!(cx.debug_bounds("home.quick").is_some());
-    for hidden in [
-        "home.recent",
-        "home.favorites",
-        "home.groups",
-        "home.dashboard",
-    ] {
-        assert!(
-            cx.debug_bounds(hidden).is_none(),
-            "{hidden} has nothing to show and is not drawn"
-        );
-    }
-    assert!(cx.debug_bounds("hosts.row.0").is_some());
-
-    let empty = TempDir::new("dashboard-empty-book");
-    seed(&empty.store(), Vec::new());
-    let (_view, cx) = hosts_view_with_trust(cx, &empty);
-    assert!(
-        cx.debug_bounds("hosts.empty").is_some(),
-        "an empty book is welcomed with new host and import"
-    );
-    assert!(cx.debug_bounds("hosts.empty.new").is_some());
-    assert!(cx.debug_bounds("hosts.import.open").is_some());
-    assert!(
-        cx.debug_bounds("home.dashboard").is_none(),
-        "no card band over an empty book"
-    );
-}
-
-/// The dashboard's cards fade in one after another (R4), but only their opacity moves:
-/// every card stands where it will stay from the first frame, a press during the
-/// entrance lands on it, and reduced motion draws the same cards in the same places.
-#[gpui::test]
-async fn the_dashboard_cards_fade_in_turn_where_they_stand_and_take_a_press_at_once(
-    cx: &mut TestAppContext,
-) {
-    theme::set_motion(Motion::Full);
-    let dir = TempDir::new("dashboard-entrance");
+async fn the_sidebar_folds_to_icons_and_opens_again(cx: &mut TestAppContext) {
+    let dir = TempDir::new("home-fold");
     seed_dashboard(&dir);
     let (view, cx) = hosts_view_with_trust(cx, &dir);
+    let folded =
+        |cx: &mut VisualTestContext| cx.update(|_window, app| view.read(app).home_sidebar_folded());
+    assert!(!folded(cx), "a wide window starts with the words");
+    let list_before = bounds_of(cx, "hosts.row.0");
+
+    click(cx, "home.sidebar.toggle");
+    assert!(folded(cx));
+    let rail = bounds_of(cx, "home.sidebar.folded");
+    assert!(
+        (rail.size.width - Metrics::default().scale(56.0)).abs() < px(1.0),
+        "the folded sidebar is a 56-wide rail: {rail:?}"
+    );
+    let list_after = bounds_of(cx, "hosts.row.0");
+    assert!(
+        list_after.size.width > list_before.size.width,
+        "the list takes the room the words gave up"
+    );
+    // The places still work from the rail.
+    click(cx, "hosts.view.favorites");
     assert_eq!(
-        cx.update(|_window, app| view.read(app).workspace().motion()),
-        Motion::Full,
-        "the entrance is played"
+        cx.update(|_window, app| view.read(app).hosts_state().section()),
+        HomeSection::Favorites
     );
-    let cards = [
-        "home.recent.0",
-        "home.recent.2",
-        "home.favorite.0",
-        "home.group.0",
-        "home.group.1",
-    ];
-    let entering: Vec<_> = cards.iter().map(|card| bounds_of(cx, card)).collect();
-
-    while cx.update(|_window, app| view.read(app).workspace().motion()) != Motion::Reduced {
-        cx.update(|_window, app| view.update(app, |view, cx| view.cycle_motion(cx)));
-        cx.run_until_parked();
-    }
-    let still: Vec<_> = cards.iter().map(|card| bounds_of(cx, card)).collect();
-    assert_eq!(
-        entering, still,
-        "an entering card already stands where the still one does"
-    );
-    theme::set_motion(Motion::Full);
-
-    // A fresh window, pressed while its cards are still arriving.
-    let again = TempDir::new("dashboard-entrance-press");
-    seed_dashboard(&again);
-    let (view, cx) = hosts_view_with_trust(cx, &again);
-    click(cx, "home.group.1");
-    cx.update(|_window, app| {
-        assert_eq!(
-            view.read(app)
-                .hosts_state()
-                .filter()
-                .group()
-                .map(GroupPath::to_canonical),
-            Some("Staging".to_owned()),
-            "the last card to arrive already narrows the list"
-        );
-    });
-}
-
-/// The quick-connect bar is the page's main entry: a larger field than the list's own
-/// search, resting on the page above the cards (R4).
-#[gpui::test]
-async fn the_quick_bar_is_the_larger_field_above_the_cards(cx: &mut TestAppContext) {
-    let dir = TempDir::new("dashboard-quick-bar");
-    seed_dashboard(&dir);
-    let (_view, cx) = hosts_view_with_trust(cx, &dir);
-    let bar = bounds_of(cx, "home.quick");
-    let search = bounds_of(cx, "hosts.search");
-    assert!(
-        bar.size.height > search.size.height,
-        "the bar {bar:?} is taller than the list search {search:?}"
-    );
-    let first = bounds_of(cx, "home.recent.0");
-    assert!(
-        bar.bottom() <= first.top(),
-        "the bar {bar:?} sits above the first card {first:?}"
-    );
-    let surface = bounds_of(cx, "hosts.surface");
-    assert!(
-        (first.left() - bounds_of(cx, "hosts.toolbar").left()).abs() < px(0.5),
-        "the band's shadow room does not move the cards off the column"
-    );
-    assert!(
-        surface.right() <= cx.update(|window, _app| window.viewport_size().width),
-        "the list card stays inside the window"
-    );
+    click(cx, "home.sidebar.toggle");
+    assert!(!folded(cx), "the button opens the words again");
 }
 
 #[gpui::test]
-async fn the_star_marks_a_favorite_that_survives_a_restart_and_unmarks_it(cx: &mut TestAppContext) {
-    let dir = TempDir::new("dashboard-star");
+async fn an_address_in_the_search_puts_connect_to_on_top_and_a_press_dials_it(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("home-direct-row");
     seed(
         &dir.store(),
         vec![
-            stored_host("alpha", "10.0.0.1", 22, "deploy", None),
-            stored_host("beta", "10.0.0.2", 22, "deploy", None),
+            stored_host("saved-local", "127.0.0.1", 1, "ops", None),
+            stored_host("other", "10.0.0.2", 22, "deploy", None),
         ],
     );
     let (view, cx) = hosts_view_with_trust(cx, &dir);
-    assert!(cx.debug_bounds("home.favorites").is_none());
 
-    click(cx, "hosts.favorite.1");
-    let beta = cx.update(|_window, app| view.read(app).book().hosts()[1].id());
-    assert!(cx.update(|_window, app| view.read(app).book().is_favorite(beta)));
+    type_into(cx, "hosts.search", "ops@127.0.0.1:1");
+    let direct = bounds_of(cx, "hosts.direct");
+    let saved = bounds_of(cx, "hosts.row.0");
     assert!(
-        cx.debug_bounds("home.favorite.0").is_some(),
-        "the favourite appears in its section at once"
+        direct.bottom() <= saved.top() + px(0.5),
+        "the connection to what was typed is the first row: {direct:?} {saved:?}"
     );
-    // Written to the file: what the next start reads.
-    let reread = dir.store().load().expect("the book reads back");
-    assert!(reread.is_favorite(beta), "the mark is in hosts.json");
-
-    // A restart is a new view over the same directory.
-    let (again, cx) = hosts_view_with_trust(cx, &dir);
-    assert!(cx.update(|_window, app| again.read(app).book().is_favorite(beta)));
-    assert!(
-        cx.debug_bounds("home.favorite.0").is_some(),
-        "the favourite is still there after a restart"
-    );
-
-    click(cx, "hosts.favorite.1");
-    assert!(!cx.update(|_window, app| again.read(app).book().is_favorite(beta)));
-    // The section is drawn from the book's favourites, which are now none; a section
-    // with nothing in it is not drawn (see the empty-section test).
-    assert!(cx.update(|_window, app| again.read(app).book().favorite_hosts().is_empty()));
-    assert!(!dir.store().load().expect("reads").is_favorite(beta));
-}
-
-#[gpui::test]
-async fn the_host_menu_and_the_palette_toggle_the_favorite_mark(cx: &mut TestAppContext) {
-    let dir = TempDir::new("dashboard-menu-palette");
-    seed(
-        &dir.store(),
-        vec![stored_host("alpha", "10.0.0.1", 22, "deploy", None)],
-    );
-    let (view, cx) = hosts_view_with_trust(cx, &dir);
-    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
-    let alpha = cx.update(|_window, app| view.read(app).book().hosts()[0].id());
-
-    right_click(cx, "hosts.row.0");
-    click(cx, "host.menu.favorite");
-    assert!(cx.update(|_window, app| view.read(app).book().is_favorite(alpha)));
-    assert!(!cx.update(|_window, app| view.read(app).host_menu_open()));
-
-    // The card's own menu is the same menu, with the mark the other way round.
-    right_click(cx, "home.favorite.0");
-    assert!(cx.update(|_window, app| view.read(app).host_menu_open()));
-    click(cx, "host.menu.favorite");
-    assert!(!cx.update(|_window, app| view.read(app).book().is_favorite(alpha)));
-
-    // The palette offers the mark for the row under the keyboard cursor.
-    click(cx, "hosts.row.0");
-    focus_root(&view, cx);
-    go(cx, crate::app::actions::OpenPalette);
-    cx.simulate_input("favorites");
-    cx.run_until_parked();
-    let titles = cx.update(|_window, app| view.read(app).palette_titles());
-    assert_eq!(
-        titles.first().map(String::as_str),
-        Some("Add alpha to favorites"),
-        "the palette names the record it would mark: {titles:?}"
-    );
-    cx.update(|window, app| view.update(app, |view, cx| view.palette_confirm(window, cx)));
-    cx.run_until_parked();
-    assert!(cx.update(|_window, app| view.read(app).book().is_favorite(alpha)));
-}
-
-#[gpui::test]
-async fn the_favorites_filter_keeps_only_the_marked_records(cx: &mut TestAppContext) {
-    let dir = TempDir::new("dashboard-filter");
-    seed_dashboard(&dir);
-    let (view, cx) = hosts_view_with_trust(cx, &dir);
-    assert!(cx.debug_bounds("hosts.list.4").is_some());
-
-    click(cx, "hosts.filter.favorites");
-    assert!(cx.update(|_window, app| view.read(app).hosts_state().filter().favorites()));
     assert!(
         cx.debug_bounds("hosts.list.1").is_some(),
-        "only the favourite is listed"
+        "the host saved at that address is listed under it"
     );
-    assert!(cx.debug_bounds("hosts.filter.favorites.chip").is_some());
 
-    click(cx, "hosts.filter.clear");
-    assert!(cx.debug_bounds("hosts.list.4").is_some());
-}
-
-#[gpui::test]
-async fn the_quick_bar_finds_a_saved_host_and_enter_connects_the_highlighted_one(
-    cx: &mut TestAppContext,
-) {
-    let dir = TempDir::new("dashboard-quick-saved");
-    seed(
-        &dir.store(),
-        vec![
-            stored_host("alpha", "10.0.0.1", 22, "deploy", None),
-            stored_host("alps", "10.0.0.2", 22, "deploy", None),
-            stored_host("zulu", "10.0.0.3", 22, "deploy", None),
-        ],
-    );
-    let (view, cx) = hosts_view_with_trust(cx, &dir);
-    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
-
-    type_into(cx, "home.quick", "alp");
-    assert!(cx.debug_bounds("home.quick.results").is_some());
-    assert!(cx.debug_bounds("home.quick.saved.0").is_some());
-    assert!(cx.debug_bounds("home.quick.saved.1").is_some());
-    let (alpha, alps) = cx.update(|_window, app| {
-        let hosts = view.read(app).book().hosts();
-        (hosts[0].id(), hosts[1].id())
+    click(cx, "hosts.direct");
+    let (address, port, user) = cx.update(|_window, app| {
+        let panel = view
+            .read(app)
+            .remote_state()
+            .expect("the connection is prepared");
+        let host = panel.host();
+        (
+            host.address().to_owned(),
+            host.port().get(),
+            host.user().to_owned(),
+        )
     });
     assert_eq!(
-        cx.update(|_window, app| view.read(app).quick_results_for_test()),
-        vec![
-            crate::app::view::QuickResult::Saved(alpha),
-            crate::app::view::QuickResult::Saved(alps),
-        ],
-        "both names match and zulu does not"
+        (address.as_str(), port, user.as_str()),
+        ("127.0.0.1", 1, "ops")
     );
-    assert!(
-        cx.debug_bounds("home.recent").is_none(),
-        "the results take the cards' place while a phrase is typed"
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).book().hosts().len()),
+        2,
+        "nothing was saved"
     );
-
-    // Down moves the highlight; Enter opens the highlighted result and empties the bar.
-    cx.simulate_keystrokes("down");
-    cx.run_until_parked();
-    cx.simulate_keystrokes("enter");
-    cx.run_until_parked();
-    assert_eq!(open_form_name(cx, &view).as_deref(), Some("alps"));
-    assert!(
-        cx.update(|_window, app| view.read(app).quick_results_for_test().is_empty()),
-        "the bar empties once a result opened"
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().search().to_owned()),
+        "",
+        "the search is emptied for the next visit"
     );
 }
 
 #[gpui::test]
-async fn the_quick_bar_dials_an_unsaved_user_at_host_without_saving_it(cx: &mut TestAppContext) {
-    let dir = TempDir::new("dashboard-quick-temporary");
+async fn an_address_nobody_saved_is_offered_by_the_empty_list_and_enter_dials_it(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("home-direct-enter");
     seed(
         &dir.store(),
         vec![stored_host("alpha", "10.0.0.1", 22, "deploy", None)],
     );
     let (view, cx) = hosts_view_with_trust(cx, &dir);
 
-    type_into(cx, "home.quick", "ops@127.0.0.1:1");
+    type_into(cx, "hosts.search", "ops@127.0.0.1:1");
     assert!(
-        cx.debug_bounds("home.quick.temporary").is_some(),
-        "an address nobody saved is offered as a connection"
+        cx.debug_bounds("hosts.nomatch").is_some(),
+        "no saved record matches the address"
     );
-    let results = cx.update(|_window, app| view.read(app).quick_results_for_test());
     assert!(
-        matches!(
-            results.as_slice(),
-            [crate::app::view::QuickResult::Temporary(_)]
-        ),
-        "no saved record matches, so the address is the only result: {results:?}"
+        cx.debug_bounds("hosts.nomatch.connect").is_some(),
+        "the empty list offers the connection to what was typed"
     );
+    assert!(cx.debug_bounds("hosts.nomatch.clear").is_some());
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
 
@@ -31467,54 +31399,233 @@ async fn the_quick_bar_dials_an_unsaved_user_at_host_without_saving_it(cx: &mut 
 }
 
 #[gpui::test]
-async fn the_quick_bar_lists_a_local_shell_whose_name_it_matches(cx: &mut TestAppContext) {
-    let dir = TempDir::new("dashboard-quick-shell");
+async fn the_keyboard_finds_moves_opens_makes_and_deletes(cx: &mut TestAppContext) {
+    let dir = TempDir::new("home-keyboard");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("alpha", "10.0.0.1", 22, "deploy", None),
+            stored_host("alps", "10.0.0.2", 22, "deploy", None),
+            stored_host("zulu", "10.0.0.3", 22, "deploy", None),
+        ],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    let search_focused = |cx: &mut VisualTestContext| {
+        let handle = cx.update(|_window, app| view.read(app).hosts_search_focus_for_test(app));
+        cx.update(|window, _app| handle.is_focused(window))
+    };
+
+    // A press on a row gives the page the keyboard; "/" goes to the search from there.
+    click(cx, "hosts.row.2");
+    assert!(!search_focused(cx));
+    cx.simulate_keystrokes("/");
+    cx.run_until_parked();
+    assert!(search_focused(cx), "/ finds");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().search().to_owned()),
+        "",
+        "the slash that moved the keyboard is not typed"
+    );
+    cx.simulate_input("alp");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("hosts.list.2").is_some());
+
+    // Down and Enter: the second match opens.
+    cx.simulate_keystrokes("down down enter");
+    cx.run_until_parked();
+    assert_eq!(open_form_name(cx, &view).as_deref(), Some("alps"));
+    cx.update(|_window, app| view.update(app, |view, cx| view.hide_connection_for_test(cx)));
+    cx.run_until_parked();
+
+    // Ctrl/Cmd+F from the page finds; Ctrl/Cmd+N makes a new host.
+    click(cx, "hosts.row.0");
+    assert!(!search_focused(cx));
+    cx.simulate_keystrokes(&command_key("f"));
+    cx.run_until_parked();
+    assert!(search_focused(cx), "Ctrl/Cmd+F finds");
+    cx.simulate_keystrokes(&command_key("n"));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("hosts.editor").is_some(),
+        "Ctrl/Cmd+N opens the new host form"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Delete asks first and deletes nothing by itself.
+    click(cx, "hosts.row.0");
+    cx.simulate_keystrokes("delete");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().pending_delete().is_some()),
+        "Delete asks about the row under the cursor"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).book().hosts().len()),
+        3,
+        "nothing was deleted by the key"
+    );
+}
+
+#[gpui::test]
+async fn two_hundred_hosts_draw_only_their_visible_rows_and_answer_a_search_at_once(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("home-200");
+    let store = dir.store();
+    seed_many(&store, 200);
+    let started = std::time::Instant::now();
+    let (view, cx) = hosts_view(cx, store);
+    let opened = started.elapsed();
+    assert!(cx.debug_bounds("hosts.list.200").is_some());
+    let drawn = cx.update(|_window, app| view.read(app).hosts_rows_drawn());
+    assert!(
+        drawn > 0 && drawn <= 24,
+        "one frame built {drawn} of 200 rows, so the list is not virtualized"
+    );
+    assert!(cx.debug_bounds("hosts.row.150").is_none());
+
+    // Every keystroke of a search draws the page again; each one is a frame, not a
+    // rebuild of 200 rows.
+    let typed = std::time::Instant::now();
+    type_into(cx, "hosts.search", "node-0199");
+    let searched = typed.elapsed();
+    assert!(
+        cx.debug_bounds("hosts.list.1").is_some(),
+        "the search narrows 200 hosts to the one it names"
+    );
+    // Generous bounds for a debug build on a loaded runner: what they catch is a list
+    // that builds every row, which costs seconds at this size, not milliseconds.
+    assert!(
+        opened < std::time::Duration::from_secs(5),
+        "200 hosts took {opened:?} to open"
+    );
+    assert!(
+        searched < std::time::Duration::from_secs(3),
+        "a search over 200 hosts took {searched:?}"
+    );
+}
+
+#[gpui::test]
+async fn the_more_menu_imports_and_starts_a_batch(cx: &mut TestAppContext) {
+    let dir = TempDir::new("home-more");
+    seed_dashboard(&dir);
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    click(cx, "hosts.more");
+    assert!(cx.debug_bounds("hosts.more.menu").is_some());
+    click(cx, "hosts.import");
+    assert!(cx.update(|_window, app| view.read(app).import_state().is_open()));
+    assert!(!cx.update(|_window, app| view.read(app).home_menu_open()));
+
+    // A fresh window, for the batch task the same menu starts.
+    let again = TempDir::new("home-more-batch");
+    seed_dashboard(&again);
+    let (view, cx) = hosts_view_with_trust(cx, &again);
+    click(cx, "hosts.more");
+    click(cx, "hosts.batch.open.list");
+    assert!(
+        cx.update(|_window, app| view.read(app).batch_panel().view().is_open()),
+        "the batch preview opens from the menu"
+    );
+}
+
+#[gpui::test]
+async fn an_empty_book_is_welcomed_with_four_ways_to_start(cx: &mut TestAppContext) {
+    let empty = TempDir::new("home-empty-book");
+    seed(&empty.store(), Vec::new());
+    let (_view, cx) = hosts_view_with_trust(cx, &empty);
+    for part in [
+        "hosts.empty",
+        "hosts.empty.new",
+        "hosts.import.open",
+        "hosts.empty.local",
+        "hosts.empty.restore",
+        "home.sidebar",
+        "hosts.search",
+    ] {
+        assert!(cx.debug_bounds(part).is_some(), "{part} is drawn");
+    }
+    assert!(cx.debug_bounds("hosts.row.0").is_none());
+}
+
+#[gpui::test]
+async fn the_star_marks_a_favorite_that_survives_a_restart_and_unmarks_it(cx: &mut TestAppContext) {
+    let dir = TempDir::new("dashboard-star");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("alpha", "10.0.0.1", 22, "deploy", None),
+            stored_host("beta", "10.0.0.2", 22, "deploy", None),
+        ],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    click(cx, "hosts.favorite.1");
+    let beta = cx.update(|_window, app| view.read(app).book().hosts()[1].id());
+    assert!(cx.update(|_window, app| view.read(app).book().is_favorite(beta)));
+    click(cx, "hosts.view.favorites");
+    assert!(
+        cx.debug_bounds("hosts.list.1").is_some(),
+        "the favourite is in its place at once"
+    );
+    // Written to the file: what the next start reads.
+    let reread = dir.store().load().expect("the book reads back");
+    assert!(reread.is_favorite(beta), "the mark is in hosts.json");
+
+    // A restart is a new view over the same directory.
+    let (again, cx) = hosts_view_with_trust(cx, &dir);
+    assert!(cx.update(|_window, app| again.read(app).book().is_favorite(beta)));
+
+    click(cx, "hosts.favorite.1");
+    assert!(!cx.update(|_window, app| again.read(app).book().is_favorite(beta)));
+    assert!(cx.update(|_window, app| again.read(app).book().favorite_hosts().is_empty()));
+    assert!(!dir.store().load().expect("reads").is_favorite(beta));
+    click(cx, "hosts.view.favorites");
+    assert!(
+        cx.debug_bounds("hosts.favorites.empty").is_some(),
+        "an empty favourites place says how a record gets there"
+    );
+}
+
+#[gpui::test]
+async fn the_host_menu_and_the_palette_toggle_the_favorite_mark(cx: &mut TestAppContext) {
+    let dir = TempDir::new("dashboard-menu-palette");
     seed(
         &dir.store(),
         vec![stored_host("alpha", "10.0.0.1", 22, "deploy", None)],
     );
-    let mut workspace = Workspace::new();
-    workspace.select(Destination::Hosts);
-    workspace.set_shells(vec![
-        LocalShell::new("PowerShell", "pwsh.exe"),
-        LocalShell::new("Bash", "bash"),
-    ]);
-    let store = dir.store();
-    let trust = TrustStore::at(dir.path());
-    let (view, cx) = cx.add_window_view(move |_window, cx| {
-        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
-    });
-    cx.simulate_resize(design_window());
-    cx.run_until_parked();
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    let alpha = cx.update(|_window, app| view.read(app).book().hosts()[0].id());
 
-    cx.update(|_window, app| view.update(app, |view, cx| view.type_quick_bar("bas", cx)));
-    cx.run_until_parked();
-    assert!(
-        cx.debug_bounds("home.quick.shell.1").is_some(),
-        "the Bash shell is offered from the bar"
-    );
-    assert!(cx.debug_bounds("home.quick.shell.0").is_none());
-    assert_eq!(
-        cx.update(|_window, app| view.read(app).quick_results_for_test()),
-        vec![crate::app::view::QuickResult::Shell(1)]
-    );
+    right_click(cx, "hosts.row.0");
+    click(cx, "host.menu.favorite");
+    assert!(cx.update(|_window, app| view.read(app).book().is_favorite(alpha)));
+    assert!(!cx.update(|_window, app| view.read(app).host_menu_open()));
 
-    // A saved match comes before the shell, which is at the end.
-    cx.update(|_window, app| view.update(app, |view, cx| view.type_quick_bar("p", cx)));
+    // The menu says the mark the other way round now.
+    right_click(cx, "hosts.row.0");
+    assert!(cx.update(|_window, app| view.read(app).host_menu_open()));
+    click(cx, "host.menu.favorite");
+    assert!(!cx.update(|_window, app| view.read(app).book().is_favorite(alpha)));
+
+    // The palette offers the mark for the row under the keyboard cursor.
+    click(cx, "hosts.row.0");
+    focus_root(&view, cx);
+    go(cx, crate::app::actions::OpenPalette);
+    cx.simulate_input("favorites");
     cx.run_until_parked();
-    let results = cx.update(|_window, app| view.read(app).quick_results_for_test());
-    assert!(
-        matches!(
-            results.first(),
-            Some(crate::app::view::QuickResult::Saved(_))
-        ),
-        "alpha (alPha) leads: {results:?}"
-    );
+    let titles = cx.update(|_window, app| view.read(app).palette_titles());
     assert_eq!(
-        results.last(),
-        Some(&crate::app::view::QuickResult::Shell(0)),
-        "PowerShell closes the list"
+        titles.first().map(String::as_str),
+        Some("Add alpha to favorites"),
+        "the palette names the record it would mark: {titles:?}"
     );
+    cx.update(|window, app| view.update(app, |view, cx| view.palette_confirm(window, cx)));
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).book().is_favorite(alpha)));
 }
 
 #[gpui::test]
@@ -31545,8 +31656,14 @@ async fn the_local_terminal_menu_lists_shells_custom_and_serial(cx: &mut TestApp
     assert!(cx.update(|_window, app| view.read(app).shell_menu_open()));
     let menu = bounds_of(cx, "shell.picker");
     assert!(
-        menu.top() >= control.bottom() && menu.top() - control.bottom() < px(16.0),
-        "the menu hangs from the button: {control:?} {menu:?}"
+        menu.left() >= control.right() && menu.left() - control.right() < px(16.0),
+        "the menu opens beside the sidebar entry: {control:?} {menu:?}"
+    );
+    // The menu's entrance rises a few pixels into place, so its bottom is read
+    // within that rise.
+    assert!(
+        (menu.bottom() - control.bottom()).abs() < px(10.0) && menu.top() < control.top(),
+        "and grows upwards from it: {control:?} {menu:?}"
     );
     for entry in [
         "shell.choice.0",
@@ -31576,40 +31693,7 @@ async fn the_local_terminal_menu_lists_shells_custom_and_serial(cx: &mut TestApp
 }
 
 #[gpui::test]
-async fn a_narrow_window_stacks_the_cards_and_shows_half_as_many(cx: &mut TestAppContext) {
-    let dir = TempDir::new("dashboard-narrow");
-    seed_dashboard(&dir);
-    let store = dir.store();
-    let (view, cx) = hosts_view_at(cx, store, minimum_window());
-    assert!(!cx.update(|_window, app| view.read(app).group_column_fits()));
-    assert_eq!(
-        cx.update(|_window, app| view.read(app).home_cards_per_section(false)),
-        2
-    );
-    let first = bounds_of(cx, "home.recent.0");
-    let second = bounds_of(cx, "home.recent.1");
-    assert!(
-        second.top() >= first.bottom() - px(0.5) && (first.left() - second.left()).abs() < px(1.0),
-        "one column: {first:?} then {second:?}"
-    );
-    assert!(
-        cx.debug_bounds("home.recent.all").is_some(),
-        "the rest is one press away"
-    );
-    click(cx, "home.recent.all");
-    assert_eq!(
-        cx.update(|_window, app| view.read(app).hosts_state().view()),
-        HostView::Recent,
-        "view all opens the list's recent view"
-    );
-    assert!(
-        cx.debug_bounds("hosts.row.0").is_some() || cx.debug_bounds("hosts.recent.0").is_some(),
-        "the list is still drawn under the cards"
-    );
-}
-
-#[gpui::test]
-async fn the_minimum_window_at_two_hundred_percent_keeps_the_bar_and_the_filters_reachable(
+async fn the_minimum_window_at_two_hundred_percent_keeps_the_search_and_the_list_reachable(
     cx: &mut TestAppContext,
 ) {
     let dir = TempDir::new("dashboard-200");
@@ -31632,37 +31716,33 @@ async fn the_minimum_window_at_two_hundred_percent_keeps_the_bar_and_the_filters
         cx.update(|_window, app| view.read(app).workspace().zoom()),
         Zoom::Largest
     );
+    assert!(
+        cx.update(|_window, app| view.read(app).home_sidebar_folded()),
+        "the minimum window folds the sidebar to its icons"
+    );
 
     let viewport = cx.update(|window, _app| window.viewport_size());
-    assert_fits_inside(
-        bounds_of(cx, "home.quick"),
-        viewport,
-        "the quick-connect bar",
-    );
-    assert_within_width(
-        bounds_of(cx, "home.local"),
-        viewport,
-        "the local terminal menu",
-    );
-    // The list's filters start inside the window, and the page scrolls the rest of
-    // them into view: at this size the page is one scrolling column (R8).
+    assert_within_width(bounds_of(cx, "hosts.search"), viewport, "the search");
+    assert_within_width(bounds_of(cx, "hosts.new"), viewport, "the new host button");
+    assert_within_width(bounds_of(cx, "home.local"), viewport, "the local terminal");
     let toolbar = bounds_of(cx, "hosts.toolbar");
     assert!(
         toolbar.top() < viewport.height,
-        "the filters start inside the window: {toolbar:?}"
+        "the toolbar starts inside the window: {toolbar:?}"
     );
-    let title = bounds_of(cx, "header.title");
+    // The list is reached by scrolling the page: at this size it is one column (R8).
+    let row = bounds_of(cx, "hosts.row.0");
     cx.simulate_event(ScrollWheelEvent {
-        position: title.center(),
-        delta: ScrollDelta::Pixels(point(px(0.0), -(toolbar.top() - px(60.0)))),
+        position: toolbar.center(),
+        delta: ScrollDelta::Pixels(point(px(0.0), -(row.top() - px(40.0)).max(px(0.0)))),
         touch_phase: gpui::TouchPhase::Started,
         ..Default::default()
     });
     cx.run_until_parked();
-    assert_fits_inside(
-        bounds_of(cx, "hosts.toolbar"),
-        viewport,
-        "the list's filters after scrolling the page",
+    let row = bounds_of(cx, "hosts.row.0");
+    assert!(
+        row.top() >= px(-0.5) && row.top() < viewport.height,
+        "the first row can be scrolled into the window: {row:?}"
     );
 }
 
@@ -32354,59 +32434,6 @@ async fn the_preview_names_servers_whose_key_differs_and_paths_from_another_plat
         kept.entry("10.0.0.5", 22)
             .map(|entry| entry.fingerprint().to_owned()),
         Some(presented_key(1).fingerprint)
-    );
-}
-
-#[gpui::test]
-async fn a_group_card_in_a_short_window_scrolls_the_page_to_the_narrowed_list(
-    cx: &mut TestAppContext,
-) {
-    let dir = TempDir::new("group-card-scroll");
-    seed(
-        &dir.store(),
-        vec![
-            stored_host("alpha", "10.0.0.1", 22, "root", Some("Prod")),
-            stored_host("beta", "10.0.0.2", 22, "root", Some("Prod")),
-            stored_host("gamma", "10.0.0.3", 22, "root", Some("Stage")),
-        ],
-    );
-    let store = dir.store();
-    let trust = TrustStore::at(dir.path());
-    let mut workspace = Workspace::new();
-    workspace.select(Destination::Hosts);
-    let (view, cx) = cx.add_window_view(move |_window, cx| {
-        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
-    });
-    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
-    cx.simulate_resize(minimum_window());
-    focus_root(&view, cx);
-    cx.dispatch_action(CycleTextSize);
-    cx.dispatch_action(CycleTextSize);
-    cx.run_until_parked();
-    assert_eq!(
-        cx.update(|_window, app| view.read(app).workspace().zoom()),
-        Zoom::Largest
-    );
-    let viewport = cx.update(|window, _app| window.viewport_size());
-    let card = bounds_of(cx, "home.group.0");
-    assert!(
-        card.center().y < viewport.height,
-        "the first group card can be pressed on the first screen: {card:?}"
-    );
-    let before = bounds_of(cx, "hosts.toolbar");
-
-    click(cx, "home.group.0");
-    cx.run_until_parked();
-    let after = bounds_of(cx, "hosts.toolbar");
-    assert!(
-        after.top() < before.top(),
-        "the page moved to the list: {before:?} -> {after:?}"
-    );
-    // The filters are taller than the window at this size; the page brings their
-    // start to the top of what is visible.
-    assert!(
-        after.top() >= px(0.0) && after.top() < viewport.height / 4.0,
-        "the narrowed list starts near the top of the window: {after:?}"
     );
 }
 
@@ -35678,7 +35705,7 @@ async fn a_launch_shows_the_brand_while_the_stores_are_read_then_fades_into_the_
             && cx.debug_bounds("startup.splash.tagline").is_some()
     );
     assert!(
-        cx.debug_bounds("home.quick").is_none() && cx.debug_bounds("topbar").is_none(),
+        cx.debug_bounds("hosts.search").is_none() && cx.debug_bounds("topbar").is_none(),
         "the page is not drawn behind the brand"
     );
     assert_eq!(
@@ -35696,7 +35723,7 @@ async fn a_launch_shows_the_brand_while_the_stores_are_read_then_fades_into_the_
     );
     assert!(cx.debug_bounds("startup.crossfade").is_some());
     assert!(
-        cx.debug_bounds("home.quick").is_some() && cx.debug_bounds("topbar").is_some(),
+        cx.debug_bounds("hosts.search").is_some() && cx.debug_bounds("topbar").is_some(),
         "the page is drawn under the fading brand"
     );
     cx.update(|_window, app| {
@@ -35836,7 +35863,7 @@ async fn reduced_motion_skips_the_brand_and_shows_the_page_once_it_is_read(
         "reduced motion draws no brand"
     );
     assert!(cx.debug_bounds("startup.crossfade").is_none());
-    assert!(cx.debug_bounds("home.quick").is_some());
+    assert!(cx.debug_bounds("hosts.search").is_some());
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().item_count(Destination::Hosts)),
         1

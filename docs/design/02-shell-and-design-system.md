@@ -11,19 +11,19 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 
 ```
 +----------------------------------------------------------------------------------+
-| [◐] [▤ 主机 3] | [● ▤ prod-web ×] [● >_ Bash ×] [+|v]   ……拖动区……   [⌕] [⚙] [_][□][×] |  顶栏 = 标题栏
+| [◐] [▤ 主机 24] | [● ▤ prod-web ×] [● >_ Bash ×] [+|v]   ……拖动区……   [⌕] [⚙] [_][□][×] |  顶栏 = 标题栏
 +----------------------------------------------------------------------------------+
-| 主机 3 [⌕ 搜索已保存的主机，或输入 user@host:port……] [⏚ 快速连接] [>_ 本地终端 ▾] [+ 新建主机] |  标题 + 快速连接栏
-| 最近连接                                                            查看全部        |  卡片带（限高、自身滚动）
-| [P1 prod-web  deploy@10.0.0.12:22 · 2 小时前 ★] [S1 stage-01 …] [L7 lab-07 …]       |
-| 收藏      [E3 edge-03 …] [L7 lab-07 …]                                             |  空的区整区不画
-| 分组      [▣ Prod  3 台 · 1 在线] [▣ Staging  2 台]                                 |
-| 所有主机 [搜索…………] [全部主机|按分组|最近连接] ☆ ≋ 批量任务 ⇩ 导入 SSH 配置       |  工具栏只有一行（☆ = 仅收藏）
-| 分组  + | 全部主机 · 3 台中显示 3 台                                                |
-| 全部 3  | ┌────────────────────────────────────────────────────────────────┐   |  列表在一块面板里
-| Prod 2  | │ P1 prod-web  deploy@10.0.0.12:22   Prod   (⇄ ✎ ⧉ 🗑)  [连接] │   |  工具图标悬停才出现
-| 状态    | └────────────────────────────────────────────────────────────────┘   |
-| 所有/当前已连接/曾经连接过/从未连接                                                  |  状态筛选在侧栏
+| [◫]          | 全部主机 24  [⌕ 搜索已保存的主机，或输入 user@host:port 直接连接   /] [⏷] [⋯] [+ 新建主机] |  工具条（一行，窄窗口换行）
+| ▣ 全部主机 24 |--------------------------------------------------------------------|
+| ☆ 收藏      3 | → 连接到 deploy@192.0.2.24 · 不保存 · 打开登录               [回车] |  搜索读成地址时的第一行
+| ◷ 最近连接  5 | B1 build-01  deploy@192.0.2.11      Prod  昨天  ●  (☆ ✎ ⧉ 🗑 [连接]) |  一行一台（uniform_list）
+| ─────────── | A2 api-02    deploy@192.0.2.24      Prod  2 小时前                  |  工具悬停 / 键盘行才出现
+| 分组       + | …                                                                  |
+| ▾ ▣ Prod   12 |                                                                    |
+|    ▣ Web    3 |                                                                    |
+|   ▣ Staging 4 |                                                                    |
+|              |                                                                    |
+| >_ 本地终端   |                                                                    |  侧栏底部
 +----------------------------------------------------------------------------------+
 终端页（浏览器式标签：当前标签与下方页面连成一片，只有一条底边）：
 | [◐] [▤ 主机 3] ╭● ▣ prod-web ×╮ ● ▣ db … | ‹ ● ▣ api … › [⧉][+|v] ……拖动区…… [⌕] [⚙] [_][□][×] |  头部第一行：标签即身份
@@ -45,6 +45,97 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   左缩进 16pt），窗口打开时用偏好文件里的文字大小（`view::saved_zoom`）计算一次——系统只在建窗时接受这个位置，
   运行中改文字大小要到下次打开窗口才重新居中；`traffic_light_room(metrics)` 预留"缩进 + 三个按钮 52pt +
   一个随缩放的间距"，小字号时第一个标签不会滑到红绿灯下面，大字号时也不再按比例放大空白。Linux 保留系统标题栏。
+- **主机主页 = 侧栏 + 工具条 + 一张列表（ADR-3，`view/home.rs::home_page`）**。取代下文"仪表盘"各版：
+  页面左右两块，右边一块从上到下只有工具条与列表；没有第二个搜索框、卡片带、分段控件与重复计数。
+  - **侧栏**（`home.sidebar`，宽 220；`SURFACE` 底 + 右侧发丝线）：顶部是折叠按钮（`home.sidebar.toggle`，图标 `Sidebar`）；
+    然后是三个"位置"——全部主机（`hosts.view.all`，计数 = 全部记录）、收藏（`hosts.view.favorites`，计数 = 收藏数）、
+    最近连接（`hosts.view.recent`，计数 = 有连接记录的主机数），用 `components::sidebar_item`（选中为 `SURFACE_SELECTED`
+    底 + 主文字色 + 500 字重）；分隔线；"分组"标题与右侧 `+`（`hosts.group.new`，打开创建分组对话框）；分组树
+    （`hosts.groups` 内每项 `hosts.tree.<n>`，按层级缩进 12，有子分组的项前面有展开箭头 `hosts.tree.<n>.toggle`，叶子
+    保留箭头位置以对齐；项本身是 `sidebar_item`：文件夹图标、最后一段名字、命中数）。**右键分组项**打开分组菜单
+    （`hosts.group.menu`：`hosts.group.rename.open` 重命名、`hosts.group.delete.open` 删除，删除仍先选去向）。树太长时
+    在自己的区域里滚动。侧栏底部是**本地终端**（`home.local`），打开与顶栏 ▾ 相同的 Shell 菜单，菜单在条目右侧、
+    底边对齐、向上展开（检测到的 Shell、自定义路径、串口一节与新建串口连接）。
+  - **位置 = 视图 + 筛选**（`hosts::HomeSection`，`HostsPanel::section/set_section`）：全部 = `HostView::All` 无筛选；
+    收藏 = 收藏筛选；最近 = `HostView::Recent`（新到旧，行选择器 `hosts.recent.<n>`）；分组 = 分组筛选（含子分组）。
+    四者互斥，由同一组状态读出，侧栏与列表不会不一致；状态筛选、排序和搜索在切换位置时保留。
+  - **折叠**：按钮把侧栏收成 56 宽的图标栏（`home.sidebar.folded`，`components::sidebar_icon_item`，名字在工具提示里），
+    分组在图标栏上是一个文件夹（`home.sidebar.groups`），点它展开侧栏到分组树。窗口逻辑宽度 < 900（随缩放）时侧栏
+    默认折叠，用户按过按钮后以用户选择为准（`ShelluneView::home_sidebar_folded`）。
+  - **工具条**（`hosts.toolbar`，`components::toolbar`：最小高 44、底部发丝线、可换行）：页标题（`header.title`，当前位置
+    的名字，分组写完整路径；title 字号、最长 240 后省略）与数量（`header.count`，当前列表的条数）；
+    **搜索**（`hosts.search`，`components::search_field` 包住 `TextField::set_bare` 的输入框：放大镜、清除按钮、空且
+    未聚焦时显示 `/` 键帽；聚焦时整框是 Focused 面 + 焦点环）；筛选按钮（`hosts.filter`，图标 `Filter`，有筛选或排序
+    生效时为 accent tint 常亮）打开**筛选菜单**（`hosts.filter.menu`：状态 `hosts.status.any/connected/recent/never` 与排序
+    `hosts.sort.saved/name/recent`，当前项打勾，选中即关闭）；`⋯`（`hosts.more`）打开**更多菜单**（`hosts.more.menu`：
+    `hosts.import` 导入 SSH 配置、`hosts.batch.open.list` 批量任务）；最后是唯一的主按钮"新建主机"（`hosts.new`，紧凑高 28）。
+    状态或排序不是默认值时，列表上方一行写出（`hosts.filters`：`hosts.filter.status`、`hosts.filter.sort` chip 与
+    `hosts.filter.clear`，清除只还原状态与排序，不动当前位置）。
+  - **列表**（`hosts.list.<条数>` 内的 `uniform_list` `hosts.rows`，行高 `list_row_height` 52）：每行是
+    `components::list_row_frame`（平面行；键盘光标所在行为 Selected 面 + 左侧 accent 竖条；批量选中行为 `ACCENT_TINT` 底）：
+    头像（与复选框共用位置，悬停 / 光标 / 已开始多选时换成复选框 `hosts.select.<n>`）、两行文字（名称 + 等宽的
+    `user@host:port`，放不下以省略号收尾；缺私钥的主机名称旁有警示 chip）、右侧元信息（分组标签 `hosts.tag.<n>`、相对时间
+    `hosts.last.<n>`，悬停显示 UTC 时间与连接次数；窗口 < 600 时两者省略）、状态点（本窗口有已连接会话时才画绿色点
+    `hosts.state.<n>`，没有会话不写"离线"，位置保留以对齐），然后是收藏星（已收藏常显）与悬停 / 光标行才出现的工具：
+    编辑、复制（窗口 ≥ 760）、删除、主按钮"连接"（`hosts.connect.<n>`）。端口转发从行上移到右键菜单
+    （`host.menu.forwards`）。**单击选中、双击或 Enter 连接、右键打开记录菜单**。其它协议的记录同一种行
+    （`hosts.connection.<n>`，名字旁写协议标签，无复选框）。
+  - **统一搜索**：输入即过滤（名称、地址、用户、分组，以及主机会拨的 `user@地址:端口`）。文本能读成
+    `user@host[:port]`（`hosts::parse_quick_target`）且列表还有记录时，第一行固定为"连接到 user@host:port · 不保存 ·
+    打开登录"（`hosts.direct`，没有键盘光标时带"回车"键帽）；Enter 或点击它走快速连接表单同一条临时连接路径
+    （登录方式"自动"，不写主机文件，被拒时打开快速连接表单并写明原因），并清空搜索。键盘光标在某行时 Enter 连接该行；
+    既没有地址也没有光标时 Enter 连接第一台匹配的主机（`first_searched_host`）。原来的"快速连接"按钮删除，完整的
+    快速连接表单仍在顶栏 ▾ 菜单（`menu.quick`）与命令面板里。
+  - **空状态**：主机文件里一条记录都没有且没在搜索时，列表位置是欢迎面板（`hosts.empty`，`components::empty_state`：
+    新建主机 `hosts.empty.new`、从 SSH 配置导入 `hosts.import.open`、本地终端 `hosts.empty.local`、从备份恢复
+    `hosts.empty.restore`）。搜索或状态筛选无结果时是 `hosts.nomatch`：说明 + "清除筛选"（`hosts.nomatch.clear`）；搜索
+    读成地址时另给主按钮"连接到 …"（`hosts.nomatch.connect`）。最近为空（`hosts.recent.empty`）、收藏为空
+    （`hosts.favorites.empty`，说明"在主机上点星标"）、分组为空（`hosts.group.empty`）各有一句和回到全部主机的按钮。
+  - **键盘**（`ShelluneView::hosts_key`，页面或搜索框有焦点、没有对话框或菜单时）：`/`（页面焦点时）与 Ctrl/Cmd+F
+    聚焦搜索；↑↓ 移动键盘光标（列表跟随滚动，"连接到 …"行算第 0 行）；Enter 连接；Ctrl/Cmd+N 新建主机；
+    Delete（macOS 的 Backspace）对光标行先问删除确认。Esc 关闭首页菜单。
+  - **矮窗口**（高 < 320，随缩放）整页一列滚动，列表保留两行最小高度；720×480 @ 200% 时侧栏为图标栏、工具条换行，
+    搜索、新建主机与本地终端都在窗口宽度内。
+  - **证据**：`src/app/tests.rs` 的首页测试（`the_home_is_a_sidebar_a_toolbar_and_one_list`、
+    `the_sidebar_places_narrow_the_list_and_name_the_page`、`the_sidebar_folds_to_icons_and_opens_again`、
+    `an_address_in_the_search_puts_connect_to_on_top_and_a_press_dials_it`、
+    `an_address_nobody_saved_is_offered_by_the_empty_list_and_enter_dials_it`、
+    `the_keyboard_finds_moves_opens_makes_and_deletes`、
+    `two_hundred_hosts_draw_only_their_visible_rows_and_answer_a_search_at_once`、
+    `the_filter_menu_narrows_by_status_and_orders_the_list`、`the_more_menu_imports_and_starts_a_batch`、
+    `an_empty_book_is_welcomed_with_four_ways_to_start` 等）；`hosts.rs` 单元测试覆盖位置、排序与按地址搜索。
+    截图场景：`home-hosts`（24 台）、`home-favorites`、`home-direct`、`home-empty`、`home-no-match`、`home-narrow`、
+    `home-collapsed`，深浅、中英各有变体。
+
+  **首页入口新旧对照**（T4）：
+
+  | 入口 | 改版前 | 改版后 |
+  | --- | --- | --- |
+  | 搜索已保存主机 | 标题行快速连接栏 + 列表工具栏第二个搜索框 | 工具条唯一搜索框（`hosts.search`），`/`、Ctrl/Cmd+F |
+  | 直连 `user@host[:port]` | 快速连接栏结果 `home.quick.temporary` | 列表第一行 `hosts.direct` / 无结果时 `hosts.nomatch.connect`，Enter 直连 |
+  | 完整快速连接表单 | 标题行"快速连接"按钮 `welcome.quick` | 顶栏 ▾ 菜单 `menu.quick`、命令面板（首页按钮删除） |
+  | 本地 Shell | 标题行"本地终端 ▾" `home.local`；快速连接栏可搜到 Shell | 侧栏底部"本地终端" `home.local`（同一菜单）；顶栏 ▾、命令面板 |
+  | 最近连接 | 最近连接卡片 `home.recent.*` + 分段"最近连接" | 侧栏"最近连接" `hosts.view.recent` |
+  | 收藏 | 收藏卡片 `home.favorite.*` + 工具栏 ☆ 仅收藏 `hosts.filter.favorites` | 侧栏"收藏" `hosts.view.favorites`；行上星标不变 |
+  | 分组 | 分组卡片 `home.group.*` + 分段"按分组" + 左侧分组列 / 窄窗口选择条 | 侧栏分组树 `hosts.tree.<n>`；行上分组标签 `hosts.tag.<n>` |
+  | 新建 / 重命名 / 删除分组 | 分组列 `+`；列表上方 `hosts.group.rename.open` / `delete.open` 按钮 | 侧栏 `+`；分组项右键菜单 `hosts.group.menu` |
+  | 状态筛选 | 分组列"状态"一节 / 窄窗口分段控件 | 工具条筛选菜单 `hosts.filter.menu`（另加排序） |
+  | 导入 SSH 配置 | 工具栏按钮 `hosts.import` | 工具条 `⋯` 菜单 `hosts.import`；空状态 `hosts.import.open` |
+  | 批量任务 | 工具栏按钮 `hosts.batch.open.list` | 工具条 `⋯` 菜单 `hosts.batch.open.list`；选择条 `hosts.batch.open` 不变 |
+  | 新建主机 | 标题行主按钮 `hosts.new` | 工具条主按钮 `hosts.new`；Ctrl/Cmd+N |
+  | 记录数 | 标题旁 `header.count` + 列表上方"视图 · N / 共 M 台" `hosts.count` | 工具条 `header.count`（当前列表条数），侧栏各位置计数 |
+  | 端口转发（单台） | 行上图标 `hosts.forwards.<n>` | 行右键菜单 `host.menu.forwards` |
+  | 连接状态 | 行内"当前已连接" chip / 记录行 `hosts.connection.open.<n>` | 状态点 `hosts.state.<n>` / `hosts.connection.state.<n>` |
+
+  **选择器变更（T4，供 T9 汇总）**：删除 `home.quick*`、`home.dashboard`、`home.cards`、`home.recent*`、`home.favorite*`、
+  `home.favorites`、`home.group*`、`home.groups`、`home.all`、`welcome.quick`、`hosts.view.groups`、`hosts.count`、
+  `hosts.surface`、`hosts.statuses`、`hosts.tree.all`、`hosts.group.chooser`、`hosts.group.option.<名>`、`hosts.group.actions`、
+  `hosts.filter.favorites(.chip)`、`hosts.filter.group`、`hosts.group.<n>`（列表分组头）、`hosts.forwards.<n>`；改名
+  `hosts.group.tag.<n>` → `hosts.tag.<n>`、`hosts.connection.open.<n>` → `hosts.connection.state.<n>`；新增 `home.sidebar(.folded/.toggle/.groups)`、
+  `hosts.view.favorites`、`hosts.filter(.menu/.status/.sort)`、`hosts.sort.*`、`hosts.more(.menu)`、`hosts.group.menu`、
+  `hosts.direct`、`hosts.nomatch.connect`、`hosts.empty.local`、`hosts.favorites.empty`、`hosts.group.empty`、`hosts.state.<n>`、
+  `hosts.last.<n>`（原有，现仅宽窗口）。`hosts.status.*` 只在筛选菜单打开时存在。
+  以下"仪表盘"各版说明为历史记录，与上文冲突处以上文为准。
 - **主机主页 = 仪表盘（R1，`view/shell.rs::home_page`、`view/home.rs::home_dashboard`）**：从上到下是
   标题行、卡片带、所有主机列表。
   - **标题行**（`home_heading`）：标题 + 记录数（`header.count`）、**快速连接栏**（`home.quick`，全宽 `TextField`，
@@ -401,15 +492,17 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 每帧被要求绘制的行数记录在 `ShelluneView::hosts_rows_drawn`，测试据此证明"只有可见行被实例化"，
 而不是靠读代码下结论。滚动用 `hosts_scroll`（`UniformListScrollHandle`），测试用它把远处的行带进视野。
 
-**过滤与空态。** 过滤条 = 搜索框（名称/地址/用户名/分组）+ 视图切换（全部主机 / 按分组 / 最近连接）+
-☆ 仅收藏（`HostFilter::favorites`，SSH 主机与其它协议记录都适用）+
-状态分段（所有状态 / 当前已连接 / 曾经连接过 / 从未连接）+ 导入按钮，右侧是"视图 · 当前 N / 共 M 台"。
+**过滤与空态。**（T4 起：位置在侧栏，状态与排序在工具条的筛选菜单，见 §1"主机主页"。）列表是平的，
+不再有分组头；分组树只画在侧栏。过滤 = 搜索框（名称/地址/用户名/分组，以及 `user@地址:端口`）+ 侧栏位置
+（全部主机 / 收藏 / 最近连接 / 某个分组）+ 状态（所有状态 / 当前已连接 / 曾经连接过 / 从未连接）+ 排序
+（保存顺序 / 名称 / 最近连接时间，稳定排序）。以下为改版前的写法：过滤条 = 搜索框 + 视图切换 + ☆ 仅收藏 +
+状态分段 + 导入按钮，右侧是"视图 · 当前 N / 共 M 台"。
 分组过滤是一棵子树（`GroupPath::starts_with`），状态过滤只读窗口已有的数据：
 "当前已连接"看本窗口已建立的会话，"曾经连接过 / 从未连接"看主机文件里的重连记录——**任何过滤都不会发起 SSH 请求**。
 有过滤时列表上方列出当前条件（分组 chip、仅收藏 chip、状态 chip）和"清除筛选"；结果为空且是过滤造成的时候写
 `hosts.nomatch` 与"改搜索词或去掉一个筛选"，空书才写首次使用卡片；最近连接视图为空另有说明。
 
-**宽窄两种形状（R8）。** 窗口逻辑宽度 ≥ 900（`GROUP_COLUMN_MIN_WIDTH`）时，左边一列是层级分组树
+**宽窄两种形状（R8）。**（T4 起由侧栏的展开 / 图标栏取代，见 §1"主机主页"；以下为改版前。）窗口逻辑宽度 ≥ 900（`GROUP_COLUMN_MIN_WIDTH`）时，左边一列是层级分组树
 （缩进、展开箭头、命中数量，点标题即把列表收窄到该子树并展开），右边是列表；窄于 900 时该列不画，
 同一批分组变成过滤条里的选择条（"全部主机" + 各顶级分组），判定只有一个谓词 `group_column_fits`。
 分组列第一行是"全部主机"（`hosts.tree.all`，计数为全部主机数，清除分组过滤）；"新建分组"是列标题右侧的 `+`。
@@ -843,7 +936,8 @@ tooltip 这类在窗口渲染之外绘制的部件用 `theme::metrics()` 取得�
 | 时点 | `scale(<数字>)` | `px(<非零数字>)` | 说明 |
 | --- | --- | --- | --- |
 | 迁移前（`d59a63f`，T3 记录） | 280 | 91（另有 316 处 `px(0)`，不计） | ADR-9 的“一半以下”以这一行为准：最终需 `scale` ≤ 140、`px` ≤ 45 |
-| T3 之后（当前基线） | 267 | 82 | 新组件只用 spacing 令牌；状态标记与选中竖条的 1 / 1.5 / 2px 收为 `MARK_CORNER` / `MARK_STROKE` / `MARK_BAR_WIDTH` |
+| T3 之后 | 267 | 82 | 新组件只用 spacing 令牌；状态标记与选中竖条的 1 / 1.5 / 2px 收为 `MARK_CORNER` / `MARK_STROKE` / `MARK_BAR_WIDTH` |
+| T4 之后（当前基线） | 220 | 82 | 首页改为侧栏 + 单列表：卡片带、快速连接栏、分组列与分组头删除；新代码的尺寸都是命名常量（`SIDEBAR_WIDTH` 等）或 spacing 令牌 |
 
 ### 终端内搜索（`crates/terminal` + `src/app/terminal.rs`）
 

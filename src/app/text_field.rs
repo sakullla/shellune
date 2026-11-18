@@ -453,9 +453,10 @@ pub struct TextField {
     browse: Option<Browse>,
     /// A quiet icon before the text, such as the magnifier of a search field.
     leading: Option<Icon>,
-    /// Whether the field is the page's main entry: taller, rounder and resting on the
-    /// page at the low elevation, like the home page's quick-connect bar.
-    prominent: bool,
+    /// Whether the field is drawn without a box of its own, inside a frame the caller
+    /// draws: the home page's search sits in [`crate::app::components::search_field`],
+    /// which owns the edge, the focus ring and the magnifier.
+    bare: bool,
     /// Whether the left button is down after a press in the field: dragging selects.
     selecting: bool,
     /// How far the line is scrolled left so the caret stays in view.
@@ -511,7 +512,7 @@ impl TextField {
             clearable: false,
             browse: None,
             leading: None,
-            prominent: false,
+            bare: false,
             selecting: false,
             scroll: px(0.0),
             menu: None,
@@ -561,14 +562,11 @@ impl TextField {
         cx.notify();
     }
 
-    /// Draws the field as the page's main entry: a taller, rounder box on the surface
-    /// layer at the low elevation, with the same focus ring every field has.
-    ///
-    /// Only the home page's quick-connect bar asks for it; every other field keeps the
-    /// regular form-field look.
-    pub fn set_prominent(&mut self, prominent: bool, cx: &mut Context<Self>) {
-        if self.prominent != prominent {
-            self.prominent = prominent;
+    /// Draws the field without its own box: no edge, no fill, no ring and no leading
+    /// icon, so it can sit inside a frame the caller draws.
+    pub fn set_bare(&mut self, bare: bool, cx: &mut Context<Self>) {
+        if self.bare != bare {
+            self.bare = bare;
             cx.notify();
         }
     }
@@ -1072,77 +1070,51 @@ impl Render for TextField {
         let revealed = self.revealed;
         let clear = self.clearable && !self.model.text().is_empty() && self.marked.is_none();
         let trailing = clear || reveal || self.browse.is_some();
-        let prominent = self.prominent;
-        // The main entry rests on the page at the low elevation; its focus ring is drawn
-        // on top of that rest, so the ring and the lift are both there while it types.
-        let rest = if prominent {
-            theme::Elevation::Raised.shadows()
-        } else {
-            Vec::new()
-        };
-        let inset = if prominent {
-            spacing::SNUG
-        } else {
-            spacing::SNUG - 2.0
-        };
+        let bare = self.bare;
+        let inset = spacing::SNUG - spacing::HALF;
 
         div()
             .id(self.id.clone())
             .relative()
             .flex()
             .items_center()
-            .gap(metrics.scale(if prominent {
-                spacing::TIGHT - 2.0
-            } else {
-                spacing::HAIRLINE
-            }))
+            .gap(metrics.scale(spacing::HAIRLINE))
             .flex_1()
             .min_w_0()
-            .h(if prominent {
-                metrics.scale(40.0)
-            } else {
-                metrics.control_height()
+            .when(bare, |field| field.h_full())
+            .when(!bare, |field| {
+                field
+                    .h(metrics.control_height())
+                    .pl(metrics.scale(inset))
+                    .rounded(px(radius::MEDIUM))
+                    .bg(theme::swatch(palette::CANVAS))
+                    .border_1()
+                    .border_color(if focused {
+                        accent
+                    } else {
+                        theme::swatch(palette::BORDER_STRONG)
+                    })
             })
-            .pl(metrics.scale(inset))
-            .pr(metrics.scale(if trailing { spacing::HAIRLINE } else { inset }))
-            .rounded(px(if prominent {
-                radius::XLARGE
+            .pr(metrics.scale(if trailing || bare {
+                spacing::HAIRLINE
             } else {
-                radius::MEDIUM
+                inset
             }))
-            .bg(theme::swatch(if prominent {
-                palette::SURFACE
-            } else {
-                palette::CANVAS
-            }))
-            .border_1()
-            .border_color(if focused {
-                accent
-            } else {
-                theme::swatch(palette::BORDER_STRONG)
-            })
             // A soft ring outside the border marks the field that has the keyboard,
             // so it reads at a glance without the border alone carrying it.
-            .when(focused, |field| {
-                let mut ring = rest.clone();
-                ring.push(BoxShadow {
+            .when(focused && !bare, |field| {
+                field.shadow(vec![BoxShadow {
                     color: theme::faded(accent, 0.22).into(),
                     offset: point(px(0.0), px(0.0)),
                     blur_radius: px(0.0),
                     spread_radius: px(3.0),
-                });
-                field.shadow(ring)
+                }])
             })
-            .when(!focused && prominent, |field| field.shadow(rest.clone()))
-            .when(!focused, |field| {
+            .when(!focused && !bare, |field| {
                 let hover = theme::swatch(palette::TEXT_MUTED);
                 field.hover(move |style| style.border_color(hover))
             })
-            .text_size(if prominent {
-                metrics.body_size()
-            } else {
-                metrics.label_size()
-            })
+            .text_size(metrics.label_size())
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
             .track_focus(&self.focus)
             .cursor_text()
@@ -1177,14 +1149,10 @@ impl Render for TextField {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key(event, window, cx);
             }))
-            .children(self.leading.map(|icon| {
+            .children(self.leading.filter(|_| !bare).map(|icon| {
                 icons::icon(
                     icon,
-                    if prominent {
-                        metrics.icon_size()
-                    } else {
-                        metrics.small_icon_size()
-                    },
+                    metrics.small_icon_size(),
                     theme::swatch(palette::TEXT_MUTED),
                 )
                 .flex_none()

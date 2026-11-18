@@ -318,6 +318,89 @@ fn saved_hosts() -> Result<Vec<HostConfig>, String> {
     Ok(hosts)
 }
 
+/// The eighteen more hosts the home page's shots list beside the six above: 24 in all,
+/// in nested groups and without one, so the list is longer than a window and the sidebar
+/// has a tree to show (ADR-3).
+const HOME_ROWS: [(&str, &str, &str, Option<&str>); 18] = [
+    ("web-01", "192.0.2.41", "deploy", Some("Prod/Web")),
+    ("web-02", "192.0.2.42", "deploy", Some("Prod/Web")),
+    ("web-03", "192.0.2.43", "deploy", Some("Prod/Web")),
+    ("db-primary", "192.0.2.51", "postgres", Some("Prod/DB")),
+    ("db-replica", "192.0.2.52", "postgres", Some("Prod/DB")),
+    ("cache-01", "192.0.2.61", "ops", Some("Prod")),
+    ("queue-01", "192.0.2.62", "ops", Some("Prod")),
+    ("stage-db", "198.51.100.41", "postgres", Some("Staging")),
+    ("stage-web", "198.51.100.42", "deploy", Some("Staging")),
+    ("ci-runner-01", "198.51.100.61", "ci", Some("CI")),
+    ("ci-runner-02", "198.51.100.62", "ci", Some("CI")),
+    ("ci-cache", "198.51.100.63", "ci", Some("CI")),
+    ("bastion", "203.0.113.5", "jump", None),
+    ("monitoring", "203.0.113.21", "ops", None),
+    ("backup-nas", "203.0.113.30", "backup", None),
+    ("lab-08", "203.0.113.20", "lab", None),
+    ("printer-gw", "203.0.113.40", "admin", None),
+    ("design-ws", "203.0.113.50", "design", None),
+];
+
+/// How many hosts the home page's shots hold.
+const HOME_HOSTS: usize = 24;
+
+/// Builds the 24 hosts of the home page's shots: the six above, then [`HOME_ROWS`].
+fn home_hosts() -> Result<Vec<HostConfig>, String> {
+    let mut hosts = saved_hosts()?;
+    for (number, (name, address, user, group)) in HOME_ROWS.iter().enumerate() {
+        let record = serde_json::json!({
+            "id": format!("00000000-0000-4000-8000-000000000c{number:02}"),
+            "name": name,
+            "address": address,
+            "port": if number % 5 == 3 { 2222 } else { 22 },
+            "user": user,
+            "group": group,
+        });
+        let host: HostConfig = serde_json::from_value(record)
+            .map_err(|error| format!("the host fixture {name} is not a valid record: {error}"))?;
+        hosts.push(host);
+    }
+    Ok(hosts)
+}
+
+/// Writes the 24 hosts with five of them reached before, stamped relative to the moment
+/// the fixture is written, and three of them marked as favourites (ADR-3). Nothing was
+/// dialled: the stamps are written, not earned.
+fn seed_home(root: &Path) -> Result<(), String> {
+    let mut book = shellune_storage::HostBook::new();
+    let hosts = home_hosts()?;
+    for host in &hosts {
+        book.apply(&HostEdit::create(host.clone()))
+            .map_err(|error| format!("the host fixture could not be built: {error}"))?;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("the clock is before 1970: {error}"))?
+        .as_secs();
+    // api-02 two hours ago, build-01 yesterday, stage-01 five days ago, web-01 ten
+    // minutes ago and bastion three weeks ago.
+    for (index, age) in [
+        (1usize, 2 * 3_600u64),
+        (0, 30 * 3_600),
+        (3, 5 * 86_400),
+        (6, 600),
+        (18, 21 * 86_400),
+    ] {
+        book.record_connection(hosts[index].id(), now.saturating_sub(age))
+            .map_err(|error| format!("the history fixture could not be built: {error}"))?;
+    }
+    // edge-03, web-01 and lab-07 are the favourites, in that order.
+    for index in [2usize, 6, 5] {
+        book.set_favorite(hosts[index].id(), true)
+            .map_err(|error| format!("the favourite fixture could not be built: {error}"))?;
+    }
+    HostStore::at(root)
+        .save(&book)
+        .map_err(|error| format!("the host fixture could not be written: {error}"))?;
+    Ok(())
+}
+
 /// Writes the saved hosts as a previous run would have left them.
 fn seed_hosts(root: &Path) -> Result<(), String> {
     let mut book = shellune_storage::HostBook::new();
@@ -329,49 +412,6 @@ fn seed_hosts(root: &Path) -> Result<(), String> {
         .save(&book)
         .map_err(|error| format!("the host fixture could not be written: {error}"))?;
     Ok(())
-}
-
-/// Writes the saved hosts with a connection history, and marks `favorites` of them, so
-/// the home dashboard has recent, favourite and group cards to show (R1).
-///
-/// The history is stamped relative to the moment the fixture is written, so the cards
-/// say "2 h ago" and "yesterday" on every run instead of an age that grows with the
-/// calendar. Nothing was dialled: the stamps are written, not earned.
-fn seed_dashboard_hosts(root: &Path, favorites: usize) -> Result<(), String> {
-    let mut book = shellune_storage::HostBook::new();
-    let hosts = saved_hosts()?;
-    for host in &hosts {
-        book.apply(&HostEdit::create(host.clone()))
-            .map_err(|error| format!("the host fixture could not be built: {error}"))?;
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| format!("the clock is before 1970: {error}"))?
-        .as_secs();
-    // api-02 two hours ago, build-01 yesterday, stage-01 five days ago.
-    for (index, age) in [(1usize, 2 * 3_600u64), (0, 30 * 3_600), (3, 5 * 86_400)] {
-        book.record_connection(hosts[index].id(), now.saturating_sub(age))
-            .map_err(|error| format!("the history fixture could not be built: {error}"))?;
-    }
-    // edge-03 and lab-07 are the favourites, in that order.
-    for index in [2usize, 5].into_iter().take(favorites) {
-        book.set_favorite(hosts[index].id(), true)
-            .map_err(|error| format!("the favourite fixture could not be built: {error}"))?;
-    }
-    HostStore::at(root)
-        .save(&book)
-        .map_err(|error| format!("the host fixture could not be written: {error}"))?;
-    Ok(())
-}
-
-/// The hosts with their connection history and no favourite.
-fn seed_dashboard_recent(root: &Path) -> Result<(), String> {
-    seed_dashboard_hosts(root, 0)
-}
-
-/// The hosts with their connection history and two favourites.
-fn seed_dashboard_favorites(root: &Path) -> Result<(), String> {
-    seed_dashboard_hosts(root, 2)
 }
 
 /// Writes three saved commands, so the manager has rows to show: two one-liners and one
@@ -1063,28 +1103,51 @@ fn show_no_match(
     Ok(())
 }
 
-/// Types a part of two saved names into the home page's quick-connect bar.
-fn show_quick_bar(
+/// Types an address into the home page's search: a saved host answers it, and the
+/// "connect to …" row sits on top of it (ADR-3).
+fn show_direct(
     view: &mut ShelluneView,
     _window: &mut Window,
     cx: &mut Context<ShelluneView>,
 ) -> Result<(), String> {
-    view.type_quick_bar("stage", cx);
+    view.search_hosts("deploy@192.0.2.24", cx);
     Ok(())
 }
 
-/// Where the quick-connect shot has arrived: the bar lists the two staging hosts.
-fn quick_bar_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+/// Where the direct-connection shot has arrived: the search reads as an address.
+fn direct_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
     home_hosts_ready(view, cx)?;
-    let saved = view
-        .quick_results_for_test()
-        .into_iter()
-        .filter(|result| matches!(result, crate::app::view::QuickResult::Saved(_)))
-        .count();
-    if saved != 2 {
-        return Err(format!(
-            "the bar lists {saved} saved host(s) for \"stage\", not the two the fixture holds"
-        ));
+    if crate::app::hosts::parse_quick_target(view.hosts_state().search()).is_none() {
+        return Err("the search does not read as user@host".to_owned());
+    }
+    Ok(())
+}
+
+/// The favourites place of the sidebar (ADR-3).
+fn show_home_favorites(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_home_section(crate::app::hosts::HomeSection::Favorites, cx);
+    Ok(())
+}
+
+/// The sidebar folded to its icons on a wide window (ADR-3).
+fn show_home_folded(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_home_fold(true, cx);
+    Ok(())
+}
+
+/// Where the folded shot has arrived.
+fn home_folded_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    home_hosts_ready(view, cx)?;
+    if !view.home_sidebar_folded() {
+        return Err("the sidebar is not folded".to_owned());
     }
     Ok(())
 }
@@ -1650,30 +1713,33 @@ fn home_empty_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
 
 fn home_hosts_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
     on_page(view, Destination::Hosts, SectionState::Populated)?;
-    let expected = HOST_IDS.len();
     let listed = view.book().hosts().len();
-    if listed != expected {
+    if listed != HOME_HOSTS {
         return Err(format!(
-            "the hosts page lists {listed} host(s), not the {expected} the fixture holds"
+            "the hosts page lists {listed} host(s), not the {HOME_HOSTS} the fixture holds"
         ));
     }
     let recent = view.book().recent_hosts().len();
-    if recent != 3 {
+    if recent != 5 {
         return Err(format!(
-            "the dashboard has {recent} recent connection(s), not the three the fixture wrote"
+            "the book has {recent} recent connection(s), not the five the fixture wrote"
         ));
     }
     Ok(())
 }
 
-/// The dashboard has its favourites as well as its history.
+/// The favourites place is on screen, with the three the fixture marked.
 fn home_favorites_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
     home_hosts_ready(view, cx)?;
     let favorites = view.book().favorite_hosts().len();
-    if favorites != 2 {
+    if favorites != 3 {
         return Err(format!(
-            "the dashboard has {favorites} favourite(s), not the two the fixture marked"
+            "the book has {favorites} favourite(s), not the three the fixture marked"
         ));
+    }
+    let place = view.capture_host_view_id();
+    if place != "hosts.view.favorites" {
+        return Err(format!("the list shows {place}, not the favourites"));
     }
     Ok(())
 }
@@ -2031,17 +2097,23 @@ fn show_scale_hosts(
     _window: &mut Window,
     cx: &mut Context<ShelluneView>,
 ) -> Result<(), String> {
-    view.capture_host_view(crate::app::hosts::HostView::All, cx);
+    view.capture_home_section(crate::app::hosts::HomeSection::All, cx);
     Ok(())
 }
 
-/// The grouped view: the list's headers and the group column beside it (R4, R18).
+/// One group of the sidebar's tree, shown in the list (R4, R18, ADR-3).
 fn show_group_tree(
     view: &mut ShelluneView,
     _window: &mut Window,
     cx: &mut Context<ShelluneView>,
 ) -> Result<(), String> {
-    view.capture_host_view(crate::app::hosts::HostView::Groups, cx);
+    view.capture_home_section(
+        crate::app::hosts::HomeSection::Group(
+            shellune_core::GroupPath::parse("Prod")
+                .map_err(|error| format!("the group fixture is not a path: {error}"))?,
+        ),
+        cx,
+    );
     Ok(())
 }
 
@@ -2407,12 +2479,12 @@ fn many_hosts_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
     Ok(())
 }
 
-/// The grouped view is on screen, with the tree open beside it.
+/// One group is shown, with the tree open in the sidebar.
 fn group_tree_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
     many_hosts_ready(view, _cx)?;
     let view_id = view.capture_host_view_id();
-    if view_id != "hosts.view.groups" {
-        return Err(format!("the list is in {view_id}, not the grouped view"));
+    if view_id != "hosts.view.group" {
+        return Err(format!("the list is in {view_id}, not one group"));
     }
     let groups = view.capture_group_tree_len();
     if groups < 4 {
@@ -2579,10 +2651,11 @@ pub const SCENARIOS: &[Scenario] = &[
         title: "首页 · 没有保存的主机",
         category: Category::Home,
         fixture: "an empty data directory",
-        evidence: "shows the empty home page: the quick-connect bar and the welcome card, with no \
-                   card band; says nothing about a host list with items",
+        evidence: "shows the empty home page: the sidebar, the toolbar with its one search and the \
+                   welcome in the list's place with its four ways to start; says nothing about a \
+                   host list with items",
         quick: false,
-        variants: &[Variant::dark().smallest()],
+        variants: &[Variant::dark().smallest(), Variant::light().chinese()],
         start: || page(Destination::Hosts),
         prepare: nothing,
         install: no_state,
@@ -2590,73 +2663,94 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         id: "home-hosts",
-        title: "首页 · 仪表盘：快速连接、最近连接与分组",
+        title: "首页 · 侧栏、工具条与 24 台主机的列表",
         category: Category::Home,
-        fixture: "six saved hosts in two groups and one without, three of them with a connection \
-                  history stamped relative to the run, seeded on disk before the view starts",
-        evidence: "shows the quick-connect bar, the recent and group cards and the full list this \
-                   build draws; the history was written, not earned, so no host was ever \
-                   connected and the online counts are zero",
+        fixture: "24 saved hosts in nested groups and without one, five of them with a connection \
+                  history stamped relative to the run and three marked as favourites, seeded on \
+                  disk before the view starts",
+        evidence: "shows the sidebar with its places and the group tree, the toolbar with the \
+                   title, count, search, filter, more and new host, and the rows with avatar, \
+                   address, group tag, time and state; the history was written, not earned, so \
+                   no host was ever connected",
         quick: true,
         variants: &[
             Variant::dark().chinese(),
-            Variant::dark().comfortable(),
+            Variant::light().comfortable(),
             Variant::dark().smallest(),
         ],
         start: || page(Destination::Hosts),
-        prepare: seed_dashboard_recent,
+        prepare: seed_home,
         install: no_state,
         ready: home_hosts_ready,
     },
     Scenario {
         id: "home-favorites",
-        title: "首页 · 仪表盘：收藏卡片与行上的星标",
+        title: "首页 · 侧栏的收藏",
         category: Category::Home,
-        fixture: "the same six hosts and history, with edge-03 and lab-07 marked as favourites in \
-                  hosts.json",
-        evidence: "shows the favourite cards beside the recent and group cards and the filled star \
-                   on the favourite rows; marking and clearing a favourite is proved by the GPUI \
+        fixture: "the same 24 hosts and history, with edge-03, web-01 and lab-07 marked as \
+                  favourites in hosts.json and the favourites place chosen",
+        evidence: "shows the favourites place chosen in the sidebar, its title and count, and the \
+                   filled star on each row; marking and clearing a favourite is proved by the GPUI \
                    tests, not by this frame",
         quick: true,
         variants: &[Variant::dark().chinese(), Variant::light().comfortable()],
         start: || page(Destination::Hosts),
-        prepare: seed_dashboard_favorites,
-        install: no_state,
+        prepare: seed_home,
+        install: show_home_favorites,
         ready: home_favorites_ready,
     },
     Scenario {
-        id: "home-quick",
-        title: "首页 · 快速连接栏的结果",
+        id: "home-direct",
+        title: "首页 · 搜索里输入 user@host",
         category: Category::Home,
-        fixture: "the same six hosts and history, with stage typed into the quick-connect bar",
-        evidence: "shows the results that take the cards' place while a phrase is typed and the \
-                   one Enter opens; nothing was opened and no host was dialled",
+        fixture: "the same 24 hosts, with deploy@192.0.2.24 typed into the search; api-02 is saved \
+                  at that address",
+        evidence: "shows the \"connect to …\" row on top with the Enter key cap and the saved host \
+                   the address also finds under it; nothing was opened and no host was dialled",
         quick: false,
-        variants: &[Variant::dark().chinese().smallest()],
+        variants: &[
+            Variant::dark().chinese().smallest(),
+            Variant::light().comfortable(),
+        ],
         start: || page(Destination::Hosts),
-        prepare: seed_dashboard_recent,
-        install: show_quick_bar,
-        ready: quick_bar_ready,
+        prepare: seed_home,
+        install: show_direct,
+        ready: direct_ready,
     },
     Scenario {
         id: "home-narrow",
-        title: "首页 · 窄窗口：卡片单列、数量减半",
+        title: "首页 · 窄窗口：侧栏收成图标",
         category: Category::Home,
-        fixture: "the same six hosts, history and two favourites, drawn narrower than the 900 \
-                  threshold where the cards stack in one column",
-        evidence: "shows the stacked cards, their view-all entries and that the bar and the list's \
-                   filters stay in the window; the 720x480 shot at 200% shows where the page has \
-                   to scroll to reach the rest",
+        fixture: "the same 24 hosts, drawn narrower than the 900 threshold where the sidebar \
+                  starts folded",
+        evidence: "the 860x640 and 720x480 shots show the sidebar as a rail of icons, the toolbar \
+                   wrapping its controls and the rows dropping their tags and times, and at 200% \
+                   the row tools giving way before the names; the 1120x720 shots are the wide page \
+                   beside them, sidebar open",
         quick: false,
         variants: &[
             Variant::dark().sized(860.0, 640.0),
-            Variant::dark().sized(860.0, 640.0).chinese(),
+            Variant::light().sized(860.0, 640.0).chinese(),
             Variant::dark().smallest().largest(),
         ],
         start: || page(Destination::Hosts),
-        prepare: seed_dashboard_favorites,
+        prepare: seed_home,
         install: no_state,
-        ready: home_favorites_ready,
+        ready: home_hosts_ready,
+    },
+    Scenario {
+        id: "home-collapsed",
+        title: "首页 · 宽窗口里收起的侧栏",
+        category: Category::Home,
+        fixture: "the same 24 hosts on a wide window, with the sidebar folded by its button",
+        evidence: "shows the 56-wide rail of icons with the chosen place marked and the list taking \
+                   the room the words gave up; the rail's tooltips are not part of the frame",
+        quick: false,
+        variants: &[Variant::dark().comfortable(), Variant::light().chinese()],
+        start: || page(Destination::Hosts),
+        prepare: seed_home,
+        install: show_home_folded,
+        ready: home_folded_ready,
     },
     Scenario {
         id: "hosts-5000",
@@ -2680,11 +2774,12 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         id: "hosts-groups",
-        title: "主机 · 层级分组树与分组行",
+        title: "主机 · 侧栏分组树与一个分组",
         category: Category::Home,
         fixture: "the same five thousand hosts, grouped Prod/Web, Prod/DB, Prod/Edge and \
-                  Staging in the grouped view",
-        evidence: "shows the group column and the group headers of the list; opening and \
+                  Staging, with the Prod group chosen in the sidebar",
+        evidence: "shows the nested group tree in the sidebar with Prod chosen, the page titled \
+                   by the group and the flat list of its hosts with their group tags; opening and \
                    closing a group is not part of the shot, and no group was created or moved by it",
         quick: true,
         variants: &[
@@ -2806,14 +2901,18 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         id: "home-no-match",
-        title: "首页 · 零结果筛选与清除",
+        title: "首页 · 搜索无结果与清除",
         category: Category::Home,
-        fixture: "six saved hosts with the phrase no-such-host typed into the search field",
+        fixture: "the 24 saved hosts with the phrase no-such-host typed into the search field",
         evidence: "shows the reason, the current condition and the press that drops it over a real narrowed list; proves nothing about a search across a live server list",
         quick: true,
-        variants: &[Variant::dark().smallest(), Variant::dark().chinese()],
+        variants: &[
+            Variant::dark().smallest(),
+            Variant::dark().chinese(),
+            Variant::light().comfortable(),
+        ],
         start: || page(Destination::Hosts),
-        prepare: seed_hosts,
+        prepare: seed_home,
         install: show_no_match,
         ready: no_match_ready,
     },

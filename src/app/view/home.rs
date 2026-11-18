@@ -1,17 +1,18 @@
-//! The servers region of the home page: the filters, the group column and the list.
+//! The hosts home (ADR-3): a sidebar of places, one toolbar with the page's only search,
+//! and one virtualized list.
 //!
-//! The page is drawn from one row model (crate::app::hosts::HostList): the group headers
-//! and the hosts the filters keep, flattened into rows that name a HostId or a GroupPath.
-//! The rows are drawn through gpui's uniform_list, which asks for the slice it is about
-//! to show instead of the whole list, so five thousand saved hosts cost the elements of
-//! the visible screen and nothing more (R18, ADR-8).
+//! The page is drawn from one row model (crate::app::hosts::HostList): the hosts and the
+//! other connections the place, the search and the filters keep, flattened into rows that
+//! name a HostId. The rows are drawn through gpui's uniform_list, which asks for the slice
+//! it is about to show instead of the whole list, so five thousand saved hosts cost the
+//! elements of the visible screen and nothing more (R18, ADR-8).
 //!
-//! Three properties hold at both window widths:
+//! Three properties hold at every window width:
 //!
-//! * a row is identified by its host or its group, never by its position, so a search, a
-//!   collapse or a reload cannot move a selection onto another host;
-//! * the wide window adds a group column and the narrow one folds the same groups into a
-//!   filter control, but both draw the same rows;
+//! * a row is identified by its host, never by its position, so a search, a sort or a
+//!   reload cannot move a selection onto another host;
+//! * there is one search on the page. It filters the list as it is typed, and text that
+//!   reads as `user@host[:port]` puts a "connect to …" row on top that Enter dials;
 //! * nothing here asks a server anything. The connection state the rows show and the
 //!   status filter narrows by are read from the sessions this window already has and the
 //!   recent-connection log the host file carries.
@@ -20,90 +21,104 @@ use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, Div, FontWeight, IntoElement, SharedString, Stateful, WeakEntity, div, px,
-    uniform_list,
+    AnyElement, Context, Div, IntoElement, Pixels, Point, SharedString, Stateful, WeakEntity,
+    Window, div, px, uniform_list,
 };
 use shellune_core::{GroupPath, HostId, SessionKind, SessionState};
 
 use super::shell::ModalContent;
-use crate::app::components::Variant;
+use crate::app::components::{self, ControlState, Variant};
 use crate::app::copy::{self, Strings, UxStrings};
 use crate::app::hosts::{
-    GroupAction, HostGroupRow, HostList, HostListRow, HostStatusFilter, SelectionScope, format_unix,
+    GroupAction, HomeSection, HostGroupRow, HostList, HostListRow, HostSort, HostStatusFilter,
+    HostView, QuickTarget, SelectionScope, format_unix, parse_quick_target,
 };
 use crate::app::icons::{self, Icon};
-use crate::app::theme::{self, Elevated, Elevation, Metrics, Tone, palette, spacing};
+use crate::app::nav::Destination;
+use crate::app::theme::{self, Metrics, Tone, palette, radius, spacing};
 use crate::app::view::ShelluneView;
-use crate::app::{components, theme::radius};
+use crate::app::workspace::SectionState;
 
-/// The window width at which the group tree gets a column of its own.
+/// How wide the sidebar is when it shows its words, before zoom.
+pub(crate) const SIDEBAR_WIDTH: f32 = 220.0;
+
+/// How wide the sidebar is when it is folded to its icons, before zoom.
+pub(crate) const SIDEBAR_FOLDED_WIDTH: f32 = 56.0;
+
+/// The window width below which the sidebar starts folded.
 ///
-/// Narrower than this, the column would take more room than the hosts it navigates; the
-/// groups then become the filter control above the list, which reaches the same hosts
-/// with one press (R8).
-const GROUP_COLUMN_MIN_WIDTH: f32 = 900.0;
+/// Narrower than this the words would take more room than the hosts they navigate; the
+/// icons reach the same places with one press, and the fold button opens the words again.
+const SIDEBAR_FOLD_BELOW: f32 = 900.0;
 
-/// How wide the group column is when it is drawn.
-const GROUP_COLUMN_WIDTH: f32 = 208.0;
+/// How far one level of the group tree is indented, before zoom.
+const GROUP_INDENT: f32 = 12.0;
 
-/// The narrowest a dashboard card is drawn on a wide window, before zoom.
-const HOME_CARD_MIN_WIDTH: f32 = 200.0;
+/// The edge of a group's open/close chevron, before zoom.
+const CHEVRON_SIZE: f32 = 18.0;
 
-/// The most cards one dashboard section shows on a wide window.
-const HOME_CARDS_WIDE: usize = 4;
+/// The window height below which the page scrolls as one column, before zoom.
+const SHORT_HEIGHT: f32 = 320.0;
 
-/// The cards one section shows on a narrow window: half as many, stacked (R1, R8).
-const HOME_CARDS_NARROW: usize = 2;
+/// Below this width a row leaves out its duplicate tool, before zoom.
+const ROW_DUPLICATE_MIN_WIDTH: f32 = 760.0;
 
-/// What a section's "view all" does.
-type SectionAction = Box<dyn Fn(&mut ShelluneView, &mut Context<ShelluneView>) + 'static>;
+/// Below this width a row leaves out its group tag and its time, before zoom.
+const ROW_META_MIN_WIDTH: f32 = 600.0;
 
-/// One saved record as a dashboard card shows it.
-struct CardRecord {
-    /// The selector prefix of the section the card is in.
-    selector: &'static str,
-    /// The card's number in its section.
-    number: usize,
-    id: HostId,
-    name: String,
-    /// What a connection would reach, in full: the card's tooltip says it.
-    target: String,
-    /// Whether the record is an SSH host, whose default port the card leaves out.
-    ssh: bool,
-    /// When it was last reached, or which protocol it speaks.
-    meta: Option<String>,
-    /// Whether it is marked as a favourite.
-    favorite: bool,
+/// The least room a row keeps for its name and address before its tools give way.
+const ROW_TEXT_MIN_WIDTH: f32 = 96.0;
+
+/// The narrowest the search is drawn, before zoom.
+const SEARCH_MIN_WIDTH: f32 = 160.0;
+
+/// The widest the page title is drawn: a long group name gives way to the search.
+const TITLE_MAX_WIDTH: f32 = 240.0;
+
+/// How wide the toolbar's menus are, before zoom.
+const MENU_WIDTH: f32 = 232.0;
+
+/// A menu of the home page: the toolbar's two and a group's own.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum HomeMenu {
+    /// The status filter and the sort, under the toolbar's funnel.
+    Filter,
+    /// Importing and batch tasks, under the toolbar's "⋯".
+    More,
+    /// Renaming or deleting one group, where the sidebar row was right-pressed.
+    Group(GroupPath, Point<Pixels>),
 }
 
 /// One row of the list, as the window draws it.
 enum SnapshotRow {
-    /// A group header.
-    Group {
-        /// The header's number among the headers of this list, for its selector.
-        number: usize,
-        /// The group itself.
-        row: HostGroupRow,
-    },
+    /// The unsaved `user@host[:port]` the search reads as an address.
+    Direct(DirectRowView),
     /// A saved host.
     Host(HostRowView),
     /// A saved connection of another protocol.
     Connection(ConnectionRowView),
 }
 
+/// The "connect to …" row on top of a search that reads as an address.
+struct DirectRowView {
+    /// "Connect to user@host:port".
+    title: SharedString,
+    /// That nothing is saved.
+    hint: SharedString,
+    /// Whether Enter in the search opens it: no row has the keyboard cursor.
+    enter: bool,
+}
+
 /// One connection of another protocol, with what its row shows (R2, R18).
 ///
 /// It has no checkbox: a selection is a batch or group-move target, and both are SSH
-/// operations, so a desktop or serial record is never silently pulled into one. Its
-/// main action is the same as a host row's - the labelled connect button at the end,
-/// with the row's own double press meaning the same - and the record's own protocol
-/// decides what pressing it starts (R2).
+/// operations, so a desktop or serial record is never silently pulled into one.
 struct ConnectionRowView {
     id: HostId,
     /// The row's number among the connection rows, for its selector.
     number: usize,
     name: SharedString,
-    /// The protocol, as the chip in front of the target says it.
+    /// The protocol, as the tag beside the name says it.
     protocol: SharedString,
     target: SharedString,
     group: Option<SharedString>,
@@ -129,21 +144,20 @@ struct HostRowView {
     name: SharedString,
     /// What a connection would dial.
     target: SharedString,
-    /// The group the host is in, when it is in one.
+    /// The group the host is in, when it is in one and the row has room for it.
     group: Option<SharedString>,
     /// Whether this window already has a session to it.
     open: bool,
-    /// When the book last recorded a connection to it, said relatively ("3 hours
-    /// ago · 12 connections"), when it ever did.
+    /// When the book last recorded a connection to it, said relatively ("3 hours ago"),
+    /// when it ever did and the row has room for it.
     last: Option<SharedString>,
-    /// The exact stamp of that connection, for the hover.
+    /// The exact stamp of that connection and how many there were, for the hover.
     last_exact: Option<SharedString>,
     /// Whether the user picked it.
     selected: bool,
     /// Whether the keyboard cursor is on this row.
     cursor: bool,
-    /// Whether the viewport is wide enough to show the inline duplicate icon alongside
-    /// the forward, edit and delete icons without crowding narrow zoomed windows.
+    /// Whether the row has room for the duplicate tool beside edit and delete.
     show_duplicate: bool,
     /// Whether any host is picked, which keeps every checkbox in view: once a
     /// selection has started, picking the next host must not need a hover first.
@@ -173,8 +187,7 @@ impl ShelluneView {
     ///
     /// The same rule as a host row's: the state is read from the sessions this window
     /// already holds, never from the saved record, so a connection that was saved and
-    /// never started is not drawn as online. A record with no running session says
-    /// nothing rather than saying "not connected", because idle is not a state it has.
+    /// never started is not drawn as online.
     pub(super) fn connection_is_open(&self, id: HostId) -> bool {
         self.workspace.sessions().items().iter().any(|session| {
             matches!(
@@ -186,230 +199,942 @@ impl ShelluneView {
     }
 
     // -----------------------------------------------------------------------
-    // The list
+    // The places, the search and the menus
     // -----------------------------------------------------------------------
 
-    /// The servers section: the filters, the selection strip and the list itself.
-    pub(super) fn hosts_management(&self, cx: &mut Context<Self>) -> Div {
+    /// Whether the sidebar is folded to its icons: what the user chose last, or, until
+    /// they chose, whether the window is narrow.
+    #[must_use]
+    pub fn home_sidebar_folded(&self) -> bool {
+        self.home_sidebar_fold
+            .unwrap_or_else(|| self.viewport_width < self.metrics().scale(SIDEBAR_FOLD_BELOW))
+    }
+
+    /// Folds the sidebar to its icons, or opens its words again.
+    pub(super) fn toggle_home_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.home_sidebar_fold = Some(!self.home_sidebar_folded());
+        cx.notify();
+    }
+
+    /// Shows one place of the sidebar: every record, the favourites, the recent hosts or
+    /// one group. The list starts again from its top and the keyboard cursor is dropped,
+    /// since the row it was on may not be in the new place.
+    pub fn show_home_section(&mut self, section: HomeSection, cx: &mut Context<Self>) {
+        self.hosts.set_section(&section);
+        if let HomeSection::Group(path) = &section {
+            self.hosts.set_expanded(path, true);
+        }
+        self.hosts_cursor = None;
+        self.home_menu = None;
+        self.hosts_scroll
+            .scroll_to_item(0, gpui::ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// The address the search reads as, when it reads as one (`user@host[:port]`).
+    pub(super) fn home_direct_target(&self) -> Option<QuickTarget> {
+        parse_quick_target(self.hosts.search())
+    }
+
+    /// Whether the list draws the "connect to …" row on top of its records: the search
+    /// reads as an address and something else is listed under it. With nothing listed,
+    /// the empty state offers the same connection as its action instead.
+    pub(super) fn home_direct_row(&self, list: &HostList) -> Option<QuickTarget> {
+        self.home_direct_target().filter(|_| !list.is_empty())
+    }
+
+    /// Dials the address the search reads as, without saving it (ADR-3).
+    ///
+    /// The search is emptied first, so the list is whole again when the page comes back.
+    /// Enter is handled inside the field, which empties its own text when told the press
+    /// was used, so `from_field` leaves the field alone; a press on a row empties it
+    /// here. Returns whether there was an address to dial.
+    pub(super) fn connect_home_direct(
+        &mut self,
+        from_field: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(target) = self.home_direct_target() else {
+            return false;
+        };
+        if !from_field {
+            self.hosts_search
+                .update(cx, |field, cx| field.set_text(String::new(), cx));
+        }
+        self.hosts.set_search(String::new());
+        self.hosts_cursor = None;
+        self.connect_quick_target(&target, window, cx);
+        cx.notify();
+        true
+    }
+
+    /// Gives the keyboard to the page's search, with what it holds kept.
+    pub(super) fn focus_hosts_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.hosts_search.read(cx).focus_handle().clone();
+        window.focus(&handle);
+        cx.notify();
+    }
+
+    /// Opens one of the home page's menus, or closes it when it is the one open.
+    pub(super) fn toggle_home_menu(&mut self, menu: HomeMenu, cx: &mut Context<Self>) {
+        let same = matches!(
+            (&self.home_menu, &menu),
+            (Some(HomeMenu::Filter), HomeMenu::Filter) | (Some(HomeMenu::More), HomeMenu::More)
+        );
+        self.shell_menu_open = false;
+        self.host_menu = None;
+        self.home_menu = if same { None } else { Some(menu) };
+        cx.notify();
+    }
+
+    /// Closes the connection form a test opened from the list, as its own close does.
+    #[cfg(test)]
+    pub fn hide_connection_for_test(&mut self, cx: &mut Context<Self>) {
+        self.hide_connection(cx);
+    }
+
+    /// Whether one of the home page's menus is open.
+    #[cfg(test)]
+    #[must_use]
+    pub fn home_menu_open(&self) -> bool {
+        self.home_menu.is_some()
+    }
+
+    /// Closes the home page's menu, when one is open.
+    pub(super) fn close_home_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.home_menu.take().is_some() {
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The title of the page: the name of the place the list shows.
+    fn home_title(&self) -> String {
+        let strings = self.strings();
+        match self.hosts.section() {
+            HomeSection::All => strings.hosts_view_all.to_owned(),
+            HomeSection::Favorites => copy::ux().home_favorites_section.to_owned(),
+            HomeSection::Recent => strings.hosts_view_recent.to_owned(),
+            HomeSection::Group(path) => path.to_canonical(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The page
+    // -----------------------------------------------------------------------
+
+    /// The home page (ADR-3): the sidebar of places on the left, and the toolbar with the
+    /// one search over the one list on the right.
+    ///
+    /// A host file that is still being read or could not be read is a state card with
+    /// its reason and a retry, because "no hosts" and "the file is broken" are different
+    /// answers; every other state is the sidebar and the list, a first run included,
+    /// whose list is the welcome.
+    pub(super) fn home_page(&self, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics();
+        let state = self.workspace.state(Destination::Hosts);
+        // The page holds the keyboard of whichever destination shows it, so the
+        // shortcuts keep working after a click on the page or a page switch.
+        let page = div()
+            .id("content.scroll")
+            .debug_selector(|| "content".to_owned())
+            .track_focus(self.destination_focus(self.workspace.destination()))
+            .flex()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .bg(theme::swatch(super::PAGE_FLOOR));
+        if matches!(state, SectionState::Loading | SectionState::Failed) {
+            let strings = self.strings();
+            let mut card = self.section_card(Destination::Hosts, state);
+            if state == SectionState::Failed {
+                card = card.child(self.text_button(
+                    SharedString::from("hosts.retry"),
+                    strings.hosts_retry,
+                    Variant::Primary,
+                    cx,
+                    |view, cx| view.reload_hosts(cx),
+                ));
+            }
+            return page.flex_col().overflow_y_scroll().child(
+                div()
+                    .debug_selector(|| "home".to_owned())
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .gap(metrics.scale(spacing::SNUG))
+                    .p(metrics.scale(spacing::LOOSE))
+                    .children(
+                        self.local_error
+                            .as_ref()
+                            .map(|reason| self.notice_line(reason.clone(), Tone::Danger)),
+                    )
+                    .child(card),
+            );
+        }
         let list = self
             .hosts
             .list(&self.book, &self.groups, &|id| self.host_is_open(id));
-        let short = self.viewport_height < metrics.scale(320.0);
-        let mut column = div()
+        page.flex_row()
+            .child(self.home_sidebar(&list, cx))
+            .child(self.home_main(&list, window, cx))
+    }
+
+    /// The sidebar: every record, the favourites, the recent hosts, the groups, and the
+    /// local terminal at its foot. Folded, it is a rail of the same places as icons.
+    fn home_sidebar(&self, list: &HostList, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let ux = copy::ux();
+        let folded = self.home_sidebar_folded();
+        let section = self.hosts.section();
+        let width = metrics.scale(if folded {
+            SIDEBAR_FOLDED_WIDTH
+        } else {
+            SIDEBAR_WIDTH
+        });
+
+        let toggle = components::icon_only_button(Icon::Sidebar, metrics)
+            .id("home.sidebar.toggle")
+            .debug_selector(|| "home.sidebar.toggle".to_owned())
+            .tooltip(components::tooltip(if folded {
+                ux.home_sidebar_expand
+            } else {
+                ux.home_sidebar_collapse
+            }))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.toggle_home_sidebar(cx);
+            }));
+
+        let mut bar = div()
+            .debug_selector(move || {
+                if folded {
+                    "home.sidebar.folded".to_owned()
+                } else {
+                    "home.sidebar".to_owned()
+                }
+            })
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(width)
+            .min_h_0()
+            .gap(metrics.scale(spacing::HALF))
+            .p(metrics.scale(spacing::TIGHT))
+            .bg(theme::swatch(palette::SURFACE))
+            .border_r_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .when(folded, |bar| bar.items_center())
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .w_full()
+                    .when(folded, |row| row.justify_center())
+                    .when(!folded, |row| row.justify_end())
+                    .pb(metrics.scale(spacing::HAIRLINE))
+                    .child(toggle),
+            );
+
+        let places = [
+            (
+                HomeSection::All,
+                Icon::Server,
+                strings.hosts_view_all,
+                list.total(),
+            ),
+            (
+                HomeSection::Favorites,
+                Icon::Star,
+                ux.home_favorites_section,
+                self.book.favorite_hosts().len(),
+            ),
+            (
+                HomeSection::Recent,
+                Icon::Clock,
+                strings.hosts_view_recent,
+                self.book.recent_hosts().len(),
+            ),
+        ];
+        for (place, icon, label, count) in places {
+            let chosen = section == place;
+            let selector = place.debug_selector();
+            let item = if folded {
+                components::sidebar_icon_item(icon, chosen, metrics)
+            } else {
+                components::sidebar_item(icon, label, Some(count), chosen, metrics)
+            };
+            bar = bar.child(
+                item.id(selector)
+                    .debug_selector(move || selector.to_owned())
+                    .when(folded, |item| item.tooltip(components::tooltip(label)))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.show_home_section(place.clone(), cx);
+                    })),
+            );
+        }
+
+        bar = bar.child(
+            div()
+                .flex_none()
+                .w_full()
+                .my(metrics.scale(spacing::HAIRLINE))
+                .border_t_1()
+                .border_color(theme::swatch(palette::BORDER)),
+        );
+
+        if folded {
+            // The groups are one folder on the rail: pressing it opens the words, where
+            // the tree is, rather than squeezing a tree into the width of an icon.
+            let chosen = matches!(section, HomeSection::Group(_));
+            bar = bar.child(
+                components::sidebar_icon_item(Icon::Folder, chosen, metrics)
+                    .id("home.sidebar.groups")
+                    .debug_selector(|| "home.sidebar.groups".to_owned())
+                    .tooltip(components::tooltip(ux.hosts_groups_title))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.home_sidebar_fold = Some(false);
+                        cx.notify();
+                    })),
+            );
+        } else {
+            bar = bar.child(self.home_group_tree(&section, cx));
+        }
+
+        // The local terminal sits at the sidebar's foot: it is this computer, not a
+        // place of the list (ADR-3).
+        let local_open = self.shell_menu_open && self.shell_menu_home;
+        let anchor = self.home_local_anchor.clone();
+        let local = if folded {
+            components::sidebar_icon_item(Icon::Terminal, local_open, metrics)
+        } else {
+            components::sidebar_item(
+                Icon::Terminal,
+                ux.home_local_button,
+                None,
+                local_open,
+                metrics,
+            )
+        };
+        bar.child(div().flex_1().min_h_0()).child(
+            div()
+                .relative()
+                .flex()
+                .flex_none()
+                .w_full()
+                .when(folded, |slot| slot.justify_center())
+                .child(
+                    local
+                        .id("home.local")
+                        .debug_selector(|| "home.local".to_owned())
+                        .when(!local_open, |item| {
+                            item.tooltip(components::tooltip(if folded {
+                                ux.home_local_button
+                            } else {
+                                ux.home_local_hint
+                            }))
+                        })
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.home_menu = None;
+                            this.toggle_home_local_menu(cx);
+                        })),
+                )
+                // Records where the entry is drawn, for the menu that opens beside it.
+                .child(
+                    gpui::canvas(
+                        move |bounds, _window, _cx| anchor.set(bounds),
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0(),
+                ),
+        )
+    }
+
+    /// The groups of the sidebar: the heading with "+", and the tree under it, each group
+    /// a place to show with its count (R18, ADR-3).
+    fn home_group_tree(&self, section: &HomeSection, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let heading = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_between()
+            .w_full()
+            .pl(metrics.scale(spacing::TIGHT))
+            .child(components::section_label(ux.hosts_groups_title, metrics))
+            .child(
+                components::icon_only_button(Icon::Plus, metrics)
+                    .id("hosts.group.new")
+                    .debug_selector(|| "hosts.group.new".to_owned())
+                    .tooltip(components::tooltip(ux.hosts_group_new))
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.home_menu = None;
+                        this.open_group_dialog(GroupAction::Create, window, cx);
+                    })),
+            );
+
+        let mut rows = div()
+            .id("hosts.groups.scroll")
+            .debug_selector(|| "hosts.groups".to_owned())
+            .flex()
+            .flex_col()
+            .flex_shrink()
+            .min_h_0()
+            .w_full()
+            .gap(metrics.scale(spacing::HALF))
+            .overflow_y_scroll();
+        // A row of the tree is a group to show. The hosts in no group are not one: every
+        // record reaches them, and their rows say they have no group.
+        let tree = self.group_tree_rows();
+        let groups: Vec<(usize, &HostGroupRow)> = tree
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| group.path.is_some())
+            .collect();
+        for (position, (number, group)) in groups.iter().enumerate() {
+            let Some(path) = &group.path else {
+                continue;
+            };
+            let branch = groups
+                .get(position + 1)
+                .is_some_and(|(_, next)| next.depth > group.depth);
+            rows = rows.child(self.group_tree_row(group, path, *number, branch, section, cx));
+        }
+        // The tree follows the search, so an empty tree under a search only means the
+        // search hid the groups. The hint to make a group is for a book that has none.
+        let searching = !self.hosts.search().trim().is_empty()
+            || self.hosts.filter().status() != HostStatusFilter::Any;
+        if groups.is_empty() && !searching {
+            rows = rows.child(
+                div()
+                    .px(metrics.scale(spacing::TIGHT))
+                    .py(metrics.scale(spacing::HAIRLINE))
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "hosts.groups.empty".to_owned())
+                    .child(ux.hosts_group_empty),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .flex_shrink()
+            .min_h_0()
+            .w_full()
+            .gap(metrics.scale(spacing::HALF))
+            .child(heading)
+            .child(rows)
+    }
+
+    /// The group tree the sidebar reads.
+    fn group_tree_rows(&self) -> Vec<HostGroupRow> {
+        self.hosts
+            .group_tree(&self.book, &self.groups, &|id| self.host_is_open(id))
+    }
+
+    /// One group of the sidebar: its chevron, its name and how many records it holds. A
+    /// press shows it; a right press offers to rename or delete it.
+    ///
+    /// Only a branch has a chevron; a leaf keeps the chevron's room so names still line
+    /// up, but offers nothing to open.
+    fn group_tree_row(
+        &self,
+        group: &HostGroupRow,
+        path: &GroupPath,
+        number: usize,
+        branch: bool,
+        section: &HomeSection,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let path = path.clone();
+        let chosen = matches!(section, HomeSection::Group(shown) if *shown == path);
+        let label = path.segments().last().cloned().unwrap_or_default();
+        let chevron = if group.expanded {
+            Icon::ChevronDown
+        } else {
+            Icon::ChevronRight
+        };
+        let toggle_path = path.clone();
+        let pick_path = path.clone();
+        let menu_path = path;
+        let toggle = if branch {
+            components::icon_only_button(chevron, metrics)
+                .size(metrics.scale(CHEVRON_SIZE))
+                .id(SharedString::from(format!("hosts.tree.{number}.toggle")))
+                .debug_selector(move || format!("hosts.tree.{number}.toggle"))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    this.toggle_group_row(Some(toggle_path.clone()), cx);
+                }))
+                .into_any_element()
+        } else {
+            div()
+                .flex_none()
+                .size(metrics.scale(CHEVRON_SIZE))
+                .into_any_element()
+        };
+        div()
+            .id(SharedString::from(format!("hosts.tree.{number}")))
+            .debug_selector(move || format!("hosts.tree.{number}"))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(metrics.scale(spacing::HALF))
+            .w_full()
+            .min_w_0()
+            .pl(metrics.scale(GROUP_INDENT * group.depth as f32))
+            .child(toggle)
+            .child(
+                components::sidebar_item(Icon::Folder, label, Some(group.hosts), chosen, metrics)
+                    .flex_1(),
+            )
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.show_home_section(HomeSection::Group(pick_path.clone()), cx);
+            }))
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                    this.shell_menu_open = false;
+                    this.host_menu = None;
+                    this.home_menu = Some(HomeMenu::Group(menu_path.clone(), event.position));
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// The right side of the page: the toolbar, what the page has to say, and the list.
+    fn home_main(&self, list: &HostList, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let short = self.viewport_height < metrics.scale(SHORT_HEIGHT);
+
+        let mut body = div()
             .flex()
             .flex_col()
             .flex_1()
-            .when(!short, |col| col.min_h_0())
             .min_w_0()
+            .when(!short, |body| body.min_h_0())
             .gap(metrics.scale(spacing::TIGHT))
-            .child(self.hosts_filters(&list, cx));
-
-        if !self.hosts.selected().is_empty() {
-            column = column.child(self.hosts_selection_strip(&list, cx));
+            .px(metrics.scale(spacing::SNUG))
+            .pt(metrics.scale(spacing::TIGHT))
+            .pb(metrics.scale(spacing::SNUG))
+            .children(
+                self.local_error
+                    .as_ref()
+                    .map(|reason| self.notice_line(reason.clone(), Tone::Danger)),
+            );
+        // While the host dialog is open, its own refusals are shown inside it.
+        if let Some(message) = self
+            .hosts
+            .message()
+            .filter(|message| !(message.failed() && self.host_fields.is_some()))
+        {
+            body = body.child(
+                components::banner(
+                    if message.failed() {
+                        Tone::Danger
+                    } else {
+                        Tone::Positive
+                    },
+                    metrics,
+                )
+                .debug_selector(|| "hosts.message".to_owned())
+                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                .child(SharedString::from(message.text().to_owned())),
+            );
         }
         if let Some(problem) = &self.group_problem {
-            column = column.child(
+            body = body.child(
                 components::banner(Tone::Danger, metrics)
                     .debug_selector(|| "hosts.group.problem".to_owned())
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     .child(SharedString::from(problem.clone())),
             );
         }
-        column.child(self.hosts_body(&list, cx))
-    }
-
-    /// The search, the view switch, the status filter and the active narrowing.
-    fn hosts_filters(&self, list: &HostList, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        let ux = copy::ux();
-
-        let mut views = components::segmented(metrics);
-        for view in crate::app::hosts::HostView::ALL {
-            let selected = self.hosts.view() == view;
-            views = views.child(
-                components::segment(view.label(strings), selected, metrics)
-                    .id(view.debug_selector())
-                    .debug_selector(move || view.debug_selector().to_owned())
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.select_host_view(view, cx);
-                    })),
-            );
-        }
-
-        // One toolbar line: find, choose how the list is arranged, and the two tools that
-        // work on the list as a whole. The status filter lives in the side column on a
-        // wide window - beside the groups, where the other narrowing is - and only takes a
-        // line of its own here when there is no column.
-        let wide = self.group_column_fits();
-        let mut row = div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .gap(metrics.scale(spacing::TIGHT))
-            .debug_selector(|| "hosts.toolbar".to_owned())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(metrics.scale(180.0))
-                            .debug_selector(|| "hosts.search".to_owned())
-                            .child(self.hosts_search.clone()),
-                    )
-                    .child(views)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .gap(metrics.scale(2.0))
-                            .child(self.favorites_filter_button(cx))
-                            .child(self.batch_entry_button(cx))
-                            .child(self.toolbar_import_button(cx)),
-                    ),
-            )
-            .when(!wide, |row| {
-                row.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .flex_wrap()
-                        .gap(metrics.scale(spacing::TIGHT))
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .child(ux.hosts_status_label),
-                        )
-                        .child(self.hosts_status_segments(cx)),
-                )
-            });
-        let _ = list;
-
-        // A narrowed list says what narrows it, and offers one press to drop it: a
-        // filter that hides hosts without naming itself is how a list looks empty for no
-        // reason (R4).
-        if self.hosts.filter().is_narrowing() {
+        // A list narrowed or ordered by the filter menu says so, and offers one press to
+        // drop it: a filter that hides hosts without naming itself is how a list looks
+        // empty for no reason (R4).
+        let status = self.hosts.filter().status();
+        let sort = self.hosts.sort();
+        if status != HostStatusFilter::Any || sort != HostSort::Saved {
             let mut chips = div()
                 .flex()
+                .flex_none()
                 .items_center()
                 .flex_wrap()
                 .gap(metrics.scale(spacing::TIGHT))
                 .debug_selector(|| "hosts.filters".to_owned());
-            if let Some(path) = self.hosts.filter().group() {
+            if status != HostStatusFilter::Any {
                 chips = chips.child(
-                    components::chip(path.to_canonical(), Tone::Accent, metrics)
-                        .debug_selector(|| "hosts.filter.group".to_owned()),
+                    components::chip(status.label(ux), Tone::Accent, metrics)
+                        .debug_selector(|| "hosts.filter.status".to_owned()),
                 );
             }
-            if self.hosts.filter().favorites() {
-                chips = chips.child(
-                    components::chip(ux.hosts_filter_favorites, Tone::Accent, metrics)
-                        .debug_selector(|| "hosts.filter.favorites.chip".to_owned()),
-                );
-            }
-            if self.hosts.filter().status() != HostStatusFilter::Any {
+            if sort != HostSort::Saved {
                 chips = chips.child(
                     components::chip(
-                        self.hosts.filter().status().label(ux),
+                        format!("{} · {}", ux.home_sort_label, sort.label(ux)),
                         Tone::Neutral,
                         metrics,
                     )
-                    .debug_selector(|| "hosts.filter.status".to_owned()),
+                    .debug_selector(|| "hosts.filter.sort".to_owned()),
                 );
             }
-            row = row.child(
+            body = body.child(
                 chips.child(
                     components::compact_button(ux.hosts_filter_clear, Variant::Ghost, metrics)
                         .id("hosts.filter.clear")
                         .debug_selector(|| "hosts.filter.clear".to_owned())
                         .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.hosts.clear_filters();
+                            this.hosts.set_status_filter(HostStatusFilter::Any);
+                            this.hosts.set_sort(HostSort::Saved);
+                            this.hosts_cursor = None;
                             cx.notify();
                         })),
                 ),
             );
         }
-        row
-    }
-
-    /// The import entry of the toolbar: labelled on a wide window, an icon on a narrow one.
-    fn toolbar_import_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        let button = if self.group_column_fits() {
-            components::icon_label_button(
-                Icon::Import,
-                strings.import_open,
-                Variant::Ghost,
-                metrics,
-            )
-        } else {
-            components::icon_only_button(Icon::Import, metrics).size(metrics.control_height())
-        };
-        button
-            .id("hosts.import")
-            .debug_selector(|| "hosts.import".to_owned())
-            .tooltip(components::tooltip(strings.import_open))
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.open_import(cx);
-            }))
-    }
-
-    /// The status filter as one segmented control, for a window without the side column.
-    fn hosts_status_segments(&self, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        let ux = copy::ux();
-        let mut statuses = components::segmented(metrics);
-        for status in HostStatusFilter::ALL {
-            let selected = self.hosts.filter().status() == status;
-            statuses = statuses.child(
-                components::segment(status.label(ux), selected, metrics)
-                    .id(status.debug_selector())
-                    .debug_selector(move || status.debug_selector().to_owned())
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.hosts.set_status_filter(status);
-                        cx.notify();
-                    })),
-            );
+        if !self.hosts.selected().is_empty() {
+            body = body.child(self.hosts_selection_strip(list, cx));
         }
-        statuses
+        body = body.child(self.hosts_body(list, cx));
+
+        div()
+            .id("home.scroll")
+            .track_scroll(&self.home_scroll)
+            .debug_selector(|| "home".to_owned())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            // A short window scrolls the toolbar and the list as one column, so the list
+            // keeps the height it needs instead of being squeezed under the toolbar.
+            .when(short, |column| {
+                column.min_h_0().overflow_y_scroll().overflow_x_hidden()
+            })
+            .when(!short, |column| column.min_h_0().overflow_hidden())
+            .child(self.home_toolbar(list, window, cx))
+            .child(body)
     }
 
-    /// How many hosts the list shows of how many are saved.
-    ///
-    /// The count is the same number the selection uses: "shown of saved" answers both
-    /// "how many are left" and "is this everything".
-    fn hosts_count_line(&self, list: &HostList) -> Div {
+    /// The toolbar of the list: the place and its count, the search, the filter menu,
+    /// the "⋯" menu and the one primary action, a new host (ADR-3).
+    fn home_toolbar(&self, list: &HostList, window: &Window, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
         let ux = copy::ux();
-        let count = format!(
-            "{} · {}",
-            view_label(self.hosts.view(), strings),
-            copy::fill(
-                ux.hosts_result_count,
-                &[
-                    ("shown", &list.matched_len().to_string()),
-                    ("total", &list.total().to_string()),
-                ],
+        let title = div()
+            .flex()
+            .flex_none()
+            .items_baseline()
+            .gap(metrics.scale(spacing::TIGHT))
+            .max_w(metrics.scale(TITLE_MAX_WIDTH))
+            .min_w_0()
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(metrics.title_size())
+                    .font_weight(metrics.title_weight())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .debug_selector(|| "header.title".to_owned())
+                    .child(components::line_text(self.home_title())),
             )
-        );
-        div()
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "header.count".to_owned())
+                    .child(SharedString::from(list.matched_len().to_string())),
+            );
+
+        let focused = self.hosts_search.read(cx).focus_handle().is_focused(window);
+        let empty = self.hosts.search().is_empty();
+        let search = div()
             .flex_1()
-            .min_w(metrics.scale(80.0))
-            .truncate()
-            .debug_selector(|| "hosts.count".to_owned())
-            .text_size(metrics.caption_size())
-            .text_color(theme::swatch(palette::TEXT_MUTED))
-            .child(SharedString::from(count))
+            .min_w(metrics.scale(SEARCH_MIN_WIDTH))
+            .debug_selector(|| "hosts.search".to_owned())
+            .child(components::search_field(
+                self.hosts_search.clone().into_any_element(),
+                None,
+                (empty && !focused).then(|| SharedString::from("/")),
+                if focused {
+                    ControlState::Focused
+                } else {
+                    ControlState::Resting
+                },
+                metrics,
+            ));
+
+        let narrowing = self.hosts.filter().status() != HostStatusFilter::Any
+            || self.hosts.sort() != HostSort::Saved;
+        let filter_open = self.home_menu == Some(HomeMenu::Filter);
+        let filter_anchor = self.home_filter_anchor.clone();
+        let filter = div()
+            .relative()
+            .flex_none()
+            .child(
+                components::toggle_icon_button(Icon::Filter, narrowing || filter_open, metrics)
+                    .id("hosts.filter")
+                    .debug_selector(|| "hosts.filter".to_owned())
+                    .when(!filter_open, |button| {
+                        button.tooltip(components::tooltip(ux.home_filter))
+                    })
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.toggle_home_menu(HomeMenu::Filter, cx);
+                    })),
+            )
+            .child(
+                gpui::canvas(
+                    move |bounds, _window, _cx| filter_anchor.set(bounds),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            );
+        let more_open = self.home_menu == Some(HomeMenu::More);
+        let more_anchor = self.home_more_anchor.clone();
+        let more = div()
+            .relative()
+            .flex_none()
+            .child(
+                components::toggle_icon_button(Icon::More, more_open, metrics)
+                    .id("hosts.more")
+                    .debug_selector(|| "hosts.more".to_owned())
+                    .when(!more_open, |button| {
+                        button.tooltip(components::tooltip(ux.home_card_more))
+                    })
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.toggle_home_menu(HomeMenu::More, cx);
+                    })),
+            )
+            .child(
+                gpui::canvas(
+                    move |bounds, _window, _cx| more_anchor.set(bounds),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            );
+
+        components::toolbar(metrics)
+            .debug_selector(|| "hosts.toolbar".to_owned())
+            .flex_wrap()
+            .child(title)
+            .child(search)
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(metrics.scale(spacing::HALF))
+                    .child(filter)
+                    .child(more)
+                    .child(
+                        components::icon_label_button(
+                            Icon::Plus,
+                            strings.primary_hosts,
+                            Variant::Primary,
+                            metrics,
+                        )
+                        .h(metrics.compact_control_height())
+                        .id("hosts.new")
+                        .debug_selector(|| "hosts.new".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.home_menu = None;
+                                this.open_create_host(cx);
+                            },
+                        )),
+                    ),
+            )
+    }
+
+    /// The menu open over the home page, if one is: the filter, the "⋯" or a group's.
+    pub(super) fn home_menu_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
+        let menu = self.home_menu.clone()?;
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let ux = copy::ux();
+        let viewport = window.viewport_size();
+        let below = |anchor: gpui::Bounds<Pixels>| {
+            gpui::point(
+                anchor.left(),
+                anchor.bottom() + metrics.scale(spacing::HAIRLINE),
+            )
+        };
+        let (card, position) = match menu {
+            HomeMenu::Filter => {
+                let mut card = components::menu_card("hosts.filter.menu", metrics)
+                    .w(metrics.scale(MENU_WIDTH))
+                    .child(components::menu_section(ux.hosts_status_label, metrics));
+                for status in HostStatusFilter::ALL {
+                    let chosen = self.hosts.filter().status() == status;
+                    card = card.child(
+                        components::menu_entry(
+                            status.label(ux),
+                            status.debug_selector(),
+                            None,
+                            true,
+                            false,
+                            metrics,
+                        )
+                        .children(chosen.then(|| menu_check(metrics)))
+                        .on_click(cx.listener(
+                            move |this, _event, _window, cx| {
+                                this.hosts.set_status_filter(status);
+                                this.hosts_cursor = None;
+                                this.close_home_menu(cx);
+                            },
+                        )),
+                    );
+                }
+                card = card
+                    .child(components::menu_divider(metrics))
+                    .child(components::menu_section(ux.home_sort_label, metrics));
+                for sort in HostSort::ALL {
+                    let chosen = self.hosts.sort() == sort;
+                    card = card.child(
+                        components::menu_entry(
+                            sort.label(ux),
+                            sort.debug_selector(),
+                            None,
+                            true,
+                            false,
+                            metrics,
+                        )
+                        .children(chosen.then(|| menu_check(metrics)))
+                        .on_click(cx.listener(
+                            move |this, _event, _window, cx| {
+                                this.hosts.set_sort(sort);
+                                this.close_home_menu(cx);
+                            },
+                        )),
+                    );
+                }
+                (card, below(self.home_filter_anchor.get()))
+            }
+            HomeMenu::More => {
+                let card = components::menu_card("hosts.more.menu", metrics)
+                    .w(metrics.scale(MENU_WIDTH))
+                    .child(
+                        components::menu_entry(
+                            strings.import_open,
+                            "hosts.import",
+                            Some(Icon::Import),
+                            true,
+                            false,
+                            metrics,
+                        )
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.close_home_menu(cx);
+                                this.open_import(cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        components::menu_entry(
+                            ux.hosts_batch_open,
+                            "hosts.batch.open.list",
+                            Some(Icon::Layers),
+                            true,
+                            false,
+                            metrics,
+                        )
+                        .tooltip(components::tooltip(ux.hosts_batch_open_hint))
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.close_home_menu(cx);
+                                this.open_batch_preview(cx);
+                            },
+                        )),
+                    );
+                (card, below(self.home_more_anchor.get()))
+            }
+            HomeMenu::Group(path, position) => {
+                let rename = path.clone();
+                let delete = path;
+                let card = components::menu_card("hosts.group.menu", metrics)
+                    .child(
+                        components::menu_entry(
+                            ux.hosts_group_rename,
+                            "hosts.group.rename.open",
+                            Some(Icon::Pencil),
+                            true,
+                            false,
+                            metrics,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _event, window, cx| {
+                                this.close_home_menu(cx);
+                                this.open_group_dialog(
+                                    GroupAction::Rename(rename.clone()),
+                                    window,
+                                    cx,
+                                );
+                            },
+                        )),
+                    )
+                    .child(
+                        components::menu_entry(
+                            ux.hosts_group_delete,
+                            "hosts.group.delete.open",
+                            Some(Icon::Trash),
+                            true,
+                            true,
+                            metrics,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _event, window, cx| {
+                                this.close_home_menu(cx);
+                                this.open_group_dialog(
+                                    GroupAction::Delete(delete.clone()),
+                                    window,
+                                    cx,
+                                );
+                            },
+                        )),
+                    );
+                (card, position)
+            }
+        };
+        Some(
+            super::overlay_layer().child(
+                div()
+                    .relative()
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .child(
+                        div()
+                            .id("home.menu.backdrop")
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .on_any_mouse_down(cx.listener(|this, _event, _window, cx| {
+                                this.close_home_menu(cx);
+                            })),
+                    )
+                    .child(
+                        gpui::anchored()
+                            .position(position)
+                            .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
+                            .child(
+                                div()
+                                    .occlude()
+                                    .child(components::menu_enter(card, "home.menu.enter")),
+                            ),
+                    ),
+            ),
+        )
     }
 
     /// What the selection holds, what it covers, and what can be done with it.
@@ -439,6 +1164,7 @@ impl ShelluneView {
 
         div()
             .flex()
+            .flex_none()
             .items_center()
             .flex_wrap()
             .gap(metrics.scale(spacing::TIGHT))
@@ -450,7 +1176,7 @@ impl ShelluneView {
                 div()
                     .flex_none()
                     .text_size(metrics.label_size())
-                    .font_weight(FontWeight::MEDIUM)
+                    .font_weight(metrics.medium_weight())
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     .debug_selector(|| "hosts.selection.count".to_owned())
                     .child(SharedString::from(count)),
@@ -498,502 +1224,45 @@ impl ShelluneView {
             )
     }
 
-    /// The way into a batch task from the list itself.
-    ///
-    /// A task is built from the current results as well as from a selection (R18), so the
-    /// entry sits beside the filters: narrowing the list then pressing once is a whole
-    /// batch target, and the preview is where the count is confirmed.
-    fn batch_entry_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let metrics = self.metrics();
-        let ux = copy::ux();
-        // A narrow window keeps the toolbar on one line: the tool is its icon, and the
-        // tooltip says its name.
-        let button = if self.group_column_fits() {
-            components::icon_label_button(
-                Icon::Layers,
-                ux.hosts_batch_open,
-                Variant::Ghost,
-                metrics,
-            )
-        } else {
-            components::icon_only_button(Icon::Layers, metrics).size(metrics.control_height())
-        };
-        button
-            .id("hosts.batch.open.list")
-            .debug_selector(|| "hosts.batch.open.list".to_owned())
-            .tooltip(components::tooltip(ux.hosts_batch_open_hint))
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.open_batch_preview(cx);
-            }))
-    }
-
-    /// The group column and the list on a wide window; the list alone on a narrow one.
+    /// The list, or what an empty one says.
     fn hosts_body(&self, list: &HostList, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
-        let wide = self.group_column_fits();
         let rows = self.host_rows_snapshot(list);
-        let empty = list.is_empty();
-        let short = self.viewport_height < metrics.scale(320.0);
-        let mut list_column = div()
+        let short = self.viewport_height < metrics.scale(SHORT_HEIGHT);
+        let body = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
-            .when(!short, |col| col.min_h_0())
-            .gap(metrics.scale(spacing::TIGHT))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .min_h(metrics.compact_control_height())
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .when(!wide, |row| row.child(self.hosts_group_chooser(cx)))
-                    .child(self.hosts_count_line(list))
-                    .when(wide, |row| row.child(self.group_column_actions(cx))),
-            );
-
-        // The rows sit on one card, so the list reads as one object beside the column
-        // that narrows it: the same surface, edge and low elevation as the dashboard's
-        // cards above it, with the rows drawn flat inside.
-        let surface = components::card(metrics)
-            .gap(px(0.0))
-            .flex_1()
-            .when(!short, |col| col.min_h_0())
-            .p(metrics.scale(spacing::HAIRLINE))
-            .debug_selector(|| "hosts.surface".to_owned());
-        if empty {
-            list_column = list_column.child(
-                surface
-                    .px(metrics.scale(spacing::BASE))
-                    .py(metrics.scale(spacing::SNUG))
-                    .child(self.hosts_empty_list(cx)),
-            );
-        } else {
-            list_column = list_column.child(surface.child(self.hosts_virtual_list(rows, cx)));
-        }
-
-        let mut body = div()
-            .flex()
-            .flex_row()
-            .flex_1()
-            .when(!short, |b| b.min_h_0())
-            .min_w_0()
-            .gap(metrics.scale(spacing::SNUG))
-            // The number of rows is part of the selector, so a test can tell "the
-            // search narrowed the list" from "the list did not change" without reading
-            // text, and a person reading the manifest sees the same count.
+            .when(!short, |body| body.min_h_0())
+            // The number of records listed is part of the selector, so a test can tell
+            // "the search narrowed the list" from "the list did not change" without
+            // reading text, and a person reading the manifest sees the same count.
             .debug_selector({
                 let shown = list.matched_len();
                 move || format!("hosts.list.{shown}")
             });
-        if wide {
-            body = body.child(self.hosts_group_column(&self.group_tree_rows(), cx));
-        }
-        body.child(list_column)
-    }
-
-    /// Whether the window is wide enough for the group column (R8).
-    ///
-    /// One predicate decides it, so the layout and a test cannot disagree about which
-    /// of the two shapes was drawn.
-    pub(crate) fn group_column_fits(&self) -> bool {
-        self.viewport_width >= self.metrics().scale(GROUP_COLUMN_MIN_WIDTH)
-    }
-
-    /// The group tree the column and the narrow chooser both read.
-    fn group_tree_rows(&self) -> Vec<HostGroupRow> {
-        self.hosts
-            .group_tree(&self.book, &self.groups, &|id| self.host_is_open(id))
-    }
-
-    /// The group column: the tree the list's headers come from (R4, R18).
-    ///
-    /// It opens with "all hosts", the row that clears the narrowing, and the creation of
-    /// a group sits on the column's own heading, where a new group will appear.
-    fn hosts_group_column(&self, tree: &[HostGroupRow], cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        let ux = copy::ux();
-        let column = div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .w(metrics.scale(GROUP_COLUMN_WIDTH))
-            .min_h_0()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .debug_selector(|| "hosts.groups".to_owned())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .pl(metrics.scale(spacing::TIGHT))
-                    .child(components::section_label(ux.hosts_groups_title, metrics))
-                    .child(
-                        components::icon_only_button(Icon::Plus, metrics)
-                            .id("hosts.group.new")
-                            .debug_selector(|| "hosts.group.new".to_owned())
-                            .tooltip(components::tooltip(ux.hosts_group_new))
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.open_group_dialog(GroupAction::Create, window, cx);
-                            })),
-                    ),
-            );
-
-        let mut rows = div()
-            .id("hosts.groups.scroll")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .gap(metrics.scale(1.0))
-            .overflow_y_scroll()
-            .child(self.group_tree_all_row(cx));
-
-        // A row of the tree is a group to narrow to. The hosts in no group are not one:
-        // they have their own header in the list, and "all hosts" above reaches them.
-        let groups: Vec<(usize, &HostGroupRow)> = tree
-            .iter()
-            .enumerate()
-            .filter(|(_, group)| group.path.is_some())
-            .collect();
-        for (position, (number, group)) in groups.iter().enumerate() {
-            let branch = groups
-                .get(position + 1)
-                .is_some_and(|(_, next)| next.depth > group.depth);
-            rows = rows.child(self.group_tree_row(group, *number, branch, cx));
-        }
-        // The tree follows the search, so an empty tree under a search only means the
-        // search hid the groups; the list beside it already says so. The hint to make
-        // a group is for a book that really has none.
-        let searching =
-            !self.hosts.search().trim().is_empty() || self.hosts.filter().is_narrowing();
-        if groups.is_empty() && !searching {
-            rows = rows.child(
-                div()
-                    .px(metrics.scale(spacing::TIGHT))
-                    .py(metrics.scale(spacing::TIGHT))
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .debug_selector(|| "hosts.groups.empty".to_owned())
-                    .child(ux.hosts_group_empty),
-            );
-        }
-        // The statuses follow the groups in the same scrolling column, so they sit
-        // right under the last group instead of at the far end of the window.
-        column.child(rows.child(self.hosts_status_column(cx)))
-    }
-
-    /// The status filter as rows of the side column, under the groups: both narrow the
-    /// same list, so they sit together, and the toolbar keeps a single line.
-    fn hosts_status_column(&self, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        let ux = copy::ux();
-        let mut section = div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .gap(metrics.scale(1.0))
-            .pt(metrics.scale(spacing::SNUG))
-            .mt(metrics.scale(spacing::HAIRLINE))
-            .border_t_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .debug_selector(|| "hosts.statuses".to_owned())
-            .child(
-                div()
-                    .pl(metrics.scale(spacing::TIGHT))
-                    .pb(metrics.scale(spacing::HAIRLINE))
-                    .child(components::section_label(ux.hosts_status_label, metrics)),
-            );
-        for status in HostStatusFilter::ALL {
-            let chosen = self.hosts.filter().status() == status;
-            let tone = match status {
-                HostStatusFilter::Any => None,
-                HostStatusFilter::Connected => Some(Tone::Positive),
-                HostStatusFilter::Recent => Some(Tone::Accent),
-                HostStatusFilter::NeverConnected => Some(Tone::Neutral),
-            };
-            section = section.child(
-                tree_row_frame(chosen, metrics)
-                    .id(status.debug_selector())
-                    .debug_selector(move || status.debug_selector().to_owned())
-                    .pl(metrics.scale(spacing::TIGHT))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .size(metrics.small_icon_size())
-                            .children(tone.map(|tone| components::status_dot(tone, metrics))),
-                    )
-                    .child(tree_row_label(status.label(ux).to_owned(), chosen, metrics))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.hosts.set_status_filter(status);
-                        cx.notify();
-                    })),
-            );
-        }
-        section
-    }
-
-    /// The favourites filter of the toolbar: a star that stays lit while only the
-    /// favourites are listed (R1).
-    ///
-    /// It sits with the list's other whole-list tools rather than in the side column,
-    /// so it is in view on both window shapes; a host can be a favourite and never
-    /// connected, so it combines with the status instead of being one.
-    fn favorites_filter_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let metrics = self.metrics();
-        let ux = copy::ux();
-        let favorites = self.hosts.filter().favorites();
-        let hover = theme::swatch(palette::SURFACE_HOVER);
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .size(metrics.control_height())
-            .rounded(px(radius::MEDIUM))
-            .cursor_pointer()
-            .when(favorites, |button| {
-                button.bg(theme::swatch(palette::SURFACE_SELECTED))
-            })
-            .when(!favorites, |button| {
-                button.hover(move |style| style.bg(hover))
-            })
-            .child(icons::icon(
-                if favorites {
-                    Icon::StarFilled
-                } else {
-                    Icon::Star
-                },
-                metrics.small_icon_size(),
-                theme::swatch(if favorites {
-                    palette::ACCENT
-                } else {
-                    palette::TEXT_SECONDARY
-                }),
-            ))
-            .id("hosts.filter.favorites")
-            .debug_selector(|| "hosts.filter.favorites".to_owned())
-            .tooltip(components::tooltip(ux.hosts_filter_favorites))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.hosts.set_favorites_filter(!favorites);
-                this.hosts_cursor = None;
-                cx.notify();
-            }))
-    }
-
-    /// The first row of the group column: every saved host, which is no narrowing.
-    fn group_tree_all_row(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let metrics = self.metrics();
-        let ux = copy::ux();
-        let chosen = self.hosts.filter().group().is_none();
-        tree_row_frame(chosen, metrics)
-            .id("hosts.tree.all")
-            .debug_selector(|| "hosts.tree.all".to_owned())
-            .pl(metrics.scale(spacing::TIGHT))
-            .child(icons::icon(
-                Icon::Server,
-                metrics.small_icon_size(),
-                theme::swatch(if chosen {
-                    palette::ACCENT
-                } else {
-                    palette::TEXT_MUTED
-                }),
-            ))
-            .child(tree_row_label(
-                ux.hosts_groups_all.to_owned(),
-                chosen,
-                metrics,
-            ))
-            // Every saved record the list can show, desktop and serial ones included,
-            // so the number matches the list's own "n of m" line.
-            .child(components::badge(
-                self.book.hosts().len() + self.book.connections().len(),
-                if chosen { Tone::Accent } else { Tone::Neutral },
-                metrics,
-            ))
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.pick_group_row(None, cx);
-            }))
-    }
-
-    /// One group of the column: its chevron, its name and how many hosts it holds.
-    ///
-    /// Only a branch has a chevron; a leaf keeps the chevron's room so names still line
-    /// up, but offers nothing to open.
-    fn group_tree_row(
-        &self,
-        group: &HostGroupRow,
-        number: usize,
-        branch: bool,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let metrics = self.metrics();
-        let path = group.path.clone();
-        let narrowed = match (&path, self.hosts.filter().group()) {
-            (Some(path), Some(filter)) => path == filter,
-            _ => false,
-        };
-        let label = group.path.as_ref().map_or_else(String::new, |path| {
-            path.segments().last().cloned().unwrap_or_default()
-        });
-        let chevron = if group.expanded {
-            Icon::ChevronDown
+        if rows.is_empty() {
+            body.child(self.hosts_empty_list(cx))
         } else {
-            Icon::ChevronRight
-        };
-        let toggle_path = path.clone();
-        let pick_path = path.clone();
-        let toggle = if branch {
-            components::icon_only_button(chevron, metrics)
-                .size(metrics.scale(18.0))
-                .id(SharedString::from(format!("hosts.tree.{number}.toggle")))
-                .debug_selector(move || format!("hosts.tree.{number}.toggle"))
-                .on_click(cx.listener(move |this, _event, _window, cx| {
-                    cx.stop_propagation();
-                    this.toggle_group_row(toggle_path.clone(), cx);
-                }))
-                .into_any_element()
-        } else {
-            div()
-                .flex_none()
-                .size(metrics.scale(18.0))
-                .into_any_element()
-        };
-        tree_row_frame(narrowed, metrics)
-            .id(SharedString::from(format!("hosts.tree.{number}")))
-            .debug_selector(move || format!("hosts.tree.{number}"))
-            .pl(metrics.scale(spacing::HAIRLINE + group.depth as f32 * 14.0))
-            .child(toggle)
-            .child(icons::icon(
-                Icon::Folder,
-                metrics.small_icon_size(),
-                theme::swatch(if narrowed {
-                    palette::ACCENT
-                } else {
-                    palette::TEXT_MUTED
-                }),
-            ))
-            .child(tree_row_label(label, narrowed, metrics))
-            .child(components::badge(
-                group.hosts,
-                if narrowed {
-                    Tone::Accent
-                } else {
-                    Tone::Neutral
-                },
-                metrics,
-            ))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.pick_group_row(pick_path.clone(), cx);
-            }))
-    }
-
-    /// The group filter, folded into one control on a narrow window (R8).
-    fn hosts_group_chooser(&self, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        let ux = copy::ux();
-        let current = self.hosts.filter().group().cloned();
-        let mut chooser = div()
-            .flex()
-            .items_center()
-            .flex_wrap()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .debug_selector(|| "hosts.group.chooser".to_owned())
-            .child(
-                components::segment(ux.hosts_groups_all, current.is_none(), metrics)
-                    .id("hosts.group.all")
-                    .debug_selector(|| "hosts.group.all".to_owned())
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.hosts.set_group_filter(None);
-                        cx.notify();
-                    })),
-            );
-        // The top level of the tree is what a narrow window offers: a branch is reached
-        // by choosing its parent, which is one press and still narrows to the subtree.
-        let mut paths: Vec<GroupPath> = self
-            .group_tree_rows()
-            .into_iter()
-            .filter(|group| group.depth == 0)
-            .filter_map(|group| group.path)
-            .collect();
-        paths.sort();
-        for path in paths {
-            let label = path.to_canonical();
-            let chosen = current.as_ref() == Some(&path);
-            let pick = path.clone();
-            chooser = chooser.child(
-                components::segment(label, chosen, metrics)
-                    .id(SharedString::from(format!(
-                        "hosts.group.option.{}",
-                        path.to_canonical()
-                    )))
-                    .debug_selector({
-                        let name = path.to_canonical();
-                        move || format!("hosts.group.option.{name}")
-                    })
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.hosts.set_group_filter(Some(pick.clone()));
-                        cx.notify();
-                    })),
-            );
+            body.child(self.hosts_virtual_list(rows, cx))
         }
-        chooser
-    }
-
-    /// The group actions that the wide window keeps beside the tree.
-    fn group_column_actions(&self, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        let ux = copy::ux();
-        let mut row = div()
-            .flex()
-            .items_center()
-            .flex_wrap()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .debug_selector(|| "hosts.group.actions".to_owned());
-        if let Some(path) = self.hosts.filter().group().cloned() {
-            let rename = path.clone();
-            let delete = path;
-            row = row
-                .child(
-                    components::compact_button(ux.hosts_group_rename, Variant::Ghost, metrics)
-                        .id("hosts.group.rename.open")
-                        .debug_selector(|| "hosts.group.rename.open".to_owned())
-                        .on_click(cx.listener(move |this, _event, window, cx| {
-                            this.open_group_dialog(GroupAction::Rename(rename.clone()), window, cx);
-                        })),
-                )
-                .child(
-                    components::compact_button(ux.hosts_group_delete, Variant::Ghost, metrics)
-                        .id("hosts.group.delete.open")
-                        .debug_selector(|| "hosts.group.delete.open".to_owned())
-                        .on_click(cx.listener(move |this, _event, window, cx| {
-                            this.open_group_dialog(GroupAction::Delete(delete.clone()), window, cx);
-                        })),
-                );
-        }
-        row
     }
 
     /// What a list with no row says: the reason, and what would change it (R1, R3).
     ///
-    /// A list emptied by a search or a filter names what narrowed it and offers one press
-    /// that drops all of it; an empty recent view offers the whole list. Neither is allowed
-    /// to be a sentence with no next step.
+    /// A book with no record at all is the welcome: a new host, an import, the local
+    /// terminal or a backup. A search that finds nothing offers to connect to what was
+    /// typed when it reads as an address, and to clear the search otherwise. An empty
+    /// place says how something gets there. None is a sentence with no next step.
     fn hosts_empty_list(&self, cx: &mut Context<Self>) -> AnyElement {
         let metrics = self.metrics();
         let strings = self.strings();
         let ux = copy::ux();
-        // An empty list is the shared empty state in the middle of the list's surface:
-        // an icon, what happened, and the one press that changes it. The button is as
-        // wide as its words, not a bar across the list.
         let note = |selector: &'static str,
                     icon: Icon,
-                    title: &'static str,
-                    hint: Option<&'static str>,
+                    title: SharedString,
+                    hint: Option<SharedString>,
                     action: AnyElement| {
             div()
                 .w_full()
@@ -1001,44 +1270,186 @@ impl ShelluneView {
                 .child(components::empty_state(
                     icon,
                     title,
-                    hint.map(SharedString::from),
+                    hint,
                     Some(action),
                     metrics,
                 ))
                 .into_any_element()
         };
-        if self.hosts.view() == crate::app::hosts::HostView::Recent {
-            return note(
-                "hosts.recent.empty",
-                Icon::Layers,
-                strings.hosts_recent_empty,
-                None,
-                components::compact_button(strings.hosts_view_all, Variant::Secondary, metrics)
-                    .id("hosts.recent.all")
-                    .debug_selector(|| "hosts.recent.all".to_owned())
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.select_host_view(crate::app::hosts::HostView::All, cx);
-                    }))
+        let searching = !self.hosts.search().trim().is_empty();
+        let book_empty = self.book.hosts().is_empty() && self.book.connections().is_empty();
+        if book_empty && !searching {
+            return self.home_welcome(cx);
+        }
+        if searching || self.hosts.filter().status() != HostStatusFilter::Any {
+            let clear = components::button_sized(
+                ux.hosts_filter_clear,
+                Variant::Secondary,
+                components::ButtonSize::Compact,
+                metrics,
+            )
+            .id("hosts.nomatch.clear")
+            .debug_selector(|| "hosts.nomatch.clear".to_owned())
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.clear_host_narrowing(cx);
+            }));
+            let action = match self.home_direct_target() {
+                Some(target) => div()
+                    .flex()
+                    .flex_wrap()
+                    .justify_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        components::icon_label_button(
+                            Icon::ArrowRight,
+                            copy::fill(ux.home_quick_temporary, &[("target", &target.label())]),
+                            Variant::Primary,
+                            metrics,
+                        )
+                        .id("hosts.nomatch.connect")
+                        .debug_selector(|| "hosts.nomatch.connect".to_owned())
+                        .tooltip(components::tooltip(ux.home_quick_temporary_hint))
+                        .on_click(cx.listener(
+                            |this, _event, window, cx| {
+                                this.connect_home_direct(false, window, cx);
+                            },
+                        )),
+                    )
+                    .child(clear)
                     .into_any_element(),
+                None => clear.into_any_element(),
+            };
+            return note(
+                "hosts.nomatch",
+                Icon::Search,
+                SharedString::from(strings.hosts_no_match),
+                Some(SharedString::from(ux.hosts_no_match_hint)),
+                action,
             );
         }
-        let narrow = !self.hosts.search().trim().is_empty() || self.hosts.filter().is_narrowing();
-        if !narrow {
-            return div().into_any_element();
+        let all = components::button_sized(
+            strings.hosts_view_all,
+            Variant::Secondary,
+            components::ButtonSize::Compact,
+            metrics,
+        );
+        match self.hosts.section() {
+            HomeSection::Recent => note(
+                "hosts.recent.empty",
+                Icon::Clock,
+                SharedString::from(strings.hosts_recent_empty),
+                None,
+                all.id("hosts.recent.all")
+                    .debug_selector(|| "hosts.recent.all".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.show_home_section(HomeSection::All, cx);
+                    }))
+                    .into_any_element(),
+            ),
+            HomeSection::Favorites => note(
+                "hosts.favorites.empty",
+                Icon::Star,
+                SharedString::from(ux.home_favorites_empty),
+                Some(SharedString::from(ux.home_favorites_empty_hint)),
+                all.id("hosts.favorites.all")
+                    .debug_selector(|| "hosts.favorites.all".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.show_home_section(HomeSection::All, cx);
+                    }))
+                    .into_any_element(),
+            ),
+            HomeSection::Group(_) | HomeSection::All => note(
+                "hosts.group.empty",
+                Icon::Folder,
+                SharedString::from(strings.hosts_no_match),
+                None,
+                all.id("hosts.group.all")
+                    .debug_selector(|| "hosts.group.all".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.show_home_section(HomeSection::All, cx);
+                    }))
+                    .into_any_element(),
+            ),
         }
-        note(
-            "hosts.nomatch",
-            Icon::Search,
-            strings.hosts_no_match,
-            Some(ux.hosts_no_match_hint),
-            components::compact_button(ux.hosts_filter_clear, Variant::Secondary, metrics)
-                .id("hosts.nomatch.clear")
-                .debug_selector(|| "hosts.nomatch.clear".to_owned())
+    }
+
+    /// The welcome of a book with no record: what a host is, and the ways to get one or
+    /// to start without one - a new host, an import, the local terminal, a backup.
+    fn home_welcome(&self, cx: &mut Context<Self>) -> AnyElement {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let ux = copy::ux();
+        let actions = div()
+            .flex()
+            .flex_wrap()
+            .justify_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .child(
+                components::icon_label_button(
+                    Icon::Plus,
+                    strings.primary_hosts,
+                    Variant::Primary,
+                    metrics,
+                )
+                .id("hosts.empty.new")
+                .debug_selector(|| "hosts.empty.new".to_owned())
                 .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.clear_host_narrowing(cx);
-                }))
-                .into_any_element(),
-        )
+                    this.open_create_host(cx);
+                })),
+            )
+            .child(
+                components::icon_label_button(
+                    Icon::Import,
+                    ux.home_import,
+                    Variant::Secondary,
+                    metrics,
+                )
+                .id("hosts.import.open")
+                .debug_selector(|| "hosts.import.open".to_owned())
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.open_import(cx);
+                })),
+            )
+            .child(
+                components::icon_label_button(
+                    Icon::Terminal,
+                    ux.home_local_button,
+                    Variant::Secondary,
+                    metrics,
+                )
+                .id("hosts.empty.local")
+                .debug_selector(|| "hosts.empty.local".to_owned())
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    let choice = this.workspace.shell_choice();
+                    this.launch_choice(choice, window, cx);
+                })),
+            )
+            // A new machine with a backup elsewhere starts here: the file chooser, then
+            // the same preview the settings page shows (R5, R6).
+            .child(
+                components::icon_label_button(
+                    Icon::FolderOpen,
+                    copy::backup_for(self.workspace.locale()).home_restore,
+                    Variant::Ghost,
+                    metrics,
+                )
+                .id("hosts.empty.restore")
+                .debug_selector(|| "hosts.empty.restore".to_owned())
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.choose_backup_import(cx);
+                })),
+            );
+        let welcome = div()
+            .w_full()
+            .debug_selector(|| "hosts.empty".to_owned())
+            .child(components::empty_state(
+                Icon::Server,
+                ux.home_welcome_title,
+                Some(SharedString::from(ux.home_welcome_body)),
+                Some(actions.into_any_element()),
+                metrics,
+            ));
+        theme::enter(welcome, "hosts.empty.enter", theme::Enter::Rise)
     }
 
     /// The list itself: a uniform list that is asked for the rows it shows.
@@ -1060,12 +1471,12 @@ impl ShelluneView {
         // The recent view names its rows after the connection that put them there, and
         // every other view names them after the host; both are the host's number in the
         // list, so a test can read either without knowing the layout.
-        let prefix = if self.hosts.view() == crate::app::hosts::HostView::Recent {
+        let prefix = if self.hosts.view() == HostView::Recent {
             "hosts.recent"
         } else {
             "hosts.row"
         };
-        let min_list_height = if self.viewport_height < metrics.scale(320.0) {
+        let min_list_height = if self.viewport_height < metrics.scale(SHORT_HEIGHT) {
             row_height * 2.0
         } else {
             px(0.0)
@@ -1075,14 +1486,14 @@ impl ShelluneView {
             let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
             for row in &rows[range] {
                 let element = match row {
-                    SnapshotRow::Group { number, row } => {
-                        group_header_row(row, *number, row_height, metrics, strings, &weak)
+                    SnapshotRow::Direct(direct) => {
+                        direct_row_element(direct, &weak, row_height, metrics, ux)
                     }
                     SnapshotRow::Host(host) => {
                         host_row_element(host, &weak, row_height, prefix, metrics, strings, ux)
                     }
                     SnapshotRow::Connection(connection) => {
-                        connection_row_element(connection, &weak, row_height, metrics, strings)
+                        connection_row_element(connection, &weak, row_height, metrics, strings, ux)
                     }
                 };
                 items.push(element.into_any_element());
@@ -1099,56 +1510,58 @@ impl ShelluneView {
 
     /// Reads every row of the list once, for the frame about to be drawn.
     fn host_rows_snapshot(&self, list: &HostList) -> Rc<Vec<SnapshotRow>> {
+        let metrics = self.metrics();
+        let ux = copy::ux();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
         let cursor = self.active_hosts_cursor();
-        let show_duplicate = self.viewport_width >= self.metrics().scale(760.0);
-        let show_group_tag = self.viewport_width >= self.metrics().scale(540.0);
-        let mut rows = Vec::with_capacity(list.len());
+        let show_duplicate = self.viewport_width >= metrics.scale(ROW_DUPLICATE_MIN_WIDTH);
+        let show_meta = self.viewport_width >= metrics.scale(ROW_META_MIN_WIDTH);
+        let mut rows = Vec::with_capacity(list.len() + 1);
+        if let Some(target) = self.home_direct_row(list) {
+            rows.push(SnapshotRow::Direct(DirectRowView {
+                title: SharedString::from(copy::fill(
+                    ux.home_quick_temporary,
+                    &[("target", &target.label())],
+                )),
+                hint: SharedString::from(ux.home_quick_temporary_hint),
+                enter: cursor.is_none(),
+            }));
+        }
         let mut hosts = 0usize;
-        let mut groups = 0usize;
         let mut connections = 0usize;
         for row in list.rows() {
             match row {
-                HostListRow::Group(group) => {
-                    rows.push(SnapshotRow::Group {
-                        number: groups,
-                        row: group.clone(),
-                    });
-                    groups += 1;
-                }
+                HostListRow::Group(_) => {}
                 HostListRow::Host(host) => {
                     let Some(saved) = self.book.host(host.id) else {
                         continue;
                     };
+                    let recent = self.book.recent_of(host.id);
                     rows.push(SnapshotRow::Host(HostRowView {
                         id: host.id,
                         number: hosts,
                         name: SharedString::from(saved.name().to_owned()),
                         target: SharedString::from(saved.target()),
-                        group: show_group_tag
+                        group: show_meta
                             .then(|| saved.group_text().map(SharedString::from))
                             .flatten(),
                         open: self.host_is_open(host.id),
-                        last: self.book.recent_of(host.id).map(|recent| {
+                        last: recent.as_ref().filter(|_| show_meta).map(|recent| {
+                            SharedString::from(copy::relative_time(
+                                recent.last_connected_unix(),
+                                now,
+                                copy::Locale::current(),
+                            ))
+                        }),
+                        last_exact: recent.as_ref().map(|recent| {
                             SharedString::from(format!(
                                 "{} {} · {} {}",
                                 self.strings().host_last_connected,
-                                copy::relative_time(
-                                    recent.last_connected_unix(),
-                                    now,
-                                    copy::Locale::current()
-                                ),
+                                format_unix(recent.last_connected_unix()),
                                 recent.connections(),
                                 self.strings().host_connection_count
-                            ))
-                        }),
-                        last_exact: self.book.recent_of(host.id).map(|recent| {
-                            SharedString::from(format!(
-                                "{} {}",
-                                self.strings().host_last_connected,
-                                format_unix(recent.last_connected_unix())
                             ))
                         }),
                         selected: self.hosts.selected().contains(host.id),
@@ -1182,7 +1595,7 @@ impl ShelluneView {
                         name: SharedString::from(saved.name().to_owned()),
                         protocol: SharedString::from(saved.protocol().label()),
                         target: SharedString::from(saved.target()),
-                        group: show_group_tag
+                        group: show_meta
                             .then(|| saved.group_text().map(SharedString::from))
                             .flatten(),
                         open: self.connection_is_open(row.id),
@@ -1194,577 +1607,6 @@ impl ShelluneView {
             }
         }
         Rc::new(rows)
-    }
-
-    // -----------------------------------------------------------------------
-    // The dashboard (R1)
-    // -----------------------------------------------------------------------
-
-    /// The band under the quick-connect bar: what the bar found while a phrase is
-    /// typed, otherwise the recent, favourite and group cards.
-    ///
-    /// A section with nothing to show is left out rather than drawn empty, and a band
-    /// with no section at all is no band: a first run shows its welcome card instead.
-    pub(super) fn home_dashboard(
-        &self,
-        cards_allowed: bool,
-        wide: bool,
-        cx: &mut Context<Self>,
-    ) -> Option<Div> {
-        if !self.quick_query.trim().is_empty() {
-            return Some(self.quick_results_panel(cx));
-        }
-        if !cards_allowed {
-            return None;
-        }
-        let metrics = self.metrics();
-        let ux = copy::ux();
-        let per_section = self.home_cards_per_section(wide);
-        let mut band = div()
-            .flex()
-            .flex_col()
-            .gap(metrics.scale(spacing::SNUG))
-            .debug_selector(|| "home.cards".to_owned());
-        // Which section this is, from the top: each one's cards start their entrance a
-        // turn after the section above started its own.
-        let mut order = 0usize;
-
-        let recent = self.book.recent_hosts();
-        if !recent.is_empty() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_secs());
-            let cards: Vec<AnyElement> = recent
-                .iter()
-                .take(per_section)
-                .enumerate()
-                .map(|(number, recent)| {
-                    let host = recent.host;
-                    let id = host.id();
-                    let when = copy::relative_time(
-                        recent.last_connected_unix,
-                        now,
-                        copy::Locale::current(),
-                    );
-                    self.home_record_card(
-                        CardRecord {
-                            selector: "home.recent",
-                            number,
-                            id,
-                            name: host.name().to_owned(),
-                            target: host.target(),
-                            ssh: true,
-                            meta: Some(when),
-                            favorite: self.book.is_favorite(id),
-                        },
-                        cx,
-                    )
-                    .into_any_element()
-                })
-                .collect();
-            band = band.child(self.home_section(
-                "home.recent",
-                ux.home_recent_section,
-                recent.len(),
-                cards,
-                (wide, per_section),
-                order,
-                Some(Box::new(|this: &mut Self, cx: &mut Context<Self>| {
-                    this.show_all_recent(cx);
-                })),
-                cx,
-            ));
-            order += 1;
-        }
-
-        let favorites = self.book.favorite_hosts();
-        if !favorites.is_empty() {
-            let cards: Vec<AnyElement> = favorites
-                .iter()
-                .take(per_section)
-                .enumerate()
-                .map(|(number, record)| {
-                    let id = record.id();
-                    // A record of another protocol says which, as its list row does.
-                    let meta = (record.protocol() != shellune_core::ProtocolKind::Ssh)
-                        .then(|| record.protocol().label().to_owned());
-                    self.home_record_card(
-                        CardRecord {
-                            selector: "home.favorite",
-                            number,
-                            id,
-                            name: record.name().to_owned(),
-                            target: record.target(),
-                            ssh: record.protocol() == shellune_core::ProtocolKind::Ssh,
-                            meta,
-                            favorite: true,
-                        },
-                        cx,
-                    )
-                    .into_any_element()
-                })
-                .collect();
-            band = band.child(self.home_section(
-                "home.favorites",
-                ux.home_favorites_section,
-                favorites.len(),
-                cards,
-                (wide, per_section),
-                order,
-                Some(Box::new(|this: &mut Self, cx: &mut Context<Self>| {
-                    this.show_all_favorites(cx);
-                })),
-                cx,
-            ));
-            order += 1;
-        }
-
-        let groups = crate::app::hosts::group_overview(&self.book, &self.groups, &|id| {
-            self.host_is_open(id) || self.connection_is_open(id)
-        });
-        if !groups.is_empty() {
-            // Every group fits the band when the window has room for it; the tree beside
-            // the list is the place for the rest, so the section has no "view all".
-            let cards: Vec<AnyElement> = groups
-                .iter()
-                .take(per_section)
-                .enumerate()
-                .map(|(number, group)| self.home_group_card(group, number, cx).into_any_element())
-                .collect();
-            band = band.child(self.home_section(
-                "home.groups",
-                ux.home_groups_section,
-                cards.len(),
-                cards,
-                (wide, per_section),
-                order,
-                None,
-                cx,
-            ));
-            order += 1;
-        }
-        (order > 0).then_some(band)
-    }
-
-    /// How many cards one section shows.
-    ///
-    /// A wide window lays the cards out on one line and shows as many as fit, at most
-    /// four; a narrow one stacks them in one column and shows half as many, so the
-    /// band never pushes the list off the window (R1, R8).
-    pub(crate) fn home_cards_per_section(&self, wide: bool) -> usize {
-        if !wide {
-            return HOME_CARDS_NARROW;
-        }
-        let metrics = self.metrics();
-        let gap = metrics.scale(spacing::TIGHT + 2.0);
-        let width = self
-            .viewport_width
-            .min(metrics.scale(super::HOME_MAX_WIDTH))
-            - metrics.scale(super::HOME_SIDE_PADDING) * 2.0;
-        let fits = ((width + gap) / (metrics.scale(HOME_CARD_MIN_WIDTH) + gap)).floor();
-        (fits.max(1.0) as usize).min(HOME_CARDS_WIDE)
-    }
-
-    /// One section of the band: its title, the "view all" that opens the rest in the
-    /// list, and the cards - on one line when wide, stacked when narrow.
-    ///
-    /// `shape` is whether the window is wide and how many cards a full line holds;
-    /// `order` is the section's place in the band, which sets when its cards fade in:
-    /// the band arrives card by card, top-left first, when motion is allowed (R4).
-    #[allow(clippy::too_many_arguments)]
-    fn home_section(
-        &self,
-        selector: &'static str,
-        title: &'static str,
-        total: usize,
-        cards: Vec<AnyElement>,
-        shape: (bool, usize),
-        order: usize,
-        view_all: Option<SectionAction>,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let (wide, per_line) = shape;
-        let metrics = self.metrics();
-        let ux = copy::ux();
-        let shown = cards.len();
-        let mut heading = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(metrics.scale(spacing::TIGHT))
-            .min_h(metrics.scale(20.0))
-            .child(components::section_label(title, metrics));
-        if let Some(action) = view_all.filter(|_| total > shown) {
-            heading = heading.child(
-                components::compact_button(ux.home_view_all, Variant::Ghost, metrics)
-                    .h(metrics.scale(20.0))
-                    .id(SharedString::from(format!("{selector}.all")))
-                    .debug_selector(move || format!("{selector}.all"))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        action(this, cx);
-                    })),
-            );
-        }
-        let mut line = if wide {
-            div().flex()
-        } else {
-            div().flex().flex_col()
-        }
-        .gap(metrics.scale(spacing::TIGHT + 2.0))
-        .debug_selector(move || format!("{selector}.cards"));
-        let count = cards.len();
-        for (number, card) in cards.into_iter().enumerate() {
-            line = line.child(components::enter_in_turn(
-                div().flex().flex_1().min_w_0().child(card),
-                SharedString::from(format!("{selector}.enter.{number}")),
-                order + number,
-            ));
-        }
-        // A short line keeps the cards the width a full one gives them.
-        if wide {
-            for _ in count..per_line {
-                line = line.child(div().flex_1().min_w_0());
-            }
-        }
-        div()
-            .flex()
-            .flex_col()
-            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-            .debug_selector(move || selector.to_owned())
-            .child(heading)
-            .child(line)
-    }
-
-    /// One saved record as a card: press to connect, right press or the "⋯" for every
-    /// action the list row offers.
-    fn home_record_card(&self, card: CardRecord, cx: &mut Context<Self>) -> Stateful<Div> {
-        let metrics = self.metrics();
-        let ux = copy::ux();
-        let CardRecord {
-            selector,
-            number,
-            id,
-            name,
-            target,
-            ssh,
-            meta,
-            favorite,
-        } = card;
-        let group = format!("{selector}-card");
-        let more_group = group.clone();
-        // The card leaves out what every SSH host has, so the part that tells two hosts
-        // apart is what fits; the tooltip carries the whole target (R1).
-        let shown = card_target_text(&target, ssh);
-        let tooltip = card_tooltip(&target, ux.home_card_connect_hint);
-        home_card_frame(metrics)
-            .id(SharedString::from(format!("{selector}.{number}")))
-            .debug_selector(move || format!("{selector}.{number}"))
-            .group(SharedString::from(group))
-            .tooltip(components::tooltip(SharedString::from(tooltip)))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.connect_saved_connection(id, cx);
-            }))
-            .on_mouse_down(
-                gpui::MouseButton::Right,
-                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    this.open_host_menu(id, event, window, cx);
-                }),
-            )
-            .child(super::host_avatar(&name, false, metrics).size(metrics.scale(30.0)))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(metrics.scale(2.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(metrics.scale(spacing::HAIRLINE))
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(metrics.label_size())
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                    .child(SharedString::from(name)),
-                            )
-                            .when(favorite, |line| {
-                                line.child(icons::icon(
-                                    Icon::StarFilled,
-                                    metrics.scale(11.0),
-                                    theme::swatch(palette::ACCENT),
-                                ))
-                            }),
-                    )
-                    // The target gives way first: the age or the protocol after it is
-                    // the short part a card is scanned for.
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(metrics.scale(spacing::HAIRLINE))
-                            .min_w_0()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            // One clamped line with an ellipsis rather than `truncate()`:
-                            // gpui measures a no-wrap text once, at its full length, and
-                            // keeps that layout when the card later gives it less room, so
-                            // the card clipped the address mid-character into what reads
-                            // as another address. A wrapping text is measured again at
-                            // the width it is given, and the clamp shortens it there with
-                            // an ellipsis.
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .flex_basis(px(0.0))
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_normal()
-                                    .text_ellipsis()
-                                    .line_clamp(1)
-                                    .font_family(crate::app::terminal::monospace_family())
-                                    .debug_selector(move || format!("{selector}.{number}.target"))
-                                    .child(SharedString::from(shown)),
-                            )
-                            .children(meta.map(|meta| {
-                                div()
-                                    .flex_none()
-                                    .child(SharedString::from(format!("· {meta}")))
-                            })),
-                    ),
-            )
-            .child(
-                components::icon_only_button(Icon::More, metrics)
-                    .size(metrics.scale(24.0))
-                    .opacity(0.0)
-                    .group_hover(SharedString::from(more_group), |style| style.opacity(1.0))
-                    .id(SharedString::from(format!("{selector}.{number}.more")))
-                    .debug_selector(move || format!("{selector}.{number}.more"))
-                    .tooltip(components::tooltip(ux.home_card_more))
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.open_host_menu(id, event, window, cx);
-                        }),
-                    ),
-            )
-    }
-
-    /// One top-level group as a card: its name, how much it holds and how much of it is
-    /// open. Pressing it narrows the list below to the group.
-    fn home_group_card(
-        &self,
-        group: &crate::app::hosts::GroupOverview,
-        number: usize,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let metrics = self.metrics();
-        let ux = copy::ux();
-        let count = if group.online > 0 {
-            copy::fill(
-                ux.home_group_count,
-                &[
-                    ("count", &group.records.to_string()),
-                    ("online", &group.online.to_string()),
-                ],
-            )
-        } else {
-            copy::fill(
-                ux.home_group_count_idle,
-                &[("count", &group.records.to_string())],
-            )
-        };
-        let narrowed = self.hosts.filter().group() == Some(&group.path);
-        let path = group.path.clone();
-        home_card_frame(metrics)
-            .id(SharedString::from(format!("home.group.{number}")))
-            .debug_selector(move || format!("home.group.{number}"))
-            .when(narrowed, |card| {
-                card.border_color(theme::faded(theme::swatch(palette::ACCENT), 0.6))
-            })
-            .tooltip(components::tooltip(ux.home_group_card_hint))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.pick_group_card(path.clone(), cx);
-            }))
-            // A group is a place rather than a machine: its tile is the accent block,
-            // where a host card shows the host's own initials.
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .size(metrics.scale(30.0))
-                    .rounded(px(radius::MEDIUM))
-                    .bg(super::brand_gradient())
-                    .child(icons::icon(
-                        Icon::Folder,
-                        metrics.small_icon_size(),
-                        theme::swatch(palette::ON_ACCENT),
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(metrics.scale(2.0))
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(metrics.label_size())
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .child(SharedString::from(group.path.to_canonical())),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .when(group.online > 0, |line| {
-                                line.text_color(Tone::Positive.text())
-                            })
-                            .child(SharedString::from(count)),
-                    ),
-            )
-    }
-
-    /// What the quick-connect bar found: saved records, the unsaved address and the
-    /// local shells, with the one Enter opens marked (R1).
-    fn quick_results_panel(&self, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        let ux = copy::ux();
-        let results = self.quick_results();
-        let highlight = self.quick_highlight();
-        // The results take the cards' place, so they are a card of their own: the
-        // same surface, edge and low elevation, holding one row per result.
-        let mut panel = components::card(metrics)
-            .gap(metrics.scale(1.0))
-            .p(metrics.scale(spacing::HAIRLINE))
-            .debug_selector(|| "home.quick.results".to_owned());
-        if results.is_empty() {
-            return panel.child(
-                div()
-                    .px(metrics.scale(spacing::TIGHT + 2.0))
-                    .py(metrics.scale(spacing::TIGHT))
-                    .text_size(metrics.label_size())
-                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .debug_selector(|| "home.quick.empty".to_owned())
-                    .child(ux.home_quick_empty),
-            );
-        }
-        let mut saved = 0usize;
-        for (number, result) in results.iter().enumerate() {
-            let (icon, title, detail, kind) = match result {
-                super::QuickResult::Saved(id) => {
-                    let Some(record) = self.book.connection(*id) else {
-                        continue;
-                    };
-                    let detail = format!("{} · {}", record.protocol().label(), record.target());
-                    let kind = format!("home.quick.saved.{saved}");
-                    saved += 1;
-                    (Icon::Plug, record.name().to_owned(), detail, kind)
-                }
-                super::QuickResult::Temporary(target) => (
-                    Icon::ArrowRight,
-                    copy::fill(ux.home_quick_temporary, &[("target", &target.label())]),
-                    ux.home_quick_temporary_hint.to_owned(),
-                    "home.quick.temporary".to_owned(),
-                ),
-                super::QuickResult::Shell(index) => {
-                    let Some(shell) = self.workspace.shells().get(*index) else {
-                        continue;
-                    };
-                    // The shell "+" opens says so, as the menus mark it.
-                    let mut detail = format!(
-                        "{} · {}",
-                        ux.home_quick_shell_hint,
-                        super::program_label(shell.program())
-                    );
-                    if *index == self.workspace.shell_choice() {
-                        detail.push_str(" · ");
-                        detail.push_str(self.strings().shell_default);
-                    }
-                    (
-                        Icon::Terminal,
-                        shell.name().to_owned(),
-                        detail,
-                        format!("home.quick.shell.{index}"),
-                    )
-                }
-            };
-            let lit = number == highlight;
-            let hover = theme::swatch(palette::SURFACE_HOVER);
-            panel = panel.child(
-                div()
-                    .id(SharedString::from(format!("home.quick.result.{number}")))
-                    .debug_selector(move || format!("home.quick.result.{number}"))
-                    .flex()
-                    .items_center()
-                    .gap(metrics.scale(spacing::SNUG))
-                    .min_h(metrics.scale(40.0))
-                    .px(metrics.scale(spacing::TIGHT + 2.0))
-                    .rounded(px(radius::MEDIUM))
-                    .cursor_pointer()
-                    .when(lit, |row| row.bg(theme::swatch(palette::SURFACE_SELECTED)))
-                    .when(!lit, |row| row.hover(move |style| style.bg(hover)))
-                    .on_click(cx.listener(move |this, _event, window, cx| {
-                        if this.run_quick_result(Some(number), window, cx) {
-                            this.clear_quick_bar(cx);
-                        }
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .size(metrics.scale(26.0))
-                            .rounded(px(radius::SMALL))
-                            .bg(theme::swatch(palette::ACCENT_TINT))
-                            .child(icons::icon(
-                                icon,
-                                metrics.small_icon_size(),
-                                theme::swatch(palette::ACCENT_ON_TINT),
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(metrics.label_size())
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                    .debug_selector(move || kind.clone())
-                                    .child(SharedString::from(title)),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(metrics.caption_size())
-                                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                                    .child(SharedString::from(detail)),
-                            ),
-                    )
-                    .when(lit, |row| {
-                        row.child(components::kbd(ux.home_quick_enter, metrics))
-                    }),
-            );
-        }
-        panel
     }
 
     // -----------------------------------------------------------------------
@@ -1912,117 +1754,180 @@ impl ShelluneView {
     }
 }
 
-/// The label of a list view, for the count line.
-fn view_label(view: crate::app::hosts::HostView, strings: &Strings) -> &'static str {
-    view.label(strings)
+/// The check that marks the current choice of a menu.
+fn menu_check(metrics: Metrics) -> gpui::Svg {
+    icons::icon(
+        Icon::Check,
+        metrics.small_icon_size(),
+        theme::swatch(palette::ACCENT),
+    )
 }
 
-/// One group header inside the list: the chevron, the name and the count.
-fn group_header_row(
-    group: &HostGroupRow,
-    number: usize,
-    row_height: gpui::Pixels,
-    metrics: Metrics,
-    strings: &'static Strings,
+/// The "connect to …" row on top of a search that reads as an address: one press, or
+/// Enter in the search, dials it without saving it (ADR-3).
+fn direct_row_element(
+    direct: &DirectRowView,
     weak: &WeakEntity<ShelluneView>,
+    row_height: Pixels,
+    metrics: Metrics,
+    ux: &'static UxStrings,
 ) -> Stateful<Div> {
-    // The hosts without a group are a place in the list like any group, and they are
-    // named as what they are instead of borrowing the "every group" label of the filter.
-    let label = group.path.as_ref().map_or_else(
-        || strings.hosts_ungrouped.to_owned(),
-        GroupPath::to_canonical,
-    );
-    let chevron = if group.expanded {
-        Icon::ChevronDown
+    let connect = weak.clone();
+    let state = if direct.enter {
+        ControlState::Selected
     } else {
-        Icon::ChevronRight
+        ControlState::Resting
     };
-    let toggled = weak.clone();
-    let path = group.path.clone();
-    let clicked = weak.clone();
-    let click_path = group.path.clone();
-    // A header is one row of the uniform list, so it keeps the row's height exactly
-    // and spans the list's width: a section divider the eye can follow, not a
-    // floating label. The bar sits at the bottom of its row, so the gap above it
-    // separates the group from the one before.
-    div()
+    components::list_row_frame(state, metrics)
         .h(row_height)
-        .w_full()
-        .id(SharedString::from(format!("hosts.group.row.{number}")))
-        .debug_selector(move || format!("hosts.group.{number}"))
-        .flex()
-        .items_end()
-        .pb(metrics.scale(spacing::HAIRLINE))
-        .child(
-            div()
-                .id(SharedString::from(format!("hosts.group.bar.{number}")))
-                .flex()
-                .flex_1()
-                .min_w_0()
-                .items_center()
-                .gap(metrics.scale(spacing::TIGHT))
-                .h(metrics.scale(32.0))
-                .pl(metrics.scale(spacing::HAIRLINE + group.depth as f32 * 14.0))
-                .pr(metrics.scale(spacing::TIGHT))
-                .border_b_1()
-                .border_color(theme::swatch(palette::BORDER))
-                // The whole header folds its group, not only the chevron.
-                .cursor_pointer()
-                .on_click(move |_event, _window, cx| {
-                    let path = click_path.clone();
-                    let _ = clicked.update(cx, |view, cx| view.toggle_group_row(path, cx));
-                })
-                .child(group_header_body(
-                    group, number, label, chevron, path, toggled, metrics,
-                )),
-        )
+        .id("hosts.direct")
+        .debug_selector(|| "hosts.direct".to_owned())
+        .cursor_pointer()
+        .on_click(move |_event, window, cx| {
+            let _ = connect.update(cx, |view, cx| view.connect_home_direct(false, window, cx));
+        })
+        .child(components::leading_icon(
+            Icon::ArrowRight,
+            Tone::Accent,
+            metrics,
+        ))
+        .child(row_text(
+            direct.title.clone(),
+            direct.hint.clone(),
+            false,
+            None,
+            metrics,
+        ))
+        .when(direct.enter, |row| {
+            row.child(components::kbd(ux.home_quick_enter, metrics))
+        })
 }
 
-/// The chevron, name and count of a group header.
-fn group_header_body(
-    group: &HostGroupRow,
-    number: usize,
-    label: String,
-    chevron: Icon,
-    path: Option<GroupPath>,
-    toggled: WeakEntity<ShelluneView>,
+/// The two lines of a row: the name with what is said beside it, and the address, each
+/// ending in an ellipsis where the row is too narrow.
+fn row_text(
+    title: SharedString,
+    subtitle: SharedString,
+    monospace: bool,
+    beside_title: Option<AnyElement>,
     metrics: Metrics,
 ) -> Div {
     div()
         .flex()
+        .flex_col()
         .flex_1()
-        .min_w_0()
-        .items_center()
-        .gap(metrics.scale(spacing::TIGHT))
-        .child(
-            components::icon_only_button(chevron, metrics)
-                .size(metrics.scale(18.0))
-                .id(SharedString::from(format!("hosts.group.{number}.toggle")))
-                .debug_selector(move || format!("hosts.group.{number}.toggle"))
-                .on_click(move |_event, _window, cx| {
-                    cx.stop_propagation();
-                    let path = path.clone();
-                    let _ = toggled.update(cx, |view, cx| view.toggle_group_row(path, cx));
-                }),
-        )
+        .min_w(metrics.scale(ROW_TEXT_MIN_WIDTH))
+        .gap(metrics.scale(spacing::HALF))
         .child(
             div()
-                .flex_1()
+                .flex()
+                .items_center()
+                .gap(metrics.scale(spacing::NARROW))
                 .min_w_0()
-                .truncate()
-                .text_size(metrics.label_size())
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                .child(SharedString::from(label)),
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(metrics.body_size())
+                        .font_weight(metrics.medium_weight())
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .child(components::line_text(title)),
+                )
+                .children(beside_title),
         )
-        .child(components::badge(group.hosts, Tone::Neutral, metrics))
+        .child(
+            div().flex().min_w_0().child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .when(monospace, |line| {
+                        line.font_family(crate::app::terminal::monospace_family())
+                    })
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .child(components::line_text(subtitle)),
+            ),
+        )
 }
 
-/// One host inside the list: who it is, what it dials, its group and what can be done.
+/// The quiet facts at a row's right end: the group tag, when it was last reached and
+/// the state dot.
+///
+/// The dot is drawn only while this window holds a running session to the record: a
+/// record that was only saved has no state to show, and an "offline" it never had would
+/// be a guess (R2). Its place is kept either way, so the columns line up.
+fn row_meta(
+    number: usize,
+    prefix: &'static str,
+    group: Option<SharedString>,
+    last: Option<(SharedString, SharedString)>,
+    open: bool,
+    metrics: Metrics,
+    ux: &'static UxStrings,
+) -> Div {
+    let dot = div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(metrics.small_icon_size());
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(metrics.scale(spacing::TIGHT))
+        .children(group.map(|group| {
+            components::tag(group, metrics).debug_selector(move || format!("{prefix}.tag.{number}"))
+        }))
+        .children(last.map(|(last, exact)| {
+            div()
+                .id(SharedString::from(format!("{prefix}.last.{number}")))
+                .debug_selector(move || format!("{prefix}.last.{number}"))
+                .flex_none()
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .tooltip(components::tooltip(exact))
+                .child(last)
+        }))
+        .child(if open {
+            dot.id(SharedString::from(format!("{prefix}.state.{number}")))
+                .debug_selector(move || format!("{prefix}.state.{number}"))
+                .tooltip(components::tooltip(ux.hosts_status_connected))
+                .child(components::status_dot(Tone::Positive, metrics))
+                .into_any_element()
+        } else {
+            dot.into_any_element()
+        })
+}
+
+/// The commands a row reveals under the pointer and on the keyboard's row.
+fn row_tools() -> Div {
+    div().flex().flex_none().items_center().gap(px(0.0))
+}
+
+/// The place the tools stand in: it gives way before the name does, so a narrow or
+/// zoomed window clips the quiet icons from the left and keeps the name and the
+/// Connect button at the end; everything stays on the record's right-press menu.
+fn row_tools_slot(tools: Div, cursor: bool) -> Div {
+    div()
+        .flex()
+        .flex_shrink()
+        .justify_end()
+        .min_w_0()
+        .overflow_hidden()
+        .when(!cursor, |slot| {
+            slot.opacity(0.0)
+                .group_hover(components::ROW_GROUP, |style| style.opacity(1.0))
+        })
+        .child(tools)
+}
+
+/// One host inside the list: who it is, what it dials, its group, when it was reached,
+/// its state, and what can be done with it.
 fn host_row_element(
     host: &HostRowView,
     weak: &WeakEntity<ShelluneView>,
-    row_height: gpui::Pixels,
+    row_height: Pixels,
     prefix: &'static str,
     metrics: Metrics,
     strings: &'static Strings,
@@ -2032,50 +1937,127 @@ fn host_row_element(
     let id = host.id;
     let selected = host.selected;
     let cursor = host.cursor;
-    let show_duplicate = host.show_duplicate;
-    let hover = theme::swatch(palette::SURFACE_HOVER);
     let pick = weak.clone();
     let connect = weak.clone();
-    let forwards = weak.clone();
     let edit = weak.clone();
     let duplicate = weak.clone();
     let delete = weak.clone();
     let open_row = weak.clone();
     let menu_row = weak.clone();
-    // A row is a line on the page, not a card: the list reads as one surface and the
-    // pointer, the selection and the keyboard are what lift a row out of it.
-    let mut row = div()
+    let state = if cursor {
+        ControlState::Selected
+    } else {
+        ControlState::Resting
+    };
+    // The checkbox shares the avatar's place, as in a mail client: the avatar shows at
+    // rest, and the box takes its place under the pointer, on the keyboard's row, or
+    // once a selection has started - so picking hosts costs the list no column of empty
+    // boxes.
+    let picking = selected || cursor || host.selecting;
+    let avatar = super::host_avatar(host.name.as_ref(), selected, metrics);
+    let leading = div()
+        .relative()
+        .flex_none()
+        .child(if picking {
+            avatar.opacity(0.0)
+        } else {
+            avatar.group_hover(components::ROW_GROUP, |style| style.opacity(0.0))
+        })
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    components::checkbox_target(selected, metrics)
+                        .when(!picking, |boxed| {
+                            boxed
+                                .opacity(0.0)
+                                .group_hover(components::ROW_GROUP, |style| style.opacity(1.0))
+                        })
+                        .id(SharedString::from(format!("hosts.select.{number}")))
+                        .debug_selector(move || format!("hosts.select.{number}"))
+                        .tooltip(components::tooltip(ux.hosts_select_start))
+                        .on_click(move |_event, _window, cx| {
+                            cx.stop_propagation();
+                            let _ = pick.update(cx, |view, cx| view.toggle_host_selection(id, cx));
+                        }),
+                ),
+        );
+    let beside = host.key_missing.clone().map(|(label, tip)| {
+        div()
+            .id(SharedString::from(format!("hosts.key-missing.{number}")))
+            .debug_selector(move || format!("hosts.key-missing.{number}"))
+            .flex_none()
+            .tooltip(components::tooltip(tip))
+            .child(components::chip(label, Tone::Warning, metrics))
+            .into_any_element()
+    });
+    let last = host
+        .last
+        .clone()
+        .map(|last| (last, host.last_exact.clone().unwrap_or_default()));
+
+    // The tools of a host are quiet icons and the one thing a row is for - connecting -
+    // is the labelled button at its end. Every press stops at its button, so a quick
+    // double press on an icon never also opens the host underneath it.
+    let tools = row_tools()
+        .child(
+            components::icon_only_button(Icon::Pencil, metrics)
+                .id(SharedString::from(format!("hosts.edit.{number}")))
+                .debug_selector(move || format!("hosts.edit.{number}"))
+                .tooltip(components::tooltip(strings.host_edit))
+                .on_click(move |_event, _window, cx| {
+                    cx.stop_propagation();
+                    let _ = edit.update(cx, |view, cx| view.edit_saved_host(id, cx));
+                }),
+        )
+        .when(host.show_duplicate, |tools| {
+            tools.child(
+                components::icon_only_button(Icon::Copy, metrics)
+                    .id(SharedString::from(format!("hosts.duplicate.{number}")))
+                    .debug_selector(move || format!("hosts.duplicate.{number}"))
+                    .tooltip(components::tooltip(strings.connection_duplicate))
+                    .on_click(move |_event, _window, cx| {
+                        cx.stop_propagation();
+                        let _ = duplicate
+                            .update(cx, |view, cx| view.duplicate_saved_connection(id, cx));
+                    }),
+            )
+        })
+        .child(
+            components::danger_icon_button(Icon::Trash, metrics)
+                .id(SharedString::from(format!("hosts.delete.{number}")))
+                .debug_selector(move || format!("hosts.delete.{number}"))
+                .tooltip(components::tooltip(strings.host_delete))
+                .on_click(move |_event, _window, cx| {
+                    cx.stop_propagation();
+                    let _ = delete.update(cx, |view, cx| view.ask_delete_host(id, cx));
+                }),
+        )
+        .child(
+            div().pl(metrics.scale(spacing::HALF)).child(
+                components::compact_button(strings.remote_connect, Variant::Primary, metrics)
+                    .id(SharedString::from(format!("hosts.connect.{number}")))
+                    .debug_selector(move || format!("hosts.connect.{number}"))
+                    .tooltip(components::tooltip(ux.hosts_connect_hint))
+                    .on_click(move |_event, _window, cx| {
+                        cx.stop_propagation();
+                        let _ = connect.update(cx, |view, cx| view.connect_saved_host(id, cx));
+                    }),
+            ),
+        );
+
+    components::list_row_frame(state, metrics)
+        .h(row_height)
         .id(SharedString::from(format!("hosts.row.id.{number}")))
         .debug_selector(move || format!("{prefix}.{number}"))
-        .group("host-row")
-        .h(row_height)
-        .flex()
-        .items_center()
-        .gap(metrics.scale(spacing::SNUG))
-        .w_full()
-        .min_w_0()
-        .px(metrics.scale(spacing::SNUG))
-        .rounded(px(radius::MEDIUM))
-        .border_1()
         // A picked row is a soft tint: picked rows sit next to each other, and an
-        // outline on each of them stacked into a grid of borders.
-        .when(selected && !cursor, |row| {
-            row.bg(theme::swatch(palette::ACCENT_TINT))
-                .border_color(theme::clear())
-        })
-        .when(selected && cursor, |row| {
-            row.bg(theme::swatch(palette::ACCENT_TINT))
-                .border_color(theme::faded(theme::swatch(palette::ACCENT), 0.5))
-        })
-        .when(!selected && cursor, |row| {
-            row.bg(theme::swatch(palette::SURFACE_SELECTED))
-                .border_color(theme::faded(theme::swatch(palette::ACCENT), 0.5))
-        })
-        .when(!selected && !cursor, |row| {
-            row.border_color(theme::clear())
-                .hover(move |style| style.bg(hover))
-        })
-        // A single click points at the row; a double click opens it; a right click
+        // outline on each of them would stack into a grid of borders.
+        .when(selected, |row| row.bg(theme::swatch(palette::ACCENT_TINT)))
+        // A single press points at the row; a double press opens it; a right press
         // offers every action on the record.
         .on_click(move |event, _window, cx| {
             if event.click_count() >= 2 {
@@ -2091,217 +2073,32 @@ fn host_row_element(
                 let _ = menu_row.update(cx, |view, cx| view.open_host_menu(id, event, window, cx));
             },
         )
-        // The checkbox shares the avatar's place, as in a mail client: the avatar
-        // shows at rest, and the box takes its place under the pointer, on the
-        // keyboard's row, or once a selection has started - so picking hosts costs
-        // the list no column of empty boxes.
-        .child({
-            let picking = selected || cursor || host.selecting;
-            let avatar = super::host_avatar(host.name.as_ref(), selected, metrics);
-            div()
-                .relative()
-                .flex_none()
-                .size(metrics.scale(36.0))
-                .child(if picking {
-                    avatar.opacity(0.0)
-                } else {
-                    avatar.group_hover("host-row", |style| style.opacity(0.0))
-                })
-                .child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            components::checkbox_target(selected, metrics)
-                                .when(!picking, |boxed| {
-                                    boxed
-                                        .opacity(0.0)
-                                        .group_hover("host-row", |style| style.opacity(1.0))
-                                })
-                                .id(SharedString::from(format!("hosts.select.{number}")))
-                                .debug_selector(move || format!("hosts.select.{number}"))
-                                .tooltip(components::tooltip(ux.hosts_select_start))
-                                .on_click(move |_event, _window, cx| {
-                                    cx.stop_propagation();
-                                    let _ = pick
-                                        .update(cx, |view, cx| view.toggle_host_selection(id, cx));
-                                }),
-                        ),
-                )
-        })
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w_0()
-                .gap(metrics.scale(2.0))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-                        .min_w_0()
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(metrics.body_size())
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                .child(host.name.clone()),
-                        )
-                        .when(host.open, |line| {
-                            line.child(components::chip(
-                                ux.hosts_status_connected,
-                                Tone::Positive,
-                                metrics,
-                            ))
-                        })
-                        .when_some(host.key_missing.clone(), |line, (label, tip)| {
-                            line.child(
-                                div()
-                                    .id(SharedString::from(format!("hosts.key-missing.{number}")))
-                                    .debug_selector(move || format!("hosts.key-missing.{number}"))
-                                    .flex_none()
-                                    .tooltip(components::tooltip(tip))
-                                    .child(components::chip(label, Tone::Warning, metrics)),
-                            )
-                        }),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-                        .min_w_0()
-                        .child(
-                            components::copy_on_click(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .font_family(crate::app::terminal::monospace_family())
-                                    .text_size(metrics.caption_size())
-                                    .text_color(theme::swatch(palette::TEXT_MUTED)),
-                                host.target.to_string(),
-                            )
-                            .child(host.target.clone()),
-                        )
-                        .children(host.last.clone().map(|last| {
-                            let exact = host.last_exact.clone().unwrap_or_default();
-                            div()
-                                .id(SharedString::from(format!("hosts.last.{number}")))
-                                .truncate()
-                                .min_w_0()
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .tooltip(components::tooltip(exact))
-                                .child(SharedString::from(format!("· {last}")))
-                        })),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(metrics.scale(spacing::HAIRLINE))
-                .children(host.group.clone().map(|group| {
-                    components::tag(group, metrics)
-                        .id(SharedString::from(format!("hosts.group.tag.{number}")))
-                })),
-        );
-
-    // The tools of a host are quiet icons; the one thing a row is for - connecting - is
-    // the labelled button at its end. Every press stops at its button, so a quick
-    // double press on an icon never also opens the host underneath it.
-    // They appear with the pointer or the keyboard cursor, so a list at rest shows
-    // names and the one labelled action, not a column of tool icons per host.
-    let tools = div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .gap(metrics.scale(2.0))
-        .when(!cursor, |tools| {
-            tools
-                .opacity(0.0)
-                .group_hover("host-row", |style| style.opacity(1.0))
-        })
-        .child(
-            components::icon_only_button(Icon::Forward, metrics)
-                .size(metrics.scale(26.0))
-                .id(SharedString::from(format!("hosts.forwards.{number}")))
-                .debug_selector(move || format!("hosts.forwards.{number}"))
-                .tooltip(components::tooltip(strings.forward_open))
-                .on_click(move |_event, _window, cx| {
-                    cx.stop_propagation();
-                    let _ = forwards.update(cx, |view, cx| view.open_saved_forwards(id, cx));
-                }),
-        )
-        .child(
-            components::icon_only_button(Icon::Pencil, metrics)
-                .size(metrics.scale(26.0))
-                .id(SharedString::from(format!("hosts.edit.{number}")))
-                .debug_selector(move || format!("hosts.edit.{number}"))
-                .tooltip(components::tooltip(strings.host_edit))
-                .on_click(move |_event, _window, cx| {
-                    cx.stop_propagation();
-                    let _ = edit.update(cx, |view, cx| view.edit_saved_host(id, cx));
-                }),
-        )
-        .when(show_duplicate, |tools| {
-            tools.child(
-                components::icon_only_button(Icon::Copy, metrics)
-                    .size(metrics.scale(26.0))
-                    .id(SharedString::from(format!("hosts.duplicate.{number}")))
-                    .debug_selector(move || format!("hosts.duplicate.{number}"))
-                    .tooltip(components::tooltip(strings.connection_duplicate))
-                    .on_click(move |_event, _window, cx| {
-                        cx.stop_propagation();
-                        let _ = duplicate
-                            .update(cx, |view, cx| view.duplicate_saved_connection(id, cx));
-                    }),
-            )
-        })
-        .child(
-            components::danger_icon_button(Icon::Trash, metrics)
-                .size(metrics.scale(26.0))
-                .id(SharedString::from(format!("hosts.delete.{number}")))
-                .debug_selector(move || format!("hosts.delete.{number}"))
-                .tooltip(components::tooltip(strings.host_delete))
-                .on_click(move |_event, _window, cx| {
-                    cx.stop_propagation();
-                    let _ = delete.update(cx, |view, cx| view.ask_delete_host(id, cx));
-                }),
-        );
-    row = row.child(favorite_star(
-        host.favorite,
-        cursor,
-        format!("hosts.favorite.{number}"),
-        id,
-        weak,
-        metrics,
-    ));
-    row = row.child(tools);
-    row.child(
-        components::icon_label_button(
-            Icon::Plug,
-            strings.remote_connect,
-            Variant::Secondary,
+        .child(leading)
+        .child(row_text(
+            host.name.clone(),
+            host.target.clone(),
+            true,
+            beside,
             metrics,
-        )
-        .h(metrics.compact_control_height())
-        .text_size(metrics.caption_size())
-        .id(SharedString::from(format!("hosts.connect.{number}")))
-        .debug_selector(move || format!("hosts.connect.{number}"))
-        .tooltip(components::tooltip(ux.hosts_connect_hint))
-        .on_click(move |_event, _window, cx| {
-            cx.stop_propagation();
-            let _ = connect.update(cx, |view, cx| view.connect_saved_host(id, cx));
-        }),
-    )
+        ))
+        .child(row_meta(
+            number,
+            "hosts",
+            host.group.clone(),
+            last,
+            host.open,
+            metrics,
+            ux,
+        ))
+        .child(favorite_star(
+            host.favorite,
+            cursor,
+            format!("hosts.favorite.{number}"),
+            id,
+            weak,
+            metrics,
+        ))
+        .child(row_tools_slot(tools, cursor))
 }
 
 /// One saved connection of another protocol inside the list.
@@ -2314,41 +2111,82 @@ fn host_row_element(
 fn connection_row_element(
     connection: &ConnectionRowView,
     weak: &WeakEntity<ShelluneView>,
-    row_height: gpui::Pixels,
+    row_height: Pixels,
     metrics: Metrics,
     strings: &'static Strings,
+    ux: &'static UxStrings,
 ) -> Stateful<Div> {
     let number = connection.number;
     let id = connection.id;
     let cursor = connection.cursor;
-    let hover = theme::swatch(palette::SURFACE_HOVER);
     let edit = weak.clone();
     let connect = weak.clone();
     let open_row = weak.clone();
     let menu_row = weak.clone();
     let copy = weak.clone();
     let delete = weak.clone();
-    div()
+    let state = if cursor {
+        ControlState::Selected
+    } else {
+        ControlState::Resting
+    };
+    let protocol = components::tag(connection.protocol.clone(), metrics).into_any_element();
+    let tools = row_tools()
+        .child(
+            components::icon_only_button(Icon::Pencil, metrics)
+                .id(SharedString::from(format!(
+                    "hosts.connection.edit.{number}"
+                )))
+                .debug_selector(move || format!("hosts.connection.edit.{number}"))
+                .tooltip(components::tooltip(strings.host_edit))
+                .on_click(move |_event, _window, cx| {
+                    cx.stop_propagation();
+                    let _ = edit.update(cx, |view, cx| view.edit_saved_connection(id, cx));
+                }),
+        )
+        .child(
+            components::icon_only_button(Icon::Copy, metrics)
+                .id(SharedString::from(format!(
+                    "hosts.connection.copy.{number}"
+                )))
+                .debug_selector(move || format!("hosts.connection.copy.{number}"))
+                .tooltip(components::tooltip(strings.connection_duplicate))
+                .on_click(move |_event, _window, cx| {
+                    cx.stop_propagation();
+                    let _ = copy.update(cx, |view, cx| view.duplicate_saved_connection(id, cx));
+                }),
+        )
+        .child(
+            components::danger_icon_button(Icon::Trash, metrics)
+                .id(SharedString::from(format!(
+                    "hosts.connection.delete.{number}"
+                )))
+                .debug_selector(move || format!("hosts.connection.delete.{number}"))
+                .tooltip(components::tooltip(strings.connection_delete))
+                .on_click(move |_event, _window, cx| {
+                    cx.stop_propagation();
+                    let _ = delete.update(cx, |view, cx| view.ask_delete_host(id, cx));
+                }),
+        )
+        .child(
+            div().pl(metrics.scale(spacing::HALF)).child(
+                components::compact_button(strings.remote_connect, Variant::Primary, metrics)
+                    .id(SharedString::from(format!(
+                        "hosts.connection.connect.{number}"
+                    )))
+                    .debug_selector(move || format!("hosts.connection.connect.{number}"))
+                    .tooltip(components::tooltip(ux.hosts_connect_hint))
+                    .on_click(move |_event, _window, cx| {
+                        cx.stop_propagation();
+                        let _ =
+                            connect.update(cx, |view, cx| view.connect_saved_connection(id, cx));
+                    }),
+            ),
+        );
+    components::list_row_frame(state, metrics)
+        .h(row_height)
         .id(SharedString::from(format!("hosts.connection.id.{number}")))
         .debug_selector(move || format!("hosts.connection.{number}"))
-        .group("host-row")
-        .h(row_height)
-        .flex()
-        .items_center()
-        .gap(metrics.scale(spacing::SNUG))
-        .w_full()
-        .min_w_0()
-        .px(metrics.scale(spacing::SNUG))
-        .rounded(px(radius::MEDIUM))
-        .border_1()
-        .when(cursor, |row| {
-            row.bg(theme::swatch(palette::SURFACE_SELECTED))
-                .border_color(theme::faded(theme::swatch(palette::ACCENT), 0.5))
-        })
-        .when(!cursor, |row| {
-            row.border_color(theme::clear())
-                .hover(move |style| style.bg(hover))
-        })
         // A single press points at the row; a double press connects it; a right press
         // opens the record's menu.
         .on_click(move |event, _window, cx| {
@@ -2366,68 +2204,23 @@ fn connection_row_element(
             },
         )
         .child(super::host_avatar(connection.name.as_ref(), false, metrics))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w_0()
-                .gap(metrics.scale(2.0))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-                        .min_w_0()
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(metrics.body_size())
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                .child(connection.name.clone()),
-                        )
-                        .child(components::tag(connection.protocol.clone(), metrics))
-                        // A running session of this record says so, exactly as a host
-                        // row does, and a record that was only saved says nothing (R2).
-                        .when(connection.open, |line| {
-                            line.child(
-                                components::chip(
-                                    copy::ux().hosts_status_connected,
-                                    Tone::Positive,
-                                    metrics,
-                                )
-                                .debug_selector(move || format!("hosts.connection.open.{number}")),
-                            )
-                        }),
-                )
-                .child(
-                    div().flex().items_center().min_w_0().child(
-                        components::copy_on_click(
-                            div()
-                                .truncate()
-                                .font_family(crate::app::terminal::monospace_family())
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_MUTED)),
-                            connection.target.to_string(),
-                        )
-                        .child(connection.target.clone()),
-                    ),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(metrics.scale(spacing::HAIRLINE))
-                .children(
-                    connection
-                        .group
-                        .clone()
-                        .map(|group| components::tag(group, metrics)),
-                ),
-        )
+        .child(row_text(
+            connection.name.clone(),
+            connection.target.clone(),
+            true,
+            Some(protocol),
+            metrics,
+        ))
+        // A running session of this record says so, exactly as a host row does (R2).
+        .child(row_meta(
+            number,
+            "hosts.connection",
+            connection.group.clone(),
+            None,
+            connection.open,
+            metrics,
+            ux,
+        ))
         .child(favorite_star(
             connection.favorite,
             cursor,
@@ -2436,150 +2229,7 @@ fn connection_row_element(
             weak,
             metrics,
         ))
-        .child(
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(metrics.scale(2.0))
-                .when(!cursor, |tools| {
-                    tools
-                        .opacity(0.0)
-                        .group_hover("host-row", |style| style.opacity(1.0))
-                })
-                .child(
-                    components::icon_only_button(Icon::Pencil, metrics)
-                        .size(metrics.scale(26.0))
-                        .id(SharedString::from(format!(
-                            "hosts.connection.edit.{number}"
-                        )))
-                        .debug_selector(move || format!("hosts.connection.edit.{number}"))
-                        .tooltip(components::tooltip(strings.host_edit))
-                        .on_click(move |_event, _window, cx| {
-                            cx.stop_propagation();
-                            let _ = edit.update(cx, |view, cx| view.edit_saved_connection(id, cx));
-                        }),
-                )
-                .child(
-                    components::icon_only_button(Icon::Copy, metrics)
-                        .size(metrics.scale(26.0))
-                        .id(SharedString::from(format!(
-                            "hosts.connection.copy.{number}"
-                        )))
-                        .debug_selector(move || format!("hosts.connection.copy.{number}"))
-                        .tooltip(components::tooltip(strings.connection_duplicate))
-                        .on_click(move |_event, _window, cx| {
-                            cx.stop_propagation();
-                            let _ =
-                                copy.update(cx, |view, cx| view.duplicate_saved_connection(id, cx));
-                        }),
-                )
-                .child(
-                    components::danger_icon_button(Icon::Trash, metrics)
-                        .size(metrics.scale(26.0))
-                        .id(SharedString::from(format!(
-                            "hosts.connection.delete.{number}"
-                        )))
-                        .debug_selector(move || format!("hosts.connection.delete.{number}"))
-                        .tooltip(components::tooltip(strings.connection_delete))
-                        .on_click(move |_event, _window, cx| {
-                            cx.stop_propagation();
-                            let _ = delete.update(cx, |view, cx| view.ask_delete_host(id, cx));
-                        }),
-                ),
-        )
-        .child(
-            components::icon_label_button(
-                Icon::Plug,
-                strings.remote_connect,
-                Variant::Secondary,
-                metrics,
-            )
-            .h(metrics.compact_control_height())
-            .text_size(metrics.caption_size())
-            .id(SharedString::from(format!(
-                "hosts.connection.connect.{number}"
-            )))
-            .debug_selector(move || format!("hosts.connection.connect.{number}"))
-            .tooltip(components::tooltip(
-                crate::app::copy::ux().hosts_connect_hint,
-            ))
-            .on_click(move |_event, _window, cx| {
-                cx.stop_propagation();
-                let _ = connect.update(cx, |view, cx| view.connect_saved_connection(id, cx));
-            }),
-        )
-}
-
-/// The frame of one row of the group column, chosen or not.
-fn tree_row_frame(chosen: bool, metrics: Metrics) -> Div {
-    let hover = theme::swatch(palette::SURFACE_HOVER);
-    div()
-        .flex()
-        .items_center()
-        .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-        .min_h(metrics.scale(28.0))
-        .pr(metrics.scale(spacing::TIGHT))
-        .rounded(px(radius::SMALL))
-        .cursor_pointer()
-        .when(chosen, |row| {
-            row.bg(theme::swatch(palette::SURFACE_SELECTED))
-        })
-        .when(!chosen, |row| row.hover(move |style| style.bg(hover)))
-}
-
-/// The name in a row of the group column.
-fn tree_row_label(label: String, chosen: bool, metrics: Metrics) -> Div {
-    div()
-        .flex_1()
-        .min_w_0()
-        .truncate()
-        .text_size(metrics.label_size())
-        .when(chosen, |label| label.font_weight(FontWeight::MEDIUM))
-        .text_color(theme::swatch(if chosen {
-            palette::TEXT_PRIMARY
-        } else {
-            palette::TEXT_SECONDARY
-        }))
-        .child(SharedString::from(label))
-}
-
-/// The target a card draws: the SSH default port is left out, so the address keeps
-/// the room.
-#[must_use]
-pub(crate) fn card_target_text(target: &str, ssh: bool) -> String {
-    if ssh && let Some(stripped) = target.strip_suffix(":22") {
-        return stripped.to_owned();
-    }
-    target.to_owned()
-}
-
-/// The tooltip of a record card: the whole target, then what a press does.
-#[must_use]
-pub(crate) fn card_tooltip(target: &str, hint: &str) -> String {
-    format!("{target} · {hint}")
-}
-
-/// The frame of one dashboard card: the shared [`components::card`] laid out as a row,
-/// resting at the low elevation and lifted to the mid one under the pointer (R4).
-///
-/// GPUI has no hover transition, so the lift is immediate; the stronger edge comes with
-/// it, so the card under the pointer reads in both palettes even where a shadow is faint.
-fn home_card_frame(metrics: Metrics) -> Div {
-    let hover_border = theme::swatch(palette::BORDER_STRONG);
-    components::card(metrics)
-        .flex_row()
-        .items_center()
-        .w_full()
-        .gap(metrics.scale(spacing::SNUG - 2.0))
-        .px(metrics.scale(spacing::SNUG))
-        .py(metrics.scale(spacing::TIGHT))
-        .cursor_pointer()
-        .hover(move |style| {
-            style
-                .border_color(hover_border)
-                .elevation(Elevation::Overlay)
-        })
+        .child(row_tools_slot(tools, cursor))
 }
 
 /// The favourite mark of a row: a filled star that stays in view on a favourite, an
@@ -2609,7 +2259,7 @@ fn favorite_star(
         .hover(move |style| style.bg(hover))
         .when(!favorite && !cursor, |star| {
             star.opacity(0.0)
-                .group_hover("host-row", |style| style.opacity(1.0))
+                .group_hover(components::ROW_GROUP, |style| style.opacity(1.0))
         })
         .child(icons::icon(
             if favorite {
@@ -2635,30 +2285,4 @@ fn favorite_star(
             cx.stop_propagation();
             let _ = toggled.update(cx, |view, cx| view.toggle_favorite(id, cx));
         })
-}
-
-#[cfg(test)]
-mod card_tests {
-    use super::{card_target_text, card_tooltip};
-
-    #[test]
-    fn a_card_leaves_out_the_ssh_default_port_and_the_tooltip_keeps_it() {
-        assert_eq!(
-            card_target_text("deploy@192.0.2.24:22", true),
-            "deploy@192.0.2.24"
-        );
-        assert_eq!(
-            card_target_text("deploy@192.0.2.24:2222", true),
-            "deploy@192.0.2.24:2222",
-            "another port is part of the address"
-        );
-        assert_eq!(
-            card_target_text("10.0.0.7:22", false),
-            "10.0.0.7:22",
-            "a desktop on port 22 is not an SSH default"
-        );
-        assert!(
-            card_tooltip("deploy@192.0.2.24:22", "Connect").starts_with("deploy@192.0.2.24:22")
-        );
-    }
 }

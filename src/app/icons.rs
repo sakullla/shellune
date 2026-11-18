@@ -120,11 +120,15 @@ pub enum Icon {
     /// A ring with ticks on its four sides: the remote files follow the terminal's
     /// directory.
     Follow,
+    /// A clock face: what was reached recently.
+    Clock,
+    /// A funnel: narrow and order a list.
+    Filter,
 }
 
 impl Icon {
     /// Every icon, for the asset listing and the tests.
-    pub const ALL: [Self; 51] = [
+    pub const ALL: [Self; 53] = [
         Self::Terminal,
         Self::Server,
         Self::Layers,
@@ -176,6 +180,8 @@ impl Icon {
         Self::StarFilled,
         Self::TabList,
         Self::Follow,
+        Self::Clock,
+        Self::Filter,
     ];
 
     /// The asset path GPUI asks the source for.
@@ -232,6 +238,8 @@ impl Icon {
             Self::StarFilled => "icons/star-filled.svg",
             Self::TabList => "icons/tab-list.svg",
             Self::Follow => "icons/follow.svg",
+            Self::Clock => "icons/clock.svg",
+            Self::Filter => "icons/filter.svg",
         }
     }
 
@@ -357,6 +365,8 @@ impl Icon {
             Self::Follow => {
                 r#"<circle cx="12" cy="12" r="6.5"/><circle cx="12" cy="12" r="2"/><path d="M12 2.5v3"/><path d="M12 18.5v3"/><path d="M2.5 12h3"/><path d="M18.5 12h3"/>"#
             }
+            Self::Clock => r#"<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>"#,
+            Self::Filter => r#"<path d="M4 5.5h16l-6.2 7.3V18l-3.6 1.8v-7z"/>"#,
         }
     }
 

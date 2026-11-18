@@ -2220,59 +2220,6 @@ pub fn empty_state(
         }))
 }
 
-/// How much later each object of a group fades in than the one before it.
-pub const TURN_DELAY: Duration = Duration::from_millis(40);
-
-/// The last turn that waits longer than the one before it: a long group does not keep
-/// its tail waiting, everything after this turn arrives with it.
-pub const LAST_TURN: usize = 6;
-
-/// When the `turn`-th object of a group starts to fade in, and when it is fully there.
-#[must_use]
-pub fn turn_timing(turn: usize) -> (Duration, Duration) {
-    let delay = TURN_DELAY * u32::try_from(turn.min(LAST_TURN)).unwrap_or(0);
-    (delay, delay + Enter::Rise.duration())
-}
-
-/// The curve of the `turn`-th object of a group, over the whole of its [`turn_timing`]:
-/// zero while it waits for its turn, then the shared entrance curve over the fade.
-pub fn turn_curve(turn: usize) -> impl Fn(f32) -> f32 {
-    let (delay, total) = turn_timing(turn);
-    let start = delay.as_secs_f32() / total.as_secs_f32();
-    let ease = theme::ease_out();
-    move |progress| {
-        if progress <= start {
-            0.0
-        } else {
-            ease(((progress - start) / (1.0 - start)).min(1.0))
-        }
-    }
-}
-
-/// Fades a group of objects in one after another - the home page's cards - when motion
-/// is allowed (R4).
-///
-/// Each object waits [`TURN_DELAY`] longer than the one before it, then fades in over
-/// the card entrance time. Only the opacity moves: the object takes its place, its
-/// size and its pointer target from the first frame, so a press during the entrance
-/// lands where the eye expects it. Under reduced motion it is drawn as it ends.
-pub fn enter_in_turn<E>(element: E, id: impl Into<ElementId>, turn: usize) -> AnyElement
-where
-    E: IntoElement + Styled + 'static,
-{
-    if !theme::motion_allowed() {
-        return element.into_any_element();
-    }
-    let (_, total) = turn_timing(turn);
-    element
-        .with_animation(
-            id,
-            Animation::new(total).with_easing(turn_curve(turn)),
-            |element, delta| element.opacity(delta),
-        )
-        .into_any_element()
-}
-
 /// The pieces of one centred dialog.
 ///
 /// The subtitle is its own piece and is drawn at the top of the scrolling body.
@@ -2508,7 +2455,15 @@ pub fn search_field(
         metrics.small_icon_size(),
         theme::swatch(palette::TEXT_MUTED),
     ))
-    .child(div().flex().flex_1().min_w_0().child(field))
+    .child(
+        div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .items_center()
+            .child(field),
+    )
     .children(clear)
     .children(shortcut.map(|shortcut| kbd(shortcut, metrics)))
 }
@@ -3744,38 +3699,5 @@ mod tests {
         assert!(cx.debug_bounds("progress.still").is_some());
         assert!(cx.debug_bounds("progress.indeterminate").is_none());
         theme::set_motion(theme::Motion::Full);
-    }
-
-    #[test]
-    fn a_group_fades_in_one_after_another_and_every_turn_ends_fully_there() {
-        // The first object starts at once; each later one waits its turn, and a long
-        // group stops waiting at the last turn.
-        assert_eq!(turn_timing(0).0, Duration::ZERO);
-        for turn in 1..=LAST_TURN {
-            assert!(turn_timing(turn).0 > turn_timing(turn - 1).0, "turn {turn}");
-            assert_eq!(
-                turn_timing(turn).1 - turn_timing(turn).0,
-                Enter::Rise.duration(),
-                "every turn fades over the card entrance time"
-            );
-        }
-        assert_eq!(turn_timing(LAST_TURN + 5), turn_timing(LAST_TURN));
-        assert!(turn_timing(LAST_TURN).1 <= Duration::from_millis(500));
-
-        for turn in 0..=LAST_TURN + 1 {
-            let curve = turn_curve(turn);
-            assert!((curve(1.0) - 1.0).abs() < 1e-4, "turn {turn} ends drawn");
-            let mut last = 0.0;
-            for step in 0..=20 {
-                let value = curve(step as f32 / 20.0);
-                assert!(value >= last - 1e-6, "turn {turn} never fades back out");
-                last = value;
-            }
-        }
-        // While an earlier card is half in, a later one has not started yet.
-        let (delay, total) = turn_timing(2);
-        let waiting = delay.as_secs_f32() / total.as_secs_f32() * 0.9;
-        assert!(turn_curve(2)(waiting).abs() < f32::EPSILON);
-        assert!(turn_curve(0)(waiting) > 0.0);
     }
 }

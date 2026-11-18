@@ -36,36 +36,83 @@ use shellune_storage::{
 use crate::app::copy::{Strings, UxStrings};
 
 /// Which subset of the saved hosts the list shows.
+///
+/// The list is one flat list in both views (ADR-3): the group a host is in is a tag on
+/// its row and a place in the home page's sidebar, not a header inside the list.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HostView {
-    /// Every saved host, in saved order.
+    /// Every saved record, in the order the sort asks for.
     #[default]
     All,
-    /// The same hosts, grouped by group label.
-    Groups,
     /// The hosts that were really reached, newest first.
     Recent,
 }
 
-impl HostView {
-    /// Every view, in the order the switch shows them.
-    pub const ALL: [Self; 3] = [Self::All, Self::Groups, Self::Recent];
+/// The place of the home page's sidebar the list shows (ADR-3).
+///
+/// One of them is chosen at a time, and each is a setting of the panel's own view and
+/// filters: "favourites" is the favourites filter, a group is the group filter, and
+/// "recent" is the recent view. Reading the place back from those settings, instead of
+/// storing it beside them, is what keeps the sidebar and the list from disagreeing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HomeSection {
+    /// Every saved record.
+    All,
+    /// The records marked as favourites.
+    Favorites,
+    /// The hosts that were reached before, newest first.
+    Recent,
+    /// One group and everything inside it.
+    Group(GroupPath),
+}
 
-    /// Label of the view switch entry.
-    pub fn label(self, strings: &Strings) -> &'static str {
+impl HomeSection {
+    /// Debug selector of the sidebar entry, used by the tests. A group's entry is named
+    /// after its place in the tree, so it is not one of these.
+    #[must_use]
+    pub fn debug_selector(&self) -> &'static str {
         match self {
-            Self::All => strings.hosts_view_all,
-            Self::Groups => strings.hosts_view_groups,
-            Self::Recent => strings.hosts_view_recent,
+            Self::All => "hosts.view.all",
+            Self::Favorites => "hosts.view.favorites",
+            Self::Recent => "hosts.view.recent",
+            Self::Group(_) => "hosts.view.group",
+        }
+    }
+}
+
+/// The order the list draws its records in (ADR-3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HostSort {
+    /// The order they were saved in.
+    #[default]
+    Saved,
+    /// By name, ignoring case.
+    Name,
+    /// The most recently reached first; never reached last, in saved order.
+    LastConnected,
+}
+
+impl HostSort {
+    /// Every order, as the filter menu lists them.
+    pub const ALL: [Self; 3] = [Self::Saved, Self::Name, Self::LastConnected];
+
+    /// Label of the order in the filter menu.
+    #[must_use]
+    pub fn label(self, ux: &UxStrings) -> &'static str {
+        match self {
+            Self::Saved => ux.home_sort_saved,
+            Self::Name => ux.home_sort_name,
+            Self::LastConnected => ux.home_sort_recent,
         }
     }
 
-    /// Debug selector of the view switch entry, used by the layout tests.
+    /// Debug selector of the menu entry.
+    #[must_use]
     pub fn debug_selector(self) -> &'static str {
         match self {
-            Self::All => "hosts.view.all",
-            Self::Groups => "hosts.view.groups",
-            Self::Recent => "hosts.view.recent",
+            Self::Saved => "hosts.sort.saved",
+            Self::Name => "hosts.sort.name",
+            Self::LastConnected => "hosts.sort.recent",
         }
     }
 }
@@ -1254,6 +1301,8 @@ pub struct HostsPanel {
     message: Option<HostsMessage>,
     /// The group and status the list is narrowed to, beside the search phrase.
     filter: HostFilter,
+    /// The order the list draws its records in.
+    sort: HostSort,
     /// What the selection means while it grows: the current result or every host.
     scope: SelectionScope,
     /// The hosts the user picked, by identifier rather than by row (R18).
@@ -1288,6 +1337,46 @@ impl HostsPanel {
         }
     }
 
+    /// The sidebar place the list shows, read from the view and the filters.
+    #[must_use]
+    pub fn section(&self) -> HomeSection {
+        if self.view == HostView::Recent {
+            HomeSection::Recent
+        } else if let Some(group) = &self.filter.group {
+            HomeSection::Group(group.clone())
+        } else if self.filter.favorites {
+            HomeSection::Favorites
+        } else {
+            HomeSection::All
+        }
+    }
+
+    /// Shows one place of the sidebar: the view and the favourites and group filters
+    /// are set for it together, so two places are never half-chosen at once. The
+    /// status filter, the sort and the search stay as they were.
+    pub fn set_section(&mut self, section: &HomeSection) {
+        let (view, favorites, group) = match section {
+            HomeSection::All => (HostView::All, false, None),
+            HomeSection::Favorites => (HostView::All, true, None),
+            HomeSection::Recent => (HostView::Recent, false, None),
+            HomeSection::Group(path) => (HostView::All, false, Some(path.clone())),
+        };
+        self.select_view(view);
+        self.set_favorites_filter(favorites);
+        self.set_group_filter(group);
+    }
+
+    /// The order the list draws its records in.
+    #[must_use]
+    pub fn sort(&self) -> HostSort {
+        self.sort
+    }
+
+    /// Chooses the order the list draws its records in.
+    pub fn set_sort(&mut self, sort: HostSort) {
+        self.sort = sort;
+    }
+
     /// The current search phrase.
     #[must_use]
     pub fn search(&self) -> &str {
@@ -1311,6 +1400,7 @@ impl HostsPanel {
     }
 
     /// Whether a form is open.
+    #[cfg(test)]
     #[must_use]
     pub fn is_editing(&self) -> bool {
         self.draft.is_some()
@@ -1643,10 +1733,12 @@ impl HostsPanel {
             .map(HostConfig::id)
             .collect();
         let kept: BTreeSet<HostId> = matched.iter().copied().collect();
-        let narrow_search = !self.search.trim().is_empty();
         let mut rows = Vec::new();
         match self.view {
             HostView::All => {
+                self.sort_ids(book, &mut matched, |id| {
+                    book.host(id).map(|host| host.name().to_owned())
+                });
                 for id in &matched {
                     rows.push(HostListRow::Host(HostRow { id: *id }));
                 }
@@ -1665,25 +1757,28 @@ impl HostsPanel {
                 }
                 matched = shown;
             }
-            HostView::Groups => {
-                self.push_tree(&mut rows, book, groups, &kept, narrow_search);
-            }
         }
+        let _ = groups;
         // The connections of another protocol are listed after the hosts. The recent
         // view is a sign-in history, and one of them has no history to be found in.
         let connections: Vec<HostId> = match self.view {
             HostView::Recent => Vec::new(),
-            HostView::All | HostView::Groups => {
+            HostView::All => {
                 let searched: BTreeSet<HostId> = book
                     .search_connections(&self.search)
                     .iter()
                     .map(ConnectionRecord::id)
                     .collect();
-                book.connections()
+                let mut ids: Vec<HostId> = book
+                    .connections()
                     .iter()
                     .filter(|record| self.matches_connection(book, record, &searched, open))
                     .map(ConnectionRecord::id)
-                    .collect()
+                    .collect();
+                self.sort_ids(book, &mut ids, |id| {
+                    book.connection(id).map(|record| record.name().to_owned())
+                });
+                ids
             }
         };
         for id in &connections {
@@ -1839,14 +1934,47 @@ impl HostsPanel {
         self.ungrouped_collapsed = !self.ungrouped_collapsed;
     }
 
-    /// Sets whether the ungrouped bucket is drawn open.
-    pub fn set_ungrouped_expanded(&mut self, expanded: bool) {
-        self.ungrouped_collapsed = !expanded;
+    /// Puts the records of one kind in the order the sort asks for.
+    ///
+    /// The sorts are stable, so records that compare equal keep the order they were
+    /// saved in: two hosts named alike, or two never reached, never swap places from one
+    /// frame to the next.
+    fn sort_ids(
+        &self,
+        book: &HostBook,
+        ids: &mut [HostId],
+        name: impl Fn(HostId) -> Option<String>,
+    ) {
+        match self.sort {
+            HostSort::Saved => {}
+            HostSort::Name => {
+                ids.sort_by_cached_key(|id| name(*id).unwrap_or_default().to_lowercase());
+            }
+            HostSort::LastConnected => {
+                ids.sort_by_key(|id| {
+                    std::cmp::Reverse(
+                        book.recent_of(*id)
+                            .map_or(0, |recent| recent.last_connected_unix()),
+                    )
+                });
+            }
+        }
+    }
+
+    /// Whether one host answers the search phrase: the book's own matcher over the
+    /// name, the address, the user and the group, or what the host would dial, so a
+    /// typed `user@host` finds the host saved at that address (ADR-3).
+    fn search_hits(&self, host: &HostConfig) -> bool {
+        host_matches(host, &self.search)
+            || host
+                .target()
+                .to_lowercase()
+                .contains(&self.search.trim().to_lowercase())
     }
 
     /// Whether one host survives the search phrase, the group and the status.
     fn matches(&self, book: &HostBook, host: &HostConfig, open: &dyn Fn(HostId) -> bool) -> bool {
-        if !host_matches(host, &self.search) {
+        if !self.search_hits(host) {
             return false;
         }
         if let Some(wanted) = &self.filter.group {
@@ -1871,7 +1999,7 @@ impl HostsPanel {
         host: &HostConfig,
         open: &dyn Fn(HostId) -> bool,
     ) -> bool {
-        host_matches(host, &self.search)
+        self.search_hits(host)
             && self.matches_favorite(book, host.id())
             && self.matches_status(book, host, open)
     }
@@ -2360,12 +2488,14 @@ impl HostFilter {
     }
 
     /// Whether only the favourite records are kept.
+    #[cfg(test)]
     #[must_use]
     pub fn favorites(&self) -> bool {
         self.favorites
     }
 
     /// Whether any filter narrows anything.
+    #[cfg(test)]
     #[must_use]
     pub fn is_narrowing(&self) -> bool {
         self.group.is_some() || self.status != HostStatusFilter::Any || self.favorites
@@ -2437,90 +2567,6 @@ pub fn parse_quick_target(text: &str) -> Option<QuickTarget> {
         host: host.to_owned(),
         port,
     })
-}
-
-/// The saved records of any protocol that a phrase typed into the quick-connect bar
-/// finds, best first.
-///
-/// The matcher is the book's own (name, address, user, group, protocol), the one the
-/// list's search uses, so the bar and the list never disagree about what a phrase
-/// finds. A record whose name starts with the phrase comes first; the rest keep the
-/// order they were saved in. An empty phrase finds nothing: the bar is not a list.
-#[must_use]
-pub fn quick_matches(book: &HostBook, phrase: &str) -> Vec<HostId> {
-    let phrase = phrase.trim();
-    if phrase.is_empty() {
-        return Vec::new();
-    }
-    let lowered = phrase.to_lowercase();
-    let mut found: Vec<(bool, HostId)> = book
-        .search_connections(phrase)
-        .iter()
-        .map(|record| {
-            (
-                !record.name().to_lowercase().starts_with(&lowered),
-                record.id(),
-            )
-        })
-        .collect();
-    // A stable sort: within each half the saved order stays.
-    found.sort_by_key(|(later, _)| *later);
-    found.into_iter().map(|(_, id)| id).collect()
-}
-
-/// One group card of the home dashboard: a top-level group, what it holds and how
-/// much of it this window has open.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GroupOverview {
-    /// The top-level group.
-    pub path: GroupPath,
-    /// Every saved record inside it and inside its children, of any protocol.
-    pub records: usize,
-    /// How many of those this window holds a connected session to.
-    pub online: usize,
-}
-
-/// The top-level groups that hold at least one record, in tree order, with their
-/// counts (R1).
-///
-/// The counts ignore the list's search and filters: a card says what the group is,
-/// and pressing it is what narrows the list. A group with nothing in it has no card;
-/// the tree beside the list is where an empty group is managed. [open] is the same
-/// read of this window's sessions the list uses, so nothing here dials anything.
-#[must_use]
-pub fn group_overview(
-    book: &HostBook,
-    groups: &GroupBook,
-    open: &dyn Fn(HostId) -> bool,
-) -> Vec<GroupOverview> {
-    let mut paths: BTreeSet<GroupPath> = drawn_paths(book, groups).into_iter().collect();
-    for record in book.connections() {
-        let mut current = record.group_path();
-        while let Some(path) = current {
-            current = path.parent();
-            paths.insert(path);
-        }
-    }
-    let paths: Vec<GroupPath> = paths.into_iter().collect();
-    child_paths(&paths, None)
-        .into_iter()
-        .filter_map(|path| {
-            let ids: Vec<HostId> = book
-                .hosts_under_group(&path)
-                .into_iter()
-                .chain(book.connections_under_group(&path))
-                .collect();
-            if ids.is_empty() {
-                return None;
-            }
-            let online = ids.iter().filter(|id| open(**id)).count();
-            Some(GroupOverview {
-                path,
-                records: ids.len(),
-                online,
-            })
-        })
-        .collect()
 }
 
 /// One group header of the flattened list.
@@ -4794,9 +4840,9 @@ mod tests {
     }
 
     #[test]
-    fn the_grouped_rows_hold_every_host_once_under_its_own_group() {
-        // The rows are flattened from group headers and hosts; a host that appears twice,
-        // or not at all, is a list that disagrees with the file it was read from.
+    fn the_group_tree_counts_every_host_once_under_its_own_group() {
+        // The tree is flattened from group headers and hosts; a host that appears twice,
+        // or not at all, is a sidebar that disagrees with the file it was read from.
         let web = host("web", "10.0.0.5", 22, "deploy", Some("Prod"));
         let api = host("api", "api.example.org", 2222, "svc", Some("Prod"));
         let lab = host("lab", "lab.internal", 22, "root", None);
@@ -4809,7 +4855,20 @@ mod tests {
 
         let no_sessions = |_: HostId| false;
         let mut panel = HostsPanel::new();
-        panel.select_view(HostView::Groups);
+        let tree = panel.group_tree(&book, &groups, &no_sessions);
+        let headers: Vec<(Option<GroupPath>, usize)> = tree
+            .iter()
+            .map(|group| (group.path.clone(), group.hosts))
+            .collect();
+        assert_eq!(
+            headers,
+            vec![
+                (Some(GroupPath::parse("Prod").expect("a valid path")), 2),
+                (None, 1),
+            ],
+            "the named group and the hosts without one each get a header with their count"
+        );
+        // The list itself is flat: every host once, in saved order, with no header.
         let list = panel.list(&book, &groups, &no_sessions);
         let hosts: Vec<HostId> = list
             .rows()
@@ -4819,35 +4878,14 @@ mod tests {
                 HostListRow::Group(_) | HostListRow::Connection(_) => None,
             })
             .collect();
-        assert_eq!(
-            hosts,
-            vec![web.id(), api.id(), lab.id()],
-            "every host is listed once, in saved order, under its own header"
-        );
-        let headers: Vec<Option<GroupPath>> = list
-            .rows()
-            .iter()
-            .filter_map(|row| match row {
-                HostListRow::Group(group) => Some(group.path.clone()),
-                HostListRow::Host(_) | HostListRow::Connection(_) => None,
-            })
-            .collect();
-        assert_eq!(
-            headers,
-            vec![Some(GroupPath::parse("Prod").expect("a valid path")), None,],
-            "the named group and the hosts without one each get a header"
-        );
+        assert_eq!(hosts, vec![web.id(), api.id(), lab.id()]);
+        assert_eq!(list.rows().len(), 3, "no header in the flat list");
 
-        // Closing a group hides its rows and keeps its hosts in the result: the count in
-        // the header and the set a selection covers are the same either way.
+        // Closing a group in the tree changes what the tree draws, not its count.
         panel.toggle_group(&GroupPath::parse("Prod").expect("a valid path"));
-        let closed = panel.list(&book, &groups, &no_sessions);
-        assert_eq!(closed.matched_len(), 3);
-        assert_eq!(
-            closed.rows().len(),
-            3,
-            "two headers and the ungrouped host, without the closed group's hosts"
-        );
+        let closed = panel.group_tree(&book, &groups, &no_sessions);
+        assert_eq!(closed[0].hosts, 2);
+        assert_eq!(panel.list(&book, &groups, &no_sessions).matched_len(), 3);
 
         // A host that is edited away leaves the list with it.
         book.remove(lab.id()).expect("the host is saved");
@@ -4965,64 +5003,90 @@ mod tests {
     }
 
     #[test]
-    fn the_quick_bar_finds_saved_records_with_name_prefixes_first() {
-        let mut book = HostBook::new();
-        let staging = host("staging-web", "10.0.0.9", 22, "deploy", None);
-        let web = host("web-01", "10.0.0.2", 22, "deploy", Some("Prod"));
-        let db = host("db", "10.0.0.3", 22, "postgres", None);
-        for record in [staging.clone(), web.clone(), db.clone()] {
-            book.insert(record).expect("a new host");
-        }
-        let desk = ConnectionRecord::Rdp(
-            RdpConfig::new("web desk", "10.0.0.7:3389", Some("alice")).expect("a valid record"),
-        );
-        let desk_id = desk.id();
-        book.insert_connection(desk).expect("a new connection");
-
+    fn the_sidebar_places_set_the_view_and_the_filters_together() {
+        let prod = GroupPath::parse("Prod").expect("a valid path");
+        let mut panel = HostsPanel::new();
+        assert_eq!(panel.section(), HomeSection::All);
+        panel.set_status_filter(HostStatusFilter::Recent);
+        panel.set_section(&HomeSection::Favorites);
+        assert_eq!(panel.section(), HomeSection::Favorites);
+        assert!(panel.filter().favorites());
+        panel.set_section(&HomeSection::Group(prod.clone()));
+        assert_eq!(panel.section(), HomeSection::Group(prod.clone()));
+        assert!(!panel.filter().favorites(), "one place at a time");
+        assert_eq!(panel.filter().group(), Some(&prod));
+        panel.set_section(&HomeSection::Recent);
+        assert_eq!(panel.section(), HomeSection::Recent);
+        assert_eq!(panel.view(), HostView::Recent);
+        assert_eq!(panel.filter().group(), None);
+        panel.set_section(&HomeSection::All);
+        assert_eq!(panel.view(), HostView::All);
         assert_eq!(
-            quick_matches(&book, "web"),
-            vec![web.id(), desk_id, staging.id()],
-            "names that start with the phrase lead, the rest keep their saved order"
+            panel.filter().status(),
+            HostStatusFilter::Recent,
+            "a place leaves the status filter as it was"
         );
-        assert_eq!(quick_matches(&book, "postgres"), vec![db.id()]);
-        assert!(
-            quick_matches(&book, "   ").is_empty(),
-            "an empty bar lists nothing"
-        );
-        assert!(quick_matches(&book, "nothing-like-it").is_empty());
     }
 
     #[test]
-    fn the_group_cards_count_every_record_and_skip_empty_groups() {
+    fn the_sort_orders_by_name_or_last_connection_and_keeps_saved_order_on_ties() {
         let mut book = HostBook::new();
-        let mut web = host("web", "10.0.0.2", 22, "deploy", None);
-        web.set_group_path(Some(GroupPath::parse("Prod/Web").expect("a valid path")));
-        let mut db = host("db", "10.0.0.3", 22, "deploy", None);
-        db.set_group_path(Some(GroupPath::parse("Prod/DB").expect("a valid path")));
-        let lab = host("lab", "10.0.0.4", 22, "deploy", None);
-        for record in [web.clone(), db.clone(), lab] {
+        let zeta = host("Zeta", "10.0.0.1", 22, "deploy", None);
+        let alpha = host("alpha", "10.0.0.2", 22, "deploy", None);
+        let mid = host("Mid", "10.0.0.3", 22, "deploy", None);
+        let never = host("never", "10.0.0.4", 22, "deploy", None);
+        for record in [zeta.clone(), alpha.clone(), mid.clone(), never.clone()] {
             book.insert(record).expect("a new host");
         }
-        let mut desk =
-            RdpConfig::new("desk", "10.0.0.7:3389", Some("alice")).expect("a valid record");
-        desk.set_group_path(Some(GroupPath::parse("Office").expect("a valid path")));
-        book.insert_connection(ConnectionRecord::Rdp(desk))
-            .expect("a new connection");
-        let mut groups = GroupBook::new();
-        groups
-            .insert(&GroupPath::parse("Empty").expect("a valid path"))
-            .expect("a new group");
-
-        let open = web.id();
-        let cards = group_overview(&book, &groups, &|id| id == open);
-        let named: Vec<(String, usize, usize)> = cards
-            .iter()
-            .map(|card| (card.path.to_canonical(), card.records, card.online))
-            .collect();
+        book.record_connection(mid.id(), 2_000)
+            .expect("a saved host");
+        book.record_connection(zeta.id(), 1_000)
+            .expect("a saved host");
+        let groups = GroupBook::new();
+        let mut panel = HostsPanel::new();
+        let order = |panel: &HostsPanel| -> Vec<HostId> {
+            panel
+                .list(&book, &groups, &|_| false)
+                .rows()
+                .iter()
+                .filter_map(|row| match row {
+                    HostListRow::Host(host) => Some(host.id),
+                    HostListRow::Group(_) | HostListRow::Connection(_) => None,
+                })
+                .collect()
+        };
         assert_eq!(
-            named,
-            vec![("Office".to_owned(), 1, 0), ("Prod".to_owned(), 2, 1)],
-            "top-level groups only, children counted in, an empty group has no card"
+            order(&panel),
+            vec![zeta.id(), alpha.id(), mid.id(), never.id()]
+        );
+        panel.set_sort(HostSort::Name);
+        assert_eq!(
+            order(&panel),
+            vec![alpha.id(), mid.id(), never.id(), zeta.id()],
+            "names compare without case"
+        );
+        panel.set_sort(HostSort::LastConnected);
+        assert_eq!(
+            order(&panel),
+            vec![mid.id(), zeta.id(), alpha.id(), never.id()],
+            "newest first; never reached last, in saved order"
+        );
+    }
+
+    #[test]
+    fn an_address_typed_into_the_search_finds_the_host_saved_at_it() {
+        let mut book = HostBook::new();
+        let api = host("api", "192.0.2.24", 22, "deploy", None);
+        let other = host("other", "192.0.2.25", 22, "deploy", None);
+        book.insert(api.clone()).expect("a new host");
+        book.insert(other).expect("a new host");
+        let mut panel = HostsPanel::new();
+        panel.set_search("deploy@192.0.2.24");
+        let list = panel.list(&book, &GroupBook::new(), &|_| false);
+        assert_eq!(
+            list.ids_in_scope(SelectionScope::CurrentResults),
+            &[api.id()],
+            "user@host reads against what a host would dial"
         );
     }
 

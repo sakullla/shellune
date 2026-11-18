@@ -173,27 +173,18 @@ pub struct Strings {
     pub terminal_smaller: &'static str,
     /// Tooltip of the button that makes the terminal text larger.
     pub terminal_larger: &'static str,
-    /// Heading above the shell tiles and the shell menu.
-    /// The mark on the launcher tile the main button opens.
-    pub shell_default: &'static str,
     /// The second line of the custom-path launcher tile.
     pub shell_custom_hint: &'static str,
-    /// Placeholder in the host search field.
-    pub hosts_search_placeholder: &'static str,
     /// Placeholder in the settings page's action search.
     pub keys_search_placeholder: &'static str,
     /// Host list view: every saved host.
     pub hosts_view_all: &'static str,
-    /// Host list view: hosts grouped by their group label.
-    pub hosts_view_groups: &'static str,
     /// Host list view: hosts that were really connected, newest first.
     pub hosts_view_recent: &'static str,
     /// Shown when no connection has been recorded yet.
     pub hosts_recent_empty: &'static str,
     /// Shown when a search matches no saved host.
     pub hosts_no_match: &'static str,
-    /// Group heading for hosts without a group label.
-    pub hosts_ungrouped: &'static str,
     /// Form label: host name.
     pub host_field_name: &'static str,
     /// Form label: host address.
@@ -1242,16 +1233,12 @@ pub static ENGLISH: Strings = Strings {
     terminal_copy: "Copy",
     terminal_smaller: "Smaller text",
     terminal_larger: "Larger text",
-    shell_default: "Default",
     shell_custom_hint: "Any program, by path",
-    hosts_search_placeholder: "Search hosts · Enter connects",
     keys_search_placeholder: "Search actions or shortcuts",
     hosts_view_all: "All hosts",
-    hosts_view_groups: "Groups",
     hosts_view_recent: "Recent connections",
     hosts_recent_empty: "No connection has been recorded yet. A host appears here after it really connected.",
     hosts_no_match: "No saved host matches this search.",
-    hosts_ungrouped: "Ungrouped",
     host_field_name: "Name",
     host_field_address: "Address",
     host_field_port: "Port",
@@ -1796,16 +1783,12 @@ pub static CHINESE: Strings = Strings {
     terminal_copy: "复制",
     terminal_smaller: "缩小字号",
     terminal_larger: "放大字号",
-    shell_default: "默认",
     shell_custom_hint: "本机上的任意程序",
-    hosts_search_placeholder: "搜索主机，回车直接连接",
     keys_search_placeholder: "搜索动作或快捷键",
     hosts_view_all: "全部主机",
-    hosts_view_groups: "按分组",
     hosts_view_recent: "最近连接",
     hosts_recent_empty: "还没有连接记录。主机真正连接成功之后才会出现在这里。",
     hosts_no_match: "没有符合这个搜索条件的主机。",
-    hosts_ungrouped: "未分组",
     host_field_name: "名称",
     host_field_address: "地址",
     host_field_port: "端口",
@@ -2434,8 +2417,6 @@ pub struct UxStrings {
     pub new_tab_menu: &'static str,
     /// Search hosts and commands
     pub search: &'static str,
-    /// Hosts
-    pub home_title: &'static str,
     /// This computer
     pub home_local_section: &'static str,
     /// Opens in a new tab
@@ -2809,8 +2790,6 @@ pub struct UxStrings {
     pub snippet_problem_unknown: &'static str,
     /// Heading of the group column on a wide window
     pub hosts_groups_title: &'static str,
-    /// Filter entry that clears the group narrowing
-    pub hosts_groups_all: &'static str,
     /// Hover on a host row's connect button: the faster way in
     pub hosts_connect_hint: &'static str,
     /// Example a host form's empty group field shows
@@ -2921,8 +2900,6 @@ pub struct UxStrings {
     pub hosts_select_none: &'static str,
     /// Button: turn on the selection boxes
     pub hosts_select_start: &'static str,
-    /// How many hosts the filters keep, with both numbers filled in
-    pub hosts_result_count: &'static str,
     /// Button: clear the search and every filter
     pub hosts_filter_clear: &'static str,
     /// What a narrowing filter leaves behind when nothing matches
@@ -3181,10 +3158,6 @@ pub struct UxStrings {
     pub home_quick_temporary: &'static str,
     /// Detail of that result: nothing is saved
     pub home_quick_temporary_hint: &'static str,
-    /// Detail of a local terminal in the quick-connect results
-    pub home_quick_shell_hint: &'static str,
-    /// What the quick-connect bar says when nothing matches
-    pub home_quick_empty: &'static str,
     /// Keycap beside the result Enter opens
     pub home_quick_enter: &'static str,
     /// The home page's menu of local terminals
@@ -3193,26 +3166,28 @@ pub struct UxStrings {
     pub home_serial_section: &'static str,
     /// Menu entry: a new serial connection
     pub home_serial_new: &'static str,
-    /// Heading of the recent-connection cards
-    pub home_recent_section: &'static str,
-    /// Heading of the favourite cards
+    /// The sidebar entry of the favourite records
     pub home_favorites_section: &'static str,
-    /// Heading of the group cards
-    pub home_groups_section: &'static str,
-    /// Heading of the full host list on the home page
-    pub home_all_hosts: &'static str,
-    /// Button: show the whole section in the list
-    pub home_view_all: &'static str,
-    /// A group card's count, with how many are connected
-    pub home_group_count: &'static str,
-    /// A group card's count when none is connected
-    pub home_group_count_idle: &'static str,
-    /// Tooltip of a card's menu button
+    /// Tooltip of the toolbar's "⋯" menu
     pub home_card_more: &'static str,
-    /// Tooltip of a card: pressing it connects
-    pub home_card_connect_hint: &'static str,
-    /// Tooltip of a group card: pressing it narrows the list
-    pub home_group_card_hint: &'static str,
+    /// Heading of the orders in the filter menu
+    pub home_sort_label: &'static str,
+    /// Order: as saved
+    pub home_sort_saved: &'static str,
+    /// Order: by name
+    pub home_sort_name: &'static str,
+    /// Order: most recently reached first
+    pub home_sort_recent: &'static str,
+    /// Tooltip of the toolbar's filter menu
+    pub home_filter: &'static str,
+    /// Tooltip: fold the sidebar to its icons
+    pub home_sidebar_collapse: &'static str,
+    /// Tooltip: unfold the sidebar
+    pub home_sidebar_expand: &'static str,
+    /// The favourites view when nothing is marked
+    pub home_favorites_empty: &'static str,
+    /// The line under it: how a record gets there
+    pub home_favorites_empty_hint: &'static str,
     /// Action: mark a record as a favourite
     pub favorite_add: &'static str,
     /// Action: clear a record's favourite mark
@@ -3225,8 +3200,6 @@ pub struct UxStrings {
     pub favorite_added: &'static str,
     /// Toast after a mark was cleared
     pub favorite_removed: &'static str,
-    /// The list filter that keeps only favourites
-    pub hosts_filter_favorites: &'static str,
     /// Tooltip of the terminal bar's menu that holds the tools a narrow bar folded
     pub terminal_more: &'static str,
     /// The grid size line in that menu
@@ -3246,7 +3219,6 @@ impl UxStrings {
             self.new_tab,
             self.new_tab_menu,
             self.search,
-            self.home_title,
             self.home_local_section,
             self.home_local_hint,
             self.home_hosts_section,
@@ -3434,7 +3406,6 @@ impl UxStrings {
             self.snippet_problem_body_long,
             self.snippet_problem_unknown,
             self.hosts_groups_title,
-            self.hosts_groups_all,
             self.hosts_connect_hint,
             self.host_example_group,
             self.copy_click_hint,
@@ -3490,7 +3461,6 @@ impl UxStrings {
             self.hosts_select_scope,
             self.hosts_select_none,
             self.hosts_select_start,
-            self.hosts_result_count,
             self.hosts_filter_clear,
             self.hosts_no_match_hint,
             self.hosts_group_empty,
@@ -3620,29 +3590,27 @@ impl UxStrings {
             self.home_quick_placeholder,
             self.home_quick_temporary,
             self.home_quick_temporary_hint,
-            self.home_quick_shell_hint,
-            self.home_quick_empty,
             self.home_quick_enter,
             self.home_local_button,
             self.home_serial_section,
             self.home_serial_new,
-            self.home_recent_section,
             self.home_favorites_section,
-            self.home_groups_section,
-            self.home_all_hosts,
-            self.home_view_all,
-            self.home_group_count,
-            self.home_group_count_idle,
             self.home_card_more,
-            self.home_card_connect_hint,
-            self.home_group_card_hint,
+            self.home_sort_label,
+            self.home_sort_saved,
+            self.home_sort_name,
+            self.home_sort_recent,
+            self.home_filter,
+            self.home_sidebar_collapse,
+            self.home_sidebar_expand,
+            self.home_favorites_empty,
+            self.home_favorites_empty_hint,
             self.favorite_add,
             self.favorite_remove,
             self.favorite_add_named,
             self.favorite_remove_named,
             self.favorite_added,
             self.favorite_removed,
-            self.hosts_filter_favorites,
             self.terminal_more,
             self.terminal_grid_size,
             self.session_connecting_card_hint,
@@ -3657,12 +3625,11 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     new_tab: "New tab",
     new_tab_menu: "More ways to open a tab",
     search: "Search hosts and commands",
-    home_title: "Hosts",
     home_local_section: "This computer",
     home_local_hint: "Opens in a new tab",
     home_hosts_section: "Servers",
     home_welcome_title: "Add your first server",
-    home_welcome_body: "Enter the address, user and sign-in once, then connect with one click. Just trying a server? Quick connect does not save anything.",
+    home_welcome_body: "Enter the address, user and sign-in once, then connect with one click. Just trying a server? Type user@host into the search to connect without saving.",
     home_import: "Import from SSH config",
     terminals_empty_title: "No terminal is open",
     terminals_empty_body: "Open a shell on this computer or connect to a server from Hosts.",
@@ -3862,7 +3829,6 @@ included",
     snippet_problem_body_long: "The command body is limited to {max} characters.",
     snippet_problem_unknown: "That command is no longer in the library; reopen the list.",
     hosts_groups_title: "Groups",
-    hosts_groups_all: "All hosts",
     hosts_connect_hint: "Connect (or double-click the row)",
     host_example_group: "Production/Web",
     copy_click_hint: "Click to copy",
@@ -3918,7 +3884,6 @@ included",
     hosts_select_scope: "Select",
     hosts_select_none: "Clear",
     hosts_select_start: "Select",
-    hosts_result_count: "{shown} of {total} hosts",
     hosts_filter_clear: "Clear filters",
     hosts_no_match_hint: "Change the search or drop a filter to see more hosts.",
     hosts_group_empty: "No groups yet. Use + to make one.",
@@ -4048,29 +4013,27 @@ included",
     home_quick_placeholder: "Search saved hosts, or type user@host:port to connect",
     home_quick_temporary: "Connect to {target}",
     home_quick_temporary_hint: "Not saved · opens the sign-in",
-    home_quick_shell_hint: "Local terminal · opens in a new tab",
-    home_quick_empty: "No saved host matches. Type user@host[:port] to connect without saving.",
     home_quick_enter: "Enter",
     home_local_button: "Local terminal",
     home_serial_section: "Serial",
     home_serial_new: "New serial connection",
-    home_recent_section: "Recent",
     home_favorites_section: "Favorites",
-    home_groups_section: "Groups",
-    home_all_hosts: "All hosts",
-    home_view_all: "View all",
-    home_group_count: "{count} hosts · {online} online",
-    home_group_count_idle: "{count} hosts",
     home_card_more: "More actions",
-    home_card_connect_hint: "Connect",
-    home_group_card_hint: "Show this group in the list",
+    home_sort_label: "Sort",
+    home_sort_saved: "Saved order",
+    home_sort_name: "Name",
+    home_sort_recent: "Last connected",
+    home_filter: "Filter and sort",
+    home_sidebar_collapse: "Collapse sidebar",
+    home_sidebar_expand: "Expand sidebar",
+    home_favorites_empty: "No favorites yet",
+    home_favorites_empty_hint: "Star a host and it is kept here.",
     favorite_add: "Add to favorites",
     favorite_remove: "Remove from favorites",
     favorite_add_named: "Add {name} to favorites",
     favorite_remove_named: "Remove {name} from favorites",
     favorite_added: "Added to favorites",
     favorite_removed: "Removed from favorites",
-    hosts_filter_favorites: "Favorites only",
     terminal_more: "More terminal tools",
     terminal_grid_size: "Terminal size",
     session_connecting_card_hint: "The terminal opens here as soon as the connection is up.",
@@ -4083,12 +4046,11 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     new_tab: "新建标签",
     new_tab_menu: "更多打开方式",
     search: "搜索主机与命令",
-    home_title: "主机",
     home_local_section: "本机",
     home_local_hint: "在新标签中打开",
     home_hosts_section: "服务器",
     home_welcome_title: "添加你的第一台服务器",
-    home_welcome_body: "填写一次地址、用户名和登录方式，以后一键连接。只是临时连一下？快速连接不会保存任何东西。",
+    home_welcome_body: "填写一次地址、用户名和登录方式，以后一键连接。只是临时连一下？在搜索框输入 user@host 即可直接连接，不会保存。",
     home_import: "从 SSH 配置导入",
     terminals_empty_title: "没有打开的终端",
     terminals_empty_body: "在“主机”中打开本机终端或连接服务器。",
@@ -4285,7 +4247,6 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     snippet_problem_body_long: "命令正文最多 {max} 个字符。",
     snippet_problem_unknown: "这条命令已不在库中，请重新打开列表。",
     hosts_groups_title: "分组",
-    hosts_groups_all: "全部主机",
     hosts_connect_hint: "连接（也可以双击这一行）",
     host_example_group: "生产/Web",
     copy_click_hint: "点击复制",
@@ -4341,7 +4302,6 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     hosts_select_scope: "全选",
     hosts_select_none: "清空",
     hosts_select_start: "选择",
-    hosts_result_count: "共 {total} 台，当前显示 {shown} 台",
     hosts_filter_clear: "清除筛选",
     hosts_no_match_hint: "改一下搜索词，或去掉一个筛选条件，就能看到更多主机。",
     hosts_group_empty: "还没有分组，点 + 新建",
@@ -4471,29 +4431,27 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     home_quick_placeholder: "搜索已保存的主机，或输入 user@host:port 直接连接",
     home_quick_temporary: "连接到 {target}",
     home_quick_temporary_hint: "不保存 · 打开登录",
-    home_quick_shell_hint: "本地终端 · 在新标签中打开",
-    home_quick_empty: "没有匹配的已保存主机。输入 user@host[:port] 可直接连接，不会保存。",
     home_quick_enter: "回车",
     home_local_button: "本地终端",
     home_serial_section: "串口",
     home_serial_new: "新建串口连接",
-    home_recent_section: "最近连接",
     home_favorites_section: "收藏",
-    home_groups_section: "分组",
-    home_all_hosts: "所有主机",
-    home_view_all: "查看全部",
-    home_group_count: "{count} 台 · {online} 在线",
-    home_group_count_idle: "{count} 台",
     home_card_more: "更多操作",
-    home_card_connect_hint: "连接",
-    home_group_card_hint: "在列表中只看这个分组",
+    home_sort_label: "排序",
+    home_sort_saved: "保存顺序",
+    home_sort_name: "名称",
+    home_sort_recent: "最近连接时间",
+    home_filter: "筛选与排序",
+    home_sidebar_collapse: "收起侧栏",
+    home_sidebar_expand: "展开侧栏",
+    home_favorites_empty: "还没有收藏",
+    home_favorites_empty_hint: "在主机上点星标，它就会出现在这里。",
     favorite_add: "加入收藏",
     favorite_remove: "取消收藏",
     favorite_add_named: "收藏 {name}",
     favorite_remove_named: "取消收藏 {name}",
     favorite_added: "已加入收藏",
     favorite_removed: "已取消收藏",
-    hosts_filter_favorites: "仅收藏",
     terminal_more: "更多终端工具",
     terminal_grid_size: "终端尺寸",
     session_connecting_card_hint: "连接建立后，终端会在这里打开。",
