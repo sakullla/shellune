@@ -12864,11 +12864,17 @@ async fn the_upload_question_is_asked_and_answered_with_the_keyboard_alone(
         "Enter on the SCP choice chooses it for this one task"
     );
 
-    // SCP brought the recursive switch with it; Tab walks past it to the confirmation.
+    // SCP brought the recursive switch with it; Tab walks past it and the cancelling
+    // button to the confirmation, which stands last (ADR-7).
     press_key(cx, "tab");
     assert_eq!(
         files_stop(cx, &view),
         Some((FileSource::Remote, FilesStop::QuestionRecursive))
+    );
+    press_key(cx, "tab");
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::QuestionCancel))
     );
     press_key(cx, "tab");
     assert_eq!(
@@ -12948,6 +12954,7 @@ async fn the_download_question_is_asked_and_answered_with_the_keyboard_alone(
         Some((FileSource::Remote, FilesStop::QuestionScp))
     );
     press_key(cx, "enter");
+    press_key(cx, "tab");
     press_key(cx, "tab");
     press_key(cx, "tab");
     assert_eq!(
@@ -13141,6 +13148,7 @@ async fn the_failed_reads_typed_entries_are_reached_and_pressed_with_the_keyboar
     press_key(cx, "enter");
     press_key(cx, "tab");
     press_key(cx, "tab");
+    press_key(cx, "tab");
     press_key(cx, "enter");
     let starts = transfers.starts();
     assert_eq!(
@@ -13213,8 +13221,8 @@ async fn every_control_the_keyboard_stops_on_is_turned_into_its_column(cx: &mut 
     for (steps, selector) in [
         (1, "files.question.remote"),
         (2, "files.question.protocol"),
-        (1, "files.question.confirm"),
         (1, "files.question.cancel"),
+        (1, "files.question.confirm"),
     ] {
         for _ in 0..steps {
             press_key(cx, "tab");
@@ -13224,8 +13232,8 @@ async fn every_control_the_keyboard_stops_on_is_turned_into_its_column(cx: &mut 
     }
     assert_eq!(
         files_stop(cx, &view),
-        Some((FileSource::Remote, FilesStop::QuestionCancel)),
-        "the cancelling button is the last stop of the question"
+        Some((FileSource::Remote, FilesStop::QuestionConfirm)),
+        "the answering button is the last stop of the question, right of cancel"
     );
 
     // The toolbar sits at the top of the column. With the pane turned to the card's end,
@@ -19278,6 +19286,126 @@ async fn the_tunnel_form_names_its_fields_and_says_what_it_will_do(cx: &mut Test
     assert_eq!(
         cx.update(|_window, app| view.read(app).forward_editor_kind_for_test()),
         Some(shellune_core::ForwardKind::Dynamic)
+    );
+}
+
+/// The host a tunnel goes through is one field that opens a searchable list, so a book
+/// of 24 hosts fits the form instead of running a row of segments out of it; the list
+/// is narrowed by typing and answered with the arrows, Enter and Escape (ADR-7).
+#[gpui::test]
+async fn the_tunnel_forms_host_picker_narrows_twenty_four_hosts_from_the_keyboard(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("tunnel-host-picker");
+    let book = seed(
+        &dir.store(),
+        (0..24)
+            .map(|index| {
+                stored_host(
+                    &format!("node-{index:02}"),
+                    &format!("10.0.1.{index}"),
+                    22,
+                    "deploy",
+                    None,
+                )
+            })
+            .collect(),
+    );
+    let id_of = |name: &str| {
+        book.hosts()
+            .iter()
+            .find(|host| host.name() == name)
+            .map(HostConfig::id)
+    };
+    let (view, cx) = hosts_view(cx, dir.store());
+    right_click(cx, "hosts.row.0");
+    click(cx, "host.menu.forwards");
+    click(cx, "forwards.new");
+
+    let metrics = Metrics::default();
+    let form = bounds_of(cx, "forwards.form");
+    let control = bounds_of(cx, "forwards.host");
+    assert!(
+        control.left() >= form.left() && control.right() <= form.right(),
+        "the host control stays inside the form: {control:?} vs {form:?}"
+    );
+    assert!(
+        control.size.height <= metrics.control_height() + px(1.0),
+        "24 hosts are one field, not a wrapped row of segments: {control:?}"
+    );
+    assert!(cx.debug_bounds("forwards.host.picker").is_none());
+
+    // The pointer opens the list over every host, at most six rows tall.
+    click(cx, "forwards.host");
+    let picker = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| view.read(app).forward_host_picker_for_test(app))
+    };
+    assert_eq!(picker(cx).map(|(_, _, count)| count), Some(24));
+    let options = bounds_of(cx, "forwards.host.options");
+    assert!(
+        options.size.height <= metrics.control_height() * 6.0 + px(1.0),
+        "the list scrolls past six rows: {options:?}"
+    );
+    let card = bounds_of(cx, "forwards.host.picker");
+    assert!(
+        card.left() >= form.left() && card.right() <= form.right(),
+        "the list stays inside the form: {card:?} vs {form:?}"
+    );
+
+    // Typing narrows it; the arrows move the mark and Enter takes the marked host.
+    type_here(cx, "node-1");
+    assert_eq!(
+        picker(cx),
+        Some(("node-1".to_owned(), 0, 10)),
+        "node-10 to node-19 match"
+    );
+    press_key(cx, "down");
+    press_key(cx, "down");
+    press_key(cx, "up");
+    press_key(cx, "down");
+    assert_eq!(picker(cx).map(|(_, mark, _)| mark), Some(2));
+    press_key(cx, "enter");
+    assert!(picker(cx).is_none(), "Enter closes the list");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).forward_editor_host_for_test()),
+        id_of("node-12"),
+        "the marked host is the one the tunnel goes through"
+    );
+    assert!(
+        cx.update(|window, app| view.read(app).forward_host_control_focused_for_test(window)),
+        "the keyboard is back on the control"
+    );
+
+    // From the keyboard alone: Enter opens it with the chosen host marked, a search
+    // nothing matches says so, and Escape closes the list but not the form.
+    press_key(cx, "enter");
+    assert_eq!(picker(cx).map(|(_, mark, _)| mark), Some(12));
+    type_here(cx, "nothing-here");
+    assert_eq!(picker(cx).map(|(_, _, count)| count), Some(0));
+    assert!(cx.debug_bounds("forwards.host.none").is_some());
+    press_key(cx, "escape");
+    assert!(picker(cx).is_none(), "Escape closes the list");
+    assert!(
+        cx.update(|_window, app| view.read(app).forward_editor_kind_for_test())
+            .is_some(),
+        "and leaves the form open"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).forward_editor_host_for_test()),
+        id_of("node-12"),
+        "closing the list changes nothing"
+    );
+
+    // Tab walks from the control into the form's first field and back.
+    press_key(cx, "tab");
+    assert!(
+        !cx.update(|window, app| view.read(app).forward_host_control_focused_for_test(window)),
+        "Tab leaves the control for the listen address"
+    );
+    press_key(cx, "shift-tab");
+    assert!(
+        cx.update(|window, app| view.read(app).forward_host_control_focused_for_test(window)),
+        "Shift+Tab from the first field comes back to the control"
     );
 }
 
@@ -27166,6 +27294,124 @@ async fn an_ended_desktop_states_itself_in_the_banner_above_its_own_card(cx: &mu
     assert!(
         bounds_of(cx, "desktop.status").size.height > px(0.0),
         "the desktop's card still says the session ended"
+    );
+}
+
+/// The banner above an ended desktop is reached from the keyboard the way a terminal's
+/// is: the banner does not take the keyboard, Tab from the desktop reaches its first
+/// control, Tab past the last one goes back to the desktop, and Enter presses the step
+/// (ADR-6, ADR-7). A live desktop keeps Tab for the remote side.
+#[gpui::test]
+async fn tab_reaches_the_banner_above_an_ended_desktop_and_enter_reconnects(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    let (link, _log) = ScriptedLink::new(vec![LinkEvent::State {
+        state: LinkState::Failed(LinkFailure::Connect),
+        failure: LinkFailure::Connect,
+        detail: 0,
+        reason: "the address could not be reached".to_owned(),
+    }]);
+    let record = desktop_record("desk");
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+    redraw(cx);
+    let pane = cx
+        .update(|_window, app| view.read(app).desktop_of(id).cloned())
+        .expect("the surface is mounted");
+    cx.update(|window, app| window.focus(pane.read(app).focus_handle()));
+    redraw(cx);
+    let focused = |cx: &mut VisualTestContext| {
+        cx.update(|window, app| view.read(app).banner_focus_for_test(window))
+    };
+    let desktop_focused = |cx: &mut VisualTestContext| {
+        cx.update(|window, app| pane.read(app).focus_handle().is_focused(window))
+    };
+    assert!(
+        cx.debug_bounds("terminal.failure.next").is_some(),
+        "the banner offers the reconnect"
+    );
+    assert_eq!(focused(cx), None, "the banner does not take the keyboard");
+    assert!(desktop_focused(cx), "the desktop holds the keyboard");
+
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(focused(cx), Some(0), "Tab reaches the next step first");
+    cx.simulate_keystrokes("shift-tab");
+    cx.run_until_parked();
+    assert_eq!(focused(cx), None);
+    assert!(
+        desktop_focused(cx),
+        "Shift+Tab before the first control gives the keyboard back to the desktop"
+    );
+
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(focused(cx), Some(0));
+    let before = session_state(cx, &view, id);
+    assert!(
+        matches!(
+            before,
+            Some(SessionState::Failed(_) | SessionState::Disconnected(_))
+        ),
+        "the session ended: {before:?}"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let replaced = cx.update(|_window, app| {
+        view.read(app)
+            .desktop_of(id)
+            .is_none_or(|now| now.entity_id() != pane.entity_id())
+    });
+    assert!(
+        replaced,
+        "Enter on the step reconnects: the ended surface is released"
+    );
+}
+
+/// Escape closes the banner above an ended desktop, as it does above a terminal, and
+/// the keyboard is on the desktop afterwards whether it was on the banner or not
+/// (ADR-6, ADR-7).
+#[gpui::test]
+async fn escape_closes_the_banner_above_an_ended_desktop(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    let (link, _log) = ScriptedLink::new(vec![LinkEvent::State {
+        state: LinkState::Failed(LinkFailure::Connect),
+        failure: LinkFailure::Connect,
+        detail: 0,
+        reason: "the address could not be reached".to_owned(),
+    }]);
+    let record = desktop_record("desk");
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+    redraw(cx);
+    let pane = cx
+        .update(|_window, app| view.read(app).desktop_of(id).cloned())
+        .expect("the surface is mounted");
+    cx.update(|window, app| window.focus(pane.read(app).focus_handle()));
+    redraw(cx);
+    assert!(cx.update(|_window, app| view.read(app).banner_shown_for_test(id, app)));
+
+    // From a banner control: the banner closes and the desktop has the keyboard.
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|window, app| view.read(app).banner_focus_for_test(window)),
+        Some(0)
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).banner_shown_for_test(id, app)),
+        "Escape closes the banner"
+    );
+    assert!(
+        cx.update(|window, app| pane.read(app).focus_handle().is_focused(window)),
+        "the keyboard goes back to the desktop"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).desktop_of(id).is_some()),
+        "closing the banner leaves the session's place"
     );
 }
 

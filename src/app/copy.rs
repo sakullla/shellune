@@ -717,6 +717,9 @@ pub struct Strings {
     pub transfers_remote_directory: &'static str,
     /// Label of the remote path a download would copy.
     pub transfers_remote_path: &'static str,
+    /// The full path an upload lands at, said only when it differs from the typed
+    /// directory; `{path}` is that path.
+    pub transfers_lands_at: &'static str,
     /// Word before the protocol of one transfer in the list.
     pub transfers_protocol_label: &'static str,
     /// Why directory browsing failing does not stop a copy over SCP.
@@ -1500,6 +1503,7 @@ pub static ENGLISH: Strings = Strings {
     transfers_recursive: "Copy the directory and everything in it",
     transfers_remote_directory: "Remote directory",
     transfers_remote_path: "Remote path",
+    transfers_lands_at: "Saves to {path}",
     transfers_protocol_label: "Protocol",
     files_sftp_scp_hint: "Listing and managing a directory need SFTP. Copying a file still works with SCP: open Upload and type a remote directory (for example ~), or open Download and type the remote file (for example ~/report.txt), then choose SCP.",
     transfers_close_question: "Closing this session cancels its transfers",
@@ -2049,6 +2053,7 @@ pub static CHINESE: Strings = Strings {
     transfers_recursive: "复制整个目录及其内容",
     transfers_remote_directory: "远端目录",
     transfers_remote_path: "远端路径",
+    transfers_lands_at: "将保存到 {path}",
     transfers_protocol_label: "协议",
     files_sftp_scp_hint: "目录列表与管理需要 SFTP。复制文件仍可用 SCP：打开“上传”并填写远端目录（例如 ~），或打开“下载”并填写远端文件（例如 ~/报告.txt），再选择 SCP。",
     transfers_close_question: "关闭这个会话会取消它的传输",
@@ -2582,6 +2587,12 @@ pub struct UxStrings {
     pub fwd_kind_dynamic_hint: &'static str,
     /// Through host
     pub fwd_through: &'static str,
+    /// Placeholder of the search in the through-host picker.
+    pub fwd_host_search: &'static str,
+    /// The through-host picker's line when no host matches its search.
+    pub fwd_host_no_match: &'static str,
+    /// The through-host control before a host is chosen.
+    pub fwd_host_choose: &'static str,
     /// On this computer
     pub fwd_listen_local: &'static str,
     /// On the server
@@ -3309,6 +3320,9 @@ impl UxStrings {
             self.fwd_kind_remote_hint,
             self.fwd_kind_dynamic_hint,
             self.fwd_through,
+            self.fwd_host_search,
+            self.fwd_host_no_match,
+            self.fwd_host_choose,
             self.fwd_listen_local,
             self.fwd_listen_remote,
             self.fwd_target_remote,
@@ -3723,6 +3737,9 @@ included",
     fwd_kind_remote_hint: "Let the server reach a service running on this computer.",
     fwd_kind_dynamic_hint: "Send apps through the server: set their SOCKS proxy to the local port.",
     fwd_through: "Through host",
+    fwd_host_search: "Search hosts by name or address",
+    fwd_host_no_match: "No saved host matches this search.",
+    fwd_host_choose: "Choose a host",
     fwd_listen_local: "On this computer",
     fwd_listen_remote: "On the server",
     fwd_target_remote: "Destination, as the server sees it",
@@ -4146,6 +4163,9 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     fwd_kind_remote_hint: "让服务器访问本机上运行的服务。",
     fwd_kind_dynamic_hint: "让应用经由服务器上网：把应用的 SOCKS 代理设置为本机这个端口。",
     fwd_through: "经由主机",
+    fwd_host_search: "按名称或地址搜索主机",
+    fwd_host_no_match: "没有与搜索匹配的已保存主机。",
+    fwd_host_choose: "选择主机",
     fwd_listen_local: "本机监听",
     fwd_listen_remote: "服务器监听",
     fwd_target_remote: "目标（从服务器看）",

@@ -459,6 +459,13 @@ impl ShelluneView {
             .flatten()
             .filter(|id| self.pane_for(*id).is_some() || self.desktop_for(*id).is_some())
             .and_then(|id| self.status_banner(id, cx));
+        // A remote desktop draws no banner of its own, so it is handed the first control
+        // of the one above it: Tab reaches the banner from a session that ended, as it
+        // does from a terminal (ADR-6).
+        if let Some(pane) = session_id.and_then(|id| self.desktop_for(id)) {
+            let focus = banner.as_ref().map(|(_, focus)| focus.clone());
+            pane.read(cx).set_banner_focus(focus);
+        }
         if let Some((banner, _)) = banner {
             // The files have the terminal's place, or a remote desktop draws its own
             // card where the picture was: the banner stands above them (ADR-6, ADR-7).

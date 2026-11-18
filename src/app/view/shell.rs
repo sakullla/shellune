@@ -2778,9 +2778,11 @@ impl ShelluneView {
             div()
                 .flex()
                 .items_center()
+                .w_full()
+                .justify_end()
                 .gap(metrics.scale(spacing::TIGHT))
-                .child(save)
-                .child(cancel),
+                .child(cancel)
+                .child(save),
         )
     }
 
@@ -2821,14 +2823,9 @@ impl ShelluneView {
                     div()
                         .flex()
                         .items_center()
+                        .w_full()
+                        .justify_end()
                         .gap(metrics.scale(spacing::TIGHT))
-                        .child(self.text_button(
-                            SharedString::from("snippet.delete.yes"),
-                            ux.snippet_delete_yes,
-                            Variant::Danger,
-                            cx,
-                            |this, cx| this.confirm_snippet_delete(cx),
-                        ))
                         .child(self.text_button(
                             SharedString::from("snippet.delete.no"),
                             ux.snippet_delete_no,
@@ -2838,6 +2835,13 @@ impl ShelluneView {
                                 this.snippet_panel.keep();
                                 cx.notify();
                             },
+                        ))
+                        .child(self.text_button(
+                            SharedString::from("snippet.delete.yes"),
+                            ux.snippet_delete_yes,
+                            Variant::Danger,
+                            cx,
+                            |this, cx| this.confirm_snippet_delete(cx),
                         )),
                 ),
         )

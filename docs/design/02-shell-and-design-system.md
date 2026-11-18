@@ -661,7 +661,10 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   另有选择器 `desktop.status.headline` / `desktop.status.detail`。没有画面时的警告句是卡片里的一行（警告色调的状态记号 + 换行文字）。
 - **会话结束**：窗口不再在桌面上方另画一张失败卡片（旧版与桌面自己的状态卡上下叠成两张），而是与终端同一条顶部横幅
   （ADR-6 的 `status_banner`：图标、一句话、重新连接、详情、关闭，选择器仍是 `terminal.failure*`），桌面自己的状态卡留在画面
-  位置说“远程桌面会话已结束”和停在哪一步。横幅关闭后不再回落成旧卡片；Tab、Esc 与终端横幅相同，键盘离开横幅时回到桌面画面。
+  位置说“远程桌面会话已结束”和停在哪一步。横幅关闭后不再回落成旧卡片；Tab、Esc 与终端横幅相同：会话结束后桌面画面上按 Tab 进入横幅第一个控件（窗口每帧把
+  横幅首个控件的焦点交给 `DesktopPane::set_banner_focus`，在线会话的 Tab 仍发给远端），键盘离开横幅时回到桌面画面
+  （`tab_reaches_the_banner_above_an_ended_desktop_and_enter_reconnects`）；Esc 关闭横幅，键盘无论在横幅上还是在画面上，
+  关闭后都在桌面画面（`escape_closes_the_banner_above_an_ended_desktop`）。
 - **证书确认**是同一种 `status_card`（警告色调、锁图标），标题是证书摘要，指纹以等宽字体**整段换行显示、不加省略号**
   （`desktop.certificate.fingerprint`，点按复制）——它是决定的依据；底部“拒绝”（Danger）在前、“信任”（Primary）在后，右对齐。
 - **提示条**（`desktop.notice`）移到画面**左下角**：在顶部时，最小窗口里它会盖住右上角的缩放控件（截图 `desktop-notices`
@@ -1176,8 +1179,15 @@ resize 都按同一条 recount 路径重新计数，视口停在读者原处，�
   accent tint 打开文件夹图块 + 状态 + 下一步（`capped_text`，`files.empty` / `files.empty.hint`）；筛选无结果是放大镜 + 一句。
   等待服务器应答的提示（`files.pending`）是警告色调的 `inline_banner_frame` 加可换行的句子。
 - **行内问题是 `components::inline_form`**：raised 底 + 强发丝边（危险 / 警告问题为该色调的边）+ 圆角 8 + Raised，
-  头部是 `form_heading`（动作图标在色调 tint 上 + 一句，`files.question.heading`），字段上方是 `form_label`，目标路径用等宽
-  字体，协议分段只有自己的宽度。行的顺序、键盘停靠点与“确定在前、取消在后”不变。
+  头部是 `form_heading`（动作图标在色调 tint 上 + 一句，`files.question.heading`），字段上方是 `form_label`，协议分段只有
+  自己的宽度。新建文件夹 / 改名 / 删除仍以等宽字体写出目标的完整路径（`files.question.target`）；上传 / 下载的远端路径
+  已在“远端目录 / 远端路径”输入框里，**不再在下方重复**——只有上传时“目录 + 所选文件名”得出的最终路径与输入不同，才以
+  MUTED 小字写“将保存到 …”（`transfers_lands_at`，同一选择器）。按钮行占满表单宽度、靠右，**取消在左、主按钮在最右**，
+  键盘停靠顺序随之是“…… → 取消 → 确定”（`files_question_stops`）；传输覆盖确认是“保留 → 替换”。
+- **按钮顺序（全应用，T7 起）**：一组回答按钮靠右排列，主按钮（Primary / Danger 的那一个）在最右，取消 / 拒绝 / 保留
+  紧挨在它左边；Tab 顺序与视觉顺序一致。已按此调整：文件栏问题、传输覆盖（栏内与传输中心）、片段编辑器“取消 → 保存”、
+  片段删除“保留 → 删除”、连接表单里的主机身份确认“拒绝 → 信任”与 ProxyCommand 确认“拒绝 → 运行”；隧道表单、停止 /
+  删除 / 暴露确认、远程桌面证书卡、备份对话框与批量预览本来就是这个顺序。T8 的对话框三段式沿用同一规则。
 - 栏的焦点环改为 `FOCUS_RING`，边框平时就在（透明），拿到键盘时内容不再挪动 1px。
 - 拖动文件时跟随指针的标签是 raised + 强边 + Overlay，尺寸取窗口正在用的缩放。
 - 截图：`files-dual`、`files-question`（新增）、`files-marked`、`files-server-failed`、`files-empty` 各有深浅、中文与
@@ -1280,8 +1290,9 @@ SCP 失败就报 SCP 的失败，SFTP 失败就报 SFTP 的失败，不会静默
 - 没有“暂停/继续”：worker 与队列都没有暂停语义（`TransferCommand` 只有 Start / Decide / Cancel），本轮不给一个只会改
   样式的按钮。真正的暂停需要 `crates/ssh` 与 `crates/core` 的改动，超出本轮范围，记为未实现。
 - **新视觉（T7，ADR-7）**：传输条的标题行是它自己的工具行（传输图标 + “传输” + 运行中的数量，仍在滚动区之上）；
-  每个任务是 panel 底 + 发丝边 + 圆角 6 的一行，状态句与动作同在第一行，条太窄时动作整体换到句子下面（句子最窄
-  `FILES_SELECTION_WORDS_MIN`，不再被挤成一行两个字）；进度条是共享的 `components::progress_bar`（确定）；“无法开始”与
+  每个任务是 panel 底 + 发丝边 + 圆角 6 的一行，状态句与动作同在第一行，条太窄时动作整体换成单独一行并放在句子**上面**（`flex_wrap_reverse`；句子最窄
+  `FILES_SELECTION_WORDS_MIN`，不再被挤成一行两个字）——720×480 @200% 下传输条按视口 42% 封顶，长原因被截在下方可滚动，
+  “续传 / 重新传输”仍在首屏；进度条是共享的 `components::progress_bar`（确定）；“无法开始”与
   “文件夹未传输”是色调 tint 上的状态记号 + 句子；覆盖确认是危险边的 `inline_form`。传输中心（传输对话框）的
   行改为 `list_row_frame`：左侧上传 / 下载图标在状态色调上，右侧状态 chip；没有任务时是共享的 `empty_state`
   （`transfers.empty`，取代原来的 `state.card`）。
@@ -1299,7 +1310,13 @@ SCP 失败就报 SCP 的失败，SFTP 失败就报 SFTP 的失败，不会静默
 - 新建/编辑表单本身就是“类型 · 经由主机 · 两个带标签的端点 · 一句话预览”；保存前校验在表单内出现（`forwards.error`），
   被拒绝时表单不关、文件不写（`the_tunnel_form_refuses_an_incomplete_endpoint_and_saves_nothing`）。
 - **新视觉（T7，ADR-7）**：表单是 `inline_form`（头部隧道图标 + “新建 / 编辑端口转发”，每个字段上方 `form_label`，端口框宽
-  `FORWARD_PORT_WIDTH`，底部取消在前、保存在后右对齐）；停止 / 删除确认与“监听所有地址”确认是警告 / 危险边的
+  `FORWARD_PORT_WIDTH`，底部取消在前、保存在后右对齐）。“经由主机”不再是每台主机一段的分段控件（主机一多就冲出
+  表单），而是一个字段样式的选择器（`forwards.host`：服务器图标 + 名称 + 等宽地址 + 下拉箭头），点开后在其下方展开
+  `menu_card`（`forwards.host.picker`）：顶部搜索框按名称或地址过滤（忽略大小写），列表最多 `FORWARD_HOST_ROWS`（6）
+  行高、超出滚动（`forwards.host.options` / `forwards.host.option.<n>`，已选主机带勾），无匹配时一句
+  `forwards.host.none`。键盘：控件上 Enter / Space / ↓ 打开（标记落在当前主机），↑↓ 移动、Enter 选中并把键盘还给控件，
+  Esc 只关列表不关表单，点外部关闭；Tab 从控件进入第一个地址框，第一个地址框 Shift+Tab、最后一个框 Tab 回到控件
+  （`the_tunnel_forms_host_picker_narrows_twenty_four_hosts_from_the_keyboard`，24 台主机）；停止 / 删除确认与“监听所有地址”确认是警告 / 危险边的
   `inline_form`（停止图标 / 垃圾桶 / 地球，按钮右对齐）。规则行仍是 `list_row_frame`，文字最窄 `FORWARD_ROW_WORDS_MIN`，
   对话框太窄（720×480 @200%）时命令换到文字下一行，不再压在“监听中”chip 上。
 
@@ -1948,7 +1965,7 @@ surface 底、静止 Raised，焦点环叠在 Raised 之上；尺寸不随窗口
 | `search_field(field, clear, shortcut, state)` | 唯一的搜索框：放大镜图标 + 调用方的文本框 + 可选清除按钮 + 可选快捷键提示（`kbd`）；外观取 `field_face(state)`，高 32、圆角 6。文本框的占位文字比框宽时以“…”结尾（`text_field.rs` 绘制时截断，测试 `a_placeholder_wider_than_its_field_ends_in_an_ellipsis`）；已输入的文字仍横向滚动 |
 | `list_row(ListRow, state)` / `list_row_frame(state)` / `list_row_face` / `leading_icon` | 列表行：扁平（静止无底无边），悬停 hover 底、选中 selected 底 + 左侧 2px accent 竖条（画在内边距里，内容不移动）、焦点 2px 焦点环；左侧头像或图标块（32），两行文字（名称 13 MEDIUM、副行 12，放不下时以画出的“…”结尾，测试 `cut_words_in_rows_banners_and_sidebars_end_in_a_drawn_ellipsis` 读回排版后的行来校验），右侧元信息（12、muted）与动作区；`reveal_actions` 时动作只在悬停（`ROW_GROUP`）或选中时显示。端口转发列表已改用它 |
 | `compact_row_frame(state, marked)` | 紧凑列表行（T7）：与 `list_row_frame` 同一张面表、同一个 `ROW_GROUP`，最小高一个紧凑控件（28）、无上下内边距、间距 8；`marked` 为批量标记行（`ACCENT_TINT` 底，悬停不覆盖）。文件列表与“上级目录”行用它 |
-| `inline_form(tone)` + `form_heading(tone, icon, title)` + `form_label(label)` | 栏内 / 对话框内的问题与短表单（T7）：raised 底 + 强发丝边（危险、警告为该色调的边）+ 圆角 8 + Raised，内边距 12、间距 8；头部是指针目标大小的色调图块 + 一句（body、500）；字段标签 caption、500、次要色；主次按钮放在最后一行并靠右，不用大面积强调色底。文件栏问题、传输覆盖确认、隧道表单与停止 / 删除 / 暴露确认用它，取代这些地方的 `banner` 与 `card` |
+| `inline_form(tone)` + `form_heading(tone, icon, title)` + `form_label(label)` | 栏内 / 对话框内的问题与短表单（T7）：raised 底 + 强发丝边（危险、警告为该色调的边）+ 圆角 8 + Raised，内边距 12、间距 8；头部是指针目标大小的色调图块 + 一句（body、500）；字段标签 caption、500、次要色；主次按钮放在最后一行、占满宽度并靠右，主按钮在最右、取消在它左边，不用大面积强调色底。文件栏问题、传输覆盖确认、隧道表单与停止 / 删除 / 暴露确认用它，取代这些地方的 `banner` 与 `card` |
 | `crumb(current)` + `crumb_separator` | 面包屑的一段与段间箭头（T7）：次要文字、圆角 4、悬停浅底与主文字色，当前段主文字 + 500；箭头 caption 大小、muted |
 | `column_divider` / `HAIRLINE_WIDTH` | 两栏之间从顶到底的发丝线；发丝线宽度常量（`divider_vertical` 与文件栏宽度计算也用它） |
 | `sidebar_item(icon, label, count, selected)` / `sidebar_icon_item` | 侧栏项：高 32、圆角 6，图标 16 + 文字（省略号）+ 右对齐计数（12、muted）；选中为 selected 底 + 主色 + MEDIUM；折叠侧栏用仅图标的方形项 |

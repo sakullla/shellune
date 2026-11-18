@@ -317,6 +317,10 @@ pub struct DesktopPane {
     noticed: Vec<DesktopNotice>,
     /// The focus and activation observers, alive as long as the pane.
     subscriptions: Vec<Subscription>,
+    /// The first control of the banner the window draws above an ended session, which
+    /// Tab reaches from a pane that no longer sends keys (ADR-6, ADR-7). The window
+    /// hands it in on every draw, and `None` when no banner is shown.
+    banner_focus: std::cell::RefCell<Option<FocusHandle>>,
 }
 
 impl DesktopPane {
@@ -353,7 +357,14 @@ impl DesktopPane {
             notices: Vec::new(),
             noticed: Vec::new(),
             subscriptions: Vec::new(),
+            banner_focus: std::cell::RefCell::new(None),
         }
+    }
+
+    /// Hands the pane the first control of the banner the window draws above it for
+    /// the next draw, or `None` when no banner is shown (ADR-6).
+    pub fn set_banner_focus(&self, focus: Option<FocusHandle>) {
+        *self.banner_focus.borrow_mut() = focus;
     }
 
     /// A pane already holding a link, which is how the tests drive every rule the
@@ -919,13 +930,6 @@ impl DesktopPane {
         }
     }
 
-    /// Answers the certificate question on screen.
-    ///
-    /// The link is answered before anything else happens, with the request id the
-    /// question carries: a refusal that only stopped this pane would leave the
-    /// server waiting out its own timeout with the worker and its socket still
-    /// held. Accepting starts the sign-in, which is the next visible step; refusing
-    /// ends the session, and ending it shuts the link down.
     /// Whether the server's certificate question is waiting on screen, for a capture.
     #[cfg(feature = "ui-capture")]
     #[must_use]
@@ -933,6 +937,13 @@ impl DesktopPane {
         self.certificate.is_some()
     }
 
+    /// Answers the certificate question on screen.
+    ///
+    /// The link is answered before anything else happens, with the request id the
+    /// question carries: a refusal that only stopped this pane would leave the
+    /// server waiting out its own timeout with the worker and its socket still
+    /// held. Accepting starts the sign-in, which is the next visible step; refusing
+    /// ends the session, and ending it shuts the link down.
     pub fn answer_certificate(&mut self, accept: bool, cx: &mut Context<Self>) {
         let Some(question) = self.certificate.take() else {
             return;
@@ -1142,6 +1153,22 @@ impl DesktopPane {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+        // A session that ended sends no keys, so Tab moves on to the banner above the
+        // pane and its commands are reached without the pointer, as from a terminal
+        // (ADR-6). A live session keeps Tab: it is the remote side's key.
+        let modifiers = &keystroke.modifiers;
+        if keystroke.key == "tab"
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+            && !modifiers.shift
+            && matches!(self.phase, DesktopPhase::Ended(_))
+            && let Some(focus) = self.banner_focus.borrow().clone()
+        {
+            window.focus(&focus);
+            cx.stop_propagation();
+            return;
+        }
         // The pane hands every key to the remote side, so the two controls that
         // belong to the pane itself are taken here, before the key table can turn
         // them into remote keys: F11 for the whole window (R18) and Alt with the

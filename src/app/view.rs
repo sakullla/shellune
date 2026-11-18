@@ -664,6 +664,10 @@ pub struct ShelluneView {
     host_advanced: bool,
     /// The host dialog's jump host picker, while it is open (R3).
     jump_picker: Option<host_dialog::JumpPicker>,
+    /// The tunnel form's through-host picker, while it is open (ADR-7).
+    forward_host_picker: Option<forwarding::ForwardHostPicker>,
+    /// The keyboard stop of the tunnel form's through-host control.
+    forward_host_focus: FocusHandle,
     /// Whether the connection form shows its less common options (X11 forwarding).
     remote_more: bool,
     /// Whether a failure that was not about signing in still shows the sign-in form.
@@ -2723,6 +2727,8 @@ impl ShelluneView {
             forward_only_dial: false,
             host_advanced: false,
             jump_picker: None,
+            forward_host_picker: None,
+            forward_host_focus: cx.focus_handle(),
             remote_more: false,
             remote_edit_auth: false,
             pending_forward_rules: Vec::new(),
@@ -7918,7 +7924,8 @@ impl ShelluneView {
         true
     }
 
-    /// Wires Tab and Shift+Tab across the visible Port Forwarding form fields.
+    /// Wires Tab and Shift+Tab across the visible Port Forwarding form fields, with the
+    /// through-host control as the stop before the first of them (ADR-7).
     fn bind_forward_fields(&mut self, cx: &mut Context<Self>) {
         let candidates = [
             self.forward_listen_host.clone(),
@@ -7926,30 +7933,51 @@ impl ShelluneView {
             self.forward_target_host.clone(),
             self.forward_target_port.clone(),
         ];
-        let tab_view = cx.entity().downgrade();
-        TextField::wire_dynamic_tab_ring(
-            &candidates,
-            move |app| {
-                let Some(view) = tab_view.upgrade() else {
-                    return Vec::new();
-                };
-                let view = view.read(app);
-                let mut visible = vec![
-                    view.forward_listen_host.clone(),
-                    view.forward_listen_port.clone(),
-                ];
-                let dynamic = view
-                    .forwards
-                    .editor()
-                    .is_some_and(|editor| editor.kind == shellune_core::ForwardKind::Dynamic);
-                if !dynamic {
-                    visible.push(view.forward_target_host.clone());
-                    visible.push(view.forward_target_port.clone());
-                }
-                visible
-            },
-            cx,
-        );
+        for field in &candidates {
+            let me = field.downgrade();
+            let tab_view = cx.entity().downgrade();
+            field.update(cx, |text_field, _cx| {
+                text_field.on_tab(move |shift, window, app| {
+                    let (Some(me), Some(view)) = (me.upgrade(), tab_view.upgrade()) else {
+                        return false;
+                    };
+                    let view = view.read(app);
+                    let fields = view.forward_tab_fields();
+                    let Some(index) = fields.iter().position(|entry| *entry == me) else {
+                        return false;
+                    };
+                    // The host control stands before the first field and after the last.
+                    let next = if shift {
+                        index.checked_sub(1)
+                    } else {
+                        Some(index + 1).filter(|next| *next < fields.len())
+                    };
+                    let handle = match next {
+                        Some(next) => fields[next].read(app).focus_handle().clone(),
+                        None => view.forward_host_focus.clone(),
+                    };
+                    window.focus(&handle);
+                    true
+                });
+            });
+        }
+    }
+
+    /// The text fields of the tunnel form the keyboard walks, in visual order.
+    fn forward_tab_fields(&self) -> Vec<Entity<TextField>> {
+        let mut visible = vec![
+            self.forward_listen_host.clone(),
+            self.forward_listen_port.clone(),
+        ];
+        let dynamic = self
+            .forwards
+            .editor()
+            .is_some_and(|editor| editor.kind == shellune_core::ForwardKind::Dynamic);
+        if !dynamic {
+            visible.push(self.forward_target_host.clone());
+            visible.push(self.forward_target_port.clone());
+        }
+        visible
     }
 
     /// Copies the form's values into the fields, for a form that just opened.
@@ -10450,20 +10478,22 @@ impl ShelluneView {
                         div()
                             .flex()
                             .items_center()
+                            .w_full()
+                            .justify_end()
                             .gap(metrics.scale(spacing::TIGHT))
-                            .child(self.text_button(
-                                SharedString::from("remote.trust.accept"),
-                                strings.trust_accept,
-                                Variant::Primary,
-                                cx,
-                                |view, cx| view.answer_trust(true, cx),
-                            ))
                             .child(self.text_button(
                                 SharedString::from("remote.trust.reject"),
                                 strings.trust_reject,
                                 Variant::Danger,
                                 cx,
                                 |view, cx| view.answer_trust(false, cx),
+                            ))
+                            .child(self.text_button(
+                                SharedString::from("remote.trust.accept"),
+                                strings.trust_accept,
+                                Variant::Primary,
+                                cx,
+                                |view, cx| view.answer_trust(true, cx),
                             )),
                     ),
             );
@@ -10502,20 +10532,22 @@ impl ShelluneView {
                         div()
                             .flex()
                             .items_center()
+                            .w_full()
+                            .justify_end()
                             .gap(metrics.scale(spacing::TIGHT))
-                            .child(self.text_button(
-                                SharedString::from("remote.proxy.confirm"),
-                                strings.remote_proxy_confirm,
-                                Variant::Primary,
-                                cx,
-                                move |view, cx| view.answer_proxy(true, cx),
-                            ))
                             .child(self.text_button(
                                 SharedString::from("remote.proxy.refuse"),
                                 strings.remote_proxy_refuse,
                                 Variant::Danger,
                                 cx,
                                 move |view, cx| view.answer_proxy(false, cx),
+                            ))
+                            .child(self.text_button(
+                                SharedString::from("remote.proxy.confirm"),
+                                strings.remote_proxy_confirm,
+                                Variant::Primary,
+                                cx,
+                                move |view, cx| view.answer_proxy(true, cx),
                             )),
                     ),
             );
@@ -11855,6 +11887,12 @@ impl ShelluneView {
         // and leaves the dialog, and what was typed in it, where it was (R3).
         if self.jump_picker.is_some() && self.host_fields.is_some() {
             self.close_jump_picker(window, cx);
+            return true;
+        }
+        // The through-host picker is a list over the tunnel form: Escape closes the
+        // list and leaves the form where it was (ADR-7).
+        if self.forward_host_picker_shown() {
+            self.close_forward_host_picker(window, cx);
             return true;
         }
         if self.host_fields.is_some() {
@@ -14058,8 +14096,10 @@ impl ShelluneView {
                 stops.push(FilesStop::QuestionRecursive);
             }
         }
-        stops.push(FilesStop::QuestionConfirm);
+        // The cancelling button stands left of the one that answers, which is the last
+        // control of the question (ADR-7).
         stops.push(FilesStop::QuestionCancel);
+        stops.push(FilesStop::QuestionConfirm);
         stops
     }
 
@@ -15396,19 +15436,11 @@ impl ShelluneView {
             .child(
                 div()
                     .flex()
+                    .w_full()
                     .items_center()
                     .flex_wrap()
                     .justify_end()
                     .gap(metrics.scale(spacing::TIGHT))
-                    .child(self.text_button(
-                        SharedString::from(format!("transfers.overwrite.replace.{index}")),
-                        strings.transfers_overwrite_replace,
-                        Variant::Danger,
-                        cx,
-                        move |view, cx| {
-                            view.transfer_decide(id, shellune_core::OverwriteChoice::Replace, cx);
-                        },
-                    ))
                     .child(self.text_button(
                         SharedString::from(format!("transfers.overwrite.keep.{index}")),
                         strings.transfers_overwrite_keep,
@@ -15420,6 +15452,15 @@ impl ShelluneView {
                                 shellune_core::OverwriteChoice::KeepExisting,
                                 cx,
                             );
+                        },
+                    ))
+                    .child(self.text_button(
+                        SharedString::from(format!("transfers.overwrite.replace.{index}")),
+                        strings.transfers_overwrite_replace,
+                        Variant::Danger,
+                        cx,
+                        move |view, cx| {
+                            view.transfer_decide(id, shellune_core::OverwriteChoice::Replace, cx);
                         },
                     )),
             )
@@ -15576,16 +15617,9 @@ impl ShelluneView {
             ));
         }
         if include_overwrite && task.state().is_awaiting_overwrite() {
+            // Keeping the file is the cancelling answer and stands left of the one that
+            // replaces it (ADR-7).
             actions = actions
-                .child(self.text_button(
-                    SharedString::from(format!("{prefix}.overwrite.replace.{index}")),
-                    strings.transfers_overwrite_replace,
-                    Variant::Danger,
-                    cx,
-                    move |view, cx| {
-                        view.transfer_decide(id, shellune_core::OverwriteChoice::Replace, cx);
-                    },
-                ))
                 .child(self.text_button(
                     SharedString::from(format!("{prefix}.overwrite.keep.{index}")),
                     strings.transfers_overwrite_keep,
@@ -15593,6 +15627,15 @@ impl ShelluneView {
                     cx,
                     move |view, cx| {
                         view.transfer_decide(id, shellune_core::OverwriteChoice::KeepExisting, cx);
+                    },
+                ))
+                .child(self.text_button(
+                    SharedString::from(format!("{prefix}.overwrite.replace.{index}")),
+                    strings.transfers_overwrite_replace,
+                    Variant::Danger,
+                    cx,
+                    move |view, cx| {
+                        view.transfer_decide(id, shellune_core::OverwriteChoice::Replace, cx);
                     },
                 ));
         }
@@ -15681,12 +15724,14 @@ impl ShelluneView {
             .text_size(metrics.caption_size())
             // The state and the actions it allows share one line: the button sits
             // beside what it acts on instead of on a line of its own under the bar. In a
-            // narrow strip the actions wrap under the words rather than squeezing them
-            // into a column of two words a line.
+            // narrow strip the actions wrap onto a line of their own rather than squeezing
+            // the words into a column of two words a line, and that line is the first
+            // one: a long reason under them is what the strip's share cuts, not the next
+            // step (R4).
             .child(
                 div()
                     .flex()
-                    .flex_wrap()
+                    .flex_wrap_reverse()
                     .items_center()
                     .gap(metrics.scale(spacing::TIGHT))
                     .min_w_0()
@@ -15888,17 +15933,40 @@ impl ShelluneView {
                             .child(div().flex_none().child(field.clone())),
                     ));
                 }
-                rows.push((
-                    Vec::new(),
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .font_family(terminal::monospace_family())
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                        .debug_selector(|| "files.question.target".to_owned())
-                        .child(SharedString::from(display_path(dialog.source(), &target))),
-                ));
+                // A transfer question already shows its remote path in the field above, so
+                // the path is not repeated under it. Only an upload whose file name makes
+                // the final path differ from the typed directory says where it lands.
+                match dialog.remote() {
+                    Some(typed) if self.files_remote_field.is_some() => {
+                        if target.trim() != typed.trim() {
+                            rows.push((
+                                Vec::new(),
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .whitespace_normal()
+                                    .text_size(metrics.caption_size())
+                                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                                    .debug_selector(|| "files.question.target".to_owned())
+                                    .child(SharedString::from(copy::fill(
+                                        strings.transfers_lands_at,
+                                        &[("path", &display_path(dialog.source(), &target))],
+                                    ))),
+                            ));
+                        }
+                    }
+                    _ => rows.push((
+                        Vec::new(),
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_family(terminal::monospace_family())
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .debug_selector(|| "files.question.target".to_owned())
+                            .child(SharedString::from(display_path(dialog.source(), &target))),
+                    )),
+                }
                 if let Some(field) = &self.files_field {
                     rows.push((
                         vec![FilesStop::QuestionLocal],
@@ -15985,24 +16053,14 @@ impl ShelluneView {
                     _ => strings.files_create,
                 };
                 rows.push((
-                    vec![FilesStop::QuestionConfirm, FilesStop::QuestionCancel],
+                    vec![FilesStop::QuestionCancel, FilesStop::QuestionConfirm],
                     div()
                         .flex()
+                        .w_full()
                         .items_center()
                         .flex_wrap()
                         .justify_end()
                         .gap(metrics.scale(spacing::TIGHT))
-                        .child(
-                            self.text_button(
-                                SharedString::from("files.question.confirm"),
-                                confirm,
-                                Variant::Primary,
-                                cx,
-                                |view, cx| view.submit_files_change(cx),
-                            )
-                            .track_focus(&self.files_question_confirm_focus)
-                            .focus(files_focus_ring),
-                        )
                         .child(
                             self.text_button(
                                 SharedString::from("files.question.cancel"),
@@ -16012,6 +16070,17 @@ impl ShelluneView {
                                 |view, cx| view.files_cancel_change(cx),
                             )
                             .track_focus(&self.files_question_cancel_focus)
+                            .focus(files_focus_ring),
+                        )
+                        .child(
+                            self.text_button(
+                                SharedString::from("files.question.confirm"),
+                                confirm,
+                                Variant::Primary,
+                                cx,
+                                |view, cx| view.submit_files_change(cx),
+                            )
+                            .track_focus(&self.files_question_confirm_focus)
                             .focus(files_focus_ring),
                         ),
                 ));
@@ -16148,24 +16217,14 @@ impl ShelluneView {
                     ));
                 }
                 rows.push((
-                    vec![FilesStop::QuestionConfirm, FilesStop::QuestionCancel],
+                    vec![FilesStop::QuestionCancel, FilesStop::QuestionConfirm],
                     div()
                         .flex()
+                        .w_full()
                         .items_center()
                         .flex_wrap()
                         .justify_end()
                         .gap(metrics.scale(spacing::TIGHT))
-                        .child(
-                            self.text_button(
-                                SharedString::from("files.question.confirm"),
-                                strings.files_delete_confirm,
-                                Variant::Danger,
-                                cx,
-                                |view, cx| view.submit_files_change(cx),
-                            )
-                            .track_focus(&self.files_question_confirm_focus)
-                            .focus(files_focus_ring),
-                        )
                         .child(
                             self.text_button(
                                 SharedString::from("files.question.cancel"),
@@ -16175,6 +16234,17 @@ impl ShelluneView {
                                 |view, cx| view.files_cancel_change(cx),
                             )
                             .track_focus(&self.files_question_cancel_focus)
+                            .focus(files_focus_ring),
+                        )
+                        .child(
+                            self.text_button(
+                                SharedString::from("files.question.confirm"),
+                                strings.files_delete_confirm,
+                                Variant::Danger,
+                                cx,
+                                |view, cx| view.submit_files_change(cx),
+                            )
+                            .track_focus(&self.files_question_confirm_focus)
                             .focus(files_focus_ring),
                         ),
                 ));

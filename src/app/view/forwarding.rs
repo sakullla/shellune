@@ -1,7 +1,9 @@
 //! The forwarding page: saved rules, their real runtime, and the form (R11).
 
 use gpui::prelude::*;
-use gpui::{Context, FontWeight, SharedString, Window, div};
+use gpui::{
+    App, Context, Entity, FontWeight, KeyDownEvent, ScrollHandle, SharedString, Window, div, px,
+};
 use shellune_core::{
     BindExposure, ForwardFault, ForwardId, ForwardKind, ForwardRule, HostConfig, HostId, SessionId,
     SessionKind, SessionState,
@@ -15,8 +17,9 @@ use crate::app::copy::{self, Strings};
 use crate::app::forwarding::{
     ForwardConfirm, ForwardEditor, ForwardPhase, ForwardScope, ForwardStart,
 };
-use crate::app::icons::Icon;
-use crate::app::theme::{self, Tone, palette, spacing};
+use crate::app::icons::{self, Icon};
+use crate::app::text_field::TextField;
+use crate::app::theme::{self, Tone, palette, radius, spacing};
 
 /// The width of a port field beside its address, before text scale: five digits and
 /// the field's own padding.
@@ -25,6 +28,28 @@ const FORWARD_PORT_WIDTH: f32 = 120.0;
 /// The narrowest a tunnel row's words get before its commands wrap under them, before
 /// text scale.
 const FORWARD_ROW_WORDS_MIN: f32 = 200.0;
+
+/// How many hosts the through-host picker lists before its list scrolls.
+const FORWARD_HOST_ROWS: f32 = 6.0;
+
+/// The widest a host's name gets in the through-host control and its picker, before
+/// text scale; its address takes the rest.
+const FORWARD_HOST_NAME_MAX: f32 = 200.0;
+
+/// The through-host picker of the tunnel form, while it is open (ADR-7).
+///
+/// A search field over the saved hosts with one candidate marked for the keyboard: a
+/// book of any size is one short list to narrow instead of a row of segments that runs
+/// out of the form.
+pub(super) struct ForwardHostPicker {
+    search: Entity<TextField>,
+    /// The search the candidates were last narrowed by: a new phrase moves the mark
+    /// back to the first candidate.
+    phrase: String,
+    /// The candidate Enter picks, as an index into the narrowed list.
+    highlight: usize,
+    scroll: ScrollHandle,
+}
 
 impl ShelluneView {
     pub(super) fn reload_forwards(&mut self) {
@@ -75,8 +100,390 @@ impl ShelluneView {
             _ => self.book.hosts().first().map(HostConfig::id),
         };
         self.forwards.begin_new(host);
+        self.forward_host_picker = None;
         self.fill_forward_fields("", "127.0.0.1", "", "", "", cx);
         cx.notify();
+    }
+
+    /// Whether the through-host picker is open over a tunnel form on screen.
+    pub(super) fn forward_host_picker_shown(&self) -> bool {
+        self.forward_host_picker.is_some()
+            && self.tool == Some(super::shell::Tool::Forwards)
+            && self.forwards.editor().is_some()
+    }
+
+    /// Opens the through-host picker with an empty search that has the keyboard and the
+    /// chosen host marked, or closes it when it is already open.
+    pub(super) fn toggle_forward_host_picker(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.forward_host_picker.is_some() {
+            self.close_forward_host_picker(window, cx);
+            return;
+        }
+        let placeholder = copy::ux_for(self.workspace.locale()).fwd_host_search;
+        let search = cx.new(|cx| {
+            let mut field = TextField::new(placeholder, cx);
+            field.set_leading_icon(Icon::Search, cx);
+            field
+        });
+        // A new phrase marks the first candidate again; the list itself is read from
+        // the field on every draw.
+        cx.observe(&search, |this, search, cx| {
+            let text = search.read(cx).text().to_owned();
+            if let Some(picker) = this.forward_host_picker.as_mut()
+                && picker.phrase != text
+            {
+                picker.phrase = text;
+                picker.highlight = 0;
+                picker.scroll.scroll_to_item(0);
+            }
+            cx.notify();
+        })
+        .detach();
+        window.focus(search.read(cx).focus_handle());
+        let chosen = self.forwards.editor().and_then(|editor| editor.host);
+        let highlight = self
+            .book
+            .hosts()
+            .iter()
+            .position(|host| Some(host.id()) == chosen)
+            .unwrap_or(0);
+        let scroll = ScrollHandle::new();
+        scroll.scroll_to_item(highlight);
+        self.forward_host_picker = Some(ForwardHostPicker {
+            search,
+            phrase: String::new(),
+            highlight,
+            scroll,
+        });
+        cx.notify();
+    }
+
+    /// Closes the through-host picker and gives the keyboard back to its control.
+    pub(super) fn close_forward_host_picker(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.forward_host_picker.take().is_some() {
+            window.focus(&self.forward_host_focus);
+            cx.notify();
+        }
+    }
+
+    /// The saved hosts the open picker offers for what is typed in it, in saved order:
+    /// those whose name or address holds the phrase, ignoring case.
+    fn forward_host_candidates(&self, cx: &App) -> Vec<HostId> {
+        let phrase = self
+            .forward_host_picker
+            .as_ref()
+            .map(|picker| picker.search.read(cx).text().trim().to_lowercase())
+            .unwrap_or_default();
+        self.book
+            .hosts()
+            .iter()
+            .filter(|host| {
+                phrase.is_empty()
+                    || host.name().to_lowercase().contains(&phrase)
+                    || host.address().to_lowercase().contains(&phrase)
+            })
+            .map(HostConfig::id)
+            .collect()
+    }
+
+    /// Takes `id` as the host the tunnel goes through and closes the picker.
+    fn pick_forward_host(&mut self, id: HostId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self.forwards.editor_mut() {
+            editor.host = Some(id);
+        }
+        self.close_forward_host_picker(window, cx);
+        cx.notify();
+    }
+
+    /// Up and Down move the mark through the candidates, Enter picks the marked one and
+    /// Escape closes the list. They are taken before the search field sees them: the
+    /// field would read Enter as a submit of its own.
+    fn forward_host_picker_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.modifiers.number_of_modifiers() != 0 {
+            return;
+        }
+        let candidates = self.forward_host_candidates(cx);
+        let Some(picker) = self.forward_host_picker.as_mut() else {
+            return;
+        };
+        let last = candidates.len().saturating_sub(1);
+        match event.keystroke.key.as_str() {
+            "down" => {
+                picker.highlight = (picker.highlight + 1).min(last);
+                picker.scroll.scroll_to_item(picker.highlight);
+            }
+            "up" => {
+                picker.highlight = picker.highlight.saturating_sub(1).min(last);
+                picker.scroll.scroll_to_item(picker.highlight);
+            }
+            "enter" => {
+                if let Some(id) = candidates.get(picker.highlight.min(last)).copied() {
+                    self.pick_forward_host(id, window, cx);
+                }
+            }
+            "escape" => self.close_forward_host_picker(window, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// The keys of the closed through-host control: Enter, Space or Down opens the
+    /// picker, and Tab walks on to the form's fields.
+    fn forward_host_control_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modifiers = &event.keystroke.modifiers;
+        if modifiers.control || modifiers.alt || modifiers.platform {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "enter" | "space" | "down" if !modifiers.shift => {
+                self.toggle_forward_host_picker(window, cx);
+            }
+            "tab" => {
+                let fields = self.forward_tab_fields();
+                let field = if modifiers.shift {
+                    fields.last()
+                } else {
+                    fields.first()
+                };
+                if let Some(field) = field {
+                    window.focus(field.read(cx).focus_handle());
+                }
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
+    /// The search, the marked candidate and how many candidates the open through-host
+    /// picker shows, for the tests.
+    #[cfg(test)]
+    pub(crate) fn forward_host_picker_for_test(&self, cx: &App) -> Option<(String, usize, usize)> {
+        let picker = self.forward_host_picker.as_ref()?;
+        Some((
+            picker.search.read(cx).text().to_owned(),
+            picker.highlight,
+            self.forward_host_candidates(cx).len(),
+        ))
+    }
+
+    /// The host the tunnel form goes through, for the tests.
+    #[cfg(test)]
+    pub(crate) fn forward_editor_host_for_test(&self) -> Option<HostId> {
+        self.forwards.editor().and_then(|editor| editor.host)
+    }
+
+    /// Whether the through-host control holds the keyboard, for the tests.
+    #[cfg(test)]
+    pub(crate) fn forward_host_control_focused_for_test(&self, window: &Window) -> bool {
+        self.forward_host_focus.is_focused(window)
+    }
+
+    /// The through-host control: the chosen host as a field that opens a searchable
+    /// list, with the list under it while it is open (ADR-7).
+    fn forward_host_control(&self, editor: &ForwardEditor, cx: &mut Context<Self>) -> gpui::Div {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let chosen = editor.host.and_then(|id| self.book.host(id));
+        let ring = theme::swatch(palette::FOCUS_RING);
+        let open = self.forward_host_picker.is_some();
+        let trigger = components::field_frame(
+            if open {
+                ControlState::Focused
+            } else {
+                ControlState::Resting
+            },
+            metrics,
+        )
+        .id("forwards.host")
+        .debug_selector(|| "forwards.host".to_owned())
+        .track_focus(&self.forward_host_focus)
+        .focus(move |style| style.border_color(ring))
+        .cursor_pointer()
+        .child(icons::icon(
+            Icon::Server,
+            metrics.small_icon_size(),
+            theme::swatch(palette::TEXT_MUTED),
+        ))
+        .child(
+            div()
+                .flex_none()
+                .max_w(metrics.scale(FORWARD_HOST_NAME_MAX))
+                .truncate()
+                .text_size(metrics.label_size())
+                .text_color(theme::swatch(if chosen.is_some() {
+                    palette::TEXT_PRIMARY
+                } else {
+                    palette::TEXT_MUTED
+                }))
+                .debug_selector(|| "forwards.host.name".to_owned())
+                .child(SharedString::from(
+                    chosen
+                        .map_or(ux.fwd_host_choose, HostConfig::name)
+                        .to_owned(),
+                )),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_family(crate::app::terminal::monospace_family())
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .children(chosen.map(|host| SharedString::from(host.target()))),
+        )
+        .child(icons::icon(
+            if open {
+                Icon::ChevronUp
+            } else {
+                Icon::ChevronDown
+            },
+            metrics.small_icon_size(),
+            theme::swatch(palette::TEXT_MUTED),
+        ))
+        .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+            view.forward_host_control_key(event, window, cx);
+        }))
+        .on_click(cx.listener(|view, _event, window, cx| {
+            view.toggle_forward_host_picker(window, cx);
+        }));
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            // A press anywhere else closes the list; the control itself toggles it.
+            .when(open, |control| {
+                control.on_mouse_down_out(cx.listener(|view, _event, window, cx| {
+                    view.close_forward_host_picker(window, cx);
+                }))
+            })
+            .child(trigger)
+            .children(self.forward_host_picker_card(editor, cx))
+    }
+
+    /// The open through-host picker: its search field over the hosts it narrows.
+    fn forward_host_picker_card(
+        &self,
+        editor: &ForwardEditor,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        let picker = self.forward_host_picker.as_ref()?;
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let candidates = self.forward_host_candidates(cx);
+        let marked = picker.highlight.min(candidates.len().saturating_sub(1));
+        let row_height = metrics.control_height();
+        let mut list = div()
+            .id("forwards.host.options")
+            .debug_selector(|| "forwards.host.options".to_owned())
+            .flex()
+            .flex_col()
+            .max_h(row_height * FORWARD_HOST_ROWS)
+            .overflow_y_scroll()
+            .track_scroll(&picker.scroll);
+        for (index, id) in candidates.iter().copied().enumerate() {
+            let Some(host) = self.book.host(id) else {
+                continue;
+            };
+            let marked_row = index == marked;
+            let chosen = editor.host == Some(id);
+            let hover = theme::swatch(palette::SURFACE_HOVER);
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("forwards.host.option.{index}")))
+                    .debug_selector(move || format!("forwards.host.option.{index}"))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .h(row_height)
+                    .px(metrics.scale(spacing::TIGHT))
+                    .rounded(px(radius::SMALL))
+                    .cursor_pointer()
+                    .when(marked_row, |row| {
+                        row.bg(theme::swatch(palette::SURFACE_SELECTED))
+                    })
+                    .when(!marked_row, |row| row.hover(move |style| style.bg(hover)))
+                    .child(icons::icon(
+                        if chosen { Icon::Check } else { Icon::Server },
+                        metrics.small_icon_size(),
+                        theme::swatch(if chosen || marked_row {
+                            palette::ACCENT
+                        } else {
+                            palette::TEXT_MUTED
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(metrics.scale(FORWARD_HOST_NAME_MAX))
+                            .truncate()
+                            .text_size(metrics.label_size())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(host.name().to_owned())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(crate::app::terminal::monospace_family())
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(SharedString::from(host.target())),
+                    )
+                    .on_click(cx.listener(move |view, _event, window, cx| {
+                        view.pick_forward_host(id, window, cx);
+                    })),
+            );
+        }
+        let none = candidates.is_empty().then(|| {
+            div()
+                .debug_selector(|| "forwards.host.none".to_owned())
+                .px(metrics.scale(spacing::TIGHT))
+                .py(metrics.scale(spacing::TIGHT))
+                .whitespace_normal()
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .child(ux.fwd_host_no_match)
+        });
+        Some(
+            components::menu_card("forwards.host.picker", metrics)
+                .w_full()
+                .min_w_0()
+                .capture_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                    view.forward_host_picker_key(event, window, cx);
+                }))
+                .child(
+                    div()
+                        .flex_none()
+                        .debug_selector(|| "forwards.host.search".to_owned())
+                        .child(picker.search.clone()),
+                )
+                .child(list)
+                .children(none),
+        )
     }
 
     fn fill_forward_fields(
@@ -106,6 +513,7 @@ impl ShelluneView {
             return;
         };
         self.forwards.begin_edit(id);
+        self.forward_host_picker = None;
         let target = rule.target();
         self.fill_forward_fields(
             "",
@@ -929,27 +1337,9 @@ impl ShelluneView {
                 cx.notify();
             },
         );
-        let hosts: Vec<(HostId, String)> = self
-            .book
-            .hosts()
-            .iter()
-            .map(|host| (host.id(), host.name().to_owned()))
-            .collect();
-        let ids: Vec<HostId> = hosts.iter().map(|(id, _)| *id).collect();
-        let host_control = self.segments(
-            "forwards.host",
-            hosts
-                .iter()
-                .map(|(id, name)| (name.clone(), Some(*id) == editor.host))
-                .collect(),
-            cx,
-            move |view, index, cx| {
-                if let Some(editor) = view.forwards.editor_mut() {
-                    editor.host = ids.get(index).copied();
-                }
-                cx.notify();
-            },
-        );
+        // A searchable list instead of one segment per host: a book of any size fits
+        // the form (ADR-7).
+        let host_control = self.forward_host_control(editor, cx);
         let hint = match editor.kind {
             ForwardKind::Local => ux.fwd_kind_local_hint,
             ForwardKind::Remote => ux.fwd_kind_remote_hint,
@@ -1051,7 +1441,7 @@ impl ShelluneView {
                     .flex_col()
                     .gap(metrics.scale(spacing::NARROW))
                     .child(field_label(ux.fwd_through))
-                    .child(div().flex().child(host_control)),
+                    .child(host_control),
             )
             .child(pair(
                 listen_label,
