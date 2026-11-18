@@ -912,7 +912,7 @@ pub struct Strings {
     pub host_jump_title: &'static str,
     /// Host dialog: shown when the jump list is empty.
     pub host_jump_empty: &'static str,
-    /// Host dialog: adds a saved host to the jump list.
+    /// Host dialog: opens the picker that adds a saved host to the jump list.
     pub host_jump_add: &'static str,
     /// Host dialog: moves a jump earlier.
     pub host_jump_up: &'static str,
@@ -1569,7 +1569,7 @@ pub static ENGLISH: Strings = Strings {
     quick_save_inconsistent_next: "Repair the host file, then save again. This session stays connected.",
     host_jump_title: "Jump hosts",
     host_jump_empty: "Direct connection. Add a saved host to reach this one through it.",
-    host_jump_add: "Add",
+    host_jump_add: "Add jump host",
     host_jump_up: "Move up",
     host_jump_down: "Move down",
     host_jump_remove: "Remove",
@@ -2104,7 +2104,7 @@ pub static CHINESE: Strings = Strings {
     quick_save_inconsistent_next: "先修好主机文件，再保存一次。当前会话保持连接。",
     host_jump_title: "跳板主机",
     host_jump_empty: "直接连接。添加已保存的主机，即可经它到达这一台。",
-    host_jump_add: "添加",
+    host_jump_add: "添加跳板",
     host_jump_up: "上移",
     host_jump_down: "下移",
     host_jump_remove: "移除",
@@ -2774,6 +2774,12 @@ pub struct UxStrings {
     pub host_advanced_hint: &'static str,
     /// Host dialog: something in the folded section is set
     pub host_advanced_in_use: &'static str,
+    /// Host dialog: the placeholder of the jump host picker's search
+    pub host_jump_search: &'static str,
+    /// Host dialog: the jump host picker has no saved SSH host left to offer
+    pub host_jump_none_left: &'static str,
+    /// Host dialog: the jump host picker's search matches no host
+    pub host_jump_no_match: &'static str,
     /// Group action: create a group
     pub hosts_group_new: &'static str,
     /// Group action: rename a group
@@ -3372,6 +3378,9 @@ impl UxStrings {
             self.host_advanced_title,
             self.host_advanced_hint,
             self.host_advanced_in_use,
+            self.host_jump_search,
+            self.host_jump_none_left,
+            self.host_jump_no_match,
             self.hosts_group_new,
             self.hosts_group_rename,
             self.hosts_group_move,
@@ -3796,6 +3805,9 @@ included",
     host_advanced_title: "Advanced",
     host_advanced_hint: "Jump hosts, ProxyCommand, startup command, file transfer, X11, keepalive",
     host_advanced_in_use: "In use",
+    host_jump_search: "Search by name or address",
+    host_jump_none_left: "Every other saved SSH host is already in the chain.",
+    host_jump_no_match: "No saved SSH host matches this search.",
     auth_auto_hint: "Tries the system SSH agent, then your keys in ~/.ssh (id_ed25519, id_ecdsa, id_rsa), then the password below if you give one.",
     hosts_group_new: "New group",
     hosts_group_rename: "Rename group",
@@ -4216,6 +4228,9 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     host_advanced_title: "高级设置",
     host_advanced_hint: "跳板机、代理命令、启动命令、文件传输、X11、保活",
     host_advanced_in_use: "已设置",
+    host_jump_search: "按名称或地址搜索",
+    host_jump_none_left: "其余已保存的 SSH 主机都已在跳板链中。",
+    host_jump_no_match: "没有与搜索匹配的 SSH 主机。",
     auth_auto_hint: "依次尝试系统 SSH Agent、~/.ssh 里的私钥（id_ed25519、id_ecdsa、id_rsa），最后用下面的密码（可不填）。",
     hosts_group_new: "新建分组",
     hosts_group_rename: "重命名分组",

@@ -636,6 +636,8 @@ pub struct ShelluneView {
     forward_only_dial: bool,
     /// Whether the host dialog shows its advanced settings.
     host_advanced: bool,
+    /// The host dialog's jump host picker, while it is open (R3).
+    jump_picker: Option<host_dialog::JumpPicker>,
     /// Whether the connection form shows its less common options (X11 forwarding).
     remote_more: bool,
     /// Whether a failure that was not about signing in still shows the sign-in form.
@@ -1678,6 +1680,43 @@ impl ShelluneView {
         self.open_create_host(cx);
     }
 
+    /// Opens the empty form for a new host with its advanced section, the first `chain`
+    /// saved hosts as its jump chain and the jump picker open, for a capture (R3).
+    /// Nothing is saved.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_new_host_jumps(
+        &mut self,
+        chain: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_create_host(cx);
+        self.host_advanced = true;
+        let ids: Vec<HostId> = self
+            .book
+            .hosts()
+            .iter()
+            .take(chain)
+            .map(HostConfig::id)
+            .collect();
+        if let Some(draft) = self.hosts.draft_mut() {
+            for id in ids {
+                draft.add_jump(id);
+            }
+        }
+        self.toggle_jump_picker(window, cx);
+    }
+
+    /// How many hops the new host's chain holds while its jump picker is open, for a
+    /// capture.
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_jump_picker_chain(&self) -> Option<usize> {
+        self.jump_picker.as_ref()?;
+        self.host_fields.as_ref()?;
+        self.hosts.draft().map(|draft| draft.jumps().len())
+    }
+
     /// Whether the host form is open, and on a new record rather than a saved one.
     #[cfg(feature = "ui-capture")]
     #[must_use]
@@ -2570,6 +2609,7 @@ impl ShelluneView {
             forwards_polling: false,
             forward_only_dial: false,
             host_advanced: false,
+            jump_picker: None,
             remote_more: false,
             remote_edit_auth: false,
             pending_forward_rules: Vec::new(),
@@ -4251,6 +4291,7 @@ impl ShelluneView {
         for (field, label) in labels {
             field.update(cx, |field, cx| field.set_placeholder(label, cx));
         }
+        self.relabel_jump_picker(cx);
         self.relabel_sync_fields(cx);
     }
 
@@ -6798,6 +6839,7 @@ impl ShelluneView {
                 // host is shown that the file does not really contain.
                 self.book = HostBook::new();
                 self.host_fields = None;
+                self.jump_picker = None;
                 self.workspace
                     .fail_hosts(Failure::new(error, Recovery::Retry));
                 self.recheck_open_hosts();
@@ -6829,6 +6871,7 @@ impl ShelluneView {
     }
 
     fn open_host_fields(&mut self, cx: &mut Context<Self>) {
+        self.jump_picker = None;
         self.host_advanced = self
             .hosts
             .draft()
@@ -6998,6 +7041,7 @@ impl ShelluneView {
     /// Closes the form without touching the saved records.
     fn close_host_editor(&mut self, cx: &mut Context<Self>) {
         self.hosts.close_editor();
+        self.jump_picker = None;
         self.host_fields = None;
         self.host_connection_fields = None;
         self.restore_focus_pending = true;
@@ -7292,6 +7336,7 @@ impl ShelluneView {
                 self.note_data_changed(cx);
                 self.hosts.close_editor();
                 self.host_fields = None;
+                self.jump_picker = None;
                 self.protocol_fields = None;
                 self.restore_focus_pending = true;
                 self.hosts.set_message(message.to_owned(), false);
@@ -7309,6 +7354,7 @@ impl ShelluneView {
     /// Asks the deletion question for one host.
     fn ask_delete_host(&mut self, id: HostId, cx: &mut Context<Self>) {
         self.host_fields = None;
+        self.jump_picker = None;
         self.hosts.ask_delete(id);
         cx.notify();
     }
@@ -7431,6 +7477,7 @@ impl ShelluneView {
         self.import.open(path);
         self.hosts.close_editor();
         self.host_fields = None;
+        self.jump_picker = None;
         self.hosts.clear_message();
         let placeholder = self.strings().import_path_placeholder;
         let text = self.import.path().to_owned();
@@ -11882,6 +11929,12 @@ impl ShelluneView {
         }
         if self.custom_shell_open {
             self.close_custom_shell(window, cx);
+            return true;
+        }
+        // The jump picker is a list over the host dialog: Escape closes the list
+        // and leaves the dialog, and what was typed in it, where it was (R3).
+        if self.jump_picker.is_some() && self.host_fields.is_some() {
+            self.close_jump_picker(window, cx);
             return true;
         }
         if self.host_fields.is_some() {

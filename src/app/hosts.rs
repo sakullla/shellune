@@ -1100,6 +1100,28 @@ impl HostDraft {
         true
     }
 
+    /// The saved SSH hosts the jump picker offers for `phrase`, in saved order.
+    ///
+    /// `hosts` is the book's SSH hosts: a jump is an SSH hop, so a desktop or serial
+    /// record is never offered. The host being edited and the hops already in the chain
+    /// are left out, which is what [`Self::add_jump`] would refuse anyway. A phrase
+    /// narrows the list to the hosts whose name or address holds it, ignoring case, the
+    /// way the quick-connect bar matches; an empty phrase offers every candidate.
+    #[must_use]
+    pub fn jump_candidates(&self, hosts: &[HostConfig], phrase: &str) -> Vec<HostId> {
+        let phrase = phrase.trim().to_lowercase();
+        hosts
+            .iter()
+            .filter(|host| self.editing != Some(host.id()) && !self.jumps.contains(&host.id()))
+            .filter(|host| {
+                phrase.is_empty()
+                    || host.name().to_lowercase().contains(&phrase)
+                    || host.address().to_lowercase().contains(&phrase)
+            })
+            .map(HostConfig::id)
+            .collect()
+    }
+
     /// Removes the hop at `index`.
     pub fn remove_jump(&mut self, index: usize) {
         if index < self.jumps.len() {
@@ -4736,6 +4758,32 @@ mod tests {
         assert_eq!(cleared.host().jumps(), &[bastion.id()]);
         assert_eq!(cleared.host().proxy_command(), None);
         assert!(!HostDraft::edit(cleared.host()).proxy_conflicts());
+    }
+
+    #[test]
+    fn the_jump_picker_offers_other_ssh_hosts_by_name_or_address() {
+        let bastion = host("Bastion", "10.0.0.1", 22, "jump", None);
+        let edge = host("edge", "edge.example.org", 22, "jump", None);
+        let web = host("web", "10.0.0.2", 22, "deploy", None);
+        let hosts = vec![bastion.clone(), edge.clone(), web.clone()];
+        let mut draft = HostDraft::edit(&web);
+        assert_eq!(
+            draft.jump_candidates(&hosts, ""),
+            vec![bastion.id(), edge.id()],
+            "everything but the host being edited, in saved order"
+        );
+        assert_eq!(draft.jump_candidates(&hosts, "bAST"), vec![bastion.id()]);
+        assert_eq!(draft.jump_candidates(&hosts, " EXAMPLE "), vec![edge.id()]);
+        assert_eq!(draft.jump_candidates(&hosts, "10.0.0"), vec![bastion.id()]);
+        assert!(draft.jump_candidates(&hosts, "nothing").is_empty());
+        assert!(draft.add_jump(edge.id()));
+        assert_eq!(
+            draft.jump_candidates(&hosts, ""),
+            vec![bastion.id()],
+            "a hop already in the chain is not offered again"
+        );
+        let fresh = HostDraft::create();
+        assert_eq!(fresh.jump_candidates(&hosts, "").len(), 3);
     }
 
     // -- The home dashboard (R1) ------------------------------------------------

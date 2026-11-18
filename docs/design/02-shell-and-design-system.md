@@ -182,6 +182,22 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   口令"复选框。**自动**（`AuthMethodKind::Auto` / `AuthMethod::Auto`）在一次连接里依次尝试系统 SSH Agent 的全部
   身份、`~/.ssh` 下能免口令打开的 `id_ed25519`/`id_ecdsa`/`id_rsa`、最后是可选的密码；缺什么就跳过什么，全部被拒才
   失败。它的密码可记住在系统凭据库，记住后一次点击即连。
+  **跳板主机**（高级设置第一块，`hosts.jump`）：标题下一行说明（未选时是“直接连接……”），已选跳板按经过顺序排成
+  带编号的小卡片（`hosts.jump.{i}`），每张有上移 / 下移 / 移除；下面只有一个“+ 添加跳板”（`hosts.jump.add`）。
+  按下后在按钮正下方展开选择器（`hosts.jump.picker`，`menu_card` 外观）：顶部搜索框（`hosts.jump.search`，打开即
+  获得键盘），下面是候选列表（`hosts.jump.options`，每行 `hosts.jump.option.{i}`：服务器图标、名称、等宽的
+  `user@地址:端口`）。候选只取已保存的 **SSH** 主机，去掉正在编辑的这台和已在链中的（`HostDraft::jump_candidates`），
+  按名称或地址做不区分大小写的子串过滤，保持保存顺序；没有候选时写出原因（`hosts.jump.none`：全部已在链中 / 没有
+  匹配）。键盘：↑↓ 移动高亮（列表跟随滚动），Enter 添加高亮项，Esc 只关闭选择器、不关闭对话框；点击某行同样
+  添加。每次添加后选择器保持打开、搜索清空、高亮回到第一项，便于连续添加；点在按钮与选择器之外、再按一次按钮
+  或折起高级设置都会关闭它。列表最多显示约 6 行，其余在列表内滚动，所以 24 台或上百台主机时高级设置的高度与
+  6 台时相同。选择器在表单流内展开而不是浮在上面：主体是会滚动的对话框，浮层会被主体边缘裁掉；第一次布局时
+  主体只滚动到刚好露出整个选择器（比主体高时露出顶部）。保存格式与 `add_jump` / `remove_jump` / `move_jump` 不变。
+  测试：`the_jump_picker_narrows_by_name_or_address_and_adds_from_the_keyboard`、
+  `twenty_four_hosts_keep_the_jump_section_as_tall_as_six`、
+  `the_jump_picker_scrolls_its_list_and_stays_clear_of_the_proxy_field`（选择器与“代理命令”标签、标签与输入框
+  互不重叠，720×480@200% 与 1120×720、中英文）、`the_jump_picker_scrolls_itself_into_the_smallest_dialog`；
+  截图场景 `host-new-jumps`。
 - **连接弹窗**：头部只有主机名（进行中时不再在标题下重复地址）。进行中与等待确认时，主体是四步进度
   （连接服务器 → 验证服务器身份 → 登录 → 打开终端，`remote.stage`）：已完成打勾，进行中的一步有呼吸点
   （减少动态效果时静止），等待用户的一步标"等待你操作"并说明在等什么，问题卡片（指纹 / ProxyCommand / X11）
@@ -1347,6 +1363,16 @@ Windows 安装器的启动与重启）。
   而不是把轨道推出卡片。
 - **快捷键行**：名称列最小 180（随缩放），按键与三个操作按钮作为一组整体换行，因此长组合键（如
   `Ctrl+Alt+Shift+F12`）不会把按钮挤出卡片。
+- **换行文本**：居中、有宽度上限、会换行的文字（空状态的标题与说明等）一律经 `components::capped_text(max_w, text)`
+  放进列里，不在文字自身上同时写 `w_full()` 与 `max_w`。原因是布局引擎在 flex 列里求子项高度时用的是列的整宽，
+  没有先套上 `max_w`；随后又按上限宽度布局和绘制。一句话在整宽下放得进一行、在上限宽度下要两行时，盒子只留了
+  一行高，第二行就画到下面的按钮上（端口转发空状态的“使用。”）。`capped_text` 把文字放进一个 flex 行，行内的
+  主轴尺寸会先按上限收窄再求高度，所以盒子高度就是实际画出的行数。新写的换行文字照此处理；不居中、不设上限的
+  说明行（在 `flex_col` 里按默认拉伸占满宽度）不受影响。
+  锁定测试：`an_empty_states_line_wraps_above_its_button_at_any_width`（直接按多种列宽与缩放布局 `empty_state`，
+  断言说明盒子的高度不小于按其宽度换行后画出的高度、按钮在其下）与
+  `the_forwards_and_host_list_empty_states_keep_their_button_below_the_words`（`forwards.empty`、
+  `hosts.recent.empty`、`hosts.nomatch` 在 720×480@200% 与 1120×720、中英文下标题、说明、按钮依次不重叠）。
 - 新增设置行或行内控件时沿用这三条：控件外面不要再套 `flex_none` 容器；可能比行宽的内容自带 `flex_wrap` 与
   `min_w(0)`；控件仍按 `Metrics::hit_target()` 等因素绘制，不靠缩小命中区换取宽度。
 - 该约束由三处测试锁定（`src/app/tests.rs`，均为 720×480、200%、中文）：
@@ -1555,7 +1581,8 @@ surface 底、静止 Low，焦点环叠在 Low 之上；尺寸不随窗口缩放
 | `modal_footer` / `modal_icon(icon, tone)` | 对话框底部动作行（顶部分隔线、右对齐、可换行，主操作最后）；头部图标块（默认 accent tint，危险问题用色调 tint） |
 | `dialog_face` / `dialog_panel` / `dialog_header` | 对话框表面令牌与内嵌标题块 |
 | `toast(tone, icon, title, detail)` | 通知：raised + 强边 + 圆角 10 + Mid，色调图标圆底；关闭按钮与位置由调用方加，进入时 Fade |
-| `empty_state(icon, title, body, action)` | 空状态：accent tint 图标块（圆角 14）+ 标题 + 可选一行说明 + 可选动作；不带状态色调；调用方在外层加自己的选择器 |
+| `empty_state(icon, title, body, action)` | 空状态：accent tint 图标块（圆角 14）+ 标题 + 可选说明（可换任意行）+ 可选动作；标题与说明经 `capped_text` 居中、上限 420，动作总在文字下方（`empty.state.title` / `.body` / `.action`）；不带状态色调；调用方在外层加自己的选择器 |
+| `capped_text(max_w, text)` | 居中、有宽度上限的换行文字：按上限宽度求高度，盒子与画出的行数一致（见 4“换行文本”） |
 | `enter_in_turn(element, id, turn)` + `turn_timing` / `turn_curve` | 一组物体依次淡入：第 `turn` 个晚 `TURN_DELAY`×turn（到 `LAST_TURN` 为止），淡入 BASE，只动透明度；减少动效时直接画终态 |
 | `banner` / `notice` | 提示、失败、确认问题（色调底 + 左侧 3px 色条）；完成后的通知 |
 | `state_card` / `state_card_with_icon` | 加载中 / 失败 / 空：surface 卡 + Low，色调 tint 徽记块 |

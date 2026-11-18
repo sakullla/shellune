@@ -1410,6 +1410,241 @@ async fn transfers_and_forwards_open_over_the_page_and_close_again(cx: &mut Test
     });
 }
 
+/// An empty state drawn alone in a column of a chosen width, the way the forwards
+/// dialog and the host list hold it.
+struct EmptyStateHarness {
+    width: f32,
+    zoom: Zoom,
+    body: &'static str,
+}
+
+impl Render for EmptyStateHarness {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl IntoElement {
+        let metrics = Metrics::new(self.zoom);
+        div().size_full().child(
+            div()
+                .w(px(self.width))
+                .flex()
+                .flex_col()
+                .child(crate::app::components::empty_state(
+                    crate::app::icons::Icon::Forward,
+                    "Nothing yet",
+                    Some(self.body.into()),
+                    Some(
+                        crate::app::components::button(
+                            "New",
+                            crate::app::components::Variant::Primary,
+                            metrics,
+                        )
+                        .into_any_element(),
+                    ),
+                    metrics,
+                )),
+        )
+    }
+}
+
+/// How tall `text` is once wrapped at `width`, at the size the empty state's line is
+/// drawn at: the height its painted lines take, whatever box layout gave it.
+fn wrapped_height(
+    cx: &mut VisualTestContext,
+    text: &str,
+    font_size: Pixels,
+    width: Pixels,
+) -> Pixels {
+    cx.update(|window, _app| {
+        let style = window.text_style();
+        // The height a wrapped text measures itself with: unrounded, unlike the one
+        // `line_height_in_pixels` gives.
+        let line_height = style
+            .line_height
+            .to_pixels(font_size.into(), window.rem_size());
+        let run = style.to_run(text.len());
+        window
+            .text_system()
+            .shape_text(text.to_owned().into(), font_size, &[run], Some(width), None)
+            .expect("the line is shaped")
+            .iter()
+            .map(|line| line.size(line_height).height)
+            .fold(px(0.0), |total, height| total + height)
+    })
+}
+
+/// The empty state's title, its line and its button, measured top to bottom: each
+/// starts below where the one before it is painted to, and each text's box is as tall
+/// as the lines it is painted in at the width it was given (R1).
+fn assert_empty_state_stacks(
+    cx: &mut VisualTestContext,
+    title: &str,
+    body: Option<&str>,
+    zoom: Zoom,
+    what: &str,
+) {
+    let metrics = Metrics::new(zoom);
+    let heading = bounds_of(cx, "empty.state.title");
+    let action = bounds_of(cx, "empty.state.action");
+    let mut end =
+        heading.origin.y + wrapped_height(cx, title, metrics.title_size(), heading.size.width);
+    assert!(
+        heading.origin.y + heading.size.height + px(1.0) >= end,
+        "{what}: the title is painted to {end:?} but its box is {heading:?}"
+    );
+    if let Some(body) = body {
+        let line = bounds_of(cx, "empty.state.body");
+        let painted = wrapped_height(cx, body, metrics.body_size(), line.size.width);
+        assert!(
+            line.size.height + px(1.0) >= painted,
+            "{what}: the line is painted {painted:?} tall but its box is {line:?}, so its \
+             last line runs into what follows"
+        );
+        assert!(
+            end <= line.origin.y + px(0.5),
+            "{what}: the title, painted to {end:?}, overlaps the line {line:?}"
+        );
+        end = line.origin.y + painted;
+    }
+    assert!(
+        end <= action.origin.y + px(0.5),
+        "{what}: the text is painted to {end:?}, below the top of the button {action:?}"
+    );
+}
+
+/// Puts the window at `window`, the text at `zoom` and the copy in `locale`.
+fn set_look(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+    window: Size<Pixels>,
+    zoom: Zoom,
+    locale: Locale,
+) {
+    cx.simulate_resize(window);
+    cx.run_until_parked();
+    for _ in 0..Zoom::ALL.len() {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == zoom {
+            break;
+        }
+        go(cx, CycleTextSize);
+    }
+    if cx.update(|_window, app| view.read(app).workspace().locale()) != locale {
+        go(cx, ToggleLanguage);
+    }
+    assert_eq!(
+        cx.update(|_window, app| {
+            let workspace = view.read(app).workspace();
+            (workspace.zoom(), workspace.locale())
+        }),
+        (zoom, locale)
+    );
+}
+
+/// The two sizes a wrapping line has to survive, in both languages (R1).
+fn empty_state_looks() -> [(Size<Pixels>, Zoom, Locale); 4] {
+    [
+        (minimum_window(), Zoom::Largest, Locale::English),
+        (minimum_window(), Zoom::Largest, Locale::Chinese),
+        (design_window(), Zoom::Regular, Locale::English),
+        (design_window(), Zoom::Regular, Locale::Chinese),
+    ]
+}
+
+#[gpui::test]
+async fn the_forwards_and_host_list_empty_states_keep_their_button_below_the_words(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("empty-states");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let (view, cx) = hosts_view(cx, dir.store());
+    focus_root(&view, cx);
+
+    // The forwards dialog with a host to tunnel through: the line and its button.
+    go(cx, GoToForwards);
+    for (window, zoom, locale) in empty_state_looks() {
+        set_look(&view, cx, window, zoom, locale);
+        let what = format!("forwards.empty at {window:?} {zoom:?} {locale:?}");
+        assert!(cx.debug_bounds("forwards.empty").is_some(), "{what}");
+        let ux = copy::ux_for(locale);
+        assert_empty_state_stacks(cx, ux.fwd_empty_title, Some(ux.fwd_empty_body), zoom, &what);
+    }
+    set_look(&view, cx, design_window(), Zoom::Regular, Locale::English);
+    click(cx, "forwards.dialog.close");
+
+    // The recent view before anything was connected: a title and its button.
+    click(cx, "hosts.view.recent");
+    for (window, zoom, locale) in empty_state_looks() {
+        set_look(&view, cx, window, zoom, locale);
+        let what = format!("hosts.recent.empty at {window:?} {zoom:?} {locale:?}");
+        assert!(cx.debug_bounds("hosts.recent.empty").is_some(), "{what}");
+        let strings: &Strings = if locale == Locale::Chinese {
+            &CHINESE
+        } else {
+            &ENGLISH
+        };
+        assert_empty_state_stacks(cx, strings.hosts_recent_empty, None, zoom, &what);
+    }
+    set_look(&view, cx, design_window(), Zoom::Regular, Locale::English);
+
+    // A search that matches nothing: the reason, the hint and the way out.
+    click(cx, "hosts.view.all");
+    type_into(cx, "hosts.search", "zzz");
+    for (window, zoom, locale) in empty_state_looks() {
+        set_look(&view, cx, window, zoom, locale);
+        let what = format!("hosts.nomatch at {window:?} {zoom:?} {locale:?}");
+        assert!(cx.debug_bounds("hosts.nomatch").is_some(), "{what}");
+        let strings: &Strings = if locale == Locale::Chinese {
+            &CHINESE
+        } else {
+            &ENGLISH
+        };
+        let ux = copy::ux_for(locale);
+        assert_empty_state_stacks(
+            cx,
+            strings.hosts_no_match,
+            Some(ux.hosts_no_match_hint),
+            zoom,
+            &what,
+        );
+    }
+}
+
+#[gpui::test]
+async fn an_empty_states_line_wraps_above_its_button_at_any_width(cx: &mut TestAppContext) {
+    // Long enough to fit on one line across the whole column but not inside the
+    // line's own cap: the width the column offers and the width the line is drawn at
+    // disagree, which is when the box used to keep one line and paint two.
+    const BODY: &str = "A tunnel carries one port through a host, so it is used on the other side.";
+    for (width, zoom) in [
+        (630.0, Zoom::Regular),
+        (560.0, Zoom::Regular),
+        (480.0, Zoom::Regular),
+        (1200.0, Zoom::Largest),
+        (900.0, Zoom::Largest),
+        (590.0, Zoom::Largest),
+        (360.0, Zoom::Largest),
+    ] {
+        let (_view, cx) = cx.add_window_view(move |_window, _cx| EmptyStateHarness {
+            width,
+            zoom,
+            body: BODY,
+        });
+        cx.simulate_resize(size(px(1400.0), px(1200.0)));
+        cx.run_until_parked();
+        assert_empty_state_stacks(
+            cx,
+            "Nothing yet",
+            Some(BODY),
+            zoom,
+            &format!("{width}px at {zoom:?}"),
+        );
+    }
+}
+
 #[gpui::test]
 async fn every_empty_loading_and_failed_state_renders_a_state_card(cx: &mut TestAppContext) {
     // No capability of this build is "planned" any more, so the states a section can
@@ -16368,7 +16603,9 @@ async fn the_host_dialog_keeps_a_jump_and_a_proxy_command_on_the_form(cx: &mut T
     click(cx, "hosts.advanced");
     assert!(cx.debug_bounds("hosts.field.proxy").is_some());
     assert!(cx.debug_bounds("hosts.jump").is_some());
-    click(cx, "hosts.jump.add.0");
+    // A hop is added through the picker, not from a wall of buttons (R3).
+    click(cx, "hosts.jump.add");
+    click(cx, "hosts.jump.option.0");
     type_into(cx, "hosts.field.proxy", "nc %h %p");
     assert!(cx.debug_bounds("hosts.proxy.conflict").is_some());
     click(cx, "hosts.save");
@@ -16384,6 +16621,373 @@ async fn the_host_dialog_keeps_a_jump_and_a_proxy_command_on_the_form(cx: &mut T
         assert_eq!(host.jumps().len(), 1);
         assert_eq!(host.proxy_command(), Some("nc %h %p"));
     });
+}
+
+/// A host dialog over a book of SSH hosts and one remote desktop, sized so the whole
+/// advanced section can be clicked.
+fn jump_dialog_view(
+    cx: &mut TestAppContext,
+    hosts: Vec<HostConfig>,
+) -> (Entity<ShelluneView>, &mut VisualTestContext, TempDir) {
+    let dir = TempDir::new("jump-picker");
+    let mut book = HostBook::new();
+    for host in hosts {
+        book.apply(&HostEdit::create(host))
+            .expect("the host is inserted");
+    }
+    // A desktop is a saved connection too, but never a hop of an SSH chain.
+    book.insert_connection(desktop_record("zz-desk"))
+        .expect("the desktop is inserted");
+    dir.store().save(&book).expect("the book saves");
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, Workspace::new(), store, trust)
+    });
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    click(cx, "nav.hosts");
+    (view, cx, dir)
+}
+
+fn jump_picker_state(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+) -> Option<(String, usize, usize)> {
+    cx.update(|_window, app| view.read(app).jump_picker_for_test(app))
+}
+
+fn draft_jumps(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> Vec<HostId> {
+    cx.update(|_window, app| {
+        view.read(app)
+            .hosts_state()
+            .draft()
+            .map(|draft| draft.jumps().to_vec())
+            .unwrap_or_default()
+    })
+}
+
+#[gpui::test]
+async fn the_jump_picker_narrows_by_name_or_address_and_adds_from_the_keyboard(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx, _dir) = jump_dialog_view(
+        cx,
+        vec![
+            stored_host("bastion", "10.0.0.1", 22, "jump", None),
+            stored_host("db", "10.0.9.9", 22, "jump", None),
+            stored_host("edge", "edge.example.org", 22, "jump", None),
+            stored_host("web", "10.0.0.2", 22, "deploy", None),
+        ],
+    );
+    let id = |view: &Entity<ShelluneView>, cx: &mut VisualTestContext, name: &str| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .book()
+                .hosts()
+                .iter()
+                .find(|host| host.name() == name)
+                .expect("the host is saved")
+                .id()
+        })
+    };
+    let db = id(&view, cx, "db");
+    let edge = id(&view, cx, "edge");
+    click(cx, "hosts.edit.3");
+    click(cx, "hosts.advanced");
+    // Nothing chosen yet: one line and the button, and no list until it is asked for.
+    assert!(cx.debug_bounds("hosts.jump.add").is_some());
+    assert!(cx.debug_bounds("hosts.jump.picker").is_none());
+    assert!(cx.debug_bounds("hosts.jump.option.0").is_none());
+
+    click(cx, "hosts.jump.add");
+    assert!(cx.debug_bounds("hosts.jump.picker").is_some());
+    assert!(cx.debug_bounds("hosts.jump.search").is_some());
+    assert_eq!(
+        jump_picker_state(&view, cx),
+        Some((String::new(), 0, 3)),
+        "every other SSH host is offered: not the host being edited, not the desktop"
+    );
+
+    // The search has the keyboard as soon as the picker opens; it narrows by name...
+    cx.simulate_input("EDG");
+    cx.run_until_parked();
+    assert_eq!(jump_picker_state(&view, cx), Some(("EDG".to_owned(), 0, 1)));
+    assert!(cx.debug_bounds("hosts.jump.option.0").is_some());
+    // ...and by address.
+    for _ in 0..3 {
+        cx.simulate_keystrokes("backspace");
+    }
+    cx.simulate_input("10.0.");
+    cx.run_until_parked();
+    assert_eq!(
+        jump_picker_state(&view, cx),
+        Some(("10.0.".to_owned(), 0, 2)),
+        "bastion and db; web is the host being edited"
+    );
+
+    // Down marks the second match and Enter adds it; the picker stays open with an
+    // empty search for the next hop.
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(
+        jump_picker_state(&view, cx),
+        Some(("10.0.".to_owned(), 1, 2))
+    );
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(
+        jump_picker_state(&view, cx).map(|state| state.1),
+        Some(1),
+        "the mark stops at the last match"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(draft_jumps(&view, cx), vec![db]);
+    assert_eq!(
+        jump_picker_state(&view, cx),
+        Some((String::new(), 0, 2)),
+        "the picker stays open, emptied, and no longer offers the hop just added"
+    );
+    assert!(cx.debug_bounds("hosts.jump.0").is_some());
+
+    // Typing goes on into the same field: the keyboard stayed there.
+    cx.simulate_input("edge");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(draft_jumps(&view, cx), vec![db, edge]);
+
+    // The desktop is not offered under any search.
+    cx.simulate_input("desk");
+    cx.run_until_parked();
+    assert_eq!(jump_picker_state(&view, cx).map(|state| state.2), Some(0));
+    assert!(
+        cx.debug_bounds("hosts.jump.none").is_some(),
+        "an empty result says so"
+    );
+
+    // Escape closes the list and nothing else.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    // The window keeps the bounds of what it drew before, so what closed is read
+    // from the view rather than from a missing box.
+    assert_eq!(jump_picker_state(&view, cx), None);
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().draft().is_some()),
+        "the dialog stays open behind the closed list"
+    );
+
+    // A click on an option adds it as well, and a press outside closes the picker.
+    click(cx, "hosts.jump.add");
+    assert_eq!(jump_picker_state(&view, cx).map(|state| state.2), Some(1));
+    click(cx, "hosts.jump.option.0");
+    assert_eq!(draft_jumps(&view, cx).len(), 3);
+    assert_eq!(
+        jump_picker_state(&view, cx),
+        Some((String::new(), 0, 0)),
+        "every other host is in the chain now, and the picker says so"
+    );
+    click(cx, "hosts.field.proxy");
+    assert_eq!(jump_picker_state(&view, cx), None);
+
+    // Reordering is unchanged, and the chain is saved in the order shown.
+    click(cx, "hosts.jump.up.1");
+    click(cx, "hosts.save");
+    cx.update(|_window, app| {
+        let host = view
+            .read(app)
+            .book()
+            .hosts()
+            .iter()
+            .find(|host| host.name() == "web")
+            .expect("web is saved")
+            .clone();
+        assert_eq!(host.jumps().len(), 3);
+        assert_eq!(&host.jumps()[..2], &[edge, db]);
+    });
+}
+
+/// The height of the jump section, and of the advanced section around it, for a book
+/// of `count` hosts, measured with the picker shut and then open.
+async fn jump_section_heights(cx: &mut TestAppContext, count: usize) -> (Pixels, Pixels, Pixels) {
+    let hosts = (1..=count)
+        .map(|n| {
+            stored_host(
+                &format!("host-{n:02}"),
+                &format!("10.0.1.{n}"),
+                22,
+                "ops",
+                None,
+            )
+        })
+        .collect();
+    let (_view, cx, _dir) = jump_dialog_view(cx, hosts);
+    click(cx, "hosts.new");
+    click(cx, "hosts.advanced");
+    let shut = bounds_of(cx, "hosts.jump").size.height;
+    click(cx, "hosts.jump.add");
+    let open = bounds_of(cx, "hosts.jump").size.height;
+    let advanced = bounds_of(cx, "hosts.advanced.body").size.height;
+    (shut, open, advanced)
+}
+
+#[gpui::test]
+async fn twenty_four_hosts_keep_the_jump_section_as_tall_as_six(cx: &mut TestAppContext) {
+    let (few_shut, few_open, few_advanced) = jump_section_heights(cx, 6).await;
+    let (many_shut, many_open, many_advanced) = jump_section_heights(cx, 24).await;
+    assert!(
+        (few_shut - many_shut).abs() <= px(1.0),
+        "with the picker shut, the book's size does not show in the form: \
+         {many_shut:?} against {few_shut:?}"
+    );
+    assert!(
+        many_open <= few_open + px(1.0),
+        "the open list scrolls instead of growing: {many_open:?} against {few_open:?}"
+    );
+    assert!(
+        many_advanced <= few_advanced + px(1.0),
+        "the advanced section is bounded: {many_advanced:?} against {few_advanced:?}"
+    );
+}
+
+#[gpui::test]
+async fn the_jump_picker_scrolls_its_list_and_stays_clear_of_the_proxy_field(
+    cx: &mut TestAppContext,
+) {
+    let hosts = (1..=24)
+        .map(|n| {
+            stored_host(
+                &format!("host-{n:02}"),
+                &format!("10.0.1.{n}"),
+                22,
+                "ops",
+                None,
+            )
+        })
+        .collect();
+    let (view, cx, _dir) = jump_dialog_view(cx, hosts);
+    focus_root(&view, cx);
+    click(cx, "hosts.new");
+    click(cx, "hosts.advanced");
+    click(cx, "hosts.jump.add");
+    assert_eq!(jump_picker_state(&view, cx).map(|state| state.2), Some(24));
+
+    // The mark is walked past the rows on show and the list follows it.
+    let list = bounds_of(cx, "hosts.jump.options");
+    for _ in 0..12 {
+        cx.simulate_keystrokes("down");
+    }
+    cx.run_until_parked();
+    assert_eq!(jump_picker_state(&view, cx).map(|state| state.1), Some(12));
+    let marked = bounds_of(cx, "hosts.jump.option.12");
+    assert!(
+        marked.origin.y >= list.origin.y - px(0.5)
+            && marked.origin.y + marked.size.height <= list.origin.y + list.size.height + px(0.5),
+        "the marked row {marked:?} is scrolled into the list {list:?}"
+    );
+
+    for (window, zoom, locale) in empty_state_looks() {
+        set_look(&view, cx, window, zoom, locale);
+        let what = format!("{window:?} {zoom:?} {locale:?}");
+        let row = bounds_of(cx, "hosts.jump.option.0").size.height;
+        let list = bounds_of(cx, "hosts.jump.options");
+        assert!(
+            list.size.height <= row * 7.0,
+            "{what}: the list is capped at a few rows: {list:?}, rows of {row:?}"
+        );
+        let picker = bounds_of(cx, "hosts.jump.picker");
+        let label = bounds_of(cx, "hosts.field.proxy.label");
+        assert!(
+            picker.origin.y + picker.size.height <= label.origin.y + px(0.5),
+            "{what}: the picker {picker:?} runs into the ProxyCommand label {label:?}"
+        );
+        let field = bounds_of(cx, "hosts.field.proxy");
+        assert!(
+            label.origin.y + label.size.height <= field.origin.y + px(0.5),
+            "{what}: the ProxyCommand label {label:?} overlaps its field {field:?}"
+        );
+    }
+
+    // With the picker shut, the label is still below what precedes it.
+    set_look(&view, cx, tall_window(), Zoom::Regular, Locale::English);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(jump_picker_state(&view, cx), None);
+    for (window, zoom, locale) in empty_state_looks() {
+        set_look(&view, cx, window, zoom, locale);
+        let what = format!("{window:?} {zoom:?} {locale:?}, picker shut");
+        let add = bounds_of(cx, "hosts.jump.add");
+        let label = bounds_of(cx, "hosts.field.proxy.label");
+        assert!(
+            add.origin.y + add.size.height <= label.origin.y + px(0.5),
+            "{what}: the add button {add:?} runs into the ProxyCommand label {label:?}"
+        );
+    }
+}
+
+#[gpui::test]
+async fn the_jump_picker_scrolls_itself_into_the_smallest_dialog(cx: &mut TestAppContext) {
+    let hosts = (1..=24)
+        .map(|n| {
+            stored_host(
+                &format!("host-{n:02}"),
+                &format!("10.0.1.{n}"),
+                22,
+                "ops",
+                None,
+            )
+        })
+        .collect();
+    let (view, cx, _dir) = jump_dialog_view(cx, hosts);
+    focus_root(&view, cx);
+    click(cx, "hosts.new");
+    click(cx, "hosts.advanced");
+    set_look(&view, cx, minimum_window(), Zoom::Largest, Locale::Chinese);
+
+    // Scroll the form by hand until the button is on screen, the way a person reaches it.
+    let inside = |cx: &mut VisualTestContext, selector: &'static str| {
+        let body = bounds_of(cx, "hosts.editor.body");
+        let item = bounds_of(cx, selector);
+        item.origin.y >= body.origin.y - px(0.5)
+            && item.origin.y + item.size.height <= body.origin.y + body.size.height + px(0.5)
+    };
+    for _ in 0..80 {
+        if inside(cx, "hosts.jump.add") {
+            break;
+        }
+        let center = bounds_of(cx, "hosts.editor.body").center();
+        cx.simulate_event(ScrollWheelEvent {
+            position: center,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-20.0))),
+            modifiers: Modifiers::default(),
+            touch_phase: Default::default(),
+        });
+        cx.run_until_parked();
+    }
+    assert!(
+        inside(cx, "hosts.jump.add"),
+        "the button can be scrolled to"
+    );
+    click(cx, "hosts.jump.add");
+    cx.run_until_parked();
+
+    let body = bounds_of(cx, "hosts.editor.body");
+    let picker = bounds_of(cx, "hosts.jump.picker");
+    assert!(
+        picker.origin.y >= body.origin.y - px(0.5),
+        "the picker's top {picker:?} is inside the dialog body {body:?}"
+    );
+    assert!(
+        picker.origin.y + picker.size.height <= body.origin.y + body.size.height + px(0.5)
+            || picker.origin.y - body.origin.y <= px(16.0),
+        "the picker {picker:?} is scrolled into the dialog body {body:?}, or starts at its top"
+    );
+    assert!(
+        inside(cx, "hosts.jump.search"),
+        "the search that has the keyboard is on screen"
+    );
 }
 
 #[gpui::test]

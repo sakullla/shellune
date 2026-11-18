@@ -1966,6 +1966,30 @@ pub fn toast(
         )
 }
 
+/// A wrapping text with a width cap, centred in the row it is given, laid out at the
+/// width it is painted at.
+///
+/// A wrapping text measures its lines once per width it is asked about and paints the
+/// lines of the last ask. As a flex item of a column, a text with `w_full()` and a
+/// `max_w` was asked for its height at the column's whole width - the cap is not
+/// applied there - and then laid out and painted at the capped width: a line that fit
+/// across the column but not inside the cap kept a one-line box and painted two, the
+/// second over whatever came next (R1). Here the text is an item of a row, where its
+/// width is the column's width clamped to the cap before its height is asked for, so
+/// the box is as tall as the lines that are painted in it.
+///
+/// Every centred, capped, wrapping text in a column - an empty state's title and line,
+/// a picker's hint - goes through this rather than putting `max_w` on the text itself.
+pub fn capped_text(max_width: Pixels, text: Div) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .justify_center()
+        .w_full()
+        .min_w(px(0.0))
+        .child(text.w_full().min_w(px(0.0)).max_w(max_width))
+}
+
 /// An empty page or section: an icon on the accent tint, a title, an optional line and
 /// an optional next step.
 ///
@@ -2004,28 +2028,35 @@ pub fn empty_state(
                     theme::swatch(palette::ACCENT_ON_TINT),
                 )),
         )
-        .child(
+        .child(capped_text(
+            metrics.scale(420.0),
             div()
-                .w_full()
-                .max_w(metrics.scale(420.0))
                 .whitespace_normal()
                 .text_center()
                 .text_size(metrics.title_size())
                 .font_weight(metrics.title_weight())
                 .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                .debug_selector(|| "empty.state.title".to_owned())
                 .child(title.into()),
-        )
+        ))
         .children(body.map(|body| {
-            div()
-                .w_full()
-                .max_w(metrics.scale(420.0))
-                .whitespace_normal()
-                .text_center()
-                .text_size(metrics.body_size())
-                .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                .child(body)
+            capped_text(
+                metrics.scale(420.0),
+                div()
+                    .debug_selector(|| "empty.state.body".to_owned())
+                    .whitespace_normal()
+                    .text_center()
+                    .text_size(metrics.body_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .child(body),
+            )
         }))
-        .children(action.map(|action| div().mt(metrics.scale(spacing::HAIRLINE)).child(action)))
+        .children(action.map(|action| {
+            div()
+                .debug_selector(|| "empty.state.action".to_owned())
+                .mt(metrics.scale(spacing::HAIRLINE))
+                .child(action)
+        }))
 }
 
 /// How much later each object of a group fades in than the one before it.

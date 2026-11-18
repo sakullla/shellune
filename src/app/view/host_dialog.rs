@@ -6,8 +6,14 @@
 //! the form in one place over a dimmed window, with the sign-in choice deciding which
 //! fields are asked for.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui::prelude::*;
-use gpui::{Context, Div, FontWeight, SharedString, Stateful, Window, div, px};
+use gpui::{
+    App, Context, Div, Entity, FontWeight, KeyDownEvent, ScrollHandle, SharedString, Stateful,
+    Window, canvas, div, px,
+};
 use shellune_core::{
     AuthMethodKind, HostId, ProtocolKind, RdpCertificatePolicy, SerialFlow, SerialParity,
     SerialStopBits, TransferProtocol, VncSecurity, X11Forwarding,
@@ -23,12 +29,163 @@ use crate::app::hosts::{
 };
 use crate::app::icons::{self, Icon};
 use crate::app::remote::MethodChoice;
+use crate::app::text_field::TextField;
 use crate::app::theme::{self, Metrics, Tone, palette, radius, spacing};
 
 // A checkbox with its label is the shared component.
 use crate::app::components::checkbox;
 
+/// How many candidates the jump picker shows before its list scrolls.
+const JUMP_PICKER_ROWS: f32 = 6.0;
+
+/// The jump host picker of the host dialog, while it is open (R3).
+///
+/// It is a search field over the saved SSH hosts that can still be added, with one
+/// candidate marked for the keyboard. Each pick adds a hop and leaves the picker open
+/// with an empty search, so a chain of several hops is built without reopening it.
+pub(super) struct JumpPicker {
+    search: Entity<TextField>,
+    /// The search the candidates were last narrowed by: a new phrase moves the mark
+    /// back to the first candidate, a caret move does not.
+    phrase: String,
+    /// The candidate Enter adds, as an index into the narrowed list.
+    highlight: usize,
+    scroll: ScrollHandle,
+    /// Whether the dialog body still has to scroll the just-opened picker into view.
+    reveal: Rc<Cell<bool>>,
+}
+
 impl ShelluneView {
+    /// Opens the jump picker with an empty search that has the keyboard, or closes it
+    /// when it is already open.
+    pub(super) fn toggle_jump_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.jump_picker.is_some() {
+            self.close_jump_picker(window, cx);
+            return;
+        }
+        let placeholder = copy::ux_for(self.workspace.locale()).host_jump_search;
+        let search = cx.new(|cx| {
+            let mut field = TextField::new(placeholder, cx);
+            field.set_leading_icon(Icon::Search, cx);
+            field
+        });
+        // A new phrase marks the first candidate again; the list itself is read from
+        // the field on every draw.
+        cx.observe(&search, |this, search, cx| {
+            let text = search.read(cx).text().to_owned();
+            if let Some(picker) = this.jump_picker.as_mut()
+                && picker.phrase != text
+            {
+                picker.phrase = text;
+                picker.highlight = 0;
+                picker.scroll.scroll_to_item(0);
+            }
+            cx.notify();
+        })
+        .detach();
+        window.focus(search.read(cx).focus_handle());
+        self.jump_picker = Some(JumpPicker {
+            search,
+            phrase: String::new(),
+            highlight: 0,
+            scroll: ScrollHandle::new(),
+            reveal: Rc::new(Cell::new(true)),
+        });
+        cx.notify();
+    }
+
+    /// Puts the open picker's placeholder in the current language.
+    pub(super) fn relabel_jump_picker(&self, cx: &mut Context<Self>) {
+        if let Some(picker) = self.jump_picker.as_ref() {
+            let placeholder = copy::ux_for(self.workspace.locale()).host_jump_search;
+            picker
+                .search
+                .update(cx, |field, cx| field.set_placeholder(placeholder, cx));
+        }
+    }
+
+    /// Closes the jump picker and gives the keyboard back to the dialog.
+    pub(super) fn close_jump_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.jump_picker.take().is_some() {
+            window.focus(&self.root_focus);
+            cx.notify();
+        }
+    }
+
+    /// The hosts the open picker offers for what is typed in it, in saved order.
+    fn jump_picker_candidates(&self, cx: &App) -> Vec<HostId> {
+        let (Some(picker), Some(draft)) = (self.jump_picker.as_ref(), self.hosts.draft()) else {
+            return Vec::new();
+        };
+        draft.jump_candidates(self.book.hosts(), picker.search.read(cx).text())
+    }
+
+    /// Adds a picked host to the end of the chain and readies the picker for the next
+    /// hop: the search is emptied, the mark is on the first candidate and the field
+    /// keeps the keyboard.
+    fn pick_jump(&mut self, id: HostId, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_host_jump(id, cx);
+        if let Some(picker) = self.jump_picker.as_mut() {
+            picker.phrase.clear();
+            picker.highlight = 0;
+            picker.scroll.scroll_to_item(0);
+            let search = picker.search.clone();
+            search.update(cx, |field, cx| field.set_text("", cx));
+            window.focus(search.read(cx).focus_handle());
+        }
+        cx.notify();
+    }
+
+    /// Up and Down move the mark through the candidates and Enter adds the marked one.
+    ///
+    /// Escape is not here: the window's own Escape closes what floats on top first,
+    /// and the picker is above the dialog.
+    fn jump_picker_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.modifiers.number_of_modifiers() != 0 {
+            return;
+        }
+        let candidates = self.jump_picker_candidates(cx);
+        let Some(picker) = self.jump_picker.as_mut() else {
+            return;
+        };
+        let last = candidates.len().saturating_sub(1);
+        match event.keystroke.key.as_str() {
+            "down" => {
+                picker.highlight = (picker.highlight + 1).min(last);
+                picker.scroll.scroll_to_item(picker.highlight);
+            }
+            "up" => {
+                picker.highlight = picker.highlight.saturating_sub(1).min(last);
+                picker.scroll.scroll_to_item(picker.highlight);
+            }
+            "enter" => {
+                if let Some(id) = candidates.get(picker.highlight.min(last)).copied() {
+                    self.pick_jump(id, window, cx);
+                }
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// The search, the marked candidate and how many candidates the open jump picker
+    /// shows, for the tests.
+    #[cfg(test)]
+    pub(crate) fn jump_picker_for_test(&self, cx: &App) -> Option<(String, usize, usize)> {
+        let picker = self.jump_picker.as_ref()?;
+        Some((
+            picker.search.read(cx).text().to_owned(),
+            picker.highlight,
+            self.jump_picker_candidates(cx).len(),
+        ))
+    }
+
     /// Chooses how the host in the dialog signs in.
     fn set_host_auth(&mut self, kind: AuthMethodKind, cx: &mut Context<Self>) {
         if let Some(draft) = self.hosts.draft_mut()
@@ -160,38 +317,7 @@ impl ShelluneView {
                     )),
             );
         }
-        let editing = draft.editing();
-        let present = draft.jumps().to_vec();
-        let additions: Vec<(HostId, String)> = self
-            .book
-            .hosts()
-            .iter()
-            .filter(|host| editing != Some(host.id()) && !present.contains(&host.id()))
-            .map(|host| (host.id(), host.name().to_owned()))
-            .collect();
-        // The saved hosts that can be added, as small buttons that wrap, so a long
-        // host book does not push the rest of the form out of reach.
-        if !additions.is_empty() {
-            let mut choices = div()
-                .flex()
-                .flex_wrap()
-                .gap(metrics.scale(spacing::HAIRLINE));
-            for (index, (id, name)) in additions.into_iter().enumerate() {
-                choices = choices.child(
-                    self.icon_text_button(
-                        SharedString::from(format!("hosts.jump.add.{index}")),
-                        Icon::Plus,
-                        name,
-                        Variant::Secondary,
-                        cx,
-                        move |view, cx| view.add_host_jump(id, cx),
-                    )
-                    .max_w(metrics.scale(220.0))
-                    .tooltip(components::tooltip(strings.host_jump_add)),
-                );
-            }
-            column = column.child(choices);
-        }
+        column = column.child(self.jump_adder(cx));
         column = column
             .child(self.dialog_field(fields, HostField::ProxyCommand, None, 1.0))
             .child(
@@ -210,6 +336,194 @@ impl ShelluneView {
             );
         }
         column
+    }
+
+    /// "Add jump host" and, while it is open, the picker under it (R3).
+    ///
+    /// The picker sits in the form's flow rather than floating over it: the form is a
+    /// scrolling dialog body, where a floating list would be cut at the body's edge at
+    /// 720×480 and 200% text, while a list in the flow scrolls into view with the rest of
+    /// the form. Its own list is capped at a few rows and scrolls, so a book of a hundred
+    /// hosts makes it no taller than a book of six. A press anywhere outside the button
+    /// and the picker closes it.
+    fn jump_adder(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let open = self.jump_picker.is_some();
+        let button = components::icon_label_button(
+            Icon::Plus,
+            self.strings().host_jump_add,
+            Variant::Secondary,
+            metrics,
+        )
+        .h(metrics.compact_control_height())
+        .pl(metrics.scale(spacing::TIGHT))
+        .pr(metrics.scale(spacing::TIGHT + 2.0))
+        .text_size(metrics.caption_size())
+        .when(open, |button| {
+            button.bg(theme::swatch(palette::SURFACE_SELECTED))
+        })
+        .id("hosts.jump.add")
+        .debug_selector(|| "hosts.jump.add".to_owned())
+        .on_click(cx.listener(|this, _event, window, cx| {
+            this.toggle_jump_picker(window, cx);
+        }));
+        let mut adder = div()
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .w_full()
+            .min_w(px(0.0))
+            .child(button);
+        if open {
+            adder = adder
+                .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
+                    this.close_jump_picker(window, cx);
+                }))
+                .children(self.jump_picker_card(cx));
+        }
+        adder
+    }
+
+    /// The open jump picker: its search field over the candidates it narrows.
+    fn jump_picker_card(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let picker = self.jump_picker.as_ref()?;
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let candidates = self.jump_picker_candidates(cx);
+        let marked = picker.highlight.min(candidates.len().saturating_sub(1));
+        let row_height = metrics.scale(34.0);
+        let narrowed = !picker.search.read(cx).text().trim().is_empty();
+        let mut list = div()
+            .id("hosts.jump.options")
+            .debug_selector(|| "hosts.jump.options".to_owned())
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(1.0))
+            .max_h(row_height * JUMP_PICKER_ROWS + metrics.scale(JUMP_PICKER_ROWS))
+            .overflow_y_scroll()
+            .track_scroll(&picker.scroll);
+        for (index, id) in candidates.iter().copied().enumerate() {
+            let Some(host) = self.book.host(id) else {
+                continue;
+            };
+            let selected = index == marked;
+            let hover = theme::swatch(palette::SURFACE_HOVER);
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("hosts.jump.option.{index}")))
+                    .debug_selector(move || format!("hosts.jump.option.{index}"))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .h(row_height)
+                    .px(metrics.scale(spacing::TIGHT + 2.0))
+                    .rounded(px(radius::MEDIUM - 2.0))
+                    .cursor_pointer()
+                    .when(selected, |row| {
+                        row.bg(theme::swatch(palette::SURFACE_SELECTED))
+                    })
+                    .when(!selected, |row| row.hover(move |style| style.bg(hover)))
+                    .child(icons::icon(
+                        Icon::Server,
+                        metrics.small_icon_size(),
+                        theme::swatch(if selected {
+                            palette::ACCENT
+                        } else {
+                            palette::TEXT_MUTED
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(metrics.scale(200.0))
+                            .truncate()
+                            .text_size(metrics.label_size())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(host.name().to_owned())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .font_family(crate::app::terminal::monospace_family())
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(SharedString::from(host.target())),
+                    )
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.pick_jump(id, window, cx);
+                    })),
+            );
+        }
+        let none = candidates.is_empty().then(|| {
+            div()
+                .debug_selector(|| "hosts.jump.none".to_owned())
+                .px(metrics.scale(spacing::TIGHT + 2.0))
+                .py(metrics.scale(spacing::TIGHT))
+                .whitespace_normal()
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .child(if narrowed {
+                    ux.host_jump_no_match
+                } else {
+                    ux.host_jump_none_left
+                })
+        });
+        // The first time the picker is laid out, the dialog body scrolls just enough to
+        // show all of it, or its top when it is taller than the body: at 720×480 and 200%
+        // text the button is near the body's bottom edge, and a list that opened below
+        // the fold would look like nothing happened.
+        let reveal = picker.reveal.clone();
+        let body = self.host_body_scroll.clone();
+        let shell = cx.entity_id();
+        // The card's edge and a little room stay in view as well.
+        let margin = metrics.scale(spacing::HAIRLINE);
+        let reveal = canvas(
+            move |bounds, _window, cx| {
+                if !reveal.replace(false) {
+                    return;
+                }
+                let view = body.bounds();
+                let below = bounds.bottom() + margin - view.bottom();
+                let shift = below.min(bounds.top() - margin - view.top());
+                if shift > px(0.0) {
+                    let mut offset = body.offset();
+                    offset.y -= shift;
+                    body.set_offset(offset);
+                    // The new offset is drawn by the next frame.
+                    cx.defer(move |cx| cx.notify(shell));
+                }
+            },
+            |_bounds, (), _window, _cx| {},
+        )
+        .absolute()
+        .inset_0();
+        Some(
+            components::menu_card("hosts.jump.picker", metrics)
+                .relative()
+                .w_full()
+                .min_w(px(0.0))
+                .child(reveal)
+                .gap(metrics.scale(spacing::HAIRLINE))
+                // The keys the picker answers are taken before the field sees them:
+                // the field would read Enter as a submit of its own.
+                .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    this.jump_picker_key(event, window, cx);
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .debug_selector(|| "hosts.jump.search".to_owned())
+                        .child(picker.search.clone()),
+                )
+                .children(none)
+                .when(!candidates.is_empty(), |card| card.child(list)),
+        )
     }
 
     /// Saves the host and, when it was saved, connects to it at once.
@@ -244,6 +558,7 @@ impl ShelluneView {
                     .text_size(metrics.caption_size())
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .debug_selector(move || format!("{}.label", field.debug_selector()))
                     .child(label),
             )
             .child(
@@ -422,6 +737,10 @@ impl ShelluneView {
             })
             .on_click(cx.listener(|this, _event, _window, cx| {
                 this.host_advanced = !this.host_advanced;
+                // The jump picker is inside the section; folding it away closes it.
+                if !this.host_advanced {
+                    this.jump_picker = None;
+                }
                 cx.notify();
             }))
     }

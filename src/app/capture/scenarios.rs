@@ -1123,6 +1123,33 @@ fn new_host_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
     Ok(())
 }
 
+/// How many saved hosts the jump picker shot offers: the book size at which the old
+/// wall of buttons filled half the form (R3).
+const JUMP_HOSTS: usize = 24;
+
+/// Writes the hosts the jump picker shot chooses from.
+fn seed_jump_hosts(root: &Path) -> Result<(), String> {
+    write_hosts(root, scale_hosts(JUMP_HOSTS)?)
+}
+
+/// The new host form with two jump hosts chosen and the picker open on the rest (R3).
+fn show_new_host_jumps(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_new_host_jumps(2, window, cx);
+    Ok(())
+}
+
+fn new_host_jumps_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    match view.capture_jump_picker_chain() {
+        Some(2) => Ok(()),
+        Some(other) => Err(format!("the chain holds {other} hops, not 2")),
+        None => Err("the new host form with its jump picker is not open".to_owned()),
+    }
+}
+
 /// The question asked before a session that is copying a file closes (R5, R9).
 ///
 /// The transfer is the one the transfer strip scenario seeds: the queue holds it as a
@@ -2792,6 +2819,25 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: seed_hosts,
         install: show_new_host,
         ready: new_host_ready,
+    },
+    Scenario {
+        id: "host-new-jumps",
+        title: "对话框 · 新建主机 · 跳板主机选择",
+        category: Category::Overlay,
+        fixture: "twenty-four saved hosts; the empty form for a new host with its advanced section \
+                  open, two of them chosen as jump hosts and the picker open",
+        evidence: "shows the ordered jump cards, the add button and the searchable picker with a \
+                   bounded, scrolling list above the ProxyCommand field; nothing was saved and no \
+                   connection was made",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::light().smallest().largest(),
+        ],
+        start: || page(Destination::Hosts),
+        prepare: seed_jump_hosts,
+        install: show_new_host_jumps,
+        ready: new_host_jumps_ready,
     },
     Scenario {
         id: "close-question",
