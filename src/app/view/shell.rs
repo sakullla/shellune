@@ -263,7 +263,7 @@ impl ShelluneView {
             .h(height)
             .overflow_hidden()
             .when(!self.workspace.layout().tabs().is_empty(), |row| {
-                row.child(self.tab_strip(cx))
+                row.child(self.tab_strip(window, cx))
             });
 
         let trailing = div()

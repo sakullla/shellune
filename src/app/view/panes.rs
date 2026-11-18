@@ -1308,6 +1308,7 @@ impl ShelluneView {
     pub(super) fn pending_tab(
         &self,
         index: usize,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let metrics = self.metrics();
@@ -1319,6 +1320,7 @@ impl ShelluneView {
         let accent = tab.and_then(|tab| tab.accent());
         let selected = self.tab_is_current(index);
         let tooltip = format!("{title} · {}", strings.pane_pending);
+        let title_width = super::tab_title_width(window, &title, metrics);
         let frame = super::browser_tab(
             ("session.tab", index),
             format!("session.tab.{index}"),
@@ -1327,7 +1329,8 @@ impl ShelluneView {
             self.tab_floor(cx),
             metrics,
         )
-        .w(metrics.tab_max_width())
+        // As wide as its title, within the strip's bounds, as a session tab (R2).
+        .max_w(metrics.tab_max_width())
         .flex_shrink()
         .min_w(self.tab_min_width())
         .tooltip(crate::app::components::tooltip(tooltip))
@@ -1351,6 +1354,7 @@ impl ShelluneView {
             })
             .child(super::tab_title_label(
                 title,
+                title_width,
                 selected,
                 format!("session.tab.title.{index}"),
                 metrics,

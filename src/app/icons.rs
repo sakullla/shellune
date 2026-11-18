@@ -117,11 +117,14 @@ pub enum Icon {
     StarFilled,
     /// Rows with a mark at their start: the list of every open tab.
     TabList,
+    /// A ring with ticks on its four sides: the remote files follow the terminal's
+    /// directory.
+    Follow,
 }
 
 impl Icon {
     /// Every icon, for the asset listing and the tests.
-    pub const ALL: [Self; 50] = [
+    pub const ALL: [Self; 51] = [
         Self::Terminal,
         Self::Server,
         Self::Layers,
@@ -172,6 +175,7 @@ impl Icon {
         Self::Star,
         Self::StarFilled,
         Self::TabList,
+        Self::Follow,
     ];
 
     /// The asset path GPUI asks the source for.
@@ -227,6 +231,7 @@ impl Icon {
             Self::Star => "icons/star.svg",
             Self::StarFilled => "icons/star-filled.svg",
             Self::TabList => "icons/tab-list.svg",
+            Self::Follow => "icons/follow.svg",
         }
     }
 
@@ -348,6 +353,9 @@ impl Icon {
             }
             Self::TabList => {
                 r#"<rect x="3" y="4" width="18" height="16" rx="2.6"/><path d="M7 9h.01"/><path d="M10.5 9H17"/><path d="M7 12.5h.01"/><path d="M10.5 12.5H17"/><path d="M7 16h.01"/><path d="M10.5 16H17"/>"#
+            }
+            Self::Follow => {
+                r#"<circle cx="12" cy="12" r="6.5"/><circle cx="12" cy="12" r="2"/><path d="M12 2.5v3"/><path d="M12 18.5v3"/><path d="M2.5 12h3"/><path d="M18.5 12h3"/>"#
             }
         }
     }

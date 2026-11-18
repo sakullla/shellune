@@ -729,6 +729,30 @@ pub fn danger_icon_button(icon: Icon, metrics: Metrics) -> Div {
     )
 }
 
+/// [`icon_only_button`] for a switch that stays on: while `on` it sits on the accent
+/// tint and draws its icon in the tint's own text colour, so the state is read from
+/// the button itself and not only from its tooltip.
+pub fn toggle_icon_button(icon: Icon, on: bool, metrics: Metrics) -> Div {
+    if !on {
+        return icon_only_button(icon, metrics);
+    }
+    let tint = theme::swatch(palette::ACCENT_TINT);
+    let ink = theme::swatch(palette::ACCENT_ON_TINT);
+    let size = metrics.hit_target();
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .w(size)
+        .h(size)
+        .rounded(px(radius::SMALL))
+        .bg(tint)
+        .text_color(ink)
+        .cursor_pointer()
+        .child(icons::icon(icon, metrics.small_icon_size(), ink))
+}
+
 fn icon_only_button_hover(icon: Icon, metrics: Metrics, hover: Rgba, hover_text: Rgba) -> Div {
     let size = metrics.hit_target();
     div()
@@ -1129,45 +1153,57 @@ pub fn state_card_with_icon(
             None => attention_dot(tone, metrics),
         });
 
+    // Each line of words goes through [`capped_text`]: a column with `w_full()` and a
+    // `max_w` asks its wrapping text for its height at the card's whole width and then
+    // paints it at the cap, so a sentence that fits across the card but not inside the
+    // cap kept a one-line box, painted two lines and ran into the padding and the step
+    // under it (R1, R5).
+    let cap = metrics.scale(480.0);
     let mut text = div()
         .flex()
         .flex_col()
         .items_center()
         .w_full()
         .min_w(px(0.0))
-        .max_w(metrics.scale(480.0))
         .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-        .child(
+        .child(capped_text(
+            cap,
             div()
-                .w_full()
                 .whitespace_normal()
                 .text_size(metrics.title_size() + px(1.0))
                 .text_color(theme::swatch(palette::TEXT_PRIMARY))
                 .font_weight(metrics.title_weight())
                 .text_center()
+                .debug_selector(|| "state.card.title".to_owned())
                 .child(title.into()),
-        )
-        .child(
+        ))
+        .child(capped_text(
+            cap,
             div()
-                .w_full()
                 .whitespace_normal()
                 .text_size(metrics.body_size())
                 .text_color(theme::swatch(palette::TEXT_SECONDARY))
                 .font_weight(metrics.body_weight())
                 .text_center()
+                .debug_selector(|| "state.card.body".to_owned())
                 .child(body.into()),
-        );
+        ));
     if let Some(step) = next_step {
         text = text.child(
-            div()
-                .mt(metrics.scale(spacing::HAIRLINE))
-                .text_size(metrics.label_size())
-                .text_color(match tone {
-                    Tone::Neutral | Tone::Planned => theme::swatch(palette::TEXT_MUTED),
-                    tone => tone.text(),
-                })
-                .text_center()
-                .child(step),
+            capped_text(
+                cap,
+                div()
+                    .whitespace_normal()
+                    .text_size(metrics.label_size())
+                    .text_color(match tone {
+                        Tone::Neutral | Tone::Planned => theme::swatch(palette::TEXT_MUTED),
+                        tone => tone.text(),
+                    })
+                    .text_center()
+                    .debug_selector(|| "state.card.step".to_owned())
+                    .child(step),
+            )
+            .mt(metrics.scale(spacing::HAIRLINE)),
         );
     }
 

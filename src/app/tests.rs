@@ -1645,6 +1645,117 @@ async fn an_empty_states_line_wraps_above_its_button_at_any_width(cx: &mut TestA
     }
 }
 
+/// A section's state card drawn alone in a column of a chosen width, with a row under
+/// it, the way a page holds its empty, loading or failed section.
+struct StateCardHarness {
+    width: f32,
+    zoom: Zoom,
+    body: &'static str,
+}
+
+impl Render for StateCardHarness {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl IntoElement {
+        let metrics = Metrics::new(self.zoom);
+        div().size_full().child(
+            div()
+                .w(px(self.width))
+                .flex()
+                .flex_col()
+                .child(crate::app::components::state_card_with_icon(
+                    Tone::Neutral,
+                    Some(crate::app::icons::Icon::Terminal),
+                    "No sessions yet",
+                    self.body,
+                    Some("Press + to open one.".into()),
+                    metrics,
+                ))
+                .child(
+                    div()
+                        .h(px(20.0))
+                        .debug_selector(|| "state.card.after".to_owned()),
+                ),
+        )
+    }
+}
+
+#[gpui::test]
+async fn a_state_cards_words_wrap_inside_their_own_boxes_at_any_width(cx: &mut TestAppContext) {
+    // R1, R5: the same measuring trap as the empty state. The words are long enough to
+    // fit on one line across the whole card but not inside the card's cap, which is
+    // when a box measured at one width and painted at another kept one line and
+    // painted two over the next step.
+    const BODY: &str =
+        "A session is a shell on this computer or a host; it keeps running in its tab.";
+    for (width, zoom) in [
+        (900.0, Zoom::Regular),
+        (760.0, Zoom::Regular),
+        (620.0, Zoom::Regular),
+        (420.0, Zoom::Regular),
+        (1600.0, Zoom::Largest),
+        (1200.0, Zoom::Largest),
+        (720.0, Zoom::Largest),
+        (420.0, Zoom::Largest),
+    ] {
+        let (_view, cx) = cx.add_window_view(move |_window, _cx| StateCardHarness {
+            width,
+            zoom,
+            body: BODY,
+        });
+        cx.simulate_resize(size(px(1800.0), px(1400.0)));
+        cx.run_until_parked();
+        let what = format!("{width}px at {zoom:?}");
+        let metrics = Metrics::new(zoom);
+        let title = bounds_of(cx, "state.card.title");
+        let body = bounds_of(cx, "state.card.body");
+        let step = bounds_of(cx, "state.card.step");
+        let card = bounds_of(cx, "state.card");
+        let after = bounds_of(cx, "state.card.after");
+        let title_end = title.origin.y
+            + wrapped_height(
+                cx,
+                "No sessions yet",
+                metrics.title_size() + px(1.0),
+                title.size.width,
+            );
+        assert!(
+            title_end <= body.origin.y + px(0.5),
+            "{what}: the title, painted to {title_end:?}, overlaps the line {body:?}"
+        );
+        let painted = wrapped_height(cx, BODY, metrics.body_size(), body.size.width);
+        assert!(
+            body.size.height + px(1.0) >= painted,
+            "{what}: the line is painted {painted:?} tall but its box is {body:?}, so its last \
+             line runs into what follows"
+        );
+        let body_end = body.origin.y + painted;
+        assert!(
+            body_end <= step.origin.y + px(0.5),
+            "{what}: the line, painted to {body_end:?}, overlaps the next step {step:?}"
+        );
+        // The card is as tall as the words it paints: its bottom padding is whole
+        // under the next step, so nothing is painted into the padding or past the card.
+        let card_end = card.origin.y + card.size.height;
+        let step_end = step.origin.y + step.size.height;
+        assert!(
+            step_end + metrics.scale(theme::spacing::LOOSE + 16.0) <= card_end + px(0.5),
+            "{what}: the card was measured shorter than its words paint: the step ends at \
+             {step_end:?}, the card at {card_end:?}"
+        );
+        assert!(
+            card_end <= after.origin.y + px(0.5),
+            "{what}: the card ends before what follows it: {card:?}, then {after:?}"
+        );
+        assert!(
+            body.size.width <= metrics.scale(480.0) + px(0.5),
+            "{what}: the line keeps to its cap: {body:?}"
+        );
+    }
+}
+
 #[gpui::test]
 async fn every_empty_loading_and_failed_state_renders_a_state_card(cx: &mut TestAppContext) {
     // No capability of this build is "planned" any more, so the states a section can
@@ -12534,8 +12645,10 @@ async fn the_failed_reads_typed_entries_are_reached_and_pressed_with_the_keyboar
         "End turns to the entries, which are the card's last rows: {entry:?} in {panel:?}"
     );
 
-    // Tab walks the column: its toolbar's two entries, then the failed read's two.
+    // Tab walks the column: its toolbar's follow switch and two entries, then the
+    // failed read's two.
     for expected in [
+        FilesStop::Follow,
         FilesStop::ToolbarUpload,
         FilesStop::ToolbarDownload,
         FilesStop::CardUpload,
@@ -12579,13 +12692,14 @@ async fn the_failed_reads_typed_entries_are_reached_and_pressed_with_the_keyboar
         Some((FileSource::Remote, FilesStop::Body)),
         "Escape gives the keyboard back to the column"
     );
-    for _ in 0..3 {
+    // The follow switch, the toolbar's upload and download, then the card's upload.
+    for _ in 0..4 {
         press_key(cx, "tab");
     }
     assert_eq!(
         files_stop(cx, &view),
         Some((FileSource::Remote, FilesStop::CardUpload)),
-        "the upload entry is three steps from the listing"
+        "the upload entry is four steps from the listing"
     );
 
     // The ring is on a control the user can see: the pane scrolled the entry into it.
@@ -12707,14 +12821,21 @@ async fn every_control_the_keyboard_stops_on_is_turned_into_its_column(cx: &mut 
     );
 
     // The toolbar sits at the top of the column. With the pane turned to the card's end,
-    // Tab back to the upload entry turns it to the toolbar, so the ring is drawn there and
-    // not above the slice.
+    // Tab back to the follow switch - the toolbar's first stop, beside the refresh -
+    // turns it to the toolbar, so the ring is drawn there and not above the slice.
     press_key(cx, "escape");
     assert_eq!(
         files_stop(cx, &view),
         Some((FileSource::Remote, FilesStop::Body))
     );
     press_key(cx, "end");
+    press_key(cx, "tab");
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::Follow))
+    );
+    let panel = bounds_of(cx, "files.panel");
+    assert_inside_slice(bounds_of(cx, "files.follow"), panel, "the follow switch");
     press_key(cx, "tab");
     assert_eq!(
         files_stop(cx, &view),
@@ -14197,6 +14318,169 @@ async fn a_dock_reopen_restores_a_minimized_window(cx: &mut TestAppContext) {
 // ---------------------------------------------------------------------------
 
 /// Opens two real shells from the header, or returns `None` when the machine has none.
+/// Narrows the window step by step, keeping the full top row, until the tab strip
+/// holds more tabs than it shows and the control that lists every tab is drawn beside
+/// it (R2). Returns the window it stopped at.
+///
+/// The control is only there while a tab is out of sight, so a test of the list itself
+/// first puts the strip in that state, as a crowded window does.
+fn crowd_the_strip(cx: &mut VisualTestContext, view: &Entity<ShelluneView>) -> Size<Pixels> {
+    let mut viewport = cx.update(|window, _app| window.viewport_size());
+    for _ in 0..200 {
+        if cx.update(|_window, app| view.read(app).tab_list_control_shown_for_test()) {
+            assert!(
+                cx.update(|_window, app| view.read(app).tab_strip_overflows_for_test()),
+                "the list is drawn because the strip runs on, at {viewport:?}"
+            );
+            return viewport;
+        }
+        assert!(
+            !cx.update(|_window, app| view.read(app).header_compact_for_test()),
+            "the strip ran on only once the row was compact, at {viewport:?}"
+        );
+        viewport.width -= px(10.0);
+        cx.simulate_resize(viewport);
+        cx.run_until_parked();
+    }
+    panic!("the strip never ran on past its width");
+}
+
+#[gpui::test]
+async fn the_tab_list_control_appears_only_when_a_tab_is_out_of_sight(cx: &mut TestAppContext) {
+    // R2: two tabs with short titles are as wide as their titles, the "+" follows the
+    // last one, and no list of every tab stands between them: every tab is in sight.
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    name_tabs(cx, &view, &["web", "db"]);
+    for viewport in [design_window(), minimum_window()] {
+        cx.simulate_resize(viewport);
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|_window, app| view.read(app).header_compact_for_test()),
+            "{viewport:?} at the regular size draws the full row"
+        );
+        assert!(
+            !cx.update(|_window, app| view.read(app).tab_strip_overflows_for_test()),
+            "two short tabs fit the strip at {viewport:?}"
+        );
+        assert!(
+            !cx.update(|_window, app| view.read(app).tab_list_control_shown_for_test()),
+            "nothing is out of sight, so there is no list control at {viewport:?}"
+        );
+        let metrics = Metrics::new(Zoom::Regular);
+        let last = bounds_of(cx, "session.tab.1");
+        let plus = bounds_of(cx, "header.primary");
+        let gap = plus.left() - last.right();
+        assert!(
+            gap >= px(-0.5) && gap <= metrics.scale(theme::spacing::HAIRLINE) + px(0.5),
+            "the + follows the last tab at {viewport:?}: {last:?} then {plus:?}"
+        );
+        for index in 0..2 {
+            let tab: &'static str = Box::leak(format!("session.tab.{index}").into_boxed_str());
+            let bounds = bounds_of(cx, tab);
+            assert!(
+                bounds.size.width >= metrics.tab_min_width() - px(0.5)
+                    && bounds.size.width < metrics.tab_max_width() - px(0.5),
+                "{tab} is as wide as its short title, not the widest a tab grows: {bounds:?}"
+            );
+        }
+    }
+
+    // A strip that runs on draws the list beside it, before the "+".
+    let crowded = crowd_the_strip(cx, &view);
+    let list = bounds_of(cx, "tabs.list.open");
+    assert_fits_inside(list, crowded, "the all-tabs control");
+    assert_pointer_target(cx, "tabs.list.open");
+    assert!(
+        list.right() <= bounds_of(cx, "header.primary").left() + px(0.5),
+        "the list control sits between the strip and the +"
+    );
+
+    // A compact row shows the current tab alone, so the list is how the others are
+    // reached.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.workspace_mut_for_test().set_zoom(Zoom::Largest);
+            cx.notify();
+        });
+    });
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).header_compact_for_test()));
+    assert!(
+        cx.update(|_window, app| view.read(app).tab_list_control_shown_for_test()),
+        "a compact row draws the list control"
+    );
+    assert_fits_inside(
+        bounds_of(cx, "tabs.list.open"),
+        minimum_window(),
+        "the all-tabs control",
+    );
+}
+
+/// Gives the strip's tabs the names given, in order, as a user names a tab (R2).
+fn name_tabs(cx: &mut VisualTestContext, view: &Entity<ShelluneView>, names: &[&str]) {
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            let workspace = view.workspace_mut_for_test();
+            for (session, name) in tabs.iter().zip(names) {
+                let tab = workspace
+                    .tab_of_session(*session)
+                    .expect("every session has a tab");
+                // A name the tab already has is no change, and says so.
+                workspace.rename_tab(tab, Some((*name).to_owned()));
+            }
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    for (session, name) in tabs.iter().zip(names) {
+        assert_eq!(
+            cx.update(|_window, app| view.read(app).tab_label_for_test(*session)),
+            *name,
+            "the tab carries the name it was given"
+        );
+    }
+}
+
+/// A long title makes a tab grow to the widest a tab of the strip grows and no wider,
+/// and a short one leaves it narrower, down to the narrowest a tab becomes (R2).
+#[gpui::test]
+async fn a_tab_is_as_wide_as_its_title_within_the_strips_bounds(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let metrics = Metrics::new(Zoom::Regular);
+    let long_name = "a".repeat(60);
+    name_tabs(cx, &view, &[&long_name, "db"]);
+    let long = bounds_of(cx, "session.tab.0").size.width;
+    assert!(
+        (long - metrics.tab_max_width()).abs() <= px(0.5),
+        "a long title takes the widest tab and no more: {long:?}"
+    );
+    let short = bounds_of(cx, "session.tab.1").size.width;
+    assert!(
+        (short - metrics.tab_min_width()).abs() <= px(0.5),
+        "a title of two letters leaves the narrowest tab: {short:?}"
+    );
+    // A title between the two takes its own width: the tab grows with it.
+    name_tabs(cx, &view, &[&long_name, "staging-db"]);
+    let middle = bounds_of(cx, "session.tab.1").size.width;
+    assert!(
+        middle > short + px(0.5) && middle < long - px(0.5),
+        "a middle title takes a middle width: {short:?} < {middle:?} < {long:?}"
+    );
+    // The whole title fits the tab it made: nothing of it is cut.
+    let title = bounds_of(cx, "session.tab.title.1");
+    let close = bounds_of(cx, "session.tab.close.1");
+    assert!(
+        title.right() <= close.left() + px(0.5),
+        "the title ends before the close button: {title:?} then {close:?}"
+    );
+}
+
 fn two_shells(cx: &mut TestAppContext) -> Option<(Entity<ShelluneView>, &mut VisualTestContext)> {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
@@ -15085,9 +15369,10 @@ async fn the_tab_list_shows_every_tab_and_switches_to_it(cx: &mut TestAppContext
         cx.update(|_window, app| view.read(app).active_session()),
         Some(tabs[1])
     );
-    let viewport = minimum_window();
-    cx.simulate_resize(viewport);
+    cx.simulate_resize(minimum_window());
     cx.run_until_parked();
+    // The list is drawn once a tab is out of sight (R2).
+    let viewport = crowd_the_strip(cx, &view);
     assert_fits_inside(
         bounds_of(cx, "tabs.list.open"),
         viewport,
@@ -15136,6 +15421,7 @@ async fn the_tab_list_is_walked_with_the_keyboard_and_shows_the_shortcut_in_forc
         return;
     };
     let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    crowd_the_strip(cx, &view);
     click(cx, "tabs.list.open");
     assert!(
         cx.update(|_window, app| view.read(app).tab_list_open()),
@@ -15209,6 +15495,7 @@ async fn the_tab_list_names_each_tab_by_its_protocol_and_closes_only_that_one(
         "three sessions are three tabs, in the order they were opened"
     );
 
+    crowd_the_strip(cx, &view);
     click(cx, "tabs.list.open");
     assert!(
         cx.debug_bounds("tabs.list.row.2").is_some(),
@@ -15286,7 +15573,9 @@ async fn the_tab_list_names_each_tab_by_its_protocol_and_closes_only_that_one(
         "and so does the serial session"
     );
 
-    // The rows left still name their own protocols, in the order they now stand.
+    // The rows left still name their own protocols, in the order they now stand. Two
+    // tabs may fit where three did not, so the window is narrowed again if they do.
+    crowd_the_strip(cx, &view);
     click(cx, "tabs.list.open");
     assert!(
         cx.debug_bounds("tabs.list.kind.local.0").is_some(),
@@ -19743,6 +20032,7 @@ async fn the_tab_list_shows_the_marks_a_tab_carries(cx: &mut TestAppContext) {
     feed_session(cx, &view, background, b"\x07");
     feed_session(cx, &view, background, REPORTED_COMMAND);
 
+    crowd_the_strip(cx, &view);
     click(cx, "tabs.list.open");
     assert!(
         cx.debug_bounds("tabs.list.mark.bell.0").is_some(),
@@ -20509,13 +20799,20 @@ async fn a_tab_keeps_its_dot_title_and_close_inside_itself_at_any_width(cx: &mut
                 "the hosts tab's word",
             );
         }
+        // The list of every tab is there exactly when a tab is out of sight (R2).
+        let listed = cx.update(|_window, app| view.read(app).tab_list_control_shown_for_test());
+        let overflows = cx.update(|_window, app| view.read(app).tab_strip_overflows_for_test());
+        assert_eq!(
+            listed,
+            compact || overflows,
+            "the list control follows the strip ({viewport:?}, {zoom:?})"
+        );
         // Nothing beside the strip is pushed out of the window.
-        for selector in [
-            "tabs.list.open",
-            "header.primary",
-            "palette.open",
-            "nav.settings",
-        ] {
+        let mut beside = vec!["header.primary", "palette.open", "nav.settings"];
+        if listed {
+            beside.push("tabs.list.open");
+        }
+        for selector in beside {
             assert_fits_inside(bounds_of(cx, selector), viewport, selector);
             assert_pointer_target(cx, selector);
         }
@@ -20580,22 +20877,24 @@ fn assert_current_tab_whole_beside_notices(
     assert_tab_in_view(cx, "session.tab.1");
     assert_tab_holds_its_parts(cx, 1, min, metrics);
     // The strip clips what it cannot hold, so its own box is not enough: the tab and
-    // its close button end before the first control after the strip begins.
-    let list = bounds_of(cx, "tabs.list.open");
+    // its close button end before the first control after the strip begins - the list
+    // of every tab while a tab is out of sight, the "+" otherwise (R2).
+    let listed = cx.update(|_window, app| view.read(app).tab_list_control_shown_for_test());
+    let next: &'static str = if listed {
+        "tabs.list.open"
+    } else {
+        "header.primary"
+    };
+    let after = bounds_of(cx, next);
     for selector in ["session.tab.1", "session.tab.close.1"] {
         let bounds = bounds_of(cx, selector);
         assert!(
-            bounds.origin.x + bounds.size.width <= list.origin.x + px(0.5),
-            "{selector} ends before the list of every tab at {viewport:?} {zoom:?} ({form}): \
-             {bounds:?} then {list:?}"
+            bounds.origin.x + bounds.size.width <= after.origin.x + px(0.5),
+            "{selector} ends before {next} at {viewport:?} {zoom:?} ({form}): \
+             {bounds:?} then {after:?}"
         );
     }
-    for selector in [
-        "tabs.list.open",
-        "palette.open",
-        "nav.settings",
-        "topbar.batch",
-    ] {
+    for selector in [next, "palette.open", "nav.settings", "topbar.batch"] {
         assert_fits_inside(bounds_of(cx, selector), viewport, selector);
         assert_pointer_target(cx, selector);
     }
@@ -20757,6 +21056,10 @@ async fn twenty_tabs_scroll_and_leave_the_window_buttons_reachable(cx: &mut Test
             "the left scroll button",
         );
 
+        assert!(
+            cx.update(|_window, app| view.read(app).tab_list_control_shown_for_test()),
+            "twenty tabs run on, so the list of every tab is beside the strip"
+        );
         // Nothing the row holds beside the strip is pushed out of the window, and the
         // strip ends before the controls after it begin.
         let strip = bounds_of(cx, "session.tabs");
@@ -20794,6 +21097,7 @@ async fn twenty_tabs_scroll_and_leave_the_window_buttons_reachable(cx: &mut Test
     cx.simulate_resize(minimum_window());
     cx.run_until_parked();
     assert!(cx.update(|_window, app| view.read(app).header_compact_for_test()));
+    assert!(cx.update(|_window, app| view.read(app).tab_list_control_shown_for_test()));
     assert_tab_in_view(cx, "session.tab.19");
     assert_eq!(
         cx.update(|_window, app| view.read(app).tab_strip_ends_for_test()),
@@ -28323,6 +28627,35 @@ async fn the_file_view_follows_the_directory_the_shell_reports(cx: &mut TestAppC
         cx.debug_bounds("files.follow").is_some(),
         "the switch that says the view follows is on screen"
     );
+    // R4: the switch is a small icon in the column's header, right after its refresh,
+    // and nothing about following takes a row of its own under the path.
+    let follow = bounds_of(cx, "files.follow");
+    let refresh = bounds_of(cx, "files.refresh");
+    let header = bounds_of(cx, "files.header");
+    assert!(
+        (follow.top() - refresh.top()).abs() <= px(0.5)
+            && follow.left() >= refresh.right() - px(0.5)
+            && follow.left() - refresh.right() <= px(8.0),
+        "the switch sits beside the refresh: follow {follow:?}, refresh {refresh:?}"
+    );
+    assert!(
+        follow.top() >= header.top() - px(0.5) && follow.bottom() <= header.bottom() + px(0.5),
+        "the switch is part of the column's header: follow {follow:?}, header {header:?}"
+    );
+    assert!(
+        follow.size.width <= px(32.0) && follow.size.height <= px(32.0),
+        "the switch is an icon, not a labelled segment: {follow:?}"
+    );
+    assert!(
+        cx.debug_bounds("files.follow.row").is_none()
+            && cx.debug_bounds("files.follow.note").is_none(),
+        "no follow row and no note sit under the path"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_follow_tooltip_for_test(id)),
+        crate::app::copy::Locale::English.strings().files_follow_on,
+        "while it follows, the tooltip says only that it is on"
+    );
 
     // The report was a report: it is not part of what the terminal shows.
     let screen = cx.update(|_window, app| {
@@ -28549,9 +28882,19 @@ async fn a_directory_that_cannot_be_read_keeps_the_last_readable_one_and_says_wh
         }),
         "the refusal is stated together with the last readable path"
     );
+    // R4: the reason is in the switch's tooltip, after its state, and not in a warning
+    // line under the path.
     assert!(
-        cx.debug_bounds("files.follow.note").is_some(),
-        "the degradation is on screen, not only in the state"
+        cx.debug_bounds("files.follow.note").is_none(),
+        "the remote column draws no follow note under its path"
+    );
+    let tooltip = cx.update(|_window, app| view.read(app).files_follow_tooltip_for_test(id));
+    let strings = crate::app::copy::Locale::English.strings();
+    assert!(
+        tooltip.starts_with(strings.files_follow_on)
+            && tooltip.contains(strings.files_follow_unreadable)
+            && tooltip.contains("/root/private"),
+        "the tooltip states the switch and why the column is not where the shell is: {tooltip:?}"
     );
 }
 
@@ -28600,6 +28943,14 @@ async fn the_follow_switch_is_a_keyboard_stop_and_answers_enter(cx: &mut TestApp
         "the ring stays on the switch it just pressed"
     );
     press_key(cx, "enter");
+    assert!(cx.update(|_window, app| view.read(app).files_follows(id)));
+    // Space answers as Enter does.
+    press_key(cx, "space");
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_follows(id)),
+        "Space turns following off"
+    );
+    press_key(cx, "space");
     assert!(cx.update(|_window, app| view.read(app).files_follows(id)));
 }
 

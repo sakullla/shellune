@@ -4090,6 +4090,20 @@ impl ShelluneView {
         (ends.before, ends.after)
     }
 
+    /// Whether the strip holds more tabs than it shows, from its last layout (R2).
+    #[cfg(test)]
+    pub fn tab_strip_overflows_for_test(&self) -> bool {
+        strip_overflows(&self.tab_scroll)
+    }
+
+    /// Whether the top row draws the control that lists every tab (R2), read from the
+    /// same rule the row is drawn by: a control that went away keeps its old debug
+    /// bounds, so they cannot say it is gone.
+    #[cfg(test)]
+    pub fn tab_list_control_shown_for_test(&self) -> bool {
+        !self.workspace.layout().tabs().is_empty() && self.tab_list_wanted()
+    }
+
     /// The workspace itself, for the tests that put a session or a tab into a state no
     /// test-reachable control produces directly, such as a long custom name.
     #[cfg(test)]
@@ -14098,6 +14112,9 @@ impl ShelluneView {
                 stops.push((source, FilesStop::Filter));
             }
             if source == FileSource::Remote {
+                // The follow switch sits beside the column's refresh, before the
+                // toolbar's upload, and the keyboard reaches it in that order (R4, R15).
+                stops.push((source, FilesStop::Follow));
                 stops.push((source, FilesStop::ToolbarUpload));
                 if self.files_without_a_listing(id) {
                     stops.push((source, FilesStop::ToolbarDownload));
@@ -14117,12 +14134,6 @@ impl ShelluneView {
             if source == FileSource::Remote && self.files_failed_for_want_of_sftp(id) {
                 stops.push((source, FilesStop::CardUpload));
                 stops.push((source, FilesStop::CardDownload));
-            }
-            // The follow switch is the last control of the remote column: it acts on
-            // the column's path, and the keyboard reaches it after what the column
-            // offers for its own entries (R4, R15).
-            if source == FileSource::Remote {
-                stops.push((source, FilesStop::Follow));
             }
         }
         // The failure and its retry sit above the listing. They are a stop of their own
@@ -14249,8 +14260,9 @@ impl ShelluneView {
             FilesStop::Body => None,
             // The switch back to the terminal is in the session bar above the column, so
             // no slice of the column can hide it. The transfer strip is its own box.
-            FilesStop::Close | FilesStop::Transfers | FilesStop::Follow | FilesStop::Filter => None,
-            FilesStop::ToolbarUpload | FilesStop::ToolbarDownload => {
+            FilesStop::Close | FilesStop::Transfers | FilesStop::Filter => None,
+            // The follow switch sits in the toolbar beside the refresh (R15).
+            FilesStop::Follow | FilesStop::ToolbarUpload | FilesStop::ToolbarDownload => {
                 self.files_panel_scroll(source).bounds_for_item(0)
             }
             _ => self
@@ -14773,62 +14785,58 @@ impl ShelluneView {
     /// One file column: the source it is, the path it shows and the entries of that source.
     /// One side of the file manager: where it is, its toolbar, the path as
     /// breadcrumbs, and the listing.
-    /// The switch that makes the remote column follow the shell's directory, and what
-    /// that is doing right now (R15).
+    /// The switch that makes the remote column follow the shell's directory (R15).
     ///
-    /// It says three things a path cannot: following is on and waiting for the shell,
-    /// following was turned off by browsing by hand, or the directory the shell
-    /// reported could not be read. Each of them is a state the user can act on with
-    /// the same switch, so a degradation is never drawn as a normal listing.
-    fn files_follow_row(&self, id: SessionId, cx: &mut Context<Self>) -> Div {
+    /// It is a small icon beside the column's refresh, on the accent tint while it
+    /// follows. What it is doing right now is in its tooltip, after its state: following
+    /// is on and waiting for the shell, following was turned off by browsing by hand, or
+    /// the directory the shell reported could not be read. Each of them is a state the
+    /// user can act on with this same switch, and none of them takes a row of its own
+    /// under the path.
+    fn files_follow_button(&self, id: SessionId, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics();
-        let strings = self.strings();
         let on = self.files.follows(id);
-        let switch = components::segment(strings.files_follow, on, metrics)
+        let tooltip = self.files_follow_tooltip(id);
+        components::toggle_icon_button(Icon::Follow, on, metrics)
             .id("files.follow")
             .debug_selector(|| "files.follow".to_owned())
             // The switch is a keyboard stop of the file view, so it draws the ring when
             // it holds the keys (R4, R15).
             .track_focus(&self.files_follow_focus)
             .focus(files_focus_ring)
+            .tooltip(components::tooltip(SharedString::from(tooltip)))
             .on_click(cx.listener(move |view, _event, _window, cx| {
                 view.files_set_follow(id, !on, cx);
-            }));
-        let note = match self.files.follow_note(id) {
-            Some(FollowNote::NoReport) => {
-                Some((Tone::Warning, strings.files_follow_no_report.to_owned()))
+            }))
+    }
+
+    /// What the follow switch's tooltip says: its state, then why the column is not
+    /// showing the shell's directory when it is not (R15).
+    fn files_follow_tooltip(&self, id: SessionId) -> String {
+        let strings = self.strings();
+        let state = if self.files.follows(id) {
+            strings.files_follow_on
+        } else {
+            strings.files_follow_off
+        };
+        let reason = match self.files.follow_note(id) {
+            Some(FollowNote::NoReport) => Some(strings.files_follow_no_report.to_owned()),
+            Some(FollowNote::Manual) => Some(strings.files_follow_manual.to_owned()),
+            Some(FollowNote::Unreadable { path }) => {
+                Some(format!("{} {path}", strings.files_follow_unreadable))
             }
-            Some(FollowNote::Manual) => {
-                Some((Tone::Neutral, strings.files_follow_manual.to_owned()))
-            }
-            Some(FollowNote::Unreadable { path }) => Some((
-                Tone::Warning,
-                format!("{} {path}", strings.files_follow_unreadable),
-            )),
             Some(FollowNote::Following { .. }) | None => None,
         };
-        let mut row = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .flex_wrap()
-            .gap(metrics.scale(spacing::TIGHT))
-            .px(metrics.scale(spacing::HAIRLINE))
-            .debug_selector(|| "files.follow.row".to_owned())
-            .child(switch);
-        if let Some((tone, text)) = note {
-            row = row.child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .whitespace_normal()
-                    .text_size(metrics.caption_size())
-                    .text_color(tone.text())
-                    .debug_selector(|| "files.follow.note".to_owned())
-                    .child(SharedString::from(text)),
-            );
+        match reason {
+            Some(reason) => format!("{state} \u{b7} {reason}"),
+            None => state.to_owned(),
         }
-        row
+    }
+
+    /// The follow switch's tooltip, for a test (R15).
+    #[cfg(test)]
+    pub fn files_follow_tooltip_for_test(&self, id: SessionId) -> String {
+        self.files_follow_tooltip(id)
     }
 
     fn files_panel(
@@ -14887,15 +14895,20 @@ impl ShelluneView {
                 false,
                 cx,
                 move |view, cx| view.files_refresh(id, source, cx),
-            ))
-            .child(self.row_icon_button(
-                files_element_id(source, "new"),
-                Icon::FolderPlus,
-                strings.files_new,
-                false,
-                cx,
-                move |view, cx| view.files_new(id, source, cx),
             ));
+        // Following the shell's directory is how the remote column's path changes on
+        // its own, so its switch sits beside the column's own refresh (R15).
+        if remote {
+            tools = tools.child(self.files_follow_button(id, cx));
+        }
+        tools = tools.child(self.row_icon_button(
+            files_element_id(source, "new"),
+            Icon::FolderPlus,
+            strings.files_new,
+            false,
+            cx,
+            move |view, cx| view.files_new(id, source, cx),
+        ));
         if remote {
             tools = tools.child(
                 self.icon_text_button(
@@ -15275,9 +15288,6 @@ impl ShelluneView {
         // what it covers is stated once, above the listing it came from (R14).
         if !self.files.marked(id, source).is_empty() {
             panel = panel.child(self.files_selection_bar(id, source, cx));
-        }
-        if remote {
-            panel = panel.child(self.files_follow_row(id, cx));
         }
         if let Some(question) = self.files_question(id, source, cx) {
             panel = panel.child(question);
@@ -17597,7 +17607,13 @@ impl ShelluneView {
     /// with an ellipsis, and the close button. The state is the dot's tone and shape;
     /// its word, the kind and the target are in the tab's tooltip, so no word can push
     /// the tab wider than the strip gave it.
-    fn session_tab(&self, id: SessionId, index: usize, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn session_tab(
+        &self,
+        id: SessionId,
+        index: usize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let metrics = self.metrics();
         let strings = self.strings();
         let Some(session) = self.workspace.session(id) else {
@@ -17639,6 +17655,7 @@ impl ShelluneView {
         // and close button slide over its neighbour (R4, R7).
         let marks = tab_attention_marks(unread, strings, metrics, index);
         let mark_room = attention_mark_room(unread, metrics);
+        let title_width = tab_title_width(window, &title, metrics);
 
         let tab = browser_tab(
             ("session.tab", index),
@@ -17648,7 +17665,11 @@ impl ShelluneView {
             self.tab_floor(cx),
             metrics,
         )
-        .w(metrics.tab_max_width())
+        // As wide as what it holds - its title at full length - and no wider than the
+        // strip's widest tab, so a short name leaves no blank tail between the last tab
+        // and the controls beside the strip (R2). It still gives way down to its
+        // minimum when the strip is crowded.
+        .max_w(metrics.tab_max_width())
         .flex_shrink()
         .min_w(self.tab_min_width() + mark_room)
         .tooltip(components::tooltip(tooltip))
@@ -17710,6 +17731,7 @@ impl ShelluneView {
             })
             .child(tab_title_label(
                 title,
+                title_width,
                 selected,
                 format!("session.tab.title.{index}"),
                 metrics,
@@ -17872,7 +17894,7 @@ impl ShelluneView {
     /// A compact row ([`Self::header_compact`]) has room for one tab only, so the strip
     /// gathers the others away and shows the current one alone, whole; the list of
     /// every tab beside it is how the others are reached (R2, R9).
-    pub(super) fn tab_strip(&self, cx: &mut Context<Self>) -> Div {
+    pub(super) fn tab_strip(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let handle = self.tab_scroll.clone();
         let layout = self.workspace.layout();
@@ -17906,6 +17928,7 @@ impl ShelluneView {
             }
         };
         let ends = ends_of(&handle);
+        let overflow = strip_overflows(&handle);
         let fade = strip_fade_width(metrics);
 
         let mut scroller = div()
@@ -17920,9 +17943,9 @@ impl ShelluneView {
         let shown = |index: usize| !compact || index == active.unwrap_or(0);
         for index in (0..layout.tabs().len()).filter(|index| shown(*index)) {
             if let Some(id) = layout.anchor_of(index) {
-                scroller = scroller.child(self.session_tab(id, index, cx));
+                scroller = scroller.child(self.session_tab(id, index, window, cx));
             } else {
-                scroller = scroller.child(self.pending_tab(index, cx));
+                scroller = scroller.child(self.pending_tab(index, window, cx));
             }
         }
 
@@ -17946,7 +17969,13 @@ impl ShelluneView {
                         moved = true;
                     }
                 }
-                if moved || ends_of(&check) != ends || check.bounds().size.width != width {
+                // Whether the strip runs on also decides whether the list of every tab is
+                // drawn beside it, so a change there is drawn at once as well.
+                if moved
+                    || ends_of(&check) != ends
+                    || strip_overflows(&check) != overflow
+                    || check.bounds().size.width != width
+                {
                     // A view cannot be marked for drawing while it is being drawn; the
                     // request waits until this frame is done.
                     cx.defer(move |cx| cx.notify(view));
@@ -19096,16 +19125,21 @@ fn tab_icon(icon: Icon, selected: bool, metrics: Metrics) -> gpui::Svg {
 
 /// The title of a tab on one line, cut with an ellipsis where the tab ends (R2).
 ///
-/// It takes what the tab has left after its fixed parts and nothing more, so a long
-/// name never pushes the close button or the next tab aside; the whole name is in the
-/// tooltip.
+/// The slot asks for `width` - the whole name's measured width, from
+/// [`tab_title_width`] - so a tab is as wide as its own title (within the strip's
+/// bounds) and not a fixed width with a blank tail. It gives that width up as the tab
+/// narrows, and takes what the tab has left over beyond it: a long name never pushes
+/// the close button or the next tab aside; the whole name is in the tooltip.
 ///
 /// The words sit in a box pinned to the slot's edges rather than in the slot itself.
 /// A line is measured once per frame, and as a flex item its first measure is the
 /// whole name, which the slot would then clip without an ellipsis; pinned to the
 /// slot, the line is measured against the slot's own width and is cut where it ends.
+/// Being pinned, the line adds nothing to the slot's size, which is why the slot is
+/// given the measured width.
 fn tab_title_label(
     title: impl Into<SharedString>,
+    width: gpui::Pixels,
     selected: bool,
     selector: String,
     metrics: Metrics,
@@ -19113,7 +19147,11 @@ fn tab_title_label(
     let line = metrics.scale(20.0);
     div()
         .relative()
-        .flex_1()
+        // A width of its own rather than a flex basis: what a row asks for is read
+        // from its parts' widths, and a basis alone would not be counted.
+        .w(width)
+        .flex_grow()
+        .flex_shrink()
         .min_w(px(0.0))
         .h(line)
         .debug_selector(move || selector.clone())
@@ -19126,6 +19164,26 @@ fn tab_title_label(
                 .when(selected, |label| label.font_weight(FontWeight::MEDIUM))
                 .child(title.into()),
         )
+}
+
+/// The width a tab's title takes on one line, at the tab's text size and in the
+/// weight the current tab draws it in, so the tab that turns current does not cut its
+/// own name (R2).
+///
+/// It is shaped by the window's own text system, the one that paints the line, and
+/// rounded up so the line is never cut by a fraction of a pixel.
+fn tab_title_width(window: &Window, title: &str, metrics: Metrics) -> gpui::Pixels {
+    if title.is_empty() {
+        return px(0.0);
+    }
+    let mut style = window.text_style();
+    style.font_weight = FontWeight::MEDIUM;
+    let run = style.to_run(title.len());
+    let width = window
+        .text_system()
+        .layout_line(title, metrics.label_size(), &[run], None)
+        .width;
+    width.ceil() + px(1.0)
 }
 
 /// The close button of a tab: a full pointer target, shown on the current tab and on
@@ -19193,6 +19251,15 @@ impl StripEnds {
             after: max > slack && offset > -max + slack,
         }
     }
+}
+
+/// Whether the strip `handle` scrolls holds more tabs than it shows, as it was last
+/// laid out (R2).
+///
+/// It reads the scroll range itself rather than [`StripEnds`]: a strip too narrow for
+/// its scroll buttons reports no hidden end, and its tabs still run on past it.
+pub(super) fn strip_overflows(handle: &gpui::ScrollHandle) -> bool {
+    handle.max_offset().width > px(0.5)
 }
 
 /// How far a fade reaches into the strip from an end that tabs run on past (R2).

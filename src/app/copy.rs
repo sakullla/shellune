@@ -540,14 +540,17 @@ pub struct Strings {
     pub files_problem_unchanged: &'static str,
     /// Narrow-window button that shows the remote column.
     pub files_show_remote: &'static str,
-    /// Switch that makes the remote column follow the shell's own directory (R15).
-    pub files_follow: &'static str,
     /// Said while following waits for a shell that has not reported a directory.
     pub files_follow_no_report: &'static str,
     /// Said after browsing by hand turned following off.
     pub files_follow_manual: &'static str,
     /// Said when the reported directory could not be read. The path is appended.
     pub files_follow_unreadable: &'static str,
+    /// The switch that makes the remote column follow the shell's own directory, and
+    /// its state while it is on, in its tooltip (R15).
+    pub files_follow_on: &'static str,
+    /// The follow switch's state while it is off, in its tooltip (R15).
+    pub files_follow_off: &'static str,
     /// Button that uploads one local file into the remote directory on screen.
     pub files_to_remote: &'static str,
     /// Button that downloads one remote file into the local directory on screen.
@@ -1384,10 +1387,11 @@ pub static ENGLISH: Strings = Strings {
     files_problem_missing: "That entry is no longer in this directory.",
     files_problem_unchanged: "The name did not change.",
     files_show_remote: "Show remote",
-    files_follow: "Follow terminal",
     files_follow_no_report: "The shell has not reported a directory yet. It follows the next change, or browse by hand.",
     files_follow_manual: "Following is off because you browsed by hand. Turn it on to return to the terminal's directory.",
     files_follow_unreadable: "The shell reported a directory this server cannot read; showing the last readable one:",
+    files_follow_on: "Follow terminal: on",
+    files_follow_off: "Follow terminal: off",
     files_to_remote: "Upload to remote",
     files_to_local: "Download to local",
     files_delete_recursive_local: "This directory and everything inside it are deleted on this computer. This cannot be undone.",
@@ -1919,10 +1923,11 @@ pub static CHINESE: Strings = Strings {
     files_problem_missing: "这个条目已不在当前目录中。",
     files_problem_unchanged: "名称没有变化。",
     files_show_remote: "显示远程",
-    files_follow: "跟随终端目录",
     files_follow_no_report: "终端还没有报告目录。切换一次目录后会自动跟随，也可以手动浏览。",
     files_follow_manual: "已按你的浏览手动选择目录，跟随已关闭。重新打开可回到终端目录。",
     files_follow_unreadable: "终端报告的目录无法读取，仍在显示上一个可读目录：",
+    files_follow_on: "跟随终端目录：开",
+    files_follow_off: "跟随终端目录：关",
     files_to_remote: "上传到远程",
     files_to_local: "下载到本地",
     files_delete_recursive_local: "这个目录及其中的全部内容都会从这台电脑删除，且无法撤销。",

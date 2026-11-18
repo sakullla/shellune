@@ -2356,11 +2356,15 @@ impl ShelluneView {
 
     /// The control beside the strip that opens the list of every tab.
     ///
-    /// It is drawn outside the strip's clipped row, so it stays reachable however many
-    /// tabs are open, and it says how many there are (R2, R4).
+    /// It is only there when some tab is out of sight: the strip runs on past its
+    /// width, or the row is compact and shows the current tab alone. While every tab is
+    /// on the strip it would only repeat the strip, and it would stand in the gap
+    /// between the last tab and "+". It is drawn outside the strip's clipped row, so it
+    /// stays reachable however many tabs are open, and it says how many there are; an
+    /// open list keeps it until the list is closed (R2, R4).
     pub(super) fn tab_list_control(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let count = self.workspace.layout().tabs().len();
-        if count == 0 {
+        if count == 0 || !self.tab_list_wanted() {
             return None;
         }
         let metrics = self.metrics();
@@ -2383,6 +2387,15 @@ impl ShelluneView {
                     this.toggle_tab_list(window, cx);
                 })),
         )
+    }
+}
+
+impl ShelluneView {
+    /// Whether the row draws the control that lists every tab: a tab is out of sight -
+    /// the strip runs on, or a compact row shows the current tab alone - or the list is
+    /// open (R2).
+    pub(super) fn tab_list_wanted(&self) -> bool {
+        self.tab_list_open || self.header_compact() || super::strip_overflows(&self.tab_scroll)
     }
 }
 
