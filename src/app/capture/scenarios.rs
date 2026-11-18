@@ -60,6 +60,8 @@ pub enum Category {
     Overlay,
     /// The window's start, before its first page (R7).
     Startup,
+    /// The component catalogue: every shared component in every state (ADR-2).
+    Design,
 }
 
 impl Category {
@@ -73,6 +75,7 @@ impl Category {
             Self::Settings => "settings",
             Self::Overlay => "overlay",
             Self::Startup => "startup",
+            Self::Design => "design",
         }
     }
 }
@@ -1760,6 +1763,22 @@ fn hold_splash(
     cx: &mut Context<ShelluneView>,
 ) -> Result<(), String> {
     view.capture_hold_splash(cx);
+    Ok(())
+}
+
+fn show_catalog(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_show_catalog(cx);
+    Ok(())
+}
+
+fn catalog_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if !view.catalog_shown() {
+        return Err("the window is not drawing the design catalogue".to_owned());
+    }
     Ok(())
 }
 
@@ -3844,6 +3863,25 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: nothing,
         install: hold_splash,
         ready: splash_ready,
+    },
+    Scenario {
+        id: "design-catalog",
+        title: "设计 · 组件清单",
+        category: Category::Design,
+        fixture: "no data; the window draws the component catalogue (src/app/catalog.rs) \
+                  instead of a page, with fixed English sample words",
+        evidence: "shows every shared component in its states on the token v2 palette: \
+                   buttons, fields, search, choices, labels, banners, progress, skeleton, \
+                   sidebar, list rows, menu, toast and status card; hover is drawn from \
+                   the hovered face rather than a pointer, the indeterminate bar is the \
+                   still form a capture's reduced motion draws, and nothing on the page \
+                   is wired to an action",
+        quick: false,
+        variants: &[],
+        start: || page(Destination::Hosts),
+        prepare: nothing,
+        install: show_catalog,
+        ready: catalog_ready,
     },
 ];
 

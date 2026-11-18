@@ -40,7 +40,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::prelude::*;
-use gpui::{Context, Div, Entity, FontWeight, SharedString, Stateful, Window, div, px};
+use gpui::{Context, Div, Entity, FontWeight, SharedString, Stateful, Window, div};
 use shellune_core::{ForwardBook, SecretString};
 use shellune_storage::{
     ForwardStore, GroupService, HostBook, KdfParams, LocalData, LocalState, PersistError,
@@ -1394,7 +1394,7 @@ impl ShelluneView {
         let metrics = self.metrics();
         div()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .px(metrics.scale(spacing::BASE))
             .py(metrics.scale(spacing::TIGHT))
             .whitespace_normal()
@@ -1515,7 +1515,7 @@ impl ShelluneView {
             .flex_wrap()
             .items_center()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .gap(metrics.scale(spacing::TIGHT))
             .px(metrics.scale(spacing::BASE))
             .py(metrics.scale(spacing::SNUG))
@@ -1668,7 +1668,7 @@ impl ShelluneView {
         let paragraph = |text: &'static str, selector: &'static str| {
             div()
                 .w_full()
-                .min_w(px(0.0))
+                .min_w_0()
                 .whitespace_normal()
                 .text_size(metrics.caption_size())
                 .text_color(theme::swatch(palette::TEXT_SECONDARY))
@@ -1679,7 +1679,7 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::LOOSE))
             .pb(metrics.scale(spacing::LOOSE))
@@ -1698,7 +1698,7 @@ impl ShelluneView {
             .child(
                 div()
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .whitespace_normal()
                     .text_size(metrics.label_size())
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))

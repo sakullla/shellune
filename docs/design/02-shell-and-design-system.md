@@ -86,19 +86,19 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   - **所有主机**：宽窗口在列表上方写 `所有主机`（`home.all`）；以下列表能力不变。
   - **视觉（新设计语言，结构与行为不变）**：
     - **快速连接栏**：`TextField::set_prominent(true)` 画成主入口。高 40，圆角 14（`XLARGE`），
-      `surface` 底加强边，静止 Low；聚焦时在 Low 之上加 accent 边与 3px 焦点环。正文字号用 body，图标 16。
+      `surface` 底加强边，静止 Raised；聚焦时在 Raised 之上加 accent 边与 3px 焦点环。正文字号用 body，图标 16。
       其余输入框不受影响。与所有 `TextField` 一样按 `Metrics::default()` 绘制，不随窗口缩放（200% 时仍是 100% 的尺寸）。
     - **卡片**：最近、收藏、分组三类卡片都由 `home_card_frame` 构成，即共享的 `components::card` 横排
-      （surface、弱边、圆角 10、Low，内边距 12×8）。悬停时即时抬到 Mid 并换成强边，没有过渡。
+      （surface、弱边、圆角 8、Raised，内边距 12×8）。悬停时即时抬到 Overlay 并换成强边，没有过渡。
       分组卡片的图标块用品牌渐变（accent）配 `ON_ACCENT` 文件夹，与主机卡片的首字母头像区分。
       快速连接的结果面板（`home.quick.results`）也是同一种 `card`。
     - **卡片带的阴影余量**：`home.dashboard` 是滚动框，会裁掉内容的阴影。因此它左右各外扩 8（负外边距），
-      再用同样的内边距收回；底部只留 4（Low 的阴影余量），不收回，但计入限高之内，不额外占用列表的高度。卡片与下方列表左缘仍然对齐，
-      静止阴影不会被裁；需要滚动的卡片带在裁切处与“所有主机”仍保持完整的间距。悬停的 Mid 阴影达不到的部分
+      再用同样的内边距收回；底部只留 4（Raised 的阴影余量），不收回，但计入限高之内，不额外占用列表的高度。卡片与下方列表左缘仍然对齐，
+      静止阴影不会被裁；需要滚动的卡片带在裁切处与“所有主机”仍保持完整的间距。悬停的 Overlay 阴影达不到的部分
       仍会被滚动框裁掉。
     - **进入动画**：卡片依次淡入（`components::enter_in_turn`）。第 n 张卡片的次序为
       “所在区序号 + 区内序号”，每一次序晚 40ms（`TURN_DELAY`，第 6 次序以后不再加），淡入时长为
-      `Enter::Rise` 的 BASE 180ms。动画只改透明度，卡片从第一帧起就在最终位置，进入过程中也能按到。
+      `Enter::Rise` 的 BASE 200ms。动画只改透明度，卡片从第一帧起就在最终位置，进入过程中也能按到。
       减少动效时直接画终态。首次使用卡片（`hosts.empty`）用 `theme::enter(…, Enter::Rise)` 进入一次。
     - **列表**：`hosts.surface` 改为同一种 `card`（surface + Low，内边距 4），不再是 chrome 底。
       行仍是卡片里的平面行：左右内边距 12，名称与地址两行之间留 2。
@@ -129,7 +129,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   悬停抬一级底色，选中是 accent tint 底 + 半透明 accent 边。左侧是真正的复选框（空心方框，选中填 accent 加勾，
   不再借用会被读成"展开"的箭头）、头像、名称与等宽字体地址，最近连接过的补上相对时间
   （"最近连接 3 小时前 · 12 次连接"，悬停显示 UTC 精确时间，`copy::relative_time`）；右侧是分组标签、
-  端口转发 / 编辑 / 删除三个安静的图标，最后是带字的 Soft "连接"按钮——一行唯一的主操作。**双击行即连接**；
+  端口转发 / 编辑 / 删除三个安静的图标，最后是带字的 Secondary "连接"按钮——一行唯一的主操作。**双击行即连接**；
   行内按钮都会阻止冒泡，快速连点图标不会顺带打开主机。删除仍先确认。
   搜索框输入关键词后**按 Enter 连接列表最上面那台**（`first_searched_host`），空搜索框按 Enter 什么都不做。
   "保存位置"那一行从主页移走（它在 设置 → 数据 里），主页标题改为 hero 字号 semibold。
@@ -163,7 +163,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   `components::modal`：头部是图标块 + 标题 + 关闭按钮（危险问题的图标块用 danger tint），主体滚动，底部
   `components::modal_footer` 右对齐、可换行，按“退路在前、主操作在后”排列——主操作为 Primary 实心，次操作为
   Secondary / Ghost，删除与关闭为 Danger。进入时淡入并从上方 8px 落定（`Enter::Settle`，减少动效时直接出现）。
-  关闭时卡片当帧消失，背后的遮罩留下 `components::SCRIM_EXIT`（= `Motion::BASE` 180ms）淡出
+  关闭时卡片当帧消失，背后的遮罩留下 `components::SCRIM_EXIT`（= `Motion::BASE` 200ms）淡出
   （`components::modal_scrim_exit`，选择器 `modal.scrim.exit`）：gpui 每帧重建元素树，卡片完整淡出要逐个对话框
   保留关闭后的状态，按需求 R5 的确认改为只淡出遮罩。淡出中的遮罩不接收指针，答完即可操作页面；期间另开对话框
   会结束这次淡出；减少动效时遮罩随卡片立即消失。
@@ -526,7 +526,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 同一句警告。证书确认是独立的卡片（`desktop.certificate`），不会被提示条替代。
 全部用共享组件画（R6）：控件条是 `components::floating_bar`（raised + 强边 + Mid，紧凑 Ghost 按钮，全屏带图标，
 百分比与按钮之间一条竖线），浮在别人的画面上所以带浮层阴影；状态卡片是 `state_card_with_icon`（显示器图标，色调随阶段）；
-提示条是 Warning 色调的 `banner` 抬到画面上（Mid 阴影，正文主色）；证书确认是 raised 的 `card`，头部是警告色调的
+提示条是 Warning 色调的 `banner` 抬到画面上（Overlay 阴影，正文主色）；证书确认是 raised 的 `card`，头部是警告色调的
 `modal_icon`，指纹用等宽 `endpoint`，底部"拒绝"（Danger）在前、"信任"（Primary）在后。窗口在桌面标签上方画的失败卡片
 下面留 24px，给卡片的浮层阴影落脚，不再被下面的画布切成一条硬边。
 
@@ -649,10 +649,10 @@ COM1 等）不算文件夹里的文件。不满足的一律 `ERROR_ACCESS_DENIED
   更新清理与 20 秒后的检查（`start_updates`）、工作区布局恢复，都在采纳之后由 `begin_work` 一次启动；过场期间
   `layout_persist` 为关，不会把空布局写回 `workspace.json`。
 - **画面**：canvas 底色上居中的品牌——应用图标（72，随缩放）、产品名（hero 字号、SEMIBOLD）、当前语言的产品标语
-  （body、次要文字色，窄窗时换行）——以 `Enter::Settle`（`Motion::SLOW` 260ms，淡入并从上方 8px 落定，代替做不到
+  （body、次要文字色，窄窗时换行）——以 `Enter::Settle`（`Motion::SLOW` 300ms，淡入并从上方 8px 落定，代替做不到
   的轻微缩放）进入。品牌在标题行下方的区域内居中，200% 文字的 720×480 窗口里也不压到标题行（测试）。
 - **时长**：过场至少放完一轮进入（计时从构造时开始），读取更慢就等读取完成；不额外加长。之后进入 Ready，品牌层
-  以 `Motion::BASE` 180ms 淡出、露出首页或恢复的工作区（交叉淡化）。淡出层不接收指针，页面从第一帧就可以点击（测试）。
+  以 `Motion::BASE` 200ms 淡出、露出首页或恢复的工作区（交叉淡化）。淡出层不接收指针，页面从第一帧就可以点击（测试）。
 - **减少动效**（用户偏好或系统设置）：不画品牌、不等待、不淡出；读取期间只有 canvas 与标题行，读完立即显示页面。
   系统设置要靠辅助程序回答的平台（Linux，`SYSTEM_MOTION_QUERY_BLOCKS`）在后台询问，过场**等回答再决定画不画品牌**：
   等待期间只画 canvas 与标题行（与减少动效相同），最多等 `SYSTEM_MOTION_WAIT`（400ms）；回答到达后若要求减少动效
@@ -676,143 +676,161 @@ COM1 等）不算文件夹里的文件。不满足的一律 `ERROR_ACCESS_DENIED
 
 ## 2. 视觉 tokens
 
-2026-11 重设计（R1）后的设计语言：中性冷灰的五层表面，加一个克制的长春花蓝紫强调色；"质感"来自
-**表面分层 + 层级阴影 + 进入动效**，而不是渐变、描边堆叠或第二种强调色。所有值只在
-`src/app/theme.rs` 定义一次，视图只写令牌名，不写字面量颜色、阴影预设、时长或尺寸。
+2026-11-18 起是 **token v2**（全应用 UI/UX 重做，ADR-1）：极简工具风，中性灰阶加一个强调色，边框细、少用卡片、
+阴影很淡，层级主要靠明度和边框区分。所有值只在 `src/app/theme.rs` 定义一次，视图只写令牌名，不写字面量
+颜色、阴影预设、时长或尺寸；守卫测试（2.5）把这条规则变成断言。
 
 ### 2.1 颜色：两张独立的表
 
-`theme::Token` 同时携带深色值与浅色值；两张表 `theme::dark` 与 `theme::light` 并排维护，浅色**不再**
-由"深色值查表映射"得到（旧的 `light::TABLE` 已删除），因此两个令牌可以共用同一个值（例如浅色下
-surface / raised / overlay 都是白），也不再有"值不得重复"的约束。`theme::swatch(token)` 按当前外观
-解析；`theme::palette::*` 是视图唯一使用的令牌名。
+`theme::Token` 同时携带深色值与浅色值；两张表 `theme::dark` 与 `theme::light` 并排维护，浅色不由深色推导。
+`theme::swatch(token)` 按当前外观解析；`theme::palette::*` 是视图唯一使用的令牌名。两个令牌可以共用同一个值
+（例如 `CHROME` 与 `SURFACE` 都是面板层）。
 
-配色仍取自 logo：深色是带一点靛蓝的石墨，浅色是冷调纸灰。唯一的有彩身份色是 logo 的长春花蓝
-accent，用于当前对象、主操作、焦点环与选中标记；常规控件不用渐变、不出现第二种强调色，accent 不偏紫
-（蓝 > 绿 ≥ 红，蓝绿差 ≥ 0x40，由测试校验）。唯一的渐变 `brand_gradient`（accent → brand end）只画在
-品牌徽记上。表面、边框与文字在两种主题下都保持中性（各通道差值 ≤ 14，由测试校验）。
+唯一的有彩身份色是长春花蓝 accent，用于当前对象、主操作、焦点环与选中标记；常规控件不用渐变、不出现第二种
+强调色，accent 不偏紫（蓝 > 绿 ≥ 红，蓝绿差 ≥ 0x40，由测试校验）。唯一的渐变 `brand_gradient`（accent → brand end）
+只画在品牌徽记上。表面、边框与文字在两种主题下都保持中性（各通道差值 ≤ 14，由测试校验）。
 
-**五层表面**（自下而上）：
+**表面**：
 
-| 层 | 令牌 | 深色 | 浅色 | 放什么 |
-| --- | --- | --- | --- | --- |
-| 0 | `CANVAS` | `#0d0e12` | `#f3f4f7` | 窗口底：内容区底色、终端外围 |
-| 1 | `CHROME` | `#131419` | `#ebecf0` | 标题栏、标签条、导航、状态栏、键帽 |
-| 2 | `SURFACE` | `#18191f` | `#ffffff` | 内容：卡片、列表行、输入框、当前标签 |
-| 3 | `RAISED` | `#1f2027` | `#ffffff` | 浮在内容上的：菜单、弹出层、tooltip、toast |
-| 4 | `OVERLAY` | `#23242c` | `#ffffff` | 对话框（最前层，压在 scrim 上） |
+| 令牌 | 深色 | 浅色 | 放什么 |
+| --- | --- | --- | --- |
+| `CANVAS` | `#0f0f11` | `#fafafa` | 窗口底：内容区、终端外围 |
+| `SURFACE` | `#151518` | `#f4f4f5` | 面板层：侧栏、输入框、行、卡片 |
+| `CHROME` | `#151518` | `#f4f4f5` | 标题栏、标签条、状态栏（与 `SURFACE` 同值，同属面板层） |
+| `RAISED` | `#1c1c20` | `#ffffff` | 浮层：菜单、弹出层、tooltip、toast |
+| `OVERLAY` | `#202024` | `#ffffff` | 对话框、命令面板（最前层，压在 scrim 上） |
 
-深色下每一层都比下一层亮（测试校验单调递增），因为黑底上的阴影几乎看不见，浮层必须同时靠更亮的
-填充和更亮的边；浅色下内容层都是白，靠底层更灰与阴影区分（测试校验内容层亮于 canvas/chrome）。
+深色下 canvas < 面板 < 浮层 < 对话框逐级变亮（测试校验）；浅色下面板比底色灰一档，浮在上面的一律为白
+（测试校验浮层亮于 canvas 与面板）。
 
-**交互、边框、文字与状态**：
+**交互填充与发丝线**按 ADR 写成"白（深色）/ 黑（浅色）以某个比例叠在面板层上"，表里存的是叠加后的不透明值，
+测试 `the_interaction_fills_and_hairlines_are_the_documented_blends` 校验两者一致：
+
+| 令牌 | 深色（白叠面板） | 浅色（黑叠面板） |
+| --- | --- | --- |
+| `SURFACE_HOVER` | 5% → `#212124` | 4% → `#eaeaeb` |
+| `SURFACE_SELECTED` | 8% → `#28282a` | 6% → `#e5e5e6` |
+| `SURFACE_PRESSED` | 10% → `#2c2c2f` | 8% → `#e0e0e1` |
+| `BORDER` | 7% → `#252528` | 8% → `#e0e0e1` |
+| `BORDER_STRONG` | 12% → `#313134` | 14% → `#d2d2d3` |
+
+**文字、强调色与状态色**：
 
 | 令牌 | 深色 | 浅色 | 用途 |
 | --- | --- | --- | --- |
-| `SURFACE_HOVER` / `SURFACE_SELECTED` / `SURFACE_PRESSED` | `#262730` / `#2b2c36` / `#31323d` | `#eef0f4` / `#e5e7ee` / `#dcdfe7` | 悬停 / 选中 / 按下 |
-| `BORDER` / `BORDER_STRONG` | `#272831` / `#373844` | `#e1e3e9` / `#c9ccd5` | 弱边（分隔线、卡片）/ 强边（控件、浮层、悬停） |
-| `SEGMENT_TRACK` / `SEGMENT_THUMB` | `#101115` / `#2c2d37` | `#e9ebf0` / `#ffffff` | 分段控件凹槽 / 选中滑块 |
-| `TEXT_PRIMARY` / `TEXT_SECONDARY` / `TEXT_MUTED` | `#eeeff4` / `#b6b8c3` / `#9c9faa` | `#16171d` / `#444652` / `#5a5d68` | 标题 / 正文 / 提示与计数 |
-| `ACCENT` / `ACCENT_HOVER` / `ACCENT_PRESSED` / `ON_ACCENT` | `#8f9dff` / `#a6b1ff` / `#7887f2` / `#0d1033` | `#4053cc` / `#3646b4` / `#2e3c9b` / `#ffffff` | 主操作：静止 / 悬停 / 按下 / 其上文字 |
-| `ACCENT_TINT` / `ACCENT_ON_TINT` | `#1d2042` / `#c0c8ff` | `#eceffe` / `#3442a6` | Soft 按钮、徽标、空状态图标块 |
-| `POSITIVE` / `WARNING` / `DANGER` / `INFO` | `#5fd4a3` / `#e9c27c` / `#ff8f97` / `#7cc4f2` | `#0f6e49` / `#7a5300` / `#b42b3c` / `#1d5f8f` | 状态色（同时是其 tint 上的文字色） |
-| `*_TINT`（positive/warning/danger/info） | `#13261f` / `#2a2214` / `#2e181b` / `#14232f` | `#dff2e8` / `#faf0d8` / `#fce7e9` / `#e2eff9` | 状态 chip、横幅、toast 图标底 |
+| `TEXT_PRIMARY` / `TEXT_SECONDARY` / `TEXT_MUTED` | `#ededef` / `#a1a1aa` / `#92929b` | `#18181b` / `#52525b` / `#63636b` | 标题 / 正文 / 提示与计数 |
+| `ACCENT` / `ACCENT_HOVER` / `ACCENT_PRESSED` | `#8689f3` / `#9598f5` / `#7a7de8` | `#5252d2` / `#4747c4` / `#3f3fb5` | 主操作：静止 / 悬停 / 按下 |
+| `ON_ACCENT` | `#0f0f11` | `#ffffff` | 实心 accent 上的文字 |
+| `ACCENT_TINT` / `ACCENT_ON_TINT` | `#252537`（accent 14% 叠面板）/ `#c5c7fa` | `#eeeefa`（accent 10% 叠白）/ `#3e3eb8` | 徽标、空状态图标块、当前项底色 |
+| `POSITIVE` / `WARNING` / `DANGER` / `INFO` | `#5bc490` / `#d9ae5f` / `#ee8a8a` / `#78aeeb` | `#166c42` / `#825400` / `#b12f36` / `#2563ae` | 低饱和状态色（同时是其 tint 上的文字色） |
+| `*_TINT`（positive / warning / danger / info） | `#1f2e29` / `#302a22` / `#332528` / `#232a36`（各 14% 叠面板） | `#e8f0ec` / `#f2eee6` / `#f7eaeb` / `#e9eff7`（各 10% 叠白） | 状态 chip、横幅、toast 图标底 |
+| `PLANNED` | `#9a9aa6` | `#5e5e6a` | 已关闭 / 本版本不提供 |
+| `FOCUS_RING` | `#9598f5` | `#4747c4` | 键盘焦点环（2px 边） |
+| `DISABLED_SURFACE` / `DISABLED_TEXT` | `#18181b` / `#75757e` | `#f0f0f1` / `#7f7f88` | 不可用控件（保持 3:1） |
+| `LOADING_TRACK` / `LOADING_FILL` | `#28282a` / `#8689f3` | `#e5e5e6` / `#5252d2` | 进度条的槽与已完成部分 |
+| `SEGMENT_TRACK` / `SEGMENT_THUMB` | `#0c0c0e` / `#232327` | `#eaeaeb` / `#ffffff` | 分段控件凹槽 / 选中滑块 |
+| `TRACK_OFF` / `TRACK_OFF_HOVER` | `#52525b` / `#5e5e68` | `#8a8a93` / `#7c7c85` | 开关关闭时的轨道 |
+| `TRACK_ON` / `TRACK_ON_HOVER` | `#6d71e6` / `#7377ea` | `#5252d2` / `#4747c4` | 开关打开时的轨道（accent 色相，深色下压暗以托住浅色圆钮） |
+| `KNOB` | `#f4f4f5` | `#ffffff` | 开关圆钮 |
 | `DANGER_SOLID` / `ON_DANGER` | `#c42b1c` / `#ffffff` | 同 | 实心危险填充（Windows 关闭按钮悬停） |
-| `TRACK_OFF` / `TRACK_OFF_HOVER` | `#3b3c47` / `#464855` | `#878b96` / `#7a7e89` | 开关关闭时的轨道（静止 / 悬停） |
-| `TRACK_ON` / `TRACK_ON_HOVER` | `#5a69e0` / `#6170e4` | `#4053cc` / `#3646b4` | 开关打开时的轨道（accent 色相，深色下压暗以托住浅色圆钮） |
-| `KNOB` | `#f4f5f8` | `#ffffff` | 开关圆钮 |
-| `PLANNED` | `#9ca1ad` | `#5b606a` | 已关闭 / 本版本不提供 |
-| `FOCUS_RING` | `#adb8ff` | `#3646b4` | 键盘焦点环（2px 边） |
-| `DISABLED_SURFACE` / `DISABLED_TEXT` | `#17181d` / `#7b7f89` | `#f0f1f4` / `#767b84` | 不可用控件（仍保持 3:1） |
-| `LOADING_TRACK` / `LOADING_FILL` | `#262830` / `#97a5ff` | `#e2e4e9` / `#4053cc` | 进行中指示条 |
-| `SCRIM` | `#040508` | `#1a1c22` | 对话框遮罩，按 `SCRIM_ALPHA`（0.62）叠加；`theme::scrim()` |
-| `SHADOW` | `#000000` | `#101828` | 层级阴影的墨色 |
-| `BRAND_END` | `#b29bfc` | `#7c5cd6` | 唯一渐变的第二色标 |
-| `AVATARS` / `TAB_ACCENTS` | 6 组 / 6 色 | 各自独立的浅色值 | 主机头像与标签辨识色（不与状态色同源） |
+| `SCRIM` | `#000000` | `#18181b` | 对话框遮罩，按 `SCRIM_ALPHA`（0.62）叠加 |
+| `SHADOW` | `#000000` | `#000000` | 层级阴影的墨色 |
+| `BRAND_END` | `#a78bfa` | `#7c5cd6` | 唯一渐变的第二色标 |
+| `SELECTION` | `#323459`（accent 32% 叠终端底色） | `#d7d7f4`（accent 22% 叠终端底色） | 终端选区背景，按**终端**配色解析（取代 `terminal.rs` 里的两个硬编码值） |
+| `AVATARS` | 8 组 | 8 组 | 主机头像（靛、钢、青、鼠尾草、苔、沙、陶、石楠，各 18%/12% 叠底），低饱和，不与状态色同源 |
+| `TAB_ACCENTS` | 6 色 | 6 色 | 标签辨识色（不与状态色同源） |
 
-**对比度（测试断言）**：正文三色、accent 与五个状态色在全部八种表面（五层 + hover/selected/pressed）上
-深浅两套都 ≥ 4.5:1；焦点环 ≥ 3:1；每个状态色在自己的 tint 上、`ON_ACCENT` 在三种 accent 上、
-`ON_DANGER` 在 `DANGER_SOLID` 上 ≥ 4.5:1；禁用文字与加载条取图形下限 3:1；开关圆钮在四种轨道
-（关/开 × 静止/悬停）上、打开的轨道在 surface/chrome/raised/overlay 上，深浅两套都 ≥ 3:1。
+**与 ADR-1 表的偏差（为守住对比度下限）**：ADR 给的 `TEXT_MUTED`（深 `#71717a` / 浅 `#a1a1aa`）在面板上只有
+2.8:1 / 1.9:1，`ACCENT`（深 `#7c7ff2` / 浅 `#5b5bd6`）在按下底色上不到 4.5:1，深色 `ON_ACCENT` 用白只有 3.4:1。
+这里保留 ADR 的色相与层次，把这几个值调到最近的合格值：muted 深 `#92929b`、浅 `#63636b`，accent 深 `#8689f3`、
+浅 `#5252d2`，深色 `ON_ACCENT` 用 canvas 墨色 `#0f0f11`（浅色仍是白）。其余表面、hover/selected/border 比例、
+`TEXT_PRIMARY`、`TEXT_SECONDARY` 与 ADR 一致（pressed 取 10%/8%，ADR 未列）。
+
+**对比度（测试断言）**：正文三色、accent、四个状态色与 planned 在全部八种表面（canvas、chrome、surface、raised、
+overlay 与 hover/selected/pressed）上深浅两套都 ≥ 4.5:1；焦点环 ≥ 3:1；每个状态色在自己的 tint 上、
+`ON_ACCENT` 在三种 accent 上、`ON_DANGER` 在 `DANGER_SOLID` 上、头像字在头像底上 ≥ 4.5:1；禁用文字与进度条
+取图形下限 3:1；开关圆钮在四种轨道上、打开的轨道在各表面上深浅两套都 ≥ 3:1。
 
 终端默认前景、背景、光标与 16 个 ANSI 色另有浅色映射（`theme::light::TERMINAL`，按终端深色值索引）；
-程序输出的颜色不被界面主题改写。终端配色可单独选择（`theme::TerminalScheme`）。绘制时有最低对比度
-保护：低于 3:1（dim 2:1）时把文字推向黑或白。
+程序输出的颜色不被界面主题改写。终端配色可单独选择（`theme::TerminalScheme`）。绘制时有最低对比度保护：
+低于 3:1（dim 2:1）时把文字推向黑或白。
 
 ### 2.2 层级（Elevation）
 
-`theme::Elevation { Flat, Low, Mid, High }`，每级是一对阴影（贴合的接触影 + 柔和的环境影）。视图写
-`.elevation(Elevation::Mid)`（`theme::Elevated` trait）或 `.shadow(Elevation::Mid.shadows())`，
-**不再调用 GPUI 的 `shadow_xs/sm/md/lg/2xl` 预设**。
+`theme::Elevation { Flat, Raised, Overlay }`。视图写 `.elevation(Elevation::Overlay)`（`theme::Elevated`），
+不调用 GPUI 的 `shadow_*` 预设。每一级都保留 1px 边框，阴影只增加存在感；深色下阴影很淡。
 
 | 级 | 用于 | 浅色（y / blur / spread / α） | 深色 |
 | --- | --- | --- | --- |
-| Flat | 行、chrome、行内控件 | 无 | 无 |
-| Low | 卡片、输入、Primary/Secondary 按钮、分段滑块、开关圆钮 | 1/2/0/.06 + 1/3/0/.08 | 1/2/0/.32 + 1/4/0/.24 |
-| Mid | 菜单、弹出层、tooltip、toast | 2/4/−1/.06 + 8/20/−4/.14 | 2/4/−1/.40 + 10/24/−4/.50 |
-| High | 对话框、命令面板、启动过场 | 4/8/−2/.08 + 20/48/−8/.22 | 4/8/−2/.45 + 24/56/−8/.65 |
+| Flat | 行、chrome、行内控件、Secondary/Ghost 按钮 | 只有边框 | 只有边框 |
+| Raised | Primary 按钮、分段滑块、开关圆钮、`card` / `state_card` | 1/2/0/.06 | 1/2/0/.24 |
+| Overlay | 菜单、弹出层、tooltip、toast、状态卡、对话框、命令面板 | 1/2/0/.04 + 8/24/0/.12 | 1/2/0/.20 + 8/24/0/.36 |
 
-深色阴影更深、浮层边框用 `BORDER_STRONG`，测试校验"逐级更远"和"深色更深"。
+旧的 Low / Mid / High 分别并入 Raised / Overlay / Overlay。测试校验 Flat 无阴影、Raised 的外延是 0 1 2、Overlay
+是 0 8 24，以及深色阴影 α ≤ 0.4。
 
 ### 2.3 动效
 
 gpui 没有 hover 过渡、没有元素缩放，也不报告系统的"减少动态效果"设置（应用自己读取，见第 5 条），因此规则是：
 
-1. **只有进入动画，退出只有对话框遮罩淡出与启动过场的品牌层淡出**（后者见第 1.5 节）。hover、按下、选中都即时切换；除进行中指示（连接卡片的进度点、
-   连接中标签的状态点）外没有循环动画。对话框关闭时卡片立即消失，只有不带状态的遮罩用 BASE 淡出（见第 1 节
-   “弹窗”），减少动效时也立即消失。
-2. 时长令牌：`Motion::FAST` 120ms（小状态变化、toast/tooltip 淡入）、`Motion::BASE` 180ms（菜单、卡片、
-   等待徽记）、`Motion::SLOW` 260ms（对话框、启动过场）；进行中的循环脉动一拍 `Motion::PULSE` 900ms。
-   缓动统一 `theme::ease_out()`（ease-out-quint）。
-3. `theme::enter(element, id, Enter::{Fade, Rise, Settle})`：Fade 原地淡入；Rise 淡入并上移 6px；Settle 从
-   上方 8px 落定（替代做不到的轻微缩放）。同一 id 重绘不会重播。位移不改变元素的定位方式：流内元素用
-   相对偏移（不推动兄弟元素），绝对定位的元素（锚定菜单、toast 栈）在其锚定边上用外边距微移，仍留在
-   原位、不回到文档流（测试覆盖）。
-4. 减少动效时 `enter` 直接画最终状态，循环脉动静止，状态词、颜色与操作都不变。
-5. **减少动效 = 用户偏好 或 系统设置**：窗口每帧用 `Motion::with_system` 把设置里的偏好与系统设置合并，
-   任一方要求减少即为减少；系统设置只会减少动效，不会改写用户的偏好值。系统设置由
-   `theme::system_reduces_motion()` 读取：Windows 为"动画效果"关闭（`SPI_GETCLIENTAREAANIMATION`），
-   macOS 为"辅助功能 › 显示 › 减弱动态效果"（`NSWorkspace.accessibilityDisplayShouldReduceMotion`），
-   Linux 为 GNOME `org.gnome.desktop.interface enable-animations` 为 false 或 KDE
-   `AnimationDurationFactor=0`；读不到时视为未要求。窗口首次绘制时读取，之后在窗口重新获得焦点或系统
-   外观变化时重读（Linux 需要调用 `gsettings`，在后台线程读取）。截图固定为减少动效。
+1. **只有进入动画，退出只有对话框遮罩淡出与启动过场的品牌层淡出**（后者见第 1.5 节）。hover、按下、选中都即时切换；
+   除进行中指示（连接中的状态点、不确定进度条、骨架屏）外没有循环动画。对话框关闭时卡片立即消失，只有不带状态的遮罩用
+   BASE 淡出，减少动效时也立即消失。
+2. 时长令牌：`Motion::FAST` 120ms（小状态变化、toast/tooltip 淡入）、`Motion::BASE` 200ms（菜单、卡片、等待徽记）、
+   `Motion::SLOW` 300ms（对话框、启动过场）；进行中的循环脉动一拍 `Motion::PULSE` 900ms，不确定进度条一趟
+   `components::PROGRESS_SWEEP` 1200ms。缓动统一 `theme::ease_out()`：**ease-out-cubic**（`1 − (1 − t)³`，测试校验）。
+3. `theme::enter(element, id, Enter::{Fade, Rise, Settle})`：Fade 原地淡入（FAST）；Rise 淡入并上移 6px（BASE）；
+   Settle 从上方 8px 落定（SLOW，替代做不到的轻微缩放）。同一 id 重绘不会重播。位移不改变元素的定位方式。
+4. 减少动效时只保留淡入淡出：`enter` 直接画最终状态，循环脉动静止，不确定进度条画成居中的静止段，状态词、颜色与
+   操作都不变。
+5. **减少动效 = 用户偏好 或 系统设置**：窗口每帧用 `Motion::with_system` 合并，任一方要求减少即为减少。系统设置由
+   `theme::system_reduces_motion()` 读取（Windows `SPI_GETCLIENTAREAANIMATION`、macOS
+   `accessibilityDisplayShouldReduceMotion`、GNOME `enable-animations` / KDE `AnimationDurationFactor=0`）；读不到时视为
+   未要求。截图固定为减少动效。
 
-当前使用：对话框（`components::modal`）与命令面板用 Settle，关闭后遮罩淡出（`modal_scrim_exit`，命令面板与对话框
-走同一条路径）；toast 用 Fade；等待徽记与加载条用 BASE；会话状态卡用 Rise；右键与下拉菜单（标签、主机、文件、终端、
-新建标签下拉、输入框的 `field.menu`）用 Rise（`components::menu_enter`，锚定位置不变，只在锚定边上外边距微移）；
-首页卡片依次淡入（`components::enter_in_turn`，每次序晚 `TURN_DELAY` 40ms、淡入 BASE、只动透明度），
-首次使用卡片用 Rise；启动过场的品牌用 Settle，进入页面时品牌层以 BASE 淡出（第 1.5 节，只在启动时出现一次）。
+### 2.4 形状、间距与字
 
-### 2.4 形状与字
-
-**圆角** `theme::radius`：6 / 8 / 10 / 14 / 20 五档，物体越大圆角越大，"内层比外层低一档"。
+**圆角** `theme::radius`：4 / 6 / 8 / 12 四档，物体越大圆角越大。
 
 | 档 | 令牌 | 用于 |
 | --- | --- | --- |
-| 6 | `SMALL` | chip 内块、键帽、勾选框、小图标按钮、分段、tooltip |
-| 8 | `MEDIUM` | 按钮、输入框、菜单项、行内瓦片 |
-| 10 | `LARGE` | 卡片、状态卡、列表行、菜单、toast、标签、终端框 |
-| 14 | `XLARGE` | 对话框、命令面板、空状态图标块、大瓦片 |
-| 20 | `XXLARGE` | 欢迎徽记、启动过场标志 |
+| 4 | `SMALL` | 标签（tag）、chip、徽标、键帽、勾选框、分段 |
+| 6 | `MEDIUM` | 按钮、输入框、搜索框、列表行、侧栏项、菜单项 |
+| 8 | `LARGE` | 卡片、菜单、toast、tooltip、浮动控件条、终端框 |
+| 12 | `XLARGE` | 对话框、命令面板、状态卡、启动标志 |
 
-旧的 12 / 16 档已删除。1px 与 0 只用于细状态条与拼接边。
+旧的 10 / 14 / 20 档已删除（`XXLARGE` 删除，用到它的地方改为 12）。1px 与 0 只用于细状态条与拼接边。
 
-**字阶** `theme::type_scale`：caption 11、label 12、body 13、title 15、heading 17、display 22、hero 28。
-**字重** `theme::weight`：NORMAL（正文）、MEDIUM（按钮、chip、列表名、当前标签；`Metrics::medium_weight`）、
-SEMIBOLD（标题）。不用 bold。
+**间距** `theme::spacing`：2 `HALF`、4 `HAIRLINE`、6 `NARROW`、8 `TIGHT`、12 `SNUG`、16 `BASE`、20 `WIDE`、24 `LOOSE`、
+32 `SPACIOUS`（4px 栅格加两个半档）。
 
-**等宽端点**：地址、端口、路径、远端命令、组合键用终端等宽字体（`components::endpoint`），周围标签
-仍用界面字体。
+**字阶** `theme::type_scale`：12 `CAPTION`（说明、元信息、状态栏）、13 `BODY`（正文与所有控件文字，`Metrics::label_size`
+同为 13）、14 `EMPHASIS`（强调正文：横幅与卡片标题行）、16 `TITLE`（小标题：面板与对话框标题）、20 `HEADING`（页标题）、
+28 `HERO`（品牌）。旧的 label 12 / display 22 已删除。**字重** `theme::weight`：400、500、600，不用 bold。
 
-**尺寸**：控件 32（紧凑 26），行 52，标签 30，头部 46，指针目标 ≥ 24。所有长度经 `Metrics` 按文字大小
-（90% / 100% / 115% / 200%）缩放。窗口在绘制前把缩放写入 `theme::set_zoom`，终端外框与 tooltip 这类
-在窗口渲染之外绘制的部件用 `theme::metrics()` 取得同一缩放；终端外框与可收拢底栏随缩放（R3），搜索条、
-命令块浮层与串口条仍保持常规尺寸，它们还没有自己的窄布局。
+**等宽端点**：地址、端口、路径、远端命令用终端等宽字体（`components::endpoint`），周围标签仍用界面字体。
 
-**边框**：1px 发丝线；焦点与校验失败 2px；按下时底边加粗到 2px。卡片用弱边 + Low，浮层用强边 + Mid/High。
+**尺寸**：控件 32（紧凑 28、大号 36，`Metrics::{compact_control_height, control_height, large_control_height}`），
+行 52，标签 30，头部 46，指针目标 ≥ 24。所有长度经 `Metrics` 按文字大小（90% / 100% / 115% / 200%）缩放；终端外框与
+tooltip 这类在窗口渲染之外绘制的部件用 `theme::metrics()` 取得同一缩放。
+
+**边框**：1px 发丝线；焦点与校验失败 2px；按下时底边加粗到 2px。卡片用弱边，浮层用强边 + Overlay。
 
 图标是 `icons.rs` 内嵌的 24 格线条 SVG（1.6 描边），按元素文字颜色着色：控件 14px、行与标题 16px、
 状态徽记 20–22px。
+
+### 2.5 守卫测试与裸尺寸基线
+
+`theme.rs` 的 `guard` 测试读取 `src/app/**/*.rs` 的非测试代码（跳过 `tests.rs` 与 `#[cfg(test)]` 条目，忽略字符串与注释）：
+
+- **禁止颜色字面量**：`rgb(<数字>`、`rgba(<数字>`、`hsla(<数字>` 与六位以上的十六进制值只允许出现在 `theme.rs`
+  （两张调色板、头像与标签表、终端 ANSI 表）和 `capture.rs`（PNG 的 CRC 表，不是颜色）。
+- **裸尺寸只降不升**：统计 `scale(<数字>)` 与 `px(<数字>)` 的个数，超过基线即失败；基线随迁移逐步下调。
+
+| 时点 | `scale(<数字>)` | `px(<数字>)` | 说明 |
+| --- | --- | --- | --- |
+| 迁移前（HEAD `230e5b0`，T3 记录） | 280 | 407 | ADR-9 的“一半以下”以这一行为准：最终需 ≤ 140 / ≤ 203 |
+| T3 之后（当前基线） | 267 | 154 | `min_w(px(0.0))` / `min_h(px(0.0))` 统一改为 `min_w_0()` / `min_h_0()`；新组件只用 spacing 令牌 |
 
 ### 终端内搜索（`crates/terminal` + `src/app/terminal.rs`）
 
@@ -1431,7 +1449,7 @@ Windows 安装器的启动与重启）。
 
 快捷键是设置页"快捷键"分类下的独立子页，其它设置不再被动作目录挤到下面。页面自上而下是：搜索框、作用范围
 筛选（全部范围 / 终端内 / 所有位置 / 终端外，与 `Context::ALL` 同源）、需要回答的横幅，然后每个动作一行。
-行内显示名称、"上下文 · 默认/已修改/未绑定"和当前按键（`keycap`）。每行按状态给出操作：修改；动作有绑定时
+行内显示名称、"上下文 · 默认/已修改/未绑定"和当前按键（`kbd`）。每行按状态给出操作：修改；动作有绑定时
 给出解除绑定；动作不等于默认值（含已解除绑定）时给出恢复默认，因此解除绑定后单项恢复仍然可用。底部给出
 "已修改 N 项"与"恢复全部快捷键"。
 
@@ -1572,7 +1590,7 @@ Ctrl+←/→（macOS ⌥）按词移动，Ctrl+Backspace / Delete 按词删除�
 变为空格（快捷命令正文的字段是唯一例外：它保留换行并以 `\n` 画出，Shift+Enter 换行，见"快捷命令"）。
 光标是绘制的细线，选区高亮（失焦时变淡），超长内容横向滚动并保持光标可见，获得焦点时显示
 主色外环。`set_prominent(true)` 把一个输入框画成页面主入口（只用于首页快速连接栏）：高 40、圆角 14、
-surface 底、静止 Low，焦点环叠在 Low 之上；尺寸不随窗口缩放（输入框统一按 `Metrics::default()` 绘制）。密码框可点眼睛图标临时显示，且拒绝复制 / 剪切；路径框（私钥、SSH 配置、自定义 Shell、上传
+surface 底、静止 Raised，焦点环叠在 Raised 之上；尺寸不随窗口缩放（输入框统一按 `Metrics::default()` 绘制）。密码框可点眼睛图标临时显示，且拒绝复制 / 剪切；路径框（私钥、SSH 配置、自定义 Shell、上传
 文件、下载目录）右端有"浏览…"按钮，调用系统文件选择框。私钥路径中的 `~` 展开为用户主目录。
 
 ### 快捷命令（`snippets.rs` + `view/shell.rs`）
@@ -1617,7 +1635,7 @@ surface 底、静止 Low，焦点环叠在 Low 之上；尺寸不随窗口缩放
 
 ### 连接阶段与多行粘贴确认（R17）
 
-两块浮层都用共享的 `components::modal`（居中、圆角 `radius::XLARGE`、`Elevation::High`、`theme::scrim()` 遮罩），打开时接管键盘，关闭后把焦点
+两块浮层都用共享的 `components::modal`（居中、圆角 `radius::XLARGE`、`Elevation::Overlay`、`theme::scrim()` 遮罩），打开时接管键盘，关闭后把焦点
 还给打开前的终端或字段。
 
 **连接中**（`remote.dialog`）：标题是"连接到 <主机名>"，副标题是地址，右上角状态 chip 用 `remote_status_label` 的词与色调。
@@ -1666,7 +1684,7 @@ surface 底、静止 Low，焦点环叠在 Low 之上；尺寸不随窗口缩放
 
 命令面板、标签菜单和会话菜单记下打开前的焦点，关闭后还回去。点开这些层时，点击可能先把焦点移到页面上；上一帧正在编辑的字段或终端不会被这次页面焦点盖掉。主机关闭或保存后，下一帧回到打开对话框之前的位置。
 
-减少动态效果有两个来源：应用内设置（设置页“动态效果”、命令面板“减少动态效果”，默认是完整）与系统设置（见 2.3 第 5 条）；任一方要求减少即生效。加载状态的圆点会做一次约 180ms 的淡入；减少时圆点直接以不透明画出，标题、原因和下一步仍在。GPUI 0.2.2 不报告系统设置，由应用自己读取，因此跟随系统。没有 AccessKit，屏幕阅读器兼容未验证，见 `04-cross-feature-walkthrough.md`。
+减少动态效果有两个来源：应用内设置（设置页“动态效果”、命令面板“减少动态效果”，默认是完整）与系统设置（见 2.3 第 5 条）；任一方要求减少即生效。加载状态的圆点会做一次约 200ms 的淡入；减少时圆点直接以不透明画出，标题、原因和下一步仍在。GPUI 0.2.2 不报告系统设置，由应用自己读取，因此跟随系统。没有 AccessKit，屏幕阅读器兼容未验证，见 `04-cross-feature-walkthrough.md`。
 
 ## 5. 组件清单（`components.rs`）
 
@@ -1691,15 +1709,24 @@ surface 底、静止 Low，焦点环叠在 Low 之上；尺寸不随窗口缩放
 
 | 组件 | 规范 |
 | --- | --- |
-| `button` / `button_with_state` | Primary（实心 accent + Low）、Soft（accent tint）、Secondary（surface + 强边 + Low）、Ghost、Danger；高 32，圆角 8，MEDIUM 字重 |
-| `button_face(variant, state)` | 五级 × 八态外观表（测试逐格校验文字与边在六种背景、两套主题下的对比度） |
-| `icon_label_button` / `compact_button` / `icon_only_button` / `danger_icon_button` / `icon_button` | 带图标按钮、工具栏紧凑按钮（26）、方形图标按钮（≥ 24 指针目标） |
+| `button` / `button_sized` / `button_with_state` | 五种变体（v2）：Primary（实心 accent + Raised）、Secondary（面板底 + 强边）、Ghost（无底，悬停出底）、Danger（danger tint）、Icon（方形仅图标，外观同 Ghost，必须带 tooltip）；`ButtonSize` 紧凑 28 / 常规 32 / 大号 36，圆角 6，MEDIUM 字重，标签 13（紧凑为 12）。旧的 Soft 已删除，原用处改为 Secondary |
+| `button_face(variant, state)` | 五种变体 × 八态外观表（测试逐格校验文字与边在六种背景、两套主题下的对比度，且同一变体的八态互不相同） |
+| `icon_label_button` / `compact_button` / `icon_only_button` / `danger_icon_button` / `icon_button` | 带图标按钮、紧凑按钮（`ButtonSize::Compact`，28）、方形图标按钮（`Variant::Icon`，≥ 24 指针目标） |
 | `field_face` + `field_frame` | 输入框：surface 底、弱边，焦点 2px 焦点环，校验失败 2px 危险边 |
 | `segmented` + `segment` | 互斥选择：凹槽 + 选中滑块（滑块 Low） |
 | `switch(on)` | 设置开关：34×20 胶囊轨道，圆钮在左（关，`TRACK_OFF`）或右（开，`TRACK_ON`），悬停用对应 `*_HOVER`，圆钮 Low；状态先由位置表达，圆钮在每种轨道上 ≥ 3:1 |
 | `checkbox(id, label, checked)` / `checkbox_box(checked)` | 16px 方框（圆角 4）：未选为 surface + 强边，悬停（`CHECK_GROUP`）变 accent 边；选中为 accent 填充 + 勾 |
-| `card` | 内容分组：surface + 弱边 + 圆角 10 + Low，内边距 16 |
-| `status_card(tone, emblem, title, detail)` | 叠在终端上的会话状态卡：raised + 强边 + 圆角 14 + Mid，最宽 440，色调徽记块 36 + 标题 + 一行说明；吃掉指针，动作由调用方追加，进入时 Rise |
+| `card` | 内容分组：surface + 弱边 + 圆角 8 + Raised，内边距 16（新界面少用卡片，优先 `list_row` 与 `toolbar`） |
+| `status_card(tone, emblem, title, detail)` + `status_card_slot` | 叠在终端上的会话状态卡：raised + 强边 + 圆角 12 + Overlay，色调徽记块 36 + 标题 + 一行说明；吃掉指针，动作由调用方追加，进入时 Rise。卡片本身不带宽度，一律经 `status_card_slot` 放置（`capped` 规则，上限 `STATUS_CARD_WIDTH` 440），按画出的宽度求高度——修复了“展开诊断”时文字溢出卡片底边（测试 `a_status_card_is_as_tall_as_the_diagnostic_it_paints`） |
+| `search_field(field, clear, shortcut, state)` | 唯一的搜索框：放大镜图标 + 调用方的文本框 + 可选清除按钮 + 可选快捷键提示（`kbd`）；外观取 `field_face(state)`，高 32、圆角 6 |
+| `list_row(ListRow, state)` / `list_row_frame(state)` / `list_row_face` / `leading_icon` | 列表行：扁平（静止无底无边），悬停 hover 底、选中 selected 底 + 左侧 2px accent 竖条（画在内边距里，内容不移动）、焦点 2px 焦点环；左侧头像或图标块（32），两行文字（名称 13 MEDIUM、副行 12，均省略号截断），右侧元信息（12、muted）与动作区；`reveal_actions` 时动作只在悬停（`ROW_GROUP`）或选中时显示。端口转发列表已改用它 |
+| `sidebar_item(icon, label, count, selected)` / `sidebar_icon_item` | 侧栏项：高 32、圆角 6，图标 16 + 文字（省略号）+ 右对齐计数（12、muted）；选中为 selected 底 + 主色 + MEDIUM；折叠侧栏用仅图标的方形项 |
+| `toolbar` | 页面或栏的头部工具条：一行、居中对齐、间距 8、最小高 44、底部发丝线；调用方放标题、搜索框和命令，`flex_1` 的子元素占剩余空间 |
+| `inline_banner(tone, icon, message)` | 内容上方的状态横幅（ADR-6 用）：色调 tint 底 + 底部色调发丝线，最小高 36；色调图标 + 一句话（省略号截断）+ 调用方追加的紧凑按钮与关闭按钮。不遮挡下方内容 |
+| `progress_bar(id, Progress)` | 细进度条（高 4、全圆角）：确定型按比例填充；不确定型一段 30% 宽的填充以 `PROGRESS_SWEEP` 1200ms 循环扫过，减少动效时静止居中（`progress.determinate` / `.indeterminate` / `.still`） |
+| `skeleton_text(fraction)` / `skeleton_row(id)` | 骨架屏：文字行（高 10、圆角 4、selected 底）与列表行（头像块 + 两行）；允许动效时缓慢呼吸，减少动效时静止 |
+| `kbd(label)` | 键帽：高 18、圆角 4、面板底 + 强边（底边 2px），字号 caption − 1；取代旧 `keycap` |
+| `checkbox_target(checked)` / `labelled_switch(on, word, selector)` | 指针大小的勾选目标（首页多选列）；带状态词的开关（设置页），取代两处本地实现 |
 | `row` / `row_with_state` + `stacked` | 列表行：surface 底，悬停、选中（底色 + 前导竖条）、焦点、失败、进行中 |
 | `menu_card` + `menu_entry` + `menu_divider` | 右键/下拉菜单：raised + 强边 + 圆角 10 + Mid；条目 30 高，标签占满剩余宽度，禁用项保留位置，危险项悬停为 danger tint |
 | `menu_shortcut` / `menu_section` / `menu_enter` | 条目尾部的当前生效快捷键（caption、muted，右对齐）；菜单内分组小标题；菜单进入动画（Rise，减少动效时直接画出） |
@@ -1715,7 +1742,8 @@ surface 底、静止 Low，焦点环叠在 Low 之上；尺寸不随窗口缩放
 | `enter_in_turn(element, id, turn)` + `turn_timing` / `turn_curve` | 一组物体依次淡入：第 `turn` 个晚 `TURN_DELAY`×turn（到 `LAST_TURN` 为止），淡入 BASE，只动透明度；减少动效时直接画终态 |
 | `banner` / `notice` | 提示、失败、确认问题（色调底 + 左侧 3px 色条）；完成后的通知 |
 | `state_card` / `state_card_with_icon` | 加载中 / 失败 / 空：surface 卡 + Low，色调 tint 徽记块；标题、说明、下一步经 `capped_text` 居中、上限 480（`state.card.title` / `.body` / `.step`） |
-| `chip` / `tag` / `badge` / `kind_badge` / `keycap` / `status_dot` / `status_mark` | 状态（形状 + 词 + 色调）、分组、数量、类型、快捷键、状态标记 |
+| `chip` / `tag` / `badge` / `kind_badge` / `status_dot` / `status_mark` | 状态（形状 + 词 + 色调）、分组、数量、类型、状态标记；chip、tag、badge 为圆角 4 的小块（不再是胶囊）。`Tone::Info` 新增，标记为“圆环加中心点”（`StatusMark::Target`） |
+| `capped(max_w, block)` | `capped_text` 的通用版：任意块居中、有宽度上限，并按画出的宽度布局（远程桌面状态卡、`status_card_slot` 使用） |
 | `pulsing_status_dot` | 带名字的状态点；进行中（如连接中）且允许动效时以 `Motion::PULSE` 脉动，减少动效时静止（标签用） |
 | `endpoint` / `copy_on_click` | 等宽端点值，点击复制 |
 | `loading_indicator` | 进行中指示条（BASE 淡入）；减少动效时静止画出 |
@@ -1725,6 +1753,17 @@ surface 底、静止 Low，焦点环叠在 Low 之上；尺寸不随窗口缩放
 
 新增分区必须复用同一组组件、`ControlState` 与 `SectionState`，不为某个分区单独发明状态表达、私有
 配色或阴影。
+
+**组件清单页（`src/app/catalog.rs`）。** `catalog::design_catalog` 在一页四栏里画出全部共享组件的各种状态（按钮五变体 × 静止 / 悬停 /
+焦点 / 禁用与三种尺寸、输入框三态与搜索框、分段 / 开关 / 勾选、全部色调的 chip 与标记、标签 / 计数 / 类型 / 键帽、三种横幅、
+确定与不确定进度条、骨架行、侧栏项、三种状态的列表行与工具条、菜单、toast、状态卡、颜色色板与字阶）。截图场景
+`design-catalog`（分类 `design`，深浅各一张）是视觉回归基准；测试 `every_section_of_the_catalogue_stays_inside_its_column`
+在 1120×720 的深浅两套与 200% 下检查每一节都在自己的栏内。
+
+**v2 替换的本地复制品**：`view/panes.rs` 的 `components_banner` 包装 → 直接用 `components::banner`；`view/forwarding.rs` 的
+`components_row`（卡片当行用）→ `list_row_frame` + `leading_icon`；`view/home.rs` 的本地 `checkbox` → `checkbox_target`；
+`view/desktop.rs` 状态卡的手写居中限宽 → `capped`；`view/shell.rs` 的 `switch_control` 手写开关行 → `labelled_switch`；
+会话状态卡的限宽 → `status_card_slot`。`view/shell.rs::modal` 只是把 `components::modal` 放进覆盖层并记下遮罩淡出，保留。
 
 组件的测试在 `components.rs` 与 `theme.rs` 各自的 `#[cfg(test)]` 模块里：八种状态逐格校验文字对比
 度（禁用态取 3:1 图形下限）、同一变体的八种状态互不相同、焦点与校验失败只加宽边框、浮层使用 overlay /

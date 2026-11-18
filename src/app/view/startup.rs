@@ -299,6 +299,19 @@ impl ShelluneView {
         !self.system_motion_pending && theme::motion_allowed()
     }
 
+    /// Draws the design catalogue in place of a page, for the capture (ADR-2).
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_show_catalog(&mut self, cx: &mut Context<Self>) {
+        self.catalog_held = true;
+        cx.notify();
+    }
+
+    /// Whether the window draws the design catalogue.
+    #[cfg(feature = "ui-capture")]
+    pub fn catalog_shown(&self) -> bool {
+        self.catalog_held
+    }
+
     /// Puts the window back on its start, held there for a still shot (R7).
     ///
     /// Nothing is read again and nothing is started: the window simply draws the

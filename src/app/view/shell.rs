@@ -259,7 +259,7 @@ impl ShelluneView {
             .flex()
             .items_end()
             .flex_initial()
-            .min_w(px(0.0))
+            .min_w_0()
             .h(height)
             .overflow_hidden()
             .when(!self.workspace.layout().tabs().is_empty(), |row| {
@@ -377,7 +377,7 @@ impl ShelluneView {
             .flex()
             .items_center()
             .gap(metrics.scale(spacing::TIGHT))
-            .min_w(px(0.0))
+            .min_w_0()
             .overflow_hidden()
             .debug_selector(|| "session.context".to_owned())
             .child(components::status_dot(tone, metrics))
@@ -386,7 +386,7 @@ impl ShelluneView {
                     "session.target",
                     target,
                     div()
-                        .min_w(px(0.0))
+                        .min_w_0()
                         .truncate()
                         .font_family(terminal::monospace_family())
                         .text_size(metrics.caption_size())
@@ -1123,7 +1123,7 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_1()
-            .min_h(px(0.0))
+            .min_h_0()
             .w_full()
             .max_w(metrics.scale(super::HOME_MAX_WIDTH))
             .mx_auto()
@@ -1174,7 +1174,7 @@ impl ShelluneView {
                     .flex()
                     .flex_col()
                     .flex_none()
-                    .min_h(px(0.0))
+                    .min_h_0()
                     .max_h(cap)
                     .mx(-shadow_room)
                     .px(shadow_room)
@@ -1200,7 +1200,7 @@ impl ShelluneView {
                 // A short window scrolls the page as one column, so the list keeps the
                 // height it needs instead of being squeezed under the heading and the
                 // cards; a taller one gives it what is left.
-                .when(!short_viewport, |section| section.min_h(px(0.0)))
+                .when(!short_viewport, |section| section.min_h_0())
                 .gap(metrics.scale(spacing::SNUG))
                 // A narrow window spends its height on the list: the eyebrow goes there.
                 .when(wide && !welcome, |section| {
@@ -1221,7 +1221,7 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_1()
-            .min_h(px(0.0))
+            .min_h_0()
             // The hosts tab is painted with the same floor, so the two join (R2).
             .bg(theme::swatch(super::PAGE_FLOOR));
         if welcome || matches!(state, SectionState::Loading | SectionState::Failed) {
@@ -1230,9 +1230,9 @@ impl ShelluneView {
         } else if short_viewport {
             // A short window scrolls the column itself, heading, cards and list together,
             // so the bar and the list's filters are both reachable (R1, R8).
-            page.child(column.flex_1().min_h(px(0.0)))
+            page.child(column.flex_1().min_h_0())
         } else {
-            page.child(column.flex_1().min_h(px(0.0)).overflow_hidden())
+            page.child(column.flex_1().min_h_0().overflow_hidden())
         }
     }
 
@@ -1256,7 +1256,7 @@ impl ShelluneView {
             .flex_none()
             .items_baseline()
             .gap(metrics.scale(spacing::TIGHT + 2.0))
-            .min_w(px(0.0))
+            .min_w_0()
             .child(
                 div()
                     .text_size(metrics.hero_size())
@@ -1432,7 +1432,7 @@ impl ShelluneView {
                     .size(metrics.scale(56.0))
                     .rounded(px(radius::XLARGE))
                     .bg(super::brand_gradient())
-                    .elevation(theme::Elevation::Mid)
+                    .elevation(theme::Elevation::Overlay)
                     .child(icons::icon(
                         Icon::Server,
                         metrics.scale(26.0),
@@ -1444,7 +1444,7 @@ impl ShelluneView {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .gap(metrics.scale(spacing::TIGHT))
                     .child(
                         div()
@@ -1585,7 +1585,7 @@ impl ShelluneView {
                             .text_color(theme::swatch(palette::TEXT_MUTED))
                             .child(match current {
                                 Some(current) => {
-                                    components::keycap(current, metrics).into_any_element()
+                                    components::kbd(current, metrics).into_any_element()
                                 }
                                 None => div()
                                     .child(SharedString::from(ux.keys_unbound))
@@ -1699,31 +1699,17 @@ impl ShelluneView {
     ) -> Stateful<Div> {
         let metrics = self.metrics();
         let ux = copy::ux();
-        div()
-            .id(id)
-            .debug_selector(move || id.to_owned())
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(metrics.scale(spacing::TIGHT))
-            .min_h(metrics.hit_target())
-            .cursor_pointer()
-            .child(
-                div()
-                    .min_w(metrics.scale(24.0))
-                    .text_size(metrics.label_size())
-                    .text_color(theme::swatch(if on {
-                        palette::TEXT_PRIMARY
-                    } else {
-                        palette::TEXT_SECONDARY
-                    }))
-                    .debug_selector(move || format!("{id}.state"))
-                    .child(if on { ux.notice_on } else { ux.notice_off }),
-            )
-            .child(components::switch(on, metrics))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                set(this, !on, cx);
-            }))
+        components::labelled_switch(
+            on,
+            if on { ux.notice_on } else { ux.notice_off },
+            id,
+            metrics,
+        )
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            set(this, !on, cx);
+        }))
     }
 
     /// Sets the theme and repaints the terminals in it.
@@ -1866,7 +1852,7 @@ impl ShelluneView {
         let metrics = self.metrics();
         let wrapping = badge.is_some();
         let title = div()
-            .min_w(px(0.0))
+            .min_w_0()
             .text_size(metrics.heading_size())
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
@@ -1879,15 +1865,15 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_1()
-            .min_w(px(0.0))
+            .min_w_0()
             .gap(metrics.scale(spacing::HAIRLINE))
             .child(title)
-            .children(badge.map(|badge| div().flex().min_w(px(0.0)).child(badge)));
+            .children(badge.map(|badge| div().flex().min_w_0().child(badge)));
         let bar = div()
             .flex()
             .flex_none()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .when(wrapping, |bar| bar.items_start())
             .when(!wrapping, |bar| bar.items_center())
             .gap(metrics.scale(spacing::SNUG))
@@ -1911,7 +1897,7 @@ impl ShelluneView {
                 // Whole words across the dialog. A single-line truncate cut the
                 // sentence through a glyph and drew no ellipsis (R4).
                 .w_full()
-                .min_w(px(0.0))
+                .min_w_0()
                 .whitespace_normal()
                 .px(metrics.scale(spacing::LOOSE))
                 .pb(metrics.scale(spacing::TIGHT))
@@ -1998,7 +1984,7 @@ impl ShelluneView {
                 .items_center()
                 .flex_wrap()
                 .gap(metrics.scale(spacing::TIGHT))
-                .min_w(px(0.0))
+                .min_w_0()
                 .child(
                     div()
                         .flex()
@@ -2031,7 +2017,7 @@ impl ShelluneView {
                 line = line.child(
                     components::copy_on_click(
                         div()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .truncate()
                             .font_family(crate::app::terminal::monospace_family())
                             .text_size(metrics.caption_size())
@@ -2051,7 +2037,7 @@ impl ShelluneView {
                 };
                 line = line.child(
                     div()
-                        .min_w(px(0.0))
+                        .min_w_0()
                         .truncate()
                         .text_size(metrics.caption_size())
                         .text_color(theme::swatch(palette::TEXT_MUTED))
@@ -2159,7 +2145,7 @@ impl ShelluneView {
                 .flex()
                 .flex_col()
                 .flex_1()
-                .min_h(px(0.0))
+                .min_h_0()
                 .items_center()
                 .overflow_y_scroll()
                 .bg(theme::swatch(palette::CANVAS))
@@ -2179,7 +2165,7 @@ impl ShelluneView {
                         .bg(theme::swatch(palette::SURFACE))
                         .border_1()
                         .border_color(theme::swatch(palette::BORDER))
-                        .shadow(theme::Elevation::Mid.shadows())
+                        .shadow(theme::Elevation::Overlay.shadows())
                         .debug_selector(|| "remote.page.card".to_owned())
                         .child(header)
                         .children(subtitle)
@@ -2228,7 +2214,7 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::LOOSE))
             .pb(metrics.scale(spacing::LOOSE))

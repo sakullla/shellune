@@ -281,7 +281,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .truncate()
                             .text_size(metrics.label_size())
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
@@ -373,7 +373,7 @@ impl ShelluneView {
             .items_start()
             .gap(metrics.scale(spacing::HAIRLINE))
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .child(button);
         if open {
             adder = adder
@@ -400,7 +400,9 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .gap(metrics.scale(1.0))
-            .max_h(row_height * JUMP_PICKER_ROWS + metrics.scale(JUMP_PICKER_ROWS))
+            // Exactly the rows and the hairline gaps between them: a book of six fills
+            // the list to the cap and a longer one scrolls at that same height.
+            .max_h(row_height * JUMP_PICKER_ROWS + metrics.scale(JUMP_PICKER_ROWS - 1.0))
             .overflow_y_scroll()
             .track_scroll(&picker.scroll);
         for (index, id) in candidates.iter().copied().enumerate() {
@@ -446,7 +448,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .truncate()
                             .font_family(crate::app::terminal::monospace_family())
                             .text_size(metrics.caption_size())
@@ -505,7 +507,7 @@ impl ShelluneView {
             components::menu_card("hosts.jump.picker", metrics)
                 .relative()
                 .w_full()
-                .min_w(px(0.0))
+                .min_w_0()
                 .child(reveal)
                 .gap(metrics.scale(spacing::HAIRLINE))
                 // The keys the picker answers are taken before the field sees them:
@@ -517,7 +519,7 @@ impl ShelluneView {
                     div()
                         .flex()
                         .w_full()
-                        .min_w(px(0.0))
+                        .min_w_0()
                         .debug_selector(|| "hosts.jump.search".to_owned())
                         .child(picker.search.clone()),
                 )
@@ -551,7 +553,7 @@ impl ShelluneView {
             .flex_col()
             .flex_grow()
             .flex_basis(gpui::relative(grow))
-            .min_w(px(0.0))
+            .min_w_0()
             .gap(metrics.scale(spacing::HAIRLINE + 2.0))
             .child(
                 div()
@@ -565,7 +567,7 @@ impl ShelluneView {
                 div()
                     .flex()
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .debug_selector(move || field.debug_selector().to_owned())
                     .child(fields.get(field).clone()),
             )
@@ -722,7 +724,7 @@ impl ShelluneView {
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .truncate()
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))
@@ -958,7 +960,7 @@ impl ShelluneView {
                     .flex()
                     .flex_wrap()
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .gap(metrics.scale(spacing::SNUG))
                     .child(self.host_connection_field(
                         draft,
@@ -1038,7 +1040,7 @@ impl ShelluneView {
                 div()
                     .flex()
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .debug_selector(move || format!("hosts.connection.{}", field.id()))
                     .child(fields.get(field).clone()),
             );
@@ -1310,7 +1312,7 @@ impl ShelluneView {
             .flex_col()
             .flex_grow()
             .flex_basis(gpui::relative(1.0))
-            .min_w(px(0.0))
+            .min_w_0()
             .gap(metrics.scale(spacing::HAIRLINE + 2.0))
             .child(
                 div()
@@ -1324,7 +1326,7 @@ impl ShelluneView {
                 div()
                     .flex()
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .debug_selector(move || field.debug_selector().to_owned())
                     .child(entity),
             );

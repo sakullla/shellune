@@ -813,7 +813,7 @@ async fn the_shortcut_rows_keep_their_keys_and_buttons_inside_the_minimum_window
         )
     });
     let keycap = bounds_of(cx, "settings.keys.keycap.terminal.copy.0");
-    let key_floor = crate::app::components::keycap_reserved_width(&key_label, metrics);
+    let key_floor = crate::app::components::kbd_reserved_width(&key_label, metrics);
     assert!(
         keycap.size.width + px(0.5) >= key_floor,
         "the keycap is narrower than a real font would draw {key_label:?}: {keycap:?}, floor {key_floor:?}"
@@ -2781,20 +2781,8 @@ impl Render for TwoPaneHarness {
         div()
             .size_full()
             .flex()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .h_full()
-                    .child(self.first.clone()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .h_full()
-                    .child(self.second.clone()),
-            )
+            .child(div().flex_1().min_w_0().h_full().child(self.first.clone()))
+            .child(div().flex_1().min_w_0().h_full().child(self.second.clone()))
     }
 }
 
@@ -6254,9 +6242,14 @@ fn type_into(cx: &mut VisualTestContext, selector: &'static str, text: &str) {
     cx.run_until_parked();
 }
 
-/// Empties a field from its end, which is where the caret starts.
+/// Empties a field from its end.
+///
+/// The click that focuses the field also places the caret where it lands, which is
+/// inside a text as wide as half the field; the caret is taken to the end first, so
+/// every backspace removes a character.
 fn clear_field(cx: &mut VisualTestContext, selector: &'static str, characters: usize) {
     click(cx, selector);
+    cx.simulate_keystrokes("end");
     for _ in 0..characters {
         cx.simulate_keystrokes("backspace");
     }

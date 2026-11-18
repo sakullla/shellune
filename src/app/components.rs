@@ -32,14 +32,73 @@ use crate::app::theme::{
 pub enum Variant {
     /// The one action the screen is about: a solid accent fill.
     Primary,
-    /// A recommended action inside a list or card: an accent tint.
-    Soft,
-    /// An ordinary command: a raised surface with a hairline border.
+    /// An ordinary command: the panel fill with a strong hairline border.
     Secondary,
     /// A quiet command that only shows its surface under the pointer.
     Ghost,
     /// An action that removes or replaces something.
     Danger,
+    /// A square button that holds only an icon: quiet like [`Variant::Ghost`] until it is
+    /// pointed at, and always named by a tooltip.
+    Icon,
+}
+
+impl Variant {
+    /// The five weights, in the order the catalogue shows them.
+    #[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
+    pub const ALL: [Self; 5] = [
+        Self::Primary,
+        Self::Secondary,
+        Self::Ghost,
+        Self::Danger,
+        Self::Icon,
+    ];
+}
+
+/// How tall a button is: compact 28 in toolbars and rows, regular 32, large 36 for the
+/// one call to action of an empty page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ButtonSize {
+    /// 28: toolbars, list rows and banners.
+    Compact,
+    /// 32: forms, dialogs and pages.
+    Regular,
+    /// 36: the call to action of an empty page or a welcome.
+    #[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
+    Large,
+}
+
+impl ButtonSize {
+    /// The three sizes, smallest first.
+    #[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
+    pub const ALL: [Self; 3] = [Self::Compact, Self::Regular, Self::Large];
+
+    /// The height of a button of this size.
+    #[must_use]
+    pub fn height(self, metrics: Metrics) -> Pixels {
+        match self {
+            Self::Compact => metrics.compact_control_height(),
+            Self::Regular => metrics.control_height(),
+            Self::Large => metrics.large_control_height(),
+        }
+    }
+
+    /// The padding either side of the label.
+    fn padding(self, metrics: Metrics) -> Pixels {
+        metrics.scale(match self {
+            Self::Compact => spacing::TIGHT + spacing::HALF,
+            Self::Regular => spacing::SNUG,
+            Self::Large => spacing::BASE,
+        })
+    }
+
+    /// The label size: a compact button sets its word as a caption.
+    fn text(self, metrics: Metrics) -> Pixels {
+        match self {
+            Self::Compact => metrics.caption_size(),
+            Self::Regular | Self::Large => metrics.label_size(),
+        }
+    }
 }
 
 /// What the user is doing to a control, or what the control is doing on its own.
@@ -214,20 +273,15 @@ pub fn button_face(variant: Variant, state: ControlState) -> ControlFace {
     let resting = match variant {
         Variant::Primary => ControlFace::new(
             Some(palette::ACCENT),
-            Some(palette::ACCENT_HOVER),
+            Some(palette::ACCENT),
             palette::ON_ACCENT,
-        ),
-        Variant::Soft => ControlFace::new(
-            Some(palette::ACCENT_TINT),
-            Some(palette::ACCENT_TINT),
-            palette::ACCENT_ON_TINT,
         ),
         Variant::Secondary => ControlFace::new(
             Some(palette::SURFACE),
             Some(palette::BORDER_STRONG),
             palette::TEXT_PRIMARY,
         ),
-        Variant::Ghost => ControlFace::new(None, None, palette::TEXT_SECONDARY),
+        Variant::Ghost | Variant::Icon => ControlFace::new(None, None, palette::TEXT_SECONDARY),
         Variant::Danger => ControlFace::new(
             Some(palette::DANGER_TINT),
             Some(palette::DANGER_TINT),
@@ -240,11 +294,11 @@ pub fn button_face(variant: Variant, state: ControlState) -> ControlFace {
             Some(palette::ACCENT_HOVER),
             palette::ON_ACCENT,
         ),
-        Variant::Soft | Variant::Danger => resting.with_border(accent_of(variant)),
+        Variant::Danger => resting.with_border(palette::DANGER),
         Variant::Secondary => resting
             .with_fill(palette::SURFACE_HOVER)
             .with_border(palette::BORDER_STRONG),
-        Variant::Ghost => resting
+        Variant::Ghost | Variant::Icon => resting
             .with_fill(palette::SURFACE_HOVER)
             .with_text(palette::TEXT_PRIMARY),
     };
@@ -252,8 +306,8 @@ pub fn button_face(variant: Variant, state: ControlState) -> ControlFace {
         ControlState::Resting => resting,
         ControlState::Hovered => hovered,
         ControlState::Pressed => match variant {
-            // The primary button sinks onto a darker accent. The tonal variants keep
-            // their hovered tint and thicken the bottom edge instead, which is the
+            // The primary button sinks onto a darker accent; the quiet ones take the
+            // pressed fill. Every press also thickens the bottom edge, which is the
             // press the pointer can see.
             Variant::Primary => ControlFace::new(
                 Some(palette::ACCENT_PRESSED),
@@ -261,11 +315,11 @@ pub fn button_face(variant: Variant, state: ControlState) -> ControlFace {
                 palette::ON_ACCENT,
             )
             .pressed(),
-            Variant::Ghost => resting
+            Variant::Ghost | Variant::Icon | Variant::Secondary => resting
                 .with_fill(palette::SURFACE_PRESSED)
                 .with_text(palette::TEXT_PRIMARY)
                 .pressed(),
-            Variant::Soft | Variant::Secondary | Variant::Danger => hovered.pressed(),
+            Variant::Danger => hovered.pressed(),
         },
         ControlState::Selected => match variant {
             Variant::Primary => ControlFace::new(
@@ -274,14 +328,11 @@ pub fn button_face(variant: Variant, state: ControlState) -> ControlFace {
                 palette::ON_ACCENT,
             )
             .with_mark(palette::ON_ACCENT),
-            Variant::Soft => resting
-                .with_border(palette::ACCENT)
-                .with_mark(palette::ACCENT),
             Variant::Secondary => resting
                 .with_fill(palette::SURFACE_SELECTED)
                 .with_border(palette::BORDER_STRONG)
                 .with_mark(palette::ACCENT),
-            Variant::Ghost => resting
+            Variant::Ghost | Variant::Icon => resting
                 .with_fill(palette::SURFACE_SELECTED)
                 .with_text(palette::TEXT_PRIMARY)
                 .with_mark(palette::ACCENT),
@@ -295,7 +346,7 @@ pub fn button_face(variant: Variant, state: ControlState) -> ControlFace {
             // takes the label's ink instead - the same focus, in the colour that
             // contrasts there.
             Variant::Primary => resting.ringed(palette::ON_ACCENT),
-            Variant::Soft | Variant::Secondary | Variant::Ghost | Variant::Danger => {
+            Variant::Secondary | Variant::Ghost | Variant::Icon | Variant::Danger => {
                 resting.ringed(palette::FOCUS_RING)
             }
         },
@@ -308,7 +359,7 @@ pub fn button_face(variant: Variant, state: ControlState) -> ControlFace {
                 palette::DANGER,
             )
             .ringed(palette::DANGER),
-            Variant::Soft | Variant::Secondary | Variant::Ghost | Variant::Danger => {
+            Variant::Secondary | Variant::Ghost | Variant::Icon | Variant::Danger => {
                 resting.ringed(palette::DANGER)
             }
         },
@@ -318,14 +369,6 @@ pub fn button_face(variant: Variant, state: ControlState) -> ControlFace {
             palette::DISABLED_TEXT,
         ),
         ControlState::Loading => resting.busy(),
-    }
-}
-
-/// The colour that says "this is the chosen one" for a variant's own tones.
-fn accent_of(variant: Variant) -> Token {
-    match variant {
-        Variant::Danger => palette::DANGER,
-        _ => palette::ACCENT,
     }
 }
 
@@ -425,6 +468,16 @@ pub fn status_mark(tone: Tone, size: Pixels) -> Div {
             .border_color(color),
         StatusMark::Bar => div().w(size * 0.34).h(size).rounded(px(1.0)).bg(color),
         StatusMark::Dash => div().w(size).h(px(1.5)).rounded(px(1.0)).bg(color),
+        StatusMark::Target => div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(size)
+            .h(size)
+            .rounded_full()
+            .border(px(1.5))
+            .border_color(color)
+            .child(div().size(size * 0.3).rounded_full().bg(color)),
     };
     div()
         .flex_none()
@@ -491,22 +544,22 @@ pub fn chip(label: impl Into<SharedString>, tone: Tone, metrics: Metrics) -> Div
 pub fn chip_within(label: impl Into<SharedString>, tone: Tone, metrics: Metrics) -> Div {
     chip_frame(tone, metrics)
         .flex_initial()
-        .min_w(px(0.0))
+        .min_w_0()
         .overflow_hidden()
-        .child(div().min_w(px(0.0)).truncate().child(label.into()))
+        .child(div().min_w_0().truncate().child(label.into()))
 }
 
-/// The pill, tint and mark of a chip, without its words.
+/// The tint, edge and mark of a chip, without its words.
 fn chip_frame(tone: Tone, metrics: Metrics) -> Div {
-    // A soft pill: the tint and the mark carry the tone, so no outline is needed. A
+    // A soft block: the tint and the mark carry the tone, so the edge stays faint. A
     // neutral chip is a plain word - its dash mark read as a minus sign in front of it.
     div()
         .flex()
         .items_center()
-        .gap(metrics.scale(5.0))
+        .gap(metrics.scale(spacing::NARROW))
         .h(metrics.scale(20.0))
-        .px(metrics.scale(8.0))
-        .rounded_full()
+        .px(metrics.scale(spacing::TIGHT))
+        .rounded(px(radius::SMALL))
         .bg(tone.chip_background())
         .border_1()
         .border_color(theme::faded(tone.text(), 0.16))
@@ -514,7 +567,7 @@ fn chip_frame(tone: Tone, metrics: Metrics) -> Div {
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(tone.text())
         .when(tone != Tone::Neutral, |chip| {
-            chip.child(status_mark(tone, metrics.scale(6.0)))
+            chip.child(status_mark(tone, metrics.scale(spacing::NARROW)))
         })
 }
 
@@ -526,33 +579,39 @@ pub fn tag(label: impl Into<SharedString>, metrics: Metrics) -> Div {
         .flex_none()
         .items_center()
         .h(metrics.scale(20.0))
-        .px(metrics.scale(8.0))
-        .rounded_full()
+        .px(metrics.scale(spacing::NARROW))
+        .rounded(px(radius::SMALL))
         .bg(theme::swatch(palette::SURFACE_SELECTED))
         .text_size(metrics.caption_size())
         .text_color(theme::swatch(palette::TEXT_SECONDARY))
         .child(label.into())
 }
 
-/// A keycap that names a shortcut.
-pub fn keycap(label: impl Into<SharedString>, metrics: Metrics) -> Div {
+/// The caption size a keycap's label is set in: a step under the caption, so a
+/// shortcut beside a word reads as a hint and not as a second word.
+fn kbd_text_size(metrics: Metrics) -> Pixels {
+    metrics.caption_size() - metrics.scale(1.0)
+}
+
+/// A keycap that names a shortcut, such as `Ctrl+K` beside a command (ADR-2).
+pub fn kbd(label: impl Into<SharedString>, metrics: Metrics) -> Div {
     div()
         .flex()
         .flex_none()
         .items_center()
         .h(metrics.scale(18.0))
-        .px(metrics.scale(5.0))
+        .px(metrics.scale(spacing::HAIRLINE + 1.0))
         .rounded(px(radius::SMALL))
-        .bg(theme::swatch(palette::CHROME))
+        .bg(theme::swatch(palette::SURFACE))
         .border_1()
         .border_b_2()
         .border_color(theme::swatch(palette::BORDER_STRONG))
-        .text_size(metrics.scale(10.5))
-        .text_color(theme::swatch(palette::TEXT_MUTED))
+        .text_size(kbd_text_size(metrics))
+        .text_color(theme::swatch(palette::TEXT_SECONDARY))
         .child(label.into())
 }
 
-/// A count in a small block, for the rail and section headings.
+/// A count in a small block, for the sidebar and section headings.
 pub fn badge(count: usize, tone: Tone, metrics: Metrics) -> Div {
     let (background, text) = match tone {
         Tone::Accent => (palette::ACCENT_TINT, palette::ACCENT_ON_TINT),
@@ -565,8 +624,8 @@ pub fn badge(count: usize, tone: Tone, metrics: Metrics) -> Div {
         .justify_center()
         .min_w(metrics.scale(18.0))
         .h(metrics.scale(18.0))
-        .px(metrics.scale(6.0))
-        .rounded_full()
+        .px(metrics.scale(spacing::NARROW))
+        .rounded(px(radius::SMALL))
         .font_weight(gpui::FontWeight::MEDIUM)
         .bg(theme::swatch(background))
         .text_size(metrics.caption_size())
@@ -586,45 +645,61 @@ pub fn kind_badge(label: impl Into<SharedString>, remote: bool, metrics: Metrics
         .flex_none()
         .items_center()
         .h(metrics.scale(16.0))
-        .px(metrics.scale(5.0))
+        .px(metrics.scale(spacing::HAIRLINE + 1.0))
         .rounded(px(radius::SMALL))
         .bg(theme::swatch(background))
-        .text_size(metrics.scale(10.0))
+        .text_size(kbd_text_size(metrics))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(theme::swatch(text))
         .child(label.into())
 }
 
-/// A command button in one of the [`Variant`] weights.
-///
-/// It paints its resting face and answers the pointer with its hovered face; the states
-/// the caller owns are reached through [`button_with_state`].
-pub fn button(label: impl Into<SharedString>, variant: Variant, metrics: Metrics) -> Div {
-    let base = painted(
+/// The frame every labelled button shares: its height, padding, corner and label size,
+/// painted with `face`.
+fn button_frame(size: ButtonSize, face: ControlFace, metrics: Metrics) -> Div {
+    painted(
         div()
             .flex()
             .flex_none()
             .items_center()
             .justify_center()
-            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-            .h(metrics.control_height())
-            .px(metrics.scale(spacing::BASE - 2.0))
+            .gap(metrics.scale(spacing::NARROW))
+            .h(size.height(metrics))
+            .px(size.padding(metrics))
             .rounded(px(radius::MEDIUM))
-            .text_size(metrics.label_size())
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .cursor_pointer()
-            .child(label.into()),
-        button_face(variant, ControlState::Resting),
-    );
+            .text_size(size.text(metrics))
+            .font_weight(gpui::FontWeight::MEDIUM),
+        face,
+    )
+}
+
+/// A command button in one of the [`Variant`] weights, at the regular height.
+///
+/// It paints its resting face and answers the pointer with its hovered face; the states
+/// the caller owns are reached through [`button_with_state`].
+pub fn button(label: impl Into<SharedString>, variant: Variant, metrics: Metrics) -> Div {
+    button_sized(label, variant, ButtonSize::Regular, metrics)
+}
+
+/// [`button`] at one of the three [`ButtonSize`]s.
+pub fn button_sized(
+    label: impl Into<SharedString>,
+    variant: Variant,
+    size: ButtonSize,
+    metrics: Metrics,
+) -> Div {
+    let base = button_frame(size, button_face(variant, ControlState::Resting), metrics)
+        .cursor_pointer()
+        .child(label.into());
     lifted(base, variant).hover(hover_style(button_face(variant, ControlState::Hovered)))
 }
 
-/// A solid button rests on the page: the primary and the secondary weights carry a low
-/// shadow, the tinted and quiet ones lie flat.
+/// Only the primary button rests on the page with a soft shadow; every other weight
+/// lies flat and is told by its edge.
 fn lifted(base: Div, variant: Variant) -> Div {
     match variant {
-        Variant::Primary | Variant::Secondary => base.elevation(Elevation::Low),
-        Variant::Soft | Variant::Ghost | Variant::Danger => base,
+        Variant::Primary => base.elevation(Elevation::Raised),
+        Variant::Secondary | Variant::Ghost | Variant::Danger | Variant::Icon => base,
     }
 }
 
@@ -641,22 +716,9 @@ pub fn button_with_state(
     metrics: Metrics,
 ) -> Div {
     let face = button_face(variant, state);
-    let base = painted(
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-            .h(metrics.control_height())
-            .px(metrics.scale(spacing::BASE - 2.0))
-            .rounded(px(radius::MEDIUM))
-            .text_size(metrics.label_size())
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .when(state != ControlState::Disabled, |el| el.cursor_pointer())
-            .child(label.into()),
-        face,
-    );
+    let base = button_frame(ButtonSize::Regular, face, metrics)
+        .when(state != ControlState::Disabled, |el| el.cursor_pointer())
+        .child(label.into());
     let base = match face.mark_token() {
         Some(token) => base.child(mark_bar(token, metrics)),
         None => base,
@@ -681,41 +743,28 @@ pub fn icon_label_button(
     let color = variant_text(variant);
     let hover_text = theme::swatch(button_face(variant, ControlState::Hovered).text_token());
     let drawing = icons::icon(icon, metrics.small_icon_size(), color);
-    let drawing = if variant == Variant::Ghost {
+    let drawing = if matches!(variant, Variant::Ghost | Variant::Icon) {
         drawing.group_hover(ICON_GROUP, move |style| style.text_color(hover_text))
     } else {
         drawing
     };
-    let base = painted(
-        div()
-            .group(ICON_GROUP)
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-            .h(metrics.control_height())
-            .pl(metrics.scale(spacing::SNUG - 1.0))
-            .pr(metrics.scale(spacing::BASE - 2.0))
-            .rounded(px(radius::MEDIUM))
-            .text_size(metrics.label_size())
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .cursor_pointer()
-            .child(drawing)
-            .child(label.into()),
+    let base = button_frame(
+        ButtonSize::Regular,
         button_face(variant, ControlState::Resting),
-    );
+        metrics,
+    )
+    .group(ICON_GROUP)
+    .pl(metrics.scale(spacing::SNUG - spacing::HALF))
+    .cursor_pointer()
+    .child(drawing)
+    .child(label.into());
     lifted(base, variant).hover(hover_style(button_face(variant, ControlState::Hovered)))
 }
 
-/// A square button holding one icon, quiet until pointed at.
+/// A square button holding one icon, quiet until pointed at: [`Variant::Icon`].
 pub fn icon_only_button(icon: Icon, metrics: Metrics) -> Div {
-    icon_only_button_hover(
-        icon,
-        metrics,
-        theme::swatch(palette::SURFACE_HOVER),
-        theme::swatch(palette::TEXT_PRIMARY),
-    )
+    let hovered = button_face(Variant::Icon, ControlState::Hovered);
+    icon_only_button_hover(icon, metrics, hovered.fill_color(), hovered.text_color())
 }
 
 /// [`icon_only_button`] for a destructive action: it warns in the danger colour under
@@ -746,7 +795,7 @@ pub fn toggle_icon_button(icon: Icon, on: bool, metrics: Metrics) -> Div {
         .justify_center()
         .w(size)
         .h(size)
-        .rounded(px(radius::SMALL))
+        .rounded(px(radius::MEDIUM))
         .bg(tint)
         .text_color(ink)
         .cursor_pointer()
@@ -755,6 +804,7 @@ pub fn toggle_icon_button(icon: Icon, on: bool, metrics: Metrics) -> Div {
 
 fn icon_only_button_hover(icon: Icon, metrics: Metrics, hover: Rgba, hover_text: Rgba) -> Div {
     let size = metrics.hit_target();
+    let resting = variant_text(Variant::Icon);
     div()
         .group(ICON_GROUP)
         .flex()
@@ -763,17 +813,13 @@ fn icon_only_button_hover(icon: Icon, metrics: Metrics, hover: Rgba, hover_text:
         .justify_center()
         .w(size)
         .h(size)
-        .rounded(px(radius::SMALL))
-        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+        .rounded(px(radius::MEDIUM))
+        .text_color(resting)
         .cursor_pointer()
         .hover(move |style| style.bg(hover).text_color(hover_text))
         .child(
-            icons::icon(
-                icon,
-                metrics.small_icon_size(),
-                theme::swatch(palette::TEXT_SECONDARY),
-            )
-            .group_hover(ICON_GROUP, move |style| style.text_color(hover_text)),
+            icons::icon(icon, metrics.small_icon_size(), resting)
+                .group_hover(ICON_GROUP, move |style| style.text_color(hover_text)),
         )
 }
 
@@ -785,12 +831,9 @@ fn variant_text(variant: Variant) -> Rgba {
     theme::swatch(button_face(variant, ControlState::Resting).text_token())
 }
 
-/// A compact button for toolbars, sized to sit inside a 36px bar.
+/// A compact button for toolbars, rows and banners: [`ButtonSize::Compact`], 28 high.
 pub fn compact_button(label: impl Into<SharedString>, variant: Variant, metrics: Metrics) -> Div {
-    button(label, variant, metrics)
-        .h(metrics.compact_control_height())
-        .px(metrics.scale(spacing::TIGHT + 2.0))
-        .text_size(metrics.caption_size())
+    button_sized(label, variant, ButtonSize::Compact, metrics)
 }
 
 /// A square button that holds a short glyph such as "A+" or "×".
@@ -805,14 +848,14 @@ pub fn icon_button(glyph: impl Into<SharedString>, metrics: Metrics) -> Div {
             .min_w(size)
             .h(size)
             .px(metrics.scale(spacing::HAIRLINE))
-            .rounded(px(radius::SMALL))
+            .rounded(px(radius::MEDIUM))
             .text_size(metrics.caption_size())
             .cursor_pointer()
             .child(glyph.into()),
-        button_face(Variant::Ghost, ControlState::Resting),
+        button_face(Variant::Icon, ControlState::Resting),
     )
     .hover(hover_style(button_face(
-        Variant::Ghost,
+        Variant::Icon,
         ControlState::Hovered,
     )))
 }
@@ -824,7 +867,7 @@ pub fn segment(label: impl Into<SharedString>, selected: bool, metrics: Metrics)
         .flex_none()
         .items_center()
         .h(metrics.compact_control_height())
-        .px(metrics.scale(spacing::TIGHT + 2.0))
+        .px(metrics.scale(spacing::TIGHT + spacing::HALF))
         .rounded(px(radius::SMALL))
         .text_size(metrics.label_size())
         .cursor_pointer()
@@ -835,7 +878,7 @@ pub fn segment(label: impl Into<SharedString>, selected: bool, metrics: Metrics)
             .font_weight(gpui::FontWeight::MEDIUM)
             .border_1()
             .border_color(theme::swatch(palette::BORDER_STRONG))
-            .elevation(Elevation::Low)
+            .elevation(Elevation::Raised)
     } else {
         let hover = theme::swatch(palette::TEXT_PRIMARY);
         base.text_color(theme::swatch(palette::TEXT_MUTED))
@@ -859,11 +902,11 @@ pub fn segmented(metrics: Metrics) -> Div {
         .flex_shrink()
         .flex_wrap()
         .items_center()
-        .min_w(px(0.0))
+        .min_w_0()
         .max_w_full()
-        .gap(metrics.scale(2.0))
-        .p(metrics.scale(3.0))
-        .rounded(px(radius::MEDIUM + 1.0))
+        .gap(metrics.scale(spacing::HALF))
+        .p(metrics.scale(spacing::HALF))
+        .rounded(px(radius::MEDIUM))
         .bg(theme::swatch(palette::SEGMENT_TRACK))
         .border_1()
         .border_color(theme::faded(theme::swatch(palette::BORDER), 0.7))
@@ -924,9 +967,9 @@ pub(crate) fn settings_row_content_cap(metrics: Metrics) -> Pixels {
 /// Border-box floor for one [`segment`], capped so it still fits in the track.
 pub(crate) fn segment_reserved_width(label: &str, metrics: Metrics) -> Pixels {
     let text = reserved_text_width(label, metrics.label_size());
-    let padding = metrics.scale(spacing::TIGHT + 2.0) * 2.0;
+    let padding = metrics.scale(spacing::TIGHT + spacing::HALF) * 2.0;
     let border = px(2.0);
-    let track_pad = metrics.scale(3.0) * 2.0;
+    let track_pad = metrics.scale(spacing::HALF) * 2.0;
     let track_border = px(2.0);
     let cap = settings_row_content_cap(metrics) - track_pad - track_border;
     (text + padding + border).min(cap)
@@ -936,12 +979,12 @@ pub(crate) fn segment_reserved_width(label: &str, metrics: Metrics) -> Pixels {
 /// hairline and, for any tone but the neutral one, its mark.
 pub(crate) fn chip_reserved_width(label: &str, tone: Tone, metrics: Metrics) -> Pixels {
     let text = reserved_text_width(label, metrics.caption_size());
-    let padding = metrics.scale(8.0) * 2.0;
+    let padding = metrics.scale(spacing::TIGHT) * 2.0;
     let border = px(2.0);
     let mark = if tone == Tone::Neutral {
         px(0.0)
     } else {
-        metrics.scale(6.0) + metrics.scale(5.0)
+        metrics.scale(spacing::NARROW) * 2.0
     };
     text + padding + border + mark
 }
@@ -954,10 +997,10 @@ pub(crate) fn compact_label_reserved_width(label: &str, metrics: Metrics) -> Pix
     (text + padding + border).min(settings_row_content_cap(metrics))
 }
 
-/// Border-box floor for a [`keycap`].
-pub(crate) fn keycap_reserved_width(label: &str, metrics: Metrics) -> Pixels {
-    let text = reserved_text_width(label, metrics.scale(10.5));
-    let padding = metrics.scale(5.0) * 2.0;
+/// Border-box floor for a [`kbd`].
+pub(crate) fn kbd_reserved_width(label: &str, metrics: Metrics) -> Pixels {
+    let text = reserved_text_width(label, kbd_text_size(metrics));
+    let padding = metrics.scale(spacing::HAIRLINE + 1.0) * 2.0;
     let border = px(2.0);
     (text + padding + border).min(settings_row_content_cap(metrics))
 }
@@ -1017,7 +1060,7 @@ pub fn notice(
                 .child(
                     div()
                         .flex_1()
-                        .min_w(px(0.0))
+                        .min_w_0()
                         .whitespace_normal()
                         .text_size(metrics.label_size())
                         .font_weight(gpui::FontWeight::MEDIUM)
@@ -1041,7 +1084,7 @@ pub fn field_row(label: impl Into<SharedString>, metrics: Metrics) -> Div {
         .flex()
         .items_center()
         .gap(metrics.scale(spacing::SNUG))
-        .min_w(px(0.0))
+        .min_w_0()
         .child(
             div()
                 .flex_none()
@@ -1093,7 +1136,7 @@ pub fn field_frame(state: ControlState, metrics: Metrics) -> Div {
             .flex_none()
             .items_center()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .h(metrics.control_height())
             .gap(metrics.scale(spacing::TIGHT))
             .px(metrics.scale(spacing::TIGHT + 2.0))
@@ -1164,7 +1207,7 @@ pub fn state_card_with_icon(
         .flex_col()
         .items_center()
         .w_full()
-        .min_w(px(0.0))
+        .min_w_0()
         .gap(metrics.scale(spacing::HAIRLINE + 2.0))
         .child(capped_text(
             cap,
@@ -1220,7 +1263,7 @@ pub fn state_card_with_icon(
         .bg(theme::swatch(palette::SURFACE))
         .border_1()
         .border_color(theme::swatch(palette::BORDER))
-        .elevation(Elevation::Low)
+        .elevation(Elevation::Raised)
         .child(emblem)
         .child(text)
 }
@@ -1372,7 +1415,7 @@ pub fn menu_card(selector: &'static str, metrics: Metrics) -> Div {
         .bg(theme::swatch(palette::RAISED))
         .border_1()
         .border_color(theme::swatch(palette::BORDER_STRONG))
-        .elevation(Elevation::Mid)
+        .elevation(Elevation::Overlay)
 }
 
 /// One command of a [`menu_card`]: an optional icon and a label.
@@ -1416,7 +1459,7 @@ pub fn menu_entry(
         .children(icon.map(|icon| icons::icon(icon, metrics.small_icon_size(), color)))
         // The label takes the room, so a shortcut appended after it sits at the far end
         // without pushing on the gap between the icon and the word.
-        .child(div().flex_1().min_w(px(0.0)).truncate().child(label.into()))
+        .child(div().flex_1().min_w_0().truncate().child(label.into()))
 }
 
 /// The shortcut at the far end of a [`menu_entry`]: the binding in force, quiet, so
@@ -1476,7 +1519,7 @@ pub fn floating_bar(metrics: Metrics) -> Div {
         .bg(theme::swatch(palette::RAISED))
         .border_1()
         .border_color(theme::swatch(palette::BORDER_STRONG))
-        .elevation(Elevation::Mid)
+        .elevation(Elevation::Overlay)
 }
 
 /// The hairline between groups of [`menu_entry`]s.
@@ -1492,7 +1535,7 @@ pub fn menu_divider(metrics: Metrics) -> Div {
 /// The panel a choice menu is drawn in: a [`menu_card`] without a selector.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn menu_panel(metrics: Metrics) -> Div {
-    menu_card("menu.panel", metrics).flex_none().min_w(px(0.0))
+    menu_card("menu.panel", metrics).flex_none().min_w_0()
 }
 
 /// One value of a [`menu_panel`], drawn from the [`menu_item_face`] table.
@@ -1548,7 +1591,7 @@ pub fn dialog_surface() -> Div {
             .flex()
             .flex_col()
             .rounded(px(radius::XLARGE))
-            .elevation(Elevation::High)
+            .elevation(Elevation::Overlay)
             .overflow_hidden()
             .occlude(),
         dialog_face(),
@@ -1567,7 +1610,7 @@ pub fn dialog_panel(metrics: Metrics) -> Div {
             .gap(metrics.scale(spacing::BASE))
             .p(metrics.scale(spacing::LOOSE))
             .rounded(px(radius::XLARGE))
-            .elevation(Elevation::High),
+            .elevation(Elevation::Overlay),
         dialog_face(),
     )
 }
@@ -1589,7 +1632,7 @@ pub fn dialog_header(
             div()
                 .flex()
                 .flex_col()
-                .min_w(px(0.0))
+                .min_w_0()
                 .gap(metrics.scale(2.0))
                 .child(
                     div()
@@ -1620,7 +1663,7 @@ pub fn endpoint(value: impl Into<SharedString>, metrics: Metrics) -> Div {
     copy_on_click(
         div()
             .flex_none()
-            .min_w(px(0.0))
+            .min_w_0()
             .truncate()
             .font_family(crate::app::terminal::monospace_family())
             .text_size(metrics.label_size())
@@ -1690,7 +1733,7 @@ pub fn stacked(
     div()
         .flex()
         .flex_col()
-        .min_w(px(0.0))
+        .min_w_0()
         .gap(metrics.scale(2.0))
         .child(
             div()
@@ -1735,7 +1778,7 @@ impl Render for Tooltip {
             .bg(theme::swatch(palette::RAISED))
             .border_1()
             .border_color(theme::swatch(palette::BORDER_STRONG))
-            .elevation(Elevation::Mid)
+            .elevation(Elevation::Overlay)
             .text_size(metrics.caption_size())
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
             .child(self.text.clone())
@@ -1757,24 +1800,30 @@ pub fn card(metrics: Metrics) -> Div {
     div()
         .flex()
         .flex_col()
-        .min_w(px(0.0))
+        .min_w_0()
         .gap(metrics.scale(spacing::SNUG))
         .p(metrics.scale(spacing::BASE))
         .rounded(px(radius::LARGE))
         .bg(theme::swatch(palette::SURFACE))
         .border_1()
         .border_color(theme::swatch(palette::BORDER))
-        .elevation(Elevation::Low)
+        .elevation(Elevation::Raised)
 }
 
 /// The card a session's state is laid over its terminal in: why it ended, or that it is
 /// on its way (R3).
 ///
-/// It floats over the grid, so it is the raised layer at the mid elevation, centred by
-/// its caller and no wider than a sentence needs. The emblem tile carries the tone, the
-/// title states the state and the optional line says what it means; the caller appends
-/// the actions and any disclosure. A press on the card stays on the card: it occludes
-/// the grid under it, while the grid around it keeps its pointer.
+/// It floats over the grid, so it is the raised layer at the overlay elevation. The
+/// emblem tile carries the tone, the title states the state and the optional line says
+/// what it means; the caller appends the actions and any disclosure. A press on the card
+/// stays on the card: it occludes the grid under it, while the grid around it keeps its
+/// pointer.
+///
+/// The card has no width of its own: it is placed through [`status_card_slot`], which
+/// caps it the way [`capped_text`] caps a line. A card that carried `w_full` and a
+/// `max_w` in a column was asked for its height at the column's whole width and painted
+/// at the cap, so a long diagnostic painted more lines than its box held and ran out of
+/// the card (R5).
 pub fn status_card(
     tone: Tone,
     emblem: AnyElement,
@@ -1787,23 +1836,21 @@ pub fn status_card(
         .flex()
         .flex_col()
         .flex_none()
-        .w_full()
-        .min_w(px(0.0))
-        .max_w(metrics.scale(440.0))
+        .min_w_0()
         .gap(metrics.scale(spacing::SNUG))
-        .p(metrics.scale(spacing::BASE + 4.0))
+        .p(metrics.scale(spacing::WIDE))
         .rounded(px(radius::XLARGE))
         .bg(theme::swatch(palette::RAISED))
         .border_1()
         .border_color(theme::swatch(palette::BORDER_STRONG))
-        .elevation(Elevation::Mid)
+        .elevation(Elevation::Overlay)
         .cursor_default()
         .child(
             div()
                 .flex()
                 .items_start()
                 .gap(metrics.scale(spacing::SNUG))
-                .min_w(px(0.0))
+                .min_w_0()
                 .child(
                     div()
                         .flex()
@@ -1820,7 +1867,7 @@ pub fn status_card(
                         .flex()
                         .flex_col()
                         .flex_1()
-                        .min_w(px(0.0))
+                        .min_w_0()
                         .gap(metrics.scale(2.0))
                         .child(
                             title
@@ -1880,7 +1927,7 @@ pub fn switch(on: bool, metrics: Metrics) -> Div {
                 .size(knob)
                 .rounded_full()
                 .bg(theme::swatch(palette::KNOB))
-                .elevation(Elevation::Low),
+                .elevation(Elevation::Raised),
         )
 }
 
@@ -1967,7 +2014,7 @@ pub fn toast(
         .bg(theme::swatch(palette::RAISED))
         .border_1()
         .border_color(theme::swatch(palette::BORDER_STRONG))
-        .elevation(Elevation::Mid)
+        .elevation(Elevation::Overlay)
         .child(
             div()
                 .flex()
@@ -1984,7 +2031,7 @@ pub fn toast(
                 .flex()
                 .flex_col()
                 .flex_1()
-                .min_w(px(0.0))
+                .min_w_0()
                 .gap(metrics.scale(2.0))
                 .child(
                     title
@@ -2017,13 +2064,28 @@ pub fn toast(
 /// Every centred, capped, wrapping text in a column - an empty state's title and line,
 /// a picker's hint - goes through this rather than putting `max_w` on the text itself.
 pub fn capped_text(max_width: Pixels, text: Div) -> Div {
+    capped(max_width, text)
+}
+
+/// Any block - a card, a column of words - centred with a width cap and laid out at the
+/// width it is painted at, by the rule of [`capped_text`].
+pub fn capped(max_width: Pixels, block: Div) -> Div {
     div()
         .flex()
         .flex_none()
         .justify_center()
         .w_full()
-        .min_w(px(0.0))
-        .child(text.w_full().min_w(px(0.0)).max_w(max_width))
+        .min_w_0()
+        .child(block.w_full().min_w_0().max_w(max_width))
+}
+
+/// The widest a [`status_card`] grows, in logical pixels before zoom.
+pub const STATUS_CARD_WIDTH: f32 = 440.0;
+
+/// Places a [`status_card`] in the column it is shown in: centred, as wide as the
+/// column up to [`STATUS_CARD_WIDTH`], and measured at the width it is painted at.
+pub fn status_card_slot(card: Div, metrics: Metrics) -> Div {
+    capped(metrics.scale(STATUS_CARD_WIDTH), card)
 }
 
 /// An empty page or section: an icon on the accent tint, a title, an optional line and
@@ -2045,7 +2107,7 @@ pub fn empty_state(
         .flex_col()
         .items_center()
         .w_full()
-        .min_w(px(0.0))
+        .min_w_0()
         .gap(metrics.scale(spacing::SNUG))
         .px(metrics.scale(spacing::LOOSE))
         .py(metrics.scale(spacing::LOOSE + 8.0))
@@ -2279,7 +2341,7 @@ pub fn modal_with(
                 .flex()
                 .flex_col()
                 .flex_1()
-                .min_h(px(0.0))
+                .min_h_0()
                 .overflow_y_scroll()
                 .when_some(scroll, |body, handle| body.track_scroll(&handle))
                 .children(subtitle)
@@ -2345,6 +2407,535 @@ pub fn modal_scrim_exit(viewport: gpui::Size<Pixels>, key: u64) -> AnyElement {
         .into_any_element()
 }
 
+// ---------------------------------------------------------------------------
+// Component library v2 (ADR-2): search, rows, sidebar, toolbar, banner, progress,
+// skeleton
+// ---------------------------------------------------------------------------
+
+/// The one search box a page has: a magnifier, the caller's text field, an optional
+/// clear button and an optional shortcut hint (ADR-2).
+///
+/// The field is the caller's own [`crate::app::text_field::TextField`]; the clear
+/// button is the caller's too, so it can carry its id and its click. The frame is the
+/// [`field_face`] of `state`, so a focused search box rings like every other field.
+#[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
+pub fn search_field(
+    field: AnyElement,
+    clear: Option<AnyElement>,
+    shortcut: Option<SharedString>,
+    state: ControlState,
+    metrics: Metrics,
+) -> Div {
+    painted(
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .w_full()
+            .min_w_0()
+            .h(metrics.control_height())
+            .gap(metrics.scale(spacing::NARROW))
+            .pl(metrics.scale(spacing::TIGHT + spacing::HALF))
+            .pr(metrics.scale(spacing::NARROW))
+            .rounded(px(radius::MEDIUM)),
+        field_face(state),
+    )
+    .child(icons::icon(
+        Icon::Search,
+        metrics.small_icon_size(),
+        theme::swatch(palette::TEXT_MUTED),
+    ))
+    .child(div().flex().flex_1().min_w_0().child(field))
+    .children(clear)
+    .children(shortcut.map(|shortcut| kbd(shortcut, metrics)))
+}
+
+/// The face of a [`list_row`] in one state.
+///
+/// A list row is flat: it lies on the page with no fill and no edge, and only the
+/// pointer, the selection and the keyboard give it a surface. The chosen row also
+/// carries the accent bar, so "chosen" is not told by a shade alone.
+#[must_use]
+pub fn list_row_face(state: ControlState) -> ControlFace {
+    let resting = ControlFace::new(None, None, palette::TEXT_PRIMARY);
+    match state {
+        ControlState::Resting => resting,
+        ControlState::Hovered => resting.with_fill(palette::SURFACE_HOVER),
+        ControlState::Pressed => resting.with_fill(palette::SURFACE_PRESSED).pressed(),
+        ControlState::Selected => resting
+            .with_fill(palette::SURFACE_SELECTED)
+            .with_mark(palette::ACCENT),
+        ControlState::Focused => resting.ringed(palette::FOCUS_RING),
+        ControlState::Invalid => resting.ringed(palette::DANGER),
+        ControlState::Disabled => ControlFace::new(
+            Some(palette::DISABLED_SURFACE),
+            None,
+            palette::DISABLED_TEXT,
+        ),
+        ControlState::Loading => resting.busy(),
+    }
+}
+
+/// The hover group a [`list_row`]'s revealed actions follow.
+pub const ROW_GROUP: &str = "list-row";
+
+/// The frame of a [`list_row`] alone, for a row that lays out its own content.
+pub fn list_row_frame(state: ControlState, metrics: Metrics) -> Div {
+    let face = list_row_face(state);
+    let base = painted(
+        div()
+            .group(ROW_GROUP)
+            .relative()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(metrics.scale(spacing::SNUG))
+            .w_full()
+            .min_w_0()
+            .min_h(metrics.scale(44.0))
+            .px(metrics.scale(spacing::SNUG))
+            .py(metrics.scale(spacing::NARROW))
+            .rounded(px(radius::MEDIUM)),
+        face,
+    );
+    let base = match state {
+        ControlState::Resting => base.hover(hover_style(list_row_face(ControlState::Hovered))),
+        _ => base,
+    };
+    match face.mark_token() {
+        // The accent bar stands in the row's left padding, so the content does not move
+        // when the row is chosen.
+        Some(token) => base.child(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(metrics.scale(spacing::TIGHT + spacing::HALF))
+                .bottom(metrics.scale(spacing::TIGHT + spacing::HALF))
+                .w(px(2.0))
+                .rounded(px(1.0))
+                .bg(theme::swatch(token)),
+        ),
+        None => base,
+    }
+}
+
+/// What one [`list_row`] shows, left to right.
+#[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
+pub struct ListRow {
+    /// An avatar or an icon tile ([`leading_icon`]).
+    pub leading: Option<AnyElement>,
+    /// The first line: the object's name.
+    pub title: SharedString,
+    /// The second line: an address, a path or a short status. It is words rather than
+    /// an element so it ends in an ellipsis where the row is too narrow.
+    pub subtitle: Option<SharedString>,
+    /// Whether the second line is an endpoint, set in the terminal's monospace face.
+    pub monospace_subtitle: bool,
+    /// Quiet information at the right end: a tag, a time, a status dot.
+    pub meta: Option<AnyElement>,
+    /// The row's own commands.
+    pub actions: Option<AnyElement>,
+    /// Whether the commands only show under the pointer or on the chosen row.
+    pub reveal_actions: bool,
+}
+
+/// A row of a list of saved things: a leading avatar or icon, two lines of words, quiet
+/// metadata on the right and the row's commands after it (ADR-2).
+///
+/// The words give way before anything else: the title and the second line end in an
+/// ellipsis, never in a cut letter, and the metadata and the commands keep their size.
+/// With `reveal_actions` the commands are drawn only under the pointer and on the chosen
+/// row, so a long list stays quiet.
+#[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
+pub fn list_row(row: ListRow, state: ControlState, metrics: Metrics) -> Div {
+    let ListRow {
+        leading,
+        title,
+        subtitle,
+        monospace_subtitle,
+        meta,
+        actions,
+        reveal_actions,
+    } = row;
+    let shown = !reveal_actions || state == ControlState::Selected;
+    let text = div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .gap(metrics.scale(spacing::HALF))
+        // Each line is the one item of a row of its own: a line that ends in an
+        // ellipsis is shaped at the width a row gives it, where a column's item was
+        // shaped at a narrower pass and drew only the ellipsis.
+        .child(
+            div().flex().min_w_0().child(
+                div()
+                    .debug_selector(|| "list.row.title".to_owned())
+                    .min_w_0()
+                    .truncate()
+                    .text_size(metrics.body_size())
+                    .font_weight(metrics.medium_weight())
+                    .child(title),
+            ),
+        )
+        .children(subtitle.map(|subtitle| {
+            div().flex().min_w_0().child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .when(monospace_subtitle, |line| {
+                        line.font_family(crate::app::terminal::monospace_family())
+                    })
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .child(subtitle),
+            )
+        }));
+    list_row_frame(state, metrics)
+        .children(leading)
+        .child(text)
+        .children(meta.map(|meta| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(metrics.scale(spacing::TIGHT))
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .child(meta)
+        }))
+        .children(actions.map(|actions| {
+            let actions = div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(metrics.scale(spacing::HALF))
+                .child(actions);
+            if shown {
+                actions
+            } else {
+                actions
+                    .invisible()
+                    .group_hover(ROW_GROUP, |style| style.visible())
+            }
+        }))
+}
+
+/// A square tile holding an icon in a tone's tint, at the head of a [`list_row`].
+pub fn leading_icon(icon: Icon, tone: Tone, metrics: Metrics) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(metrics.control_height())
+        .rounded(px(radius::MEDIUM))
+        .bg(tone.chip_background())
+        .child(icons::icon(icon, metrics.icon_size(), tone.text()))
+}
+
+/// One entry of a sidebar: an icon, a label, an optional count, and the chosen state
+/// (ADR-2).
+///
+/// The chosen entry takes the selected fill and the primary ink; the others are
+/// secondary until pointed at. The count is quiet and right-aligned, and the label gives
+/// way to it with an ellipsis.
+#[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
+pub fn sidebar_item(
+    icon: Icon,
+    label: impl Into<SharedString>,
+    count: Option<usize>,
+    selected: bool,
+    metrics: Metrics,
+) -> Div {
+    let (fill, ink) = if selected {
+        (Some(palette::SURFACE_SELECTED), palette::TEXT_PRIMARY)
+    } else {
+        (None, palette::TEXT_SECONDARY)
+    };
+    let hover_fill = theme::swatch(palette::SURFACE_HOVER);
+    let hover_ink = theme::swatch(palette::TEXT_PRIMARY);
+    let ink_color = theme::swatch(ink);
+    div()
+        .group(ICON_GROUP)
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(metrics.scale(spacing::TIGHT))
+        .w_full()
+        .min_w_0()
+        .h(metrics.control_height())
+        .px(metrics.scale(spacing::TIGHT))
+        .rounded(px(radius::MEDIUM))
+        .when_some(fill, |item, fill| item.bg(theme::swatch(fill)))
+        .text_size(metrics.label_size())
+        .text_color(ink_color)
+        .when(selected, |item| item.font_weight(metrics.medium_weight()))
+        .cursor_pointer()
+        .when(!selected, |item| {
+            item.hover(move |style| style.bg(hover_fill).text_color(hover_ink))
+        })
+        .child(
+            icons::icon(icon, metrics.icon_size(), ink_color)
+                .group_hover(ICON_GROUP, move |style| style.text_color(hover_ink)),
+        )
+        .child(div().flex_1().min_w_0().truncate().child(label.into()))
+        .children(count.map(|count| {
+            div()
+                .flex_none()
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .child(SharedString::from(count.to_string()))
+        }))
+}
+
+/// A sidebar entry folded to its icon, for the collapsed sidebar: a square target with
+/// the chosen fill when it is the current one. Its label is the caller's tooltip.
+#[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
+pub fn sidebar_icon_item(icon: Icon, selected: bool, metrics: Metrics) -> Div {
+    let size = metrics.control_height();
+    let ink = theme::swatch(if selected {
+        palette::TEXT_PRIMARY
+    } else {
+        palette::TEXT_SECONDARY
+    });
+    let hover_fill = theme::swatch(palette::SURFACE_HOVER);
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(size)
+        .rounded(px(radius::MEDIUM))
+        .when(selected, |item| {
+            item.bg(theme::swatch(palette::SURFACE_SELECTED))
+        })
+        .when(!selected, |item| {
+            item.hover(move |style| style.bg(hover_fill))
+        })
+        .cursor_pointer()
+        .child(icons::icon(icon, metrics.icon_size(), ink))
+}
+
+/// The bar of controls at the head of a page or a column (ADR-2): one line, items
+/// centred, a hairline under it. The caller adds the title, the search field and the
+/// commands; a child with `flex_1` takes the room between them.
+#[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
+pub fn toolbar(metrics: Metrics) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(metrics.scale(spacing::TIGHT))
+        .w_full()
+        .min_w_0()
+        .min_h(metrics.scale(44.0))
+        .px(metrics.scale(spacing::SNUG))
+        .py(metrics.scale(spacing::NARROW))
+        .border_b_1()
+        .border_color(theme::swatch(palette::BORDER))
+}
+
+/// The bar a state is stated in above the content it is about, without covering it
+/// (ADR-2, ADR-6): a tone icon, one sentence, and the caller's commands after it.
+///
+/// It is one line high at rest; the sentence ends in an ellipsis rather than pushing the
+/// commands off the bar, and the caller keeps the whole sentence in a tooltip or in a
+/// detail it unfolds under the bar. The tone's tint is the fill and a hairline closes it
+/// off from what is under it.
+#[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
+pub fn inline_banner(
+    tone: Tone,
+    icon: Icon,
+    message: impl Into<SharedString>,
+    metrics: Metrics,
+) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(metrics.scale(spacing::TIGHT))
+        .w_full()
+        .min_w_0()
+        .min_h(metrics.large_control_height())
+        .pl(metrics.scale(spacing::SNUG))
+        .pr(metrics.scale(spacing::NARROW))
+        .py(metrics.scale(spacing::HALF))
+        .bg(tone.chip_background())
+        .border_b_1()
+        .border_color(theme::faded(tone.text(), 0.24))
+        .text_size(metrics.label_size())
+        .child(icons::icon(icon, metrics.small_icon_size(), tone.text()))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                .child(message.into()),
+        )
+}
+
+/// How far a piece of work has come, for a [`progress_bar`].
+#[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Progress {
+    /// A known fraction, from 0 to 1.
+    Determinate(f32),
+    /// Work whose length is not known: a segment that travels the track.
+    Indeterminate,
+}
+
+/// How long the travelling segment of an indeterminate [`progress_bar`] takes to cross.
+#[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
+pub const PROGRESS_SWEEP: Duration = Duration::from_millis(1200);
+
+/// A thin progress bar: the groove and the part that is done (ADR-2).
+///
+/// A determinate bar fills to its fraction. An indeterminate one sends a segment along
+/// the groove while motion is allowed, and holds it still in the middle when motion is
+/// reduced, so the bar still says "working" without moving. `id` keys the sweep.
+#[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
+pub fn progress_bar(id: impl Into<ElementId>, progress: Progress, metrics: Metrics) -> AnyElement {
+    let track = div()
+        .relative()
+        .flex_none()
+        .w_full()
+        .h(metrics.scale(spacing::HAIRLINE))
+        .rounded_full()
+        .overflow_hidden()
+        .bg(theme::swatch(palette::LOADING_TRACK));
+    let fill = div()
+        .absolute()
+        .top(px(0.0))
+        .bottom(px(0.0))
+        .rounded_full()
+        .bg(theme::swatch(palette::LOADING_FILL));
+    match progress {
+        Progress::Determinate(fraction) => track
+            .debug_selector(|| "progress.determinate".to_owned())
+            .child(
+                fill.left(px(0.0))
+                    .w(gpui::relative(fraction.clamp(0.0, 1.0))),
+            )
+            .into_any_element(),
+        Progress::Indeterminate if theme::motion_allowed() => track
+            .debug_selector(|| "progress.indeterminate".to_owned())
+            .child(
+                fill.w(gpui::relative(0.3)).with_animation(
+                    id,
+                    Animation::new(PROGRESS_SWEEP)
+                        .repeat()
+                        .with_easing(gpui::ease_in_out),
+                    |fill, delta| fill.left(gpui::relative(delta * 1.3 - 0.3)),
+                ),
+            )
+            .into_any_element(),
+        Progress::Indeterminate => track
+            .debug_selector(|| "progress.still".to_owned())
+            .child(fill.left(gpui::relative(0.35)).w(gpui::relative(0.3)))
+            .into_any_element(),
+    }
+}
+
+/// A placeholder line of text while the words load: a rounded block at `fraction` of
+/// the width it is given (ADR-2).
+#[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
+pub fn skeleton_text(fraction: f32, metrics: Metrics) -> Div {
+    div()
+        .flex_none()
+        .w(gpui::relative(fraction.clamp(0.05, 1.0)))
+        .h(metrics.scale(10.0))
+        .rounded(px(radius::SMALL))
+        .bg(theme::swatch(palette::SURFACE_SELECTED))
+}
+
+/// A placeholder [`list_row`] while a list loads: an avatar block and two lines.
+///
+/// While motion is allowed it breathes once per pulse; reduced motion draws it still.
+/// `id` keys the breath.
+#[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
+pub fn skeleton_row(id: impl Into<ElementId>, metrics: Metrics) -> AnyElement {
+    let row = list_row_frame(ControlState::Resting, metrics)
+        .debug_selector(|| "skeleton.row".to_owned())
+        .child(
+            div()
+                .flex_none()
+                .size(metrics.control_height())
+                .rounded(px(radius::MEDIUM))
+                .bg(theme::swatch(palette::SURFACE_SELECTED)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .gap(metrics.scale(spacing::NARROW))
+                .child(skeleton_text(0.4, metrics))
+                .child(skeleton_text(0.7, metrics)),
+        );
+    if theme::motion_allowed() {
+        row.with_animation(
+            id,
+            Animation::new(theme::Motion::PULSE * 2)
+                .repeat()
+                .with_easing(gpui::pulsating_between(0.55, 1.0)),
+            |row, delta| row.opacity(delta),
+        )
+        .into_any_element()
+    } else {
+        row.into_any_element()
+    }
+}
+
+/// A checkbox box in a pointer-sized target: the shared [`checkbox_box`], lit by the
+/// pointer anywhere on its target, for the selection column of a list.
+pub fn checkbox_target(checked: bool, metrics: Metrics) -> Div {
+    div()
+        .group(CHECK_GROUP)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(metrics.hit_target())
+        .cursor_pointer()
+        .child(checkbox_box(checked, metrics))
+}
+
+/// A [`switch`] with its state word before it, for a setting that is on or off.
+///
+/// The word says the state in text as well, so it is not told by the knob's side and
+/// colour alone. The caller gives the whole of it an id, a selector and the click; the
+/// word carries `<selector>.state`.
+pub fn labelled_switch(
+    on: bool,
+    word: impl Into<SharedString>,
+    selector: &'static str,
+    metrics: Metrics,
+) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(metrics.scale(spacing::TIGHT))
+        .min_h(metrics.hit_target())
+        .cursor_pointer()
+        .child(
+            div()
+                .min_w(metrics.scale(24.0))
+                .text_size(metrics.label_size())
+                .text_color(theme::swatch(if on {
+                    palette::TEXT_PRIMARY
+                } else {
+                    palette::TEXT_SECONDARY
+                }))
+                .debug_selector(move || format!("{selector}.state"))
+                .child(word.into()),
+        )
+        .child(switch(on, metrics))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2355,13 +2946,7 @@ mod tests {
     /// Minimum contrast for an edge, a mark or an inactive control.
     const GRAPHIC: f64 = 3.0;
 
-    const VARIANTS: [Variant; 5] = [
-        Variant::Primary,
-        Variant::Soft,
-        Variant::Secondary,
-        Variant::Ghost,
-        Variant::Danger,
-    ];
+    const VARIANTS: [Variant; 5] = Variant::ALL;
 
     /// Where a face with no fill of its own ends up being drawn.
     const BACKDROPS: [Token; 6] = [
@@ -2539,6 +3124,7 @@ mod tests {
             ("field", every_state(field_face)),
             ("row", every_state(row_face)),
             ("menu item", every_state(menu_item_face)),
+            ("list row", every_state(list_row_face)),
         ] {
             assert_states_differ(name, &faces);
             for (state, face) in faces {
@@ -2560,6 +3146,55 @@ mod tests {
     #[test]
     fn every_shared_piece_builds_in_every_state() {
         let metrics = Metrics::default();
+        for variant in VARIANTS {
+            for size in ButtonSize::ALL {
+                let _ = button_sized("Connect", variant, size, metrics);
+            }
+        }
+        for state in ControlState::ALL {
+            let _ = search_field(
+                div().into_any_element(),
+                Some(icon_only_button(Icon::Close, metrics).into_any_element()),
+                Some("Ctrl+F".into()),
+                state,
+                metrics,
+            );
+            let _ = list_row(
+                ListRow {
+                    leading: Some(
+                        leading_icon(Icon::Server, Tone::Accent, metrics).into_any_element(),
+                    ),
+                    title: "build-01".into(),
+                    subtitle: Some("deploy@192.0.2.11".into()),
+                    monospace_subtitle: true,
+                    meta: Some(tag("Prod", metrics).into_any_element()),
+                    actions: Some(
+                        compact_button("Connect", Variant::Primary, metrics).into_any_element(),
+                    ),
+                    reveal_actions: true,
+                },
+                state,
+                metrics,
+            );
+        }
+        for selected in [false, true] {
+            let _ = sidebar_item(Icon::Server, "All hosts", Some(24), selected, metrics);
+            let _ = sidebar_icon_item(Icon::Server, selected, metrics);
+        }
+        let _ = toolbar(metrics).child(kbd("Ctrl+K", metrics));
+        for tone in [Tone::Danger, Tone::Warning, Tone::Info, Tone::Positive] {
+            let _ = inline_banner(tone, Icon::Plug, "Connection lost", metrics);
+        }
+        for motion in [theme::Motion::Full, theme::Motion::Reduced] {
+            theme::set_motion(motion);
+            let _ = progress_bar("progress", Progress::Determinate(0.4), metrics);
+            let _ = progress_bar("progress", Progress::Indeterminate, metrics);
+            let _ = skeleton_row("skeleton", metrics);
+        }
+        theme::set_motion(theme::Motion::Full);
+        let _ = skeleton_text(0.5, metrics);
+        let _ = checkbox_target(true, metrics);
+        let _ = labelled_switch(true, "On", "switch", metrics);
         for variant in VARIANTS {
             for state in ControlState::ALL {
                 let _ = button_with_state("Connect", variant, state, metrics);
@@ -2729,6 +3364,7 @@ mod tests {
             Tone::Warning => "Connecting",
             Tone::Danger => "Failed",
             Tone::Planned => "Closed",
+            Tone::Info => "Info",
         }
     }
 
@@ -2753,6 +3389,199 @@ mod tests {
         assert!(!theme::motion_allowed());
         theme::set_motion(theme::Motion::Full);
         assert!(theme::motion_allowed());
+    }
+
+    /// A column of a given width that holds one piece, for the layout tests below.
+    struct Column {
+        width: f32,
+        piece: fn(Metrics) -> AnyElement,
+    }
+
+    impl Render for Column {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .w(px(self.width))
+                .debug_selector(|| "column".to_owned())
+                .child((self.piece)(Metrics::default()))
+        }
+    }
+
+    fn lay_out(
+        cx: &mut gpui::TestAppContext,
+        width: f32,
+        piece: fn(Metrics) -> AnyElement,
+    ) -> &mut gpui::VisualTestContext {
+        theme::set_motion(theme::Motion::Reduced);
+        let (_view, cx) = cx.add_window_view(move |_window, _cx| Column { width, piece });
+        cx.simulate_resize(gpui::size(px(800.0), px(900.0)));
+        cx.run_until_parked();
+        cx
+    }
+
+    /// A diagnostic as long as a real one: one unbroken path, then a sentence.
+    const LONG_DIAGNOSTIC: &str = concat!(
+        "ssh: connect to host build-01.internal.example port 22: Connection timed out ",
+        "after 3 keepalives; C:\\Users\\someone\\AppData\\Local\\Temp\\",
+        "shellune-pty-0123456789abcdef was closed while the session was still reading ",
+        "from it, and the reconnect budget of five attempts is spent"
+    );
+
+    #[gpui::test]
+    fn a_status_card_is_as_tall_as_the_diagnostic_it_paints(cx: &mut gpui::TestAppContext) {
+        // The card is centred in a column wider than its cap. Measured at the column's
+        // width and painted at the cap, the diagnostic used to run out of the card's
+        // bottom edge (R5); placed through the slot it is laid out where it is painted.
+        let cx = lay_out(cx, 760.0, |metrics| {
+            status_card_slot(
+                status_card(
+                    Tone::Danger,
+                    icons::icon(Icon::Plug, metrics.icon_size(), Tone::Danger.text())
+                        .into_any_element(),
+                    div().child("Connection lost"),
+                    Some(div().child("The server stopped answering.")),
+                    metrics,
+                )
+                .debug_selector(|| "card".to_owned())
+                .child(
+                    div()
+                        .debug_selector(|| "diagnostic".to_owned())
+                        .whitespace_normal()
+                        .text_size(metrics.caption_size())
+                        .child(LONG_DIAGNOSTIC),
+                ),
+                metrics,
+            )
+            .into_any_element()
+        });
+        let card = cx.debug_bounds("card").expect("the card is drawn");
+        let diagnostic = cx
+            .debug_bounds("diagnostic")
+            .expect("the diagnostic is drawn");
+        assert!(
+            card.size.width <= px(STATUS_CARD_WIDTH) + px(0.5),
+            "the card keeps its cap: {card:?}"
+        );
+        assert!(
+            diagnostic.bottom() <= card.bottom() + px(0.5)
+                && diagnostic.right() <= card.right() + px(0.5),
+            "the diagnostic runs out of its card: {diagnostic:?} in {card:?}"
+        );
+        // The wrapped diagnostic is several lines tall, not the one line a full-width
+        // measurement would give it.
+        assert!(diagnostic.size.height > Metrics::default().caption_size() * 2.0);
+        theme::set_motion(theme::Motion::Full);
+    }
+
+    #[gpui::test]
+    fn a_list_row_and_a_banner_end_long_words_in_an_ellipsis(cx: &mut gpui::TestAppContext) {
+        let cx = lay_out(cx, 280.0, |metrics| {
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .child(
+                    list_row(
+                        ListRow {
+                            leading: Some(
+                                leading_icon(Icon::Server, Tone::Accent, metrics)
+                                    .into_any_element(),
+                            ),
+                            title: "a-host-name-that-is-much-longer-than-the-row".into(),
+                            subtitle: Some(
+                                "deploy@a-very-long-address.internal.example:2222".into(),
+                            ),
+                            monospace_subtitle: true,
+                            meta: Some(tag("Prod", metrics).into_any_element()),
+                            actions: None,
+                            reveal_actions: false,
+                        },
+                        ControlState::Resting,
+                        metrics,
+                    )
+                    .debug_selector(|| "row".to_owned()),
+                )
+                .child(
+                    inline_banner(
+                        Tone::Danger,
+                        Icon::Plug,
+                        "Connection lost · the server stopped answering keepalives",
+                        metrics,
+                    )
+                    .debug_selector(|| "banner".to_owned())
+                    .child(compact_button(
+                        "Reconnect",
+                        Variant::Primary,
+                        metrics,
+                    )),
+                )
+                .into_any_element()
+        });
+        let column = cx.debug_bounds("column").expect("the column is drawn");
+        let title = cx
+            .debug_bounds("list.row.title")
+            .expect("the title is drawn");
+        assert!(
+            title.size.width > px(60.0),
+            "the title is shaped at a width it is not drawn at: {title:?}"
+        );
+        // Two lines for the row and one for the banner: a wrapped word would add a
+        // line to either.
+        let line = |size: Pixels| size * 1.7;
+        let metrics = Metrics::default();
+        for (selector, most) in [
+            (
+                "row",
+                line(metrics.body_size())
+                    + line(metrics.caption_size())
+                    + metrics.scale(spacing::NARROW + spacing::HALF) * 2.0,
+            ),
+            ("banner", metrics.scale(36.0) + px(1.0)),
+        ] {
+            let piece = cx.debug_bounds(selector).expect("the piece is drawn");
+            assert!(
+                piece.right() <= column.right() + px(0.5),
+                "{selector} runs past its column: {piece:?} in {column:?}"
+            );
+            assert!(
+                piece.size.height <= most,
+                "{selector} wrapped instead of ending in an ellipsis: {piece:?}, most {most:?}"
+            );
+        }
+        theme::set_motion(theme::Motion::Full);
+    }
+
+    #[gpui::test]
+    fn a_progress_bar_fills_to_its_fraction(cx: &mut gpui::TestAppContext) {
+        let cx = lay_out(cx, 400.0, |metrics| {
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .gap(px(8.0))
+                .child(progress_bar(
+                    "progress",
+                    Progress::Determinate(0.25),
+                    metrics,
+                ))
+                .child(progress_bar("sweep", Progress::Indeterminate, metrics))
+                .into_any_element()
+        });
+        let bar = cx
+            .debug_bounds("progress.determinate")
+            .expect("the bar is drawn");
+        assert_eq!(bar.size.width, px(400.0));
+        assert_eq!(bar.size.height, Metrics::default().scale(spacing::HAIRLINE));
+        // Under reduced motion an unknown length is still drawn, and still.
+        assert!(cx.debug_bounds("progress.still").is_some());
+        assert!(cx.debug_bounds("progress.indeterminate").is_none());
+        theme::set_motion(theme::Motion::Full);
     }
 
     #[test]

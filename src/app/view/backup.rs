@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use gpui::prelude::*;
-use gpui::{App, Context, Div, Entity, FontWeight, SharedString, Stateful, Window, div, px};
+use gpui::{App, Context, Div, Entity, FontWeight, SharedString, Stateful, Window, div};
 use shellune_core::{HostId, SecretString};
 use shellune_storage::{
     ApplyMode, ApplyOutcome, ApplyPlan, Change, ExportOptions, ExportOutcome, KdfParams, LocalData,
@@ -948,7 +948,7 @@ impl ShelluneView {
         let metrics = self.metrics();
         div()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .whitespace_normal()
             .text_size(metrics.caption_size())
             .text_color(theme::swatch(palette::TEXT_SECONDARY))
@@ -982,7 +982,7 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .gap(metrics.scale(spacing::HAIRLINE))
             .child(
                 div()
@@ -993,7 +993,7 @@ impl ShelluneView {
             .child(
                 div()
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .debug_selector(move || selector.to_owned())
                     .child(field.clone()),
             )
@@ -1032,7 +1032,7 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::LOOSE))
             .pb(metrics.scale(spacing::LOOSE))
@@ -1379,7 +1379,7 @@ impl ShelluneView {
             .items_center()
             .justify_between()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .gap(metrics.scale(spacing::TIGHT))
             .py(metrics.scale(spacing::HAIRLINE))
             .border_b_1()
@@ -1465,7 +1465,7 @@ impl ShelluneView {
                     .flex()
                     .flex_col()
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .debug_selector(|| "backup.import.counts".to_owned())
                     .child(self.backup_count_row(
                         "hosts",

@@ -42,7 +42,7 @@ pub(super) fn tone_icon(tone: Tone) -> Icon {
         Tone::Positive => Icon::Check,
         Tone::Danger => Icon::Close,
         Tone::Warning => Icon::Refresh,
-        Tone::Neutral | Tone::Accent | Tone::Planned => Icon::More,
+        Tone::Neutral | Tone::Accent | Tone::Planned | Tone::Info => Icon::More,
     }
 }
 

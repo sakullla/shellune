@@ -950,7 +950,7 @@ impl ShelluneView {
                 .flex()
                 .flex_col()
                 .flex_1()
-                .min_w(px(0.0))
+                .min_w_0()
                 .gap(metrics.scale(spacing::HAIRLINE))
                 .child(
                     div()
@@ -1293,7 +1293,7 @@ impl ShelluneView {
                 div()
                     .flex_col()
                     .flex_1()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .child(
                         div()
                             .flex_none()
@@ -1335,7 +1335,7 @@ impl ShelluneView {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .gap(metrics.scale(spacing::HAIRLINE))
                     .child(
                         div()
@@ -1726,7 +1726,7 @@ impl ShelluneView {
                         .child(
                             div()
                                 .flex_1()
-                                .min_w(px(0.0))
+                                .min_w_0()
                                 .text_size(metrics.caption_size())
                                 .text_color(theme::swatch(palette::TEXT_SECONDARY))
                                 .child(SharedString::from(command)),
@@ -2029,7 +2029,7 @@ impl ShelluneView {
                         div()
                             .flex()
                             .flex_1()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .debug_selector(move || format!("batch.step.field.{index}"))
                             .child(field.clone()),
                     )
@@ -2757,7 +2757,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_SECONDARY))
                             .child(SharedString::from(command)),

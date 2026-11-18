@@ -1,7 +1,7 @@
 //! The forwarding page: saved rules, their real runtime, and the form (R11).
 
 use gpui::prelude::*;
-use gpui::{Context, FontWeight, SharedString, Window, div, px};
+use gpui::{Context, FontWeight, SharedString, Window, div};
 use shellune_core::{
     BindExposure, ForwardFault, ForwardId, ForwardKind, ForwardRule, HostConfig, HostId, SessionId,
     SessionKind, SessionState,
@@ -10,13 +10,13 @@ use shellune_ssh::{ForwardCommand, ForwardFailure};
 use shellune_storage::ForwardStore;
 
 use super::ShelluneView;
-use crate::app::components::{self, Variant};
+use crate::app::components::{self, ControlState, Variant};
 use crate::app::copy::{self, Strings};
 use crate::app::forwarding::{
     ForwardConfirm, ForwardEditor, ForwardPhase, ForwardScope, ForwardStart,
 };
-use crate::app::icons::{self, Icon};
-use crate::app::theme::{self, Tone, palette, radius, spacing};
+use crate::app::icons::Icon;
+use crate::app::theme::{self, Tone, palette, spacing};
 
 impl ShelluneView {
     pub(super) fn reload_forwards(&mut self) {
@@ -490,36 +490,21 @@ impl ShelluneView {
                 ForwardKind::Dynamic => format!("{} {listen} · SOCKS", ux.fwd_here),
             };
             list = list.child(
-                components_row(self, index, cx)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .size(metrics.scale(36.0))
-                            .rounded(px(radius::MEDIUM))
-                            .bg(theme::swatch(if active {
-                                palette::POSITIVE_TINT
-                            } else {
-                                palette::ACCENT_TINT
-                            }))
-                            .child(icons::icon(
-                                Icon::Forward,
-                                metrics.icon_size(),
-                                theme::swatch(if active {
-                                    palette::POSITIVE
-                                } else {
-                                    palette::ACCENT
-                                }),
-                            )),
-                    )
+                // A tunnel is one row of the shared list kind, so the list reads like
+                // every other list of saved things (R6, ADR-2).
+                components::list_row_frame(ControlState::Resting, metrics)
+                    .debug_selector(move || format!("forwards.row.{index}"))
+                    .child(components::leading_icon(
+                        Icon::Forward,
+                        if active { Tone::Positive } else { Tone::Accent },
+                        metrics,
+                    ))
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .flex_1()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .gap(metrics.scale(3.0))
                             .child(
                                 div()
@@ -974,7 +959,7 @@ impl ShelluneView {
                     div()
                         .flex()
                         .gap(metrics.scale(spacing::TIGHT))
-                        .child(div().flex_1().min_w(px(0.0)).child(address))
+                        .child(div().flex_1().min_w_0().child(address))
                         .child(div().w(metrics.scale(120.0)).flex_none().child(port)),
                 )
         };
@@ -1112,18 +1097,6 @@ impl ShelluneView {
             text
         }
     }
-}
-
-fn components_row(view: &ShelluneView, index: usize, _cx: &mut Context<ShelluneView>) -> gpui::Div {
-    let metrics = view.metrics();
-    // A tunnel is one card of the shared kind, so the list reads like every other list
-    // of saved things (R6).
-    components::card(metrics)
-        .flex_row()
-        .items_center()
-        .gap(metrics.scale(spacing::SNUG))
-        .p(metrics.scale(spacing::SNUG))
-        .debug_selector(move || format!("forwards.row.{index}"))
 }
 
 fn displayed_listen(rule: &ForwardRule, phase: &ForwardPhase) -> String {

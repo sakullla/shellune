@@ -1358,11 +1358,9 @@ impl DesktopPane {
                     .child(SharedString::from(problem.clone())),
             ));
         }
-        div()
-            .w_full()
-            .max_w(metrics.scale(560.0))
-            .px(metrics.scale(spacing::LOOSE))
-            .child(card)
+        // The card is centred and capped by the shared rule, so it is measured at the
+        // width it is painted at (ADR-2).
+        components::capped(metrics.scale(560.0), card).px(metrics.scale(spacing::LOOSE))
     }
 
     /// The strip that says a send did not reach the remote side (R18).
@@ -1390,7 +1388,7 @@ impl DesktopPane {
         };
         let mut lines = div()
             .flex_1()
-            .min_w(px(0.0))
+            .min_w_0()
             .flex()
             .flex_col()
             .gap(metrics.scale(spacing::HAIRLINE));
@@ -1426,7 +1424,7 @@ impl DesktopPane {
                 .flex_row()
                 .items_center()
                 .gap(metrics.scale(spacing::TIGHT))
-                .elevation(theme::Elevation::Mid)
+                .elevation(theme::Elevation::Overlay)
                 .occlude()
                 .debug_selector(|| "desktop.notice".to_owned())
                 // A press on the strip belongs to it: the picture underneath is not
@@ -1537,7 +1535,7 @@ impl DesktopPane {
             .max_w(metrics.scale(480.0))
             .bg(theme::swatch(palette::RAISED))
             .border_color(theme::swatch(palette::BORDER_STRONG))
-            .elevation(theme::Elevation::Mid)
+            .elevation(theme::Elevation::Overlay)
             .debug_selector(|| "desktop.certificate".to_owned())
             .child(
                 div()
@@ -1554,7 +1552,7 @@ impl DesktopPane {
                             .flex()
                             .flex_col()
                             .flex_1()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .gap(metrics.scale(spacing::HAIRLINE))
                             .child(
                                 div()
@@ -1692,7 +1690,7 @@ impl Render for DesktopPane {
             .flex()
             .flex_col()
             .size_full()
-            .min_h(px(0.0))
+            .min_h_0()
             .overflow_hidden()
             .bg(theme::swatch(palette::CANVAS))
             .key_context(crate::app::TERMINAL_KEY_CONTEXT)
@@ -1769,7 +1767,7 @@ impl Render for DesktopPane {
                 let surface = match self.zoom {
                     DesktopZoom::Fit => div()
                         .flex_1()
-                        .min_h(px(0.0))
+                        .min_h_0()
                         .relative()
                         .debug_selector(|| "desktop.surface".to_owned())
                         .child(
@@ -1784,7 +1782,7 @@ impl Render for DesktopPane {
                         let (pan_x, pan_y) = self.pan;
                         div()
                             .flex_1()
-                            .min_h(px(0.0))
+                            .min_h_0()
                             .relative()
                             .overflow_hidden()
                             .debug_selector(|| "desktop.surface".to_owned())

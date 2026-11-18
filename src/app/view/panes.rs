@@ -408,7 +408,7 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_1()
-            .min_h(px(0.0))
+            .min_h_0()
             // A page with no terminal on it - a connection being set up - shows this
             // floor, which the current tab is painted with too (R2).
             .bg(theme::swatch(super::PAGE_FLOOR))
@@ -536,8 +536,14 @@ impl ShelluneView {
     /// wheel through to that box: over the card is where the pointer is when the user
     /// wants to read on (R3, R9).
     pub(super) fn entering_status_card(&self, id: SessionId, card: gpui::Div) -> gpui::AnyElement {
-        crate::app::theme::enter(
+        // Only the card keeps the pointer; the slot it is centred in lets a press beside
+        // it through to the grid.
+        let card = crate::app::components::status_card_slot(
             card.block_mouse_except_scroll(),
+            self.metrics(),
+        );
+        crate::app::theme::enter(
+            card,
             SharedString::from(format!("session.status.enter.{id:?}")),
             crate::app::theme::Enter::Rise,
         )
@@ -559,7 +565,7 @@ impl ShelluneView {
         div()
             .flex()
             .flex_1()
-            .min_h(px(0.0))
+            .min_h_0()
             .items_center()
             .justify_center()
             .overflow_hidden()
@@ -573,7 +579,7 @@ impl ShelluneView {
                     .flex_col()
                     .items_center()
                     .w_full()
-                    .min_h(px(0.0))
+                    .min_h_0()
                     .max_h_full()
                     .overflow_y_scroll()
                     .p(metrics.scale(spacing::BASE))
@@ -638,7 +644,8 @@ impl ShelluneView {
         let mut banners = Vec::new();
         if let Some(reason) = &self.layout_error {
             banners.push(
-                components_banner(Tone::Danger, metrics).child(SharedString::from(reason.clone())),
+                crate::app::components::banner(Tone::Danger, metrics)
+                    .child(SharedString::from(reason.clone())),
             );
         }
         for notice in self.workspace.layout().notices() {
@@ -647,7 +654,7 @@ impl ShelluneView {
                 LayoutNotice::DanglingPane { .. } => strings.workspace_dangling_pane,
             };
             banners.push(
-                components_banner(Tone::Warning, metrics)
+                crate::app::components::banner(Tone::Warning, metrics)
                     .debug_selector(|| "workspace.notice".to_owned())
                     .child(SharedString::from(text.to_owned())),
             );
@@ -701,7 +708,7 @@ impl ShelluneView {
         let metrics = self.metrics();
         let fraction = f32::from(ratio) / 10_000.0;
         let across = matches!(axis, SplitAxis::LeftRight);
-        let mut row = div().flex().flex_1().min_w(px(0.0)).min_h(px(0.0));
+        let mut row = div().flex().flex_1().min_w_0().min_h_0();
         row = if across { row } else { row.flex_col() };
         row.child(self.sized_child(self.layout_node(first, true, cx), fraction, across))
             .child(self.split_divider(id, axis, cx, metrics))
@@ -713,12 +720,12 @@ impl ShelluneView {
         let child = child
             .flex_basis(gpui::relative(fraction))
             .flex_shrink()
-            .min_w(px(0.0))
-            .min_h(px(0.0));
+            .min_w_0()
+            .min_h_0();
         if across {
-            child.min_w(px(0.0))
+            child.min_w_0()
         } else {
-            child.min_h(px(0.0))
+            child.min_h_0()
         }
     }
 
@@ -999,8 +1006,8 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_1()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
+            .min_w_0()
+            .min_h_0()
             .child(frame)
     }
 
@@ -1556,10 +1563,6 @@ fn split_ratio(node: &Node, split: u64) -> Option<u16> {
         return Some(ratio);
     }
     split_ratio(first, split).or_else(|| split_ratio(second, split))
-}
-
-fn components_banner(tone: Tone, metrics: crate::app::theme::Metrics) -> gpui::Div {
-    crate::app::components::banner(tone, metrics)
 }
 
 #[cfg(test)]

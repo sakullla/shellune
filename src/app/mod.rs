@@ -20,6 +20,8 @@
 pub mod batch;
 #[cfg(feature = "ui-capture")]
 pub mod capture;
+#[cfg(any(test, feature = "ui-capture"))]
+pub mod catalog;
 pub mod components;
 pub mod copy;
 /// The RDP and VNC surfaces a desktop session draws (R18-R20, R23).

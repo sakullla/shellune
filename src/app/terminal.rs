@@ -194,12 +194,6 @@ pub struct SessionSlot {
 /// Width of the caret in logical pixels.
 const CARET_WIDTH: f32 = 2.0;
 
-/// Background of a selected cell.
-const SELECTION_BACKGROUND: u32 = 0x2c33_5cff;
-
-/// Selection behind the text in the light palette.
-const SELECTION_BACKGROUND_LIGHT: u32 = 0xc9d1_ffff;
-
 /// Font family the grid is laid out in.
 ///
 /// A terminal needs one advance width for every cell; each platform ships its own
@@ -3319,7 +3313,7 @@ impl TerminalPane {
                         .flex_col()
                         .items_center()
                         .w_full()
-                        .min_h(px(0.0))
+                        .min_h_0()
                         .max_h_full()
                         .overflow_y_scroll()
                         // The margin scrolls with the card: it keeps the card off the
@@ -3529,7 +3523,7 @@ impl TerminalPane {
                 row.child(
                     components::compact_button(
                         strings.serial_ports_refresh,
-                        components::Variant::Soft,
+                        components::Variant::Secondary,
                         metrics,
                     )
                     .h(metrics.hit_target())
@@ -3805,7 +3799,7 @@ impl TerminalPane {
                 .flex()
                 .flex_wrap()
                 .flex_shrink()
-                .min_w(px(0.0))
+                .min_w_0()
                 .h(metrics.hit_target())
                 .overflow_hidden()
                 .items_center()
@@ -3844,7 +3838,7 @@ impl TerminalPane {
             .min_h(bar_height)
             .flex_none()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .overflow_hidden()
             .pl(metrics.scale(spacing::BASE - 2.0))
             .pr(metrics.scale(spacing::HAIRLINE))
@@ -4626,7 +4620,7 @@ impl TerminalPane {
             SearchNote::Silent => None,
             SearchNote::Position { position, total } => Some(
                 div()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .debug_selector(|| "terminal.search.position".to_owned())
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(shell_palette::TEXT_SECONDARY))
@@ -4634,7 +4628,7 @@ impl TerminalPane {
             ),
             SearchNote::Empty => Some(
                 div()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .debug_selector(|| "terminal.search.empty".to_owned())
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(shell_palette::TEXT_MUTED))
@@ -4642,7 +4636,7 @@ impl TerminalPane {
             ),
             SearchNote::Invalid(reason) => Some(
                 div()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .debug_selector(|| "terminal.search.error".to_owned())
                     .text_size(metrics.caption_size())
                     .text_color(Tone::Danger.text())
@@ -4670,7 +4664,10 @@ impl TerminalPane {
             .flex()
             .flex_wrap()
             .items_center()
-            .gap(metrics.scale(spacing::TIGHT))
+            // The find bar is the densest bar of the terminal: its quiet buttons keep a
+            // narrow padding and gap, so a pane of a split keeps the controls on two
+            // lines (R4, token v2's 28 px compact height).
+            .gap(metrics.scale(spacing::NARROW))
             .debug_selector(|| "terminal.search.bar".to_owned())
             // The field the keys are going to says so, and says it twice: an accent
             // border with a soft ring while the bar holds the keyboard, a neutral one
@@ -4739,7 +4736,7 @@ impl TerminalPane {
         // It takes its own line and wraps there instead; the buttons stay whole.
         bar = bar.child(
             div()
-                .min_w(px(0.0))
+                .min_w_0()
                 .debug_selector(move || {
                     if focused {
                         "terminal.search.keys".to_owned()
@@ -4772,6 +4769,7 @@ impl TerminalPane {
                 metrics,
             )
             .h(metrics.hit_target())
+            .px(metrics.scale(spacing::NARROW))
             .id("terminal.search.previous")
             .debug_selector(|| "terminal.search.previous".to_owned())
             .on_click(cx.listener(|this, _event, _window, cx| {
@@ -4785,6 +4783,7 @@ impl TerminalPane {
                 metrics,
             )
             .h(metrics.hit_target())
+            .px(metrics.scale(spacing::NARROW))
             .id("terminal.search.next")
             .debug_selector(|| "terminal.search.next".to_owned())
             .on_click(cx.listener(|this, _event, _window, cx| {
@@ -4814,6 +4813,7 @@ impl TerminalPane {
                 metrics,
             )
             .h(metrics.hit_target())
+            .px(metrics.scale(spacing::NARROW))
             .id("terminal.search.close")
             .debug_selector(|| "terminal.search.close".to_owned())
             .on_click(cx.listener(|this, _event, window, cx| {
@@ -4840,7 +4840,7 @@ impl TerminalPane {
         components::compact_button(
             format!("{box_mark} {label}"),
             if on {
-                components::Variant::Soft
+                components::Variant::Secondary
             } else {
                 components::Variant::Ghost
             },
@@ -4910,7 +4910,7 @@ impl TerminalPane {
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .truncate()
                     .font_family(monospace_family())
                     .text_size(metrics.caption_size())
@@ -5020,7 +5020,7 @@ impl TerminalPane {
             .bg(theme::swatch(shell_palette::RAISED))
             .border_1()
             .border_color(theme::swatch(shell_palette::BORDER_STRONG))
-            .shadow(theme::Elevation::Mid.shadows())
+            .shadow(theme::Elevation::Overlay.shadows())
             .text_size(metrics.caption_size())
             .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
             .cursor_pointer()
@@ -5072,7 +5072,7 @@ impl TerminalPane {
         div()
             .flex_1()
             .relative()
-            .min_h(px(0.0))
+            .min_h_0()
             .overflow_hidden()
             .bg(color_of(palette::BACKGROUND))
             .cursor_text()
@@ -5241,10 +5241,11 @@ fn color_of(color: Rgb) -> gpui::Rgba {
 /// The background a cell paints over the canvas, or `None` when it shows the canvas.
 fn cell_background(cell: &RenderedCell, canvas: gpui::Rgba) -> Option<gpui::Rgba> {
     if cell.selected {
-        return Some(gpui::rgba(match theme::terminal_appearance() {
-            theme::Appearance::Dark => SELECTION_BACKGROUND,
-            theme::Appearance::Light => SELECTION_BACKGROUND_LIGHT,
-        }));
+        // The selection is a token derived from the accent, resolved in the terminal's
+        // own palette, which may differ from the window's.
+        return Some(gpui::rgb(
+            theme::palette::SELECTION.value(theme::terminal_appearance()),
+        ));
     }
     let background = color_of(cell.background);
     (background != canvas).then_some(background)
@@ -5667,7 +5668,7 @@ impl Render for TerminalPane {
             .flex()
             .flex_col()
             .size_full()
-            .min_h(px(0.0))
+            .min_h_0()
             .relative()
             .child(
                 // A margin inside the frame keeps the first column off the border; the
@@ -5677,7 +5678,7 @@ impl Render for TerminalPane {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_h(px(0.0))
+                    .min_h_0()
                     .pl(metrics.scale(spacing::SNUG))
                     .pr(metrics.scale(spacing::HAIRLINE))
                     .py(metrics.scale(spacing::TIGHT))

@@ -1076,7 +1076,7 @@ impl Render for TextField {
         // The main entry rests on the page at the low elevation; its focus ring is drawn
         // on top of that rest, so the ring and the lift are both there while it types.
         let rest = if prominent {
-            theme::Elevation::Low.shadows()
+            theme::Elevation::Raised.shadows()
         } else {
             Vec::new()
         };
@@ -1097,7 +1097,7 @@ impl Render for TextField {
                 spacing::HAIRLINE
             }))
             .flex_1()
-            .min_w(px(0.0))
+            .min_w_0()
             .h(if prominent {
                 metrics.scale(40.0)
             } else {
@@ -1193,7 +1193,7 @@ impl Render for TextField {
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .overflow_hidden()
                     .child(LineElement { field: cx.entity() }),
             )

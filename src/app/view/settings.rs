@@ -332,8 +332,8 @@ impl ShelluneView {
             .flex_col()
             .flex_1()
             .w_full()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
+            .min_w_0()
+            .min_h_0()
             .max_w(metrics.scale(680.0))
             .overflow_y_scroll()
             .overflow_x_hidden()
@@ -358,8 +358,8 @@ impl ShelluneView {
                 .flex_col()
                 .flex_1()
                 .w_full()
-                .min_w(px(0.0))
-                .min_h(px(0.0))
+                .min_w_0()
+                .min_h_0()
                 .child(
                     div()
                         .flex_none()
@@ -375,8 +375,8 @@ impl ShelluneView {
                 .flex()
                 .flex_1()
                 .w_full()
-                .min_w(px(0.0))
-                .min_h(px(0.0))
+                .min_w_0()
+                .min_h_0()
                 .gap(metrics.scale(spacing::LOOSE))
                 .child(
                     div()
@@ -391,8 +391,8 @@ impl ShelluneView {
             .flex_col()
             .flex_1()
             .w_full()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
+            .min_w_0()
+            .min_h_0()
             .max_w(metrics.scale(980.0))
             .mx_auto()
             .px(metrics.scale(spacing::LOOSE))
@@ -410,8 +410,8 @@ impl ShelluneView {
             .flex_col()
             .flex_1()
             .w_full()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
+            .min_w_0()
+            .min_h_0()
             .overflow_hidden()
             .bg(theme::swatch(palette::CANVAS))
             .child(page)
@@ -472,7 +472,7 @@ impl ShelluneView {
             .flex_col()
             .flex_none()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .gap(metrics.scale(spacing::BASE))
             .debug_selector({
                 let selector = format!("settings.section.{}", category.id());
@@ -481,7 +481,7 @@ impl ShelluneView {
             .child(
                 div()
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .text_size(metrics.title_size() + metrics.scale(3.0))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
@@ -523,7 +523,7 @@ impl ShelluneView {
                     div()
                         .flex()
                         .w_full()
-                        .min_w(px(0.0))
+                        .min_w_0()
                         .debug_selector(move || page.clone())
                         .when(index + 1 < count, |row| {
                             row.border_b_1()
@@ -546,7 +546,7 @@ impl ShelluneView {
                         .child(
                             div()
                                 .flex_1()
-                                .min_w(px(0.0))
+                                .min_w_0()
                                 .debug_selector(move || card_id.clone())
                                 .child(self.settings_item_row(item, cx)),
                         ),
@@ -573,7 +573,7 @@ impl ShelluneView {
                     .flex()
                     .flex_col()
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .gap(metrics.scale(spacing::TIGHT))
                     .debug_selector(move || selector.clone())
                     .when(named, |block| {
@@ -611,7 +611,7 @@ impl ShelluneView {
                         block.child(
                             div()
                                 .w_full()
-                                .min_w(px(0.0))
+                                .min_w_0()
                                 .text_size(metrics.label_size())
                                 .text_color(theme::swatch(palette::TEXT_MUTED))
                                 .debug_selector(|| "settings.intro".to_owned())
@@ -636,7 +636,7 @@ impl ShelluneView {
             .flex_col()
             .flex_none()
             .w(metrics.scale(NAV_WIDTH))
-            .min_w(px(0.0))
+            .min_w_0()
             .gap(metrics.scale(spacing::HAIRLINE))
             .p(metrics.scale(spacing::TIGHT))
             .rounded(px(radius::LARGE))
@@ -661,7 +661,7 @@ impl ShelluneView {
                     .items_center()
                     .gap(metrics.scale(spacing::TIGHT))
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .min_h(metrics.scale(32.0))
                     .px(metrics.scale(spacing::SNUG))
                     .rounded(px(radius::SMALL))
@@ -701,7 +701,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .text_size(metrics.body_size())
                             .font_weight(if chosen {
                                 FontWeight::SEMIBOLD
@@ -740,7 +740,7 @@ impl ShelluneView {
             .mt(metrics.scale(spacing::TIGHT))
             .px(metrics.scale(spacing::SNUG))
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .whitespace_normal()
             .text_size(metrics.caption_size())
             .text_color(theme::swatch(palette::TEXT_MUTED))
@@ -767,7 +767,7 @@ impl ShelluneView {
             .items_center()
             .gap(metrics.scale(spacing::TIGHT))
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .pl(metrics.scale(spacing::SNUG))
             .pr(metrics.scale(spacing::TIGHT))
             .py(metrics.scale(spacing::HAIRLINE + 2.0))
@@ -807,7 +807,7 @@ impl ShelluneView {
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .whitespace_normal()
                     .text_size(metrics.label_size())
                     .text_color(theme::swatch(if picked {
@@ -841,7 +841,7 @@ impl ShelluneView {
             .flex_wrap()
             .items_center()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .gap(metrics.scale(spacing::HAIRLINE))
             .debug_selector(|| "settings.picker.category".to_owned());
         for candidate in Category::ALL {
@@ -870,7 +870,7 @@ impl ShelluneView {
             .flex_wrap()
             .items_center()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .gap(metrics.scale(spacing::HAIRLINE))
             .debug_selector(|| "settings.picker.item".to_owned());
         for (index, item) in category.items().iter().enumerate() {
@@ -900,7 +900,7 @@ impl ShelluneView {
             .flex_col()
             .flex_none()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .gap(metrics.scale(spacing::TIGHT))
             .child(categories)
             .when(!Self::single_named_item(category, locale), |column| {
@@ -1206,7 +1206,7 @@ impl ShelluneView {
             .flex()
             .flex_wrap()
             .items_center()
-            .min_w(px(0.0))
+            .min_w_0()
             .max_w_full()
             .gap(metrics.scale(spacing::HAIRLINE))
             .child(
@@ -1336,7 +1336,7 @@ impl ShelluneView {
                 timeout_row,
                 div()
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .px(metrics.scale(spacing::BASE))
                     .py(metrics.scale(spacing::TIGHT))
                     .text_size(metrics.caption_size())
@@ -1345,7 +1345,7 @@ impl ShelluneView {
                     .child(SharedString::from(window)),
                 div()
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .px(metrics.scale(spacing::BASE))
                     .py(metrics.scale(spacing::TIGHT))
                     .text_size(metrics.caption_size())
@@ -1458,7 +1458,7 @@ impl ShelluneView {
         div()
             .flex()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .items_center()
             .justify_between()
             .flex_wrap()
@@ -1480,7 +1480,7 @@ impl ShelluneView {
                         column.child(
                             div()
                                 .w_full()
-                                .min_w(px(0.0))
+                                .min_w_0()
                                 .text_size(metrics.body_size())
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme::swatch(palette::TEXT_PRIMARY))
@@ -1491,7 +1491,7 @@ impl ShelluneView {
                         column.child(
                             div()
                                 .w_full()
-                                .min_w(px(0.0))
+                                .min_w_0()
                                 .text_size(metrics.caption_size())
                                 .text_color(theme::swatch(palette::TEXT_MUTED))
                                 .child(hint),
@@ -1501,7 +1501,7 @@ impl ShelluneView {
             .child(
                 // No max width here: a percentage max is cyclic with the row and collapses
                 // a text control to nothing. Each control caps itself instead.
-                div().flex().flex_col().min_w(px(0.0)).child(control),
+                div().flex().flex_col().min_w_0().child(control),
             )
     }
 
@@ -1548,7 +1548,7 @@ impl ShelluneView {
             div()
                 .flex()
                 .w_full()
-                .min_w(px(0.0))
+                .min_w_0()
                 .px(metrics.scale(spacing::BASE))
                 .py(metrics.scale(spacing::TIGHT))
                 .debug_selector(|| "settings.keys.search".to_owned())
@@ -1596,7 +1596,7 @@ impl ShelluneView {
             .flex_wrap()
             .items_center()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .gap(metrics.scale(spacing::HAIRLINE))
             .px(metrics.scale(spacing::BASE))
             .py(metrics.scale(spacing::TIGHT))
@@ -1706,12 +1706,12 @@ impl ShelluneView {
                 .flex()
                 .items_center()
                 .flex_wrap()
-                .min_w(px(0.0))
+                .min_w_0()
                 .gap(metrics.scale(spacing::HAIRLINE))
                 .children(labels.into_iter().enumerate().map(|(position, label)| {
                     let selector = format!("settings.keys.keycap.{action}.{position}");
-                    let reserved = components::keycap_reserved_width(&label, metrics);
-                    components::keycap(SharedString::from(label), metrics)
+                    let reserved = components::kbd_reserved_width(&label, metrics);
+                    components::kbd(SharedString::from(label), metrics)
                         .min_w(reserved)
                         .max_w_full()
                         .flex_shrink()
@@ -1733,7 +1733,7 @@ impl ShelluneView {
             .debug_selector(move || selector.clone())
             .flex()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .items_center()
             .justify_between()
             .flex_wrap()
@@ -1758,7 +1758,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .w_full()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .text_size(metrics.body_size())
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
@@ -1767,7 +1767,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .w_full()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_MUTED))
                             .child(SharedString::from(format!(
@@ -1784,7 +1784,7 @@ impl ShelluneView {
                     .flex()
                     .items_center()
                     .flex_wrap()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .max_w_full()
                     .gap(metrics.scale(spacing::TIGHT))
                     .child(keys);
@@ -1838,7 +1838,7 @@ impl ShelluneView {
         div()
             .flex()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .items_center()
             .justify_between()
             .flex_wrap()
@@ -1847,7 +1847,7 @@ impl ShelluneView {
             .py(metrics.scale(spacing::TIGHT))
             .child(
                 div()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .max_w_full()
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))

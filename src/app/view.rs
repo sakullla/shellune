@@ -417,8 +417,9 @@ pub const FILES_REPORT_STEPS: usize = 12;
 /// and a 0.46 cap left the terminal with no height once the bar wrapped. The notice text
 /// uses a tighter line height so the short reason still fits this share on the first
 /// screen, and a longer failure scrolls with Page Up/Down once the box has the keyboard
-/// (R4, R11).
-const X11_NOTICE_SHARE: f32 = 0.38;
+/// (R4, R11). Token v2's 13 px controls and 12 px captions take 0.40 of the window for
+/// the same two lines.
+const X11_NOTICE_SHARE: f32 = 0.40;
 
 /// Ends a menu entry that asks for more input before it acts.
 const ELLIPSIS: &str = "\u{2026}";
@@ -894,6 +895,10 @@ pub struct ShelluneView {
     /// draws with reduced motion (R7).
     #[cfg(feature = "ui-capture")]
     splash_held: bool,
+    /// The capture's design catalogue: the window draws every shared component
+    /// instead of a page (ADR-2).
+    #[cfg(feature = "ui-capture")]
+    catalog_held: bool,
     /// Whether the sidebar is collapsed to its icons.
     rail_collapsed: bool,
     /// What the user chose for the palette.
@@ -2731,6 +2736,8 @@ impl ShelluneView {
             system_motion_pending: false,
             #[cfg(feature = "ui-capture")]
             splash_held: false,
+            #[cfg(feature = "ui-capture")]
+            catalog_held: false,
             #[cfg(test)]
             scripted: Vec::new(),
         };
@@ -5678,7 +5685,7 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .gap(metrics.scale(spacing::HAIRLINE))
             .px(metrics.scale(spacing::SNUG))
             .py(metrics.scale(spacing::TIGHT))
@@ -10349,7 +10356,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .child(components::stacked(title, status, metrics)),
                     )
                     .child({
@@ -10585,7 +10592,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .w_full()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .whitespace_normal()
                             .text_size(metrics.label_size())
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
@@ -10596,7 +10603,7 @@ impl ShelluneView {
                         components::copy_on_click(
                             div()
                                 .w_full()
-                                .min_w(px(0.0))
+                                .min_w_0()
                                 .whitespace_normal()
                                 .font_family(crate::app::terminal::monospace_family())
                                 .text_size(metrics.caption_size())
@@ -10694,7 +10701,7 @@ impl ShelluneView {
             .flex()
             .items_center()
             .gap(metrics.scale(spacing::TIGHT))
-            .min_w(px(0.0))
+            .min_w_0()
             .child(
                 div()
                     .flex_none()
@@ -10705,7 +10712,7 @@ impl ShelluneView {
             .child(
                 components::copy_on_click(
                     div()
-                        .min_w(px(0.0))
+                        .min_w_0()
                         .truncate()
                         .font_family(terminal::monospace_family())
                         .text_size(metrics.caption_size())
@@ -10955,7 +10962,7 @@ impl ShelluneView {
                 div()
                     .flex()
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .debug_selector(move || selector.to_string())
                     .child(field),
             )
@@ -11003,7 +11010,7 @@ impl ShelluneView {
             .flex_col()
             .flex_1()
             .w_full()
-            .when(!short, |column| column.min_h(px(0.0)))
+            .when(!short, |column| column.min_h_0())
             .gap(metrics.scale(spacing::SNUG));
         // A connection in progress belongs at the top of the destination that
         // started it, beside the host it is for. Attempts that are not the form on
@@ -11099,7 +11106,7 @@ impl ShelluneView {
         let path_field = match &self.import_path {
             Some(field) => div()
                 .flex_1()
-                .min_w(px(0.0))
+                .min_w_0()
                 .debug_selector(|| "hosts.import.path".to_owned())
                 .child(field.clone()),
             None => div().flex_1(),
@@ -11169,7 +11176,7 @@ impl ShelluneView {
                 .child(
                     div()
                         .truncate()
-                        .min_w(px(0.0))
+                        .min_w_0()
                         .text_size(metrics.caption_size())
                         .text_color(theme::swatch(palette::TEXT_SECONDARY))
                         .child(SharedString::from(preview.source().display().to_string())),
@@ -11188,7 +11195,7 @@ impl ShelluneView {
             .gap(metrics.scale(spacing::TIGHT))
             .debug_selector(|| "hosts.import.search".to_owned());
         if let Some(field) = &self.import_search {
-            search_row = search_row.child(div().flex_1().min_w(px(0.0)).child(field.clone()));
+            search_row = search_row.child(div().flex_1().min_w_0().child(field.clone()));
         }
         search_row = search_row.child(
             div()
@@ -11384,7 +11391,7 @@ impl ShelluneView {
                             .flex()
                             .items_center()
                             .gap(metrics.scale(spacing::TIGHT))
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .child(components::status_dot(tone, metrics))
                             .child(components::stacked(
                                 host.alias().to_owned(),
@@ -11505,7 +11512,7 @@ impl ShelluneView {
             .child(
                 div()
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .whitespace_normal()
                     .text_size(metrics.body_size())
                     .font_weight(metrics.medium_weight())
@@ -11516,7 +11523,7 @@ impl ShelluneView {
             .child(
                 div()
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .whitespace_normal()
                     .text_size(metrics.label_size())
                     .text_color(theme::swatch(palette::TEXT_SECONDARY))
@@ -12071,7 +12078,7 @@ impl ShelluneView {
                         .child(
                             div()
                                 .flex_1()
-                                .min_w(px(0.0))
+                                .min_w_0()
                                 .text_color(theme::swatch(palette::TEXT_PRIMARY))
                                 .child(notice.text(strings)),
                         )
@@ -12345,7 +12352,7 @@ impl ShelluneView {
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .truncate()
                     .child(SharedString::from(label)),
             )
@@ -12518,7 +12525,7 @@ impl ShelluneView {
                 .flex()
                 .flex_col()
                 .flex_1()
-                .min_h(px(0.0))
+                .min_h_0()
                 .id("content.scroll")
                 .debug_selector(|| "content".to_owned())
                 .track_focus(self.destination_focus(destination))
@@ -12540,7 +12547,7 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_1()
-            .min_h(px(0.0))
+            .min_h_0()
             .bg(theme::swatch(palette::CANVAS));
 
         // A shell that failed to start says so above the terminal that is still open.
@@ -12567,7 +12574,7 @@ impl ShelluneView {
             .and_then(|session| self.workspace.status(session.id()))
             .filter(|status| status.phase() == SessionPhase::Ended);
 
-        let mut frame = div().flex().flex_col().flex_1().min_h(px(0.0));
+        let mut frame = div().flex().flex_col().flex_1().min_h_0();
 
         // What the head cannot hold - a failed bridge, the result of a save - is drawn
         // here, above the terminal it belongs to (R11).
@@ -12669,8 +12676,8 @@ impl ShelluneView {
             .flex()
             .flex_row()
             .flex_1()
-            .min_h(px(0.0))
-            .min_w(px(0.0))
+            .min_h_0()
+            .min_w_0()
             .overflow_hidden()
             // A removed selector keeps its last bounds, so the mode has to be a
             // selector that exists only in the frame that drew it.
@@ -12739,7 +12746,7 @@ impl ShelluneView {
                 })
                 .unwrap_or_else(|| strings.files_other_side.to_owned());
             let full = label.clone();
-            div().flex().flex_1().justify_end().min_w(px(0.0)).child(
+            div().flex().flex_1().justify_end().min_w_0().child(
                 div()
                     .id("files.other")
                     .truncate()
@@ -12783,7 +12790,7 @@ impl ShelluneView {
                 // Shrinks into the files view instead of drawing past the client edge.
                 .flex_shrink()
                 .w_full()
-                .min_h(px(0.0))
+                .min_h_0()
                 .max_h(cap)
                 .overflow_hidden()
                 .track_focus(&self.files_transfer_focus)
@@ -12815,7 +12822,7 @@ impl ShelluneView {
                         .flex_col()
                         .flex_shrink()
                         .w_full()
-                        .min_h(px(0.0))
+                        .min_h_0()
                         .overflow_y_scroll()
                         .track_scroll(&scroll)
                         .debug_selector(|| "files.transfers.scroll".to_owned())
@@ -12829,8 +12836,8 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_1()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
+            .min_w_0()
+            .min_h_0()
             .overflow_hidden()
             .bg(theme::swatch(palette::CANVAS))
             .children(toolbar)
@@ -12856,16 +12863,16 @@ impl ShelluneView {
             .flex()
             .flex_row()
             .flex_1()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
+            .min_w_0()
+            .min_h_0()
             .debug_selector(|| "files.split".to_owned())
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_w(px(0.0))
-                    .min_h(px(0.0))
+                    .min_w_0()
+                    .min_h_0()
                     .child(terminal),
             )
             .child(
@@ -12881,7 +12888,7 @@ impl ShelluneView {
                     .flex_col()
                     .flex_none()
                     .w(self.files_area_width())
-                    .min_h(px(0.0))
+                    .min_h_0()
                     .child(files),
             )
     }
@@ -14716,7 +14723,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .whitespace_normal()
                             .text_size(metrics.body_size())
                             .font_weight(metrics.medium_weight())
@@ -14937,7 +14944,7 @@ impl ShelluneView {
                     SharedString::from("files.upload"),
                     Icon::Upload,
                     strings.transfers_upload,
-                    Variant::Soft,
+                    Variant::Secondary,
                     cx,
                     move |view, cx| view.files_ask_upload(id, cx),
                 )
@@ -14955,7 +14962,7 @@ impl ShelluneView {
                         SharedString::from("files.download"),
                         Icon::Download,
                         strings.transfers_download,
-                        Variant::Soft,
+                        Variant::Secondary,
                         cx,
                         move |view, cx| view.files_ask_download(id, None, cx),
                     )
@@ -14966,9 +14973,13 @@ impl ShelluneView {
             }
         }
 
+        // The header wraps: when the column is too narrow for the name and every tool
+        // (the minimum window at 200% text), the tools take a line of their own
+        // instead of running past the column's edge (R4).
         let header = div()
             .flex()
             .flex_none()
+            .flex_wrap()
             .items_center()
             .gap(metrics.scale(spacing::SNUG - 2.0))
             .debug_selector({
@@ -15007,7 +15018,7 @@ impl ShelluneView {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_w(px(0.0))
+                    .min_w(metrics.name_min_width())
                     .child(
                         div()
                             .truncate()
@@ -15085,7 +15096,7 @@ impl ShelluneView {
                     .debug_selector(move || crumb_id.to_string())
                     .flex()
                     .flex_none()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .max_w(metrics.scale(CRUMB_ROOM))
                     .px(metrics.scale(spacing::HAIRLINE + 1.0))
                     .py(metrics.scale(1.0))
@@ -15108,7 +15119,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .whitespace_normal()
                             .child(SharedString::from(label)),
                     ),
@@ -15138,7 +15149,7 @@ impl ShelluneView {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_h(px(0.0))
+                    .min_h_0()
                     .overflow_y_scroll()
                     // Page Up/Down turns the entries themselves while they are taller
                     // than the box that holds them (R4).
@@ -15229,7 +15240,7 @@ impl ShelluneView {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_h(px(0.0))
+                    .min_h_0()
                     .gap(metrics.scale(spacing::HAIRLINE))
                     .child(self.files_filter_row(id, source, cx))
                     .child(list)
@@ -15244,8 +15255,8 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_1()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
+            .min_w_0()
+            .min_h_0()
             .gap(metrics.scale(spacing::TIGHT + 2.0))
             .p(metrics.scale(spacing::BASE - 2.0))
             .id(panel_id.clone())
@@ -15530,7 +15541,7 @@ impl ShelluneView {
                 .flex_row()
                 .flex_none()
                 .w_full()
-                .min_w(px(0.0))
+                .min_w_0()
                 .h(metrics.scale(4.0))
                 .rounded_full()
                 .overflow_hidden()
@@ -15776,11 +15787,11 @@ impl ShelluneView {
                     .flex()
                     .items_center()
                     .gap(metrics.scale(spacing::TIGHT))
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .whitespace_normal()
                             .text_color(tone.text())
                             .debug_selector(move || format!("transfers.state.{index}"))
@@ -15794,12 +15805,12 @@ impl ShelluneView {
                     .flex()
                     .items_center()
                     .gap(metrics.scale(spacing::HAIRLINE))
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .child(components::status_dot(tone, metrics))
                     .child(
                         div()
                             .w_full()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .whitespace_normal()
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
                             .debug_selector(move || format!("transfers.name.{index}"))
@@ -15998,7 +16009,7 @@ impl ShelluneView {
                     Vec::new(),
                     div()
                         .flex_1()
-                        .min_w(px(0.0))
+                        .min_w_0()
                         .text_size(metrics.caption_size())
                         .text_color(theme::swatch(palette::TEXT_SECONDARY))
                         .debug_selector(|| "files.question.target".to_owned())
@@ -16209,7 +16220,7 @@ impl ShelluneView {
                                             "files.question.item.path.{index}"
                                         )))
                                         .flex_1()
-                                        .min_w(px(0.0))
+                                        .min_w_0()
                                         .truncate()
                                         .child(SharedString::from(display_path(
                                             dialog.source(),
@@ -16382,7 +16393,7 @@ impl ShelluneView {
             };
             card = card.child(
                 div()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .text_size(metrics.caption_size())
                     .text_color(if step.failure().is_some() {
                         Tone::Danger.text()
@@ -16511,7 +16522,7 @@ impl ShelluneView {
             .gap(metrics.scale(2.0))
             .rounded(px(radius::SMALL))
             .cursor_pointer()
-            .when(key == SortKey::Name, |cell| cell.flex_1().min_w(px(0.0)))
+            .when(key == SortKey::Name, |cell| cell.flex_1().min_w_0())
             .when(key == SortKey::Size, |cell| {
                 cell.flex_none().w(metrics.scale(80.0))
             })
@@ -16552,7 +16563,7 @@ impl ShelluneView {
             .get(&(id, source))
             .filter(|_| self.files_filter_shown(id, source))
         {
-            row = row.child(div().flex().flex_1().min_w(px(0.0)).child(field.clone()));
+            row = row.child(div().flex().flex_1().min_w_0().child(field.clone()));
         }
         if let Some((shown, total)) = self.files.counts(id, source) {
             let count = copy::fill(
@@ -16670,7 +16681,7 @@ impl ShelluneView {
         let mut actions = div()
             .flex()
             .flex_shrink()
-            .min_w(px(0.0))
+            .min_w_0()
             .max_w_full()
             .flex_wrap()
             .items_center()
@@ -16681,7 +16692,7 @@ impl ShelluneView {
             actions = actions.child(self.text_button(
                 action_id("download"),
                 copy::fill(strings.files_download_selected, &[("count", &count)]),
-                Variant::Soft,
+                Variant::Secondary,
                 cx,
                 move |view, cx| view.files_download_marked(id, cx),
             ));
@@ -16689,7 +16700,7 @@ impl ShelluneView {
             actions = actions.child(self.text_button(
                 action_id("upload"),
                 copy::fill(strings.files_upload_selected, &[("count", &count)]),
-                Variant::Soft,
+                Variant::Secondary,
                 cx,
                 move |view, cx| view.files_upload_marked(id, cx),
             ));
@@ -16758,7 +16769,7 @@ impl ShelluneView {
             .debug_selector(move || entry_selector.clone())
             .flex()
             .flex_1()
-            .min_w(px(0.0))
+            .min_w_0()
             .items_center()
             .gap(metrics.scale(spacing::TIGHT))
             .h_full()
@@ -16774,7 +16785,7 @@ impl ShelluneView {
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .truncate()
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     .when(openable, |name| name.font_weight(FontWeight::MEDIUM))
@@ -17503,12 +17514,12 @@ impl ShelluneView {
             // card taller than the window. A click copies the whole of it, as it does in
             // the bar.
             target.map(|target| {
-                div().flex().min_w(px(0.0)).child(
+                div().flex().min_w_0().child(
                     self.copyable_text(
                         "terminal.failure.target",
                         target,
                         div()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .truncate()
                             .font_family(terminal::monospace_family()),
                         cx,
@@ -17523,7 +17534,7 @@ impl ShelluneView {
             .flex_wrap()
             .items_center()
             .gap(metrics.scale(spacing::TIGHT))
-            .min_w(px(0.0));
+            .min_w_0();
         // The next step is the button itself, beside the reason it answers: a sentence
         // naming "Reconnect" while the button sits in the bar at the other end of the
         // window made the reader look for it.
@@ -17584,7 +17595,7 @@ impl ShelluneView {
                     "terminal.failure.diagnostic",
                     reason.to_owned(),
                     div()
-                        .min_w(px(0.0))
+                        .min_w_0()
                         .whitespace_normal()
                         .font_family(terminal::monospace_family())
                         .text_size(metrics.caption_size())
@@ -17960,7 +17971,7 @@ impl ShelluneView {
             .flex()
             .items_end()
             .h_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .debug_selector(|| "session.tabs".to_owned());
         let shown = |index: usize| !compact || index == active.unwrap_or(0);
         for index in (0..layout.tabs().len()).filter(|index| shown(*index)) {
@@ -18012,7 +18023,7 @@ impl ShelluneView {
             .relative()
             .flex()
             .flex_initial()
-            .min_w(px(0.0))
+            .min_w_0()
             .h_full()
             // The fades and buttons stay inside the strip, never over the hosts tab or
             // the controls beside it.
@@ -18130,7 +18141,7 @@ impl ShelluneView {
                     .flex()
                     .flex_col()
                     .flex_none()
-                    .min_h(px(0.0))
+                    .min_h_0()
                     .max_h(room)
                     .overflow_y_scroll()
                     .track_scroll(&scroll)
@@ -18172,7 +18183,7 @@ impl ShelluneView {
             .child(
                 div()
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .whitespace_normal()
                     // Tighter than the default golden-ratio line height so the short
                     // reason stays whole inside the notice's share of a 720×480 window
@@ -18188,7 +18199,7 @@ impl ShelluneView {
             .child(
                 div()
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .whitespace_normal()
                     .line_height(gpui::relative(1.25))
                     .text_size(metrics.caption_size())
@@ -18377,7 +18388,7 @@ impl ShelluneView {
                     .flex()
                     .items_center()
                     .gap(metrics.scale(spacing::SNUG))
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .child(components::status_dot(tone, metrics))
                     .child(components::kind_badge(
                         if remote {
@@ -18433,13 +18444,13 @@ impl ShelluneView {
                     .flex()
                     .flex_col()
                     .gap(metrics.scale(spacing::HAIRLINE))
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap(metrics.scale(spacing::SNUG))
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .child(components::status_dot(tone, metrics))
                             .child(components::kind_badge(
                                 self.direction_label(transfer.direction()),
@@ -18582,6 +18593,11 @@ impl Render for ShelluneView {
         // in the palette and at the text size the page will have (R7).
         if self.startup == startup::Startup::Splash {
             return self.startup_splash(window, cx);
+        }
+        // The capture's component catalogue takes the whole window (ADR-2).
+        #[cfg(feature = "ui-capture")]
+        if self.catalog_held {
+            return crate::app::catalog::design_catalog(self.metrics()).into_any_element();
         }
         // A field's focus is noted before a click can blur it. Opening an overlay then
         // still knows which field to restore, even when the click already moved focus.
@@ -18955,7 +18971,7 @@ impl Render for ShelluneView {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .h_full()
                     .children(header)
                     .children(notice)
@@ -19127,7 +19143,7 @@ fn tab_body(metrics: Metrics) -> Div {
         .flex()
         .flex_1()
         .items_center()
-        .min_w(px(0.0))
+        .min_w_0()
         .overflow_hidden()
         .gap(metrics.scale(spacing::TIGHT - 2.0))
 }
@@ -19174,7 +19190,7 @@ fn tab_title_label(
         .w(width)
         .flex_grow()
         .flex_shrink()
-        .min_w(px(0.0))
+        .min_w_0()
         .h(line)
         .debug_selector(move || selector.clone())
         .child(

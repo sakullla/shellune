@@ -786,7 +786,7 @@ impl ShelluneView {
                 .flex()
                 .items_center()
                 .gap(metrics.scale(spacing::HAIRLINE + 1.0))
-                .child(components::keycap(keys, metrics))
+                .child(components::kbd(keys, metrics))
                 .child(label)
         };
         // The palette is a dialog-level layer: the same surface as every dialog, and it
@@ -930,7 +930,7 @@ impl ShelluneView {
                     .flex_1()
                     .items_baseline()
                     .gap(metrics.scale(spacing::TIGHT))
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .child(
                         div()
                             .flex_none()
@@ -943,7 +943,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .truncate()
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(colors::TEXT_MUTED))
@@ -970,7 +970,7 @@ impl ShelluneView {
                 entry
                     .shortcut
                     .clone()
-                    .map(|shortcut| components::keycap(shortcut, metrics)),
+                    .map(|shortcut| components::kbd(shortcut, metrics)),
             )
     }
 
@@ -2131,7 +2131,7 @@ impl ShelluneView {
                 .children(jump.map(|shortcut| {
                     div()
                         .debug_selector(move || format!("tabs.list.jump.{index}"))
-                        .child(components::keycap(shortcut, metrics))
+                        .child(components::kbd(shortcut, metrics))
                 }))
                 .child(
                     components::icon_only_button(Icon::Pencil, metrics)
@@ -2180,7 +2180,7 @@ impl ShelluneView {
                 .flex()
                 .items_center()
                 .gap(metrics.scale(spacing::HAIRLINE + 1.0))
-                .child(components::keycap(keys, metrics))
+                .child(components::kbd(keys, metrics))
                 .child(label)
         };
         let footer = div()
@@ -2440,7 +2440,7 @@ impl ShelluneView {
                 .flex()
                 .items_center()
                 .gap(metrics.scale(spacing::TIGHT))
-                .min_w(px(0.0))
+                .min_w_0()
                 .child(
                     div()
                         .flex_none()
@@ -2450,7 +2450,7 @@ impl ShelluneView {
                 )
                 .child(
                     div()
-                        .min_w(px(0.0))
+                        .min_w_0()
                         .truncate()
                         .font_family(crate::app::terminal::monospace_family())
                         .text_size(metrics.caption_size())
@@ -2465,7 +2465,7 @@ impl ShelluneView {
             .id("terminal.paste.preview")
             .debug_selector(|| "terminal.paste.preview".to_owned())
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .max_h(px(220.0).min(window.viewport_size().height * 0.4))
             .overflow_y_scroll()
             .track_scroll(&self.paste_scroll)
@@ -2482,7 +2482,7 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .w_full()
-            .min_w(px(0.0))
+            .min_w_0()
             .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::LOOSE))
             .pb(metrics.scale(spacing::LOOSE))

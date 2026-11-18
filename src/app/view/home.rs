@@ -200,8 +200,8 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_1()
-            .when(!short, |col| col.min_h(px(0.0)))
-            .min_w(px(0.0))
+            .when(!short, |col| col.min_h_0())
+            .min_w_0()
             .gap(metrics.scale(spacing::TIGHT))
             .child(self.hosts_filters(&list, cx));
 
@@ -538,8 +538,8 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_1()
-            .min_w(px(0.0))
-            .when(!short, |col| col.min_h(px(0.0)))
+            .min_w_0()
+            .when(!short, |col| col.min_h_0())
             .gap(metrics.scale(spacing::TIGHT))
             .child(
                 div()
@@ -559,7 +559,7 @@ impl ShelluneView {
         let surface = components::card(metrics)
             .gap(px(0.0))
             .flex_1()
-            .when(!short, |col| col.min_h(px(0.0)))
+            .when(!short, |col| col.min_h_0())
             .p(metrics.scale(spacing::HAIRLINE))
             .debug_selector(|| "hosts.surface".to_owned());
         if empty {
@@ -577,8 +577,8 @@ impl ShelluneView {
             .flex()
             .flex_row()
             .flex_1()
-            .when(!short, |b| b.min_h(px(0.0)))
-            .min_w(px(0.0))
+            .when(!short, |b| b.min_h_0())
+            .min_w_0()
             .gap(metrics.scale(spacing::SNUG))
             // The number of rows is part of the selector, so a test can tell "the
             // search narrowed the list" from "the list did not change" without reading
@@ -619,7 +619,7 @@ impl ShelluneView {
             .flex_col()
             .flex_none()
             .w(metrics.scale(GROUP_COLUMN_WIDTH))
-            .min_h(px(0.0))
+            .min_h_0()
             .gap(metrics.scale(spacing::HAIRLINE))
             .debug_selector(|| "hosts.groups".to_owned())
             .child(
@@ -645,7 +645,7 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_1()
-            .min_h(px(0.0))
+            .min_h_0()
             .gap(metrics.scale(1.0))
             .overflow_y_scroll()
             .child(self.group_tree_all_row(cx));
@@ -1092,7 +1092,7 @@ impl ShelluneView {
         .track_scroll(self.hosts_scroll.clone())
         .flex_1()
         .min_h(min_list_height)
-        .min_w(px(0.0))
+        .min_w_0()
         .debug_selector(|| "hosts.rows".to_owned())
         .into_any_element()
     }
@@ -1415,7 +1415,7 @@ impl ShelluneView {
         let count = cards.len();
         for (number, card) in cards.into_iter().enumerate() {
             line = line.child(components::enter_in_turn(
-                div().flex().flex_1().min_w(px(0.0)).child(card),
+                div().flex().flex_1().min_w_0().child(card),
                 SharedString::from(format!("{selector}.enter.{number}")),
                 order + number,
             ));
@@ -1423,7 +1423,7 @@ impl ShelluneView {
         // A short line keeps the cards the width a full one gives them.
         if wide {
             for _ in count..per_line {
-                line = line.child(div().flex_1().min_w(px(0.0)));
+                line = line.child(div().flex_1().min_w_0());
             }
         }
         div()
@@ -1477,14 +1477,14 @@ impl ShelluneView {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .gap(metrics.scale(2.0))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap(metrics.scale(spacing::HAIRLINE))
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .child(
                                 div()
                                     .truncate()
@@ -1508,7 +1508,7 @@ impl ShelluneView {
                             .flex()
                             .items_center()
                             .gap(metrics.scale(spacing::HAIRLINE))
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_MUTED))
                             // One clamped line with an ellipsis rather than `truncate()`:
@@ -1522,7 +1522,7 @@ impl ShelluneView {
                                 div()
                                     .flex_1()
                                     .flex_basis(px(0.0))
-                                    .min_w(px(0.0))
+                                    .min_w_0()
                                     .overflow_hidden()
                                     .whitespace_normal()
                                     .text_ellipsis()
@@ -1614,7 +1614,7 @@ impl ShelluneView {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_w(px(0.0))
+                    .min_w_0()
                     .gap(metrics.scale(2.0))
                     .child(
                         div()
@@ -1741,7 +1741,7 @@ impl ShelluneView {
                             .flex()
                             .flex_col()
                             .flex_1()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .child(
                                 div()
                                     .truncate()
@@ -1760,7 +1760,7 @@ impl ShelluneView {
                             ),
                     )
                     .when(lit, |row| {
-                        row.child(components::keycap(ux.home_quick_enter, metrics))
+                        row.child(components::kbd(ux.home_quick_enter, metrics))
                     }),
             );
         }
@@ -1814,7 +1814,7 @@ impl ShelluneView {
                 components::field_row(ux.hosts_group_name_label, metrics).child(
                     div()
                         .flex_1()
-                        .min_w(px(0.0))
+                        .min_w_0()
                         .debug_selector(|| "hosts.group.name".to_owned())
                         .children(self.group_name_field.clone()),
                 ),
@@ -1844,7 +1844,7 @@ impl ShelluneView {
                     components::field_row(ux.hosts_group_destination_label, metrics).child(
                         div()
                             .flex_1()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .debug_selector(|| "hosts.group.destination".to_owned())
                             .children(self.group_destination_field.clone()),
                     ),
@@ -1958,7 +1958,7 @@ fn group_header_row(
                 .id(SharedString::from(format!("hosts.group.bar.{number}")))
                 .flex()
                 .flex_1()
-                .min_w(px(0.0))
+                .min_w_0()
                 .items_center()
                 .gap(metrics.scale(spacing::TIGHT))
                 .h(metrics.scale(32.0))
@@ -1991,7 +1991,7 @@ fn group_header_body(
     div()
         .flex()
         .flex_1()
-        .min_w(px(0.0))
+        .min_w_0()
         .items_center()
         .gap(metrics.scale(spacing::TIGHT))
         .child(
@@ -2008,7 +2008,7 @@ fn group_header_body(
         .child(
             div()
                 .flex_1()
-                .min_w(px(0.0))
+                .min_w_0()
                 .truncate()
                 .text_size(metrics.label_size())
                 .font_weight(FontWeight::SEMIBOLD)
@@ -2053,7 +2053,7 @@ fn host_row_element(
         .items_center()
         .gap(metrics.scale(spacing::SNUG))
         .w_full()
-        .min_w(px(0.0))
+        .min_w_0()
         .px(metrics.scale(spacing::SNUG))
         .rounded(px(radius::MEDIUM))
         .border_1()
@@ -2115,7 +2115,7 @@ fn host_row_element(
                         .items_center()
                         .justify_center()
                         .child(
-                            checkbox(selected, metrics)
+                            components::checkbox_target(selected, metrics)
                                 .when(!picking, |boxed| {
                                     boxed
                                         .opacity(0.0)
@@ -2137,14 +2137,14 @@ fn host_row_element(
                 .flex()
                 .flex_col()
                 .flex_1()
-                .min_w(px(0.0))
+                .min_w_0()
                 .gap(metrics.scale(2.0))
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-                        .min_w(px(0.0))
+                        .min_w_0()
                         .child(
                             div()
                                 .truncate()
@@ -2176,11 +2176,11 @@ fn host_row_element(
                         .flex()
                         .items_center()
                         .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-                        .min_w(px(0.0))
+                        .min_w_0()
                         .child(
                             components::copy_on_click(
                                 div()
-                                    .min_w(px(0.0))
+                                    .min_w_0()
                                     .truncate()
                                     .font_family(crate::app::terminal::monospace_family())
                                     .text_size(metrics.caption_size())
@@ -2194,7 +2194,7 @@ fn host_row_element(
                             div()
                                 .id(SharedString::from(format!("hosts.last.{number}")))
                                 .truncate()
-                                .min_w(px(0.0))
+                                .min_w_0()
                                 .text_size(metrics.caption_size())
                                 .text_color(theme::swatch(palette::TEXT_MUTED))
                                 .tooltip(components::tooltip(exact))
@@ -2286,16 +2286,21 @@ fn host_row_element(
     ));
     row = row.child(tools);
     row.child(
-        components::icon_label_button(Icon::Plug, strings.remote_connect, Variant::Soft, metrics)
-            .h(metrics.compact_control_height())
-            .text_size(metrics.caption_size())
-            .id(SharedString::from(format!("hosts.connect.{number}")))
-            .debug_selector(move || format!("hosts.connect.{number}"))
-            .tooltip(components::tooltip(ux.hosts_connect_hint))
-            .on_click(move |_event, _window, cx| {
-                cx.stop_propagation();
-                let _ = connect.update(cx, |view, cx| view.connect_saved_host(id, cx));
-            }),
+        components::icon_label_button(
+            Icon::Plug,
+            strings.remote_connect,
+            Variant::Secondary,
+            metrics,
+        )
+        .h(metrics.compact_control_height())
+        .text_size(metrics.caption_size())
+        .id(SharedString::from(format!("hosts.connect.{number}")))
+        .debug_selector(move || format!("hosts.connect.{number}"))
+        .tooltip(components::tooltip(ux.hosts_connect_hint))
+        .on_click(move |_event, _window, cx| {
+            cx.stop_propagation();
+            let _ = connect.update(cx, |view, cx| view.connect_saved_host(id, cx));
+        }),
     )
 }
 
@@ -2332,7 +2337,7 @@ fn connection_row_element(
         .items_center()
         .gap(metrics.scale(spacing::SNUG))
         .w_full()
-        .min_w(px(0.0))
+        .min_w_0()
         .px(metrics.scale(spacing::SNUG))
         .rounded(px(radius::MEDIUM))
         .border_1()
@@ -2366,14 +2371,14 @@ fn connection_row_element(
                 .flex()
                 .flex_col()
                 .flex_1()
-                .min_w(px(0.0))
+                .min_w_0()
                 .gap(metrics.scale(2.0))
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-                        .min_w(px(0.0))
+                        .min_w_0()
                         .child(
                             div()
                                 .truncate()
@@ -2397,7 +2402,7 @@ fn connection_row_element(
                         }),
                 )
                 .child(
-                    div().flex().items_center().min_w(px(0.0)).child(
+                    div().flex().items_center().min_w_0().child(
                         components::copy_on_click(
                             div()
                                 .truncate()
@@ -2487,7 +2492,7 @@ fn connection_row_element(
             components::icon_label_button(
                 Icon::Plug,
                 strings.remote_connect,
-                Variant::Soft,
+                Variant::Secondary,
                 metrics,
             )
             .h(metrics.compact_control_height())
@@ -2527,7 +2532,7 @@ fn tree_row_frame(chosen: bool, metrics: Metrics) -> Div {
 fn tree_row_label(label: String, chosen: bool, metrics: Metrics) -> Div {
     div()
         .flex_1()
-        .min_w(px(0.0))
+        .min_w_0()
         .truncate()
         .text_size(metrics.label_size())
         .when(chosen, |label| label.font_weight(FontWeight::MEDIUM))
@@ -2537,20 +2542,6 @@ fn tree_row_label(label: String, chosen: bool, metrics: Metrics) -> Div {
             palette::TEXT_SECONDARY
         }))
         .child(SharedString::from(label))
-}
-
-/// A selection box in a pointer-sized target: the shared [`components::checkbox_box`],
-/// lit by the pointer anywhere on its target.
-fn checkbox(checked: bool, metrics: Metrics) -> Div {
-    div()
-        .group(components::CHECK_GROUP)
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .size(metrics.hit_target())
-        .cursor_pointer()
-        .child(components::checkbox_box(checked, metrics))
 }
 
 /// The target a card draws: the SSH default port is left out, so the address keeps
@@ -2584,7 +2575,11 @@ fn home_card_frame(metrics: Metrics) -> Div {
         .px(metrics.scale(spacing::SNUG))
         .py(metrics.scale(spacing::TIGHT))
         .cursor_pointer()
-        .hover(move |style| style.border_color(hover_border).elevation(Elevation::Mid))
+        .hover(move |style| {
+            style
+                .border_color(hover_border)
+                .elevation(Elevation::Overlay)
+        })
 }
 
 /// The favourite mark of a row: a filled star that stays in view on a favourite, an
