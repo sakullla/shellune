@@ -25,6 +25,19 @@ static __inline char *sd_strdup(const char *text) {
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(SD_WITH_RDP) || defined(SD_WITH_VNC)
+/* macOS and Linux with the native libraries: every native prefix carries FreeRDP's
+ * WinPR, which implements the Win32 subset this shim is written against (critical
+ * sections, events, threads, interlocked operations, waits). Using it rather than a
+ * private pthread layer keeps one handle type, so a FreeRDP event handle and a shim
+ * thread handle go through the same WaitForSingleObject, and the sd_client layout
+ * is identical in every translation unit. */
+#include <winpr/wtypes.h>
+#include <winpr/handle.h>
+#include <winpr/interlocked.h>
+#include <winpr/synch.h>
+#include <winpr/sysinfo.h>
+#include <winpr/thread.h>
 #elif !defined(SD_WITH_RDP) && !defined(SD_WITH_VNC)
 #include <errno.h>
 #include <pthread.h>
@@ -177,8 +190,6 @@ static __inline void CloseHandle(HANDLE h) {
   free(h);
 }
 static __inline DWORD GetLastError(void) { return (DWORD)errno; }
-#else
-#error "The native desktop shim currently has a verified Windows implementation only."
 #endif
 
 #define SD_INPUT_QUEUE 256u

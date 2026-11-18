@@ -19,8 +19,13 @@
  * channel thread and are reported here as SD_NOTICE_DRIVE_REFUSED.
  */
 #ifdef SD_WITH_RDP
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
+#else
+/* WinPR's WSAStartup/WSACleanup: no-ops outside Windows. */
+#include <winpr/winsock.h>
+#endif
 #endif
 #include "sd_internal.h"
 

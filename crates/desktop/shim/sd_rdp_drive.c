@@ -9,8 +9,12 @@
  * code that ships rather than a copy of it.
  */
 #ifdef SD_WITH_RDP
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
+#else
+#include <winpr/winsock.h>
+#endif
 #endif
 #include "sd_internal.h"
 
@@ -28,7 +32,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if !defined(_WIN32)
+#include <dirent.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <winpr/string.h>
+#endif
+
+#if defined(_WIN32)
 static int32_t sd_drive_is_sep(WCHAR c) { return c == L'/' || c == L'\\'; }
+#endif
 
 int32_t sd_rdp_drive_check(const char *path) {
   if (path == NULL || path[0] == '\0') return SD_DRIVE_MISSING;
@@ -37,10 +50,36 @@ int32_t sd_rdp_drive_check(const char *path) {
    * another folder. Three units stay free for the separator it may add. */
   if (strlen(path) >= MAX_PATH) return SD_DRIVE_TOO_LONG;
   WCHAR wide[MAX_PATH];
+#if defined(_WIN32)
   int units = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, MAX_PATH);
+#else
+  /* WinPR's converter, which counts without the terminator and fails (-1) on
+   * invalid UTF-8. Sized first: it does not bound a short buffer. */
+  int units = 0;
+  SSIZE_T needed = ConvertUtf8ToWChar(path, NULL, 0);
+  if (needed >= 0 && needed < MAX_PATH) {
+    SSIZE_T converted = ConvertUtf8ToWChar(path, wide, MAX_PATH);
+    if (converted >= 0) units = (int)converted + 1;
+  }
+#endif
   if (units <= 1) return SD_DRIVE_NOT_ABSOLUTE;
   size_t length = (size_t)units - 1;
   if (length >= MAX_PATH - 3) return SD_DRIVE_TOO_LONG;
+#if !defined(_WIN32)
+  /* macOS and Linux: an absolute path. FreeRDP's own special values ("*" every
+   * mount, "%" home, "DynamicDrives") never start with '/'. */
+  if (path[0] != '/') return SD_DRIVE_NOT_ABSOLUTE;
+  struct stat info;
+  if (stat(path, &info) != 0) {
+    return errno == EACCES ? SD_DRIVE_NO_ACCESS : SD_DRIVE_MISSING;
+  }
+  if (!S_ISDIR(info.st_mode)) return SD_DRIVE_NOT_A_FOLDER;
+  /* Listing proves read access, as on Windows. */
+  DIR *listing = opendir(path);
+  if (listing == NULL) return SD_DRIVE_NO_ACCESS;
+  closedir(listing);
+  return 0;
+#else
   /* A drive letter path or a UNC share; FreeRDP's own special values ("*" every
    * drive, "%" home, "DynamicDrives") and the device namespaces ("\\?\", "\\.\")
    * are never accepted from here. */
@@ -72,6 +111,7 @@ int32_t sd_rdp_drive_check(const char *path) {
   }
   FindClose(listing);
   return 0;
+#endif
 }
 
 int32_t sd_rdp_drive_add(rdpSettings *settings, const char *name, const char *path) {

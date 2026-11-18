@@ -2,10 +2,15 @@
 """Build the pinned native desktop dependencies of Shellune.
 
 The RDP and VNC sessions in crates/desktop need two protocol libraries. This
-script builds both from source with MSVC into one prefix and writes the manifest
+script builds both from source into one prefix and writes the manifest
 crates/desktop/build.rs reads:
 
     target/native/dist/shellune-native.txt
+
+Three platforms are built: Windows x86_64 with MSVC, macOS arm64 and Linux x86_64
+with the system C compiler (clang on macOS, gcc or clang on Linux). The pins and
+patches are the same on every platform; only the toolchain, the archive names and
+the system libraries the manifest lists differ.
 
 What is pinned, and why:
 
@@ -34,10 +39,11 @@ the new one. `--self-test` checks that comparison without a toolchain or network
 the first run against a prefix built by an older version of this script rebuilds
 once, because those archives have no stamp yet.
 
-Nothing is downloaded at run time and no installed DLL is used: the shim links
-the static archives built here. Build prerequisites live in vendor/README.md -
-Visual Studio Build Tools (MSVC, CMake, Ninja) and, for OpenSSL, a Perl with its
-standard modules (portable Strawberry Perl works).
+Nothing is downloaded at run time and no installed shared library is used: the
+shim links the static archives built here. Build prerequisites live in
+vendor/README.md - on Windows Visual Studio Build Tools (MSVC, CMake, Ninja) and, for
+OpenSSL, a Perl with its standard modules (portable Strawberry Perl works); on macOS
+and Linux a C compiler, CMake, Ninja, make, Perl and git.
 
 Usage:
     python packaging/native/build_native.py
@@ -50,7 +56,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import http.client
+import os
 import pathlib
+import platform
 import shutil
 import subprocess
 import sys
@@ -60,6 +68,30 @@ import urllib.error
 import urllib.request
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+
+def host_platform() -> str:
+    """The platform this run builds for: windows, macos or linux."""
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    return sys.platform
+
+
+PLATFORM = host_platform()
+
+# The POSIX platforms this script builds, with OpenSSL's Configure target for each.
+# Anything else is refused instead of guessed at.
+OPENSSL_TARGETS = {
+    ("macos", "arm64"): "darwin64-arm64-cc",
+    ("linux", "x86_64"): "linux-x86_64",
+}
+# The oldest macOS the archives run on. Rust's aarch64-apple-darwin default is 11.0;
+# archives built for the runner's own (newer) version would make every link warn.
+MACOS_DEPLOYMENT_TARGET = "11.0"
 
 DEFAULT_BUILD_TOOLS = pathlib.Path(
     "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools"
@@ -256,6 +288,60 @@ CRYPTO_LIBRARIES = ["libssl", "libcrypto"]
 # zlibstatic, not zlib: the latter is the import library for a DLL we do not ship.
 ZLIB_LIBRARY = "zlibstatic"
 
+# The same archives on macOS and Linux: OpenSSL keeps its plain names there, and
+# zlib's static archive is libz.a.
+POSIX_CRYPTO_LIBRARIES = ["ssl", "crypto"]
+POSIX_ZLIB_LIBRARY = "z"
+
+# Options added on macOS and Linux. Each one keeps the build from picking up a
+# library that happens to be installed on the build machine, so the archives link
+# the same set of system libraries everywhere; the Windows build finds none of
+# these either. Position independent code because Rust links PIE executables.
+POSIX_COMMON_OPTIONS = ["-DCMAKE_POSITION_INDEPENDENT_CODE=ON"]
+MACOS_COMMON_OPTIONS = [
+    "-DCMAKE_OSX_ARCHITECTURES=arm64",
+    "-DCMAKE_OSX_DEPLOYMENT_TARGET=" + MACOS_DEPLOYMENT_TARGET,
+]
+POSIX_FREERDP_OPTIONS = [
+    "-DOPENSSL_USE_STATIC_LIBS=ON",
+    # No JSON, ICU, systemd, image or codec library: each would be a shared library
+    # the application then needs at run time.
+    "-DWITH_JSON_DISABLED=ON",
+    "-DWITH_AAD=OFF",
+    "-DWITH_UNICODE_BUILTIN=ON",
+    "-DWITH_TIMEZONE_ICU=OFF",
+    "-DWITH_SYSTEMD=OFF",
+    "-DWITH_CAIRO=OFF",
+    "-DWITH_JPEG=OFF",
+    "-DWITH_WEBP=OFF",
+    "-DWITH_OPUS=OFF",
+    "-DWITH_FDK_AAC=OFF",
+    "-DWITH_OPENH264=OFF",
+    "-DWITH_SNDIO=OFF",
+    "-DWITH_PKCS11=OFF",
+    "-DWITH_SMARTCARD_PCSC=OFF",
+]
+MACOS_FREERDP_OPTIONS = [
+    "-DWITH_APPLE_VIDEOTOOLBOX=OFF",
+    # The CoreAudio/AVFoundation sound and microphone backends, and the camera one:
+    # the shim never loads an audio or camera channel, and these would tie the link
+    # to AVFoundation and AudioToolbox.
+    "-DWITH_MACAUDIO=OFF",
+    "-DCHANNEL_RDPECAM_CLIENT=OFF",
+]
+POSIX_LIBVNC_OPTIONS = [
+    "-DOPENSSL_USE_STATIC_LIBS=ON",
+]
+# OpenSSL's Configure arguments on macOS and Linux, after the target name.
+OPENSSL_POSIX_FLAGS = [
+    "no-asm", "no-shared", "no-module", "no-tests", "no-docs", "no-apps", "-fPIC",
+]
+
+# What the static archives need from the system on macOS and Linux.
+LINUX_SYSTEM_LIBRARIES = ["pthread", "dl", "m", "rt"]
+MACOS_SYSTEM_LIBRARIES: list[str] = []
+MACOS_FRAMEWORKS = ["CoreFoundation", "Carbon", "IOKit", "Security"]
+
 # System libraries the static archives need on Windows.
 WINDOWS_SYSTEM_LIBRARIES = [
     "ws2_32",
@@ -290,6 +376,78 @@ def log(message: str) -> None:
     print("[native] " + message, flush=True)
 
 
+def archive_file(name: str, target: str | None = None) -> str:
+    """The file name of static archive `name`: foo.lib on Windows, libfoo.a elsewhere."""
+    if (target or PLATFORM) == "windows":
+        return name + ".lib"
+    return "lib" + name + ".a"
+
+
+def common_options(target: str) -> list[str]:
+    if target == "windows":
+        return []
+    if target == "macos":
+        return [*POSIX_COMMON_OPTIONS, *MACOS_COMMON_OPTIONS]
+    return list(POSIX_COMMON_OPTIONS)
+
+
+def freerdp_options(target: str) -> list[str]:
+    """FreeRDP's options on `target`. Windows uses FREERDP_OPTIONS unchanged."""
+    if target == "windows":
+        return list(FREERDP_OPTIONS)
+    options = [option for option in FREERDP_OPTIONS if "MSVC" not in option]
+    options.extend(common_options(target))
+    options.extend(POSIX_FREERDP_OPTIONS)
+    if target == "macos":
+        options.extend(MACOS_FREERDP_OPTIONS)
+    return options
+
+
+def libvnc_options(target: str) -> list[str]:
+    """LibVNCServer's options on `target`. Windows uses LIBVNC_OPTIONS unchanged."""
+    if target == "windows":
+        return list(LIBVNC_OPTIONS)
+    options = [option for option in LIBVNC_OPTIONS if "MSVC" not in option]
+    options.extend(common_options(target))
+    options.extend(POSIX_LIBVNC_OPTIONS)
+    return options
+
+
+def zlib_options(target: str) -> tuple[str, ...]:
+    return (*ZLIB_OPTIONS, *common_options(target))
+
+
+def openssl_options(target: str, machine: str | None = None) -> tuple[str, ...]:
+    """OpenSSL's Configure line on `target`; it is also the step's pin."""
+    if target == "windows":
+        return OPENSSL_OPTIONS
+    configure = OPENSSL_TARGETS.get((target, machine or platform.machine()), "unsupported")
+    options = ("Configure " + " ".join([configure, *OPENSSL_POSIX_FLAGS]),)
+    if target == "macos":
+        options += ("MACOSX_DEPLOYMENT_TARGET=" + MACOS_DEPLOYMENT_TARGET,)
+    return options
+
+
+def crypto_libraries(target: str) -> list[str]:
+    return list(CRYPTO_LIBRARIES) if target == "windows" else list(POSIX_CRYPTO_LIBRARIES)
+
+
+def zlib_library(target: str) -> str:
+    return ZLIB_LIBRARY if target == "windows" else POSIX_ZLIB_LIBRARY
+
+
+def system_libraries(target: str) -> list[str]:
+    if target == "windows":
+        return list(WINDOWS_SYSTEM_LIBRARIES)
+    if target == "macos":
+        return list(MACOS_SYSTEM_LIBRARIES)
+    return list(LINUX_SYSTEM_LIBRARIES)
+
+
+def frameworks(target: str) -> list[str]:
+    return list(MACOS_FRAMEWORKS) if target == "macos" else []
+
+
 def step_pin(name: str, spec: dict, options: list[str] | tuple[str, ...] = ()) -> str:
     """The identity of one build step: what it compiles and how."""
     parts = [name, str(spec.get("version", spec.get("tag", ""))), str(spec.get("commit", "")),
@@ -316,7 +474,7 @@ def already_built(dist: pathlib.Path, names: list[str], force: bool,
     """
     if force:
         return False
-    if not all((dist / "lib" / (name + ".lib")).is_file() for name in names):
+    if not all((dist / "lib" / archive_file(name)).is_file() for name in names):
         return False
     if step is None or pin is None:
         return True
@@ -356,6 +514,26 @@ def run_msvc(build_tools: pathlib.Path, work: pathlib.Path, name: str, lines: li
 
 def quoted(path: pathlib.Path) -> str:
     return '"' + path.as_posix() + '"'
+
+
+def run_logged(command: list[str], log_path: pathlib.Path, cwd: pathlib.Path | None = None) -> None:
+    """Runs a noisy command with its output appended to `log_path`.
+
+    A failure prints the end of the log before it stops the build, so a CI log says
+    why without holding every line of a successful OpenSSL build.
+    """
+    log(" ".join(str(part) for part in command) + " >> " + str(log_path))
+    with log_path.open("a", encoding="utf-8") as handle:
+        result = subprocess.run(command, cwd=cwd, stdout=handle, stderr=subprocess.STDOUT)
+    if result.returncode != 0:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        for line in lines[-60:]:
+            print(line, flush=True)
+        raise subprocess.CalledProcessError(result.returncode, command)
+
+
+def jobs() -> str:
+    return str(os.cpu_count() or 2)
 
 
 def fetch_external(work: pathlib.Path, name: str, spec: dict) -> pathlib.Path:
@@ -524,6 +702,88 @@ def build_zlib(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.Path
     record_built(dist, "zlib", pin)
 
 
+def build_zlib_posix(work: pathlib.Path, dist: pathlib.Path, force: bool) -> None:
+    options = zlib_options(PLATFORM)
+    pin = step_pin("zlib", EXTERNALS["zlib"], options)
+    if already_built(dist, [zlib_library(PLATFORM)], force, "zlib", pin):
+        log("zlib already installed")
+        return
+    source = fetch_external(work, "zlib", EXTERNALS["zlib"])
+    build = work / "build" / "zlib"
+    run(["cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", *options,
+         "-DCMAKE_INSTALL_PREFIX=" + str(dist), "-DINSTALL_LIB_DIR=" + str(dist / "lib")])
+    run(["cmake", "--build", str(build), "--target", "install"])
+    # zlib 1.3.1 always installs its shared library too. Nothing may link it: the
+    # prefix is a link search path, and a -lz from any crate would otherwise find it
+    # and tie the binary to this build directory.
+    for shared in [*(dist / "lib").glob("libz.so*"), *(dist / "lib").glob("libz*.dylib")]:
+        shared.unlink()
+    record_built(dist, "zlib", pin)
+
+
+def build_openssl_posix(work: pathlib.Path, dist: pathlib.Path, perl: str, force: bool) -> None:
+    options = openssl_options(PLATFORM)
+    pin = step_pin("openssl", EXTERNALS["openssl"], options)
+    if already_built(dist, crypto_libraries(PLATFORM), force, "openssl", pin):
+        log("openssl already installed")
+        return
+    configure = OPENSSL_TARGETS[(PLATFORM, platform.machine())]
+    source = fetch_external(work, "openssl", EXTERNALS["openssl"])
+    log_path = work / "openssl-build.log"
+    log_path.write_text("", encoding="utf-8")
+    run_logged([
+        perl, "Configure", configure, *OPENSSL_POSIX_FLAGS,
+        "--prefix=" + str(dist), "--openssldir=" + str(dist / "ssl"), "--libdir=lib",
+    ], log_path, cwd=source)
+    run_logged(["make", "-j" + jobs(), "build_libs"], log_path, cwd=source)
+    run_logged(["make", "install_dev"], log_path, cwd=source)
+    record_built(dist, "openssl", pin)
+
+
+def build_cmake_posix(work: pathlib.Path, dist: pathlib.Path, name: str,
+                      source: pathlib.Path, options: list[str]) -> pathlib.Path:
+    """Configures and builds one CMake project against the prefix, without installing."""
+    build = work / "build" / name
+    run([
+        "cmake", "-S", str(source), "-B", str(build), "-G", "Ninja",
+        "-DCMAKE_PREFIX_PATH=" + str(dist),
+        "-DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF",
+        "-DZLIB_LIBRARY=" + str(dist / "lib" / archive_file(zlib_library(PLATFORM))),
+        "-DZLIB_INCLUDE_DIR=" + str(dist / "include"),
+        "-DOPENSSL_ROOT_DIR=" + str(dist),
+        *options,
+    ])
+    run(["cmake", "--build", str(build), "--parallel", jobs()])
+    return build
+
+
+def build_freerdp_posix(work: pathlib.Path, dist: pathlib.Path, source: pathlib.Path,
+                        force: bool) -> pathlib.Path:
+    apply_freerdp_patches(source)
+    options = freerdp_options(PLATFORM)
+    pin = step_pin("freerdp", FREERDP, [*options, freerdp_patch_pin()])
+    if already_built(dist, FREERDP_LIBRARIES, force, "freerdp", pin):
+        log("freerdp already installed")
+        return work / "build" / "freerdp"
+    build = build_cmake_posix(work, dist, "freerdp", source, options)
+    collect_archives(build, dist, FREERDP_LIBRARIES)
+    record_built(dist, "freerdp", pin)
+    return build
+
+
+def build_libvnc_posix(work: pathlib.Path, dist: pathlib.Path, source: pathlib.Path,
+                       force: bool) -> pathlib.Path:
+    options = libvnc_options(PLATFORM)
+    pin = step_pin("libvncserver", LIBVNC, options)
+    if already_built(dist, LIBVNC_LIBRARIES, force, "libvncserver", pin):
+        log("libvncserver already installed")
+        return work / "build" / "libvncserver"
+    build = build_cmake_posix(work, dist, "libvncserver", source, options)
+    collect_archives(build, dist, LIBVNC_LIBRARIES)
+    record_built(dist, "libvncserver", pin)
+    return build
+
+
 def build_openssl(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.Path,
                   perl: str, force: bool) -> None:
     pin = step_pin("openssl", EXTERNALS["openssl"], OPENSSL_OPTIONS)
@@ -544,6 +804,11 @@ def build_openssl(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.P
             ">", quoted(log_path),
         ]),
         "nmake /nologo build_libs >> " + quoted(log_path),
+        # install_dev copies ossl_static.pdb unconditionally, but /Z7 (above) keeps the
+        # debug information in the objects, and newer MSVC releases (19.5x) then write
+        # no .pdb at all. An empty stand-in lets the install finish; the archives are
+        # the same either way, so the step's pin does not change.
+        "if not exist ossl_static.pdb copy /y nul ossl_static.pdb >nul",
         "nmake /nologo install_dev >> " + quoted(log_path),
     ])
     record_built(dist, "openssl", pin)
@@ -635,13 +900,79 @@ def collect_archives(build: pathlib.Path, dist: pathlib.Path, names: list[str]) 
     """Copies the static archives a build produced into the prefix."""
     lib_dir = dist / "lib"
     lib_dir.mkdir(parents=True, exist_ok=True)
-    wanted = {name.lower() for name in names}
     found: list[str] = []
+    if PLATFORM != "windows":
+        wanted = {archive_file(name): name for name in names}
+        for archive in build.rglob("lib*.a"):
+            if archive.name in wanted:
+                shutil.copy2(archive, lib_dir / archive.name)
+                found.append(wanted[archive.name])
+        return found
+    wanted = {name.lower() for name in names}
     for archive in build.rglob("*.lib"):
         if archive.stem.lower() in wanted:
             shutil.copy2(archive, lib_dir / archive.name)
             found.append(archive.stem)
     return found
+
+
+# The license text each linked library ships, copied to <dist>/licenses so a package
+# can carry it next to Shellune's own LICENSE: (file in the prefix, source tree,
+# file in that tree).
+THIRD_PARTY_LICENSES = [
+    ("FreeRDP-LICENSE.txt", "freerdp", "LICENSE"),
+    ("LibVNCServer-COPYING.txt", "libvncserver", "COPYING"),
+    ("OpenSSL-LICENSE.txt", "openssl", "LICENSE.txt"),
+    ("zlib-LICENSE.txt", "zlib", "LICENSE"),
+]
+LICENSES_DIR = "licenses"
+
+
+def write_licenses(work: pathlib.Path, dist: pathlib.Path) -> None:
+    """Copies the license of every library the manifest links into <dist>/licenses.
+
+    A missing text stops the run: a prefix whose package could not state the
+    licenses of what it links must not look finished.
+    """
+    target = dist / LICENSES_DIR
+    target.mkdir(parents=True, exist_ok=True)
+    for name, tree, relative in THIRD_PARTY_LICENSES:
+        source = work / "src" / tree / relative
+        if not source.is_file():
+            raise SystemExit("license text missing: " + str(source))
+        shutil.copyfile(source, target / name)
+    notice = [
+        "Shellune links these libraries statically for its RDP and VNC sessions.",
+        "",
+        "FreeRDP " + FREERDP["version"] + " (" + FREERDP["license"] + "): FreeRDP-LICENSE.txt",
+        "LibVNCServer " + LIBVNC["version"] + " (" + LIBVNC["license"]
+        + "): LibVNCServer-COPYING.txt",
+        "OpenSSL " + EXTERNALS["openssl"]["tag"] + " (" + EXTERNALS["openssl"]["license"]
+        + "): OpenSSL-LICENSE.txt",
+        "zlib " + EXTERNALS["zlib"]["tag"] + " (" + EXTERNALS["zlib"]["license"]
+        + "): zlib-LICENSE.txt",
+        "",
+        "Sources: the pinned upstream commits listed in vendor/README.md of the Shellune",
+        "source tree; FreeRDP carries the patches in packaging/native/patches.",
+    ]
+    (target / "README.txt").write_text("\n".join(notice) + "\n", encoding="utf-8")
+    log("wrote the third-party licenses to " + str(target))
+
+
+def prune(work: pathlib.Path) -> None:
+    """Deletes what a finished prefix no longer needs, before a CI cache saves it.
+
+    Object files and the verified tarballs go. The source trees (patched FreeRDP is
+    checked again on a re-run), the generated headers, the archives in the build trees
+    and the prefix stay, so a re-run with the same pins skips every step.
+    """
+    removed = 0
+    for path in work.rglob("*"):
+        if path.suffix in (".o", ".obj") and path.is_file():
+            path.unlink()
+            removed += 1
+    shutil.rmtree(work / "downloads", ignore_errors=True)
+    log("pruned " + str(removed) + " object files and the downloaded tarballs")
 
 
 def write_manifest(dist: pathlib.Path, include_dirs: list[pathlib.Path],
@@ -660,12 +991,15 @@ def write_manifest(dist: pathlib.Path, include_dirs: list[pathlib.Path],
         "# openssl=" + EXTERNALS["openssl"]["tag"] + " " + EXTERNALS["openssl"]["commit"]
         + " (" + EXTERNALS["openssl"]["license"] + ")",
     ]
-    lines.extend("# freerdp option " + option for option in FREERDP_OPTIONS)
-    lines.extend("# libvncserver option " + option for option in LIBVNC_OPTIONS)
+    lines.extend("# freerdp option " + option for option in freerdp_options(PLATFORM))
+    lines.extend("# libvncserver option " + option for option in libvnc_options(PLATFORM))
+    # build.rs refuses a prefix built for another platform than the one it compiles.
+    lines.append("platform=" + PLATFORM)
     lines.extend("include=" + str(directory) for directory in include_dirs)
     lines.append("lib_dir=" + str(dist / "lib"))
     lines.extend("lib=" + library for library in libraries)
-    lines.extend("syslib=" + library for library in WINDOWS_SYSTEM_LIBRARIES)
+    lines.extend("syslib=" + library for library in system_libraries(PLATFORM))
+    lines.extend("framework=" + name for name in frameworks(PLATFORM))
     lines.append("protocol=rdp")
     lines.append("protocol=vnc")
     target = dist / "shellune-native.txt"
@@ -685,7 +1019,7 @@ def self_test() -> int:
     try:
         dist = work / "dist"
         (dist / "lib").mkdir(parents=True)
-        (dist / "lib" / "zlibstatic.lib").write_bytes(b"archive")
+        (dist / "lib" / archive_file("zlibstatic")).write_bytes(b"archive")
         pin = step_pin("zlib", EXTERNALS["zlib"], ZLIB_OPTIONS)
         if already_built(dist, ["zlibstatic"], False, "zlib", pin):
             raise SystemExit("self-test: an archive without a stamp must not count as built")
@@ -715,10 +1049,44 @@ def self_test() -> int:
             else:
                 raise SystemExit("self-test: a failed native command must stop the build")
             assert not marker.exists(), "a later command ran after failure"
+        self_test_platforms()
         log("self-test passed: pin stamping decides skip versus rebuild as documented")
         return 0
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def self_test_platforms() -> None:
+    """The Windows build keeps its options, names and pins; the others differ only
+    where they must."""
+    if freerdp_options("windows") != FREERDP_OPTIONS:
+        raise SystemExit("self-test: the Windows FreeRDP options changed")
+    if libvnc_options("windows") != LIBVNC_OPTIONS:
+        raise SystemExit("self-test: the Windows LibVNCServer options changed")
+    if zlib_options("windows") != ZLIB_OPTIONS or openssl_options("windows") != OPENSSL_OPTIONS:
+        raise SystemExit("self-test: the Windows zlib or OpenSSL options changed")
+    if (crypto_libraries("windows") != CRYPTO_LIBRARIES
+            or zlib_library("windows") != ZLIB_LIBRARY
+            or system_libraries("windows") != WINDOWS_SYSTEM_LIBRARIES
+            or frameworks("windows")):
+        raise SystemExit("self-test: the Windows link line changed")
+    if archive_file("freerdp3", "windows") != "freerdp3.lib":
+        raise SystemExit("self-test: Windows archives are <name>.lib")
+    for target, machine in OPENSSL_TARGETS:
+        if archive_file("freerdp3", target) != "libfreerdp3.a":
+            raise SystemExit("self-test: " + target + " archives are lib<name>.a")
+        for options in (freerdp_options(target), libvnc_options(target), zlib_options(target)):
+            if any("MSVC" in option for option in options):
+                raise SystemExit("self-test: an MSVC option reached " + target)
+            if "-DCMAKE_POSITION_INDEPENDENT_CODE=ON" not in options:
+                raise SystemExit("self-test: " + target + " archives must be PIC for Rust")
+        configure = openssl_options(target, machine)[0]
+        if OPENSSL_TARGETS[(target, machine)] not in configure or "no-shared" not in configure:
+            raise SystemExit("self-test: " + target + " OpenSSL Configure line is wrong")
+    if "-DCMAKE_OSX_ARCHITECTURES=arm64" not in freerdp_options("macos"):
+        raise SystemExit("self-test: macOS builds arm64")
+    if not frameworks("macos") or frameworks("linux"):
+        raise SystemExit("self-test: frameworks are a macOS link item only")
 
 
 def main() -> int:
@@ -732,6 +1100,9 @@ def main() -> int:
                         help="Perl with its standard modules, needed by OpenSSL")
     parser.add_argument("--force", action="store_true",
                         help="rebuild steps whose archives are already installed")
+    parser.add_argument("--prune", action="store_true",
+                        help="after a successful build, delete object files and tarballs "
+                             "(for a CI cache); a re-run still skips every step")
     parser.add_argument("--self-test", action="store_true",
                         help="check the pin comparison logic and exit, no build")
     arguments = parser.parse_args()
@@ -739,12 +1110,14 @@ def main() -> int:
     if arguments.self_test:
         return self_test()
 
-    if sys.platform != "win32":
-        raise SystemExit(
-            "Only the Windows build is implemented and verified. macOS and Linux "
-            "builds of FreeRDP/LibVNCClient are not wired up; crates/desktop reports "
-            "the protocol as unavailable there instead of claiming support."
-        )
+    # CMake 4 refuses projects that declare a minimum below 3.5, which LibVNCServer
+    # 0.9.15 does. The environment form of the switch is used, not a -D option, so the
+    # step pins stay as they are; CMake 3 ignores it, and a project that already asks
+    # for 3.5 or later is not affected.
+    os.environ.setdefault("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
+
+    if PLATFORM != "windows":
+        return main_posix(arguments)
 
     work = pathlib.Path(arguments.work).resolve()
     dist = pathlib.Path(arguments.dist).resolve() if arguments.dist else work / "dist"
@@ -786,7 +1159,80 @@ def main() -> int:
     ]
     write_manifest(dist, [directory for directory in include_dirs if directory.is_dir()],
                    libraries)
+    write_licenses(work, dist)
+    if arguments.prune:
+        prune(work)
     log("done: " + ", ".join(libraries))
+    return 0
+
+
+# The link order on macOS and Linux. A Unix linker reads each archive once, in order,
+# so an archive comes before the archives it calls into: the client library and its
+# channel halves before FreeRDP, FreeRDP before WinPR, both protocol libraries before
+# OpenSSL and zlib.
+POSIX_LINK_ORDER = [
+    "freerdp-client3",
+    "remdesk-common",
+    "rdpsnd-common",
+    "freerdp3",
+    "winpr3",
+    "vncclient",
+    *POSIX_CRYPTO_LIBRARIES,
+    POSIX_ZLIB_LIBRARY,
+]
+
+
+def main_posix(arguments: argparse.Namespace) -> int:
+    """The macOS arm64 and Linux x86_64 build: same pins, the system C compiler."""
+    machine = platform.machine()
+    if (PLATFORM, machine) not in OPENSSL_TARGETS:
+        raise SystemExit(
+            "The native desktop build supports Windows x86_64, macOS arm64 and Linux "
+            "x86_64; this is " + PLATFORM + " " + machine + ". crates/desktop reports "
+            "the protocols as unavailable here instead of claiming support."
+        )
+    for tool in ["cmake", "ninja", "make", "git"]:
+        if shutil.which(tool) is None:
+            raise SystemExit(tool + " is needed to build the native desktop backends")
+    if PLATFORM == "macos":
+        # Every compiler this run starts, OpenSSL's included, targets the same macOS.
+        os.environ["MACOSX_DEPLOYMENT_TARGET"] = MACOS_DEPLOYMENT_TARGET
+
+    work = pathlib.Path(arguments.work).resolve()
+    dist = pathlib.Path(arguments.dist).resolve() if arguments.dist else work / "dist"
+    work.mkdir(parents=True, exist_ok=True)
+    dist.mkdir(parents=True, exist_ok=True)
+
+    # Sources first, as on Windows: a network or checksum failure stops the run
+    # before anything is compiled.
+    freerdp_source = ensure_source(work, FREERDP)
+    vnc_source = ensure_source(work, LIBVNC)
+
+    build_zlib_posix(work, dist, arguments.force)
+    build_openssl_posix(work, dist, arguments.perl, arguments.force)
+    freerdp_build = build_freerdp_posix(work, dist, freerdp_source, arguments.force)
+    vnc_build = build_libvnc_posix(work, dist, vnc_source, arguments.force)
+
+    missing = [
+        name for name in POSIX_LINK_ORDER if not (dist / "lib" / archive_file(name)).is_file()
+    ]
+    if missing:
+        raise SystemExit("missing archives after the build: " + ", ".join(missing))
+    include_dirs = [
+        dist / "include",
+        freerdp_source / "include",
+        freerdp_source / "winpr/include",
+        freerdp_build / "include",
+        freerdp_build / "winpr/include",
+        vnc_source / "include",
+        vnc_build / "include",
+    ]
+    write_manifest(dist, [directory for directory in include_dirs if directory.is_dir()],
+                   list(POSIX_LINK_ORDER))
+    write_licenses(work, dist)
+    if arguments.prune:
+        prune(work)
+    log("done: " + ", ".join(POSIX_LINK_ORDER))
     return 0
 
 

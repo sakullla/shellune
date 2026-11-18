@@ -6,6 +6,11 @@
 ;     makensis /DVERSION=0.4.8 /DBINARY=..\..\target\release\shellune.exe ^
 ;              /DOUTFILE=dist\Shellune-0.4.8-setup.exe packaging\windows\shellune.nsi
 ;
+; A build with the native RDP/VNC backends ships the license texts of the libraries
+; they link; pass the folder build_native.py wrote (the release workflow does):
+;
+;     makensis /DTHIRD_PARTY=..\..\target\native\dist\licenses ...
+;
 ; Optional code signing (only when a certificate exists):
 ;
 ;     makensis /DSIGNTOOL="C:\Program Files (x86)\Windows Kits\10\bin\x64\signtool.exe" ...
@@ -141,6 +146,11 @@ Section "Shellune" SecMain
   SetOutPath "$INSTDIR"
   File "${BINARY}"
   File "..\..\LICENSE"
+!ifdef THIRD_PARTY
+  SetOutPath "$INSTDIR\third-party"
+  File "${THIRD_PARTY}\*.txt"
+  SetOutPath "$INSTDIR"
+!endif
   WriteUninstaller "$INSTDIR\uninstall.exe"
   CreateShortcut "$SMPROGRAMS\Shellune.lnk" "$INSTDIR\shellune.exe"
   WriteRegStr HKCU "Software\Shellune" "InstallDir" "$INSTDIR"
@@ -177,6 +187,7 @@ FunctionEnd
 Section "Uninstall"
   Delete "$INSTDIR\shellune.exe"
   Delete "$INSTDIR\LICENSE"
+  RMDir /r "$INSTDIR\third-party"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
   Delete "$SMPROGRAMS\Shellune.lnk"

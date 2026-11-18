@@ -8,8 +8,20 @@
 
 #ifdef SD_WITH_VNC
 
+#if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#else
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+#endif
 
 #include <rfb/rfbclient.h>
 /* rfbLog/rfbLogProc live in the server header; the client header only includes the
@@ -39,10 +51,84 @@
 #define SD_HANDSHAKE_RECV_TIMEOUT_MS 30000u
 #define SD_PROBE_RECV_TIMEOUT_MS 2000u
 
+/* The few socket calls that differ between Winsock and BSD sockets. The socket is
+ * the type LibVNCClient's rfbSocket is on each platform (SOCKET on Windows, int
+ * elsewhere), so it can be handed to the library as is. */
+#if defined(_WIN32)
+typedef SOCKET sd_socket;
+typedef int sd_socklen;
+#define SD_INVALID_SOCKET INVALID_SOCKET
+#define SD_SHUT_BOTH SD_BOTH
+#define SD_ERR_INTR WSAEINTR
+#define SD_ERR_TIMEDOUT WSAETIMEDOUT
+#define sd_close_socket closesocket
+#define sd_socket_error() WSAGetLastError()
+#define sd_connect_pending(error) ((error) == WSAEWOULDBLOCK)
+#else
+typedef int sd_socket;
+typedef socklen_t sd_socklen;
+#define SD_INVALID_SOCKET (-1)
+#define SD_SHUT_BOTH SHUT_RDWR
+#define SD_ERR_INTR EINTR
+#define SD_ERR_TIMEDOUT ETIMEDOUT
+#define sd_close_socket close
+#define sd_socket_error() errno
+#define sd_connect_pending(error) ((error) == EINPROGRESS || (error) == EWOULDBLOCK)
+#endif
+
+static void sd_socket_blocking(sd_socket sock, int32_t blocking) {
+#if defined(_WIN32)
+  u_long nonblocking = blocking ? 0 : 1;
+  ioctlsocket(sock, FIONBIO, &nonblocking);
+#else
+  int flags = fcntl(sock, F_GETFL, 0);
+  if (flags < 0) return;
+  fcntl(sock, F_SETFL, blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK));
+#endif
+}
+
+/* Bounds each blocking recv on `sock`; 0 removes the bound. */
+static void sd_socket_recv_timeout(sd_socket sock, uint32_t ms) {
+#if defined(_WIN32)
+  DWORD recv_timeout = ms;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&recv_timeout,
+             (int)sizeof(recv_timeout));
+#else
+  struct timeval recv_timeout;
+  recv_timeout.tv_sec = (time_t)(ms / 1000u);
+  recv_timeout.tv_usec = (suseconds_t)((ms % 1000u) * 1000u);
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, (socklen_t)sizeof(recv_timeout));
+#endif
+}
+
+/* Waits up to `ms` for a pending connect to finish (writable) or fail. Returns > 0
+ * when it did, 0 on timeout, < 0 on error. */
+static int sd_socket_wait_connect(sd_socket sock, uint32_t ms) {
+#if defined(_WIN32)
+  fd_set writable;
+  fd_set failed;
+  FD_ZERO(&writable);
+  FD_ZERO(&failed);
+  FD_SET(sock, &writable);
+  FD_SET(sock, &failed);
+  struct timeval wait;
+  wait.tv_sec = 0;
+  wait.tv_usec = (long)ms * 1000;
+  return select(0, NULL, &writable, &failed, &wait);
+#else
+  /* poll, not select: a descriptor above FD_SETSIZE must not overrun an fd_set. */
+  struct pollfd entry;
+  entry.fd = sock;
+  entry.events = POLLOUT;
+  entry.revents = 0;
+  return poll(&entry, 1, (int)ms);
+#endif
+}
+
 typedef struct sd_vnc_session {
   sd_client *client;
   rfbClient *rfb;
-  SOCKET sock;
+  sd_socket sock;
   int32_t connected;
   int32_t limit_hit;
   /* Clipboard sharing for this attempt, copied from the configuration once. */
@@ -63,8 +149,12 @@ static BOOL CALLBACK sd_vnc_wsa_init(PINIT_ONCE once, PVOID param, PVOID *contex
   (void)once;
   (void)param;
   (void)context;
+#if defined(_WIN32)
   WSADATA data;
   sd_vnc_wsa_ready = WSAStartup(MAKEWORD(2, 2), &data) == 0 ? 1 : 0;
+#else
+  sd_vnc_wsa_ready = 1;
+#endif
   return TRUE;
 }
 
@@ -221,8 +311,8 @@ static rfbCredential *sd_vnc_credential(rfbClient *rfb, int credential_type) {
 
 /* Connects with our own timeout and cancel checkpoints, so an unreachable or
  * silent server cannot hold the worker past the deadline or a cancel. */
-static SOCKET sd_vnc_connect(sd_client *client, const char *host, uint16_t port,
-                             sd_vnc_session *session) {
+static sd_socket sd_vnc_connect(sd_client *client, const char *host, uint16_t port,
+                                sd_vnc_session *session) {
   struct addrinfo hints;
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_UNSPEC;
@@ -235,56 +325,46 @@ static SOCKET sd_vnc_connect(sd_client *client, const char *host, uint16_t port,
   int rc = getaddrinfo(host, service, &hints, &resolved);
   if (rc != 0 || resolved == NULL) {
     snprintf(session->reason, sizeof(session->reason), "could not resolve %s (%d)", host, rc);
-    return INVALID_SOCKET;
+    return SD_INVALID_SOCKET;
   }
 
-  SOCKET result = INVALID_SOCKET;
-  for (struct addrinfo *it = resolved; it != NULL && result == INVALID_SOCKET; it = it->ai_next) {
-    SOCKET sock = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-    if (sock == INVALID_SOCKET) continue;
-    u_long nonblocking = 1;
-    ioctlsocket(sock, FIONBIO, &nonblocking);
+  sd_socket result = SD_INVALID_SOCKET;
+  for (struct addrinfo *it = resolved; it != NULL && result == SD_INVALID_SOCKET;
+       it = it->ai_next) {
+    sd_socket sock = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+    if (sock == SD_INVALID_SOCKET) continue;
+    sd_socket_blocking(sock, 0);
 
-    int32_t connected = connect(sock, it->ai_addr, (int)it->ai_addrlen) == 0 ? 1 : 0;
-    int32_t last_error = WSAGetLastError();
-    if (!connected && last_error == WSAEWOULDBLOCK) {
+    int32_t connected = connect(sock, it->ai_addr, (sd_socklen)it->ai_addrlen) == 0 ? 1 : 0;
+    int32_t last_error = sd_socket_error();
+    if (!connected && sd_connect_pending(last_error)) {
       DWORD elapsed = 0;
       while (elapsed < SD_CONNECT_TIMEOUT_MS) {
         if (sd_is_cancelled(client)) {
-          last_error = WSAEINTR;
+          last_error = SD_ERR_INTR;
           break;
         }
-        fd_set writable;
-        fd_set failed;
-        FD_ZERO(&writable);
-        FD_ZERO(&failed);
-        FD_SET(sock, &writable);
-        FD_SET(sock, &failed);
-        struct timeval wait;
-        wait.tv_sec = 0;
-        wait.tv_usec = 100 * 1000;
-        int ready = select(0, NULL, &writable, &failed, &wait);
+        int ready = sd_socket_wait_connect(sock, 100);
         elapsed += 100;
         if (ready <= 0) continue;
         int32_t so_error = 0;
-        int length = sizeof(so_error);
+        sd_socklen length = sizeof(so_error);
         getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&so_error, &length);
         last_error = so_error;
         connected = so_error == 0 ? 1 : 0;
         break;
       }
-      if (!connected && last_error == 0) last_error = WSAETIMEDOUT;
+      if (!connected && last_error == 0) last_error = SD_ERR_TIMEDOUT;
     }
 
     if (connected) {
       int no_delay = 1;
       setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&no_delay, sizeof(no_delay));
-      nonblocking = 0;
-      ioctlsocket(sock, FIONBIO, &nonblocking);
+      sd_socket_blocking(sock, 1);
       result = sock;
       break;
     }
-    closesocket(sock);
+    sd_close_socket(sock);
     snprintf(session->reason, sizeof(session->reason), "connect to %s:%u failed (%d)", host,
              (unsigned)port, last_error);
   }
@@ -325,14 +405,12 @@ static int32_t sd_vnc_probe_rejects_our_security(sd_client *client, const char *
   if (host == NULL) return 0;
   sd_vnc_session scratch;
   memset(&scratch, 0, sizeof(scratch));
-  scratch.sock = INVALID_SOCKET;
+  scratch.sock = SD_INVALID_SOCKET;
 
-  SOCKET sock = sd_vnc_connect(client, host, port, &scratch);
-  if (sock == INVALID_SOCKET) return 0;
+  sd_socket sock = sd_vnc_connect(client, host, port, &scratch);
+  if (sock == SD_INVALID_SOCKET) return 0;
 
-  DWORD recv_timeout = SD_PROBE_RECV_TIMEOUT_MS;
-  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&recv_timeout,
-             (int)sizeof(recv_timeout));
+  sd_socket_recv_timeout(sock, SD_PROBE_RECV_TIMEOUT_MS);
 
   int32_t rejected = 0;
   char version[12];
@@ -362,8 +440,8 @@ static int32_t sd_vnc_probe_rejects_our_security(sd_client *client, const char *
       }
     }
   }
-  shutdown(sock, SD_BOTH);
-  closesocket(sock);
+  shutdown(sock, SD_SHUT_BOTH);
+  sd_close_socket(sock);
   return rejected;
 }
 
@@ -384,7 +462,7 @@ void sd_vnc_run(sd_client *client) {
     return;
   }
   session->client = client;
-  session->sock = INVALID_SOCKET;
+  session->sock = SD_INVALID_SOCKET;
 
   char *host = NULL;
   uint16_t port = 5900;
@@ -405,8 +483,8 @@ void sd_vnc_run(sd_client *client) {
   }
 
   int32_t failure = SD_FAILURE_NONE;
-  SOCKET sock = sd_vnc_connect(client, host, port, session);
-  if (sock == INVALID_SOCKET) {
+  sd_socket sock = sd_vnc_connect(client, host, port, session);
+  if (sock == SD_INVALID_SOCKET) {
     failure = sd_is_cancelled(client) ? SD_FAILURE_CANCELLED : SD_FAILURE_CONNECT;
     if (session->reason[0] == '\0') {
       snprintf(session->reason, sizeof(session->reason), "VNC connect failed");
@@ -488,11 +566,7 @@ void sd_vnc_run(sd_client *client) {
   /* One bounded recv per handshake step, so the read above cannot park the worker
    * forever if the abort's shutdown never reaches this socket. Cleared after the
    * peer has answered, below, because a live session reads whole messages. */
-  {
-    DWORD recv_timeout = SD_HANDSHAKE_RECV_TIMEOUT_MS;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&recv_timeout,
-               (int)sizeof(recv_timeout));
-  }
+  sd_socket_recv_timeout(sock, SD_HANDSHAKE_RECV_TIMEOUT_MS);
 
   rfbBool initialised = rfbInitClient(rfb, NULL, NULL);
 
@@ -505,7 +579,7 @@ void sd_vnc_run(sd_client *client) {
      * this session, so a stale SOCKET value cannot be handed to shutdown() after
      * Windows has recycled the number for the probe. */
     sd_backend_retire(client);
-    session->sock = INVALID_SOCKET;
+    session->sock = SD_INVALID_SOCKET;
     if (sd_is_cancelled(client)) {
       failure = SD_FAILURE_CANCELLED;
       snprintf(session->reason, sizeof(session->reason), "connect cancelled");
@@ -528,11 +602,7 @@ void sd_vnc_run(sd_client *client) {
     goto finish;
   }
 
-  {
-    DWORD recv_timeout = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&recv_timeout,
-               (int)sizeof(recv_timeout));
-  }
+  sd_socket_recv_timeout(sock, 0);
 
   /* rfbInitClient already requested the actual server dimensions. A second
    * request duplicates traffic and can exceed the server's smaller framebuffer. */
@@ -575,7 +645,7 @@ void sd_vnc_run(sd_client *client) {
   sd_backend_retire(client);
   session->connected = 0;
   /* rfbClientCleanup closes rfb->sock, which is the socket created above. */
-  session->sock = INVALID_SOCKET;
+  session->sock = SD_INVALID_SOCKET;
   rfbClientCleanup(rfb);
   session->rfb = NULL;
 
@@ -584,9 +654,9 @@ finish:
    * it clears the pointer (there is none by now in the normal case) and waits out
    * any reader, so client->backend never outlives the session it points at. */
   sd_backend_retire(client);
-  if (session->sock != INVALID_SOCKET) {
-    closesocket(session->sock);
-    session->sock = INVALID_SOCKET;
+  if (session->sock != SD_INVALID_SOCKET) {
+    sd_close_socket(session->sock);
+    session->sock = SD_INVALID_SOCKET;
   }
   free(host);
   free(session->framebuffer);
@@ -610,7 +680,7 @@ void sd_vnc_abort(sd_client *client) {
   if (session == NULL) return;
   /* shutdown, not closesocket: the worker still owns the handle and will close it
    * after its blocking read returns. */
-  if (session->sock != INVALID_SOCKET) shutdown(session->sock, SD_BOTH);
+  if (session->sock != SD_INVALID_SOCKET) shutdown(session->sock, SD_SHUT_BOTH);
   sd_backend_release(client);
 }
 

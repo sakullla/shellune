@@ -22,6 +22,8 @@ import shutil
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(REPO, "packaging"))
+import third_party  # noqa: E402
 
 INFO = {
     "CFBundleName": "Shellune",
@@ -42,6 +44,8 @@ def main():
     parser.add_argument("--binary", required=True)
     parser.add_argument("--version", default="0.4.8")
     parser.add_argument("--out", default=os.path.join(REPO, "dist"))
+    parser.add_argument("--require-native", action="store_true",
+                        help="fail unless the native RDP/VNC prefix and its licenses exist")
     args = parser.parse_args()
 
     binary = os.path.abspath(args.binary)
@@ -61,6 +65,8 @@ def main():
     shutil.copy2(binary, target)
     os.chmod(target, 0o755)
     shutil.copy2(os.path.join(REPO, "LICENSE"), os.path.join(resources, "LICENSE"))
+    # The libraries the RDP/VNC backends link, with their licenses.
+    third_party.copy_licenses(os.path.join(resources, third_party.FOLDER), args.require_native)
 
     info = {k: (args.version if v == "{version}" else v) for k, v in INFO.items()}
     with open(os.path.join(app, "Contents", "Info.plist"), "wb") as f:

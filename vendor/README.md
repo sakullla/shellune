@@ -202,8 +202,10 @@ License compatibility: LibVNCServer is GPL-2.0-or-later and this project is
 GPL-3.0-only, which covers it. FreeRDP and OpenSSL are Apache-2.0 and zlib is
 permissive; nothing here adds a distribution obligation beyond the licenses already
 listed. Because no source tree is kept in this repository, the license texts come
-from the fetched trees (`LICENSE` in FreeRDP, `COPYING` in LibVNCServer, both
-under `target/native/src/<name>/`); packaging that ships a binary must include them.
+from the fetched trees (`LICENSE` in FreeRDP, `COPYING` in LibVNCServer,
+`LICENSE.txt` in OpenSSL, `LICENSE` in zlib, under `target/native/src/<name>/`);
+`build_native.py` copies all four into `target/native/dist/licenses/` and every
+package ships that folder as `third-party` (see `packaging/README.md`).
 
 ### Building
 
@@ -221,6 +223,16 @@ repository.
 
     python packaging/native/build_native.py --perl C:/Strawberry/perl/bin/perl.exe
 
+Prerequisites on macOS (arm64) and Linux (x86_64): the system C compiler (Xcode's
+clang; gcc or clang), CMake, Ninja, make, Perl, git and Python 3, and the same
+network access. On Debian or Ubuntu: `apt install build-essential cmake ninja-build
+perl git python3`; on macOS: `brew install cmake ninja`.
+
+    python3 packaging/native/build_native.py
+
+Other platforms (an Intel Mac, Linux on arm64) are refused with a message: nothing
+has been built or tested there.
+
 That is the whole reproduction: on an empty `target/native` it downloads, verifies,
 unpacks and builds zlib, OpenSSL, FreeRDP and LibVNCServer. Failures are reported per
 step and are not skipped: a network error, a sha256 mismatch (with the expected and
@@ -228,6 +240,8 @@ the actual digest) and an unusable archive each print their own message, and a
 mismatch stops before anything is compiled. Verified tarballs stay in
 `target/native/downloads/` and unpacked trees in `target/native/src/`, so a repeat run
 re-uses them; `--force` rebuilds a step whose archives are already installed.
+`--prune` deletes object files and the tarballs after a successful build, which is
+what CI caches; a re-run with the same pins still skips every step.
 
 The options are fixed in the script and copied into the manifest, so a built prefix
 records how it was made:
@@ -241,12 +255,39 @@ records how it was made:
 * OpenSSL: static, `no-asm`, `no-tests`, `no-apps`, built with `/MD` so it shares the C runtime
   Rust links against - a `/MT` libcrypto would put two heaps in one process.
 
+On macOS and Linux the same pins and patches are built with the same options, minus
+the MSVC runtime switch, plus:
+
+* every archive position independent (Rust links PIE executables) and, on macOS,
+  arm64 for macOS 11.0, Rust's own minimum for that target;
+* FreeRDP: JSON, ICU (built-in Unicode conversion instead), systemd, Cairo, JPEG,
+  WebP, Opus, FDK-AAC, OpenH264, sndio, PKCS#11, PC/SC and, on macOS, VideoToolbox,
+  the CoreAudio/AVFoundation sound and microphone backends and the camera channel
+  off, and OpenSSL taken from the prefix as static archives. Each of these would
+  otherwise be found on the build machine and become a shared library the
+  application needs at run time; none is found on Windows either.
+* OpenSSL: `Configure linux-x86_64` or `darwin64-arm64-cc` with `-fPIC`.
+* zlib's shared library, which its build always installs, is deleted from the prefix
+  so nothing can link it by accident.
+
+The manifest then lists the archives in link order (a Unix linker reads each once)
+and the system libraries: `pthread`, `dl`, `m`, `rt` on Linux; the CoreFoundation,
+Carbon, IOKit and Security frameworks on macOS. It also names the platform it was
+built for, and `crates/desktop/build.rs` refuses a prefix built for another one. On
+macOS and Linux the shim reaches threads, events and critical sections through
+WinPR, which FreeRDP builds into every prefix, and uses BSD sockets for VNC.
+
 ### What is and is not verified
 
 | platform | build | run |
 | --- | --- | --- |
-| Windows x86_64 | built here, repeatedly, from the pinned sources | shim and wrapper tests run against scripted peers; no real RDP or VNC server exists on this machine |
-| macOS, Linux | not wired up | not claimed: `crates/desktop` reports both protocols as unavailable there |
+| Windows x86_64 | built on the development machine (MSVC 19.44) and in CI (`windows-latest`, MSVC 19.5x) | `tests/desktop_native.rs` against scripted peers, on that machine and in CI |
+| macOS arm64 | built in CI only (`macos-latest`, Xcode clang); no Mac was available | `tests/desktop_native.rs` in CI |
+| Linux x86_64 | built on Debian 13 (gcc, WSL) and in CI (`ubuntu-22.04`) | `tests/desktop_native.rs` on Debian and in CI |
+
+CI (`.github/workflows/ci.yml`) builds the libraries on all three before cargo and
+runs the native tests with `SHELLUNE_REQUIRE_NATIVE=1`, so a missing backend fails
+there instead of being skipped. No real RDP or VNC server is involved anywhere.
 
 The shim's own header (`crates/desktop/shim/shellune_desktop_shim.h`) states the ABI
 promises; `tests/desktop_native.rs` checks the struct layout from both sides and exercises

@@ -10,7 +10,9 @@
 //! reported as unverified until it actually runs.
 //!
 //! When the native libraries were not built, every test here reports SKIP and says
-//! which command produces them. Nothing is faked into a pass.
+//! which command produces them. Nothing is faked into a pass. With
+//! `SHELLUNE_REQUIRE_NATIVE=1` (set by CI, which builds them first) a missing backend
+//! fails instead, so a broken native build cannot pass as a row of skips.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -35,6 +37,12 @@ fn backends_built() -> bool {
         match backend_info(protocol) {
             Ok(info) => eprintln!("backend {protocol:?}: {info}"),
             Err(Error::Unavailable(reason)) => {
+                if std::env::var_os("SHELLUNE_REQUIRE_NATIVE").is_some_and(|value| value == "1") {
+                    panic!(
+                        "{protocol:?} is not built ({reason}), and SHELLUNE_REQUIRE_NATIVE=1 \
+                         says it must be"
+                    );
+                }
                 eprintln!(
                     "SKIP: {protocol:?} is not built here ({reason}); run                      packaging/native/build_native.py"
                 );
@@ -46,12 +54,20 @@ fn backends_built() -> bool {
     built
 }
 
-/// A port nothing is listening on: bind, note the number, then close.
+/// A port nothing is listening on.
+///
+/// Port 1 (tcpmux) is unused on every machine this runs on and lies below the
+/// ephemeral range, so no scripted peer of a test running in parallel can be handed
+/// it. A port taken from the ephemeral range and released again can be: a Windows CI
+/// runner gave one to a silent peer, and the "closed" port then accepted.
 fn a_closed_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a probe port");
-    let port = listener.local_addr().expect("probe address").port();
-    drop(listener);
-    port
+    const CLOSED: u16 = 1;
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], CLOSED));
+    assert!(
+        TcpStream::connect_timeout(&address, Duration::from_secs(5)).is_err(),
+        "something listens on 127.0.0.1:{CLOSED}; these tests need it closed"
+    );
+    CLOSED
 }
 
 fn pump(
@@ -1218,26 +1234,24 @@ fn the_patched_drive_channel_keeps_the_server_inside_the_mapped_folder() {
     std::fs::create_dir_all(&outside).expect("outside folder");
     std::fs::write(outside.join("secret.txt"), b"secret").expect("outside file");
     std::fs::write(base.join("f.txt"), b"mine").expect("inside file");
-    // A junction needs no privilege, unlike a symbolic link.
-    let made = std::process::Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
-        .arg(base.join("out"))
-        .arg(&outside)
-        .output()
-        .expect("run mklink");
-    assert!(made.status.success(), "mklink /J: {made:?}");
+    link_folder(&outside, &base.join("out"));
     let base_text = base.to_str().expect("utf-8 temp path").to_owned();
     let open = |path: &str| open_status(&base_text, path, FILE_OPEN, 0);
+    // Windows and a default macOS volume ignore case; a Linux file system does not,
+    // and there a differently spelled name is simply another, missing, file.
+    let case_blind = base.join("F.TXT").exists();
 
     // Ordinary use of the folder is served.
-    for path in ["\\", "\\f.txt", "/f.txt", "\\inside", "\\F.TXT"] {
+    for path in ["\\", "\\f.txt", "/f.txt", "\\inside"] {
         assert_eq!(open(path), STATUS_SUCCESS, "{path:?} is inside");
     }
-    // Through the junction: refused, however it is spelled.
+    if case_blind {
+        assert_eq!(open("\\F.TXT"), STATUS_SUCCESS, "\\F.TXT is inside");
+    }
+    // Through the link: refused, however it is spelled.
     for path in [
         "\\out",
         "\\out\\secret.txt",
-        "\\OUT\\SECRET.TXT",
         "/out/secret.txt",
         "\\\\out\\\\secret.txt",
     ] {
@@ -1246,6 +1260,11 @@ fn the_patched_drive_channel_keeps_the_server_inside_the_mapped_folder() {
             STATUS_ACCESS_DENIED,
             "{path:?} resolves outside"
         );
+    }
+    if case_blind {
+        assert_eq!(open("\\OUT\\SECRET.TXT"), STATUS_ACCESS_DENIED);
+    } else {
+        assert_ne!(open("\\OUT\\SECRET.TXT"), STATUS_SUCCESS);
     }
     // FreeRDP's own ".." refusal still holds, and a device name never opens.
     for path in [
@@ -1355,15 +1374,48 @@ fn the_patched_drive_channel_keeps_the_server_inside_the_mapped_folder() {
     assert!(base.join("inside").join("moved.txt").exists());
 
     // A symbolic link is refused like the junction, where this account may make one.
-    if std::os::windows::fs::symlink_file(outside.join("secret.txt"), base.join("link.txt")).is_ok()
-    {
+    if link_file(&outside.join("secret.txt"), &base.join("link.txt")) {
         assert_eq!(open("\\link.txt"), STATUS_ACCESS_DENIED);
     }
 
-    // The junction itself goes, its target stays: rmdir removes only the link.
-    let _ = std::fs::remove_dir(base.join("out"));
+    // The link itself goes, its target stays.
+    unlink_folder(&base.join("out"));
     assert!(outside.join("secret.txt").exists());
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Makes `link` a link to the folder `target`: a junction on Windows, which needs no
+/// privilege unlike a symbolic link, and a symbolic link elsewhere.
+fn link_folder(target: &std::path::Path, link: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("run mklink");
+        assert!(made.status.success(), "mklink /J: {made:?}");
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).expect("symbolic link to the folder");
+}
+
+/// Removes a link made by `link_folder`, never what it points at.
+fn unlink_folder(link: &std::path::Path) {
+    #[cfg(windows)]
+    let _ = std::fs::remove_dir(link);
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(link);
+}
+
+/// Makes `link` a symbolic link to the file `target`; false when this account may not.
+fn link_file(target: &std::path::Path, link: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(target, link);
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(target, link);
+    made.is_ok()
 }
 
 /// The folder is checked before it is offered, and each refusal says why.
