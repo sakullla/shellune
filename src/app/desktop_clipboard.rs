@@ -139,8 +139,9 @@ pub fn local_item(entries: &[ClipboardEntry]) -> Option<ClipboardItem> {
 /// an item with neither.
 ///
 /// Text is compared with its line breaks unified, because each side writes them its
-/// own way. A platform may read back only part of what was written (Windows reads
-/// the text or the image of an item, not both), so the pane compares parts, see
+/// own way. A platform may read back only part of what was written - a write carries
+/// text, PNG and DIB, while a read returns at most one text and one image, and an
+/// image may come back in another encoding - so the pane compares parts, see
 /// [already_shared].
 #[must_use]
 pub fn prints(item: &ClipboardItem) -> Vec<u64> {

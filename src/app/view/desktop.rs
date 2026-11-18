@@ -840,10 +840,16 @@ impl DesktopPane {
             return;
         };
         self.shared = desktop_clipboard::prints(&item);
+        let before = clipboard_generation();
         cx.write_to_clipboard(item);
         // What is on the clipboard now is what was just shared; reading it back
-        // would only find that out again.
-        self.read_generation = clipboard_generation();
+        // would only find that out again. The write reports no failure, so only a
+        // number that moved proves it landed: a clipboard another program held open
+        // keeps its old content, which must still be read and offered later.
+        let after = clipboard_generation();
+        if after != before {
+            self.read_generation = after;
+        }
     }
 
     /// Offers this computer's clipboard to the remote side, unless it is what was
@@ -870,10 +876,13 @@ impl DesktopPane {
         if generation.is_some() && generation == self.read_generation {
             return false;
         }
-        self.read_generation = generation;
+        // The number is kept only once the read succeeded: a clipboard another
+        // program holds open reads as nothing, and remembering its number then would
+        // skip that content for good instead of reading it on the next try.
         let Some(item) = cx.read_from_clipboard() else {
             return false;
         };
+        self.read_generation = generation;
         let prints = desktop_clipboard::prints(&item);
         if prints.is_empty() || desktop_clipboard::already_shared(&prints, &self.shared) {
             return false;
