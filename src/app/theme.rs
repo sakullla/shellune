@@ -1068,6 +1068,64 @@ where
         .into_any_element()
 }
 
+/// Fades `element` in over `duration` while it travels `travel` logical pixels into
+/// place (positive: from below), whatever the motion setting.
+///
+/// It is for the few arrivals that keep a fade under reduced motion - the start page
+/// and the page it hands over to (R3) - where the caller has already chosen the travel
+/// for the motion the window draws with: zero for reduced motion, so only the fade is
+/// left.
+pub fn arrive<E>(
+    element: E,
+    id: impl Into<ElementId>,
+    duration: Duration,
+    travel: f32,
+) -> AnyElement
+where
+    E: IntoElement + Styled + 'static,
+{
+    arrive_after(element, id, Duration::ZERO, duration, travel)
+}
+
+/// [`arrive`] that waits `delay` before it starts, drawn invisible and in its starting
+/// place meanwhile: the second of two pieces that arrive one after the other (R3).
+pub fn arrive_after<E>(
+    element: E,
+    id: impl Into<ElementId>,
+    delay: Duration,
+    duration: Duration,
+    travel: f32,
+) -> AnyElement
+where
+    E: IntoElement + Styled + 'static,
+{
+    let total = delay + duration;
+    let wait = delay.as_secs_f32() / total.as_secs_f32().max(f32::EPSILON);
+    element
+        .with_animation(
+            id,
+            Animation::new(total)
+                .with_easing(move |progress: f32| delayed_ease_out(progress, wait)),
+            move |element, delta| {
+                let mut element = element.opacity(delta);
+                if travel != 0.0 {
+                    travel_by(element.style(), px(travel * (1.0 - delta)));
+                }
+                element
+            },
+        )
+        .into_any_element()
+}
+
+/// The entrance curve over the part of an animation after its first `wait` share:
+/// 0 until then, then ease-out-cubic to 1.
+#[must_use]
+pub fn delayed_ease_out(progress: f32, wait: f32) -> f32 {
+    let wait = wait.clamp(0.0, 1.0);
+    let local = ((progress - wait) / (1.0 - wait).max(f32::EPSILON)).clamp(0.0, 1.0);
+    ease_out()(local)
+}
+
 /// Moves a styled element `offset` down (negative: up) without changing its position
 /// type. See [`enter`].
 fn travel_by(style: &mut gpui::StyleRefinement, offset: Pixels) {
@@ -2371,6 +2429,20 @@ mod tests {
         assert!(ease(0.5) > 0.5, "the entrance decelerates");
         // Ease-out-cubic: 1 - (1 - t)^3.
         assert!((ease(0.5) - 0.875).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_delayed_entrance_holds_still_then_follows_the_same_curve() {
+        let wait = 40.0 / 340.0;
+        assert!(super::delayed_ease_out(0.0, wait).abs() < f32::EPSILON);
+        assert!(super::delayed_ease_out(wait, wait).abs() < f32::EPSILON);
+        assert!((super::delayed_ease_out(1.0, wait) - 1.0).abs() < f32::EPSILON);
+        let halfway = wait + (1.0 - wait) / 2.0;
+        assert!((super::delayed_ease_out(halfway, wait) - 0.875).abs() < 1e-5);
+        assert!(
+            (super::delayed_ease_out(0.5, 0.0) - super::ease_out()(0.5)).abs() < f32::EPSILON,
+            "without a wait it is the plain entrance"
+        );
     }
 
     #[test]

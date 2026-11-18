@@ -740,33 +740,61 @@ COM1 等）不算文件夹里的文件。不满足的一律 `ERROR_ACCESS_DENIED
 `connection-rdp-edit` 与 `connection-vnc-edit` 打开的是预先写入的 RDP / VNC 记录的编辑表单，只证明剪贴板勾选框、映射文件夹
 输入框（含浏览按钮与说明）画在哪里、写了什么，不证明任何映射或剪贴板真的生效。
 
-### 1.5 启动过场（R7，`view/startup.rs`）
+### 1.5 启动：四个真实阶段与进度（R3，ADR-4，`view/startup.rs`）
 
-启动时窗口先打开、后读数据，首帧就是品牌过场，而不是等所有文件读完才出现的首页。
+启动时窗口先打开、后读数据，首帧就是启动页：canvas 上居中的应用图标与产品名，下面一根细进度条和一行当前阶段说明。
+进度条只跟随真实完成的阶段，不靠计时器假装前进。
 
-- **阶段**：`ShelluneView` 有 `Startup { Splash, Ready }`。`open_main_window` 用 `ShelluneView::launching` 建视图：
-  构造前只同步读 `preferences.json`（一个小文件；它决定首帧的配色、语言、文字大小、动效与快捷键），其余——主机、
-  分组、信任文件、端口转发与 `workspace.json`——在后台执行器读取（`StartupStores::read`），读完回到主线程按与同步
-  启动相同的顺序采纳（先主机后布局，缺失主机的窗格照常标记）。
+- **四个阶段**（`StartupStage`，按顺序执行，每个阶段结束都在主线程上报一次 `report_stage`）：
+
+  | # | 阶段 | 读什么 | 在哪执行 | 阶段说明（英 / 中） |
+  |---|---|---|---|---|
+  | 1 | Settings | `preferences.json`（配色、语言、文字大小、动效、快捷键） | 构造视图时同步读取（首帧要用） | Reading settings and theme / 正在读取设置与主题 |
+  | 2 | Hosts | 主机簿 `hosts.json` 与已知主机 `known_hosts.json` | 后台执行器 | Reading hosts and known servers / 正在读取主机簿与已知主机 |
+  | 3 | Workspace | 端口转发、分组树、`workspace.json` | 后台执行器 | Reading forwards, groups and workspace / 正在读取转发、分组与工作区 |
+  | 4 | Interface | 终端等宽字体解析并量一次字宽（预热）；启动页已画出一帧 | 字体在后台；首帧由 render 记下 | Preparing the interface / 正在准备界面 |
+
+  四个阶段都结束后显示 “Ready / 准备就绪”。读到的结果先存在 `StartupRun` 里，启动结束时才按与同步启动相同的顺序采纳
+  （主机 → 分组 → 信任 → 转发 → 布局；先主机后布局，缺失主机的窗格照常标记）。
+- **进度条**：第 i 个阶段结束后目标为 i/4（`StartupRun::target`）。条用 `components::progress_bar_toward`，从上一个目标
+  以 `Motion::BASE` 200ms、ease-out-cubic 缓动到新目标；宽 200（随缩放，窄窗时不超过可用宽度），`startup.progress`。
+  阶段说明为 caption 字号、次要文字色，每换一个阶段以 `Motion::FAST` 淡入（`startup.stage`）。
+- **品牌时刻**：图标从 96% 大小放大到 100%，整组淡入，用时 `BRAND_ENTRANCE` 250ms（`startup.splash.mark`、
+  `startup.splash.brand`、`startup.splash.name`）。计时从构造视图时开始；阶段比它慢就等阶段，比它快也不额外等待。
+  产品标语不再出现在启动页（保留在“关于”页）。
+- **进入首页**：阶段全部完成且品牌时刻已过时进入 Ready。启动页作为一层只读画面（全满的进度条与 “Ready”）在
+  `SPLASH_EXIT` 200ms 内淡出（`startup.crossfade`，不接收指针，首页从第一帧就可点击）；同时首页内容区（标签栏下方的
+  `destination_panel`）在 `PAGE_ENTRANCE` 300ms 内淡入并从下方 `PAGE_TRAVEL` 8px 上移到位（`theme::arrive`）。
+- **减少动效**（用户偏好或系统设置，`Choreography::for_motion`）：只保留淡入淡出——图标不缩放、首页不位移、进度条直接
+  跳到目标值；品牌时刻（250ms 淡入）、启动页淡出与首页淡入照常。系统设置要靠辅助程序回答的平台（Linux，
+  `SYSTEM_MOTION_QUERY_BLOCKS`）在后台询问，回答到达前只画 canvas 与标题行，最多等 `SYSTEM_MOTION_WAIT`（400ms），
+  品牌时刻从回答到达（或超时）时开始计时；超时按用户自己的偏好继续，迟到的回答仍用于之后的帧。Windows 与 macOS 同步读取。
+- **阶段失败**：阶段 1 在 `preferences.json` 存在但不是可读的设置文件时失败（默认设置照常生效）；阶段 2、3 在任一文件读取
+  失败时失败（原因取存储层给出的第一条）；阶段 4 不会失败（字体缺失时终端本就按比例回退）。失败时启动页停在该阶段：
+  进度条停在该阶段开始处，下方是危险色标题（`startup.failure.title`，如“无法读取主机簿”）、完整原因（换行，
+  `startup.failure.reason`）、一句说明（`startup.failure.hint`）和两个按钮：
+  - **继续**（主按钮，`startup.continue`；启动页有焦点时 Enter 同效）：剩余阶段继续执行，之后的失败不再停下；进入首页后
+    读不到的部分按原有降级显示（例如首页的 `state.card` 与原因）。
+  - **打开配置文件夹**（`startup.open_folder`）：以 `file://` 地址（`folder_url`，百分号编码）交给系统文件管理器打开数据目录；
+    启动页仍等待“继续”。
+  停下的启动页不会自行超时，也不会闪退。200% 文字的 720×480 窗口里失败内容高于可用区域时，启动页主体可滚动，按钮总能滚到
+  可见处（测试）。
+- **阶段耗时**：开发构建（`debug_assertions`）或设置了环境变量 `SHELLUNE_STARTUP_LOG` 的任意构建，在 stderr 逐个写出
+  `shellune start: stage i/4 <阶段>: <毫秒>`，最后写出 `page shown after <毫秒>`（从构造视图算起）。单元测试不输出。
+  本机实测（Windows，开发构建，真实数据副本：主机簿 8.4KB、已知主机 6KB，三次）：阶段 1 约 1.2ms、阶段 2 约 8ms、
+  阶段 3 约 6ms、阶段 4 约 1–4ms；四个阶段合计约 17ms，首页在约 255ms 出现，即由 250ms 品牌时刻决定。
 - **推迟到 Ready 的工作**：任务中心的存储与中断恢复（`batch.recover`）、自动同步的首次拉取（`start_sync`）、
-  更新清理与 20 秒后的检查（`start_updates`）、工作区布局恢复，都在采纳之后由 `begin_work` 一次启动；过场期间
+  更新清理与 20 秒后的检查（`start_updates`）、工作区布局恢复，都在采纳之后由 `begin_work` 一次启动；启动期间
   `layout_persist` 为关，不会把空布局写回 `workspace.json`。
-- **画面**：canvas 底色上居中的品牌——应用图标（72，随缩放）、产品名（hero 字号、SEMIBOLD）、当前语言的产品标语
-  （body、次要文字色，窄窗时换行）——以 `Enter::Settle`（`Motion::SLOW` 300ms，淡入并从上方 8px 落定，代替做不到
-  的轻微缩放）进入。品牌在标题行下方的区域内居中，200% 文字的 720×480 窗口里也不压到标题行（测试）。
-- **时长**：过场至少放完一轮进入（计时从构造时开始），读取更慢就等读取完成；不额外加长。之后进入 Ready，品牌层
-  以 `Motion::BASE` 200ms 淡出、露出首页或恢复的工作区（交叉淡化）。淡出层不接收指针，页面从第一帧就可以点击（测试）。
-- **减少动效**（用户偏好或系统设置）：不画品牌、不等待、不淡出；读取期间只有 canvas 与标题行，读完立即显示页面。
-  系统设置要靠辅助程序回答的平台（Linux，`SYSTEM_MOTION_QUERY_BLOCKS`）在后台询问，过场**等回答再决定画不画品牌**：
-  等待期间只画 canvas 与标题行（与减少动效相同），最多等 `SYSTEM_MOTION_WAIT`（400ms）；回答到达后若要求减少动效
-  就不画品牌，否则品牌从此刻开始一轮完整进入。超时则按用户自己的偏好继续，迟到的回答仍会被采纳用于之后的帧
-  （测试 `a_late_system_answer_for_less_motion_never_shows_the_brand` 等三项）。Windows 与 macOS 同步读取，不等待。
-- **读取失败**：照常结束过场，页面显示原有的失败卡片（如主机文件读不了时首页的 `state.card` 与原因）。
-- **标题行**：过场期间顶部是与正式标题行等高的空白拖动区（`startup.drag`），Windows 上右端是同一组窗口按钮；
-  macOS 的红绿灯由系统画在同一行，Linux 用系统标题栏。窗口在读取期间也能拖动、最小化、最大化与关闭。
+- **标题行**：启动期间顶部是与正式标题行等高的空白拖动区（`startup.drag`），Windows 上右端是同一组窗口按钮；
+  macOS 的红绿灯由系统画在同一行，Linux 用系统标题栏。窗口在读取期间、包括停在失败处时，都能拖动、最小化、最大化与关闭。
 - **测试与截图**：`ShelluneView::new` / `with_workspace` / `with_store*` 仍在返回前同步读完所有存储（测试与截图用的
-  “同步就绪”入口，首帧就是页面）；`launching_for_test` 走与启动相同的后台路径。截图场景 `startup-splash` 由
-  `capture_hold_splash` 把窗口停在过场并画出最终位置的品牌（截图固定减少动效，进入与淡出是静帧证明不了的）。
+  “同步就绪”入口，首帧就是页面）；`launching_for_test` 走与启动相同的分阶段路径。测试覆盖阶段顺序与进度目标、阶段 1 与
+  阶段 2 失败、继续与 Enter、打开配置文件夹、减少动效（不缩放、不位移、照常淡出）、系统动效回答的等待与超时、
+  最小窗口 200% 下的适配与失败滚动。截图场景 `startup-settings`、`startup-hosts`、`startup-workspace`、
+  `startup-interface`（四个阶段）与 `startup-failed`（阶段 2 失败，固定原因）由 `capture_hold_startup(done, failure)`
+  把窗口停在指定阶段并画出终态（截图固定减少动效，缩放、缓动与淡入淡出是静帧证明不了的），各有深浅两套，另有中文、
+  720×480 与 200% 变体。
 - **初始窗口背景**：GPUI 0.2.2 的 `WindowOptions` 只有不透明 / 透明 / 模糊三种窗口背景，没有颜色，因此
   `vendor/gpui` 加了一处补丁：公开函数 `gpui::set_initial_window_background(Rgba)`。Windows 注册窗口类时用这个颜色
   创建背景画刷（原为硬编码黑色）；之后打开窗口时颜色若已改变，在窗口显示前更新窗口类画刷。`open_main_window`
@@ -775,7 +803,8 @@ COM1 等）不算文件夹里的文件。不满足的一律 `ERROR_ACCESS_DENIED
 - **已知限制**：macOS 与 Linux 的补丁入口是空操作，窗口在首帧前仍是平台默认背景（macOS 不透明背景为黑色），浅色
   外观可能闪过一瞬；缓解仍是首帧只读偏好、以正确外观的 canvas 尽快覆盖窗口。Windows 上 GPUI 默认使用
   DirectComposition（`WS_EX_NOREDIRECTIONBITMAP`），窗口类画刷只在系统用 GDI 擦除背景时可见；首帧之前 DWM 实际
-  显示什么，本机截图（读回 GPU 后备缓冲）无法证明，需要在真实启动中目视确认。
+  显示什么，本机截图（读回 GPU 后备缓冲）无法证明，需要在真实启动中目视确认。GPUI 的动画按墙上时钟推进，测试只能断言
+  首页位移的方向与上限（≤8px），不能断言某一帧的确切位置。
 
 ## 2. 视觉 tokens
 
@@ -884,16 +913,17 @@ overlay）以及 hover/selected/pressed 叠在每个层上的 15 种底上深浅
 
 gpui 没有 hover 过渡、没有元素缩放，也不报告系统的"减少动态效果"设置（应用自己读取，见第 5 条），因此规则是：
 
-1. **只有进入动画，退出只有对话框遮罩淡出与启动过场的品牌层淡出**（后者见第 1.5 节）。hover、按下、选中都即时切换；
+1. **只有进入动画，退出只有对话框遮罩淡出与启动页淡出**（后者见第 1.5 节）。hover、按下、选中都即时切换；
    除进行中指示（连接中的状态点、不确定进度条、骨架屏）外没有循环动画。对话框关闭时卡片立即消失，只有不带状态的遮罩用
    BASE 淡出，减少动效时也立即消失。
 2. 时长令牌：`Motion::FAST` 120ms（小状态变化、toast/tooltip 淡入）、`Motion::BASE` 200ms（菜单、卡片、等待徽记）、
-   `Motion::SLOW` 300ms（对话框、启动过场）；进行中的循环脉动一拍 `Motion::PULSE` 900ms，不确定进度条一趟
+   `Motion::SLOW` 300ms（对话框、启动后首页淡入）；启动页品牌时刻 `BRAND_ENTRANCE` 250ms；进行中的循环脉动一拍 `Motion::PULSE` 900ms，不确定进度条一趟
    `components::PROGRESS_SWEEP` 1200ms。缓动统一 `theme::ease_out()`：**ease-out-cubic**（`1 − (1 − t)³`，测试校验）。
 3. `theme::enter(element, id, Enter::{Fade, Rise, Settle})`：Fade 原地淡入（FAST）；Rise 淡入并上移 6px（BASE）；
    Settle 从上方 8px 落定（SLOW，替代做不到的轻微缩放）。同一 id 重绘不会重播。位移不改变元素的定位方式。
 4. 减少动效时只保留淡入淡出：`enter` 直接画最终状态，循环脉动静止，不确定进度条画成居中的静止段，状态词、颜色与
-   操作都不变。
+   操作都不变。启动是唯一在减少动效时仍播放淡入淡出的地方：`theme::arrive(element, id, duration, travel)` 总是淡入，
+   位移由调用方按动效选择（减少动效时为 0），见第 1.5 节。
 5. **减少动效 = 用户偏好 或 系统设置**：窗口每帧用 `Motion::with_system` 合并，任一方要求减少即为减少。系统设置由
    `theme::system_reduces_motion()` 读取（Windows `SPI_GETCLIENTAREAANIMATION`、macOS
    `accessibilityDisplayShouldReduceMotion`、GNOME `enable-animations` / KDE `AnimationDurationFactor=0`）；读不到时视为
@@ -1841,6 +1871,7 @@ surface 底、静止 Raised，焦点环叠在 Raised 之上；尺寸不随窗口
 | `toolbar` | 页面或栏的头部工具条：一行、居中对齐、间距 8、最小高 44、底部发丝线；调用方放标题、搜索框和命令，`flex_1` 的子元素占剩余空间 |
 | `inline_banner(tone, icon, message)` | 内容上方的状态横幅（ADR-6 用）：色调 tint 底 + 底部色调发丝线，最小高 36；色调图标 + 一句话（省略号截断）+ 调用方追加的紧凑按钮与关闭按钮。不遮挡下方内容 |
 | `progress_bar(id, Progress)` | 细进度条（高 4、全圆角）：确定型按比例填充；不确定型一段 30% 宽的填充以 `PROGRESS_SWEEP` 1200ms 循环扫过，减少动效时静止居中（`progress.determinate` / `.indeterminate` / `.still`） |
+| `progress_bar_toward(id, from, to, duration)` | 确定型进度条从 `from` 以 ease-out-cubic 缓动到 `to`（新的 `id` 重播，同一 `id` 画在 `to`）；减少动效时直接画 `to`。启动页用它追阶段目标（第 1.5 节） |
 | `skeleton_text(fraction)` / `skeleton_row(id)` | 骨架屏：文字行（高 10、圆角 4、selected 底）与列表行（头像块 + 两行）；允许动效时缓慢呼吸，减少动效时静止 |
 | `kbd(label)` | 键帽：高 18、圆角 4、面板底 + 强边（底边 2px），字号 caption − 1；取代旧 `keycap` |
 | `checkbox_target(checked)` / `labelled_switch(on, word, selector)` | 指针大小的勾选目标（首页多选列）；带状态词的开关（设置页），取代两处本地实现 |

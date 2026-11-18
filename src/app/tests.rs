@@ -36001,7 +36001,7 @@ async fn the_selection_bar_wraps_its_actions_inside_it_at_720x480_and_200_percen
 }
 
 // ---------------------------------------------------------------------------
-// The window's start: the brand while the stores are read (R7)
+// The window's start: four stages, a bar that follows them, then the page (R3)
 // ---------------------------------------------------------------------------
 
 /// A window built the way a launch builds it, over `store`, at the design size.
@@ -36024,10 +36024,49 @@ fn splash_fading(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> boo
     cx.update(|_window, app| view.read(app).splash_fading())
 }
 
+fn page_entering(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|_window, app| view.read(app).page_entering())
+}
+
+/// The stages that reported so far, with whether each failed.
+fn startup_stages(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+) -> Vec<(crate::app::view::StartupStage, bool)> {
+    cx.update(|_window, app| {
+        view.read(app)
+            .startup_reports()
+            .into_iter()
+            .map(|report| (report.stage, report.failure.is_some()))
+            .collect()
+    })
+}
+
+fn startup_target(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> f32 {
+    cx.update(|_window, app| view.read(app).startup_target())
+}
+
+fn startup_stop(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+) -> Option<crate::app::view::StartupStage> {
+    cx.update(|_window, app| view.read(app).startup_stop())
+}
+
+/// The reason the stage that failed gave.
+fn startup_failure(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> String {
+    cx.update(|_window, app| {
+        view.read(app)
+            .startup_reports()
+            .into_iter()
+            .find_map(|report| report.failure)
+            .unwrap_or_default()
+    })
+}
+
 #[gpui::test]
-async fn a_launch_shows_the_brand_while_the_stores_are_read_then_fades_into_the_page(
-    cx: &mut TestAppContext,
-) {
+async fn a_launch_runs_the_four_stages_in_order_then_fades_into_the_page(cx: &mut TestAppContext) {
+    use crate::app::view::{BRAND_ENTRANCE, PAGE_ENTRANCE, SPLASH_EXIT, StartupStage};
     let dir = TempDir::new("startup-splash");
     seed(
         &dir.store(),
@@ -36037,19 +36076,34 @@ async fn a_launch_shows_the_brand_while_the_stores_are_read_then_fades_into_the_
     workspace.select(Destination::Hosts);
     let (view, cx) = launching_view(cx, workspace, dir.store());
     cx.run_until_parked();
+    assert_eq!(
+        startup_stages(&view, cx),
+        vec![
+            (StartupStage::Settings, false),
+            (StartupStage::Hosts, false),
+            (StartupStage::Workspace, false),
+            (StartupStage::Interface, false),
+        ],
+        "the four stages report one after another, in order"
+    );
+    assert!(
+        (startup_target(&view, cx) - 1.0).abs() < f32::EPSILON,
+        "the bar's target is full once the four are behind"
+    );
 
-    // The read has finished, but the brand has not had its entrance yet: the window
-    // stays on its start, with nothing of the page drawn.
+    // The stages are over, but the brand has not had its entrance yet: the window stays
+    // on its start, with nothing of the page drawn.
     assert!(starting(&view, cx), "the brand is shown for its entrance");
-    assert!(cx.debug_bounds("startup.splash").is_some());
-    assert!(
-        cx.debug_bounds("startup.splash.brand").is_some(),
-        "with full motion the brand is drawn"
-    );
-    assert!(
-        cx.debug_bounds("startup.splash.name").is_some()
-            && cx.debug_bounds("startup.splash.tagline").is_some()
-    );
+    for selector in [
+        "startup.splash",
+        "startup.splash.brand",
+        "startup.splash.mark",
+        "startup.splash.name",
+        "startup.progress",
+        "startup.stage",
+    ] {
+        assert!(cx.debug_bounds(selector).is_some(), "{selector} is drawn");
+    }
     assert!(
         cx.debug_bounds("hosts.search").is_none() && cx.debug_bounds("topbar").is_none(),
         "the page is not drawn behind the brand"
@@ -36060,17 +36114,18 @@ async fn a_launch_shows_the_brand_while_the_stores_are_read_then_fades_into_the_
         "nothing read is adopted before the start ends"
     );
 
-    cx.executor().advance_clock(Motion::SLOW);
+    cx.executor().advance_clock(BRAND_ENTRANCE);
     cx.run_until_parked();
     assert!(!starting(&view, cx), "the entrance over, the page is shown");
     assert!(
         splash_fading(&view, cx),
-        "the brand fades out over the page"
+        "the start fades out over the page"
     );
+    assert!(page_entering(&view, cx), "and the page fades in under it");
     assert!(cx.debug_bounds("startup.crossfade").is_some());
     assert!(
         cx.debug_bounds("hosts.search").is_some() && cx.debug_bounds("topbar").is_some(),
-        "the page is drawn under the fading brand"
+        "the page is drawn under the fading start"
     );
     cx.update(|_window, app| {
         let workspace = view.read(app).workspace();
@@ -36078,24 +36133,93 @@ async fn a_launch_shows_the_brand_while_the_stores_are_read_then_fades_into_the_
         assert_eq!(workspace.item_count(Destination::Hosts), 1);
     });
 
-    cx.executor().advance_clock(Motion::BASE);
+    cx.executor().advance_clock(SPLASH_EXIT);
     cx.run_until_parked();
     // The window keeps the bounds of everything it once drew, so the end of the fade
     // is read from the state the render draws the layer from.
     assert!(
         !splash_fading(&view, cx),
-        "the fade ends and nothing of the brand is left over the page"
+        "the fade ends after 200 ms and nothing of the start is left over the page"
+    );
+    assert!(page_entering(&view, cx), "the page takes 300 ms to arrive");
+    cx.executor()
+        .advance_clock(PAGE_ENTRANCE + crate::app::view::PAGE_STAGGER - SPLASH_EXIT);
+    cx.run_until_parked();
+    assert!(
+        !page_entering(&view, cx),
+        "and then it is in place, the list 40 ms after the sidebar"
+    );
+}
+
+/// How far the home's sidebar and list were drawn below their places on the first frame
+/// after the start: with full motion both rise into place, the list just after the
+/// sidebar; with reduced motion they only fade.
+fn page_rise(motion: Motion, cx: &mut TestAppContext) -> (Pixels, Pixels) {
+    use crate::app::view::{BRAND_ENTRANCE, PAGE_ENTRANCE, PAGE_STAGGER};
+    let dir = TempDir::new("startup-rise");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Hosts);
+    workspace.set_motion(motion);
+    let (view, cx) = launching_view(cx, workspace, dir.store());
+    cx.run_until_parked();
+    cx.executor().advance_clock(BRAND_ENTRANCE);
+    cx.run_until_parked();
+    assert!(!starting(&view, cx));
+    assert!(page_entering(&view, cx));
+    let sidebar_arriving = bounds_of(cx, "home.sidebar");
+    let list_arriving = bounds_of(cx, "hosts.search");
+    cx.executor().advance_clock(PAGE_ENTRANCE + PAGE_STAGGER);
+    cx.run_until_parked();
+    assert!(!page_entering(&view, cx));
+    let sidebar = bounds_of(cx, "home.sidebar");
+    let list = bounds_of(cx, "hosts.search");
+    (
+        sidebar_arriving.origin.y - sidebar.origin.y,
+        list_arriving.origin.y - list.origin.y,
+    )
+}
+
+#[gpui::test]
+async fn with_full_motion_the_sidebar_and_the_list_rise_into_place(cx: &mut TestAppContext) {
+    let (sidebar, list) = page_rise(Motion::Full, cx);
+    let travel = px(crate::app::view::PAGE_TRAVEL);
+    // The rise follows the wall clock, not the test's, so only its direction and its
+    // ceiling are certain: each piece was drawn lower, by no more than 8 px, and the
+    // list, which starts later, no higher than the sidebar.
+    for (piece, rise) in [("sidebar", sidebar), ("list", list)] {
+        assert!(
+            rise > px(0.25) && rise <= travel + px(0.5),
+            "the {piece} starts up to 8 px lower and rises: {rise:?}"
+        );
+    }
+    assert!(
+        list >= sidebar - px(0.25),
+        "the list follows the sidebar: {list:?} after {sidebar:?}"
     );
 }
 
 #[gpui::test]
-async fn the_page_answers_the_pointer_while_the_brand_fades_out(cx: &mut TestAppContext) {
+async fn with_reduced_motion_the_page_only_fades_in(cx: &mut TestAppContext) {
+    let (sidebar, list) = page_rise(Motion::Reduced, cx);
+    assert!(
+        sidebar.abs() < px(0.5) && list.abs() < px(0.5),
+        "reduced motion moves nothing: {sidebar:?}, {list:?}"
+    );
+}
+
+#[gpui::test]
+async fn the_page_answers_the_pointer_while_the_start_fades_out(cx: &mut TestAppContext) {
     let dir = TempDir::new("startup-fade-pointer");
     let mut workspace = Workspace::new();
     workspace.select(Destination::Hosts);
     let (view, cx) = launching_view(cx, workspace, dir.store());
     cx.run_until_parked();
-    cx.executor().advance_clock(Motion::SLOW);
+    cx.executor()
+        .advance_clock(crate::app::view::BRAND_ENTRANCE);
     cx.run_until_parked();
     assert!(splash_fading(&view, cx));
 
@@ -36106,7 +36230,7 @@ async fn the_page_answers_the_pointer_while_the_brand_fades_out(cx: &mut TestApp
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().destination()),
         Destination::Settings,
-        "the fading brand takes no pointer"
+        "the fading start takes no pointer"
     );
 }
 
@@ -36143,9 +36267,10 @@ async fn the_caption_drags_and_the_window_buttons_answer_during_the_start(cx: &m
 }
 
 #[gpui::test]
-async fn a_launch_that_cannot_read_the_hosts_still_reaches_the_page_and_says_why(
+async fn a_stage_that_fails_stops_the_start_and_continue_opens_the_page_with_what_was_read(
     cx: &mut TestAppContext,
 ) {
+    use crate::app::view::{BRAND_ENTRANCE, PAGE_ENTRANCE, StartupStage};
     let dir = TempDir::new("startup-unreadable");
     let root = dir.path().join("data");
     std::fs::write(&root, "not a directory").expect("the sentinel file is written");
@@ -36153,14 +36278,65 @@ async fn a_launch_that_cannot_read_the_hosts_still_reaches_the_page_and_says_why
     workspace.select(Destination::Hosts);
     let (view, cx) = launching_view(cx, workspace, HostStore::at(&root));
     cx.run_until_parked();
-    assert!(starting(&view, cx));
-
-    cx.executor().advance_clock(Motion::SLOW);
-    cx.run_until_parked();
-    assert!(!starting(&view, cx), "a failed read ends the start as well");
-    cx.executor().advance_clock(Motion::BASE);
+    cx.executor().advance_clock(BRAND_ENTRANCE);
     cx.run_until_parked();
 
+    // The host book cannot be read: the start stops on stage 2 and says why, and the
+    // stages after it wait.
+    assert!(starting(&view, cx), "a failed stage holds the start");
+    assert_eq!(startup_stop(&view, cx), Some(StartupStage::Hosts));
+    assert_eq!(
+        startup_stages(&view, cx),
+        vec![(StartupStage::Settings, false), (StartupStage::Hosts, true)],
+        "stage 3 does not run past the stop"
+    );
+    assert!(
+        (startup_target(&view, cx) - 0.25).abs() < f32::EPSILON,
+        "the bar stays where the failed stage began"
+    );
+    let reason = startup_failure(&view, cx);
+    assert!(
+        reason.contains("hosts.json"),
+        "the reason names the file it could not read: {reason}"
+    );
+    for selector in [
+        "startup.failure",
+        "startup.failure.title",
+        "startup.failure.reason",
+        "startup.failure.hint",
+        "startup.continue",
+        "startup.open_folder",
+    ] {
+        let bounds = bounds_of(cx, selector);
+        assert_fits_inside(bounds, design_window(), selector);
+    }
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(5));
+    cx.run_until_parked();
+    assert!(
+        starting(&view, cx),
+        "the stop waits for the user, however long"
+    );
+
+    // Continue: the remaining stages run - their failures no longer stop it - and the
+    // page opens with the failure card it always showed.
+    let next = bounds_of(cx, "startup.continue").center();
+    cx.simulate_click(next, Modifiers::default());
+    cx.run_until_parked();
+    assert!(!starting(&view, cx), "Continue opens the page");
+    assert_eq!(startup_stop(&view, cx), None);
+    assert_eq!(
+        startup_stages(&view, cx),
+        vec![
+            (StartupStage::Settings, false),
+            (StartupStage::Hosts, true),
+            (StartupStage::Workspace, true),
+            (StartupStage::Interface, false),
+        ],
+        "the stages after the stop ran, and the next failure did not stop it again"
+    );
+    cx.executor().advance_clock(PAGE_ENTRANCE);
+    cx.run_until_parked();
     cx.update(|_window, app| {
         let workspace = view.read(app).workspace();
         assert_eq!(workspace.state(Destination::Hosts), SectionState::Failed);
@@ -36172,7 +36348,7 @@ async fn a_launch_that_cannot_read_the_hosts_still_reaches_the_page_and_says_why
             .to_owned();
         assert!(
             reason.contains("hosts.json"),
-            "the reason names the file it could not read: {reason}"
+            "the page names the file it could not read: {reason}"
         );
     });
     assert!(
@@ -36182,9 +36358,116 @@ async fn a_launch_that_cannot_read_the_hosts_still_reaches_the_page_and_says_why
 }
 
 #[gpui::test]
-async fn reduced_motion_skips_the_brand_and_shows_the_page_once_it_is_read(
+async fn a_stopped_start_opens_the_data_folder(cx: &mut TestAppContext) {
+    let dir = TempDir::new("startup-folder");
+    let root = dir.path().join("data");
+    std::fs::write(&root, "not a directory").expect("the sentinel file is written");
+    let (view, cx) = launching_view(cx, Workspace::new(), HostStore::at(&root));
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(crate::app::view::BRAND_ENTRANCE);
+    cx.run_until_parked();
+    assert!(startup_stop(&view, cx).is_some());
+
+    let open = bounds_of(cx, "startup.open_folder").center();
+    cx.simulate_click(open, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.opened_url(),
+        Some(crate::app::view::folder_url(&root)),
+        "the system opens the folder the files are in"
+    );
+    assert!(
+        starting(&view, cx),
+        "and the start still waits for Continue"
+    );
+}
+
+/// At 200% text in the smallest window the stop is taller than the floor: it scrolls,
+/// so its buttons are always within reach, and its words never run past the edges.
+#[gpui::test]
+async fn the_stop_scrolls_to_its_buttons_in_the_smallest_window_at_the_largest_text(
     cx: &mut TestAppContext,
 ) {
+    let dir = TempDir::new("startup-stop-fit");
+    let root = dir.path().join("data");
+    std::fs::write(&root, "not a directory").expect("the sentinel file is written");
+    let mut workspace = Workspace::new();
+    workspace.set_zoom(Zoom::Largest);
+    let (view, cx) = launching_view(cx, workspace, HostStore::at(&root));
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(crate::app::view::BRAND_ENTRANCE);
+    cx.run_until_parked();
+    assert!(startup_stop(&view, cx).is_some());
+    for selector in ["startup.failure.title", "startup.failure.reason"] {
+        let bounds = bounds_of(cx, selector);
+        assert!(
+            bounds.left() >= px(-0.5) && bounds.right() <= minimum_window().width + px(0.5),
+            "{selector} stays within the window's width: {bounds:?}"
+        );
+    }
+
+    let floor = bounds_of(cx, "startup.splash").center();
+    for _ in 0..10 {
+        cx.simulate_event(ScrollWheelEvent {
+            position: floor,
+            delta: ScrollDelta::Lines(point(0.0, -5.0)),
+            modifiers: Modifiers::default(),
+            touch_phase: Default::default(),
+        });
+        cx.run_until_parked();
+    }
+    let next = bounds_of(cx, "startup.continue");
+    assert_fits_inside(next, minimum_window(), "Continue, scrolled into view");
+    cx.simulate_click(next.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(!starting(&view, cx), "the scrolled-to button goes on");
+}
+
+#[gpui::test]
+async fn an_unreadable_settings_file_stops_the_start_at_its_first_stage(cx: &mut TestAppContext) {
+    use crate::app::view::{BRAND_ENTRANCE, StartupStage};
+    let dir = TempDir::new("startup-settings");
+    std::fs::create_dir_all(dir.path()).expect("the data folder exists");
+    std::fs::write(dir.path().join("preferences.json"), "{ not a settings file")
+        .expect("the broken settings are written");
+    let (view, cx) = launching_view(cx, Workspace::new(), dir.store());
+
+    assert_eq!(
+        startup_stop(&view, cx),
+        Some(StartupStage::Settings),
+        "stage 1 fails before the first frame"
+    );
+    cx.run_until_parked();
+    cx.executor().advance_clock(BRAND_ENTRANCE);
+    cx.run_until_parked();
+    assert!(starting(&view, cx));
+    assert_eq!(
+        startup_stages(&view, cx),
+        vec![(StartupStage::Settings, true)],
+        "nothing else is read before the user decides"
+    );
+    assert!(startup_target(&view, cx).abs() < f32::EPSILON);
+    let reason = startup_failure(&view, cx);
+    assert!(reason.contains("preferences.json"), "{reason}");
+
+    // Enter goes on, the way the Continue button does.
+    cx.update(|window, app| window.focus(view.read(app).root_focus()));
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(!starting(&view, cx), "Enter opens the page");
+    assert_eq!(
+        startup_stages(&view, cx).len(),
+        StartupStage::ALL.len(),
+        "the other stages ran after it"
+    );
+}
+
+#[gpui::test]
+async fn reduced_motion_keeps_only_the_fades(cx: &mut TestAppContext) {
+    use crate::app::view::{BRAND_ENTRANCE, SPLASH_EXIT};
     let dir = TempDir::new("startup-reduced");
     seed(
         &dir.store(),
@@ -36193,23 +36476,26 @@ async fn reduced_motion_skips_the_brand_and_shows_the_page_once_it_is_read(
     let mut workspace = Workspace::new();
     workspace.select(Destination::Hosts);
     workspace.set_motion(Motion::Reduced);
-    let store = dir.store();
-    let (view, cx) = cx
-        .add_window_view(move |_window, cx| ShelluneView::launching_for_test(cx, workspace, store));
-    cx.simulate_resize(design_window());
-
-    // No clock is advanced: the page is shown as soon as the read is in.
+    let (view, cx) = launching_view(cx, workspace, dir.store());
     cx.run_until_parked();
-    assert!(!starting(&view, cx), "nothing waits for an entrance");
-    assert!(!splash_fading(&view, cx), "and nothing fades");
-    // The window keeps the bounds of everything it ever drew, so these say that no
-    // frame of this start had the brand or the fading layer in it.
+
+    // The brand is there, at its full size from the first frame: no zoom.
+    assert!(starting(&view, cx), "the brand still has its moment");
+    let mark = bounds_of(cx, "startup.splash.mark");
+    let size = Metrics::new(Zoom::Regular).scale(crate::app::view::BRAND_MARK);
     assert!(
-        cx.debug_bounds("startup.splash.brand").is_none(),
-        "reduced motion draws no brand"
+        (mark.size.width - size).abs() < px(0.5),
+        "the logo does not zoom with reduced motion: {mark:?}"
     );
-    assert!(cx.debug_bounds("startup.crossfade").is_none());
-    assert!(cx.debug_bounds("hosts.search").is_some());
+
+    cx.executor().advance_clock(BRAND_ENTRANCE);
+    cx.run_until_parked();
+    assert!(!starting(&view, cx), "the page follows the brand's moment");
+    assert!(splash_fading(&view, cx), "the start still fades out");
+    assert!(page_entering(&view, cx), "and the page still fades in");
+    cx.executor().advance_clock(SPLASH_EXIT);
+    cx.run_until_parked();
+    assert!(!splash_fading(&view, cx));
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().item_count(Destination::Hosts)),
         1
@@ -36217,19 +36503,43 @@ async fn reduced_motion_skips_the_brand_and_shows_the_page_once_it_is_read(
 }
 
 #[gpui::test]
-async fn the_system_reduce_motion_setting_also_skips_the_brand(cx: &mut TestAppContext) {
+async fn with_full_motion_the_logo_zooms_into_place(cx: &mut TestAppContext) {
+    let dir = TempDir::new("startup-zoom");
+    let (view, cx) = launching_view(cx, Workspace::new(), dir.store());
+    cx.run_until_parked();
+    assert!(starting(&view, cx));
+    assert!(
+        (cx.update(|_window, app| view.read(app).brand_zoom_from()) - 0.96).abs() < f32::EPSILON,
+        "the logo zooms from 96% of its size"
+    );
+    let mark = bounds_of(cx, "startup.splash.mark");
+    let size = Metrics::new(Zoom::Regular).scale(crate::app::view::BRAND_MARK);
+    assert!(
+        mark.size.width <= size + px(0.5) && mark.size.width >= size * 0.95,
+        "the logo is drawn between 96% and its full size: {mark:?}"
+    );
+}
+
+#[gpui::test]
+async fn the_system_reduce_motion_setting_also_keeps_only_the_fades(cx: &mut TestAppContext) {
     theme::fake_system_reduces_motion(true);
     let dir = TempDir::new("startup-system-reduced");
     let (view, cx) = launching_view(cx, Workspace::new(), dir.store());
     cx.run_until_parked();
-    // Never drawn in any frame: the window keeps the bounds of all it drew.
-    let brand = cx.debug_bounds("startup.splash.brand").is_some();
+    let mark = cx.debug_bounds("startup.splash.mark");
+    let motion = cx.update(|_window, app| view.read(app).effective_motion());
+    cx.executor()
+        .advance_clock(crate::app::view::BRAND_ENTRANCE);
+    cx.run_until_parked();
     let ready = !starting(&view, cx);
-    let fading = splash_fading(&view, cx);
     theme::fake_system_reduces_motion(false);
-    assert!(!brand, "the system's setting draws no brand either");
-    assert!(ready, "the page is shown once it is read");
-    assert!(!fading, "and nothing fades");
+    assert_eq!(motion, Motion::Reduced);
+    let size = Metrics::new(Zoom::Regular).scale(crate::app::view::BRAND_MARK);
+    assert!(
+        mark.is_some_and(|mark| (mark.size.width - size).abs() < px(0.5)),
+        "the system's setting draws the logo without a zoom: {mark:?}"
+    );
+    assert!(ready, "the page is shown after the brand's moment");
 }
 
 #[gpui::test]
@@ -36264,9 +36574,10 @@ async fn a_launch_restores_the_saved_layout_behind_the_brand_and_starts_nothing(
         "the layout is not restored before the start ends"
     );
 
-    cx.executor().advance_clock(Motion::SLOW);
+    cx.executor()
+        .advance_clock(crate::app::view::BRAND_ENTRANCE);
     cx.run_until_parked();
-    cx.executor().advance_clock(Motion::BASE);
+    cx.executor().advance_clock(crate::app::view::PAGE_ENTRANCE);
     cx.run_until_parked();
     assert!(!starting(&view, cx));
     assert_eq!(
@@ -36302,6 +36613,7 @@ async fn the_synchronous_start_the_tests_use_never_shows_the_brand(cx: &mut Test
     cx.run_until_parked();
     assert!(!starting(&view, cx));
     assert!(!splash_fading(&view, cx));
+    assert!(!page_entering(&view, cx));
     assert!(cx.debug_bounds("startup.splash").is_none());
     assert!(cx.debug_bounds("topbar").is_some());
 }
@@ -36323,8 +36635,10 @@ async fn the_brand_fits_the_smallest_window_at_the_largest_text(cx: &mut TestApp
         for selector in [
             "startup.caption",
             "startup.splash.brand",
+            "startup.splash.mark",
             "startup.splash.name",
-            "startup.splash.tagline",
+            "startup.progress",
+            "startup.stage",
         ] {
             assert_fits_inside(bounds_of(cx, selector), minimum_window(), selector);
         }
@@ -36495,11 +36809,14 @@ fn system_motion_pending(view: &Entity<ShelluneView>, cx: &mut VisualTestContext
     cx.update(|_window, app| view.read(app).system_motion_pending())
 }
 
-/// A system that asks for less motion through a helper program never flashes the
-/// brand: the start draws its bare floor until the answer is in, and the answer then
-/// shows the page at once (R7).
+/// A system that asks for less motion through a helper program never sees the logo
+/// zoom: the start draws its bare floor until the answer is in, and the brand then
+/// enters with a fade only, for a whole moment timed from the answer (R3).
 #[gpui::test]
-async fn a_late_system_answer_for_less_motion_never_shows_the_brand(cx: &mut TestAppContext) {
+async fn a_late_system_answer_for_less_motion_shows_the_brand_without_a_zoom(
+    cx: &mut TestAppContext,
+) {
+    use crate::app::view::BRAND_ENTRANCE;
     let dir = TempDir::new("startup-late-reduce");
     let (view, cx) =
         launching_with_late_answer(cx, dir.store(), std::time::Duration::from_millis(120), true);
@@ -36524,21 +36841,24 @@ async fn a_late_system_answer_for_less_motion_never_shows_the_brand(cx: &mut Tes
         Motion::Reduced,
         "the system's answer is taken"
     );
+    assert!(starting(&view, cx), "the brand has its moment first");
+    let mark = bounds_of(cx, "startup.splash.mark");
+    let size = Metrics::new(Zoom::Regular).scale(crate::app::view::BRAND_MARK);
     assert!(
-        !starting(&view, cx),
-        "with less motion the page is shown as soon as the stores are read"
+        (mark.size.width - size).abs() < px(0.5),
+        "with less motion the logo is drawn at its size at once: {mark:?}"
     );
-    assert!(!splash_fading(&view, cx), "and nothing fades over it");
-    assert!(
-        cx.debug_bounds("startup.splash.brand").is_none(),
-        "the brand was never drawn"
-    );
+    cx.executor().advance_clock(BRAND_ENTRANCE);
+    cx.run_until_parked();
+    assert!(!starting(&view, cx));
+    assert!(splash_fading(&view, cx), "the start still fades out");
 }
 
 /// A system that answers within the limit and asks for full motion gets the brand,
-/// for a whole entrance timed from its answer (R7).
+/// for a whole entrance timed from its answer (R3).
 #[gpui::test]
 async fn a_system_answer_for_full_motion_shows_the_brand_once_it_is_in(cx: &mut TestAppContext) {
+    use crate::app::view::BRAND_ENTRANCE;
     let dir = TempDir::new("startup-late-full");
     let (view, cx) =
         launching_with_late_answer(cx, dir.store(), std::time::Duration::from_millis(80), false);
@@ -36555,7 +36875,7 @@ async fn a_system_answer_for_full_motion_shows_the_brand_once_it_is_in(cx: &mut 
         "with full motion the brand is drawn once the answer is in"
     );
     cx.executor()
-        .advance_clock(Motion::SLOW - std::time::Duration::from_millis(1));
+        .advance_clock(BRAND_ENTRANCE - std::time::Duration::from_millis(1));
     cx.run_until_parked();
     assert!(
         starting(&view, cx),
@@ -36570,7 +36890,7 @@ async fn a_system_answer_for_full_motion_shows_the_brand_once_it_is_in(cx: &mut 
 
 /// A helper that never answers in time holds the start back no longer than
 /// [`crate::app::view::SYSTEM_MOTION_WAIT`]: the start then goes on with the user's own setting, and the
-/// late answer still counts for every frame after it (R7).
+/// late answer still counts for every frame after it (R3).
 #[gpui::test]
 async fn a_system_that_does_not_answer_holds_the_start_back_only_so_long(cx: &mut TestAppContext) {
     let dir = TempDir::new("startup-no-answer");
@@ -36587,7 +36907,8 @@ async fn a_system_that_does_not_answer_holds_the_start_back_only_so_long(cx: &mu
         cx.debug_bounds("startup.splash.brand").is_some(),
         "without an answer the user's own full motion shows the brand"
     );
-    cx.executor().advance_clock(Motion::SLOW);
+    cx.executor()
+        .advance_clock(crate::app::view::BRAND_ENTRANCE);
     cx.run_until_parked();
     assert!(!starting(&view, cx), "the start ends after one entrance");
 

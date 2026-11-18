@@ -5162,6 +5162,78 @@ pub fn update_for(locale: Locale) -> &'static UpdateStrings {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The window's start (R3)
+// ---------------------------------------------------------------------------
+
+/// Declares [`StartupStrings`] and its two tables from one list, so a phrase cannot be
+/// added in one language and forgotten in the other.
+macro_rules! startup_strings {
+    ($($(#[doc = $doc:literal])* $field:ident: $en:literal, $zh:literal;)*) => {
+        /// Strings of the start page: the stage under the progress bar and the stop a
+        /// failed stage makes.
+        pub struct StartupStrings {
+            $($(#[doc = $doc])* pub $field: &'static str,)*
+        }
+
+        impl StartupStrings {
+            /// Every string of the table, in declaration order, for the completeness
+            /// test.
+            #[must_use]
+            #[cfg_attr(not(test), allow(dead_code))]
+            pub fn all(&self) -> Vec<&'static str> {
+                vec![$(self.$field),*]
+            }
+        }
+
+        /// The start strings in English.
+        pub static ENGLISH_STARTUP: StartupStrings = StartupStrings { $($field: $en,)* };
+        /// The start strings in Chinese.
+        pub static CHINESE_STARTUP: StartupStrings = StartupStrings { $($field: $zh,)* };
+    };
+}
+
+startup_strings! {
+    /// Stage 1 under the bar, while it runs
+    stage_settings: "Reading settings and theme", "正在读取设置与主题";
+    /// Stage 2
+    stage_hosts: "Reading hosts and known servers", "正在读取主机簿与已知主机";
+    /// Stage 3
+    stage_workspace: "Reading forwards, groups and workspace", "正在读取转发、分组与工作区";
+    /// Stage 4
+    stage_interface: "Preparing the interface", "正在准备界面";
+    /// Every stage is done; the page comes next
+    stage_done: "Ready", "准备就绪";
+    /// Stop title: stage 1 failed
+    failed_settings: "The settings could not be read", "无法读取设置";
+    /// Stop title: stage 2 failed
+    failed_hosts: "The host book could not be read", "无法读取主机簿";
+    /// Stop title: stage 3 failed
+    failed_workspace: "Forwards, groups or the workspace could not be read",
+        "无法读取转发、分组或工作区";
+    /// Stop title: stage 4 failed
+    failed_interface: "The interface could not be prepared", "无法准备界面";
+    /// Reason of a settings file that is not a settings document
+    settings_unreadable: "{file} is not a settings file this version can read. The default settings are in use until one is changed.",
+        "{file} 不是此版本能读取的设置文件。在修改任一设置之前，将使用默认设置。";
+    /// Under the reason: what the two buttons do
+    failed_hint: "Continue opens Shellune with what could be read. The files are in the data folder.",
+        "选择“继续”将以已读取的内容打开 Shellune。相关文件都在配置文件夹中。";
+    /// Button: go on with what could be read
+    continue_start: "Continue", "继续";
+    /// Button: open the folder the files are in
+    open_folder: "Open data folder", "打开配置文件夹";
+}
+
+/// The start strings of one language.
+#[must_use]
+pub fn startup_for(locale: Locale) -> &'static StartupStrings {
+    match locale {
+        Locale::English => &ENGLISH_STARTUP,
+        Locale::Chinese => &CHINESE_STARTUP,
+    }
+}
+
 /// Why a shortcut command cannot be saved, in a language.
 ///
 /// The domain crate words its refusals in English so they stay language-neutral; the
@@ -5319,6 +5391,18 @@ mod ux_tests {
             ] {
                 assert_eq!(en.contains(name), zh.contains(name), "{en} / {zh}: {name}");
             }
+        }
+    }
+
+    #[test]
+    fn both_startup_tables_are_complete_and_translated() {
+        let english = ENGLISH_STARTUP.all();
+        let chinese = CHINESE_STARTUP.all();
+        assert_eq!(english.len(), chinese.len());
+        for (en, zh) in english.iter().zip(chinese.iter()) {
+            assert!(!en.trim().is_empty() && !zh.trim().is_empty());
+            assert_ne!(en, zh, "{en} is not translated");
+            assert_eq!(en.contains("{file}"), zh.contains("{file}"), "{en} / {zh}");
         }
     }
 

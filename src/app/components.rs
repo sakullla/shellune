@@ -2859,6 +2859,53 @@ pub fn progress_bar(id: impl Into<ElementId>, progress: Progress, metrics: Metri
     }
 }
 
+/// The start page's progress line (R3): a 2 px determinate bar, fully rounded, filled in
+/// the accent, whose fill grows from `from` to `to` over `duration` with the entrance
+/// curve, so a bar that steps forward eases into its new value instead of jumping.
+///
+/// `id` keys the growth: a new `id` plays it again, the same one draws the bar at `to`.
+/// With motion reduced, or `still`, the bar is drawn at `to` at once.
+pub fn progress_line(
+    id: impl Into<ElementId>,
+    from: f32,
+    to: f32,
+    duration: Duration,
+    still: bool,
+    metrics: Metrics,
+) -> AnyElement {
+    let to = to.clamp(0.0, 1.0);
+    let from = from.clamp(0.0, 1.0);
+    let fill = div()
+        .absolute()
+        .top(px(0.0))
+        .bottom(px(0.0))
+        .left(px(0.0))
+        .rounded_full()
+        .bg(theme::swatch(palette::ACCENT));
+    let fill = if still || !theme::motion_allowed() || (to - from).abs() < f32::EPSILON {
+        fill.w(gpui::relative(to)).into_any_element()
+    } else {
+        fill.w(gpui::relative(from))
+            .with_animation(
+                id,
+                Animation::new(duration).with_easing(theme::ease_out()),
+                move |fill, delta| fill.w(gpui::relative(from + (to - from) * delta)),
+            )
+            .into_any_element()
+    };
+    div()
+        .relative()
+        .flex_none()
+        .w_full()
+        .h(metrics.scale(spacing::HALF))
+        .rounded_full()
+        .overflow_hidden()
+        .bg(theme::swatch(palette::LOADING_TRACK))
+        .debug_selector(|| "progress.line".to_owned())
+        .child(fill)
+        .into_any_element()
+}
+
 /// A placeholder line of text while the words load: a rounded block at `fraction` of
 /// the width it is given (ADR-2).
 #[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]

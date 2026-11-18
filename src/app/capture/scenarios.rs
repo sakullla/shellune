@@ -1839,12 +1839,54 @@ fn settings_keys_conflict_ready(view: &ShelluneView, cx: &App) -> Result<(), Str
     }
 }
 
-fn hold_splash(
+fn hold_startup_settings(
     view: &mut ShelluneView,
     _window: &mut Window,
     cx: &mut Context<ShelluneView>,
 ) -> Result<(), String> {
-    view.capture_hold_splash(cx);
+    view.capture_hold_startup(0, None, cx);
+    Ok(())
+}
+
+fn hold_startup_hosts(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_hold_startup(1, None, cx);
+    Ok(())
+}
+
+fn hold_startup_workspace(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_hold_startup(2, None, cx);
+    Ok(())
+}
+
+fn hold_startup_interface(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_hold_startup(3, None, cx);
+    Ok(())
+}
+
+/// The reason the failed-start shot shows: the words the storage layer gives for a
+/// host file that is not a host document, at a typical Windows path.
+const STARTUP_FAILURE_REASON: &str = "the saved hosts at \
+     C:\\Users\\ana\\AppData\\Roaming\\Shellune\\hosts.json are not valid: expected value at \
+     line 1 column 1";
+
+fn hold_startup_failed(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_hold_startup(1, Some(STARTUP_FAILURE_REASON), cx);
     Ok(())
 }
 
@@ -3967,20 +4009,92 @@ pub const SCENARIOS: &[Scenario] = &[
         ready: shell_menu_ready,
     },
     Scenario {
-        id: "startup-splash",
-        title: "启动 · 品牌过场",
+        id: "startup-settings",
+        title: "启动 · 阶段 1 设置与主题",
         category: Category::Startup,
-        fixture: "an empty data directory; the window built and then held on its start,                   the brand drawn in its final place",
-        evidence: "shows the frame a launch draws while the stores are read: the live caption                    and the logo, name and tagline on the floor; the entrance, the fade into the                    page and how long a real read takes are motion and timing a still frame                    cannot show",
+        fixture: "an empty data directory; the window built and then held on its start with \
+                  no stage behind it, the brand drawn in its final place",
+        evidence: "shows the start page while stage 1 (settings and theme) runs: the live \
+                   caption, the logo and name, an empty bar and the stage's caption; the \
+                   entrance, the easing of the bar and the fade into the page are motion a \
+                   still frame cannot show",
+        quick: true,
+        variants: &[Variant::dark().chinese(), Variant::light().chinese()],
+        start: || page(Destination::Hosts),
+        prepare: nothing,
+        install: hold_startup_settings,
+        ready: splash_ready,
+    },
+    Scenario {
+        id: "startup-hosts",
+        title: "启动 · 阶段 2 主机簿与已知主机",
+        category: Category::Startup,
+        fixture: "an empty data directory; the window held on its start with stage 1 behind it",
+        evidence: "shows the bar at a quarter and stage 2's caption (hosts and known servers)",
+        quick: false,
+        variants: &[Variant::dark().chinese(), Variant::light().chinese()],
+        start: || page(Destination::Hosts),
+        prepare: nothing,
+        install: hold_startup_hosts,
+        ready: splash_ready,
+    },
+    Scenario {
+        id: "startup-workspace",
+        title: "启动 · 阶段 3 转发、分组与工作区",
+        category: Category::Startup,
+        fixture: "an empty data directory; the window held on its start with stages 1 and 2 \
+                  behind it",
+        evidence: "shows the bar at half and stage 3's caption (forwards, groups and workspace)",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::light().chinese(),
+            Variant::dark().smallest(),
+        ],
+        start: || page(Destination::Hosts),
+        prepare: nothing,
+        install: hold_startup_workspace,
+        ready: splash_ready,
+    },
+    Scenario {
+        id: "startup-interface",
+        title: "启动 · 阶段 4 准备界面",
+        category: Category::Startup,
+        fixture: "an empty data directory; the window held on its start with stages 1 to 3 \
+                  behind it",
+        evidence: "shows the bar at three quarters and stage 4's caption (fonts and first \
+                   frame); the brand fits the smallest window at 200% text",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::light().chinese(),
+            Variant::light().smallest().largest(),
+        ],
+        start: || page(Destination::Hosts),
+        prepare: nothing,
+        install: hold_startup_interface,
+        ready: splash_ready,
+    },
+    Scenario {
+        id: "startup-failed",
+        title: "启动 · 阶段失败",
+        category: Category::Startup,
+        fixture: "an empty data directory; the window held on its start, stopped on stage 2 \
+                  with a fixed reason naming hosts.json (nothing was really read)",
+        evidence: "shows the stop a failed stage makes: the brand, the stage's title in the \
+                   danger tone, the whole reason wrapped under it, the hint and the Continue \
+                   and Open data folder buttons; at 200% text in the smallest window the stop \
+                   scrolls rather than losing its buttons",
         quick: true,
         variants: &[
             Variant::dark().chinese(),
+            Variant::light().chinese(),
             Variant::dark().smallest(),
             Variant::light().smallest().largest(),
         ],
         start: || page(Destination::Hosts),
         prepare: nothing,
-        install: hold_splash,
+        install: hold_startup_failed,
         ready: splash_ready,
     },
     Scenario {

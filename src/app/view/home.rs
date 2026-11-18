@@ -405,9 +405,11 @@ impl ShelluneView {
         let list = self
             .hosts
             .list(&self.book, &self.groups, &|id| self.host_is_open(id));
+        // Behind the fading start the sidebar arrives first and the list just after it
+        // (R3); at any other time both are simply there.
         page.flex_row()
-            .child(self.home_sidebar(&list, cx))
-            .child(self.home_main(&list, window, cx))
+            .child(self.home_entrance(self.home_sidebar(&list, cx), "startup.page.sidebar", 0))
+            .child(self.home_entrance(self.home_main(&list, window, cx), "startup.page.list", 1))
     }
 
     /// The sidebar: every record, the favourites, the recent hosts, the groups, and the

@@ -111,7 +111,10 @@ pub use desktop::{DesktopNotice, DesktopPhase, DesktopStage};
 #[cfg(test)]
 pub use shell::Tool;
 #[cfg(test)]
-pub use startup::SYSTEM_MOTION_WAIT;
+pub use startup::{
+    BRAND_ENTRANCE, BRAND_MARK, PAGE_ENTRANCE, PAGE_STAGGER, PAGE_TRAVEL, SPLASH_EXIT,
+    SYSTEM_MOTION_WAIT, StartupStage, folder_url,
+};
 pub use titlebar::{custom_titlebar, traffic_light_position};
 
 /// Where one control of a file column was drawn (R4).
@@ -889,17 +892,20 @@ pub struct ShelluneView {
     /// desktop that fills the screen is what full screen means, and the pane's own
     /// controls are what leave it again.
     desktop_fullscreen: Option<SessionId>,
-    /// Where the window is in its start: the brand while the stores are read, then the
-    /// page (R7).
+    /// Where the window is in its start: the brand and the progress of the stages,
+    /// then the page (R3).
     startup: startup::Startup,
-    /// Whether the brand is still fading out over the page that replaced it.
+    /// The stages of the start: which ended, what they read, what the start waits for.
+    startup_run: startup::StartupRun,
+    /// Whether the start is still fading out over the page that replaced it.
     splash_fading: bool,
+    /// Whether the page is still fading in (and, with full motion, rising) under it.
+    page_entering: bool,
     /// Whether the start is still waiting for the system's reduce-motion answer, where
     /// that answer comes from a helper program (Linux): the brand is not drawn until it
-    /// is known, so a system that asks for less motion never flashes it (R7).
+    /// is known, so a system that asks for less motion never sees it zoom (R3).
     system_motion_pending: bool,
-    /// The capture's still splash: the brand drawn in its final place although a capture
-    /// draws with reduced motion (R7).
+    /// The capture's still start: drawn in its final place without an entrance (R3).
     #[cfg(feature = "ui-capture")]
     splash_held: bool,
     /// The capture's design catalogue: the window draws every shared component
@@ -2751,7 +2757,9 @@ impl ShelluneView {
             session_terminal: false,
             desktop_fullscreen: None,
             startup: startup::Startup::Ready,
+            startup_run: startup::StartupRun::default(),
             splash_fading: false,
+            page_entering: false,
             system_motion_pending: false,
             #[cfg(feature = "ui-capture")]
             splash_held: false,
@@ -18389,8 +18397,8 @@ impl Render for ShelluneView {
         // The terminal's frame and the tooltips are drawn outside this pass; they read
         // the text size from here instead of falling back to 100%.
         theme::set_zoom(self.workspace.zoom());
-        // While the stores are read the window is its start: the caption and the brand,
-        // in the palette and at the text size the page will have (R7).
+        // While the stages run the window is its start: the caption, the brand and the
+        // progress, in the palette and at the text size the page will have (R3).
         if self.startup == startup::Startup::Splash {
             return self.startup_splash(window, cx);
         }
@@ -18775,7 +18783,7 @@ impl Render for ShelluneView {
                     .h_full()
                     .children(header)
                     .children(notice)
-                    .child(self.destination_panel(window, cx)),
+                    .child(self.page_entrance(self.destination_panel(window, cx))),
             );
         // Floating layers, drawn after the page and so above it, the later the
         // higher. They are plain layers rather than deferred draws, so a field
@@ -18820,7 +18828,7 @@ impl Render for ShelluneView {
         root.children(scrim_exit)
             .children(layers.into_iter().flatten())
             .children(self.toast_stack(cx))
-            // The brand fading out over the page it became, above everything (R7).
+            // The start fading out over the page it became, above everything (R3).
             .children(self.startup_crossfade())
             .into_any_element()
     }
