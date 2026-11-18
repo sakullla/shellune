@@ -119,6 +119,19 @@ impl<T: ReceiveData> DataOffer<T> {
         Some(ClipboardItem::new_string(result))
     }
 
+    /// The text and the image the offer holds, as one item: a copy of mixed content
+    /// (spreadsheet cells, a slide, a picture with its caption) offers both, and a paste
+    /// that wants one or the other picks from the item.
+    fn read_text_and_image(&self, connection: &Connection) -> Option<ClipboardItem> {
+        let entries: Vec<ClipboardEntry> = self
+            .read_text(connection)
+            .into_iter()
+            .chain(self.read_image(connection))
+            .flat_map(ClipboardItem::into_entries)
+            .collect();
+        (!entries.is_empty()).then(|| ClipboardItem::new_entries(entries))
+    }
+
     fn read_image(&self, connection: &Connection) -> Option<ClipboardItem> {
         for format in ImageFormat::iter() {
             let mime_type = format.mime_type();
@@ -205,9 +218,7 @@ impl Clipboard {
             return self.contents.clone();
         }
 
-        let item = offer
-            .read_text(&self.connection)
-            .or_else(|| offer.read_image(&self.connection))?;
+        let item = offer.read_text_and_image(&self.connection)?;
 
         self.cached_read = Some(item.clone());
         Some(item)
@@ -223,9 +234,7 @@ impl Clipboard {
             return self.primary_contents.clone();
         }
 
-        let item = offer
-            .read_text(&self.connection)
-            .or_else(|| offer.read_image(&self.connection))?;
+        let item = offer.read_text_and_image(&self.connection)?;
 
         self.cached_primary_read = Some(item.clone());
         Some(item)

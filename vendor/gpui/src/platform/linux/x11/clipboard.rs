@@ -47,7 +47,7 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
-use crate::{ClipboardItem, Image, ImageFormat, hash};
+use crate::{ClipboardEntry, ClipboardItem, ClipboardString, Image, ImageFormat, hash};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -277,50 +277,75 @@ impl Inner {
         Ok(())
     }
 
-    /// `formats` must be a slice of atoms, where each atom represents a target format.
-    /// The first format from `formats`, which the clipboard owner supports will be the
-    /// format of the return value.
-    fn read(&self, formats: &[Atom], selection: ClipboardKind) -> Result<ClipboardData> {
+    /// `groups` is a list of slices of atoms, where each atom represents a target format.
+    /// For each group, the first format from it which the clipboard owner supports is
+    /// read, so a copy that offers both an image and text gives both; the owner is asked
+    /// for its formats once. A group none of whose formats can be read has an error in
+    /// its place.
+    fn read_each(
+        &self,
+        groups: &[&[Atom]],
+        selection: ClipboardKind,
+    ) -> Result<Vec<Result<ClipboardData>>> {
         // if we are the current owner, we can get the current clipboard ourselves
         if self.is_owner(selection)? {
             let data = self.selection_of(selection).data.read();
-            if let Some(data_list) = &*data {
-                for data in data_list {
-                    for format in formats {
-                        if *format == data.format {
-                            return Ok(data.clone());
-                        }
-                    }
-                }
-            }
-            return Err(Error::ContentNotAvailable);
+            return Ok(groups
+                .iter()
+                .map(|formats| {
+                    data.iter()
+                        .flatten()
+                        .find(|data| formats.contains(&data.format))
+                        .cloned()
+                        .ok_or(Error::ContentNotAvailable)
+                })
+                .collect());
         }
         let reader = XContext::new()?;
 
-        let highest_precedence_format =
-            match self.read_single(&reader, selection, self.atoms.TARGETS) {
-                Err(err) => {
-                    log::trace!("Clipboard TARGETS query failed with {err:?}");
+        let available_formats = match self.read_single(&reader, selection, self.atoms.TARGETS) {
+            Err(err) => {
+                log::trace!("Clipboard TARGETS query failed with {err:?}");
+                None
+            }
+            Ok(ClipboardData { bytes, format }) => {
+                if format == self.atoms.ATOM {
+                    Some(Self::parse_formats(&bytes))
+                } else {
+                    log::trace!(
+                        "Unexpected clipboard TARGETS format {}",
+                        self.atom_name(format)
+                    );
                     None
                 }
-                Ok(ClipboardData { bytes, format }) => {
-                    if format == self.atoms.ATOM {
-                        let available_formats = Self::parse_formats(&bytes);
-                        formats
-                            .iter()
-                            .find(|format| available_formats.contains(format))
-                    } else {
-                        log::trace!(
-                            "Unexpected clipboard TARGETS format {}",
-                            self.atom_name(format)
-                        );
-                        None
-                    }
-                }
-            };
+            }
+        };
 
-        if let Some(&format) = highest_precedence_format {
-            let data = self.read_single(&reader, selection, format)?;
+        Ok(groups
+            .iter()
+            .map(|formats| {
+                self.read_offered(&reader, selection, formats, available_formats.as_deref())
+            })
+            .collect())
+    }
+
+    /// The first format from `formats` which the clipboard owner supports, judged by
+    /// `available_formats` (the owner's TARGETS) when it answered that query.
+    fn read_offered(
+        &self,
+        reader: &XContext,
+        selection: ClipboardKind,
+        formats: &[Atom],
+        available_formats: Option<&[Atom]>,
+    ) -> Result<ClipboardData> {
+        if let Some(available_formats) = available_formats {
+            let Some(&format) = formats
+                .iter()
+                .find(|format| available_formats.contains(format))
+            else {
+                return Err(Error::ContentNotAvailable);
+            };
+            let data = self.read_single(reader, selection, format)?;
             if !formats.contains(&data.format) {
                 // This shouldn't happen since the format is from the TARGETS list.
                 log::trace!(
@@ -335,7 +360,7 @@ impl Inner {
 
         log::trace!("Falling back on attempting to convert clipboard to each format.");
         for format in formats {
-            match self.read_single(&reader, selection, *format) {
+            match self.read_single(reader, selection, *format) {
                 Ok(data) => {
                     if formats.contains(&data.format) {
                         return Ok(data);
@@ -1051,45 +1076,71 @@ impl Clipboard {
             self.inner.atoms.TEXT_MIME_UNKNOWN,
         ];
 
-        let atom_none: Atom = AtomEnum::NONE.into();
+        // A copy of mixed content (spreadsheet cells, a slide, a picture with its
+        // caption) offers both an image and text, and a paste that wants one or the
+        // other picks from the item, so both are read: the text first, then the image.
+        let mut results = self
+            .inner
+            .read_each(&[&text_format_atoms, &image_format_atoms], selection)?
+            .into_iter();
+        let text_result = results.next().unwrap_or(Err(Error::ContentNotAvailable));
+        let image_result = results.next().unwrap_or(Err(Error::ContentNotAvailable));
 
-        const FORMAT_ATOM_COUNT: usize = TEXT_FORMAT_COUNT + IMAGE_FORMAT_COUNT;
-
-        let mut format_atoms: [Atom; FORMAT_ATOM_COUNT] = [atom_none; FORMAT_ATOM_COUNT];
-
-        // image formats first, as they are more specific, and read will return the first
-        // format that the contents can be converted to
-        format_atoms[0..IMAGE_FORMAT_COUNT].copy_from_slice(&image_format_atoms);
-        format_atoms[IMAGE_FORMAT_COUNT..].copy_from_slice(&text_format_atoms);
-        debug_assert!(!format_atoms.contains(&atom_none));
-
-        let result = self.inner.read(&format_atoms, selection)?;
-
-        log::trace!(
-            "read clipboard as format {:?}",
-            self.inner.atom_name(result.format)
-        );
-
-        for (format_atom, image_format) in image_format_atoms.into_iter().zip(image_formats) {
-            if result.format == format_atom {
-                let bytes = result.bytes;
-                let id = hash(&bytes);
-                return Ok(ClipboardItem::new_image(&Image {
-                    id,
-                    format: image_format,
-                    bytes,
-                }));
+        let mut entries = Vec::with_capacity(2);
+        let text_error = match text_result {
+            Ok(data) => {
+                log::trace!(
+                    "read clipboard text as format {:?}",
+                    self.inner.atom_name(data.format)
+                );
+                let text = if data.format == self.inner.atoms.STRING {
+                    // ISO Latin-1
+                    // See: https://stackoverflow.com/questions/28169745/what-are-the-options-to-convert-iso-8859-1-latin-1-to-a-string-utf-8
+                    Ok(data.bytes.into_iter().map(|c| c as char).collect())
+                } else {
+                    String::from_utf8(data.bytes).map_err(|_| Error::ConversionFailure)
+                };
+                match text {
+                    Ok(text) => {
+                        entries.push(ClipboardEntry::String(ClipboardString::new(text)));
+                        None
+                    }
+                    Err(error) => Some(error),
+                }
             }
-        }
-
-        let text = if result.format == self.inner.atoms.STRING {
-            // ISO Latin-1
-            // See: https://stackoverflow.com/questions/28169745/what-are-the-options-to-convert-iso-8859-1-latin-1-to-a-string-utf-8
-            result.bytes.into_iter().map(|c| c as char).collect()
-        } else {
-            String::from_utf8(result.bytes).map_err(|_| Error::ConversionFailure)?
+            Err(error) => Some(error),
         };
-        Ok(ClipboardItem::new_string(text))
+        let image_error = match image_result {
+            Ok(data) => {
+                log::trace!(
+                    "read clipboard image as format {:?}",
+                    self.inner.atom_name(data.format)
+                );
+                let image_format = image_format_atoms
+                    .into_iter()
+                    .zip(image_formats)
+                    .find_map(|(atom, format)| (atom == data.format).then_some(format));
+                match image_format {
+                    Some(format) => {
+                        let bytes = data.bytes;
+                        let id = hash(&bytes);
+                        entries.push(ClipboardEntry::Image(Image { id, format, bytes }));
+                        None
+                    }
+                    None => Some(Error::ConversionFailure),
+                }
+            }
+            Err(error) => Some(error),
+        };
+        if entries.is_empty() {
+            // Neither could be read: say why, preferring a failure over plain absence.
+            return Err([text_error, image_error]
+                .into_iter()
+                .flatten()
+                .find(|error| !matches!(error, Error::ContentNotAvailable))
+                .unwrap_or(Error::ContentNotAvailable));
+        }
+        Ok(ClipboardItem::new_entries(entries))
     }
 
     pub fn is_owner(&self, selection: ClipboardKind) -> bool {

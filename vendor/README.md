@@ -11,7 +11,7 @@ re-run the check each one names before accepting the upgrade.
 | --- | --- | --- |
 | Frame readback | `src/platform.rs`, `src/window.rs`, `src/platform/windows/{window,directx_renderer}.rs` | the capture tool reads the frame a hidden window rendered |
 | Initial window background | `src/platform.rs`, `src/platform/windows/window.rs` | a light window does not open on a black flash |
-| Clipboard images and mixed items | `src/platform.rs`, `src/platform/windows/{clipboard,dib}.rs`, `src/platform/windows.rs`, `src/platform/linux/x11/{client,clipboard}.rs` | remote-desktop clipboard: screenshots and text-plus-image copies |
+| Clipboard images and mixed items | `src/platform.rs`, `src/platform/windows/{clipboard,dib}.rs`, `src/platform/windows.rs`, `src/platform/linux/x11/{client,clipboard}.rs`, `src/platform/linux/wayland/clipboard.rs`, `src/platform/mac/platform.rs` | remote-desktop clipboard: screenshots and text-plus-image copies |
 
 ### Frame readback
 
@@ -48,16 +48,31 @@ application with the light theme and watch for a black frame.
 ### Clipboard images and mixed items
 
 The remote-desktop clipboard carries images and text together. The released crate
-could neither read a bitmap-only Windows clipboard nor write an image on X11, and
-wrote only the first entry of an item on Windows.
+could neither read a bitmap-only Windows clipboard nor write an image on X11, wrote
+only the first entry of an item on Windows, and on every platform read one entry: a
+copy that offers both text and an image (spreadsheet cells, a slide, a picture with
+its caption) lost one of them.
 
 - `src/platform.rs`: public `ClipboardItem::new_entries(Vec<ClipboardEntry>)`, so an
   application can build one item holding a text and an image.
-- `src/platform/windows/clipboard.rs`, read: when no format the crate already knows
-  is on the clipboard, `CF_DIB` (else `CF_DIBV5`) is decoded to a PNG
-  `ClipboardEntry::Image`. PrintScreen, the snipping overlay and many older programs
-  offer only a bitmap. A text or encoded image offered beside the bitmap still wins,
-  as before.
+- Reading, on every platform: an item holds the first text and the first image the
+  clipboard offers, instead of only the first of either. Callers that want text
+  (`ClipboardItem::text`) get the text of a mixed copy; callers that look for an
+  image find it beside the text. An item holding one entry reads as before.
+- `src/platform/windows/clipboard.rs`, read: the formats are enumerated as before;
+  the first text format (`CF_UNICODETEXT`, or `CF_HDROP` file names) and the first
+  encoded image format each give an entry, in the order the program offered them.
+  When no encoded image is offered, `CF_DIB` (else `CF_DIBV5`) is decoded to a PNG
+  `ClipboardEntry::Image`, also beside text. PrintScreen, the snipping overlay and many
+  older programs offer only a bitmap; Excel and PowerPoint offer one beside their
+  text. An encoded image offered beside the bitmap still wins.
+- `src/platform/windows/clipboard.rs`, bitmap cache: converting a bitmap to PNG takes
+  about 100 ms for a 4K screen in a release build, and callers read the clipboard
+  while drawing (the terminal and text-field context menus check for something to
+  paste on every frame they are open). The converted entry is kept with the clipboard
+  sequence number (`GetClipboardSequenceNumber`) it was read at, and served again
+  until the number changes; a bitmap that would not convert is remembered the same
+  way. Nothing is cached when the number is 0 (a session that may not see it).
 - `src/platform/windows/clipboard.rs`, write: the first text entry and the first
   image entry are both written, instead of only the first entry; one failing does not
   keep the other off. An image is written as before (its own format plus PNG) and
@@ -73,11 +88,25 @@ wrote only the first entry of an item on Windows.
   the atom of its own format - it used to label every image `image/png` - and the
   item's text as `UTF8_STRING` beside it. Items without an image are written as
   text, as before.
+- `src/platform/linux/x11/clipboard.rs`, read: `Inner::read` became `Inner::read_each`,
+  which asks the owner for its `TARGETS` once and then reads the first offered format
+  of each group; `get_any` passes the text formats and the image formats as two groups.
+  It used to pass one list with the images first, so a copy offering both gave only
+  the image. A group that fails does not keep the other out; `get_any` fails only when
+  neither gives anything.
+- `src/platform/linux/wayland/clipboard.rs`, read: the offer's text and its image are
+  both read (`DataOffer::read_text_and_image`); it used to read the image only when
+  there was no text.
+- `src/platform/mac/platform.rs`: reading takes the string and then the first
+  supported image type; it used to stop at the string. Writing an item with several
+  entries also puts its first image on the pasteboard, in its own type, beside the
+  text; it used to drop it.
 
 Not changed: Wayland still writes text only, so an image cannot be put on the
-clipboard there; macOS is untouched. X11 serves the selection in one property
-change, without INCR, so an image larger than the X server's maximum request length
-(about 16 MiB with BIG-REQUESTS on Xorg) cannot be handed to a requesting program.
+clipboard there. X11 serves the selection in one property change, without INCR, so
+an image larger than the X server's maximum request length (about 16 MiB with
+BIG-REQUESTS on Xorg) cannot be handed to a requesting program. The macOS changes
+have not been compiled on macOS (see below).
 
 Check after re-applying: the conversion tests in `dib.rs`. `gpui` is not a member of
 this workspace, so `cargo test -p gpui` is refused; the file depends only on `image`
@@ -105,7 +134,26 @@ and `anyhow` and is tested through a throwaway crate outside the workspace:
 
 The Windows read and write paths themselves need a real clipboard: copy a
 PrintScreen image and paste it in a desktop pane; copy an image in the application
-and paste it in Paint.
+and paste it in Paint; copy cells in Excel and check that a desktop pane offers the
+remote side both the text and the picture.
+
+The platform reads were checked with throwaway programs that include the vendored
+file through `#[path]` and stand in the few `crate::` types it names
+(`ClipboardItem`, `ClipboardEntry`, `ClipboardString`, `Image`, `ImageFormat`, `hash`):
+
+- Windows (`clipboard.rs` and `dib.rs`): put `CF_UNICODETEXT` + `CF_DIB`, `CF_DIB`
+  alone, text alone, `PNG` + text, and text + `PNG` + `CF_DIB` on the real clipboard,
+  write a text-plus-PNG item with `write_to_clipboard`, and read each back with
+  `read_from_clipboard`; time a 4K bitmap beside text on the first and later reads.
+  Another program (clipboard history) may hold the clipboard for a moment after each
+  change, so the probe retries opening it.
+- X11 (`clipboard.rs`, plus a stand-in `util` crate with `defer`), under `xvfb-run`:
+  a child process owns `CLIPBOARD` with an image and a text, an image alone, or a text
+  alone; the parent reads it with `get_any`.
+
+The Linux build (X11 and Wayland) is checked with `cargo check -p gpui` on Linux. The
+macOS build cannot be checked from Windows or Linux: `gpui_media` generates its
+bindings from the macOS SDK.
 
 ## `xattr` 0.2.3
 

@@ -1060,18 +1060,27 @@ impl Platform for MacPlatform {
                 }
             } else {
                 let mut any_images = false;
+                // The item's first image is offered beside its text, in its own format,
+                // so a paste that wants an image gets it.
+                let mut first_image = None;
                 let attributed_string = {
                     let mut buf = NSMutableAttributedString::alloc(nil)
                         // TODO can we skip this? Or at least part of it?
                         .init_attributed_string(NSString::alloc(nil).init_str(""));
 
                     for entry in item.entries {
-                        if let ClipboardEntry::String(ClipboardString { text, metadata: _ }) = entry
-                        {
-                            let to_append = NSAttributedString::alloc(nil)
-                                .init_attributed_string(NSString::alloc(nil).init_str(&text));
+                        match entry {
+                            ClipboardEntry::String(ClipboardString { text, metadata: _ }) => {
+                                let to_append = NSAttributedString::alloc(nil)
+                                    .init_attributed_string(NSString::alloc(nil).init_str(&text));
 
-                            buf.appendAttributedString_(to_append);
+                                buf.appendAttributedString_(to_append);
+                            }
+                            ClipboardEntry::Image(image) => {
+                                if first_image.is_none() {
+                                    first_image = Some(image);
+                                }
+                            }
                         }
                     }
 
@@ -1108,6 +1117,17 @@ impl Platform for MacPlatform {
                 state
                     .pasteboard
                     .setString_forType(plain_text, NSPasteboardTypeString);
+
+                if let Some(image) = first_image {
+                    let bytes = NSData::dataWithBytes_length_(
+                        nil,
+                        image.bytes.as_ptr() as *const c_void,
+                        image.bytes.len() as u64,
+                    );
+                    state
+                        .pasteboard
+                        .setData_forType(bytes, Into::<UTType>::into(image.format).inner_mut());
+                }
             }
         }
     }
@@ -1116,37 +1136,43 @@ impl Platform for MacPlatform {
         let state = self.0.lock();
         let pasteboard = state.pasteboard;
 
-        // First, see if it's a string.
+        // A copy of mixed content (spreadsheet cells, a slide, a picture with its caption)
+        // offers both a string and an image, and a paste that wants one or the other picks
+        // from the item, so both are read: the string first, then the image.
         unsafe {
             let types: id = pasteboard.types();
             let string_type: id = ns_string("public.utf8-plain-text");
 
-            if msg_send![types, containsObject: string_type] {
+            let text = if msg_send![types, containsObject: string_type] {
                 let data = pasteboard.dataForType(string_type);
                 if data == nil {
-                    return None;
+                    None
                 } else if data.bytes().is_null() {
                     // https://developer.apple.com/documentation/foundation/nsdata/1410616-bytes?language=objc
                     // "If the length of the NSData object is 0, this property returns nil."
-                    return Some(self.read_string_from_clipboard(&state, &[]));
+                    Some(self.read_string_from_clipboard(&state, &[]))
                 } else {
                     let bytes =
                         slice::from_raw_parts(data.bytes() as *mut u8, data.length() as usize);
 
-                    return Some(self.read_string_from_clipboard(&state, bytes));
+                    Some(self.read_string_from_clipboard(&state, bytes))
                 }
-            }
+            } else {
+                None
+            };
 
-            // If it wasn't a string, try the various supported image types.
-            for format in ImageFormat::iter() {
-                if let Some(item) = try_clipboard_image(pasteboard, format) {
-                    return Some(item);
-                }
-            }
+            // The first of the supported image types the pasteboard holds.
+            let image =
+                ImageFormat::iter().find_map(|format| try_clipboard_image(pasteboard, format));
+
+            // If it was neither a string nor a supported image type, give up.
+            let entries: Vec<ClipboardEntry> = text
+                .into_iter()
+                .chain(image)
+                .flat_map(ClipboardItem::into_entries)
+                .collect();
+            (!entries.is_empty()).then(|| ClipboardItem::new_entries(entries))
         }
-
-        // If it wasn't a string or a supported image type, give up.
-        None
     }
 
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {

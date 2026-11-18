@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 
 use anyhow::Result;
 use collections::{FxHashMap, FxHashSet};
@@ -8,8 +8,8 @@ use windows::Win32::{
     System::{
         DataExchange::{
             CloseClipboard, CountClipboardFormats, EmptyClipboard, EnumClipboardFormats,
-            GetClipboardData, GetClipboardFormatNameW, IsClipboardFormatAvailable, OpenClipboard,
-            RegisterClipboardFormatW, SetClipboardData,
+            GetClipboardData, GetClipboardFormatNameW, GetClipboardSequenceNumber,
+            IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
         },
         Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
         Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT},
@@ -81,7 +81,7 @@ pub(crate) fn write_to_clipboard(item: ClipboardItem) {
 
 pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
     with_clipboard(|| {
-        with_best_match_format(|item_format| match format_to_type(item_format) {
+        with_best_match_formats(|item_format| match format_to_type(item_format) {
             ClipboardFormatType::Text => read_string_from_clipboard(),
             ClipboardFormatType::Image => read_image_from_clipboard(item_format),
             ClipboardFormatType::Files => read_files_from_clipboard(),
@@ -242,34 +242,58 @@ fn encode_png(image: &image::DynamicImage) -> Result<Vec<u8>> {
     Ok(output_buf)
 }
 
-// Here, we enumerate all formats on the clipboard and find the first one that we can process.
+// Here, we enumerate all formats on the clipboard and find, for text and for images, the
+// first one that we can process. A copy of mixed content (spreadsheet cells, a slide, a
+// picture with its caption) offers both, and a paste that wants one or the other picks
+// from the item, so both are read. The entries keep the order the program offered them in.
 // The reason we don't use `GetPriorityClipboardFormat` is that it sometimes returns the
 // wrong format.
 // For instance, when copying a JPEG image from  Microsoft Word, there may be several formats
 // on the clipboard: Jpeg, Png, Svg.
 // If we use `GetPriorityClipboardFormat`, it will return Svg, which is not what we want.
-fn with_best_match_format<F>(f: F) -> Option<ClipboardItem>
+fn with_best_match_formats<F>(f: F) -> Option<ClipboardItem>
 where
     F: Fn(u32) -> Option<ClipboardEntry>,
 {
     let count = unsafe { CountClipboardFormats() };
+    let mut entries: Vec<ClipboardEntry> = Vec::with_capacity(2);
+    let has_text = |entries: &[ClipboardEntry]| {
+        entries
+            .iter()
+            .any(|entry| matches!(entry, ClipboardEntry::String(_)))
+    };
+    let has_image = |entries: &[ClipboardEntry]| {
+        entries
+            .iter()
+            .any(|entry| matches!(entry, ClipboardEntry::Image(_)))
+    };
     let mut clipboard_format = 0;
     for _ in 0..count {
         clipboard_format = unsafe { EnumClipboardFormats(clipboard_format) };
         let Some(item_format) = FORMATS_SET.get(&clipboard_format) else {
             continue;
         };
-        if let Some(entry) = f(*item_format) {
-            return Some(ClipboardItem {
-                entries: vec![entry],
-            });
+        let wanted = match format_to_type(*item_format) {
+            ClipboardFormatType::Text | ClipboardFormatType::Files => !has_text(&entries),
+            ClipboardFormatType::Image => !has_image(&entries),
+        };
+        if !wanted {
+            continue;
+        }
+        entries.extend(f(*item_format));
+        if has_text(&entries) && has_image(&entries) {
+            break;
         }
     }
-    // Nothing above, but a bitmap: a screenshot, or a program that offers only that.
-    if let Some(entry) = read_bitmap_from_clipboard() {
-        return Some(ClipboardItem {
-            entries: vec![entry],
-        });
+    // No encoded image, but a bitmap: a screenshot, a program that offers only that, or
+    // one that offers it beside its text (spreadsheet cells, a slide).
+    if !has_image(&entries)
+        && let Some(entry) = read_bitmap_from_clipboard()
+    {
+        entries.push(entry);
+    }
+    if !entries.is_empty() {
+        return Some(ClipboardItem { entries });
     }
     // log the formats that we don't support yet.
     {
@@ -354,13 +378,53 @@ fn read_image_for_type(format_number: u32, format: ImageFormat) -> Option<Clipbo
     Some(ClipboardEntry::Image(Image { format, bytes, id }))
 }
 
+/// The bitmap last converted, and the clipboard sequence number it was read at.
+///
+/// Converting a bitmap to PNG takes tens of milliseconds for a screen and hundreds for a
+/// 4K one, and callers read the clipboard while drawing (a context menu asks whether
+/// there is anything to paste on every frame it is open). The clipboard does not change
+/// without its sequence number changing, so one conversion serves every read until then.
+/// A bitmap that could not be read is remembered too, so it is not decoded again.
+static BITMAP_CACHE: Mutex<Option<(u32, Option<ClipboardEntry>)>> = Mutex::new(None);
+
 /// A bitmap on the clipboard (`CF_DIB`, else `CF_DIBV5`) as a PNG image entry.
 ///
-/// Read only when no format above matched, so an encoded image or text offered beside
-/// the bitmap still wins. Windows synthesizes either format from the other and from
+/// Read only when no encoded image matched, so an encoded image offered beside the
+/// bitmap still wins. Windows synthesizes either format from the other and from
 /// `CF_BITMAP`; `CF_DIB` is tried first because its layout is the one every program
 /// agrees on, and screenshots carry no alpha that `CF_DIBV5` would add.
+///
+/// Called with the clipboard open, so no other program can change it in between.
 fn read_bitmap_from_clipboard() -> Option<ClipboardEntry> {
+    if [CF_DIB.0 as u32, CF_DIBV5.0 as u32]
+        .iter()
+        .all(|format| unsafe { IsClipboardFormatAvailable(*format) }.is_err())
+    {
+        return None;
+    }
+    // Zero means this session may not see the number; nothing is cached then.
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    if sequence != 0
+        && let Ok(cache) = BITMAP_CACHE.lock()
+        && let Some((cached_at, entry)) = cache.as_ref()
+        && *cached_at == sequence
+    {
+        return entry.clone();
+    }
+    let entry = convert_bitmap_on_clipboard();
+    // A program that renders its bitmap only when it is asked for (delayed rendering)
+    // may move the number as it puts the bitmap on; the number after the read is the
+    // one later reads see.
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    if sequence != 0
+        && let Ok(mut cache) = BITMAP_CACHE.lock()
+    {
+        *cache = Some((sequence, entry.clone()));
+    }
+    entry
+}
+
+fn convert_bitmap_on_clipboard() -> Option<ClipboardEntry> {
     for format in [CF_DIB.0 as u32, CF_DIBV5.0 as u32] {
         if unsafe { IsClipboardFormatAvailable(format) }.is_err() {
             continue;
