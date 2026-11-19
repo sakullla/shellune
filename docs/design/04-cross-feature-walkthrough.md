@@ -48,7 +48,7 @@
 
 `cargo test --bin shellune --all-features -- app::tests:: -- --test-threads=8`
 
-结果：174 passed、0 failed、0 ignored、82 filtered out，耗时 18.25 秒。测试程序是 `C:/Users/12976/.cargo/target/debug/deps/shellune-be14777611f5cc15.exe`。`one_step_of_text_size_is_115_percent_and_stays_inside_the_minimum_window` 断言从默认走一步仍是 `Zoom::Comfortable`（115%），并检查导航项和内容落在最小窗口内。第 2 节的实窗 exe 在这次改名之前构建；改名只动测试函数名，应用行为与那次构建相同。
+结果：174 passed、0 failed、0 ignored、82 filtered out，耗时 18.25 秒。测试程序是 `C:/Users/12976/.cargo/target/debug/deps/shellune-be14777611f5cc15.exe`。`one_step_of_text_size_is_115_percent_and_stays_inside_the_narrow_window` 断言从默认走一步仍是 `Zoom::Comfortable`（115%），并检查导航项和内容落在最小窗口内。第 2 节的实窗 exe 在这次改名之前构建；改名只动测试函数名，应用行为与那次构建相同。
 
 与这次走查直接相关、并包含在上述套件中的用例：
 
@@ -66,7 +66,7 @@
 
 `cargo test --bin shellune --offline -- --test-threads=8`
 
-结果：257 passed、0 failed、0 ignored，耗时 18.04 秒。测试程序是 `C:/Users/12976/.cargo/target/debug/deps/shellune-ac8311f8bd553847.exe`。其中 `two_hundred_percent_file_columns_stay_inside_the_window` 在 200% 下打开文件视图：720×480 与 1120×720 为单栏，路径、刷新、关闭和来源切换落在窗口内，切换后本地与远程路径仍分开；2400×900 才出现双栏，两栏也落在窗口内。这是 GPUI 测试窗口，不是第 2 节那个实窗的逐页点击。
+结果：257 passed、0 failed、0 ignored，耗时 18.04 秒。测试程序是 `C:/Users/12976/.cargo/target/debug/deps/shellune-ac8311f8bd553847.exe`。其中 `large_text_file_columns_stay_inside_the_window` 在 200% 下打开文件视图：720×480 与 1120×720 为单栏，路径、刷新、关闭和来源切换落在窗口内，切换后本地与远程路径仍分开；2400×900 才出现双栏，两栏也落在窗口内。这是 GPUI 测试窗口，不是第 2 节那个实窗的逐页点击。
 
 正式交付用的 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-features -- --include-ignored` 和 release 构建，本轮没有跑，也不记为通过。
 

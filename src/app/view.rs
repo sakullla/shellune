@@ -2963,11 +2963,14 @@ impl ShelluneView {
         }) {
             self.workspace.set_locale(locale);
         }
-        if let Some(zoom) = saved.text_size.and_then(|percent| {
-            theme::Zoom::ALL
+        // A size this build no longer offers - 200% used to be one - is not half
+        // applied: launch, restore and the sync read all land on 100%, so a window that
+        // is already at 90% or 115% does not keep it when the file says 200.
+        if let Some(percent) = saved.text_size {
+            let zoom = theme::Zoom::ALL
                 .into_iter()
                 .find(|zoom| zoom_percent(*zoom) == percent)
-        }) {
+                .unwrap_or_default();
             self.workspace.set_zoom(zoom);
         }
         if let Some(motion) = saved.motion.as_deref().and_then(|value| match value {
@@ -16757,7 +16760,8 @@ impl ShelluneView {
         // wrapping group measures its content without the gaps, then wraps a button that
         // would have fitted once the gap is counted, and the line the buttons did not
         // use was not added to the bar's height either (a button drawn past its bottom
-        // edge at 720 wide and 115%).
+        // edge at 720 wide and 115%). The bottom margin is what separates two rows once
+        // they do wrap: a wrapped group has no row gap of its own.
         let spacing = metrics.scale(spacing::HAIRLINE);
         let mut actions = div()
             .flex()
@@ -16765,7 +16769,9 @@ impl ShelluneView {
             .min_w_0()
             .max_w_full()
             .flex_wrap()
-            .items_center();
+            // Rows start at the same top: the buttons differ by half a pixel and a
+            // centred line would stagger them.
+            .items_start();
         let is_remote = source == FileSource::Remote;
         let action_id = |name: &str| SharedString::from(format!("{prefix}.mark.{name}"));
         if is_remote {
@@ -16777,7 +16783,8 @@ impl ShelluneView {
                     cx,
                     move |view, cx| view.files_download_marked(id, cx),
                 )
-                .mr(spacing),
+                .mr(spacing)
+                .mb(spacing),
             );
         } else {
             actions = actions.child(
@@ -16788,7 +16795,8 @@ impl ShelluneView {
                     cx,
                     move |view, cx| view.files_upload_marked(id, cx),
                 )
-                .mr(spacing),
+                .mr(spacing)
+                .mb(spacing),
             );
         }
         actions = actions
@@ -16800,7 +16808,8 @@ impl ShelluneView {
                     cx,
                     move |view, cx| view.files_copy_marked(id, source, cx),
                 )
-                .mr(spacing),
+                .mr(spacing)
+                .mb(spacing),
             )
             .child(
                 self.text_button(
@@ -16810,7 +16819,8 @@ impl ShelluneView {
                     cx,
                     move |view, cx| view.files_ask_delete_marked(id, source, cx),
                 )
-                .mr(spacing),
+                .mr(spacing)
+                .mb(spacing),
             )
             .child(self.text_button(
                 action_id("clear"),

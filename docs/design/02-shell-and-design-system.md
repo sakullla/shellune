@@ -49,7 +49,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   （最小化 / 最大化或还原 / 关闭）并停止传播，保证无论系统命中测试是否生效都只执行一次。窗口按钮宽 46、
   高等于顶行、12px 线形图标；悬停为 `surface hover`，按下再深一级 `surface pressed`；关闭按钮悬停为令牌
   `danger solid` + `on danger`，按下为其 82% 不透明度。按钮宽度与图标随显示器缩放、不随应用文字大小，
-  所以 720×480、200% 文字时三个按钮仍在窗口内。macOS 红绿灯是系统画的、不随文字缩放：
+  所以 720 宽、115% 文字时三个按钮仍在窗口内。macOS 红绿灯是系统画的、不随文字缩放：
   `titlebar::traffic_light_position(metrics)` 按顶行高度算出垂直位置（14pt 按钮在 `header_height` 中居中，
   左缩进 16pt），窗口打开时用偏好文件里的文字大小（`view::saved_zoom`）计算一次——系统只在建窗时接受这个位置，
   运行中改文字大小要到下次打开窗口才重新居中；`traffic_light_room(metrics)` 预留"缩进 + 三个按钮 52pt +
@@ -112,7 +112,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
     聚焦搜索；↑↓ 移动键盘光标（列表跟随滚动，"连接到 …"行算第 0 行：没有光标即选中它，从第一条记录按 ↑ 回到它，
     此时 Enter——搜索框或页面焦点——直连所输入的地址）；Enter 连接；Ctrl/Cmd+N 新建主机；
     Delete（macOS 的 Backspace）对光标行先问删除确认。Esc 关闭首页菜单。
-  - **矮窗口**（高 < 320，随缩放）整页一列滚动，列表保留两行最小高度；720×480 @ 200% 时侧栏为图标栏、工具条换行，
+  - **矮窗口**（高 < 320，随缩放）整页一列滚动，列表保留两行最小高度；720×480 @ 115% 时侧栏为图标栏、工具条换行，
     搜索、新建主机与本地终端都在窗口宽度内。
   - **证据**：`src/app/tests.rs` 的首页测试（`the_home_is_a_sidebar_a_toolbar_and_one_list`、
     `the_sidebar_places_narrow_the_list_and_name_the_page`、`the_sidebar_folds_to_icons_and_opens_again`、
@@ -196,7 +196,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   - **视觉（新设计语言，结构与行为不变）**：
     - **快速连接栏**：`TextField::set_prominent(true)` 画成主入口。高 40，圆角 12（`XLARGE`），
       `surface` 底加强边，静止 Raised；聚焦时在 Raised 之上加 accent 边与 3px 焦点环。正文字号用 body，图标 16。
-      其余输入框不受影响。与所有 `TextField` 一样按 `Metrics::default()` 绘制，不随窗口缩放（200% 时仍是 100% 的尺寸）。
+      其余输入框不受影响。与所有 `TextField` 一样按 `Metrics::default()` 绘制，不随窗口缩放（115% 时仍是 100% 的尺寸）。
     - **卡片**：最近、收藏、分组三类卡片都由 `home_card_frame` 构成，即共享的 `components::card` 横排
       （surface、弱边、圆角 8、Raised，内边距 12×8）。悬停时即时抬到 Overlay 并换成强边，没有过渡。
       分组卡片的图标块用品牌渐变（accent）配 `ON_ACCENT` 文件夹，与主机卡片的首字母头像区分。
@@ -214,12 +214,12 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
     - **空状态**：列表的“无匹配”（`hosts.nomatch`）和“暂无最近连接”（`hosts.recent.empty`）
       改用 `components::empty_state`（accent tint 图标块 + 标题 + 可选说明 + 动作），外层保留原选择器。
       首次使用卡片改用 `components::card`，取对话框圆角 12（`XLARGE`）和内边距 24，品牌图标块为 Overlay。
-    - **证据**：`home-*` 截图（宽、窄、空、中文、200%）。
+    - **证据**：`home-*` 截图（宽、窄、空、中文；200% 变体已随该档取消）。
       `the_dashboard_cards_fade_in_turn_where_they_stand_and_take_a_press_at_once` 断言进入中与减少动效时
       卡片位置一致、进入中可点；`the_quick_bar_is_the_larger_field_above_the_cards` 断言栏高于列表搜索、
       卡片与列表左对齐。
   - **证据**：截图场景 `home-hosts`（最近 + 分组）、`home-favorites`（收藏卡片与行星标）、`home-quick`（栏的结果）、
-    `home-narrow`（860 宽单列、720×480 @ 200%）、`home-empty`（首次使用）。fixture 的连接记录是写进文件的、按运行时刻
+    `home-narrow`（860 宽单列）、`home-empty`（首次使用）。fixture 的连接记录是写进文件的、按运行时刻
     取相对时间，不代表真的连过；收藏的标记/取消、快速连接的匹配与临时连接、分组筛选、空区隐藏由 `src/app/tests.rs`
     的仪表盘测试断言。
   以下为仪表盘之前的改版说明，与上文冲突处以上文为准（"本机"启动器一节已删除）。
@@ -242,7 +242,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   行内按钮都会阻止冒泡，快速连点图标不会顺带打开主机。删除仍先确认。
   搜索框输入关键词后**按 Enter 连接列表最上面那台**（`first_searched_host`），空搜索框按 Enter 什么都不做。
   "保存位置"那一行从主页移走（它在 设置 → 数据 里），主页标题改为 hero 字号 semibold。
-  卡片带限高并自身滚动，所有主机列表和它的过滤条因此留在窗口内；矮窗口（720×480 @ 200%）整页成为一列滚动，
+  卡片带限高并自身滚动，所有主机列表和它的过滤条因此留在窗口内；矮窗口（720 宽 @ 115%）整页成为一列滚动，
   快速连接栏在最上方、可见，列表过滤条从窗口内开始、滚动整页即可完整到达，列表本身保留两行的最小高度。
 - **终端**（`view/shell.rs::session_header`）：顶栏与它下面那行是一个连续头部，会话只写一次（见 1.1 节）。
   只有一个窗格时不画窗格标记与焦点框，分屏按钮在头部第二行；分屏后每个窗格只恢复一条 26 高的标记
@@ -309,7 +309,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   测试：`the_jump_picker_narrows_by_name_or_address_and_adds_from_the_keyboard`、
   `twenty_four_hosts_keep_the_jump_section_as_tall_as_six`、
   `the_jump_picker_scrolls_its_list_and_stays_clear_of_the_proxy_field`（选择器与“代理命令”标签、标签与输入框
-  互不重叠，720×480@200% 与 1120×720、中英文）、`the_jump_picker_scrolls_itself_into_the_smallest_dialog`；
+  互不重叠，720 宽 @115% 与 1120×720、中英文）、`the_jump_picker_scrolls_itself_into_the_smallest_dialog`；
   截图场景 `host-new-jumps`。
 - **连接弹窗**：头部只有主机名（进行中时不再在标题下重复地址）。进行中与等待确认时，主体是四步进度
   （连接服务器 → 验证服务器身份 → 登录 → 打开终端，`remote.stage`）：已完成打勾，进行中的一步有呼吸点
@@ -453,7 +453,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 - **详情**在横幅下方展开（`terminal.failure.detail`）："诊断"标题与"复制诊断"（`terminal.failure.copy`），下面是等宽字的
   完整诊断（`terminal.failure.diagnostic`，`copyable_lines`：每行一个按横幅宽度换行的块，点任何一行复制全部），
   最高 `DIAGNOSTIC_MAX_HEIGHT`（160，随缩放），同时不超过窗格高度的 `DIAGNOSTIC_MAX_SHARE`（40%，外层
-  `terminal.failure.room` 以相对高度限制，T9），超出时纵向滚动；720×480 @200% 展开后网格仍至少留 3 行
+  `terminal.failure.room` 以相对高度限制，T9），超出时纵向滚动；720 宽 @115% 展开后网格仍至少留 3 行
   （`unfolded_details_leave_rows_of_the_last_screen_in_a_short_pane`）。展开后长诊断需要多布局一帧（`window.on_next_frame`
   请求重画）。复制的是会话陈述的整段诊断（哪个会话停止 + 原因），经 `sanitize_diagnostic` 清理。
 - **键盘**：横幅出现时不抢键盘。终端不再接收输入时，在终端里按 Tab 到达横幅第一个控件；Tab / Shift+Tab 在
@@ -470,7 +470,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   `the_banner_closes_with_its_button_or_escape_and_the_bar_keeps_reconnect`、`tab_reaches_the_banner_and_enter_presses_its_step`、
   `a_long_diagnostic_unfolds_under_the_banner_scrolls_and_copies`、
   `a_reconnect_runs_under_a_banner_over_the_last_screen_and_can_be_cancelled`，以及 `an_ended_shell_*`（单窗格、左右与上下
-  分屏在设计尺寸与 720×480 @200% 下横幅可见、下一步可达；上下分屏 @200% 时窗格比横幅一行还矮，横幅行被压短）。
+  分屏在设计尺寸与 720×480 @115% 下横幅可见、下一步可达；上下分屏 @115% 时窗格比横幅一行还矮，横幅行被压短）。
   截图场景 `terminal-disconnected`、`terminal-banner-failed`、`terminal-banner-details`、`terminal-banner-long`。
 
 **仍用卡片的状态。** 还没有任何屏幕内容的会话——首次连接、证书或密码的问题——仍是居中卡片。
@@ -520,7 +520,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 标记里没有会话名——那已经在标签上。
 
 **窄窗口与 115% 文字。** 窗口窄于 `CONTEXT_ONE_LINE_WIDTH`（860，随文字缩放）时，关闭留在目标那一行，
-操作整组换到第二行内部，头部只长一行、不横向裁切；这是 720×480 + 200% 下最矮的排法。
+操作整组换到第二行内部，头部只长一行、不横向裁切；这是 720×480 + 115% 下最矮的排法。
 
 **状态原因留在终端上方。** X11 失败原因与"保存主机"结果不再住在头部里（一块占窗口 38% 的文本会把头部
 撑高），而是画在头部下方、终端之上（`session_notices`），边到边、宽度满格、上限 `X11_NOTICE_SHARE`，
@@ -690,7 +690,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 - **提示条**（`desktop.notice`）移到画面**左下角**：在顶部时，最小窗口里它会盖住右上角的缩放控件（截图 `desktop-notices`
   720×480 可见）；最宽 `NOTICE_WIDTH` 420（桌面窗格按 `Metrics::default()` 绘制，与改版前一样不随文字大小缩放）。控件条里百分比的宽度是命名常量 `ZOOM_LABEL_WIDTH`。
 - 截图：`desktop-rdp`、`desktop-vnc-failed`（横幅 + 状态卡）、`desktop-certificate`（新增）、`desktop-send-problem`、
-  `desktop-notices`，各有浅色中文与 720×480 @200% 变体。
+  `desktop-notices`，各有浅色中文；旧 200% 变体已随该档取消。
 
 **全屏的作用域（R18）。** 全屏不是窗口进入的一种模式，而是「这块画面此刻是不是屏幕上唯一的那块」：它只在
 会话页（`Destination::LocalShells` 的画面上）、该会话是活动窗格、窗格仍在、而且它的标签里只有它这一个叶子时成立。
@@ -715,10 +715,8 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   头里，含 alpha）。`BITMAPV5HEADER` 之后是否再重复三个颜色掩码各家写法不一（Windows 自己合成的重复，浏览器等多数程序
   不重复），而 `image` crate 总是跳过 12 字节；`dib_to_png` 按包长判断——像素数据总在包尾——没有这 12 字节时先补上，
   两种写法都按原样解出（`a_remote_dibv5_pastes_as_the_same_picture_with_its_transparency`）。远端文本超过 1 MiB 时 shim 同样
-  截断后照常送达并提示“已截断”；远端图片超过 32 MiB 时从这一组里被跳过，其余格式照常送达并提示“没有传输”。换行按
-  本机习惯写入（R1，`local_line_breaks`）：CRLF、单独的 LF、单独的 CR 都算一个换行，Windows 上写成 CRLF，macOS 与 Linux
-  上写成 LF——RDP 远端复制的 CRLF 在 macOS / Linux 上原样写入会让每行多一个 `\r`（vim 里的 `^M`），Linux VNC 远端的 LF
-  在旧的 Windows 程序里会连成一行（`remote_text_is_written_with_this_computers_line_breaks`）。
+  截断后照常送达并提示“已截断”；远端图片超过 32 MiB 时从这一组里被跳过，其余格式照常送达并提示“没有传输”。RDP 远端
+  文本保留 Windows 的 CRLF 换行，原样写入本机。
 - **什么时候推送**：窗格拿到键盘（`cx.on_focus_in`）、窗口重新激活且画面仍有焦点（`observe_window_activation`；GPUI
   的焦点事件在窗口失活时也视为失焦，所以重新激活同样触发 focus-in，两条路径由去重合并成一次）、以及按下粘贴快捷键。
   这样远端程序无论用 Ctrl+V 还是右键“粘贴”都拿到本机最新内容。只在会话 **Live**（画面已出现）且有链路时读剪贴板：
@@ -788,7 +786,8 @@ COM1 等）不算文件夹里的文件。不满足的一律 `ERROR_ACCESS_DENIED
 **已知限制（需实机确认）。** 本机没有 RDP / VNC 服务器：cliprdr 与 rdpdr 的真实往返、服务器在 `fDisableCdm` 等策略下的回应、
 剪贴板通道与输入通道之间的先后，都只由脚本链路和 shim 探针覆盖，真实 RDP / VNC 服务器的往返未在本机验证。服务器打开了
 设备重定向却始终不回这个磁盘的 Device Reply 时客户端收不到信号，不会提示。越界拦截在 Windows 上靠打开后的句柄复核关住
-检查与打开之间的竞态；其它系统只在打开前用 `realpath` 校验，留有这一窗口。平台限制：Wayland 下本机写不出图片；X11 不支持 INCR，超过约 16 MiB 的图片无法提供给本机其它程序；libvncclient 收到超过 1 MiB 的
+检查与打开之间的竞态；其它系统只在打开前用 `realpath` 校验，留有这一窗口。平台限制：Wayland 下本机写不出图片（远端复制的
+图片只有文本部分落到本机）；X11 不支持 INCR，超过约 16 MiB 的图片无法提供给本机其它程序；libvncclient 收到超过 1 MiB 的
 服务器剪贴板文本会直接断开会话。关闭了剪贴板的主机在 0.4.8 及以前的版本上会让整份主机文件 / 同步文件被拒收，需提示其它
 设备升级。
 
@@ -844,7 +843,7 @@ COM1 等）不算文件夹里的文件。不满足的一律 `ERROR_ACCESS_DENIED
   - **打开配置文件夹**（`startup.open_folder`）：以 `file://` 地址（`folder_url`，百分号编码）交给系统文件管理器打开数据目录；
     启动页仍等待“继续”。
   停下的启动页不会自行超时，也不会闪退。布局（T9，`splash_body`）：标题行之下的区域把“品牌 + 停止面板”与按钮行一起
-  垂直居中；内容放得下时按钮紧跟在说明下方，放不下时（200% 文字的 720×480）只有品牌与文字的部分（`startup.body`）收缩并
+  垂直居中；内容放得下时按钮紧跟在说明下方，放不下时（115% 文字的 720×480）只有品牌与文字的部分（`startup.body`）收缩并
   纵向滚动，按钮行不收缩、始终在首屏可见（`the_stop_scrolls_to_its_buttons_in_the_smallest_window_at_the_largest_text`
   先断言两个按钮不滚动就在窗口内且可点，再断言滚动后仍可点）。
 - **阶段耗时**：开发构建（`debug_assertions`）或设置了环境变量 `SHELLUNE_STARTUP_LOG` 的任意构建，在 stderr 逐个写出
@@ -865,10 +864,10 @@ COM1 等）不算文件夹里的文件。不满足的一律 `ERROR_ACCESS_DENIED
 - **测试与截图**：`ShelluneView::new` / `with_workspace` / `with_store*` 仍在返回前同步读完所有存储（测试与截图用的
   “同步就绪”入口，首帧就是页面）；`launching_for_test` 走与启动相同的分阶段路径。测试覆盖阶段顺序与进度目标、阶段 1 与
   阶段 2 失败、继续与 Enter、打开配置文件夹、减少动效（不缩放、不位移、照常淡出）、系统动效回答的等待与超时、
-  最小窗口 200% 下的适配与失败滚动。截图场景 `startup-settings`、`startup-hosts`、`startup-workspace`、
+  720 宽 115% 下的适配与失败滚动；旧 200% 图是 §7 的历史记录。截图场景 `startup-settings`、`startup-hosts`、`startup-workspace`、
   `startup-interface`（四个阶段）与 `startup-failed`（阶段 2 失败，固定原因）由 `capture_hold_startup(done, failure)`
   把窗口停在指定阶段并画出终态（截图固定减少动效，缩放、缓动与淡入淡出是静帧证明不了的），各有深浅两套，另有中文、
-  720×480 与 200% 变体。
+  720×480 变体（旧 200% 变体已取消）。
 - **初始窗口背景**：GPUI 0.2.2 的 `WindowOptions` 只有不透明 / 透明 / 模糊三种窗口背景，没有颜色，因此
   `vendor/gpui` 加了一处补丁：公开函数 `gpui::set_initial_window_background(Rgba)`。Windows 注册窗口类时用这个颜色
   创建背景画刷（原为硬编码黑色）；之后打开窗口时颜色若已改变，在窗口显示前更新窗口类画刷。`open_main_window`
@@ -1079,8 +1078,7 @@ tooltip 这类在窗口渲染之外绘制的部件用 `theme::metrics()` 取得�
 `shift_click_extends_the_selection`、`alt_drag_selects_a_block`、`a_drag_that_leaves_the_grid_keeps_selecting`、
 `a_drag_past_the_edge_scrolls_the_history`、`shift_drag_selects_locally_while_a_program_has_the_mouse`、
 `double_and_triple_clicks_select_a_word_and_a_line`、`a_mouse_selection_is_copied_when_it_is_released`。截图场景（T9 新增）：
-`terminal-selection`（从 “42 passed” 的 “4” 左半部到 “部署完成” 末字右半部，跨两行与宽字符；深浅、中英、1120×720 与
-720×480 的 200%）与 `terminal-selection-block`（“grid” 到 “paste” 的块选；深浅、中文、200%）。选区由截图工具经
+`terminal-selection`（从 “42 passed” 的 “4” 左半部到 “部署完成” 末字右半部，跨两行与宽字符；深浅、中英、1120×720；旧 720×480 @200% 变体已取消）与 `terminal-selection-block`（“grid” 到 “paste” 的块选；深浅、中文；旧 200% 变体已取消）。选区由截图工具经
 `TerminalPane::capture_select` 按文字定位后铺上，网格改宽时重新铺一次；截图证明不了阈值、Shift、窗口级捕获与自动滚动，
 这些由上面的 GPUI 测试覆盖。
 
@@ -1102,8 +1100,8 @@ tooltip 这类在窗口渲染之外绘制的部件用 `theme::metrics()` 取得�
 计数、空结果和非法正则原因是同一类整句，同一条规则：可以先被压窄，再在自己的行里换行。
 `a{2,1}` 的原因（重复次数的起点大于终点）比分栏后的窗格宽；钉成 `flex_none` 时尾部画出窗格右缘，被窗格的 `overflow_hidden` 裁掉。
 条所在的命令块面板最高 180 px（按文字大小上限 260 px），内容更高时在面板内纵向滚动，关闭与两个开关因此始终可达。
-最小窗口 720×480 + 200% 文字（中英文）与分栏窗格下，条的全部部件都在窗口与所在面板/窗格内，由
-`src/app/tests.rs` 的 `the_find_bar_stays_inside_the_window_at_two_hundred_percent`、
+720 宽 + 115% 文字（中英文）与分栏窗格下，条的全部部件都在窗口与所在面板/窗格内，由
+`src/app/tests.rs` 的 `the_find_bar_stays_inside_the_window_at_the_large_text`、
 `the_find_bar_narrows_with_the_pane_instead_of_leaving_it`、`a_find_bar_in_a_split_pane_stays_inside_its_pane`
 与 `a_broken_expression_reason_wraps_inside_the_narrow_pane`
 按测量到的 bounds 锁定。
@@ -1173,7 +1171,7 @@ resize 都按同一条 recount 路径重新计数，视口停在读者原处，�
 - 词不压缩，标签自己让路：标签的最小宽度把两枚标记的字宽算进去（`attention_mark_room`，每枚按三个 `caption`
   字高估，覆盖英文五个字母与中文两个全角字），所以挤不下时先由顶栏裁掉整块标签，而不是让标记和它后面的关闭按钮
   滑到相邻标签上。标签内部可变的正文（标题、状态词、标记）放在自带裁切的行里，关闭按钮始终留在标签自己的边界内，
-  点到的就是它自己的标签。拥挤的顶栏（多标签）与 720×480 + 200% 文字（顶栏已无标签空间，标记改由标签列表读出）
+  点到的就是它自己的标签。拥挤的顶栏（多标签）与 720 宽 + 115% 文字（顶栏已无标签空间，标记改由标签列表读出）
   分别由 `a_marked_tab_keeps_its_marks_and_close_button_inside_itself` 与
   `the_tab_list_keeps_the_marks_readable_in_the_smallest_window_at_large_text`（中英文各量一次）按实测 bounds 锁定。
 - 什么算"已查看"：是当前标签，不是当前聚焦的那个窗格。分屏标签把它的窗格同时画在屏幕上，所以同一标签里
@@ -1260,7 +1258,7 @@ resize 都按同一条 recount 路径重新计数，视口停在读者原处，�
 - 栏的焦点环改为 `FOCUS_RING`，边框平时就在（透明），拿到键盘时内容不再挪动 1px。
 - 拖动文件时跟随指针的标签是 raised + 强边 + Overlay，尺寸取窗口正在用的缩放。
 - 截图：`files-dual`、`files-question`（新增）、`files-marked`、`files-server-failed`、`files-empty` 各有深浅、中文与
-  720×480 @200% 变体；`files-split` 只在宽窗口出现，保留深浅与 1680×940 中文。
+  旧 720×480 @200% 变体（已取消）；`files-split` 只在宽窗口出现，保留深浅与 1680×940 中文。
 
 ### SCP 文件复制（`crates/ssh/src/scp.rs`、`transfers.rs`）
 
@@ -1285,14 +1283,14 @@ SCP 失败就报 SCP 的失败，SFTP 失败就报 SFTP 的失败，不会静默
   确定、取消，最后是头部第二行里切回"终端"的那一段），Enter/Space 激活当前控件，Esc 先关掉问题并把键盘还给这一栏、
   再按一次才关掉整个文件视图（终端拿回键盘，`reclaim_focus`）。切回终端因此有两条键盘出口，一条在焦点环上
   （Tab 到"终端"分段、Enter 按下）、一条是 Esc；文件视图打开时终端列被它替换，没有出口的话键盘就被留在里面了。
-  失败卡比一屏高时因此不必滚轮：200% 文字、最小窗口下原因与两个手输入口用 Page Down/Tab 就能到达并被激活，
+  失败卡比一屏高时因此不必滚轮：115% 文字、720 宽下原因与两个手输入口用 Page Down/Tab 就能到达并被激活，
   焦点环画在控件自身（accent 边框，与设置页焦点环一致）。
 - 焦点环画在控件自己身上，所以每个停靠点都要把**自己那一行**转进栏的视口，而不是只把失败卡翻到底：工具栏停靠点
   回到栏头（栏内容的第一行），问题里的每一行（本地框、远端框、协议、递归、确定/取消）与打开问题时自动聚焦的
   第一个输入框都按上一帧画出的真实 bounds 计算最小滚动量，已经在视口里就不动，比视口还高的一行按顶部读。
   框的高度取决于它带的文字、错误原因和选项（SFTP 换成 SCP 会多出说明与递归两行），所以位置的来源是"画它的那一帧"
   （`on_children_prepainted` 记录内容坐标），刚打开的问题在那一帧结束后（`defer_in`）再转一次并重画：720×480
-  加 200% 文字时 `files.question.input`、问题末尾的取消按钮、栏头的上传/下载都不会落在视口之外。
+  加 115% 文字时 `files.question.input`、问题末尾的取消按钮、栏头的上传/下载都不会落在视口之外。
   头部第二行里那条切回终端的停靠点画在这一栏之外，永远不会被栏的沿挡到，因此不需要转。
 - 传统 SCP 由服务器自己的 `scp` 完成，走同一条已认证连接（含跳板链）上的 exec 通道：上传是 `scp -t`（服务器当
   接收端），下载是 `scp -f`（服务器当发送端），控制记录就是这个通道的字节流。OpenSSH 9 的 `scp` 默认说 SFTP，
@@ -1331,8 +1329,8 @@ SCP 失败就报 SCP 的失败，SFTP 失败就报 SFTP 的失败，不会静默
 
 **长路径。** 面包屑一段一个文件夹，每段有上限宽度（`CRUMB_ROOM` = 240 逻辑像素 × 缩放）：名字本身在段内换行
 读全，不被省略号截断；段多了就整体换行，最后一段（当前目录）也在列内。每段的提示给出它指向的完整路径，最后
-一段的提示给出当前完整路径。这样 200% 文字、最小窗口下，深目录仍然逐段可读，而不会把列表挤出窗口——
-`a_deep_path_is_readable_instead_of_being_cut_off` 保留，新增 `a_deep_path_is_drawn_inside_its_column_at_two_hundred_percent`
+一段的提示给出当前完整路径。这样 115% 文字、720 宽下，深目录仍然逐段可读，而不会把列表挤出窗口——
+`a_deep_path_is_readable_instead_of_being_cut_off` 保留，新增 `a_deep_path_is_drawn_inside_its_column_at_the_large_text`
 把“每段都在列内、单段有上限”也固定下来。
 
 **空、失败与无权限。** 空目录是状态而不是空白列表：图标 + “这个目录是空的” + 下一步（把文件从另一侧拖过来，
@@ -1360,7 +1358,7 @@ SCP 失败就报 SCP 的失败，SFTP 失败就报 SFTP 的失败，不会静默
   样式的按钮。真正的暂停需要 `crates/ssh` 与 `crates/core` 的改动，超出本轮范围，记为未实现。
 - **新视觉（T7，ADR-7）**：传输条的标题行是它自己的工具行（传输图标 + “传输” + 运行中的数量，仍在滚动区之上）；
   每个任务是 panel 底 + 发丝边 + 圆角 6 的一行，状态句与动作同在第一行，条太窄时动作整体换成单独一行并放在句子**上面**（`flex_wrap_reverse`；句子最窄
-  `FILES_SELECTION_WORDS_MIN`，不再被挤成一行两个字）——720×480 @200% 下传输条按视口 42% 封顶，长原因被截在下方可滚动，
+  `FILES_SELECTION_WORDS_MIN`，不再被挤成一行两个字）——720×480 @115% 下传输条按视口 42% 封顶，长原因被截在下方可滚动，
   “续传 / 重新传输”仍在首屏；进度条是共享的 `components::progress_bar`（确定）；“无法开始”与
   “文件夹未传输”是色调 tint 上的状态记号 + 句子；覆盖确认是危险边的 `inline_form`。传输中心（传输对话框）的
   行改为 `list_row_frame`：左侧上传 / 下载图标在状态色调上，右侧状态 chip；没有任务时是共享的 `empty_state`
@@ -1387,12 +1385,12 @@ SCP 失败就报 SCP 的失败，SFTP 失败就报 SFTP 的失败，不会静默
   Esc 只关列表不关表单，点外部关闭；Tab 从控件进入第一个地址框，第一个地址框 Shift+Tab、最后一个框 Tab 回到控件
   （`the_tunnel_forms_host_picker_narrows_twenty_four_hosts_from_the_keyboard`，24 台主机）；停止 / 删除确认与“监听所有地址”确认是警告 / 危险边的
   `inline_form`（停止图标 / 垃圾桶 / 地球，按钮右对齐）。规则行仍是 `list_row_frame`，文字最窄 `FORWARD_ROW_WORDS_MIN`，
-  对话框太窄（720×480 @200%）时命令换到文字下一行，不再压在“监听中”chip 上。
+  对话框太窄（720×480 @115%）时命令换到文字下一行，不再压在“监听中”chip 上。
 
 **捕获。** `files-dual`、`files-empty`、`transfers-running`、`transfers-failed`、`forwards-empty`、`forwards-running`
 六个场景由夹具数据构造：两侧目录来自脚本化通道（不读磁盘、不连服务器），传输任务通过队列自己的事件进入“进行中 /
 失败”，转发规则在不绑定任何套接字的情况下标记为监听中。每个场景都有浅色与深色，T7 起另有浅色中文与
-720×480 @200%；T7 新增 `files-question`（上传问题的行内表单）与 `forwards-form`（新建隧道表单），T9 新增
+720×480（旧 200% 变体已取消）；T7 新增 `files-question`（上传问题的行内表单）与 `forwards-form`（新建隧道表单），T9 新增
 `forwards-host-picker`（隧道表单的主机选择器展开态，`capture_forward_host_picker_open` 判断就绪）；
 就绪判断读的是渲染所用的同一份模型（`capture_files_listing`、`capture_transfer_count`、`capture_forward_counts`、
 `capture_files_question_open`、`capture_forward_form_open`）。
@@ -1462,13 +1460,13 @@ X11 转发让服务器上的图形程序显示在这台电脑上。三个模式�
   `session.x11.enabling`（启用中，warning）、`session.x11.ready`（可用，positive）、`session.x11.failed`（失败，
   danger）。chip 的 tooltip 写原因和下一步；失败时**同一段原因与下一步还会作为常显文本块**（`session.x11.notice`，
   里面是 `session.x11.next` 与 `session.x11.reason`）出现在头部下方、终端之上——tooltip 只有指针能读，键盘用户读到的
-  是这块文本（R4）。文件视图打开时不画这块文本，失败 chip 留在头部第二行，回到终端才再画：720×480、200% 下文本块
+  是这块文本（R4）。文件视图打开时不画这块文本，失败 chip 留在头部第二行，回到终端才再画：720×480、115% 下文本块
   若留在文件窗格上方，会把失败传输的原因和 Retry 顶出客户区。一个没桥接成功的会话仍然是一个能用的会话，断开或关闭会话时 chip 与文本块随桥接一起消失。
 - 这块常显文本的高度上限是窗口高度的 35%（`X11_NOTICE_SHARE`），超出部分在框内滚动（`session.x11.notice.body`，
-  与传输列表同一套 `max_h` + `overflow_y_scroll` 写法）：原因与下一步都随文字大小放大，720×480 加 200% 文字时
+  与传输列表同一套 `max_h` + `overflow_y_scroll` 写法）：原因与下一步都随文字大小放大，720×480 加 115% 文字时
   两者加起来比整个窗口还高，按内容自然高度绘制会把终端压到零高、并把最后一行画到窗口外。**下一步排在原因之前**
   （`session.x11.next` 是框内第一段、用主文本色，`session.x11.reason` 用次要色跟在后面）：框内滚动只有滚轮，
-  纯键盘用户读到的就是首屏那一段，所以首屏给的是"能做什么"而不是诊断。720×480 加 200% 文字下首屏是下一步的**开头**：
+  纯键盘用户读到的就是首屏那一段，所以首屏给的是"能做什么"而不是诊断。720×480 加 115% 文字下首屏是下一步的**开头**：
   这段动作文本本身约五行高（实测 `session.x11.next` 194px，框高 168px），首屏放下约四行，剩下的它与原因一样靠滚轮
   到达；框高上限不变，终端与关闭按钮留在窗口内（R4）。普通窗口里这段文本仍按内容高度整段显示，不出现滚动。
   tooltip 里仍是原因在前、下一步在后，因为它没有首屏限制。
@@ -1573,7 +1571,7 @@ macOS 的 ⌘F 是系统通用"查找"，没有 shell 程序读它，所以直�
 
 1. 该栏本身（`files.panel` / `files.local.panel`）：列表在它里面，失败卡的说明文字也在它里面；这一栏获得焦点时
    整栏画 accent 边框。Page Up / Page Down 按一屏翻、Home / End 到两端——列表比框高时先翻列表本身，列表没有
-   可翻的（失败卡比一屏高）就翻整栏，所以 200% 文字、最小窗口下卡片下方的两个手输入口一定翻得到。
+   可翻的（失败卡比一屏高）就翻整栏，所以 115% 文字、720 宽下卡片下方的两个手输入口一定翻得到。
 2. 服务器栏工具栏的"跟随终端目录"开关（`files.follow`，画在刷新旁，所以排在上传之前）、上传（`files.upload`），
    以及没有列表时的下载（`files.download`）。
 3. 打开的问题按它画出的顺序：本地框、远端框、SFTP、SCP、递归（只在协议为 SCP 时出现）、确定、取消。
@@ -1806,7 +1804,7 @@ Windows 安装器的启动与重启）。
 
 ### 大文字与窄窗口（720 宽、115%）
 
-界面文字大小只有 90 / 100 / 115 三档。旧的 200% 已取消：偏好文件里记着 200 时，启动与恢复都按 100% 打开，写回的值
+界面文字大小只有 90 / 100 / 115 三档。旧的 200% 已取消：偏好文件里记着 200 时，启动、恢复与同步读取都落到 100%，写回的值
 也是 100（`a_two_hundred_percent_preference_comes_back_as_one_hundred`）。窗口没有最小尺寸：默认 1120×720，用户可以
 继续把它收窄，布局按内容换行而不是靠裁切。720 宽、115% 是收窄后的验收宽度——一行放不下"标题 + 说明 + 右对齐控件"。
 设置页因此只有纵向滚动，横向必须靠换行容纳，不能靠裁切：被画到**卡片**右缘之外的行内控件既点不到，也没有横向
@@ -1937,7 +1935,7 @@ surface 底、静止 Raised，焦点环叠在 Raised 之上；尺寸不随窗口
 - 管理弹窗（`Tool::Snippets`，`snippets.dialog`）：每条一行——名称、正文预览（换行显示为 `\n`）、多行 chip，
   右侧"填入/执行/编辑/删除"；删除先问一次（"删除这条快捷命令？"加名称，回答"删除"/"保留"），回答前不写文件。
   底部是"新建快捷命令"与"关闭"，下方常驻存储说明。空库显示空状态卡。名称与预览各占一行、放不下就用省略号截断，
-  不换行：200% 文字下四个动作标签比整行还宽，允许换行的正文会被压到几像素宽、一行一个字符，整行高过对话框本身
+  不换行：文字放大时四个动作标签比整行还宽，允许换行的正文会被压到几像素宽、一行一个字符，整行高过对话框本身
   （实测 2716 px 的行挤在 119 px 的正文区里）。所以名称/正文有一份最小宽度，动作按钮在这份宽度之外整体折到下一行，
   动作标签本身保持完整、不拆开。
 - 编辑器：名称与命令两个字段，命令字段允许换行——`Shift+Enter` 换行、回车保存（`TextField::set_keeps_line_breaks`），
@@ -1945,7 +1943,7 @@ surface 底、静止 Raised，焦点环叠在 Raised 之上；尺寸不随窗口
   被拒绝的草稿留在屏幕上并显示原因。库不可写时保存按钮变淡，草稿仍可复制。
 - 键盘：弹窗内 ↑↓ 移动行、Enter 填入当前行（安全的那条动作）、Esc 依次关闭编辑器→删除确认→弹窗；打开编辑器时
   名称字段直接获得焦点。
-  指针目标沿用 `Metrics::hit_target()`，与其余对话框一致。720×480、200% 文字下弹窗本身与底部按钮留在窗口内，
+  指针目标沿用 `Metrics::hit_target()`，与其余对话框一致。720×480、115% 文字下弹窗本身与底部按钮留在窗口内，
   行内动作区在中间可滚动区域里，通过滚动到达，不隐藏任何动作；编辑器的名称/正文字段与保存按钮、删除确认的
   "删除"/"保留"也在同一块可滚动区域里，滚动即到达。
 
@@ -1989,7 +1987,7 @@ surface 底、静止 Raised，焦点环叠在 Raised 之上；尺寸不随窗口
 清除颜色不需要指针（R2、R4）。输入后按匹配度平铺排序：标题前缀 > 词首 > 标题包含 >
 说明包含 > 三个字母起的按序模糊匹配；每个词都必须命中。↑↓/Tab 移动、Enter 执行、Esc 或点击
 遮罩关闭，关闭后键盘回到打开前的字段、终端或页面。无匹配时显示"没有匹配的结果"，Enter 不做任何事。
-720×480、200% 文字下面板留在窗口内，列表本身滚动到最后一行（每条 72 px 高，一个屏只放得下两条），
+720×480、115% 文字下面板留在窗口内，列表本身滚动到最后一行（每条 72 px 高，一个屏只放得下两条），
 搜索到某条快捷命令时"插入/执行"两行完整落在列表框内而不会被裁掉。
 外观（R6，T8 / ADR-7 更新）：面板宽 560（`components::PALETTE_WIDTH`，窗口更窄时左右各留 24），画在与菜单、tooltip、
 toast 相同的 `components::popover_surface` 上（raised + 强边 + 圆角 8 + Overlay），压在自己的遮罩上，进入时 Settle；
@@ -2060,7 +2058,7 @@ toast 相同的 `components::popover_surface` 上（raised + 强边 + 圆角 8 +
 | `modal(viewport, id, width, ModalContent)` / `modal_with(..., ModalBehaviour)` | 对话框外壳（尚未迁移的见上）：scrim 遮罩（按下不关闭；`ModalBehaviour::dismiss` 仅给无内容可丢的对话框），overlay + 强边 + 圆角 12 + Overlay，头部固定、主体滚动（`{id}.body`，可交给调用方的 `ScrollHandle`）、底部固定，遮罩为 `{id}.backdrop`，进入时 Settle；关闭后遮罩由窗口用 `modal_scrim_exit` 淡出 |
 | `modal_footer` / `modal_icon(icon, tone)` | 对话框底部动作行（顶部分隔线、右对齐、可换行，主操作最后）；头部图标块（默认 accent tint，危险问题用色调 tint） |
 | `modal_footer_noted(note, actions)` | 带说明的底部动作行（T8）：左侧安静说明（caption、muted，可换行，最小宽 `FOOTER_NOTE_MIN_WIDTH` 160），右侧动作组 `ml_auto` 靠右、可换行；放不下时动作组整体换到下一行仍贴右缘，主操作始终在最右。批量任务的四个对话框用它（原来换行后动作贴左） |
-| `form_row` + `form_field(label, control, share, min)` / `form_cell(share, min)` | 对话框的两列自适应表单（T8 / ADR-7）：一行两个（或多个）字段，每格从 0 起按 `share` 比例分剩余宽度、保底 `FORM_FIELD_MIN_WIDTH`（200，短字段如端口 `FORM_SHORT_FIELD_MIN_WIDTH` 96），底线放不下时整格换行，所以宽窗口两列、720×480@200% 一列；标签是 `form_label`。主机表单（地址 / 端口、名称 / 分组）、远程桌面 / 串口表单的成对字段、批量任务的“同时运行 / 任务名称”、快捷命令编辑器用它。测试 `the_host_form_is_two_columns_wide_and_one_column_narrow` |
+| `form_row` + `form_field(label, control, share, min)` / `form_cell(share, min)` | 对话框的两列自适应表单（T8 / ADR-7）：一行两个（或多个）字段，每格从 0 起按 `share` 比例分剩余宽度、保底 `FORM_FIELD_MIN_WIDTH`（200，短字段如端口 `FORM_SHORT_FIELD_MIN_WIDTH` 96），底线放不下时整格换行，所以宽窗口两列、窗口窄到 440（115%）时一列；标签是 `form_label`。主机表单（地址 / 端口、名称 / 分组）、远程桌面 / 串口表单的成对字段、批量任务的“同时运行 / 任务名称”、快捷命令编辑器用它。测试 `the_host_form_is_two_columns_wide_and_one_column_narrow` |
 | `form_section(title)` / `form_hint(text)` / `form_rule()` | 表单分组标题（body、600、主色）、字段下说明（caption、muted）、分组间发丝线 |
 | `disclosure(open, title, hint)` | 表单的折叠段头（“高级”，T8）：箭头 + 名称 + 一行内容说明（省略号），扁平、弱边、悬停出底，调用方加 id、点击与“已使用”chip；主机表单的高级设置默认折叠 |
 | `nav_item(icon, label, selected, ringed)` / `accent_mark(shown)` | 页面自带的导航列（设置，T8）：分类项一个控件高、带图标，子项无图标、缩进、一个紧凑控件高；选中 = selected 底 + 2px accent 竖条 + MEDIUM，键盘所在项另画焦点环（常驻透明边，不挪字；设置导航仅在导航列持有键盘时传 `ringed`）；`accent_mark` 是那条竖条本身（不选时为同宽透明占位），设置卡片行首也用它 |
@@ -2087,7 +2085,7 @@ toast 相同的 `components::popover_surface` 上（raised + 强边 + 圆角 8 +
 焦点 / 禁用与三种尺寸、输入框三态与搜索框、分段 / 开关 / 勾选、全部色调的 chip 与标记、标签 / 计数 / 类型 / 键帽、三种横幅、
 确定与不确定进度条、骨架行、侧栏项、三种状态的列表行与工具条、菜单、toast、状态卡、颜色色板与字阶）。截图场景
 `design-catalog`（分类 `design`，深浅各一张）是视觉回归基准；测试 `every_section_of_the_catalogue_stays_inside_its_column`
-在 1120×720 的深浅两套与 200% 下检查每一节都在自己的栏内，并在 100% 下检查四栏的底边都在 720 以内（整页一屏拍全，
+在 1120×720 的深浅两套与 115% 下检查每一节都在自己的栏内，并在 100% 下检查四栏的底边都在 720 以内（整页一屏拍全，
 不靠滚动）。四栏依次是：按钮 + 标签；输入框 + 反馈；列表 + 令牌（字阶排成一行换行）；浮层。列表行的头像字取
 `host_initials`（build-01 → B1、api-02 → A2、edge-03 → E3），与首页一致。
 
@@ -2138,6 +2136,8 @@ raised 与强边、开关与勾选框的轨道与勾可读、每个共享组件�
 ## 7. 2026-11 全应用重做的交付汇总（T9，ADR-9）
 
 本节只做索引与汇总：规则本身写在各自的章节里，这里给出位置、最终数字与仍未关闭的事项。各节与代码不一致时以代码为准。
+本节是 2026-11 T9 的记录，其中 200% 是当时仍在的字号档；该档已取消（见「大文字与窄窗口（720 宽、115%）」），
+所以下面提到的 200% 截图、实测与待办都属于历史，不再重拍。
 
 ### 7.1 交付项与位置
 

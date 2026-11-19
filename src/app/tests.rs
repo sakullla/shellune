@@ -110,7 +110,7 @@ fn assert_within_width(bounds: gpui::Bounds<Pixels>, viewport: Size<Pixels>, wha
 ///
 /// A dialog clips what it does not fit (`overflow_hidden`), so a row drawn past its
 /// card's right edge is drawn past everything a person can reach: the page under a
-/// dialog has no horizontal scroll, and at 200% text in the minimum window there is no
+/// dialog has no horizontal scroll, and at 115% text in a narrow window there is no
 /// room to spare. That makes "inside the card" the property to measure, not "inside the
 /// window" (R4).
 fn assert_inside_horizontally(
@@ -159,7 +159,7 @@ fn bounds_of(cx: &mut VisualTestContext, selector: &'static str) -> gpui::Bounds
 /// The transfer title and count sit above the scroller.
 ///
 /// The scroller used to be the strip itself, so its clip cut the first line of
-/// glyphs at 720×480 and 200% text. The title has to clear that clip, and the
+/// glyphs at 720×480 and 115% text. The title has to clear that clip, and the
 /// failure underneath still has to fit the strip.
 fn assert_transfer_title_clears_the_scroll_clip(cx: &mut VisualTestContext) {
     let strip = bounds_of(cx, "files.transfers");
@@ -306,7 +306,7 @@ async fn the_top_bar_and_the_home_fit_inside_the_design_window(cx: &mut TestAppC
 }
 
 #[gpui::test]
-async fn the_minimum_window_still_shows_the_top_bar_and_the_home(cx: &mut TestAppContext) {
+async fn the_narrow_window_still_shows_the_top_bar_and_the_home(cx: &mut TestAppContext) {
     let (_view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(narrow_window());
     cx.run_until_parked();
@@ -325,7 +325,7 @@ async fn the_minimum_window_still_shows_the_top_bar_and_the_home(cx: &mut TestAp
 }
 
 #[gpui::test]
-async fn one_step_of_text_size_is_115_percent_and_stays_inside_the_minimum_window(
+async fn one_step_of_text_size_is_115_percent_and_stays_inside_the_narrow_window(
     cx: &mut TestAppContext,
 ) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
@@ -347,9 +347,7 @@ async fn one_step_of_text_size_is_115_percent_and_stays_inside_the_minimum_windo
 }
 
 #[gpui::test]
-async fn two_hundred_percent_chinese_keeps_every_page_inside_the_minimum_window(
-    cx: &mut TestAppContext,
-) {
+async fn large_text_chinese_keeps_every_page_inside_the_narrow_window(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
     cx.simulate_resize(narrow_window());
@@ -398,10 +396,21 @@ async fn two_hundred_percent_chinese_keeps_every_page_inside_the_minimum_window(
 #[gpui::test]
 async fn a_two_hundred_percent_preference_comes_back_as_one_hundred(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
     let saved = shellune_storage::Preferences {
         text_size: Some(200),
         ..Default::default()
     };
+    // Restoring a window that is already at 115% is the case a lookup that merely
+    // skips the entry would miss: the old size must bring it back to 100%, not leave
+    // the window where it was.
+    focus_root(&view, cx);
+    cx.dispatch_action(CycleTextSize);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Comfortable
+    );
     cx.update(|_window, app| {
         view.update(app, |view, cx| {
             view.use_saved_preferences_for_test(&saved, cx)
@@ -653,7 +662,7 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_the_large_text(
         let bounds = bounds_of(cx, selector);
         assert!(
             bounds.size.width >= px(24.0) && bounds.size.height >= px(24.0),
-            "{selector} is smaller than a 24px pointer target at 200%: {bounds:?}"
+            "{selector} is smaller than a 24px pointer target at 115%: {bounds:?}"
         );
     }
 
@@ -776,7 +785,7 @@ async fn a_settings_control_wider_than_its_row_stays_inside_it_at_the_large_text
     let later = bounds_of(cx, "settings.shell.1");
     assert!(
         (first.origin.y - later.origin.y).abs() < px(1.0),
-        "the shells wrap at 115% instead of sharing the track's line: {first:?} and {later:?}"
+        "the shells do not share the track's one line at 115%: {first:?} and {later:?}"
     );
     let metrics = cx.update(|_window, app| view.read(app).workspace().metrics());
     for (selector, name) in [
@@ -800,7 +809,7 @@ async fn a_settings_control_wider_than_its_row_stays_inside_it_at_the_large_text
     }
 }
 
-/// A shortcut row keeps its keys and its controls inside the page at 200% text (R8).
+/// A shortcut row keeps its keys and its controls inside the page at 115% text (R8).
 ///
 /// A combination as long as a real one takes a wide keycap once the text is doubled, and the
 /// row then holds a name column, the key and three buttons. The row wraps those parts instead
@@ -1111,7 +1120,7 @@ async fn a_saved_keymap_in_conflict_is_explained_on_the_shortcut_page(cx: &mut T
 /// The minimum window at 115% text reaches every category and every item by its navigation,
 /// and nothing on the way is clipped (R8, R16).
 #[gpui::test]
-async fn the_minimum_window_reaches_every_settings_category_and_item_at_115_percent(
+async fn the_narrow_window_reaches_every_settings_category_and_item_at_115_percent(
     cx: &mut TestAppContext,
 ) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
@@ -4484,7 +4493,7 @@ const FIND_BAR_PARTS: [&str; 8] = [
 /// (R4); this test reads the boxes instead of the drawing, so a squeezed part still has
 /// to be inside them.
 #[gpui::test]
-async fn the_find_bar_stays_inside_the_window_at_two_hundred_percent(cx: &mut TestAppContext) {
+async fn the_find_bar_stays_inside_the_window_at_the_large_text(cx: &mut TestAppContext) {
     let (view, cx) = remote_view(cx);
     let id = live_remote(cx, &view);
     let pane = cx
@@ -8354,12 +8363,12 @@ async fn an_attempt_that_fails_shows_the_reason_and_opens_no_terminal(cx: &mut T
 
 /// A hop rejection names the host and then the credential error.
 ///
-/// That sentence is wider than one line of a 720×480 window at 200% text. It has to
+/// That sentence is wider than one line of a 720×480 window at 115% text. It has to
 /// wrap inside the dialog, and both it and the next step have to be inside the
 /// window: the previous line used to end at "offered" and the rest was past the
 /// client edge (R4).
 #[gpui::test]
-async fn a_rejected_hop_reason_and_its_next_step_fit_the_minimum_window(cx: &mut TestAppContext) {
+async fn a_rejected_hop_reason_and_its_next_step_fit_the_narrow_window(cx: &mut TestAppContext) {
     let dir = TempDir::new("remote-hop-reason");
     seed(
         &dir.store(),
@@ -11844,7 +11853,7 @@ async fn a_narrow_window_switches_source_without_merging_them(cx: &mut TestAppCo
 }
 
 #[gpui::test]
-async fn two_hundred_percent_file_columns_stay_inside_the_window(cx: &mut TestAppContext) {
+async fn large_text_file_columns_stay_inside_the_window(cx: &mut TestAppContext) {
     let (view, cx) = remote_view(cx);
     let id = live_remote(cx, &view);
     let (_remote, _local) = open_both_sources(
@@ -12732,7 +12741,7 @@ async fn a_server_without_sftp_says_so_and_offers_the_scp_copy_it_still_has(
 async fn the_scp_path_on_a_failed_listing_is_reached_by_scrolling_the_pane(
     cx: &mut TestAppContext,
 ) {
-    // R4 measures this page in the minimum window at 200% text, where the file pane is
+    // R4 measures this page in a narrow window at 115% text, where the file pane is
     // one slice tall and the failed card is much taller than that slice. Its next step -
     // the reason and the two typed-path entries - has to be reachable there, or the only
     // way to copy a file from a server without SFTP is drawn past an edge nothing can
@@ -13143,7 +13152,7 @@ async fn the_download_question_is_asked_and_answered_with_the_keyboard_alone(
 async fn the_failed_reads_typed_entries_are_reached_and_pressed_with_the_keyboard(
     cx: &mut TestAppContext,
 ) {
-    // The two typed-path entries of a failed read are drawn below the slice at 200% text in
+    // The two typed-path entries of a failed read are drawn below the slice at 115% text in
     // the minimum window, and they are the only way a file is copied from a server without
     // SFTP. Page Up/Down turn the pane and Tab walks the column's own controls, so the
     // whole path exists without a pointer (R4).
@@ -13343,7 +13352,7 @@ fn assert_inside_slice(inner: gpui::Bounds<Pixels>, outer: gpui::Bounds<Pixels>,
 #[gpui::test]
 async fn every_control_the_keyboard_stops_on_is_turned_into_its_column(cx: &mut TestAppContext) {
     // R4 asks for a ring the user can see, and the ring is drawn on the control itself. At
-    // 200% text in the minimum window the question is much taller than the slice a column
+    // 115% text in a narrow window the question is much taller than the slice a column
     // shows, so every stop has to turn the column to its own row - not only the failed
     // card's two typed entries, which are the card's last rows.
     let (view, cx, _id, files, _transfers) = keyboard_remote(cx);
@@ -16185,7 +16194,7 @@ async fn the_tab_name_dialog_and_the_tab_list_fit_the_smallest_window_at_large_t
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
         Zoom::Comfortable,
-        "the dialogs are measured at 200% text"
+        "the dialogs are measured at 115% text"
     );
 
     // At this size the strip itself has no room left, so the list of every tab is the
@@ -16332,7 +16341,7 @@ async fn the_tab_identity_rows_stay_inside_their_cards_and_are_reached_by_scroll
     let pencil = bounds_of(cx, "tabs.list.rename.0");
     assert!(
         first_row.size.height > pencil.size.height + px(8.0),
-        "the row should wrap at 200% text rather than stay one clipped line: \
+        "the row should wrap at 115% text rather than stay one clipped line: \
          {first_row:?} for a {pencil:?} pencil"
     );
 
@@ -16389,7 +16398,7 @@ async fn the_tab_identity_rows_stay_inside_their_cards_and_are_reached_by_scroll
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
 
-    // The same row in the tab menu, still at 200% text, in a window where the strip has
+    // The same row in the tab menu, still at 115% text, in a window where the strip has
     // room to be pointed at.
     cx.simulate_resize(design_window());
     cx.run_until_parked();
@@ -17827,7 +17836,7 @@ async fn the_jump_picker_scrolls_itself_into_the_smallest_dialog(cx: &mut TestAp
         item.origin.y >= body.origin.y - px(0.5)
             && item.origin.y + item.size.height <= body.origin.y + body.size.height + px(0.5)
     };
-    // The form is titled groups now (T8), so at 200% the button is further down.
+    // The form is titled groups now (T8), so at 115% the button is further down.
     for _ in 0..200 {
         if inside(cx, "hosts.jump.add") {
             break;
@@ -19199,7 +19208,7 @@ async fn a_narrow_split_keeps_its_pane_heads_buttons_inside_the_pane(cx: &mut Te
         Zoom::Comfortable
     );
 
-    // At 720x480 and 200% text a side-by-side pane is narrower than its head: the
+    // At 720x480 and 115% text a side-by-side pane is narrower than its head: the
     // name and the "Active" chip give way, and zoom and close stay whole in the pane.
     let pane = bounds_of(cx, "pane.active");
     for control in ["pane.zoom", "pane.close"] {
@@ -20215,7 +20224,7 @@ async fn the_session_bar_and_file_row_controls_are_pointer_targets_too(cx: &mut 
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
         Zoom::Comfortable,
-        "the file row is measured at 200% text"
+        "the file row is measured at 115% text"
     );
     assert_file_actions_keep_their_column(cx);
 
@@ -20538,9 +20547,7 @@ async fn a_shortcut_can_be_unbound_and_restored_with_the_keyboard_alone(cx: &mut
 }
 
 #[gpui::test]
-async fn two_hundred_percent_chinese_settings_shortcuts_stay_inside_the_window(
-    cx: &mut TestAppContext,
-) {
+async fn large_text_chinese_settings_shortcuts_stay_inside_the_window(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     // A narrow width, with the room the rows need to be laid out: the point is
     // that nothing is wider than the window, not how far the page scrolls.
@@ -21507,9 +21514,9 @@ async fn a_tab_keeps_its_dot_title_and_close_inside_itself_at_any_width(cx: &mut
         "the whole name is the tab's title; the strip only cuts what it draws"
     );
 
-    // At 720x480 and 200% text the full row does not fit, so the row draws its compact
-    // form: the hosts tab as its icon and the current session tab alone, whole, with
-    // the list of every tab beside it to reach the other one.
+    // In a narrow window at 115% text the full row does not always fit, so the row
+    // draws its compact form: the hosts tab as its icon and the current session tab
+    // alone, whole, with the list of every tab beside it to reach the other one.
     for (viewport, zoom) in [
         (design_window(), Zoom::Regular),
         (narrow_window(), Zoom::Regular),
@@ -21843,7 +21850,7 @@ async fn twenty_tabs_scroll_and_leave_the_window_buttons_reachable(cx: &mut Test
         }
     }
 
-    // At 720x480 and 200% text the compact row shows the current tab alone and whole,
+    // At 520 wide and 115% text the compact row shows the current tab alone and whole,
     // and every control beside it - the list of the other nineteen among them - and the
     // window buttons stay inside the window and take the pointer.
     cx.update(|_window, app| {
@@ -22738,7 +22745,7 @@ async fn deleting_a_command_asks_first_and_removes_it_from_the_file(cx: &mut Tes
 }
 
 #[gpui::test]
-async fn the_shortcut_command_dialog_stays_inside_the_minimum_window_at_200_percent(
+async fn the_shortcut_command_dialog_stays_inside_the_narrow_window_at_the_large_text(
     cx: &mut TestAppContext,
 ) {
     let dir = TempDir::new("snippet-min");
@@ -22851,7 +22858,7 @@ fn scroll_fully_into_view(
 /// Wheels a scrollable box until the centre of `target` is inside the part of it that is
 /// on screen, the way a person scrolls down to a control below the fold.
 ///
-/// In the minimum window at 200% text a dialog shows one slice of its body, so where an
+/// In a narrow window at 115% text a dialog shows one slice of its body, so where an
 /// element was laid out says nothing about whether anyone can reach it (R4): the question
 /// is whether scrolling reaches it, and this is that question asked of the drawing itself.
 fn scroll_into_view(cx: &mut VisualTestContext, container: &'static str, target: &'static str) {
@@ -22875,7 +22882,7 @@ fn scroll_into_view(cx: &mut VisualTestContext, container: &'static str, target:
 }
 
 #[gpui::test]
-async fn a_saved_command_row_keeps_a_readable_preview_and_reaches_its_buttons_at_200_percent(
+async fn a_saved_command_row_keeps_a_readable_preview_and_reaches_its_buttons_at_the_large_text(
     cx: &mut TestAppContext,
 ) {
     let dir = TempDir::new("snippet-reached");
@@ -22988,7 +22995,7 @@ async fn a_saved_command_row_keeps_a_readable_preview_and_reaches_its_buttons_at
 }
 
 #[gpui::test]
-async fn the_palette_reaches_the_saved_command_rows_in_the_minimum_window_at_200_percent(
+async fn the_palette_reaches_the_saved_command_rows_in_the_narrow_window_at_the_large_text(
     cx: &mut TestAppContext,
 ) {
     let dir = TempDir::new("snippet-palette");
@@ -23499,9 +23506,16 @@ async fn the_x11_state_and_its_reason_stay_inside_the_narrow_window(cx: &mut Tes
     );
     let first_screen = (boxed.origin.y + boxed.size.height).min(next.origin.y + next.size.height)
         - next.origin.y.max(boxed.origin.y);
-    // The first screen has to hold a usable opening of the direction — three of its lines at
-    // this size, which is more than the single line a one-line direction needs — for putting
-    // it first to mean anything to a reader who cannot scroll.
+    // The first screen has to hold a usable opening of the direction for putting it
+    // first to mean anything to a reader who cannot scroll. At 720 wide and 115% this
+    // direction wraps to three lines of 18.7px (56px together), and all three are on the
+    // first screen: the opening is whole rather than cut mid-sentence. The three-line
+    // floor is the same contract the 200% size met with four of its (26px) lines.
+    assert!(
+        first_screen + px(0.5) >= next.size.height,
+        "the next step is cut before any scrolling: {first_screen:?} of {:?} in {boxed:?}",
+        next.size.height
+    );
     assert!(
         first_screen >= one_line * 3.0,
         "the next step shows too little before any scrolling: \
@@ -23546,11 +23560,9 @@ async fn the_x11_state_and_its_reason_stay_inside_the_narrow_window(cx: &mut Tes
 }
 
 /// The failure a real window shows when DISPLAY is unset: the reason line is whole
-/// on the first screen at 720×480 and 200% text, not cut by the banner edge (R4).
+/// on the first screen at 720×480 and 115% text, not cut by the banner edge (R4).
 #[gpui::test]
-async fn the_short_x11_reason_stays_on_the_first_screen_at_two_hundred_percent(
-    cx: &mut TestAppContext,
-) {
+async fn the_short_x11_reason_stays_on_the_first_screen_at_the_large_text(cx: &mut TestAppContext) {
     let (view, cx, _dir) =
         dialog_view(cx, vec![stored_host("web", "127.0.0.1", 1, "deploy", None)]);
     click(cx, "hosts.connect.0");
@@ -23605,9 +23617,9 @@ async fn the_short_x11_reason_stays_on_the_first_screen_at_two_hundred_percent(
     );
 }
 
-/// A failed transfer's reason and Retry stay inside 720×480 at 200% text (R4).
+/// A failed transfer's reason and Retry stay inside 720×480 at 115% text (R4).
 #[gpui::test]
-async fn a_failed_transfer_shows_its_reason_and_retry_in_the_minimum_window(
+async fn a_failed_transfer_shows_its_reason_and_retry_in_the_narrow_window(
     cx: &mut TestAppContext,
 ) {
     let (view, cx) = remote_view(cx);
@@ -23674,7 +23686,7 @@ async fn a_failed_transfer_shows_its_reason_and_retry_in_the_minimum_window(
 /// it there with files open pushes Retry past the client edge, so the body yields
 /// while the file pane is up and the chip stays (R4).
 #[gpui::test]
-async fn a_transfer_failure_stays_whole_while_x11_failed_at_two_hundred_percent(
+async fn a_transfer_failure_stays_whole_while_x11_failed_at_the_large_text(
     cx: &mut TestAppContext,
 ) {
     let (view, cx) = remote_view(cx);
@@ -23867,7 +23879,7 @@ async fn a_window_that_widens_and_narrows_again_keeps_the_source_and_both_paths(
 }
 
 #[gpui::test]
-async fn a_deep_path_is_drawn_inside_its_column_at_two_hundred_percent(cx: &mut TestAppContext) {
+async fn a_deep_path_is_drawn_inside_its_column_at_the_large_text(cx: &mut TestAppContext) {
     let (view, cx) = remote_view(cx);
     let id = live_remote(cx, &view);
     let remote = FileAnswers::accepting();
@@ -24538,7 +24550,7 @@ async fn the_filter_menu_narrows_by_status_and_orders_the_list(cx: &mut TestAppC
 }
 
 #[gpui::test]
-async fn the_minimum_window_keeps_the_filter_and_its_menu_inside(cx: &mut TestAppContext) {
+async fn the_narrow_window_keeps_the_filter_and_its_menu_inside(cx: &mut TestAppContext) {
     let dir = TempDir::new("status-narrow");
     let store = dir.store();
     seed_many(&store, 12);
@@ -25472,7 +25484,7 @@ async fn escape_closes_the_preview_and_keeps_a_run_on_screen(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-async fn the_batch_dialog_fits_the_minimum_window(cx: &mut TestAppContext) {
+async fn the_batch_dialog_fits_the_narrow_window(cx: &mut TestAppContext) {
     let dir = TempDir::new("batch-minimum");
     seed(&dir.store(), batch_hosts());
     let (view, cx) = hosts_view(cx, dir.store());
@@ -26088,9 +26100,7 @@ async fn the_library_and_the_history_answer_the_keyboard(cx: &mut TestAppContext
 }
 
 #[gpui::test]
-async fn the_task_centre_fits_the_minimum_window_and_speaks_both_languages(
-    cx: &mut TestAppContext,
-) {
+async fn the_task_centre_fits_the_narrow_window_and_speaks_both_languages(cx: &mut TestAppContext) {
     let dir = TempDir::new("batch-centre-bounds");
     seed(&dir.store(), batch_hosts());
     let mut task = saved_task(
@@ -26571,7 +26581,7 @@ async fn a_run_that_ends_while_the_history_is_open_joins_the_list(cx: &mut TestA
 }
 
 #[gpui::test]
-async fn two_hundred_percent_chinese_keeps_the_task_centre_inside_the_minimum_window(
+async fn large_text_chinese_keeps_the_task_centre_inside_the_narrow_window(
     cx: &mut TestAppContext,
 ) {
     let dir = TempDir::new("batch-centre-zoom");
@@ -26630,12 +26640,12 @@ async fn two_hundred_percent_chinese_keeps_the_task_centre_inside_the_minimum_wi
     assert_fits_inside(
         bounds_of(cx, "batch.library"),
         narrow_window(),
-        "the library dialog at 200% in Chinese",
+        "the library dialog at 115% in Chinese",
     );
     for selector in ["batch.switch", "batch.library.row.0", "batch.library.new"] {
         assert!(
             cx.debug_bounds(selector).is_some(),
-            "{selector} is drawn at the minimum window and 200% in Chinese"
+            "{selector} is drawn at the narrow window and 115% in Chinese"
         );
     }
 
@@ -26646,12 +26656,12 @@ async fn two_hundred_percent_chinese_keeps_the_task_centre_inside_the_minimum_wi
     assert_fits_inside(
         bounds_of(cx, "batch.history"),
         narrow_window(),
-        "the history dialog at 200% in Chinese",
+        "the history dialog at 115% in Chinese",
     );
     for selector in ["batch.switch", "batch.history.row.0"] {
         assert!(
             cx.debug_bounds(selector).is_some(),
-            "{selector} is drawn at the minimum window and 200% in Chinese"
+            "{selector} is drawn at the narrow window and 115% in Chinese"
         );
     }
 
@@ -26662,7 +26672,7 @@ async fn two_hundred_percent_chinese_keeps_the_task_centre_inside_the_minimum_wi
     assert_fits_inside(
         bounds_of(cx, "batch.history"),
         narrow_window(),
-        "the history detail at 200% in Chinese",
+        "the history detail at 115% in Chinese",
     );
     for selector in [
         "batch.history.detail",
@@ -26672,7 +26682,7 @@ async fn two_hundred_percent_chinese_keeps_the_task_centre_inside_the_minimum_wi
     ] {
         assert!(
             cx.debug_bounds(selector).is_some(),
-            "{selector} is drawn at the minimum window and 200% in Chinese"
+            "{selector} is drawn at the narrow window and 115% in Chinese"
         );
     }
 }
@@ -31781,8 +31791,13 @@ async fn narrow_window_at_comfortable_text_keeps_hosts_row_and_actions_within_bo
     cx.simulate_resize(narrow_window());
     focus_root(&view, cx);
     cx.dispatch_action(ToggleLanguage);
+    // One step from the default is 115%. The row is measured at that size, not at
+    // 90%: a second step would hide and show different columns.
     cx.dispatch_action(CycleTextSize);
-    cx.dispatch_action(CycleTextSize);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Comfortable
+    );
     click(cx, "nav.hosts");
     cx.simulate_resize(narrow_window());
     cx.run_until_parked();
@@ -31790,8 +31805,14 @@ async fn narrow_window_at_comfortable_text_keeps_hosts_row_and_actions_within_bo
     let viewport = cx.update(|window, _app| window.viewport_size());
     let row = bounds_of(cx, "hosts.row.0");
     let connect = bounds_of(cx, "hosts.connect.0");
-    assert_within_width(row, viewport, "hosts.row.0 at 1120x720 @ 115%");
-    assert_within_width(connect, viewport, "hosts.connect.0 at 1120x720 @ 115%");
+    assert_within_width(row, viewport, "hosts.row.0 at 720x480 @ 115%");
+    assert_within_width(connect, viewport, "hosts.connect.0 at 720x480 @ 115%");
+    // 720 is narrower than the 760 (scaled to 874 at 115%) the row needs for its
+    // duplicate tool, so the tool is left out rather than pushing the actions out.
+    assert!(
+        cx.debug_bounds("hosts.duplicate.0").is_none(),
+        "a narrow window at 115% hides the inline duplicate icon so the primary actions fit"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -32612,11 +32633,11 @@ async fn the_row_facts_stand_in_columns_whether_or_not_a_row_has_them(cx: &mut T
     };
     check(cx, "100%");
 
-    // The same at 200% text, in a window wide enough for the columns.
+    // The same at 115% text, in a window wide enough for the columns.
     cx.simulate_resize(size(px(1600.0), px(900.0)));
     cx.run_until_parked();
     largest_text_size(&view, cx);
-    check(cx, "200%");
+    check(cx, "115%");
 }
 
 #[gpui::test]
@@ -32781,7 +32802,7 @@ async fn the_local_terminal_menu_lists_shells_custom_and_serial(cx: &mut TestApp
 }
 
 #[gpui::test]
-async fn the_minimum_window_at_two_hundred_percent_keeps_the_search_and_the_list_reachable(
+async fn the_narrow_window_at_the_large_text_keeps_the_search_and_the_list_reachable(
     cx: &mut TestAppContext,
 ) {
     let dir = TempDir::new("dashboard-200");
@@ -35427,7 +35448,7 @@ const TOOL_ENTRIES: [&str; 6] = [
 
 /// The bar under a terminal is 28 high and keeps files, split, search and the session's
 /// menu on its line; the grid size, the presentation, copy and the font size are in that
-/// menu, where they still work, and the bar fits 720x480 at 200% (ADR-7).
+/// menu, where they still work, and the bar fits 720x480 at 115% (ADR-7).
 #[gpui::test]
 async fn the_terminal_bar_keeps_files_split_search_and_more_and_its_tools_are_in_the_menu(
     cx: &mut TestAppContext,
@@ -35509,7 +35530,7 @@ async fn the_terminal_bar_keeps_files_split_search_and_more_and_its_tools_are_in
         "a command closes the menu"
     );
 
-    // 720x480 at 200%: the bar follows the text size and still holds its line.
+    // 720x480 at 115%: the bar follows the text size and still holds its line.
     cx.simulate_resize(narrow_window());
     largest_text_size(&view, cx);
     cx.run_until_parked();
@@ -35569,7 +35590,7 @@ async fn a_pane_of_its_own_keeps_search_and_its_menu_with_every_tool_in_it(
 
 /// A remote session that drops states it in a banner above its last screen: the grid
 /// moves down and nothing covers it, and the banner holds the sentence, Reconnect, the
-/// details and a close, inside the window at 720x480 and 200% (ADR-6, R5).
+/// details and a close, inside the window at 720x480 and 115% (ADR-6, R5).
 #[gpui::test]
 async fn a_dropped_session_states_itself_in_a_banner_above_its_last_screen(
     cx: &mut TestAppContext,
@@ -35751,7 +35772,7 @@ async fn tab_reaches_the_banner_and_enter_presses_its_step(cx: &mut TestAppConte
 /// The details unfold under the banner: the whole diagnostic in the monospace face, no
 /// taller than 160 and scrolling past that, with a command that copies all of it; a
 /// long diagnostic stays inside the window and leaves the bar on screen at 720x480 and
-/// 200% (ADR-6, R5).
+/// 115% (ADR-6, R5).
 #[gpui::test]
 async fn a_long_diagnostic_unfolds_under_the_banner_scrolls_and_copies(cx: &mut TestAppContext) {
     let (view, cx) = remote_view(cx);
@@ -35949,7 +35970,7 @@ async fn a_closed_banner_comes_back_after_a_reconnect_is_cancelled(cx: &mut Test
 }
 
 /// In a short pane the unfolded details keep to a share of its height: at 720x480 and
-/// 200% text at least three rows of the last screen stay under them (T9, ADR-6).
+/// 115% text at least three rows of the last screen stay under them (T9, ADR-6).
 #[gpui::test]
 async fn unfolded_details_leave_rows_of_the_last_screen_in_a_short_pane(cx: &mut TestAppContext) {
     let (view, cx) = remote_view(cx);
@@ -35986,7 +36007,7 @@ async fn unfolded_details_leave_rows_of_the_last_screen_in_a_short_pane(cx: &mut
     );
 }
 
-/// The one tab of a compact row - 720x480 at 200% text - shows at least four letters of
+/// The one tab of a compact row - 720x480 at 115% text - shows at least four letters of
 /// its name: its close button gives the title its room and shows under the pointer
 /// (T9, R2).
 #[gpui::test]
@@ -36084,7 +36105,7 @@ fn wholly_inside(inner: gpui::Bounds<Pixels>, outer: gpui::Bounds<Pixels>) -> bo
 
 /// A local shell that ended - its target a full path, the default session of the app -
 /// states it in a banner above its terminal in `split`, at the design size and at
-/// 720x480 and 200%; the banner's Reconnect restarts it in place (ADR-6, R8, R9).
+/// 720x480 and 115%; the banner's Reconnect restarts it in place (ADR-6, R8, R9).
 fn an_ended_shell_card_reaches_its_step(cx: &mut TestAppContext, split: Option<SplitAxis>) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
@@ -36117,7 +36138,7 @@ fn an_ended_shell_card_reaches_its_step(cx: &mut TestAppContext, split: Option<S
     lose_pane_with(&view, cx, id, LONG_LOSS);
 
     let layout = format!("{split:?}");
-    for (what, small) in [("at the design size", false), ("at 720x480 and 200%", true)] {
+    for (what, small) in [("at the design size", false), ("at 720x480 and 115%", true)] {
         if small {
             cx.simulate_resize(narrow_window());
             largest_text_size(&view, cx);
@@ -36135,7 +36156,7 @@ fn an_ended_shell_card_reaches_its_step(cx: &mut TestAppContext, split: Option<S
             assert_fits_inside(bounds_of(cx, selector), viewport, selector);
         }
         let next = bounds_of(cx, "terminal.failure.next");
-        // A stacked pane at 720x480 and 200% is too short for the whole line and the
+        // A stacked pane at 720x480 and 115% is too short for the whole line and the
         // bar: the line gives way and the bar, with its Reconnect and its menu, stays.
         let short = small && split == Some(SplitAxis::TopBottom);
         assert!(
@@ -36385,7 +36406,7 @@ fn wheel_over_card(
     (card, bounds_of(cx, card_selector))
 }
 
-/// A session with no terminal in a short pane - a stacked split at 720x480 and 200% -
+/// A session with no terminal in a short pane - a stacked split at 720x480 and 115% -
 /// shows its card from the top, inside the pane, and the wheel over the card scrolls
 /// the rest into view (R3, R9).
 #[gpui::test]
@@ -36501,7 +36522,7 @@ async fn a_state_card_in_a_short_pane_starts_at_its_top_and_scrolls_under_the_wh
 }
 
 #[gpui::test]
-async fn the_host_dialog_is_the_shared_dialog_and_keeps_its_actions_in_the_minimum_window(
+async fn the_host_dialog_is_the_shared_dialog_and_keeps_its_actions_in_the_narrow_window(
     cx: &mut TestAppContext,
 ) {
     let (view, cx, _dir) = dialog_view(cx, Vec::new());
@@ -37036,6 +37057,46 @@ async fn the_selection_bar_keeps_its_actions_inside_it_at_the_narrow_window(
             top = Some(bounds.top());
         }
     }
+    let one_row = bounds_of(cx, "files.selection").size.height;
+
+    // Narrower still, the four actions no longer share a line. The bar grows by the row
+    // they take instead of keeping one line's height, the rows are separated, and every
+    // action is still inside it (R6, R9). Only the server's bar is measured: at this
+    // width the two panes no longer fit and the local one is not on screen.
+    cx.simulate_resize(compact_window());
+    cx.run_until_parked();
+    let bar = bounds_of(cx, "files.selection");
+    let mut rows: Vec<Pixels> = Vec::new();
+    for selector in [
+        "files.mark.download",
+        "files.mark.copy",
+        "files.mark.delete",
+        "files.mark.clear",
+    ] {
+        let bounds = bounds_of(cx, selector);
+        assert!(
+            bounds.left() >= bar.left() - px(0.5)
+                && bounds.right() <= bar.right() + px(0.5)
+                && bounds.top() >= bar.top() - px(0.5)
+                && bounds.bottom() <= bar.bottom() + px(0.5),
+            "{selector} is inside the bar once the actions wrap: {bounds:?} in {bar:?}"
+        );
+        if !rows.iter().any(|top| (*top - bounds.top()).abs() < px(1.0)) {
+            rows.push(bounds.top());
+        }
+    }
+    assert_eq!(
+        rows.len(),
+        2,
+        "the four actions take two rows at this width"
+    );
+    assert!(
+        bar.size.height > one_row + px(1.0),
+        "the bar grew by the row the actions added: {bar:?} was {one_row:?}"
+    );
+    let first = bounds_of(cx, "files.mark.download");
+    let gap = rows[1] - rows[0] - first.size.height;
+    assert!(gap > px(1.0), "the two rows are separated: {gap:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -37421,7 +37482,7 @@ async fn a_stopped_start_opens_the_data_folder(cx: &mut TestAppContext) {
     );
 }
 
-/// At 200% text in the smallest window the stop is taller than the floor: it scrolls,
+/// At 115% text in a narrow window the stop is taller than the floor: it scrolls,
 /// so its buttons are always within reach, and its words never run past the edges.
 #[gpui::test]
 async fn the_stop_scrolls_to_its_buttons_in_the_smallest_window_at_the_largest_text(
