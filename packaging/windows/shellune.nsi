@@ -3,8 +3,8 @@
 ; The release workflow compiles it on windows-latest with NSIS 3 (choco install
 ; nsis). Compile it locally with:
 ;
-;     makensis /DVERSION=0.4.8 /DBINARY=..\..\target\release\shellune.exe ^
-;              /DOUTFILE=dist\Shellune-0.4.8-setup.exe packaging\windows\shellune.nsi
+;     makensis /DVERSION=0.4.9 /DBINARY=..\..\target\release\shellune.exe ^
+;              /DOUTFILE=dist\Shellune-0.4.9-setup.exe packaging\windows\shellune.nsi
 ;
 ; A build with the native RDP/VNC backends ships the license texts of the libraries
 ; they link; pass the folder build_native.py wrote (the release workflow does):
@@ -40,7 +40,7 @@ Unicode true
 !define MUI_UNICON "..\..\assets\icons\shellune.ico"
 
 !ifndef VERSION
-  !define VERSION "0.4.8"
+  !define VERSION "0.4.9"
 !endif
 !ifndef BINARY
   !define BINARY "..\..\target\release\shellune.exe"

@@ -1,6 +1,6 @@
 [package]
 name = "shellune"
-version = "0.4.8"
+version = "0.4.9"
 edition = "2024"
 rust-version = "1.99"
 description = "A modern terminal for local shells, SSH, and SFTP."
@@ -115,7 +115,7 @@ exclude = ["vendor"]
 resolver = "3"
 
 [workspace.package]
-version = "0.4.8"
+version = "0.4.9"
 edition = "2024"
 rust-version = "1.99"
 license = "GPL-3.0-only"
