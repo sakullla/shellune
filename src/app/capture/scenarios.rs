@@ -126,48 +126,6 @@ impl Variant {
         }
     }
 
-    /// The same shot at the smallest supported window (720x480).
-    pub const fn smallest(self) -> Self {
-        Self {
-            width: crate::app::MIN_WINDOW_SIZE.0,
-            height: crate::app::MIN_WINDOW_SIZE.1,
-            ..self
-        }
-    }
-
-    /// The same shot at 115% text.
-    pub const fn comfortable(self) -> Self {
-        Self {
-            zoom: Zoom::Comfortable,
-            ..self
-        }
-    }
-
-    /// The same shot at 200% text, the ceiling of the text-size setting (R5).
-    pub const fn largest(self) -> Self {
-        Self {
-            zoom: Zoom::Largest,
-            ..self
-        }
-    }
-
-    /// The same shot at a named logical size, for layouts a default window cannot show.
-    pub const fn sized(self, width: f32, height: f32) -> Self {
-        Self {
-            width,
-            height,
-            ..self
-        }
-    }
-
-    /// The same shot in Chinese.
-    pub const fn chinese(self) -> Self {
-        Self {
-            locale: Locale::Chinese,
-            ..self
-        }
-    }
-
     /// `dark` or `light`, as the manifest and the file name spell it.
     #[must_use]
     pub fn theme_name(self) -> &'static str {
@@ -226,10 +184,6 @@ pub struct Scenario {
     pub fixture: &'static str,
     /// What this shot cannot prove.
     pub evidence: &'static str,
-    /// Whether the quick run covers it.
-    pub quick: bool,
-    /// Shots beyond the dark and light pair every scenario gets.
-    pub variants: &'static [Variant],
     /// Where the shell starts: the destination the shot is about, already selected.
     pub start: fn() -> Workspace,
     /// Data written into the run's temporary root before the view exists.
@@ -242,24 +196,19 @@ pub struct Scenario {
 }
 
 impl Scenario {
-    /// Every shot this scenario is taken in: the dark and light pair at the design
-    /// window, then whatever else it declares.
-    ///
-    /// Every scenario is also shot in Chinese and at 200% text at least once (ADR-9):
-    /// one that declares neither gets the light palette in Chinese and the dark one at
-    /// 200% text, both at the design window, so no surface goes without a look at its
-    /// longer words or its largest type.
-    #[must_use]
-    pub fn shots(&self) -> Vec<Variant> {
-        let mut shots = vec![Variant::dark(), Variant::light()];
-        shots.extend_from_slice(self.variants);
-        if !shots.iter().any(|shot| shot.locale == Locale::Chinese) {
-            shots.push(Variant::light().chinese());
-        }
-        if !shots.iter().any(|shot| shot.zoom == Zoom::Largest) {
-            shots.push(Variant::dark().largest());
-        }
-        shots
+    /// The three pages included when no scenario is requested.
+    pub fn preview(&self) -> bool {
+        matches!(self.id, "home-hosts" | "terminal-local" | "desktop-rdp")
+    }
+
+    /// The narrow home and side-by-side file views need a particular layout.
+    pub fn variant(&self, mut variant: Variant) -> Variant {
+        (variant.width, variant.height) = match self.id {
+            "home-narrow" => (860.0, 640.0),
+            "files-split" => (1680.0, 940.0),
+            _ => crate::app::DEFAULT_WINDOW_SIZE,
+        };
+        variant
     }
 }
 
@@ -2993,8 +2942,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the empty home page: the sidebar, the toolbar with its one search and the \
                    welcome in the list's place with its four ways to start; says nothing about a \
                    host list with items",
-        quick: false,
-        variants: &[Variant::dark().smallest(), Variant::light().chinese()],
         start: || page(Destination::Hosts),
         prepare: nothing,
         install: no_state,
@@ -3011,16 +2958,6 @@ pub const SCENARIOS: &[Scenario] = &[
                    title, count, search, filter, more and new host, and the rows with avatar, \
                    address, group tag, time and state; the history was written, not earned, so \
                    no host was ever connected",
-        quick: true,
-        // 200% text in a window wide enough for the tag and time columns, so the shot
-        // shows they stay aligned at the largest text in both palettes.
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::light().comfortable(),
-            Variant::dark().smallest(),
-            Variant::dark().largest().sized(1600.0, 900.0),
-            Variant::light().largest().sized(1600.0, 900.0),
-        ],
         start: || page(Destination::Hosts),
         prepare: seed_home,
         install: no_state,
@@ -3035,8 +2972,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the favourites place chosen in the sidebar, its title and count, and the \
                    filled star on each row; marking and clearing a favourite is proved by the GPUI \
                    tests, not by this frame",
-        quick: true,
-        variants: &[Variant::dark().chinese(), Variant::light().comfortable()],
         start: || page(Destination::Hosts),
         prepare: seed_home,
         install: show_home_favorites,
@@ -3050,11 +2985,6 @@ pub const SCENARIOS: &[Scenario] = &[
                   at that address",
         evidence: "shows the \"connect to …\" row on top with the Enter key cap and the saved host \
                    the address also finds under it; nothing was opened and no host was dialled",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese().smallest(),
-            Variant::light().comfortable(),
-        ],
         start: || page(Destination::Hosts),
         prepare: seed_home,
         install: show_direct,
@@ -3066,16 +2996,7 @@ pub const SCENARIOS: &[Scenario] = &[
         category: Category::Home,
         fixture: "the same 24 hosts, drawn narrower than the 900 threshold where the sidebar \
                   starts folded",
-        evidence: "the 860x640 and 720x480 shots show the sidebar as a rail of icons, the toolbar \
-                   wrapping its controls and the rows dropping their tags and times, and at 200% \
-                   the row tools giving way before the names; the 1120x720 shots are the wide page \
-                   beside them, sidebar open",
-        quick: false,
-        variants: &[
-            Variant::dark().sized(860.0, 640.0),
-            Variant::light().sized(860.0, 640.0).chinese(),
-            Variant::dark().smallest().largest(),
-        ],
+        evidence: "shows the sidebar as an icon rail and the host list at 860x640",
         start: || page(Destination::Hosts),
         prepare: seed_home,
         install: no_state,
@@ -3088,8 +3009,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "the same 24 hosts on a wide window, with the sidebar folded by its button",
         evidence: "shows the 56-wide rail of icons with the chosen place marked and the list taking \
                    the room the words gave up; the rail's tooltips are not part of the frame",
-        quick: false,
-        variants: &[Variant::dark().comfortable(), Variant::light().chinese()],
         start: || page(Destination::Hosts),
         prepare: seed_home,
         install: show_home_folded,
@@ -3104,12 +3023,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the list this build draws and the filters above it; the list is asked \
                    for the rows it shows, so the shot cannot show how many elements exist. No host \
                    was connected, so no connection state is part of it",
-        quick: true,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::dark().comfortable(),
-            Variant::dark().smallest(),
-        ],
         start: || page(Destination::Hosts),
         prepare: seed_scaled_hosts,
         install: show_scale_hosts,
@@ -3124,11 +3037,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the nested group tree in the sidebar with Prod chosen, the page titled \
                    by the group and the flat list of its hosts with their group tags; opening and \
                    closing a group is not part of the shot, and no group was created or moved by it",
-        quick: true,
-        variants: &[
-            Variant::dark().chinese().comfortable(),
-            Variant::dark().smallest(),
-        ],
         start: || page(Destination::Hosts),
         prepare: seed_scaled_hosts,
         install: show_group_tree,
@@ -3141,8 +3049,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "the same five thousand hosts with 250 of the current result selected",
         evidence: "shows the count and the scope of a selection, which is what a batch target \
                    would use; nothing was moved and no command was prepared",
-        quick: false,
-        variants: &[Variant::dark().chinese()],
         start: || page(Destination::Hosts),
         prepare: seed_scaled_hosts,
         install: show_selection,
@@ -3158,8 +3064,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the preview, its limits and a row per host with the outcome the importer \
                    produced, including the keepalive it would apply; nothing was saved and no host \
                    was dialled",
-        quick: false,
-        variants: &[Variant::dark().chinese()],
         start: || page(Destination::Hosts),
         prepare: seed_import_config,
         install: show_import,
@@ -3173,8 +3077,6 @@ pub const SCENARIOS: &[Scenario] = &[
                   first",
         evidence: "shows the three-way choice on inherit and the numbers it inherits; nothing was \
                    saved and no connection was made",
-        quick: false,
-        variants: &[Variant::dark().chinese()],
         start: || page(Destination::Hosts),
         prepare: seed_hosts,
         install: show_host_connection_inherit,
@@ -3187,8 +3089,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "the same hosts, with the editor on the off choice",
         evidence: "shows what switching keepalive off for one host means and that the connect \
                    timeout still follows the default; nothing was saved",
-        quick: false,
-        variants: &[Variant::dark().chinese().smallest()],
         start: || page(Destination::Hosts),
         prepare: seed_hosts,
         install: show_host_connection_off,
@@ -3202,11 +3102,6 @@ pub const SCENARIOS: &[Scenario] = &[
                   would save",
         evidence: "shows the three numbers, the detection window they add up to and that they apply \
                    to this host alone; no value was typed and nothing was saved",
-        quick: false,
-        variants: &[
-            Variant::light().chinese().comfortable(),
-            Variant::dark().smallest(),
-        ],
         start: || page(Destination::Hosts),
         prepare: seed_hosts,
         install: show_host_connection_override,
@@ -3218,12 +3113,6 @@ pub const SCENARIOS: &[Scenario] = &[
         category: Category::Terminal,
         fixture: "two display-only serial panes: one open on COM3 with a fixed transcript, one that could not open COM7 with a port list holding COM3; no port was opened",
         evidence: "proves what the serial strip, the send habits and the failure card say in these states; proves nothing about a device, a driver, hardware flow control or an unplug, none of which this machine has",
-        quick: true,
-        variants: &[
-            Variant::dark().smallest(),
-            Variant::dark().comfortable(),
-            Variant::dark().chinese(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_serial,
@@ -3235,8 +3124,6 @@ pub const SCENARIOS: &[Scenario] = &[
         category: Category::Home,
         fixture: "six saved hosts plus one RDP, one VNC and one serial record, written before the view starts",
         evidence: "shows that the records of other protocols are listed beside the hosts with the same labelled connect button and no selection box; nothing was dialled and no session exists",
-        quick: true,
-        variants: &[Variant::dark().smallest(), Variant::dark().chinese()],
         start: || page(Destination::Hosts),
         prepare: seed_connections,
         install: no_state,
@@ -3248,12 +3135,6 @@ pub const SCENARIOS: &[Scenario] = &[
         category: Category::Home,
         fixture: "the 24 saved hosts with the phrase no-such-host typed into the search field",
         evidence: "shows the reason, the current condition and the press that drops it over a real narrowed list; proves nothing about a search across a live server list",
-        quick: true,
-        variants: &[
-            Variant::dark().smallest(),
-            Variant::dark().chinese(),
-            Variant::light().comfortable(),
-        ],
         start: || page(Destination::Hosts),
         prepare: seed_home,
         install: show_no_match,
@@ -3265,8 +3146,6 @@ pub const SCENARIOS: &[Scenario] = &[
         category: Category::Home,
         fixture: "a hosts file holding text that is not a host book, written before the view starts",
         evidence: "shows that an unreadable store is not drawn as an empty list, and which reason and retry it offers; proves nothing about a real disk failure",
-        quick: false,
-        variants: &[Variant::dark().smallest(), Variant::dark().chinese()],
         start: || page(Destination::Hosts),
         prepare: damage_hosts,
         install: no_state,
@@ -3279,14 +3158,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "a display-only RDP surface mounted on a scripted link: four flat regions and a connected state; no server was dialled",
         evidence: "shows the tab, the control strip and the zoom the window draws around a picture; proves \
                    nothing about a real RDP server, its frames, its input or its clipboard",
-        quick: true,
-        variants: &[
-            Variant::dark().smallest(),
-            Variant::dark().comfortable(),
-            Variant::dark().chinese(),
-            Variant::light().chinese(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_desktop_rdp,
@@ -3299,14 +3170,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "a display-only VNC surface whose scripted link reports an authentication failure; no server was dialled",
         evidence: "shows the card a refused sign-in leaves and the step it stopped on; proves nothing about a \
                    real VNC server's handshake or security types",
-        quick: false,
-        variants: &[
-            Variant::dark().smallest(),
-            Variant::dark().chinese(),
-            Variant::light().chinese(),
-            Variant::dark().smallest().largest(),
-            Variant::light().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_desktop_vnc_failed,
@@ -3321,12 +3184,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the question card a certificate decision is asked in, with the \
                    fingerprint and both answers; proves nothing about a real server's \
                    certificate or the policy that checks it",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::light().chinese(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_desktop_certificate,
@@ -3339,13 +3196,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "a live display-only RDP surface with the send warning the pane draws after a send fails; no server was dialled",
         evidence: "shows where the warning sits over a picture and that it does not replace it; proves nothing \
                    about a real input path",
-        quick: false,
-        variants: &[
-            Variant::dark().comfortable(),
-            Variant::dark().chinese(),
-            Variant::light().chinese(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_desktop_send_problem,
@@ -3359,14 +3209,6 @@ pub const SCENARIOS: &[Scenario] = &[
                   not exist and a clipboard the server refused; no server was dialled",
         evidence: "shows the notices over the picture, each said once, and the way to dismiss them; proves \
                    nothing about a real server's clipboard channel or drive redirection",
-        quick: false,
-        variants: &[
-            Variant::dark().comfortable(),
-            Variant::dark().chinese(),
-            Variant::light().smallest(),
-            Variant::light().chinese(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_desktop_notices,
@@ -3377,18 +3219,7 @@ pub const SCENARIOS: &[Scenario] = &[
         title: "本地终端 · 会话与标签",
         category: Category::Terminal,
         fixture: "one display-only session fed a fixed transcript; no PTY or shell ran",
-        evidence: "proves terminal layout, colour and text rendering, and the bar's two \
-                   sides - where the session is on the left; files, split, search and the \
-                   one menu that holds the terminal's tools on the right; at 720x480 and \
-                   200% the bar follows the text size; proves nothing about a live shell, \
-                   its environment or its keystrokes",
-        quick: true,
-        variants: &[
-            Variant::dark().smallest(),
-            Variant::dark().comfortable(),
-            Variant::dark().chinese(),
-            Variant::light().smallest().largest(),
-        ],
+        evidence: "shows terminal text, colours, status and pane controls from a display fixture",
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_terminal,
@@ -3401,12 +3232,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "one display-only session fed a fixed transcript, with the find bar open on a query",
         evidence: "shows the find bar, its query and the match count over the real grid; nothing was \
                    searched on a server",
-        quick: false,
-        variants: &[
-            Variant::dark().comfortable(),
-            Variant::light().comfortable(),
-            Variant::dark().chinese(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_terminal_search,
@@ -3424,13 +3249,6 @@ pub const SCENARIOS: &[Scenario] = &[
                    of a wide character; the selection is laid by the capture, so the shot proves \
                    nothing about the drag threshold, Shift, the window-wide capture or edge \
                    scrolling, which the GPUI tests cover",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::light().chinese(),
-            Variant::dark().largest(),
-            Variant::light().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_terminal_selection,
@@ -3445,8 +3263,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows a block selection as the rectangle Alt/Option+drag keeps: the same \
                    columns on every line; laid by the capture, so the modifier itself is not \
                    part of it",
-        quick: false,
-        variants: &[Variant::dark().chinese(), Variant::dark().largest()],
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_terminal_block_selection,
@@ -3459,11 +3275,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "a saved host whose connection dialog reports a refused sign-in; nothing was dialled",
         evidence: "shows the failure, its reason and the way back; no transport, DNS lookup or \
                    authentication is part of it",
-        quick: false,
-        variants: &[
-            Variant::dark().comfortable(),
-            Variant::light().comfortable(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_connection_failed,
@@ -3476,12 +3287,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "six saved hosts and the question shown before one of them is removed",
         evidence: "shows the destructive question, the host it names and the way out; nothing was \
                    deleted and no connection was made",
-        quick: false,
-        variants: &[
-            Variant::dark().comfortable(),
-            Variant::light().comfortable(),
-            Variant::dark().chinese(),
-        ],
         start: || page(Destination::Hosts),
         prepare: seed_hosts,
         install: show_delete_question,
@@ -3494,11 +3299,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "six saved hosts and the empty form a new host starts from",
         evidence: "shows the shared dialog: header, scrolling form and the footer's action order; \
                    nothing was saved and no connection was made",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::light().smallest().largest(),
-        ],
         start: || page(Destination::Hosts),
         prepare: seed_hosts,
         install: show_new_host,
@@ -3513,11 +3313,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the ordered jump cards, the add button and the searchable picker with a \
                    bounded, scrolling list above the ProxyCommand field; nothing was saved and no \
                    connection was made",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::light().smallest().largest(),
-        ],
         start: || page(Destination::Hosts),
         prepare: seed_jump_hosts,
         install: show_new_host_jumps,
@@ -3531,8 +3326,6 @@ pub const SCENARIOS: &[Scenario] = &[
                   written before the view starts; the RDP connection's form is open",
         evidence: "shows the clipboard switch, the mapped-folder field with its browse button and its \
                    note in the RDP form; nothing was saved, dialled or mapped",
-        quick: false,
-        variants: &[Variant::dark().comfortable(), Variant::dark().chinese()],
         start: || page(Destination::Hosts),
         prepare: seed_sharing_connections,
         install: show_rdp_editor,
@@ -3546,8 +3339,6 @@ pub const SCENARIOS: &[Scenario] = &[
                   written before the view starts; the VNC connection's form is open",
         evidence: "shows the clipboard switch, off, in the VNC form and that the form has no folder \
                    field; nothing was saved or dialled",
-        quick: false,
-        variants: &[Variant::dark().comfortable(), Variant::dark().chinese()],
         start: || page(Destination::Hosts),
         prepare: seed_sharing_connections,
         install: show_vnc_editor,
@@ -3560,11 +3351,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "a remote session with one transfer the queue holds, and its tab's close asked for",
         evidence: "shows the question, the task it would stop and the way out; nothing was closed, \
                    cancelled or transferred",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_close_question,
@@ -3576,12 +3362,6 @@ pub const SCENARIOS: &[Scenario] = &[
         category: Category::Overlay,
         fixture: "the local terminal with one saved notification over it",
         evidence: "shows the notification stack and its wording; nothing was saved by the shot",
-        quick: false,
-        variants: &[
-            Variant::dark().comfortable(),
-            Variant::light().comfortable(),
-            Variant::dark().smallest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_notification,
@@ -3597,12 +3377,6 @@ pub const SCENARIOS: &[Scenario] = &[
                    each tab is a state dot, an icon, a cut title and a close button, and \
                    another tab's bell is marked while it is not the one on screen; no shell, \
                    SSH session or bell from a real program is part of it",
-        quick: true,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::dark().smallest(),
-            Variant::light().comfortable(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_tabs,
@@ -3617,12 +3391,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "proves a strip with more tabs than room scrolls instead of clipping: both ends \
                    fade and carry a scroll button, the current tab is in view, and the window \
                    buttons keep their place; no shell is running behind any tab",
-        quick: true,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::dark().smallest(),
-            Variant::dark().comfortable(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_tabs_overflow,
@@ -3634,18 +3402,7 @@ pub const SCENARIOS: &[Scenario] = &[
         category: Category::Terminal,
         fixture: "a display-only shell with a long name and a saved host's tab put back into \
                   connecting, the way a reconnect starts",
-        evidence: "proves a connecting tab says so with its dot and keeps its width, and a long \
-                   name is cut inside its own tab; at 720x480 and 200% the row is compact - \
-                   the hosts tab is its icon and the current tab is shown alone, whole and \
-                   cut with an ellipsis, the connecting one in the list of every tab; the \
-                   capture runs with reduced motion, so the dot's breath is not in the \
-                   picture, and no connection is being made",
-        quick: true,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::dark().smallest(),
-            Variant::light().smallest().largest(),
-        ],
+        evidence: "shows a connecting tab, its status indicator and a long title with reduced motion",
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_tabs_connecting,
@@ -3657,15 +3414,7 @@ pub const SCENARIOS: &[Scenario] = &[
         category: Category::Terminal,
         fixture: "the tabs-connecting fixture with a fixed newer release on offer and the \
                   last sync marked as failed; the window has no updater and is offline",
-        evidence: "proves the top row's notices never take the current tab's room: with room \
-                   they are words, in a 720x480 window they are icons in their tone, and in \
-                   the compact row of 720x480 at 200% they fold into the settings button as \
-                   a mark, the current tab still whole; nothing was sent or installed",
-        quick: true,
-        variants: &[
-            Variant::dark().smallest(),
-            Variant::light().smallest().largest(),
-        ],
+        evidence: "shows the active tab and notification controls together",
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_tabs_notices,
@@ -3681,12 +3430,6 @@ pub const SCENARIOS: &[Scenario] = &[
                    session, and that a pane of its own keeps search and its menu, with \
                    every terminal tool in that menu, inside the pane; the second pane has \
                    no process behind it",
-        quick: true,
-        variants: &[
-            Variant::dark().comfortable().chinese(),
-            Variant::dark().smallest(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_split,
@@ -3697,18 +3440,7 @@ pub const SCENARIOS: &[Scenario] = &[
         title: "终端 · 连接断开横幅",
         category: Category::Terminal,
         fixture: "a saved host's display-only terminal, ended the way a lost connection ends",
-        evidence: "proves the state, the reason and the next step are one banner above the \
-                   last screen, which moves down under it and stays readable and uncovered, \
-                   and that the banner and the bar fit 720x480 at 200%; the capture runs with \
-                   reduced motion, so the banner's fade is not in the picture; no connection \
-                   was ever made, so no transport behaviour is shown",
-        quick: true,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::light().comfortable(),
-            Variant::dark().smallest().largest(),
-            Variant::light().smallest().largest(),
-        ],
+        evidence: "shows the session banner, its details or actions, and the terminal grid",
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_disconnected,
@@ -3722,12 +3454,6 @@ pub const SCENARIOS: &[Scenario] = &[
                   reconnect starts, then refused with a timeout",
         evidence: "proves a failure after the terminal had shown output is a banner above \
                    the kept screen with its Reconnect, details and close; nothing was dialled",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::dark().smallest().largest(),
-            Variant::light().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_banner_failed,
@@ -3738,15 +3464,7 @@ pub const SCENARIOS: &[Scenario] = &[
         title: "终端 · 横幅展开诊断",
         category: Category::Terminal,
         fixture: "the terminal-disconnected fixture with the banner's details unfolded",
-        evidence: "proves the diagnostic unfolds under the banner in the monospace face with \
-                   its copy command, between the banner and the grid, inside the window at \
-                   720x480 and 200%; nothing was copied",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::dark().smallest().largest(),
-            Variant::light().smallest().largest(),
-        ],
+        evidence: "shows expanded diagnostic text and its copy action in the terminal pane",
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_banner_details,
@@ -3758,15 +3476,7 @@ pub const SCENARIOS: &[Scenario] = &[
         category: Category::Terminal,
         fixture: "a saved host's display-only terminal ended with a fixed six-line reason \
                   that quotes a hop, an error and a long path, its details unfolded",
-        evidence: "proves a long diagnostic wraps at the banner's width and stops at the \
-                   details' height, where it scrolls, and that the bar stays on screen at \
-                   720x480 and 200%; the reason is a fixture, not a real transport error",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::dark().smallest().largest(),
-            Variant::light().smallest().largest(),
-        ],
+        evidence: "shows how the terminal banner arranges long diagnostic text",
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_banner_long,
@@ -3779,14 +3489,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "both file sources answered from fixture listings; nothing was read from disk or a server",
         evidence: "shows the two columns, their own paths, the actions each row offers and the direction \
                    between them; no directory was really listed, so no permission or server behaviour is shown",
-        quick: true,
-        variants: &[
-            Variant::dark().chinese().comfortable(),
-            Variant::light().chinese(),
-            Variant::dark().smallest(),
-            Variant::dark().smallest().largest(),
-            Variant::light().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_files,
@@ -3801,12 +3503,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the inline form a file question is drawn in, its fields, its \
                    protocol switch and its answers, in the column it is about; nothing \
                    was uploaded and no server answered",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::light().chinese(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_files_question,
@@ -3820,12 +3516,6 @@ pub const SCENARIOS: &[Scenario] = &[
                   column marked by the build itself",
         evidence: "shows the marks, the batch bar and what each action covers; nothing was \
                    transferred or deleted, and no server answered",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::light().chinese(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_marked_files,
@@ -3839,12 +3529,6 @@ pub const SCENARIOS: &[Scenario] = &[
                   a listing, both from fixtures",
         evidence: "shows the reason and the recovery entries of the server's column beside \
                    this computer's unchanged list; no permission or disconnection was real",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese().smallest(),
-            Variant::light().chinese(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_isolated_failure,
@@ -3858,8 +3542,6 @@ pub const SCENARIOS: &[Scenario] = &[
                   fixture listings",
         evidence: "shows the terminal and the file view in one row, which is what a wide \
                    window draws; the transcript is a fixture, not a live shell",
-        quick: false,
-        variants: &[Variant::dark().chinese().sized(1680.0, 940.0)],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_files,
@@ -3872,12 +3554,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "a remote directory with no entries, answered from a fixture",
         evidence: "shows what an empty directory says and the actions still offered beside it; nothing \
                    was listed on a server",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese().smallest(),
-            Variant::light().chinese(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_empty_files,
@@ -3890,13 +3566,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "one transfer in the strip, started and progressed through the queue's own events",
         evidence: "shows the share, the measured speed and the time left of a task this build holds; \
                    no byte was moved and no connection took part",
-        quick: true,
-        variants: &[
-            Variant::dark().chinese().comfortable(),
-            Variant::light().chinese(),
-            Variant::dark().smallest(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_running_transfer,
@@ -3909,13 +3578,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "one transfer failed the way a lost connection stops it: it left a partial file",
         evidence: "shows the reason, the partial file and the retry actions of a task the queue really \
                    holds; no transfer was attempted",
-        quick: true,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::light().chinese(),
-            Variant::dark().smallest().largest(),
-            Variant::light().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_failed_transfer,
@@ -3928,12 +3590,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "one saved host and an empty rule book",
         evidence: "shows the empty forwarding page and how a tunnel is created; nothing was bound or \
                    dialled",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese().smallest(),
-            Variant::light().chinese(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_forwards_empty,
@@ -3946,13 +3602,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "three saved rules - local, remote and SOCKS - with the first marked as listening",
         evidence: "shows the kind, the host each rule goes through, which side each endpoint is on and \
                    the state of every row; no socket was bound and no connection exists",
-        quick: true,
-        variants: &[
-            Variant::dark().chinese().comfortable(),
-            Variant::light().chinese(),
-            Variant::dark().smallest(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_forwards_running,
@@ -3967,12 +3616,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the inline form a tunnel is made in: its kind, the host it goes \
                    through, its two labelled endpoints and the sentence it will do; \
                    nothing was saved, bound or dialled",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::light().chinese(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_forward_form,
@@ -3987,12 +3630,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the searchable list a tunnel's host is chosen from, the chosen host \
                    marked and the search holding the keyboard; nothing was saved, bound or \
                    dialled",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::light().chinese(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_forward_host_picker,
@@ -4005,11 +3642,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "default preferences; nothing is saved",
         evidence: "shows the category and item navigation and the one page it opens; the values \
                    are this build's defaults and no preference was written",
-        quick: true,
-        variants: &[
-            Variant::dark().smallest(),
-            Variant::dark().chinese().comfortable(),
-        ],
         start: || page(Destination::Settings),
         prepare: nothing,
         install: no_state,
@@ -4023,8 +3655,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the switch, the three numbers and the sentence saying how long a silent \
                    link takes to be noticed; nothing was dialled and the numbers are this build's \
                    defaults",
-        quick: false,
-        variants: &[Variant::dark().chinese().smallest()],
         start: || page(Destination::Settings),
         prepare: nothing,
         install: show_settings_connection,
@@ -4038,8 +3668,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the page as a restart reads it back from the file; the numbers were \
                    written before the window started, so the shot proves the file reaches the \
                    fields, not that a keystroke did",
-        quick: false,
-        variants: &[Variant::light().chinese(), Variant::dark().comfortable()],
         start: || page(Destination::Settings),
         prepare: seed_connection_defaults,
         install: show_settings_connection,
@@ -4052,11 +3680,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "default preferences; every action at its default binding",
         evidence: "shows the search, the scope filter and the bindings in force on the shortcut \
                    page alone; pressing a control is not part of the shot",
-        quick: true,
-        variants: &[
-            Variant::dark().comfortable(),
-            Variant::dark().chinese().smallest(),
-        ],
         start: || page(Destination::Settings),
         prepare: nothing,
         install: show_settings_keys,
@@ -4069,11 +3692,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "default preferences, with ctrl in the shortcut search",
         evidence: "shows the shortcut page narrowed to the actions whose keys contain the query, \
                    in both languages; the query was typed, no binding was changed",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese().comfortable(),
-            Variant::dark().smallest(),
-        ],
         start: || page(Destination::Settings),
         prepare: nothing,
         install: show_settings_keys_search,
@@ -4086,11 +3704,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "a saved key map that binds two actions to one combination",
         evidence: "shows the shortcut page naming the two actions that collide and that the \
                    defaults are in force instead; no binding was changed by the shot",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese().comfortable(),
-            Variant::dark().smallest(),
-        ],
         start: || page(Destination::Settings),
         prepare: seed_conflicting_keymap,
         install: show_settings_keys,
@@ -4105,11 +3718,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the checkbox, the two masked passphrase fields and the export button \
                    this build draws; nothing was exported, and the passphrase checks and the \
                    file written are proved by the GPUI tests, not by this frame",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::Settings),
         prepare: nothing,
         install: show_backup_export,
@@ -4125,11 +3733,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the counts, the source line, the missing key and the merge/replace \
                    choice of a real plan against the hosts on disk; nothing was applied, and \
                    applying, replacing and refusing are proved by the GPUI tests",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::dark().chinese().smallest(),
-        ],
         start: || page(Destination::Settings),
         prepare: seed_backup_import,
         install: show_backup_import_preview,
@@ -4145,11 +3748,6 @@ pub const SCENARIOS: &[Scenario] = &[
                    and the status line this build draws; the window is offline, so nothing \
                    was sent, and saving, testing, uploading and pulling are proved by the \
                    GPUI tests against the in-process WebDAV server",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::Settings),
         prepare: seed_sync,
         install: show_sync_settings,
@@ -4164,11 +3762,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the conflict question, where the cloud data came from and the \
                    three answers, plus the conflict marker in the top bar; nothing was \
                    resolved, and each answer is proved by the GPUI tests",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::dark().chinese().smallest(),
-        ],
         start: || page(Destination::Settings),
         prepare: seed_sync_conflict,
         install: show_sync_conflict,
@@ -4185,11 +3778,6 @@ pub const SCENARIOS: &[Scenario] = &[
                    the new-version chip in the top bar; nothing was sent, and checking, \
                    downloading, verifying and installing are proved by the GPUI tests \
                    against a loopback release server",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::Settings),
         prepare: seed_hosts,
         install: show_update_available,
@@ -4204,11 +3792,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the question asked before an install while sessions run and the \
                    counts it lists; no process, connection or device is behind the panes, \
                    nothing is installed, and both answers are proved by the GPUI tests",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::dark().chinese().smallest(),
-        ],
         start: || page(Destination::Settings),
         prepare: seed_hosts,
         install: show_update_confirm,
@@ -4221,8 +3804,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "six saved hosts; the palette opened over the hosts page",
         evidence: "shows the palette over a populated list; selecting an entry is not part of \
                    the shot",
-        quick: false,
-        variants: &[],
         start: || page(Destination::Hosts),
         prepare: seed_hosts,
         install: show_palette,
@@ -4236,8 +3817,6 @@ pub const SCENARIOS: &[Scenario] = &[
                   under the manager",
         evidence: "shows the manager, its fill-in and run actions and the line count of a \
                    block; pressing either action is not part of the shot",
-        quick: false,
-        variants: &[],
         start: || page(Destination::LocalShells),
         prepare: seed_snippets,
         install: show_snippets,
@@ -4251,8 +3830,6 @@ pub const SCENARIOS: &[Scenario] = &[
                   was dialled",
         evidence: "shows the stage, the target, the wait and the two ways out the dialog \
                    draws; no transport, DNS lookup or authentication is part of it",
-        quick: false,
-        variants: &[Variant::dark().chinese()],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_connection,
@@ -4265,8 +3842,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "one display-only session with a five-line block held by the paste dialog",
         evidence: "shows the modal confirmation, its target, its line count and the scrolled \
                    preview; nothing was pasted into a process, because there is none",
-        quick: false,
-        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_paste,
@@ -4279,8 +3854,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "three tabs, one of them carrying a background bell, listed over the terminal",
         evidence: "shows every tab with its target, its state and the shortcut that reaches \
                    it; no shell ran and the bell is a fixture mark",
-        quick: false,
-        variants: &[Variant::dark().chinese()],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_tab_list,
@@ -4295,12 +3868,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the preview this build draws before anything is confirmed: the count of \
                    targets, their addresses, the commands and the limits. No session was opened and \
                    no command was sent, which is what the shot cannot show but the model proves",
-        quick: true,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::dark().comfortable(),
-            Variant::dark().smallest(),
-        ],
         start: || page(Destination::Hosts),
         prepare: seed_hosts,
         install: show_batch_preview,
@@ -4314,8 +3881,6 @@ pub const SCENARIOS: &[Scenario] = &[
                   two held inside the second command by the fixture gate",
         evidence: "shows the states, exit results, output and timeline the runner reported; the \
                    transport is a fixture, so this is not evidence about any SSH server",
-        quick: true,
-        variants: &[Variant::dark().chinese()],
         start: || page(Destination::Hosts),
         prepare: seed_hosts,
         install: show_batch_running,
@@ -4329,8 +3894,6 @@ pub const SCENARIOS: &[Scenario] = &[
                   the other hosts succeed",
         evidence: "shows the failed host, its exit status and reason, the untouched hosts and the \
                    retry action; no rollback is claimed, because none happens",
-        quick: true,
-        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
         start: || page(Destination::Hosts),
         prepare: seed_hosts,
         install: show_batch_failed,
@@ -4343,8 +3906,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "the runner holding every host inside its command, then paused",
         evidence: "shows that a pause starts no new step while the commands already running stay \
                    connected; nothing was stopped by it",
-        quick: false,
-        variants: &[Variant::dark().chinese()],
         start: || page(Destination::Hosts),
         prepare: seed_hosts,
         install: show_batch_paused,
@@ -4359,8 +3920,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the library this build draws: the switch to the run and the history, the \
                    targets and steps of each definition, and the edit and delete actions. Opening \
                    the library reads the file and starts nothing",
-        quick: true,
-        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
         start: || page(Destination::Hosts),
         prepare: seed_batch_library,
         install: show_batch_library,
@@ -4375,8 +3934,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the detail of one stored run: the state of every host, the exit status of \
                    every step, the output rebuilt from the log and the offsets taken from it. The \
                    records are fixtures, so this is not evidence about any SSH server",
-        quick: true,
-        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
         start: || page(Destination::Hosts),
         prepare: seed_batch_history,
         install: show_batch_history,
@@ -4389,8 +3946,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "a run the last session left unfinished: started, one host done, the rest waiting",
         evidence: "shows the history after a start: the run is marked interrupted, what it had \
                    finished is still readable, and nothing was replayed to find that out",
-        quick: false,
-        variants: &[Variant::dark().chinese()],
         start: || page(Destination::Hosts),
         prepare: seed_batch_interrupted,
         install: show_batch_history,
@@ -4405,8 +3960,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the run still going with the page it was left from: the top bar carries \
                    the run and its progress, and choosing it returns to the same page. The \
                    transport is a fixture, so this is not evidence about any SSH server",
-        quick: true,
-        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
         start: || page(Destination::Hosts),
         prepare: seed_hosts,
         install: show_batch_background,
@@ -4419,8 +3972,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "the runner with a cancel requested while every command is still running",
         evidence: "shows cancelling rather than cancelled: the page says the request was made and \
                    that the remote command has not ended, which is the state the run model waits in",
-        quick: false,
-        variants: &[Variant::dark().chinese()],
         start: || page(Destination::Hosts),
         prepare: seed_hosts,
         install: show_batch_cancelling,
@@ -4435,11 +3986,6 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the shared menu card: the reconnect entry first, the commands with \
                    their icons and shortcuts, the colour row and the disabled moves; no entry \
                    was pressed and no connection was made",
-        quick: true,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_tab_menu,
@@ -4452,8 +3998,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "six saved hosts, with the first one's right-click menu opened by the build",
         evidence: "shows the shared menu card over the hosts page and its danger entry; \
                    nothing was connected, copied or deleted",
-        quick: false,
-        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
         start: || page(Destination::Hosts),
         prepare: seed_hosts,
         install: show_host_menu,
@@ -4467,8 +4011,6 @@ pub const SCENARIOS: &[Scenario] = &[
                   server file opened by the build",
         evidence: "shows the shared menu card over the file view and its danger entry; \
                    nothing was transferred, renamed or deleted",
-        quick: false,
-        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_files_menu,
@@ -4482,11 +4024,6 @@ pub const SCENARIOS: &[Scenario] = &[
                   menu opened by the build",
         evidence: "shows the shared menu card over the grid with the shortcuts in force and \
                    copy unavailable while nothing is selected; nothing was copied or pasted",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::dark().smallest().largest(),
-        ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_terminal_menu,
@@ -4500,8 +4037,6 @@ pub const SCENARIOS: &[Scenario] = &[
                   shells listed are the ones this machine reports",
         evidence: "shows the shared menu card hanging from its control, its headings and the \
                    current shell's check; no shell was started",
-        quick: false,
-        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_shell_menu,
@@ -4517,8 +4052,6 @@ pub const SCENARIOS: &[Scenario] = &[
                    caption, the logo and name, an empty bar and the stage's caption; the \
                    entrance, the easing of the bar and the fade into the page are motion a \
                    still frame cannot show",
-        quick: true,
-        variants: &[Variant::dark().chinese(), Variant::light().chinese()],
         start: || page(Destination::Hosts),
         prepare: nothing,
         install: hold_startup_settings,
@@ -4530,8 +4063,6 @@ pub const SCENARIOS: &[Scenario] = &[
         category: Category::Startup,
         fixture: "an empty data directory; the window held on its start with stage 1 behind it",
         evidence: "shows the bar at a quarter and stage 2's caption (hosts and known servers)",
-        quick: false,
-        variants: &[Variant::dark().chinese(), Variant::light().chinese()],
         start: || page(Destination::Hosts),
         prepare: nothing,
         install: hold_startup_hosts,
@@ -4544,12 +4075,6 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "an empty data directory; the window held on its start with stages 1 and 2 \
                   behind it",
         evidence: "shows the bar at half and stage 3's caption (forwards, groups and workspace)",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::light().chinese(),
-            Variant::dark().smallest(),
-        ],
         start: || page(Destination::Hosts),
         prepare: nothing,
         install: hold_startup_workspace,
@@ -4561,14 +4086,7 @@ pub const SCENARIOS: &[Scenario] = &[
         category: Category::Startup,
         fixture: "an empty data directory; the window held on its start with stages 1 to 3 \
                   behind it",
-        evidence: "shows the bar at three quarters and stage 4's caption (fonts and first \
-                   frame); the brand fits the smallest window at 200% text",
-        quick: false,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::light().chinese(),
-            Variant::light().smallest().largest(),
-        ],
+        evidence: "shows the current startup stage and the actions available in that state",
         start: || page(Destination::Hosts),
         prepare: nothing,
         install: hold_startup_interface,
@@ -4580,17 +4098,7 @@ pub const SCENARIOS: &[Scenario] = &[
         category: Category::Startup,
         fixture: "an empty data directory; the window held on its start, stopped on stage 2 \
                   with a fixed reason naming hosts.json (nothing was really read)",
-        evidence: "shows the stop a failed stage makes: the brand, the stage's title in the \
-                   danger tone, the whole reason wrapped under it, the hint and the Continue \
-                   and Open data folder buttons; at 200% text in the smallest window the stop \
-                   scrolls rather than losing its buttons",
-        quick: true,
-        variants: &[
-            Variant::dark().chinese(),
-            Variant::light().chinese(),
-            Variant::dark().smallest(),
-            Variant::light().smallest().largest(),
-        ],
+        evidence: "shows the current startup stage and the actions available in that state",
         start: || page(Destination::Hosts),
         prepare: nothing,
         install: hold_startup_failed,
@@ -4608,8 +4116,6 @@ pub const SCENARIOS: &[Scenario] = &[
                    the hovered face rather than a pointer, the indeterminate bar is the \
                    still form a capture's reduced motion draws, and nothing on the page \
                    is wired to an action",
-        quick: false,
-        variants: &[],
         start: || page(Destination::Hosts),
         prepare: nothing,
         install: show_catalog,

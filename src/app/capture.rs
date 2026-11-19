@@ -7,7 +7,7 @@
 //!
 //! * [`scenarios`] registers the states worth photographing, in the real view, each with
 //!   what it was built from and what it cannot prove;
-//! * a run is [`--theme`], [`--size`], [`--only`], [`--quick`] or a full matrix, and
+//! * a run is [`--theme`], [`--size`], [`--only`], [`--quick`] or a three-page preview, and
 //!   each shot names its palette, logical and physical size, DPI, language and text size
 //!   in the manifest it writes beside the PNGs;
 //! * a shot is taken only after the scenario says it arrived and after the window drew
@@ -77,14 +77,15 @@ const MANIFEST_FILE: &str = "capture-ui-manifest.json";
 
 const USAGE: &str = "\
 usage: shellune --ui-capture [--list] [--quick] [--out <directory>]
-                             [--theme dark|light|both] [--size <width>[x<height>]]
+                             [--theme dark|light|both] [--language en|zh] [--size <width>[x<height>]]
                              [--only <pattern>[,<pattern>...]]
 
   --list                print the scenarios and their shots as JSON, capture nothing
-  --quick               only the main pages, in the dark palette
+  --quick               run the three-page preview (also the default)
   --out <directory>     where the PNGs and their manifest go; the gallery script
                         passes its own staging directory
-  --theme <choice>      dark, light or both (default: both; quick defaults to dark)
+  --theme <choice>      dark, light or both (default: dark)
+  --language <code>     en or zh (default: en)
   --size <width>[x<h>]  keep the shots at this logical width (and height, if given);
                         repeat the flag to keep more than one
   --only <pattern>      keep the scenarios whose id matches (glob: * and ?); repeat or
@@ -196,6 +197,8 @@ struct Options {
     list: bool,
     /// Which palettes to keep.
     theme: ThemeFilter,
+    /// Language used for each requested shot.
+    language: super::copy::Locale,
     /// Logical sizes to keep: a width, and a height when the caller gave one.
     sizes: Vec<(f32, Option<f32>)>,
     /// Scenario id patterns. Empty means every scenario.
@@ -209,7 +212,8 @@ impl Default for Options {
         Self {
             quick: false,
             list: false,
-            theme: ThemeFilter::Both,
+            theme: ThemeFilter::Dark,
+            language: super::copy::Locale::English,
             sizes: Vec::new(),
             only: Vec::new(),
             out: default_out(),
@@ -228,7 +232,6 @@ fn default_out() -> PathBuf {
 impl Options {
     fn parse(arguments: &[String]) -> Result<Self, String> {
         let mut options = Self::default();
-        let mut theme_given = false;
         let mut arguments = arguments
             .iter()
             .filter(|argument| argument.as_str() != FLAG)
@@ -257,7 +260,13 @@ impl Options {
                             ));
                         }
                     };
-                    theme_given = true;
+                }
+                "--language" => {
+                    options.language = match arguments.next().map(String::as_str) {
+                        Some("en") => super::copy::Locale::English,
+                        Some("zh") => super::copy::Locale::Chinese,
+                        _ => return Err("--language needs en or zh".to_owned()),
+                    };
                 }
                 "--size" => {
                     let value = arguments
@@ -283,10 +292,6 @@ impl Options {
                 "--help" | "-h" => return Err("help requested".to_owned()),
                 other => return Err(format!("unknown argument {other:?}")),
             }
-        }
-        // The quick run is the dark one unless the caller asked for a palette.
-        if options.quick && !theme_given {
-            options.theme = ThemeFilter::Dark;
         }
         Ok(options)
     }
@@ -347,63 +352,30 @@ fn matches_pattern(pattern: &str, id: &str) -> bool {
 /// possible, and by registry order inside a size, so two runs of the same command write
 /// the same list in the same order.
 fn plan(options: &Options) -> Result<Vec<Shot>, String> {
-    let selected: Vec<&'static Scenario> = SCENARIOS
-        .iter()
-        .filter(|scenario| {
-            options.only.is_empty()
-                || options
-                    .only
-                    .iter()
-                    .any(|pattern| matches_pattern(pattern, scenario.id))
-        })
-        .collect();
-    if selected.is_empty() {
-        return Err(format!(
-            "no scenario matches {}; --list shows the ids",
+    let mut shots = Vec::new();
+    for scenario in SCENARIOS {
+        let selected = if options.only.is_empty() {
+            scenario.preview()
+        } else {
             options
                 .only
                 .iter()
-                .map(|pattern| format!("{pattern:?}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    if options.quick {
-        let kept: Vec<&'static Scenario> = selected
-            .into_iter()
-            .filter(|scenario| scenario.quick)
-            .collect();
-        if kept.is_empty() {
-            return Err(
-                "no scenario the quick run covers matches --only; --list marks the quick ones"
-                    .to_owned(),
-            );
-        }
-        let variant = if options.theme == ThemeFilter::Light {
-            Variant::light()
-        } else {
-            Variant::dark()
+                .any(|pattern| matches_pattern(pattern, scenario.id))
         };
-        return Ok(kept
-            .into_iter()
-            .map(|scenario| Shot { scenario, variant })
-            .collect());
-    }
-    let mut shots = Vec::new();
-    for scenario in selected {
-        for variant in scenario.shots() {
-            if !options.theme.keeps(variant.theme) {
-                continue;
+        if !selected {
+            continue;
+        }
+        for palette in [Variant::dark(), Variant::light()] {
+            let mut variant = scenario.variant(palette);
+            variant.locale = options.language;
+            if options.theme.keeps(variant.theme) && kept_size(options, variant) {
+                shots.push(Shot { scenario, variant });
             }
-            if !kept_size(options, variant) {
-                continue;
-            }
-            shots.push(Shot { scenario, variant });
         }
     }
     if shots.is_empty() {
         return Err(format!(
-            "the selected scenarios have no shots at theme {:?} and the sizes asked for; \
+            "no shot matches the requested scenario, theme {:?} and the sizes asked for; \
              --list shows every shot",
             options.theme.name()
         ));
@@ -430,8 +402,7 @@ fn print_scenarios() {
     let scenarios: Vec<Value> = SCENARIOS
         .iter()
         .map(|scenario| {
-            let shots: Vec<Value> = scenario
-                .shots()
+            let shots: Vec<Value> = [scenario.variant(Variant::dark())]
                 .into_iter()
                 .map(|variant| {
                     json!({
@@ -448,7 +419,7 @@ fn print_scenarios() {
                 "id": scenario.id,
                 "title": scenario.title,
                 "category": scenario.category.id(),
-                "quick": scenario.quick,
+                "quick": scenario.preview(),
                 "fixture": scenario.fixture,
                 "evidence": scenario.evidence,
                 "shots": shots,
@@ -472,12 +443,6 @@ fn print_scenarios() {
 #[cfg(target_os = "windows")]
 struct Accepted {
     image: windows::Image,
-    distinct_colors: usize,
-    mean_luminance: f64,
-    /// The colour a blank frame is filled with, so a failure can say what the system
-    /// handed back instead of only that it was uniform.
-    uniform_colour: String,
-    pixel_crc32: u32,
     window_visible: bool,
     frames: u32,
     /// The logical size the shell had laid out for when the pixels were read.
@@ -1067,10 +1032,6 @@ async fn capture_in(
     wait_ready(wx, shot).await?;
     let Accepted {
         image,
-        distinct_colors,
-        mean_luminance,
-        uniform_colour,
-        pixel_crc32,
         window_visible,
         frames,
         viewport,
@@ -1083,9 +1044,17 @@ async fn capture_in(
         wait_ready(wx, shot).await?;
     }
 
+    let Stats {
+        distinct_colors,
+        mean_luminance,
+        uniform_colour,
+    } = analyse(&image)?;
+    let pixel_crc32 = pixel_crc32(&image.rgb);
     let file = format!("{}.png", shot.variant.file_stem(shot.scenario.id));
     let path = options.out.join(&file);
-    let png = encode_png(image.width, image.height, &image.rgb);
+    let png = encode_png(image.width, image.height, &image.rgb).map_err(|error| {
+        ShotError::Window(format!("could not encode {}: {error}", path.display()))
+    })?;
     std::fs::write(&path, &png).map_err(|error| {
         ShotError::Window(format!(
             "could not write {}: {error} (the frame itself was read back)",
@@ -1264,13 +1233,8 @@ fn grab(wx: &mut AsyncWindowContext, state: &Arc<Mutex<RunState>>) -> Result<Acc
             height: frame.height,
             rgb: frame.rgb,
         };
-        let stats = analyse(&image)?;
         Ok(Accepted {
-            pixel_crc32: Crc32::of(&image.rgb),
             image,
-            distinct_colors: stats.distinct_colors,
-            mean_luminance: stats.mean_luminance,
-            uniform_colour: stats.uniform_colour,
             window_visible,
             frames,
             viewport: (f32::from(viewport.width), f32::from(viewport.height)),
@@ -1571,133 +1535,64 @@ fn analyse(image: &windows::Image) -> Result<Stats, String> {
         return Err("the frame came back with no pixels".to_owned());
     }
     let mut seen = std::collections::HashSet::new();
-    let mut sum = 0f64;
-    let mut first = [0u8; 3];
+    let mut sums = [0u64; 3];
     let (pixels, _) = image.rgb.as_chunks::<3>();
-    for (index, pixel) in pixels.iter().enumerate() {
-        if index == 0 {
-            first = *pixel;
-        }
-        if seen.len() < 4096 {
+    let first = pixels[0];
+    let mut last = None;
+    for pixel in pixels {
+        if last != Some(pixel) && seen.len() < 4096 {
             seen.insert(*pixel);
+            last = Some(pixel);
         }
-        sum += luminance(pixel);
+        sums[0] += u64::from(pixel[0]);
+        sums[1] += u64::from(pixel[1]);
+        sums[2] += u64::from(pixel[2]);
     }
-    let count = (image.rgb.len() / 3) as f64;
+    let luminance = sums[0] as f64 * 0.2126 + sums[1] as f64 * 0.7152 + sums[2] as f64 * 0.0722;
     Ok(Stats {
         distinct_colors: seen.len(),
-        mean_luminance: sum / count,
+        mean_luminance: luminance / (pixels.len() as f64 * 255.0),
         uniform_colour: format!("#{:02x}{:02x}{:02x}", first[0], first[1], first[2]),
     })
 }
 
+/// Encode the published image once, directly from the accepted RGB frame.
 #[cfg(target_os = "windows")]
-fn luminance(pixel: &[u8]) -> f64 {
-    0.2126f64.mul_add(
-        f64::from(pixel[0]),
-        0.7152f64.mul_add(f64::from(pixel[1]), 0.0722 * f64::from(pixel[2])),
-    ) / 255.0
-}
-
-/// A PNG of the frame, encoded here so the tool needs no image crate.
-///
-/// The deflate stream uses stored blocks: the job is recording a frame, not compressing
-/// an image, and a stored stream cannot disagree with the pixels.
-#[cfg(target_os = "windows")]
-fn encode_png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
-    let mut out = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-    let mut header = Vec::with_capacity(13);
-    header.extend_from_slice(&width.to_be_bytes());
-    header.extend_from_slice(&height.to_be_bytes());
-    // 8 bits per channel, colour type 2 (RGB), the usual deflate and filter methods.
-    header.extend_from_slice(&[8, 2, 0, 0, 0]);
-    png_chunk(&mut out, b"IHDR", &header);
-
-    let stride = width as usize * 3;
-    let mut raw = Vec::with_capacity((stride + 1) * height as usize);
-    for row in 0..height as usize {
-        // Filter type 0: the bytes are the pixels.
-        raw.push(0);
-        raw.extend_from_slice(&rgb[row * stride..(row + 1) * stride]);
-    }
-
-    let mut deflate = vec![0x78, 0x01];
-    let mut rest = raw.as_slice();
-    loop {
-        let take = rest.len().min(65_535);
-        let (block, remainder) = rest.split_at(take);
-        let last = remainder.is_empty();
-        deflate.push(u8::from(last));
-        deflate.extend_from_slice(&(block.len() as u16).to_le_bytes());
-        deflate.extend_from_slice(&(!(block.len() as u16)).to_le_bytes());
-        deflate.extend_from_slice(block);
-        if last {
-            break;
-        }
-        rest = remainder;
-    }
-    deflate.extend_from_slice(&adler32(&raw).to_be_bytes());
-    png_chunk(&mut out, b"IDAT", &deflate);
-    png_chunk(&mut out, b"IEND", &[]);
-    out
+fn encode_png(width: u32, height: u32, rgb: &[u8]) -> image::ImageResult<Vec<u8>> {
+    use image::ImageEncoder;
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    let mut png = Vec::new();
+    PngEncoder::new_with_quality(&mut png, CompressionType::Level(1), FilterType::NoFilter)
+        .write_image(rgb, width, height, image::ExtendedColorType::Rgb8)?;
+    Ok(png)
 }
 
 #[cfg(target_os = "windows")]
-fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
-    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    out.extend_from_slice(kind);
-    out.extend_from_slice(data);
-    let mut crc = Crc32::new();
-    crc.update(kind);
-    crc.update(data);
-    out.extend_from_slice(&crc.finish().to_be_bytes());
-}
-
-#[cfg(target_os = "windows")]
-fn adler32(data: &[u8]) -> u32 {
-    let mut a: u32 = 1;
-    let mut b: u32 = 0;
-    for byte in data {
-        a = (a + u32::from(*byte)) % 65_521;
-        b = (b + a) % 65_521;
-    }
-    (b << 16) | a
-}
-
-#[cfg(target_os = "windows")]
-struct Crc32(u32);
-
-#[cfg(target_os = "windows")]
-impl Crc32 {
-    fn new() -> Self {
-        Self(0xffff_ffff)
-    }
-
-    /// The CRC of a whole buffer, as the manifest reports it: two runs of the same shot
-    /// can be compared without keeping the PNG.
-    fn of(data: &[u8]) -> u32 {
-        let mut crc = Self::new();
-        crc.update(data);
-        crc.finish()
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        for byte in data {
-            let mut value = (self.0 ^ u32::from(*byte)) & 0xff;
-            for _ in 0..8 {
-                value = if value & 1 == 1 {
-                    0xedb8_8320 ^ (value >> 1)
+fn pixel_crc32(data: &[u8]) -> u32 {
+    const TABLE: [u32; 256] = {
+        let mut table = [0; 256];
+        let mut index = 0;
+        while index < table.len() {
+            let mut crc = index as u32;
+            let mut bit = 0;
+            while bit < 8 {
+                crc = if crc & 1 == 1 {
+                    0xedb8_8320 ^ (crc >> 1)
                 } else {
-                    value >> 1
+                    crc >> 1
                 };
+                bit += 1;
             }
-            self.0 = (self.0 >> 8) ^ value;
+            table[index] = crc;
+            index += 1;
         }
+        table
+    };
+    let mut crc = u32::MAX;
+    for &byte in data {
+        crc = (crc >> 8) ^ TABLE[usize::from(crc as u8 ^ byte)];
     }
-
-    fn finish(&self) -> u32 {
-        self.0 ^ 0xffff_ffff
-    }
+    !crc
 }
 
 /// The decision logic the tool runs without a window: what a run covers, what a shot is
@@ -1789,107 +1684,49 @@ mod tool_tests {
     }
 
     #[test]
-    fn the_quick_run_covers_the_main_pages_in_dark_only() {
-        let parsed = options(&["--quick"]);
-        assert_eq!(parsed.theme, ThemeFilter::Dark);
-        let shots = plan(&parsed).expect("the quick run has shots");
-        let quick: Vec<&str> = SCENARIOS
-            .iter()
-            .filter(|scenario| scenario.quick)
-            .map(|scenario| scenario.id)
-            .collect();
-        assert!(!quick.is_empty());
-        assert_eq!(shots.len(), quick.len(), "one shot per quick page");
-        for shot in &shots {
-            assert!(
-                shot.scenario.quick,
-                "{} is not a quick page",
-                shot.scenario.id
-            );
-            assert_eq!(shot.variant.theme, ThemeChoice::Dark);
-            assert_eq!(shot.variant.width, crate::app::DEFAULT_WINDOW_SIZE.0);
-        }
-        for id in quick {
-            assert!(
-                shots.iter().any(|shot| shot.scenario.id == id),
-                "the quick run left out {id}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_full_run_shoots_every_scenario_in_both_palettes() {
-        let parsed = options(&[]);
-        let shots = plan(&parsed).expect("a full run has shots");
-        let expected: usize = SCENARIOS
-            .iter()
-            .map(|scenario| scenario.shots().len())
-            .sum();
-        assert_eq!(shots.len(), expected);
-        for scenario in SCENARIOS {
-            for theme in [ThemeChoice::Dark, ThemeChoice::Light] {
-                assert!(
-                    shots
-                        .iter()
-                        .any(|shot| shot.scenario.id == scenario.id && shot.variant.theme == theme),
-                    "{} is missing its {theme:?} shot",
-                    scenario.id
+    fn previews_have_only_three_regular_dark_english_pages() {
+        for flags in [vec![], vec!["--quick"]] {
+            let shots = plan(&options(&flags)).unwrap();
+            let mut ids: Vec<_> = shots.iter().map(|shot| shot.scenario.id).collect();
+            ids.sort_unstable();
+            assert_eq!(ids, ["desktop-rdp", "home-hosts", "terminal-local"]);
+            for shot in shots {
+                assert_eq!(shot.variant.theme, ThemeChoice::Dark);
+                assert_eq!(shot.variant.language_name(), "en");
+                assert_eq!(shot.variant.zoom_percent(), 100);
+                assert_eq!(
+                    (shot.variant.width, shot.variant.height),
+                    crate::app::DEFAULT_WINDOW_SIZE
                 );
             }
-            // ADR-9: every surface is seen in Chinese and at 200% text at least once.
-            let own = || shots.iter().filter(|shot| shot.scenario.id == scenario.id);
-            assert!(
-                own().any(|shot| shot.variant.locale == crate::app::copy::Locale::Chinese),
-                "{} has no Chinese shot",
-                scenario.id
-            );
-            assert!(
-                own().any(|shot| shot.variant.zoom == crate::app::theme::Zoom::Largest),
-                "{} has no shot at 200% text",
-                scenario.id
-            );
-            let mut stems: Vec<String> = own()
-                .map(|shot| shot.variant.file_stem(scenario.id))
-                .collect();
-            let count = stems.len();
-            stems.sort_unstable();
-            stems.dedup();
-            assert_eq!(stems.len(), count, "{} names two shots alike", scenario.id);
         }
-        // No shot is ever taken in the palette the machine happens to be in.
-        assert!(
-            shots
-                .iter()
-                .all(|shot| shot.variant.theme != ThemeChoice::System)
-        );
     }
 
     #[test]
-    fn the_theme_and_size_flags_narrow_the_matrix_without_inventing_shots() {
-        let light = plan(&options(&["--theme", "light"])).expect("the light run has shots");
-        assert!(
-            light
-                .iter()
-                .all(|shot| shot.variant.theme == ThemeChoice::Light)
+    fn explicit_filters_target_one_state_and_can_select_language_and_theme() {
+        let flags = [
+            "--only",
+            "settings",
+            "--language",
+            "zh",
+            "--theme",
+            "light",
+            "--size",
+            "1120",
+        ];
+        let shots = plan(&options(&flags)).unwrap();
+        assert_eq!(shots.len(), 1);
+        assert_eq!(shots[0].scenario.id, "settings");
+        assert_eq!(shots[0].variant.theme, ThemeChoice::Light);
+        assert_eq!(shots[0].variant.language_name(), "zh");
+        assert_eq!(
+            plan(&options(&["--only", "settings", "--theme", "both"]))
+                .unwrap()
+                .len(),
+            2
         );
-        assert!(!light.is_empty());
-
-        let smallest = plan(&options(&["--size", "720x480"])).expect("the smallest size has shots");
-        assert!(!smallest.is_empty());
-        assert!(smallest.iter().all(|shot| {
-            shot.variant.width == crate::app::MIN_WINDOW_SIZE.0
-                && shot.variant.height == crate::app::MIN_WINDOW_SIZE.1
-        }));
-
-        let width_only = plan(&options(&["--size", "1120"])).expect("the width has shots");
-        assert!(
-            width_only
-                .iter()
-                .all(|shot| shot.variant.width == crate::app::DEFAULT_WINDOW_SIZE.0)
-        );
-
-        // A size no scenario is shot in is a mistake worth reporting, not an empty run.
-        assert!(plan(&options(&["--size", "4096x2160"])).is_err());
+        assert!(plan(&options(&["--size", "720x480"])).is_err());
+        assert!(Options::parse(&["--language".into(), "fr".into()]).is_err());
     }
 
     #[test]
@@ -1911,8 +1748,8 @@ mod tool_tests {
 
         // A typo must not quietly produce a run of something else.
         assert!(plan(&options(&["--only", "nope-*"])).is_err());
-        // Quick mode only covers the pages it has shots for.
-        assert!(plan(&options(&["--quick", "--only", "overlay-*"])).is_err());
+        // An explicit request can select any individual fixture.
+        assert!(plan(&options(&["--quick", "--only", "overlay-*"])).is_ok());
     }
 
     #[test]
@@ -1976,19 +1813,14 @@ mod tool_tests {
         assert_eq!(plain.file_stem("home-hosts"), "home-hosts-1120x720-dark");
         let light = Variant::light();
         assert_eq!(light.file_stem("settings"), "settings-1120x720-light");
-        let named = Variant::dark().smallest().comfortable().chinese();
-        // The private builders are used through a scenario below; this asserts the
-        // spelling of each modifier instead.
-        assert_eq!(named.zoom_percent(), 115);
-        assert_eq!(named.language_name(), "zh");
-        assert_eq!(named.theme_name(), "dark");
-        assert_eq!(named.width, crate::app::MIN_WINDOW_SIZE.0);
-        let expected = format!(
-            "terminal-local-{}x{}-dark-z115-zh",
-            crate::app::MIN_WINDOW_SIZE.0 as u32,
-            crate::app::MIN_WINDOW_SIZE.1 as u32
+        let named = Variant {
+            locale: crate::app::copy::Locale::Chinese,
+            ..plain
+        };
+        assert_eq!(
+            named.file_stem("terminal-local"),
+            "terminal-local-1120x720-dark-zh"
         );
-        assert_eq!(named.file_stem("terminal-local"), expected);
     }
 
     #[test]
@@ -2094,67 +1926,19 @@ mod frame_tests {
     fn the_same_pixels_give_the_same_checksum() {
         let frame = image(8, 8, |x, y| [x as u8, y as u8, 0x40]);
         let other = image(8, 8, |x, y| [x as u8, y as u8, 0x40]);
-        assert_eq!(Crc32::of(&frame.rgb), Crc32::of(&other.rgb));
+        assert_eq!(pixel_crc32(&frame.rgb), pixel_crc32(&other.rgb));
         let changed = image(8, 8, |x, y| [x as u8, y as u8, 0x41]);
-        assert_ne!(Crc32::of(&frame.rgb), Crc32::of(&changed.rgb));
+        assert_ne!(pixel_crc32(&frame.rgb), pixel_crc32(&changed.rgb));
     }
 
     #[test]
     fn the_encoded_file_is_a_png_of_the_frame_it_was_given() {
         let frame = image(3, 2, |x, y| [x as u8, y as u8, 0x7f]);
-        let png = encode_png(frame.width, frame.height, &frame.rgb);
-        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
-
-        let mut offset = 8;
-        let mut kinds = Vec::new();
-        let mut idat = Vec::new();
-        while offset < png.len() {
-            let length = u32::from_be_bytes(png[offset..offset + 4].try_into().expect("length"));
-            let kind = &png[offset + 4..offset + 8];
-            let data = &png[offset + 8..offset + 8 + length as usize];
-            let crc = u32::from_be_bytes(
-                png[offset + 8 + length as usize..offset + 12 + length as usize]
-                    .try_into()
-                    .expect("crc"),
-            );
-            let mut check = Crc32::new();
-            check.update(kind);
-            check.update(data);
-            assert_eq!(crc, check.finish(), "chunk {kind:?} carries a wrong crc");
-            kinds.push(kind.to_vec());
-            if kind == b"IDAT" {
-                idat.extend_from_slice(data);
-            }
-            offset += 12 + length as usize;
-        }
-        assert_eq!(
-            kinds,
-            [b"IHDR".to_vec(), b"IDAT".to_vec(), b"IEND".to_vec()]
-        );
-
-        // The deflate stream is a zlib header and stored blocks; undoing them has to give
-        // back one filter byte and the row's pixels per scan line.
-        assert_eq!(idat[..2], [0x78, 0x01]);
-        let mut raw = Vec::new();
-        let mut at = 2;
-        loop {
-            let header = idat[at];
-            let length = u16::from_le_bytes([idat[at + 1], idat[at + 2]]) as usize;
-            raw.extend_from_slice(&idat[at + 5..at + 5 + length]);
-            at += 5 + length;
-            if header == 1 {
-                break;
-            }
-        }
-        assert_eq!(
-            raw,
-            vec![
-                // First row: filter byte, then x, y, 0x7f for every pixel.
-                0, 0, 0, 0x7f, 1, 0, 0x7f, 2, 0, 0x7f, // Second row: y is 1 now.
-                0, 0, 1, 0x7f, 1, 1, 0x7f, 2, 1, 0x7f,
-            ]
-        );
-        let stored = u32::from_be_bytes(idat[at..at + 4].try_into().expect("adler"));
-        assert_eq!(stored, adler32(&raw));
+        let png = encode_png(frame.width, frame.height, &frame.rgb).unwrap();
+        let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(decoded.dimensions(), (frame.width, frame.height));
+        assert_eq!(decoded.as_raw(), &frame.rgb);
     }
 }

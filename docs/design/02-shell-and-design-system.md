@@ -3,6 +3,14 @@
 本文件是 `src/app/theme.rs`、`src/app/components.rs` 与 `src/app/view.rs` 的设计依据（2026-11 重设计：令牌、组件与动效见 §2、§5）。
 tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为准并同时修正本文件。
 
+### 当前界面截图入口
+
+普通测试默认生成零张截图。在 Windows 运行 `python scripts/capture-ui.py` 或附加 `--quick`，可生成首页主机列表、本地终端、RDP 画面三张预览。预览使用 1120×720 逻辑窗口、100% 字号、深色英文。
+
+核对单项改动时使用场景 ID。例如，`python scripts/capture-ui.py --only settings --language zh --theme light` 只拍一张浅色中文设置页。`--list` 列出可用场景，`--no-build` 复用已经带有 `ui-capture` 功能且与当前代码一致的构建。下文各轮历史截图数量与变体用于追溯当时的观察。
+
+日常验证可按负责的 crate 或测试名运行。例如，`cargo test --features ui-capture --bin shellune app::capture::` 检查场景选择与像素处理，`python scripts/capture-ui.py --self-test` 检查发布与回滚。CI 的工作区测试一次覆盖远程桌面用例。
+
 ## 1. 结构：顶栏标签 + 页面
 
 本次改版取消了侧边栏。用户只在三处之间切换：**主机**（主页）、**终端**（已打开的标签）、**设置**。

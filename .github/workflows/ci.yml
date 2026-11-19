@@ -121,15 +121,6 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      # The desktop boundary against the linked libraries, on its own so its result is
-      # visible apart from the rest of the suite.
-      - name: Native desktop tests
-        env:
-          SHELLUNE_REQUIRE_NATIVE: "1"
-        run: |
-          cargo test -p shellune-desktop --test native
-          cargo test --all-features --test rdp_vnc
-
       - name: Test
         env:
           SHELLUNE_REQUIRE_NATIVE: "1"

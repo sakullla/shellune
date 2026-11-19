@@ -15,8 +15,7 @@ This script owns the rest of the command:
 * a round publishes into a directory of its own: a full run into docs/verification/ui, a
   quick or filtered run into a subdirectory of it (quick/, only-home-hosts/ ...), so a
   narrow run can never delete the shots it did not take;
-* on success it publishes in three steps: every staged PNG is checked and repacked
-  losslessly first, then the whole round is moved into place, and only then are the
+* on success it publishes in three steps: every staged PNG is validated first, then the whole round is moved into place, and only then are the
   images the previous round registered - and this one did not - removed. A failure in
   either of the first two steps leaves the previous round complete, and the command can
   simply be run again;
@@ -78,7 +77,7 @@ def slug(text: str) -> str:
     return cleaned[:60] or "run"
 
 
-def round_key(quick: bool, theme, sizes, only) -> str:
+def round_key(quick: bool, theme, sizes, only, language=None) -> str:
     """Which round this run takes, as a directory name below the published root.
 
     A round keeps every shot it took and only ever replaces itself, so a quick run is
@@ -89,8 +88,10 @@ def round_key(quick: bool, theme, sizes, only) -> str:
     parts = []
     if quick:
         parts.append("quick")
-    if theme and theme != "both":
+    if theme:
         parts.append("theme-" + slug(theme))
+    if language:
+        parts.append("language-" + slug(language))
     for size in sizes or []:
         parts.append("size-" + slug(size))
     for pattern in only or []:
@@ -431,47 +432,40 @@ def png_chunk(kind: bytes, payload: bytes) -> bytes:
             + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF))
 
 
-def recompress_png(path: Path) -> int:
-    """Rewrites a PNG with a real deflate stream, keeping every pixel.
-
-    The capture tool writes its PNGs with stored deflate blocks, because its job is to
-    record a frame rather than to compress one. That leaves a 1120x720 shot at about five
-    megabytes, and a gallery of them would be a hundred megabytes of repository for no
-    information gain. Repacking the same scan lines with zlib is lossless and is verified
-    here by decompressing what was written.
-
-    Returns the file's new size.
-    """
+def validate_png(path: Path) -> None:
+    """Verify the encoder's RGB PNG including its chunk CRCs and scanline stream."""
     data = path.read_bytes()
-    if data[:8] != PNG_SIGNATURE:
-        raise ValueError(str(path) + " is not a PNG")
-    at = 8
-    header = None
-    pixels = b""
-    while at < len(data):
-        (length,) = struct.unpack(">I", data[at:at + 4])
-        kind = data[at + 4:at + 8]
-        payload = data[at + 8:at + 8 + length]
-        (crc,) = struct.unpack(">I", data[at + 8 + length:at + 12 + length])
-        if zlib.crc32(kind + payload) & 0xFFFFFFFF != crc:
-            raise ValueError(str(path) + " has a damaged " + kind.decode("ascii") + " chunk")
-        if kind == b"IHDR":
-            header = payload
+    if not data.startswith(PNG_SIGNATURE):
+        raise ValueError(f"{path}: invalid PNG signature")
+    at = len(PNG_SIGNATURE)
+    expected = None
+    payloads = []
+    while at + 12 <= len(data):
+        length, kind = struct.unpack_from(">I4s", data, at)
+        end = at + 8 + length
+        if end + 4 > len(data):
+            break
+        payload = memoryview(data)[at + 8:end]
+        (crc,) = struct.unpack_from(">I", data, end)
+        if zlib.crc32(payload, zlib.crc32(kind)) != crc:
+            raise ValueError(f"{path}: damaged {kind!r} checksum")
+        if kind == b"IHDR" and at == len(PNG_SIGNATURE) and length == 13:
+            width, height, depth, colour, compression, scan_filter, interlace = struct.unpack(">IIBBBBB", payload)
+            if not width or not height or (depth, colour, compression, scan_filter, interlace) != (8, 2, 0, 0, 0):
+                raise ValueError(f"{path}: invalid RGB header")
+            expected = (width * 3 + 1) * height
         elif kind == b"IDAT":
-            pixels += payload
-        elif kind != b"IEND":
-            raise ValueError(str(path) + " holds an unexpected " + kind.decode("ascii") + " chunk")
-        at += 12 + length
-    if header is None:
-        raise ValueError(str(path) + " has no header")
-    raw = zlib.decompress(pixels)
-    packed = zlib.compress(raw, 9)
-    if zlib.decompress(packed) != raw:
-        raise ValueError("recompressing " + str(path) + " changed its pixels")
-    out = PNG_SIGNATURE + png_chunk(b"IHDR", header) + png_chunk(b"IDAT", packed)
-    out += png_chunk(b"IEND", b"")
-    path.write_bytes(out)
-    return len(out)
+            payloads.append(payload)
+        elif kind == b"IEND" and length == 0 and end + 4 == len(data):
+            if expected is None or not payloads:
+                break
+            stream = zlib.decompressobj()
+            raw = stream.decompress(b"".join(payloads), expected + 1)
+            if stream.eof and not stream.unused_data and len(raw) == expected:
+                return
+            break
+        at = end + 4
+    raise ValueError(f"{path}: incomplete PNG image")
 
 
 def label_for(dest: Path) -> str:
@@ -489,17 +483,12 @@ def staged_names(staging: Path) -> list:
 
 
 def check_staged_images(staging: Path) -> None:
-    """Checks and repacks every image the round would publish, still inside staging.
-
-    A damaged frame must not be published as evidence. Repacking verifies the chunks and
-    the pixels, and it happens before anything is moved, so one bad shot stops the round
-    while the published one is still whole and the command can be run again.
-    """
+    """Validate in staging, before replacing the previous published round."""
     for entry in sorted(staging.iterdir()):
         if not entry.is_file() or entry.suffix.lower() != ".png":
             continue
         try:
-            recompress_png(entry)
+            validate_png(entry)
         except (ValueError, zlib.error) as error:
             raise RoundError("refusing to publish a damaged image: " + str(error)) from error
 
@@ -844,19 +833,20 @@ def self_test() -> int:
             assert needle in gallery, "the gallery does not mention " + needle
         assert "old gallery" not in gallery, "the gallery was not replaced"
 
-        # A published image is repacked losslessly, and a damaged one is refused.
+        # A published image is validated, and a damaged one is refused.
         assert published is not None
         published_bytes = published["shots"][0]["bytes"]
         on_disk = (dest / published["shots"][0]["file"]).stat().st_size
         assert published_bytes == on_disk, "the manifest does not report the published size"
         sample = root / "sample.png"
         write_png(sample, 64, 64, (17, 18, 24))
-        stored = sample.stat().st_size
-        assert recompress_png(sample) < stored, "recompression did not shrink the file"
+        stored = sample.read_bytes()
+        validate_png(sample)
+        assert sample.read_bytes() == stored, "validation changed the image"
         damaged = root / "damaged.png"
         damaged.write_bytes(b"not a png at all")
         try:
-            recompress_png(damaged)
+            validate_png(damaged)
             raise AssertionError("a damaged image was accepted")
         except ValueError:
             pass
@@ -990,7 +980,7 @@ def self_test() -> int:
         # A round is named after what was asked for, so two narrow runs never publish over
         # each other and neither of them can land on the baseline.
         assert round_key(False, None, None, None) == FULL_ROUND
-        assert round_key(False, "both", None, None) == FULL_ROUND
+        assert round_key(False, "both", None, None) == "theme-both"
         assert round_key(True, None, None, None) == "quick"
         assert round_key(False, "light", None, None) == "theme-light"
         assert round_key(False, None, ["720x480"], None) == "size-720x480"
@@ -1014,9 +1004,10 @@ def main(argv) -> int:
     parser.add_argument("--list", action="store_true",
                         help="print the scenarios and their shots, capture nothing")
     parser.add_argument("--quick", action="store_true",
-                        help="only the main pages, in the dark palette")
+                        help="the three-page preview (also the default)")
     parser.add_argument("--theme", choices=("dark", "light", "both"),
                         help="which palettes to capture")
+    parser.add_argument("--language", choices=("en", "zh"), help="language of the shots (default: en)")
     parser.add_argument("--size", action="append", metavar="WIDTH[xHEIGHT]",
                         help="keep the shots at this logical size; repeatable")
     parser.add_argument("--only", action="append", metavar="PATTERN",
@@ -1040,9 +1031,10 @@ def main(argv) -> int:
         return self_test()
 
     root = repo_root()
-    binary = Path(arguments.bin) if arguments.bin else binary_path(root)
 
     passthrough = []
+    if arguments.language:
+        passthrough += ["--language", arguments.language]
     if arguments.list:
         passthrough.append("--list")
     if arguments.quick:
@@ -1054,7 +1046,11 @@ def main(argv) -> int:
     for pattern in arguments.only or []:
         passthrough += ["--only", pattern]
 
-    if not arguments.no_build and not arguments.bin:
+    if arguments.bin:
+        binary = Path(arguments.bin).resolve()
+    elif arguments.no_build:
+        binary = binary_path(root)
+    else:
         binary = build(root)
     if not binary.is_file():
         print("no capture binary at " + str(binary) + "; build it with "
@@ -1078,7 +1074,7 @@ def main(argv) -> int:
     # A full run publishes at the root and every narrower run publishes beside it, in a
     # directory of its own: a quick run replaces the quick round, never the baseline it
     # did not shoot.
-    key = round_key(arguments.quick, arguments.theme, arguments.size, arguments.only)
+    key = round_key(arguments.quick, arguments.theme, arguments.size, arguments.only, arguments.language)
     dest = round_directory(published, key)
     print("round " + key + " publishes to " + str(dest))
     return capture(published, dest, binary, passthrough)
