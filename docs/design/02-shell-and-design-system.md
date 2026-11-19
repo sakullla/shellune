@@ -252,8 +252,10 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   （`settings_pending_reveal`），滚轮一动即恢复跟随。最后一个分类之后留出约 60% 视口高度的空白，保证任何分类都能
   滚到顶部。只有右侧滚动，导航不动。窗口窄到两栏放不下时，导航折叠为顶部的分类 / 子项选择条，内容仍是同一个
   连续页面。没有标题的设置行不再留一行空白，说明文字与右侧控件垂直居中。偏好保存在 `preferences.json`。
-  **视觉（R5）**：左侧导航是一块 chrome 层面板（`CHROME` 底 + 弱边 + 圆角 8），当前分类为浅底 + 2px accent
-  细条（展开时细条交给当前子项）；每组设置是共享的 `components::card`（surface + 弱边 + 圆角 8 + Raised，行自带
+  **视觉（R5，T8 / ADR-7 更新）**：左侧导航不再是带框面板，而是页面左侧一列 `components::nav_item`（宽 200，与首页侧栏
+  同尺寸：分类一个控件高 32、圆角 6、16px 图标；当前分类为 selected 底 + 2px accent 竖条（`accent_mark`）+ MEDIUM，
+  展开时底色、竖条与焦点环交给当前子项；子项不带图标、缩进到分类文字、一个紧凑控件高 28）；分类标题用页标题字号
+  （`heading_size`，20）；每组设置是共享的 `components::card`（surface + 弱边 + 圆角 8 + Raised，行自带
   内边距与分隔线）。开 / 关类设置全部是开关（`ShelluneView::switch_control` → `components::switch`）：整块
   （状态词“开 / 关” + 开关）是一个 ≥ 24px 的指针目标，按一下翻转并立即生效，选择器为
   `settings.notice.bell`、`settings.notice.finished`、`settings.keepalive`、`settings.sync.auto`、
@@ -868,8 +870,8 @@ COM1 等）不算文件夹里的文件。不满足的一律 `ERROR_ACCESS_DENIED
 | `CANVAS` | `#0f0f11` | `#fafafa` | 窗口底：内容区、终端外围 |
 | `SURFACE` | `#151518` | `#f4f4f5` | 面板层：侧栏、输入框、行、卡片 |
 | `CHROME` | `#151518` | `#f4f4f5` | 标题栏、标签条、状态栏（与 `SURFACE` 同值，同属面板层） |
-| `RAISED` | `#1c1c20` | `#ffffff` | 浮层：菜单、弹出层、tooltip、toast |
-| `OVERLAY` | `#202024` | `#ffffff` | 对话框、命令面板（最前层，压在 scrim 上） |
+| `RAISED` | `#1c1c20` | `#ffffff` | 浮层：菜单、弹出层、命令面板、tooltip、toast（`components::popover_surface`） |
+| `OVERLAY` | `#202024` | `#ffffff` | 对话框（最前层，压在 scrim 上） |
 
 深色下 canvas < 面板 < 浮层 < 对话框逐级变亮（测试校验）；浅色下面板比底色灰一档，浮在上面的一律为白
 （测试校验浮层亮于 canvas 与面板）。
@@ -974,10 +976,10 @@ gpui 没有 hover 过渡、没有元素缩放，也不报告系统的"减少动�
 
 | 档 | 令牌 | 用于 |
 | --- | --- | --- |
-| 4 | `SMALL` | 标签（tag）、chip、徽标、键帽、勾选框、分段、tooltip |
-| 6 | `MEDIUM` | 按钮、输入框、搜索框、列表行、侧栏项、菜单项 |
-| 8 | `LARGE` | 卡片、菜单、toast、浮动控件条、终端框、标签页顶部 |
-| 12 | `XLARGE` | 对话框、命令面板、状态卡、启动标志 |
+| 4 | `SMALL` | 标签（tag）、chip、徽标、键帽、勾选框、分段、菜单项（与菜单卡 4px 内边距同心） |
+| 6 | `MEDIUM` | 按钮、输入框、搜索框、列表行、侧栏项与设置导航项、命令面板结果行 |
+| 8 | `LARGE` | 卡片、浮层（菜单、命令面板、tooltip、toast、浮动控件条，ADR-7）、终端框、标签页顶部 |
+| 12 | `XLARGE` | 对话框、状态卡、启动标志 |
 
 旧的 10 / 14 / 20 档已删除（`XXLARGE` 删除，用到它的地方改为 12）。1px 与 0 只用于细状态条与拼接边。
 
@@ -1018,7 +1020,8 @@ tooltip 这类在窗口渲染之外绘制的部件用 `theme::metrics()` 取得�
 | T3 之后 | 267 | 82 | 新组件只用 spacing 令牌；状态标记与选中竖条的 1 / 1.5 / 2px 收为 `MARK_CORNER` / `MARK_STROKE` / `MARK_BAR_WIDTH` |
 | T4 之后 | 220 | 82 | 首页改为侧栏 + 单列表：卡片带、快速连接栏、分组列与分组头删除；新代码的尺寸都是命名常量（`SIDEBAR_WIDTH` 等）或 spacing 令牌 |
 | T6 之后 | 203 | 75 | 标签改为胶囊（标签底色、分隔线与远程画面取色删除）；底栏终端工具收进菜单（折叠测量与 `tools_width` 删除）；状态卡改为横幅，横幅只用 spacing 令牌与命名常量（`DIAGNOSTIC_MAX_HEIGHT`、`BANNER_WORDS_WIDTH`）；标签条溢出容差 `STRIP_ROUNDING_SLACK` |
-| T7 之后（当前基线） | 163 | 66 | 文件栏头、面包屑、文件行、问题、传输条与进度条、远程桌面状态卡与证书卡、隧道表单改用组件与 spacing / 度量令牌；余下的长度是命名常量（`FILES_SIZE_WIDTH`、`FILES_SELECTION_WORDS_MIN`、`NOTICE_WIDTH`、`ZOOM_LABEL_WIDTH`、`FORWARD_PORT_WIDTH`、`FORWARD_ROW_WORDS_MIN`、`LIST_ROW_MIN_HEIGHT`、`TOOLBAR_MIN_HEIGHT`、`HAIRLINE_WIDTH`）；状态卡徽记、浮动条、竖线与选中竖条的裸数换成等值的度量（外观不变） |
+| T7 之后 | 163 | 66 | 文件栏头、面包屑、文件行、问题、传输条与进度条、远程桌面状态卡与证书卡、隧道表单改用组件与 spacing / 度量令牌；余下的长度是命名常量（`FILES_SIZE_WIDTH`、`FILES_SELECTION_WORDS_MIN`、`NOTICE_WIDTH`、`ZOOM_LABEL_WIDTH`、`FORWARD_PORT_WIDTH`、`FORWARD_ROW_WORDS_MIN`、`LIST_ROW_MIN_HEIGHT`、`TOOLBAR_MIN_HEIGHT`、`HAIRLINE_WIDTH`）；状态卡徽记、浮动条、竖线与选中竖条的裸数换成等值的度量（外观不变） |
+| T8 之后（当前基线） | 99 | 43 | 设置、对话框、菜单、命令面板、toast、tooltip 与批量任务迁移：设置导航改用 `nav_item`，选中竖条改用 `accent_mark`，设置页、批量任务、命令面板、标签菜单 / 标签列表、主机表单与快捷命令编辑器余下的长度改为命名常量（`SECTIONS_MAX_WIDTH`、`PAGE_MAX_WIDTH`、`ROW_LABEL_MIN_WIDTH`、`KEYS_NAME_MIN_WIDTH`、`NUMBER_FIELD_WIDTH`、`LIST_MAX_HEIGHT`、`RUN_OUTPUT_HEIGHT`、`PALETTE_WIDTH`、`PALETTE_LIST_MAX_HEIGHT`、`MENU_MIN_WIDTH`、`MENU_MIN_HEIGHT`、`TAB_MENU_MIN_WIDTH`、`TOAST_WIDTH`、`ICON_TILE`、`KBD_HEIGHT`、`FORM_FIELD_MIN_WIDTH` 等）或度量（菜单项、命令面板脚注与跳板选择器行改为 `compact_control_height`，命令面板结果行为 `large_control_height`）；对话框标题、状态卡标题回到字阶（`title_size`），宽度计算里的 2px 边框写作 `HAIRLINE_WIDTH × 2`。已低于 ADR-9 的 `scale` 目标（≤ 140），`px` 距目标（≤ 45）已达成 |
 
 ### 终端内搜索（`crates/terminal` + `src/app/terminal.rs`）
 
@@ -1917,10 +1920,12 @@ surface 底、静止 Raised，焦点环叠在 Raised 之上；尺寸不随窗口
 清除颜色不需要指针（R2、R4）。输入后按匹配度平铺排序：标题前缀 > 词首 > 标题包含 >
 说明包含 > 三个字母起的按序模糊匹配；每个词都必须命中。↑↓/Tab 移动、Enter 执行、Esc 或点击
 遮罩关闭，关闭后键盘回到打开前的字段、终端或页面。无匹配时显示"没有匹配的结果"，Enter 不做任何事。
-720×480、200% 文字下面板留在窗口内，列表本身滚动到最后一行（每条 76 px 高，一个屏只放得下两条），
+720×480、200% 文字下面板留在窗口内，列表本身滚动到最后一行（每条 72 px 高，一个屏只放得下两条），
 搜索到某条快捷命令时"插入/执行"两行完整落在列表框内而不会被裁掉。
-外观（R6）：面板画在与对话框相同的 `components::dialog_surface` 上（overlay + 强边 + 圆角 12 + Overlay），进入时 Settle；
-它和对话框一样记作"本帧画了对话框"，关闭后遮罩由窗口用 `modal_scrim_exit` 淡出（减少动效时随面板立即消失），
+外观（R6，T8 / ADR-7 更新）：面板宽 560（`components::PALETTE_WIDTH`，窗口更窄时左右各留 24），画在与菜单、tooltip、
+toast 相同的 `components::popover_surface` 上（raised + 强边 + 圆角 8 + Overlay），压在自己的遮罩上，进入时 Settle；
+结果行一个大号控件高（36），左侧 24 的类型图块，有生效绑定的结果在行尾画键帽（`kbd`，读 `Keymap`，与菜单同源）；
+底部按键提示条一个紧凑控件高（28）。面板和对话框一样记作"本帧画了对话框"，关闭后遮罩由窗口用 `modal_scrim_exit` 淡出（减少动效时随面板立即消失），
 由 `the_palette_settles_like_a_dialog_and_its_dimming_fades_on_close` 锁定。
 
 
@@ -1974,18 +1979,24 @@ surface 底、静止 Raised，焦点环叠在 Raised 之上；尺寸不随窗口
 | `progress_bar(id, Progress)` | 细进度条（高 4、全圆角）：确定型按比例填充；不确定型一段 30% 宽的填充以 `PROGRESS_SWEEP` 1200ms 循环扫过，减少动效时静止居中（`progress.determinate` / `.indeterminate` / `.still`） |
 | `progress_bar_toward(id, from, to, duration)` | 确定型进度条从 `from` 以 ease-out-cubic 缓动到 `to`（新的 `id` 重播，同一 `id` 画在 `to`）；减少动效时直接画 `to`。启动页用它追阶段目标（第 1.5 节） |
 | `skeleton_text(fraction)` / `skeleton_row(id)` | 骨架屏：文字行（高 10、圆角 4、selected 底）与列表行（头像块 + 两行）；允许动效时缓慢呼吸，减少动效时静止 |
-| `kbd(label)` | 键帽：高 18、圆角 4、面板底 + 强边（底边 2px），字号 caption − 1；取代旧 `keycap` |
+| `kbd(label)` | 键帽：高 `KBD_HEIGHT`（18）、圆角 4、面板底 + 强边（底边 2px），字号 caption − 1；取代旧 `keycap` |
 | `checkbox_target(checked)` / `labelled_switch(on, word, selector)` | 指针大小的勾选目标（首页多选列）；带状态词的开关（设置页），取代两处本地实现 |
 | `row` / `row_with_state` + `stacked` | 列表行：surface 底，悬停、选中（底色 + 前导竖条）、焦点、失败、进行中 |
-| `menu_card` + `menu_entry` + `menu_divider` | 右键/下拉菜单：raised + 强边 + 圆角 8 + Overlay；条目 30 高，标签占满剩余宽度，禁用项保留位置，危险项悬停为 danger tint |
+| `popover_surface()` | 浮层表面（T8 / ADR-7）：raised + 强边 + 圆角 8 + Overlay。菜单卡、浮动控件条、命令面板、tooltip 与 toast 共用，测试 `menus_tooltips_toasts_and_the_palette_share_one_floating_surface` 逐个读回样式 |
+| `menu_card` + `menu_entry` + `menu_divider` | 右键/下拉菜单：`popover_surface`，最小宽 `MENU_MIN_WIDTH`（200），内边距 4；条目一个紧凑控件高（28，T8 由 30 改）、圆角 4（与卡片内边距同心），标签占满剩余宽度，禁用项保留位置，危险项悬停为 danger tint；`menu_item`（取值菜单）同为 28 高 |
 | `menu_shortcut` / `menu_section` / `menu_enter` | 条目尾部的当前生效快捷键（caption、muted，右对齐）；菜单内分组小标题；菜单进入动画（Rise，减少动效时直接画出） |
 | `floating_bar` | 浮在画面或页面上的控件条：raised + 强边 + 圆角 8 + Overlay，吃掉指针；远程桌面的缩放与全屏 |
-| `dialog_surface` | 对话框级表面：overlay + 强边 + 圆角 12 + Overlay，裁切到圆角；`modal` 的卡片与命令面板共用 |
+| `dialog_surface` | 对话框级表面：overlay + 强边 + 圆角 12 + Overlay，裁切到圆角；`modal` 的卡片（T8 起命令面板改用 `popover_surface`） |
 | `menu_panel` + `menu_item` + `menu_item_face` | 取值菜单（选中项保留选中外观） |
 | `modal(viewport, id, width, ModalContent)` / `modal_with(..., ModalBehaviour)` | 对话框外壳（尚未迁移的见上）：scrim 遮罩（按下不关闭；`ModalBehaviour::dismiss` 仅给无内容可丢的对话框），overlay + 强边 + 圆角 12 + Overlay，头部固定、主体滚动（`{id}.body`，可交给调用方的 `ScrollHandle`）、底部固定，遮罩为 `{id}.backdrop`，进入时 Settle；关闭后遮罩由窗口用 `modal_scrim_exit` 淡出 |
 | `modal_footer` / `modal_icon(icon, tone)` | 对话框底部动作行（顶部分隔线、右对齐、可换行，主操作最后）；头部图标块（默认 accent tint，危险问题用色调 tint） |
+| `modal_footer_noted(note, actions)` | 带说明的底部动作行（T8）：左侧安静说明（caption、muted，可换行，最小宽 `FOOTER_NOTE_MIN_WIDTH` 160），右侧动作组 `ml_auto` 靠右、可换行；放不下时动作组整体换到下一行仍贴右缘，主操作始终在最右。批量任务的四个对话框用它（原来换行后动作贴左） |
+| `form_row` + `form_field(label, control, share, min)` / `form_cell(share, min)` | 对话框的两列自适应表单（T8 / ADR-7）：一行两个（或多个）字段，每格从 0 起按 `share` 比例分剩余宽度、保底 `FORM_FIELD_MIN_WIDTH`（200，短字段如端口 `FORM_SHORT_FIELD_MIN_WIDTH` 96），底线放不下时整格换行，所以宽窗口两列、720×480@200% 一列；标签是 `form_label`。主机表单（地址 / 端口、名称 / 分组）、远程桌面 / 串口表单的成对字段、批量任务的“同时运行 / 任务名称”、快捷命令编辑器用它。测试 `the_host_form_is_two_columns_wide_and_one_column_narrow` |
+| `form_section(title)` / `form_hint(text)` / `form_rule()` | 表单分组标题（body、600、主色）、字段下说明（caption、muted）、分组间发丝线 |
+| `disclosure(open, title, hint)` | 表单的折叠段头（“高级”，T8）：箭头 + 名称 + 一行内容说明（省略号），扁平、弱边、悬停出底，调用方加 id、点击与“已使用”chip；主机表单的高级设置默认折叠 |
+| `nav_item(icon, label, selected, ringed)` / `accent_mark(shown)` | 页面自带的导航列（设置，T8）：分类项一个控件高、带图标，子项无图标、缩进、一个紧凑控件高；选中 = selected 底 + 2px accent 竖条 + MEDIUM，键盘所在项另画焦点环（常驻透明边，不挪字）；`accent_mark` 是那条竖条本身（不选时为同宽透明占位），设置卡片行首也用它 |
 | `dialog_face` / `dialog_panel` / `dialog_header` | 对话框表面令牌与内嵌标题块 |
-| `toast(tone, icon, title, detail)` | 通知：raised + 强边 + 圆角 8 + Overlay，色调图标圆底；关闭按钮与位置由调用方加，进入时 Fade |
+| `toast(tone, icon, title, detail)` | 通知：`popover_surface`，宽 `TOAST_WIDTH`（340），色调图标圆底（`ICON_TILE` 24）；关闭按钮与位置由调用方加，进入时 Fade |
 | `empty_state(icon, title, body, action)` | 空状态：accent tint 图标块（圆角 12）+ 标题 + 可选说明（可换任意行）+ 可选动作；标题与说明经 `capped_text` 居中、上限 420，动作总在文字下方（`empty.state.title` / `.body` / `.action`）；不带状态色调；调用方在外层加自己的选择器 |
 | `capped_text(max_w, text)` | 居中、有宽度上限的换行文字：按上限宽度求高度，盒子与画出的行数一致（见 4“换行文本”） |
 | `enter_in_turn(element, id, turn)` + `turn_timing` / `turn_curve` | 一组物体依次淡入：第 `turn` 个晚 `TURN_DELAY`×turn（到 `LAST_TURN` 为止），淡入 BASE，只动透明度；减少动效时直接画终态 |
@@ -1997,7 +2008,7 @@ surface 底、静止 Raised，焦点环叠在 Raised 之上；尺寸不随窗口
 | `endpoint` / `copy_on_click` | 等宽端点值，点击复制 |
 | `loading_indicator` | 进行中指示条（BASE 淡入）；减少动效时静止画出 |
 | `section_label` / `field_row` / `divider_vertical` | 分组标题、表单标签行、竖线分隔 |
-| `Tooltip` / `tooltip()` | raised + 强边 + 圆角 4 + Overlay，随窗口缩放（`theme::metrics()`） |
+| `Tooltip` / `tooltip()` | `popover_surface`（T8 起圆角 8，与菜单、toast 一致），内边距 8 / 4，caption 字号，随窗口缩放（`theme::metrics()`） |
 | `icons::icon(Icon, size, color)` | 内嵌线条图标 |
 
 新增分区必须复用同一组组件、`ControlState` 与 `SectionState`，不为某个分区单独发明状态表达、私有
@@ -2020,6 +2031,23 @@ T7 又把文件视图、传输、端口转发与远程桌面里的手写外形�
 `compact_row_frame`；传输进度条的自绘槽与填充 → `progress_bar`；文件问题、传输覆盖问题（3px 左边的手写块）、隧道表单与确认 →
 `inline_form`；桌面的 `state_card_with_icon` 与证书 `card` → `status_card` + `status_card_slot`；两处 `w(px(1))` 竖线 →
 `column_divider`。
+
+**T8（ADR-7）：设置、对话框、菜单、命令面板、tooltip、toast 与批量任务。** 行为、选择器与键盘路径不变，只换外观：
+
+- **设置**：导航列改为 `nav_item`（见 1.0 “设置页”与上表），分类标题 20，卡片行首的选中竖条与自带页的小标题竖条改为
+  `accent_mark`。截图工具打开某个设置页时同样滚到该分类（`capture_settings_page` 调 `settings_reveal`；此前
+  `settings-keys*` 截图拍到的是页面顶部的外观分类）。
+- **对话框**：三段式不变（固定头部 → 滚动正文 → 固定底部，主按钮最右、取消在其左）。头部标题从 20 降到对话框标题字号
+  16（`title_size`，ADR-1），头部上内边距 16。表单用 `form_row` / `form_field` 两列自适应，组标题与分隔线用
+  `form_section` / `form_rule`，“高级”用 `disclosure` 且默认折叠。表单正文行距 12。批量任务库的底部改为“关闭 → 新建任务”，
+  主按钮回到最右。
+- **菜单**：`menu_entry` 与 `menu_item` 28 高（`a_menu_entry_is_one_compact_control_high`），菜单卡、跳板选择器的
+  候选行同为 28；菜单卡与命令面板、tooltip、toast、远程桌面浮动条共用 `popover_surface`。
+- **命令面板**：宽 560、raised 浮层 + 圆角 8，结果 36 高并带生效键帽（`the_palette_is_560_wide_and_its_results_name_their_keys`）。
+- **批量任务**：库、历史、编辑与运行四个对话框的底部改为 `modal_footer_noted`（`the_batch_actions_stay_on_the_right_of_their_footer`）；
+  运行页与历史详情的主机行、库与历史的条目行从“面板底卡片行”改为扁平 `list_row_frame`（悬停出底，选中为 selected 底 +
+  accent 竖条）；编辑页的“同时运行的主机数 / 任务名称”改为一行两列的 `form_field`。
+
 
 组件的测试在 `components.rs` 与 `theme.rs` 各自的 `#[cfg(test)]` 模块里：八种状态逐格校验文字对比
 度（禁用态取 3:1 图形下限）、同一变体的八种状态互不相同、焦点与校验失败只加宽边框、浮层使用 overlay /

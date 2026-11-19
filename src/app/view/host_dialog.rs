@@ -38,6 +38,12 @@ use crate::app::components::checkbox;
 /// How many candidates the jump picker shows before its list scrolls.
 const JUMP_PICKER_ROWS: f32 = 6.0;
 
+/// The widest a host's name is drawn in the jump picker before its address.
+const JUMP_NAME_MAX_WIDTH: f32 = 200.0;
+
+/// The least width of one override number of the host form.
+const CONNECTION_FIELD_MIN_WIDTH: f32 = 120.0;
+
 /// The jump host picker of the host dialog, while it is open (R3).
 ///
 /// It is a search field over the saved SSH hosts that can still be added, with one
@@ -231,15 +237,9 @@ impl ShelluneView {
         let mut column = div()
             .flex()
             .flex_col()
-            .gap(metrics.scale(spacing::HAIRLINE))
+            .gap(metrics.scale(spacing::NARROW))
             .debug_selector(|| "hosts.jump".to_owned())
-            .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(strings.host_jump_title),
-            );
+            .child(components::form_label(strings.host_jump_title, metrics));
         if draft.jumps().is_empty() {
             column = column.child(
                 div()
@@ -319,13 +319,11 @@ impl ShelluneView {
         }
         column = column.child(self.jump_adder(cx));
         column = column
-            .child(self.dialog_field(fields, HostField::ProxyCommand, None, 1.0))
             .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(strings.host_proxy_note),
-            );
+                self.dialog_field(fields, HostField::ProxyCommand, None, 1.0)
+                    .mt(metrics.scale(spacing::TIGHT)),
+            )
+            .child(components::form_hint(strings.host_proxy_note, metrics));
         if draft.proxy_conflicts() {
             column = column.child(
                 div()
@@ -392,17 +390,21 @@ impl ShelluneView {
         let ux = copy::ux();
         let candidates = self.jump_picker_candidates(cx);
         let marked = picker.highlight.min(candidates.len().saturating_sub(1));
-        let row_height = metrics.scale(34.0);
+        // The candidates are menu entries: one compact control high, like every menu.
+        let row_height = metrics.compact_control_height();
         let narrowed = !picker.search.read(cx).text().trim().is_empty();
         let mut list = div()
             .id("hosts.jump.options")
             .debug_selector(|| "hosts.jump.options".to_owned())
             .flex()
             .flex_col()
-            .gap(metrics.scale(1.0))
+            .gap(px(components::HAIRLINE_WIDTH))
             // Exactly the rows and the hairline gaps between them: a book of six fills
             // the list to the cap and a longer one scrolls at that same height.
-            .max_h(row_height * JUMP_PICKER_ROWS + metrics.scale(JUMP_PICKER_ROWS - 1.0))
+            .max_h(
+                row_height * JUMP_PICKER_ROWS
+                    + px(components::HAIRLINE_WIDTH) * (JUMP_PICKER_ROWS - 1.0),
+            )
             .overflow_y_scroll()
             .track_scroll(&picker.scroll);
         for (index, id) in candidates.iter().copied().enumerate() {
@@ -420,8 +422,8 @@ impl ShelluneView {
                     .items_center()
                     .gap(metrics.scale(spacing::TIGHT))
                     .h(row_height)
-                    .px(metrics.scale(spacing::TIGHT + 2.0))
-                    .rounded(px(radius::MEDIUM - 2.0))
+                    .px(metrics.scale(spacing::TIGHT))
+                    .rounded(px(radius::SMALL))
                     .cursor_pointer()
                     .when(selected, |row| {
                         row.bg(theme::swatch(palette::SURFACE_SELECTED))
@@ -439,7 +441,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .flex_none()
-                            .max_w(metrics.scale(200.0))
+                            .max_w(metrics.scale(JUMP_NAME_MAX_WIDTH))
                             .truncate()
                             .text_size(metrics.label_size())
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
@@ -548,20 +550,17 @@ impl ShelluneView {
     ) -> Div {
         let metrics = self.metrics();
         let label = label.unwrap_or_else(|| field.label(self.strings()));
-        div()
-            .flex()
-            .flex_col()
-            .flex_grow()
-            .flex_basis(gpui::relative(grow))
-            .min_w_0()
-            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+        // The port, a short field beside wide ones, keeps a short floor; the others
+        // keep the form's floor, so a narrow dialog stacks them instead of squeezing.
+        let floor = if matches!(field, HostField::Port) {
+            components::FORM_SHORT_FIELD_MIN_WIDTH
+        } else {
+            components::FORM_FIELD_MIN_WIDTH
+        };
+        components::form_cell(grow, floor, metrics)
             .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .debug_selector(move || format!("{}.label", field.debug_selector()))
-                    .child(label),
+                components::form_label(label, metrics)
+                    .debug_selector(move || format!("{}.label", field.debug_selector())),
             )
             .child(
                 div()
@@ -618,7 +617,7 @@ impl ShelluneView {
             div()
                 .flex()
                 .flex_col()
-                .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                .gap(metrics.scale(spacing::NARROW))
                 .child(div().flex().child(methods))
                 .child(
                     div()
@@ -688,48 +687,9 @@ impl ShelluneView {
         let metrics = self.metrics();
         let ux = copy::ux();
         let open = self.host_advanced;
-        let hover = theme::swatch(palette::SURFACE_HOVER);
-        div()
+        components::disclosure(open, ux.host_advanced_title, ux.host_advanced_hint, metrics)
             .id("hosts.advanced")
             .debug_selector(|| "hosts.advanced".to_owned())
-            .flex()
-            .items_center()
-            .gap(metrics.scale(spacing::TIGHT))
-            .w_full()
-            .px(metrics.scale(spacing::SNUG))
-            .py(metrics.scale(spacing::TIGHT + 2.0))
-            .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::CHROME))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .cursor_pointer()
-            .hover(move |style| style.bg(hover))
-            .child(icons::icon(
-                if open {
-                    Icon::ChevronDown
-                } else {
-                    Icon::ChevronRight
-                },
-                metrics.small_icon_size(),
-                theme::swatch(palette::TEXT_SECONDARY),
-            ))
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(metrics.label_size())
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .child(ux.host_advanced_title),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(ux.host_advanced_hint),
-            )
             .when(draft.has_advanced(), |row| {
                 row.child(components::chip(
                     ux.host_advanced_in_use,
@@ -789,15 +749,7 @@ impl ShelluneView {
         div()
             .flex()
             .flex_col()
-            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-            .child(
-                div()
-                    .pt(metrics.scale(spacing::HAIRLINE))
-                    .text_size(metrics.caption_size())
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(strings.transfers_protocol),
-            )
+            .gap(metrics.scale(spacing::NARROW))
             .child(row)
             .child(
                 div()
@@ -856,15 +808,7 @@ impl ShelluneView {
         div()
             .flex()
             .flex_col()
-            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-            .child(
-                div()
-                    .pt(metrics.scale(spacing::HAIRLINE))
-                    .text_size(metrics.caption_size())
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(strings.x11_label),
-            )
+            .gap(metrics.scale(spacing::NARROW))
             .child(row)
             .child(
                 div()
@@ -937,15 +881,7 @@ impl ShelluneView {
         let mut column = div()
             .flex()
             .flex_col()
-            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-            .child(
-                div()
-                    .pt(metrics.scale(spacing::HAIRLINE))
-                    .text_size(metrics.caption_size())
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(ux.host_connection_title),
-            )
+            .gap(metrics.scale(spacing::NARROW))
             .child(div().flex().child(row))
             .child(
                 div()
@@ -1027,8 +963,8 @@ impl ShelluneView {
             .flex_col()
             .flex_grow()
             .flex_basis(gpui::relative(0.33))
-            .min_w(metrics.scale(120.0))
-            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+            .min_w(metrics.scale(CONNECTION_FIELD_MIN_WIDTH))
+            .gap(metrics.scale(spacing::NARROW))
             .child(
                 div()
                     .text_size(metrics.caption_size())
@@ -1084,32 +1020,21 @@ impl ShelluneView {
         let strings = self.strings();
         let editing = draft.editing().is_some();
 
-        let line = |left: Div, right: Div| {
-            div()
-                .flex()
-                .w_full()
-                .gap(metrics.scale(spacing::SNUG))
-                .child(left)
-                .child(right)
-        };
+        // Two fields side by side that stack when the dialog is too narrow (ADR-7).
+        let line = |left: Div, right: Div| components::form_row(metrics).child(left).child(right);
         let ux = copy::ux();
-        let section = |title: &'static str| {
-            div()
-                .text_size(metrics.label_size())
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                .child(title)
-        };
-        let rule = || div().h(px(1.0)).bg(theme::swatch(palette::BORDER));
+        let group = |icon: Icon, title: &'static str| components::form_group(icon, title, metrics);
 
         // What a person needs to reach a server comes first - where, who, how - and
-        // only that is required. Naming and grouping follow; everything a first host
-        // never needs folds away under one line that says what is inside.
+        // only that is required. Each part is a titled group of its own (ADR-7):
+        // where and who, then how to sign in; everything a first host never needs
+        // folds away under one line that says what is inside, and opens as a group
+        // per subject - the route, the startup command, transfers, X11, keepalive.
         // The dialog's own body scrolls; this column only lays the form out.
         let mut body = div()
             .flex()
             .flex_col()
-            .gap(metrics.scale(spacing::SNUG + 2.0))
+            .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::LOOSE))
             .py(metrics.scale(spacing::BASE));
         // A new record may be of another protocol. The chooser is here so the form the
@@ -1119,19 +1044,37 @@ impl ShelluneView {
             body = body.child(self.protocol_chooser(ProtocolKind::Ssh, cx));
         }
         body = body
-            .child(line(
-                self.dialog_field(fields, HostField::Address, None, 0.75),
-                self.dialog_field(fields, HostField::Port, None, 0.25),
-            ))
-            .child(self.dialog_field(fields, HostField::User, None, 1.0))
-            .child(rule())
-            .child(section(strings.host_auth_title))
-            .child(self.sign_in_fields(fields, &draft, cx))
-            .child(rule())
-            .child(line(
-                self.dialog_field(fields, HostField::Name, Some(ux.host_name_optional), 0.5),
-                self.dialog_field(fields, HostField::Group, Some(ux.host_group_optional), 0.5),
-            ))
+            .child(
+                group(Icon::Server, ux.host_group_basic)
+                    .debug_selector(|| "hosts.group.basic".to_owned())
+                    // Where and who on one line, the way it is written - user, host,
+                    // port - and stacked when the dialog is too narrow for the three.
+                    .child(
+                        components::form_row(metrics)
+                            .child(self.dialog_field(fields, HostField::Address, None, 0.5))
+                            .child(self.dialog_field(fields, HostField::Port, None, 0.18))
+                            .child(self.dialog_field(fields, HostField::User, None, 0.32)),
+                    )
+                    .child(line(
+                        self.dialog_field(
+                            fields,
+                            HostField::Name,
+                            Some(ux.host_name_optional),
+                            0.5,
+                        ),
+                        self.dialog_field(
+                            fields,
+                            HostField::Group,
+                            Some(ux.host_group_optional),
+                            0.5,
+                        ),
+                    )),
+            )
+            .child(
+                group(Icon::Key, strings.host_auth_title)
+                    .debug_selector(|| "hosts.group.auth".to_owned())
+                    .child(self.sign_in_fields(fields, &draft, cx)),
+            )
             .child(self.advanced_toggle(&draft, cx));
 
         if self.host_advanced {
@@ -1139,24 +1082,16 @@ impl ShelluneView {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(metrics.scale(spacing::SNUG + 2.0))
-                    .pl(metrics.scale(spacing::SNUG))
-                    .border_l_2()
-                    .border_color(theme::swatch(palette::BORDER))
+                    .gap(metrics.scale(spacing::SNUG))
                     .debug_selector(|| "hosts.advanced.body".to_owned())
-                    .child(self.jump_section(fields, &draft, cx))
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-                            .child(
-                                div()
-                                    .text_size(metrics.caption_size())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                                    .child(strings.host_startup_label),
-                            )
+                        group(Icon::Forward, ux.host_group_route)
+                            .debug_selector(|| "hosts.group.route".to_owned())
+                            .child(self.jump_section(fields, &draft, cx)),
+                    )
+                    .child(
+                        group(Icon::Terminal, strings.host_startup_label)
+                            .debug_selector(|| "hosts.group.startup".to_owned())
                             .child(
                                 div()
                                     .flex()
@@ -1166,16 +1101,23 @@ impl ShelluneView {
                                     })
                                     .child(fields.startup.clone()),
                             )
-                            .child(
-                                div()
-                                    .text_size(metrics.caption_size())
-                                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                                    .child(strings.host_startup_note),
-                            ),
+                            .child(components::form_hint(strings.host_startup_note, metrics)),
                     )
-                    .child(self.copy_protocol_section(&draft, metrics, strings, cx))
-                    .child(self.x11_section(&draft, metrics, strings, cx))
-                    .child(self.connection_section(&draft, metrics, cx)),
+                    .child(
+                        group(Icon::Transfer, ux.host_group_transfer)
+                            .debug_selector(|| "hosts.group.transfer".to_owned())
+                            .child(self.copy_protocol_section(&draft, metrics, strings, cx)),
+                    )
+                    .child(
+                        group(Icon::Monitor, strings.x11_label)
+                            .debug_selector(|| "hosts.group.x11".to_owned())
+                            .child(self.x11_section(&draft, metrics, strings, cx)),
+                    )
+                    .child(
+                        group(Icon::Clock, ux.host_connection_title)
+                            .debug_selector(|| "hosts.group.keepalive".to_owned())
+                            .child(self.connection_section(&draft, metrics, cx)),
+                    ),
             );
         }
 
@@ -1245,7 +1187,7 @@ impl ShelluneView {
         Some(self.modal_with(
             window,
             "hosts.editor",
-            600.0,
+            640.0,
             ModalContent {
                 header,
                 subtitle,
@@ -1287,14 +1229,11 @@ impl ShelluneView {
         div()
             .flex()
             .flex_col()
-            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-            .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .child(strings.connection_field_protocol),
-            )
+            .gap(metrics.scale(spacing::NARROW))
+            .child(components::form_label(
+                strings.connection_field_protocol,
+                metrics,
+            ))
             .child(choices)
     }
 
@@ -1307,20 +1246,10 @@ impl ShelluneView {
             .as_ref()
             .and_then(|fields| fields.get(field))
             .cloned();
-        let mut cell = div()
-            .flex()
-            .flex_col()
-            .flex_grow()
-            .flex_basis(gpui::relative(1.0))
-            .min_w_0()
-            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-            .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .child(label),
-            );
+        // Every protocol field shares its row evenly and stacks under its neighbour when
+        // the dialog is too narrow for both (ADR-7).
+        let mut cell = components::form_cell(0.5, components::FORM_FIELD_MIN_WIDTH, metrics)
+            .child(components::form_label(label, metrics));
         if let Some(entity) = entity {
             cell = cell.child(
                 div()
@@ -1366,21 +1295,13 @@ impl ShelluneView {
         let strings = self.strings();
         let editing = draft.editing().is_some();
 
-        let line = |left: Div, right: Div| {
-            div()
-                .flex()
-                .w_full()
-                .gap(metrics.scale(spacing::SNUG))
-                .child(left)
-                .child(right)
-        };
-        let rule = || div().h(px(1.0)).bg(theme::swatch(palette::BORDER));
-
+        // Two fields side by side that stack when the dialog is too narrow (ADR-7).
+        let line = |left: Div, right: Div| components::form_row(metrics).child(left).child(right);
         // The dialog's own body scrolls; this column only lays the form out.
         let mut body = div()
             .flex()
             .flex_col()
-            .gap(metrics.scale(spacing::SNUG + 2.0))
+            .gap(metrics.scale(spacing::BASE))
             .px(metrics.scale(spacing::LOOSE))
             .py(metrics.scale(spacing::BASE));
 
@@ -1388,20 +1309,27 @@ impl ShelluneView {
             body = body.child(self.protocol_chooser(draft.protocol(), cx));
         }
 
-        // Only the fields this protocol has: no identity file, no secret, no jump chain
+        // Two titled groups (ADR-7): where and who, then what this protocol lets the
+        // user choose. Only the fields this protocol has: no identity file, no secret, no jump chain
         // and no forwarding appears for a connection that cannot use them.
+        let ux = copy::ux();
+        let mut basic = components::form_group(Icon::Server, ux.host_group_basic, metrics)
+            .debug_selector(|| "connection.group.basic".to_owned());
+        let mut options = components::form_group(Icon::Settings, ux.host_group_options, metrics)
+            .debug_selector(|| "connection.group.options".to_owned());
+        let mut has_options = false;
         for field in draft.fields() {
             let field = *field;
             match field {
                 ConnectionFormField::Address => {
-                    body = body.child(line(
+                    basic = basic.child(line(
                         self.protocol_field(ConnectionFormField::Address),
                         self.protocol_field(ConnectionFormField::Port),
                     ));
                 }
                 ConnectionFormField::Port => {}
                 ConnectionFormField::User => {
-                    body = body.child(line(
+                    basic = basic.child(line(
                         self.protocol_field(ConnectionFormField::User),
                         self.protocol_field(ConnectionFormField::Domain),
                     ));
@@ -1433,11 +1361,12 @@ impl ShelluneView {
                             )),
                         );
                     }
-                    body = body.child(
+                    has_options = true;
+                    options = options.child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                            .gap(metrics.scale(spacing::NARROW))
                             .debug_selector(|| "connection.field.certificate".to_owned())
                             .child(
                                 div()
@@ -1475,11 +1404,12 @@ impl ShelluneView {
                             )),
                         );
                     }
-                    body = body.child(
+                    has_options = true;
+                    options = options.child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                            .gap(metrics.scale(spacing::NARROW))
                             .debug_selector(|| "connection.field.security".to_owned())
                             .child(
                                 div()
@@ -1495,7 +1425,8 @@ impl ShelluneView {
                     // On unless the user turns it off: copy and paste between this
                     // computer and the remote desktop is what a session is expected
                     // to do (R6).
-                    body = body.child(
+                    has_options = true;
+                    options = options.child(
                         checkbox(
                             "connection.clipboard",
                             strings.connection_field_clipboard,
@@ -1521,7 +1452,8 @@ impl ShelluneView {
                     // A blank folder is the mapping turned off, so the field is the
                     // switch and the choice at once; the note says what the remote
                     // side gets and that it gets nothing more (R5).
-                    body = body.child(
+                    has_options = true;
+                    options = options.child(
                         self.protocol_field(ConnectionFormField::DriveFolder).child(
                             div()
                                 .whitespace_normal()
@@ -1549,11 +1481,12 @@ impl ShelluneView {
                                 })),
                         );
                     }
-                    body = body.child(
+                    has_options = true;
+                    options = options.child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                            .gap(metrics.scale(spacing::NARROW))
                             .debug_selector(|| "connection.field.parity".to_owned())
                             .child(
                                 div()
@@ -1588,11 +1521,12 @@ impl ShelluneView {
                             )),
                         );
                     }
-                    body = body.child(
+                    has_options = true;
+                    options = options.child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                            .gap(metrics.scale(spacing::NARROW))
                             .debug_selector(|| "connection.field.stop_bits".to_owned())
                             .child(
                                 div()
@@ -1621,11 +1555,12 @@ impl ShelluneView {
                                 })),
                         );
                     }
-                    body = body.child(
+                    has_options = true;
+                    options = options.child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                            .gap(metrics.scale(spacing::NARROW))
                             .debug_selector(|| "connection.field.flow".to_owned())
                             .child(
                                 div()
@@ -1639,7 +1574,8 @@ impl ShelluneView {
                 }
                 ConnectionFormField::LocalEcho => {
                     let echo = draft.local_echo();
-                    body = body.child(
+                    has_options = true;
+                    options = options.child(
                         checkbox(
                             "connection.local_echo",
                             strings.connection_field_local_echo,
@@ -1662,23 +1598,28 @@ impl ShelluneView {
                     );
                 }
                 ConnectionFormField::Device => {
-                    body = body.child(line(
+                    basic = basic.child(line(
                         self.protocol_field(ConnectionFormField::Device),
                         self.protocol_field(ConnectionFormField::Baud),
                     ));
                 }
                 ConnectionFormField::Baud => {}
                 ConnectionFormField::DataBits => {
-                    body = body.child(self.protocol_field(ConnectionFormField::DataBits));
+                    has_options = true;
+                    options = options.child(self.protocol_field(ConnectionFormField::DataBits));
                 }
                 ConnectionFormField::Name => {
-                    body = body.child(rule()).child(line(
+                    basic = basic.child(line(
                         self.protocol_field(ConnectionFormField::Name),
                         self.protocol_field(ConnectionFormField::Group),
                     ));
                 }
                 ConnectionFormField::Group => {}
             }
+        }
+        body = body.child(basic);
+        if has_options {
+            body = body.child(options);
         }
 
         body = body.child(
@@ -1742,7 +1683,7 @@ impl ShelluneView {
         Some(self.modal_with(
             window,
             "connection.editor",
-            600.0,
+            640.0,
             ModalContent {
                 header,
                 subtitle,

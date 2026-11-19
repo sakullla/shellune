@@ -1170,6 +1170,23 @@ mod tests {
     const PLATFORMS: [Platform; 3] = [Platform::Windows, Platform::MacOs, Platform::Linux];
 
     #[test]
+    fn the_language_shortcut_uses_each_platforms_command_key() {
+        // macOS has no Ctrl+L shortcut: the language is Cmd+L there, which a test that
+        // pressed Ctrl+L on every platform missed (mac CI).
+        for (platform, expected) in [
+            (Platform::Windows, "ctrl-l"),
+            (Platform::Linux, "ctrl-l"),
+            (Platform::MacOs, "cmd-l"),
+        ] {
+            assert_eq!(
+                Keymap::defaults(platform).keystroke("language.toggle"),
+                Some(expected),
+                "{platform:?}"
+            );
+        }
+    }
+
+    #[test]
     fn every_action_has_a_unique_identifier_and_two_names() {
         let mut ids: Vec<&str> = ACTIONS.iter().map(|spec| spec.id).collect();
         let count = ids.len();

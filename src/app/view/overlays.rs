@@ -31,6 +31,27 @@ use crate::app::theme::{self, Metrics, Tone, palette as colors, radius, spacing}
 use crate::app::workspace::UnreadNotices;
 use shellune_terminal::paste_preview;
 
+/// The tallest the palette's list grows before it scrolls, in logical pixels.
+const PALETTE_LIST_MAX_HEIGHT: f32 = 380.0;
+/// The height of the palette's "no result" line.
+const PALETTE_EMPTY_HEIGHT: f32 = 72.0;
+/// The widest a palette result's title is drawn before its detail.
+const PALETTE_TITLE_MAX_WIDTH: f32 = 260.0;
+/// The least height a menu keeps in a window too short for all its entries.
+const MENU_MIN_HEIGHT: f32 = 120.0;
+/// The width the host menu is kept inside the window by.
+const HOST_MENU_WIDTH: f32 = 210.0;
+/// The width the tab menu is kept inside the window by.
+const TAB_MENU_WIDTH: f32 = 230.0;
+/// The narrowest the tab menu is drawn: a row of colours fits across it.
+const TAB_MENU_MIN_WIDTH: f32 = 220.0;
+/// The least width of a tab's name in the tab list.
+const TAB_LIST_NAME_MIN_WIDTH: f32 = 120.0;
+/// The least width of a tab's target in the tab list.
+const TAB_LIST_TARGET_MIN_WIDTH: f32 = 96.0;
+/// The tallest the paste preview grows before it scrolls.
+const PASTE_PREVIEW_MAX_HEIGHT: f32 = 220.0;
+
 /// The background marks of one tab, in the all-tabs list (R7).
 ///
 /// The strip has room for one word, so the list writes the whole story: a chip per kind
@@ -740,7 +761,8 @@ impl ShelluneView {
         let viewport = window.viewport_size();
         let results = self.palette_results();
         let searching = !self.palette_query.trim().is_empty();
-        let width = px(600.0).min(viewport.width - metrics.scale(spacing::LOOSE) * 2.0);
+        let width =
+            px(components::PALETTE_WIDTH).min(viewport.width - metrics.scale(spacing::LOOSE) * 2.0);
         let selected = self.palette_selected.min(results.len().saturating_sub(1));
 
         let mut list = div()
@@ -748,7 +770,11 @@ impl ShelluneView {
             .debug_selector(|| "palette.list".to_owned())
             .flex()
             .flex_col()
-            .max_h(px(380.0).min(viewport.height * 0.6))
+            .max_h(px(PALETTE_LIST_MAX_HEIGHT).min(viewport.height * 0.6))
+            // The list is the part that gives way when the window is short: it
+            // shrinks and scrolls, so the field and the key hints stay on screen.
+            .min_h_0()
+            .flex_shrink()
             .overflow_y_scroll()
             .track_scroll(&self.palette_scroll)
             .px(metrics.scale(spacing::HAIRLINE + 2.0))
@@ -773,7 +799,7 @@ impl ShelluneView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .h(metrics.scale(72.0))
+                    .h(metrics.scale(PALETTE_EMPTY_HEIGHT))
                     .text_size(metrics.label_size())
                     .text_color(theme::swatch(colors::TEXT_MUTED))
                     .debug_selector(|| "palette.empty".to_owned())
@@ -789,15 +815,23 @@ impl ShelluneView {
                 .child(components::kbd(keys, metrics))
                 .child(label)
         };
-        // The palette is a dialog-level layer: the same surface as every dialog, and it
-        // settles into place like one (R6).
-        let panel = components::dialog_surface()
+        // The palette floats like a menu - the popover surface, its radius and the
+        // overlay elevation (ADR-7) - over its own dimming, and settles into place like a
+        // dialog (R6).
+        let panel = components::popover_surface()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .occlude()
             .id("palette")
             .debug_selector(|| "palette".to_owned())
             .absolute()
             .top(viewport.height * 0.12)
             .left((viewport.width - width) / 2.0)
             .w(width)
+            // Never past the window's bottom: at 200% in a short window the field
+            // and the footer are taller, and the list makes the room (R4).
+            .max_h(viewport.height * 0.88 - metrics.scale(spacing::TIGHT))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.palette_key(event, window, cx);
             }))
@@ -819,14 +853,14 @@ impl ShelluneView {
                             .child(field),
                     ),
             )
-            .child(div().h(px(1.0)).bg(theme::swatch(colors::BORDER)))
+            .child(components::form_rule())
             .child(list)
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(metrics.scale(spacing::SNUG))
-                    .h(metrics.scale(30.0))
+                    .h(metrics.compact_control_height())
                     .px(metrics.scale(spacing::SNUG))
                     .border_t_1()
                     .border_color(theme::swatch(colors::BORDER))
@@ -883,7 +917,7 @@ impl ShelluneView {
             .flex_none()
             .items_center()
             .gap(metrics.scale(spacing::TIGHT + 2.0))
-            .h(metrics.scale(38.0))
+            .h(metrics.large_control_height())
             .px(metrics.scale(spacing::TIGHT))
             .rounded(px(radius::MEDIUM))
             .cursor_pointer()
@@ -906,8 +940,7 @@ impl ShelluneView {
                     .flex_none()
                     .items_center()
                     .justify_center()
-                    .w(metrics.scale(24.0))
-                    .h(metrics.scale(24.0))
+                    .size(metrics.scale(components::ICON_TILE))
                     .rounded(px(radius::SMALL))
                     .bg(theme::swatch(if accent {
                         colors::ACCENT_TINT
@@ -934,7 +967,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .flex_none()
-                            .max_w(metrics.scale(260.0))
+                            .max_w(metrics.scale(PALETTE_TITLE_MAX_WIDTH))
                             .truncate()
                             .text_color(theme::swatch(colors::TEXT_PRIMARY))
                             .when(selected, |title| title.font_weight(FontWeight::MEDIUM))
@@ -1070,7 +1103,7 @@ impl ShelluneView {
         let divider = || components::menu_divider(metrics);
         let max_height =
             (viewport.height - metrics.header_height() - metrics.scale(spacing::LOOSE))
-                .max(metrics.scale(120.0));
+                .max(metrics.scale(MENU_MIN_HEIGHT));
         let mut menu = components::menu_card("host.menu", metrics)
             .id("host.menu")
             .max_h(max_height)
@@ -1170,8 +1203,8 @@ impl ShelluneView {
                             .position(clamp_menu(
                                 position,
                                 viewport,
-                                metrics.scale(210.0),
-                                metrics.header_height() + metrics.scale(2.0),
+                                metrics.scale(HOST_MENU_WIDTH),
+                                metrics.header_height() + metrics.scale(spacing::HALF),
                             ))
                             .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
                             .child(
@@ -1299,10 +1332,10 @@ impl ShelluneView {
         // smallest window the last entry still has to be reachable (R4).
         let max_height =
             (viewport.height - metrics.header_height() - metrics.scale(spacing::LOOSE))
-                .max(metrics.scale(120.0));
+                .max(metrics.scale(MENU_MIN_HEIGHT));
         let menu = components::menu_card("tab.menu", metrics)
             .id("tab.menu")
-            .min_w(metrics.scale(220.0))
+            .min_w(metrics.scale(TAB_MENU_MIN_WIDTH))
             .max_h(max_height)
             .overflow_y_scroll()
             .when_some(reconnect, |menu, reconnect| {
@@ -1435,8 +1468,8 @@ impl ShelluneView {
                             .position(clamp_menu(
                                 position,
                                 viewport,
-                                metrics.scale(230.0),
-                                metrics.header_height() + metrics.scale(2.0),
+                                metrics.scale(TAB_MENU_WIDTH),
+                                metrics.header_height() + metrics.scale(spacing::HALF),
                             ))
                             .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
                             .child(
@@ -1502,7 +1535,7 @@ impl ShelluneView {
             .items_center()
             .gap(metrics.scale(spacing::HAIRLINE + 2.0))
             .px(metrics.scale(spacing::TIGHT + 2.0))
-            .py(metrics.scale(2.0))
+            .py(metrics.scale(spacing::HALF))
             .debug_selector(move || format!("{prefix}.accents"));
         let none_selector = format!("{prefix}.accent.none");
         swatches = swatches.child(
@@ -1565,7 +1598,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .flex_none()
-                            .size(metrics.scale(14.0))
+                            .size(metrics.small_icon_size())
                             .rounded(px(radius::SMALL))
                             .bg(theme::tab_accent_color(accent)),
                     ),
@@ -1574,7 +1607,7 @@ impl ShelluneView {
         div()
             .flex()
             .flex_col()
-            .gap(metrics.scale(2.0))
+            .gap(metrics.scale(spacing::HALF))
             .child(
                 div()
                     .px(metrics.scale(spacing::TIGHT + 2.0))
@@ -1930,7 +1963,7 @@ impl ShelluneView {
         let mut rows = div()
             .flex()
             .flex_col()
-            .gap(metrics.scale(2.0))
+            .gap(metrics.scale(spacing::HALF))
             .debug_selector(|| "tabs.list".to_owned());
         for index in 0..count {
             let Some(tab) = self.workspace.layout().tabs().get(index) else {
@@ -2041,7 +2074,7 @@ impl ShelluneView {
                 .gap(metrics.scale(spacing::TIGHT))
                 .min_h(metrics.hit_target())
                 .px(metrics.scale(spacing::TIGHT + 2.0))
-                .py(metrics.scale(2.0))
+                .py(metrics.scale(spacing::HALF))
                 .rounded(px(radius::SMALL))
                 .border_1()
                 .border_color(if current {
@@ -2072,7 +2105,7 @@ impl ShelluneView {
                 .child(
                     div()
                         .flex_1()
-                        .min_w(metrics.scale(120.0))
+                        .min_w(metrics.scale(TAB_LIST_NAME_MIN_WIDTH))
                         .truncate()
                         .text_size(metrics.label_size())
                         .when(current, |name| name.font_weight(FontWeight::MEDIUM))
@@ -2097,7 +2130,7 @@ impl ShelluneView {
                 .child(
                     div()
                         .flex_1()
-                        .min_w(metrics.scale(96.0))
+                        .min_w(metrics.scale(TAB_LIST_TARGET_MIN_WIDTH))
                         .truncate()
                         .font_family(crate::app::terminal::monospace_family())
                         .text_size(metrics.caption_size())
@@ -2187,7 +2220,7 @@ impl ShelluneView {
             .flex()
             .items_center()
             .gap(metrics.scale(spacing::SNUG))
-            .h(metrics.scale(30.0))
+            .h(metrics.compact_control_height())
             .px(metrics.scale(spacing::SNUG))
             .border_t_1()
             .border_color(theme::swatch(colors::BORDER))
@@ -2466,7 +2499,7 @@ impl ShelluneView {
             .debug_selector(|| "terminal.paste.preview".to_owned())
             .w_full()
             .min_w_0()
-            .max_h(px(220.0).min(window.viewport_size().height * 0.4))
+            .max_h(px(PASTE_PREVIEW_MAX_HEIGHT).min(window.viewport_size().height * 0.4))
             .overflow_y_scroll()
             .track_scroll(&self.paste_scroll)
             .rounded(px(radius::MEDIUM))

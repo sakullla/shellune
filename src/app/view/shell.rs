@@ -30,6 +30,12 @@ use crate::app::text_field::TextField;
 use crate::app::theme::{self, ThemeChoice, Tone, palette, radius, spacing};
 use crate::app::workspace::{AttentionKind, SectionState};
 
+/// The least width a saved command's name and preview keep before its actions wrap.
+const SNIPPET_DETAIL_MIN_WIDTH: f32 = 160.0;
+
+/// The widest the card of a connection in flight grows.
+const CONNECTION_CARD_MAX_WIDTH: f32 = 600.0;
+
 /// A tool of a host or session that opens over the page instead of being a page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
@@ -1348,9 +1354,11 @@ impl ShelluneView {
     ) -> (Div, Option<Div>) {
         let metrics = self.metrics();
         let wrapping = badge.is_some();
+        // A dialog's title is the title size (16), not a page heading: the dialog is
+        // a question over the page, and its words are what matter (ADR-1, ADR-7).
         let title = div()
             .min_w_0()
-            .text_size(metrics.heading_size())
+            .text_size(metrics.title_size())
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
             // Whole words, wrapped: a one-line truncate inside the flexible column
@@ -1376,7 +1384,7 @@ impl ShelluneView {
             .gap(metrics.scale(spacing::SNUG))
             .pl(metrics.scale(spacing::LOOSE))
             .pr(metrics.scale(spacing::BASE))
-            .pt(metrics.scale(spacing::SNUG + 2.0))
+            .pt(metrics.scale(spacing::BASE))
             .pb(metrics.scale(spacing::TIGHT))
             .children(lead)
             .child(column)
@@ -1659,7 +1667,7 @@ impl ShelluneView {
                         .flex_col()
                         .flex_none()
                         .w_full()
-                        .max_w(metrics.scale(600.0))
+                        .max_w(metrics.scale(CONNECTION_CARD_MAX_WIDTH))
                         .rounded(px(radius::XLARGE))
                         .bg(theme::swatch(palette::SURFACE))
                         .border_1()
@@ -2528,8 +2536,8 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_1()
-            .min_w(metrics.scale(160.0))
-            .gap(px(1.0))
+            .min_w(metrics.scale(SNIPPET_DETAIL_MIN_WIDTH))
+            .gap(px(components::HAIRLINE_WIDTH))
             .child(
                 div()
                     .truncate()
@@ -2684,48 +2692,27 @@ impl ShelluneView {
                 )
                 .debug_selector(|| "snippet.editor.title".to_owned()),
             )
-            .child(
+            .child(components::form_field(
+                ux.snippet_field_name,
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .child(
-                        div()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                            .child(ux.snippet_field_name),
-                    )
-                    .child(
-                        div()
-                            .h(metrics.control_height())
-                            .debug_selector(|| "snippet.editor.name".to_owned())
-                            .child(editor.name.clone()),
-                    ),
-            )
-            .child(
+                    .h(metrics.control_height())
+                    .debug_selector(|| "snippet.editor.name".to_owned())
+                    .child(editor.name.clone()),
+                1.0,
+                components::FORM_FIELD_MIN_WIDTH,
+                metrics,
+            ))
+            .child(components::form_field(
+                ux.snippet_field_body,
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .child(
-                        div()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                            .child(ux.snippet_field_body),
-                    )
-                    .child(
-                        div()
-                            .h(metrics.control_height())
-                            .debug_selector(|| "snippet.editor.body".to_owned())
-                            .child(editor.body.clone()),
-                    ),
-            )
-            .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(ux.snippet_editor_keys),
-            )
+                    .h(metrics.control_height())
+                    .debug_selector(|| "snippet.editor.body".to_owned())
+                    .child(editor.body.clone()),
+                1.0,
+                components::FORM_FIELD_MIN_WIDTH,
+                metrics,
+            ))
+            .child(components::form_hint(ux.snippet_editor_keys, metrics))
             // A draft that is already too long says so while it is being written: an empty
             // name or body is not reported before anything is typed, because a new command
             // starts empty on purpose.

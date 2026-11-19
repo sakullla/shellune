@@ -33,6 +33,29 @@ use crate::app::theme::{self, Metrics, Tone, palette, radius, spacing};
 /// list; the dialog falls back to the viewport minus its margin at 720 pixels.
 const BATCH_DIALOG_WIDTH: f32 = 880.0;
 
+/// The tallest the saved tasks and the stored runs grow before they scroll.
+const LIST_MAX_HEIGHT: f32 = 320.0;
+/// The tallest the hosts of a stored run grow before they scroll.
+const HOSTS_MAX_HEIGHT: f32 = 160.0;
+/// The height of a stored run's output.
+const OUTPUT_HEIGHT: f32 = 140.0;
+/// The tallest the targets of the editor grow before they scroll.
+const TARGETS_MAX_HEIGHT: f32 = 140.0;
+/// The width of a step's number before its command.
+const STEP_NUMBER_WIDTH: f32 = 20.0;
+/// The width of the hosts-at-once field.
+const CONCURRENCY_WIDTH: f32 = 72.0;
+/// The least width of the task name field.
+const NAME_MIN_WIDTH: f32 = 160.0;
+/// The least width of the running hosts column before the output moves under it.
+const RUN_HOSTS_MIN_WIDTH: f32 = 320.0;
+/// The tallest the running hosts column grows before it scrolls.
+const RUN_HOSTS_MAX_HEIGHT: f32 = 300.0;
+/// The least width of the output column of a run.
+const RUN_SIDE_MIN_WIDTH: f32 = 300.0;
+/// The height of a running host's output.
+const RUN_OUTPUT_HEIGHT: f32 = 170.0;
+
 /// How many host rows a run page lists before it counts the rest.
 ///
 /// A task can hold thousands of hosts. The count above the list is exact, so a row that
@@ -841,7 +864,7 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .gap(metrics.scale(spacing::HAIRLINE))
-            .max_h(metrics.scale(320.0))
+            .max_h(metrics.scale(LIST_MAX_HEIGHT))
             .overflow_y_scroll()
             .debug_selector(|| "batch.library.rows".to_owned());
         for (index, task) in tasks.iter().take(MAX_LIBRARY_ROWS).enumerate() {
@@ -859,48 +882,35 @@ impl ShelluneView {
                     .child(library_more_line(ux, hidden)),
             );
         }
-        let footer = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .flex_wrap()
-            .gap(metrics.scale(spacing::TIGHT))
-            .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::SNUG))
-            .border_t_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .debug_selector(|| "batch.library.note".to_owned())
-                    .child(ux.batch_no_rollback),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .flex_none()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        components::compact_button(ux.batch_library_new, Variant::Primary, metrics)
-                            .id("batch.library.new")
-                            .debug_selector(|| "batch.library.new".to_owned())
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.open_batch_preview(cx);
-                            })),
-                    )
-                    .child(
-                        components::compact_button(ux.batch_close, Variant::Ghost, metrics)
-                            .id("batch.library.dismiss")
-                            .debug_selector(|| "batch.library.dismiss".to_owned())
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.dismiss_batch(cx);
-                            })),
-                    ),
-            );
+        let footer = components::modal_footer_noted(
+            div()
+                .debug_selector(|| "batch.library.note".to_owned())
+                .child(ux.batch_no_rollback),
+            div()
+                .flex()
+                .items_center()
+                .flex_wrap()
+                .flex_none()
+                .gap(metrics.scale(spacing::TIGHT))
+                // The primary action is the last one, at the right edge (ADR-7).
+                .child(
+                    components::compact_button(ux.batch_close, Variant::Ghost, metrics)
+                        .id("batch.library.dismiss")
+                        .debug_selector(|| "batch.library.dismiss".to_owned())
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.dismiss_batch(cx);
+                        })),
+                )
+                .child(
+                    components::compact_button(ux.batch_library_new, Variant::Primary, metrics)
+                        .id("batch.library.new")
+                        .debug_selector(|| "batch.library.new".to_owned())
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.open_batch_preview(cx);
+                        })),
+                ),
+            metrics,
+        );
         self.modal(
             window,
             "batch.library",
@@ -935,7 +945,7 @@ impl ShelluneView {
             ],
         );
         let asking = self.batch.delete_asked() == Some(id);
-        let mut row = components::row_with_state(
+        let mut row = components::list_row_frame(
             if selected {
                 components::ControlState::Selected
             } else {
@@ -1111,57 +1121,41 @@ impl ShelluneView {
             }
             _ => self.batch_history_list(cx),
         });
-        let footer = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .flex_wrap()
-            .gap(metrics.scale(spacing::TIGHT))
-            .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::SNUG))
-            .border_t_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .debug_selector(|| "batch.history.note".to_owned())
-                    .child(ux.batch_no_rollback),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .flex_none()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .children(self.batch.stored_open().map(|_| {
-                        components::compact_button(
-                            ux.batch_diagnostics_copy,
-                            Variant::Secondary,
-                            metrics,
-                        )
-                        .id("batch.history.diagnostics")
-                        .debug_selector(|| "batch.history.diagnostics".to_owned())
-                        .on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                let Some(run) = this.batch.stored_summary().cloned() else {
-                                    return;
-                                };
-                                this.copy_batch_diagnostics(&run, cx);
-                            },
-                        ))
+        let footer = components::modal_footer_noted(
+            div()
+                .debug_selector(|| "batch.history.note".to_owned())
+                .child(ux.batch_no_rollback),
+            div()
+                .flex()
+                .items_center()
+                .flex_wrap()
+                .flex_none()
+                .gap(metrics.scale(spacing::TIGHT))
+                .children(self.batch.stored_open().map(|_| {
+                    components::compact_button(
+                        ux.batch_diagnostics_copy,
+                        Variant::Secondary,
+                        metrics,
+                    )
+                    .id("batch.history.diagnostics")
+                    .debug_selector(|| "batch.history.diagnostics".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        let Some(run) = this.batch.stored_summary().cloned() else {
+                            return;
+                        };
+                        this.copy_batch_diagnostics(&run, cx);
                     }))
-                    .child(
-                        components::compact_button(ux.batch_close, Variant::Ghost, metrics)
-                            .id("batch.history.dismiss")
-                            .debug_selector(|| "batch.history.dismiss".to_owned())
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.dismiss_batch(cx);
-                            })),
-                    ),
-            );
+                }))
+                .child(
+                    components::compact_button(ux.batch_close, Variant::Ghost, metrics)
+                        .id("batch.history.dismiss")
+                        .debug_selector(|| "batch.history.dismiss".to_owned())
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.dismiss_batch(cx);
+                        })),
+                ),
+            metrics,
+        );
         self.modal(
             window,
             "batch.history",
@@ -1242,7 +1236,7 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .gap(metrics.scale(spacing::HAIRLINE))
-            .max_h(metrics.scale(320.0))
+            .max_h(metrics.scale(LIST_MAX_HEIGHT))
             .overflow_y_scroll()
             .debug_selector(|| "batch.history.rows".to_owned());
         for (index, entry) in entries.iter().take(MAX_HISTORY_ROWS).enumerate() {
@@ -1278,7 +1272,7 @@ impl ShelluneView {
         let ux = copy::ux();
         let metrics = self.metrics();
         let selected = self.batch.history_selected() == index;
-        let mut row = components::row_with_state(
+        let mut row = components::list_row_frame(
             if selected {
                 components::ControlState::Selected
             } else {
@@ -1485,7 +1479,7 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .gap(metrics.scale(spacing::HAIRLINE))
-            .max_h(metrics.scale(160.0))
+            .max_h(metrics.scale(HOSTS_MAX_HEIGHT))
             .overflow_y_scroll()
             .debug_selector(|| "batch.history.hosts".to_owned());
         for (index, host) in run.hosts().iter().take(MAX_HISTORY_HOSTS).enumerate() {
@@ -1512,50 +1506,50 @@ impl ShelluneView {
                     metrics,
                 ));
             }
-            let mut row = div()
-                .id(SharedString::from(format!("batch.history.host.{index}")))
-                .flex()
-                .flex_col()
-                .gap(metrics.scale(spacing::HAIRLINE))
-                .p(metrics.scale(spacing::TIGHT))
-                .rounded(px(radius::MEDIUM))
-                .cursor_pointer()
-                .bg(if selected == Some(host_id) {
-                    theme::swatch(palette::SURFACE_SELECTED)
+            let mut row = components::list_row_frame(
+                if selected == Some(host_id) {
+                    components::ControlState::Selected
                 } else {
-                    theme::swatch(palette::SURFACE)
-                })
-                .debug_selector(move || format!("batch.history.host.{index}"))
-                .on_click(cx.listener(move |this, _event, _window, cx| {
-                    this.select_stored_host(host_id, cx);
-                }))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .flex_wrap()
-                        .gap(metrics.scale(spacing::TIGHT))
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(metrics.label_size())
-                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                .child(SharedString::from(host.target().label().to_owned())),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .child(SharedString::from(host.target().destination())),
-                        )
-                        .child(components::chip(
-                            host_state_text(host.state(), ux),
-                            host_state_tone(host.state()),
-                            metrics,
-                        )),
-                )
-                .child(steps);
+                    components::ControlState::Resting
+                },
+                metrics,
+            )
+            .flex_col()
+            .items_start()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .id(SharedString::from(format!("batch.history.host.{index}")))
+            .cursor_pointer()
+            .debug_selector(move || format!("batch.history.host.{index}"))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.select_stored_host(host_id, cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(metrics.label_size())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(host.target().label().to_owned())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(SharedString::from(host.target().destination())),
+                    )
+                    .child(components::chip(
+                        host_state_text(host.state(), ux),
+                        host_state_tone(host.state()),
+                        metrics,
+                    )),
+            )
+            .child(steps);
             if let Some(reason) = host.detail() {
                 row = row.child(
                     div()
@@ -1603,7 +1597,7 @@ impl ShelluneView {
             .id("batch.history.output")
             .flex()
             .flex_col()
-            .h(metrics.scale(140.0))
+            .h(metrics.scale(OUTPUT_HEIGHT))
             .overflow_y_scroll()
             .gap(metrics.scale(spacing::HAIRLINE))
             .p(metrics.scale(spacing::TIGHT))
@@ -1804,76 +1798,57 @@ impl ShelluneView {
                     .child(SharedString::from(problem.to_owned())),
             );
         }
-        let footer = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(metrics.scale(spacing::TIGHT))
-            .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::SNUG))
-            .border_t_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .debug_selector(|| "batch.footer.note".to_owned())
-                    .child(ux.batch_no_rollback),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_none()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        // Saving is the other half of the editor: it writes the
-                        // definition and starts nothing, which is what makes a task
-                        // reusable after a restart (R12).
-                        components::compact_button(
-                            ux.batch_save_draft,
-                            Variant::Secondary,
-                            metrics,
-                        )
+        let footer = components::modal_footer_noted(
+            div()
+                .debug_selector(|| "batch.footer.note".to_owned())
+                .child(ux.batch_no_rollback),
+            div()
+                .flex()
+                .items_center()
+                .flex_none()
+                .gap(metrics.scale(spacing::TIGHT))
+                .child(
+                    // Saving is the other half of the editor: it writes the
+                    // definition and starts nothing, which is what makes a task
+                    // reusable after a restart (R12).
+                    components::compact_button(ux.batch_save_draft, Variant::Secondary, metrics)
                         .id("batch.preview.save")
                         .debug_selector(|| "batch.preview.save".to_owned())
-                        .on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                this.save_batch_draft(cx);
-                            },
-                        )),
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.save_batch_draft(cx);
+                        })),
+                )
+                .child(
+                    components::compact_button(ux.batch_cancel, Variant::Ghost, metrics)
+                        .id("batch.preview.cancel")
+                        .debug_selector(|| "batch.preview.cancel".to_owned())
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.close_batch(cx);
+                        })),
+                )
+                .child(if let Some(refusal) = self.batch.second_run_refusal() {
+                    // A second run would replace the page of the one already going,
+                    // so the button is drawn unable to answer instead of answering
+                    // with a refusal after the click (R13).
+                    components::button_with_state(
+                        ux.batch_confirm,
+                        Variant::Primary,
+                        components::ControlState::Disabled,
+                        metrics,
                     )
-                    .child(
-                        components::compact_button(ux.batch_cancel, Variant::Ghost, metrics)
-                            .id("batch.preview.cancel")
-                            .debug_selector(|| "batch.preview.cancel".to_owned())
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.close_batch(cx);
-                            })),
-                    )
-                    .child(if let Some(refusal) = self.batch.second_run_refusal() {
-                        // A second run would replace the page of the one already going,
-                        // so the button is drawn unable to answer instead of answering
-                        // with a refusal after the click (R13).
-                        components::button_with_state(
-                            ux.batch_confirm,
-                            Variant::Primary,
-                            components::ControlState::Disabled,
-                            metrics,
-                        )
+                    .id("batch.preview.confirm")
+                    .debug_selector(|| "batch.preview.confirm".to_owned())
+                    .tooltip(components::tooltip(SharedString::from(refusal.to_string())))
+                } else {
+                    components::button(ux.batch_confirm, Variant::Primary, metrics)
                         .id("batch.preview.confirm")
                         .debug_selector(|| "batch.preview.confirm".to_owned())
-                        .tooltip(components::tooltip(SharedString::from(refusal.to_string())))
-                    } else {
-                        components::button(ux.batch_confirm, Variant::Primary, metrics)
-                            .id("batch.preview.confirm")
-                            .debug_selector(|| "batch.preview.confirm".to_owned())
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.confirm_batch(cx);
-                            }))
-                    }),
-            );
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.confirm_batch(cx);
+                        }))
+                }),
+            metrics,
+        );
         self.modal(
             window,
             "batch.dialog",
@@ -1965,7 +1940,7 @@ impl ShelluneView {
             .id("batch.targets.rows")
             .flex()
             .flex_col()
-            .max_h(metrics.scale(140.0))
+            .max_h(metrics.scale(TARGETS_MAX_HEIGHT))
             .overflow_y_scroll()
             .gap(metrics.scale(spacing::HAIRLINE))
             .debug_selector(|| "batch.targets.rows".to_owned());
@@ -2018,7 +1993,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .flex_none()
-                            .w(metrics.scale(20.0))
+                            .w(metrics.scale(STEP_NUMBER_WIDTH))
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_MUTED))
                             .child(SharedString::from(number)),
@@ -2144,58 +2119,49 @@ impl ShelluneView {
                     .child(components::section_label(ux.batch_failure, metrics))
                     .child(policies),
             )
+            // The two numbers of the run sit side by side as one row of the form grid
+            // and stack in a narrow dialog (ADR-7).
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(ux.batch_concurrency),
-                    )
-                    .children(concurrency.map(|field| {
+                components::form_row(metrics)
+                    .child(components::form_field(
+                        ux.batch_concurrency,
                         div()
                             .flex()
-                            .w(metrics.scale(72.0))
-                            .debug_selector(|| "batch.concurrency".to_owned())
-                            .child(field)
-                    }))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(copy::fill(
-                                ux.batch_concurrency_hint,
-                                &[("max", &shellune_core::MAX_BATCH_CONCURRENCY.to_string())],
+                            .items_center()
+                            .flex_wrap()
+                            .gap(metrics.scale(spacing::TIGHT))
+                            .children(concurrency.map(|field| {
+                                div()
+                                    .flex()
+                                    .w(metrics.scale(CONCURRENCY_WIDTH))
+                                    .debug_selector(|| "batch.concurrency".to_owned())
+                                    .child(field)
+                            }))
+                            .child(components::form_hint(
+                                copy::fill(
+                                    ux.batch_concurrency_hint,
+                                    &[("max", &shellune_core::MAX_BATCH_CONCURRENCY.to_string())],
+                                ),
+                                metrics,
                             )),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(ux.batch_name),
-                    )
-                    .children(name.map(|field| {
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_w(metrics.scale(160.0))
-                            .debug_selector(|| "batch.name".to_owned())
-                            .child(field)
-                    })),
+                        0.4,
+                        components::FORM_FIELD_MIN_WIDTH,
+                        metrics,
+                    ))
+                    .child(components::form_field(
+                        ux.batch_name,
+                        div().flex().w_full().children(name.map(|field| {
+                            div()
+                                .flex()
+                                .flex_1()
+                                .min_w(metrics.scale(NAME_MIN_WIDTH))
+                                .debug_selector(|| "batch.name".to_owned())
+                                .child(field)
+                        })),
+                        0.6,
+                        components::FORM_FIELD_MIN_WIDTH,
+                        metrics,
+                    )),
             )
     }
 
@@ -2249,25 +2215,13 @@ impl ShelluneView {
                 .child(self.batch_run_hosts(page, cx))
                 .child(self.batch_run_side(page)),
         );
-        let footer = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .flex_wrap()
-            .gap(metrics.scale(spacing::TIGHT))
-            .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::SNUG))
-            .border_t_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .debug_selector(|| "batch.run.note".to_owned())
-                    .child(ux.batch_no_rollback),
-            )
-            .child(self.batch_run_controls(page, cx));
+        let footer = components::modal_footer_noted(
+            div()
+                .debug_selector(|| "batch.run.note".to_owned())
+                .child(ux.batch_no_rollback),
+            self.batch_run_controls(page, cx),
+            metrics,
+        );
         self.modal(
             window,
             "batch.run",
@@ -2466,8 +2420,8 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_1()
-            .min_w(metrics.scale(320.0))
-            .max_h(metrics.scale(300.0))
+            .min_w(metrics.scale(RUN_HOSTS_MIN_WIDTH))
+            .max_h(metrics.scale(RUN_HOSTS_MAX_HEIGHT))
             .overflow_y_scroll()
             .gap(metrics.scale(spacing::HAIRLINE))
             .debug_selector(|| "batch.run.hosts".to_owned());
@@ -2502,65 +2456,67 @@ impl ShelluneView {
                 .detail()
                 .map(str::to_owned)
                 .or_else(|| question.map(|question| question.text(ux)));
-            let mut row = div()
-                .id(SharedString::from(format!("batch.run.host.{index}")))
-                .flex()
-                .flex_col()
-                .gap(metrics.scale(spacing::HAIRLINE))
-                .p(metrics.scale(spacing::TIGHT))
-                .rounded(px(radius::MEDIUM))
-                .bg(if is_selected {
-                    theme::swatch(palette::SURFACE_SELECTED)
+            // A flat list row (ADR-7): the chosen host has the selected fill and the
+            // accent bar, the others light under the pointer.
+            let mut row = components::list_row_frame(
+                if is_selected {
+                    components::ControlState::Selected
                 } else {
-                    theme::swatch(palette::SURFACE)
-                })
-                .cursor_pointer()
-                .debug_selector(move || format!("batch.run.host.{index}"))
-                .on_click(cx.listener(move |this, _event, _window, cx| {
-                    this.batch.select_host(id);
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .flex_wrap()
-                        .gap(metrics.scale(spacing::TIGHT))
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(metrics.label_size())
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                .child(SharedString::from(host.target().label().to_owned())),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .child(SharedString::from(host.target().destination())),
-                        )
-                        .child(components::chip(
-                            host_state_text(host.state(), ux),
-                            tone,
+                    components::ControlState::Resting
+                },
+                metrics,
+            )
+            .flex_col()
+            .items_start()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .id(SharedString::from(format!("batch.run.host.{index}")))
+            .cursor_pointer()
+            .debug_selector(move || format!("batch.run.host.{index}"))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.batch.select_host(id);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(metrics.label_size())
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(host.target().label().to_owned())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(SharedString::from(host.target().destination())),
+                    )
+                    .child(components::chip(
+                        host_state_text(host.state(), ux),
+                        tone,
+                        metrics,
+                    ))
+                    .when(host.target().starts_at() > 0, |row| {
+                        row.child(components::chip(
+                            copy::fill(
+                                ux.batch_from_step,
+                                &[(
+                                    "step",
+                                    &(host.target().starts_at() as usize + 1).to_string(),
+                                )],
+                            ),
+                            Tone::Neutral,
                             metrics,
                         ))
-                        .when(host.target().starts_at() > 0, |row| {
-                            row.child(components::chip(
-                                copy::fill(
-                                    ux.batch_from_step,
-                                    &[(
-                                        "step",
-                                        &(host.target().starts_at() as usize + 1).to_string(),
-                                    )],
-                                ),
-                                Tone::Neutral,
-                                metrics,
-                            ))
-                        }),
-                )
-                .child(steps);
+                    }),
+            )
+            .child(steps);
             if let Some(reason) = reason {
                 row = row.child(
                     div()
@@ -2644,7 +2600,7 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_1()
-            .min_w(metrics.scale(300.0))
+            .min_w(metrics.scale(RUN_SIDE_MIN_WIDTH))
             .gap(metrics.scale(spacing::TIGHT))
             .debug_selector(|| "batch.run.side".to_owned())
             .child(components::section_label(ux.batch_run_output, metrics));
@@ -2655,7 +2611,7 @@ impl ShelluneView {
             .id("batch.run.output")
             .flex()
             .flex_col()
-            .h(metrics.scale(170.0))
+            .h(metrics.scale(RUN_OUTPUT_HEIGHT))
             .overflow_y_scroll()
             .gap(metrics.scale(spacing::HAIRLINE))
             .p(metrics.scale(spacing::TIGHT))

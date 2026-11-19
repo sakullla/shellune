@@ -17663,7 +17663,8 @@ async fn the_jump_picker_scrolls_itself_into_the_smallest_dialog(cx: &mut TestAp
         item.origin.y >= body.origin.y - px(0.5)
             && item.origin.y + item.size.height <= body.origin.y + body.size.height + px(0.5)
     };
-    for _ in 0..80 {
+    // The form is titled groups now (T8), so at 200% the button is further down.
+    for _ in 0..200 {
         if inside(cx, "hosts.jump.add") {
             break;
         }
@@ -22910,6 +22911,7 @@ async fn the_host_dialog_saves_the_chosen_x11_mode(cx: &mut TestAppContext) {
         cx.debug_bounds("hosts.editor.x11").is_some(),
         "the X11 mode is part of the host form"
     );
+    scroll_into_view(cx, "hosts.editor.body", "hosts.editor.x11.restricted");
     click(cx, "hosts.editor.x11.restricted");
     assert!(
         cx.debug_bounds("hosts.editor.x11.warning").is_none(),
@@ -36144,6 +36146,12 @@ async fn a_delete_question_keeps_every_key_but_escape(cx: &mut TestAppContext) {
     );
     let (view, cx) = hosts_view_with_trust(cx, &dir);
     cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    // The language shortcut this platform binds: Ctrl+L on Windows and Linux, Cmd+L on
+    // macOS, where Ctrl+L is no shortcut at all and the last step could not pass.
+    let language = Keymap::defaults(Platform::current())
+        .keystroke("language.toggle")
+        .expect("the language has a default shortcut")
+        .to_owned();
     type_into(cx, "hosts.search", "db");
     let search = |cx: &mut VisualTestContext| {
         cx.update(|_window, app| view.read(app).hosts_state().search().to_owned())
@@ -36165,7 +36173,7 @@ async fn a_delete_question_keeps_every_key_but_escape(cx: &mut TestAppContext) {
     // them are spent on the question, which stays open (R5).
     cx.simulate_keystrokes("enter");
     cx.simulate_keystrokes("x");
-    cx.simulate_keystrokes("ctrl-l");
+    cx.simulate_keystrokes(&language);
     cx.run_until_parked();
     assert!(
         cx.update(|_window, app| view.read(app).remote_state().is_none()),
@@ -36199,7 +36207,7 @@ async fn a_delete_question_keeps_every_key_but_escape(cx: &mut TestAppContext) {
         cx.update(|_window, app| view.read(app).book().hosts().len()),
         2
     );
-    cx.simulate_keystrokes("ctrl-l");
+    cx.simulate_keystrokes(&language);
     cx.run_until_parked();
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().locale()),
@@ -37268,5 +37276,258 @@ async fn a_system_that_does_not_answer_holds_the_start_back_only_so_long(cx: &mu
         cx.update(|_window, app| view.read(app).effective_motion()),
         Motion::Reduced,
         "the answer that came late is still taken"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Settings, dialogs, menus, the palette and the batch centre on the v2 visual (ADR-7)
+// ---------------------------------------------------------------------------
+
+/// The palette is 560 wide in a window that has the room, and its results carry the
+/// shortcut in force as a keycap (ADR-7).
+#[gpui::test]
+async fn the_palette_is_560_wide_and_its_results_name_their_keys(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    go(cx, crate::app::actions::OpenPalette);
+    let palette = bounds_of(cx, "palette");
+    assert!(
+        (palette.size.width - px(crate::app::components::PALETTE_WIDTH)).abs() <= px(0.5),
+        "the palette is {:?} wide",
+        palette.size.width
+    );
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    let centre = palette.origin.x + palette.size.width / 2.0;
+    assert!(
+        (centre - viewport.width / 2.0).abs() <= px(1.0),
+        "the palette is centred: {palette:?} in {viewport:?}"
+    );
+    // A result with a binding in force names it.
+    let title = crate::app::nav::Destination::Settings
+        .label(cx.update(|_window, app| view.read(app).workspace().strings()))
+        .to_owned();
+    let settings = cx.update(|_window, app| view.read(app).palette_shortcut(&title));
+    assert!(settings.is_some(), "the settings result names its shortcut");
+    // Each result is one large control high, inside the palette.
+    let first = bounds_of(cx, "palette.item.0");
+    let metrics = cx.update(|_window, app| view.read(app).workspace().metrics());
+    assert!((first.size.height - metrics.large_control_height()).abs() <= px(0.5));
+    assert!(first.left() >= palette.left() && first.right() <= palette.right());
+}
+
+/// A menu entry is one compact control high (28), in the shared floating card (ADR-7).
+#[gpui::test]
+async fn a_menu_entry_is_one_compact_control_high(cx: &mut TestAppContext) {
+    let dir = TempDir::new("menu-entry-height");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let (view, cx) = hosts_view(cx, dir.store());
+    right_click(cx, "hosts.row.0");
+    let metrics = cx.update(|_window, app| view.read(app).workspace().metrics());
+    for entry in ["host.menu.connect", "host.menu.edit", "host.menu.delete"] {
+        let bounds = bounds_of(cx, entry);
+        assert!(
+            (bounds.size.height - metrics.compact_control_height()).abs() <= px(0.5),
+            "{entry} is {:?} high, not a compact control",
+            bounds.size.height
+        );
+    }
+}
+
+/// The host dialog's form is a two-column grid that becomes one column when the
+/// dialog is narrow: the address and its port side by side in a wide window, under
+/// each other at 720x480 and 200%, and neither field squeezed below its floor (ADR-7).
+#[gpui::test]
+async fn the_host_form_is_two_columns_wide_and_one_column_narrow(cx: &mut TestAppContext) {
+    let (view, cx, _dir) = dialog_view(cx, Vec::new());
+    click(cx, "hosts.new");
+    let address = bounds_of(cx, "hosts.field.address");
+    let port = bounds_of(cx, "hosts.field.port");
+    assert!(
+        (address.top() - port.top()).abs() <= px(0.5) && port.left() > address.right(),
+        "the port sits beside the address in a wide dialog: {address:?} {port:?}"
+    );
+    assert!(
+        address.size.width > port.size.width,
+        "the address takes the larger share"
+    );
+    let name = bounds_of(cx, "hosts.field.name");
+    let group = bounds_of(cx, "hosts.field.group");
+    assert!(
+        (name.top() - group.top()).abs() <= px(0.5),
+        "the name and the group share a row"
+    );
+
+    cx.simulate_resize(minimum_window());
+    largest_text_size(&view, cx);
+    let dialog = bounds_of(cx, "hosts.editor");
+    let address = bounds_of(cx, "hosts.field.address");
+    let port = bounds_of(cx, "hosts.field.port");
+    assert!(
+        port.top() >= address.bottom() - px(0.5),
+        "the port moves under the address in a narrow dialog: {address:?} {port:?}"
+    );
+    for (field, bounds) in [("address", address), ("port", port)] {
+        assert!(
+            bounds.left() >= dialog.left() - px(0.5) && bounds.right() <= dialog.right() + px(0.5),
+            "the {field} field stays inside the dialog: {bounds:?} in {dialog:?}"
+        );
+    }
+    // The folded part stays folded: one line under the form, its body not drawn.
+    assert!(cx.debug_bounds("hosts.advanced").is_some());
+    assert!(cx.debug_bounds("hosts.advanced.body").is_none());
+}
+
+/// The host form is titled groups, one under the other: where and who, then how to
+/// sign in, then the folded advanced part, which opens as one group per subject -
+/// the route, the startup command, transfers, X11 and keepalive - each holding its
+/// own fields (ADR-7, T8).
+#[gpui::test]
+async fn the_host_form_is_titled_groups_and_advanced_opens_one_group_per_subject(
+    cx: &mut TestAppContext,
+) {
+    let (_view, cx, _dir) = dialog_view(cx, Vec::new());
+    click(cx, "hosts.new");
+    let inside = |outer: gpui::Bounds<Pixels>, inner: gpui::Bounds<Pixels>| {
+        inner.left() >= outer.left() - px(0.5)
+            && inner.right() <= outer.right() + px(0.5)
+            && inner.top() >= outer.top() - px(0.5)
+            && inner.bottom() <= outer.bottom() + px(0.5)
+    };
+    let basic = bounds_of(cx, "hosts.group.basic");
+    for field in [
+        "hosts.field.address",
+        "hosts.field.port",
+        "hosts.field.user",
+        "hosts.field.name",
+        "hosts.field.group",
+    ] {
+        assert!(
+            inside(basic, bounds_of(cx, field)),
+            "{field} is a basic field"
+        );
+    }
+    let auth = bounds_of(cx, "hosts.group.auth");
+    assert!(auth.top() >= basic.bottom(), "sign-in follows the basics");
+    assert!(inside(auth, bounds_of(cx, "hosts.auth")));
+    let toggle = bounds_of(cx, "hosts.advanced");
+    assert!(
+        toggle.top() >= auth.bottom(),
+        "the advanced line follows sign-in"
+    );
+    assert!(
+        cx.debug_bounds("hosts.group.route").is_none(),
+        "the advanced groups are folded away at first"
+    );
+
+    scroll_into_view(cx, "hosts.editor.body", "hosts.advanced");
+    click(cx, "hosts.advanced");
+    let mut above = bounds_of(cx, "hosts.advanced");
+    for (group, holds) in [
+        ("hosts.group.route", "hosts.jump"),
+        ("hosts.group.startup", "hosts.field.startup"),
+        ("hosts.group.transfer", "hosts.editor.protocol"),
+        ("hosts.group.x11", "hosts.editor.x11"),
+        ("hosts.group.keepalive", "hosts.editor.connection"),
+    ] {
+        let bounds = bounds_of(cx, group);
+        assert!(
+            bounds.top() >= above.bottom(),
+            "{group} is under the one before it"
+        );
+        assert!(
+            inside(bounds, bounds_of(cx, holds)),
+            "{group} holds {holds}"
+        );
+        above = bounds;
+    }
+}
+
+/// The settings navigation is a column of navigation entries a control high, the
+/// chosen one ringed only for the keyboard, and the page heading is the heading size
+/// (ADR-7).
+#[gpui::test]
+async fn the_settings_navigation_is_a_column_of_entries_beside_the_cards(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    click(cx, "nav.settings");
+    let metrics = cx.update(|_window, app| view.read(app).workspace().metrics());
+    let nav = bounds_of(cx, "settings.nav");
+    let mut above: Option<gpui::Bounds<Pixels>> = None;
+    for category in [
+        "settings.category.appearance",
+        "settings.category.terminal",
+        "settings.category.connection",
+        "settings.category.keys",
+        "settings.category.about",
+    ] {
+        let bounds = bounds_of(cx, category);
+        assert!(
+            bounds.size.height + px(0.5) >= metrics.control_height(),
+            "{category} is a control high"
+        );
+        assert!(bounds.left() >= nav.left() && bounds.right() <= nav.right() + px(0.5));
+        if let Some(above) = above {
+            assert!(
+                bounds.top() >= above.top(),
+                "{category} is under the one before it"
+            );
+        }
+        above = Some(bounds);
+    }
+    // The page of the chosen category is beside the column, not under it.
+    let card = bounds_of(cx, "settings.card.theme");
+    assert!(
+        card.left() > nav.right(),
+        "the cards stand beside the navigation"
+    );
+    // The pages of the open category are listed under it, indented to its words.
+    let category = bounds_of(cx, "settings.category.appearance");
+    let item = bounds_of(cx, "settings.item.language");
+    assert!(item.top() >= category.bottom() - px(0.5));
+}
+
+/// A batch dialog's actions stay at its right edge, the primary one last, when its
+/// note takes the room beside them and they move to a line of their own (ADR-7).
+#[gpui::test]
+async fn the_batch_actions_stay_on_the_right_of_their_footer(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-footer");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+    preview_batch(cx, &view, 2);
+    write_commands(cx, &["uptime"]);
+    let dialog = bounds_of(cx, "batch.dialog");
+    let confirm = bounds_of(cx, "batch.preview.confirm");
+    let cancel = bounds_of(cx, "batch.preview.cancel");
+    let note = bounds_of(cx, "batch.footer.note");
+    let metrics = cx.update(|_window, app| view.read(app).workspace().metrics());
+    let pad = metrics.scale(theme::spacing::LOOSE);
+    assert!(
+        (dialog.right() - pad - confirm.right()).abs() <= px(1.0),
+        "the primary action is at the right edge: {confirm:?} in {dialog:?}"
+    );
+    assert!(
+        cancel.right() <= confirm.left(),
+        "cancel is left of the primary action"
+    );
+    assert!(note.left() < cancel.left(), "the note is at the left");
+
+    // In the smallest window at the largest text the actions wrap under the note and
+    // still end at the right edge.
+    cx.simulate_resize(minimum_window());
+    largest_text_size(&view, cx);
+    let dialog = bounds_of(cx, "batch.dialog");
+    let confirm = bounds_of(cx, "batch.preview.confirm");
+    let pad = cx
+        .update(|_window, app| view.read(app).workspace().metrics())
+        .scale(theme::spacing::LOOSE);
+    assert!(
+        (dialog.right() - pad - confirm.right()).abs() <= px(1.0),
+        "the primary action stays at the right edge when the footer wraps: {confirm:?} in {dialog:?}"
     );
 }

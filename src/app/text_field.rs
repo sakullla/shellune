@@ -32,7 +32,7 @@ use crate::app::components;
 use crate::app::copy::Locale;
 use crate::app::icons::{self, Icon};
 use crate::app::nav::Platform;
-use crate::app::theme::{self, Metrics, palette, radius, spacing};
+use crate::app::theme::{self, palette, radius, spacing};
 
 /// The character drawn in place of a masked character.
 const MASK: char = '•';
@@ -952,7 +952,9 @@ impl TextField {
     /// The right-click menu: cut, copy, paste and select all.
     fn menu(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let position = self.menu?;
-        let metrics = Metrics::default();
+        // The window's zoom, like every other control: a field's words, placeholder
+        // included, grow with the text around it (T4 review P3).
+        let metrics = theme::metrics();
         let strings = Locale::current().strings();
         let viewport = window.viewport_size();
         let has_selection = !self.model.selection().is_empty();
@@ -1062,7 +1064,9 @@ impl TextField {
 
 impl Render for TextField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let metrics = Metrics::default();
+        // The window's zoom, like every other control: a field's words, placeholder
+        // included, grow with the text around it (T4 review P3).
+        let metrics = theme::metrics();
         let focused = self.focus.is_focused(window);
         let accent = theme::swatch(palette::ACCENT);
         let strings = Locale::current().strings();
@@ -1795,34 +1799,68 @@ mod tests {
         assert_eq!(model.selected_text(), Some("你好界"));
     }
 
-    /// A field of a fixed width, for the placeholder tests.
+    /// A field of a fixed width, for the placeholder tests, drawn at a zoom the
+    /// way the window sets it before every draw.
     struct Holder {
         width: f32,
+        zoom: theme::Zoom,
         field: Entity<TextField>,
     }
 
     impl Render for Holder {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            theme::set_zoom(self.zoom);
             div().flex().w(px(self.width)).child(self.field.clone())
         }
     }
 
-    /// The placeholder as it was shaped in a field `width` wide.
-    fn drawn_placeholder(cx: &mut gpui::TestAppContext, width: f32, words: &'static str) -> String {
+    /// The placeholder as it was shaped in a field `width` wide at `zoom`: its words
+    /// and how wide they were drawn.
+    fn shaped_placeholder(
+        cx: &mut gpui::TestAppContext,
+        width: f32,
+        zoom: theme::Zoom,
+        words: &'static str,
+    ) -> (String, Pixels) {
         let (view, cx) = cx.add_window_view(move |_window, cx| Holder {
             width,
+            zoom,
             field: cx.new(|cx| TextField::new(words, cx)),
         });
         cx.run_until_parked();
-        cx.read(|cx| {
+        let shaped = cx.read(|cx| {
             view.read(cx)
                 .field
                 .read(cx)
                 .last_layout
                 .as_ref()
-                .map(|line| line.text.to_string())
+                .map(|line| (line.text.to_string(), line.width))
                 .expect("the field is drawn")
-        })
+        });
+        theme::set_zoom(theme::Zoom::default());
+        shaped
+    }
+
+    /// The placeholder as it was shaped in a field `width` wide.
+    fn drawn_placeholder(cx: &mut gpui::TestAppContext, width: f32, words: &'static str) -> String {
+        shaped_placeholder(cx, width, theme::Zoom::default(), words).0
+    }
+
+    #[gpui::test]
+    fn a_placeholder_grows_with_the_window_zoom(cx: &mut gpui::TestAppContext) {
+        // The home search's hint stayed at 100% while everything around it was drawn
+        // at 200% (T4 review P3): the field took its size from the default metrics.
+        let (regular_words, regular) =
+            shaped_placeholder(cx, 1200.0, theme::Zoom::Regular, "Search");
+        let (largest_words, largest) =
+            shaped_placeholder(cx, 1200.0, theme::Zoom::Largest, "Search");
+        assert_eq!(regular_words, "Search");
+        assert_eq!(largest_words, "Search");
+        let ratio = largest / regular;
+        assert!(
+            (1.8..=2.2).contains(&ratio),
+            "the hint is {ratio}× as wide at 200% as at 100%"
+        );
     }
 
     #[gpui::test]

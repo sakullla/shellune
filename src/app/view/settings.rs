@@ -17,6 +17,7 @@ use super::ShelluneView;
 use crate::app::components;
 use crate::app::copy::{self, Locale};
 use crate::app::hosts::{ConnectionField, connection_problem_text};
+use crate::app::icons::Icon;
 use crate::app::keymap;
 use crate::app::nav::Destination;
 use crate::app::terminal;
@@ -28,7 +29,34 @@ use crate::app::workspace::AttentionKind;
 const TWO_COLUMN_WIDTH: f32 = 780.0;
 
 /// Width of the navigation column, in logical pixels before the text scale.
-const NAV_WIDTH: f32 = 190.0;
+const NAV_WIDTH: f32 = 200.0;
+
+/// The widest the column of settings sections grows, before the text scale: a line of
+/// settings is read as one row, and a row much wider than this puts the control too far
+/// from its label.
+const SECTIONS_MAX_WIDTH: f32 = 680.0;
+
+/// The widest the whole page grows - the navigation, the gap and the sections - so a
+/// wide window centres it instead of stretching it.
+const PAGE_MAX_WIDTH: f32 = 980.0;
+
+/// The least width of a settings row's label column before the control moves under it.
+const ROW_LABEL_MIN_WIDTH: f32 = 200.0;
+
+/// The least width of a shortcut row's name column before its keys move under it.
+const KEYS_NAME_MIN_WIDTH: f32 = 180.0;
+
+/// The widest the hosts file path is drawn before it ends in an ellipsis.
+const PATH_MAX_WIDTH: f32 = 360.0;
+
+/// The width of the font size between its two buttons ("14 px").
+const FONT_VALUE_WIDTH: f32 = 44.0;
+
+/// The width of one number of the connection page.
+const NUMBER_FIELD_WIDTH: f32 = 84.0;
+
+/// The widest a refusal under a number of the connection page is drawn.
+const NUMBER_PROBLEM_WIDTH: f32 = 220.0;
 
 /// One first-level group of the settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +141,20 @@ impl Category {
             Self::Data => "data",
             Self::Sync => "sync",
             Self::About => "about",
+        }
+    }
+
+    /// The icon the navigation draws beside the category's name (ADR-7).
+    pub(super) fn icon(self) -> Icon {
+        match self {
+            Self::Appearance => Icon::Sun,
+            Self::Terminal => Icon::Terminal,
+            Self::Connection => Icon::Plug,
+            Self::Notices => Icon::Clock,
+            Self::Keys => Icon::Key,
+            Self::Data => Icon::Folder,
+            Self::Sync => Icon::Refresh,
+            Self::About => Icon::Download,
         }
     }
 
@@ -313,6 +355,14 @@ impl ShelluneView {
     pub(super) fn settings_page(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics();
         let folded = self.settings_folded();
+        // Until the reader scrolls, the category they chose stays at the top: the
+        // reveal is asked again on every frame, so a page whose sections above settle to
+        // their final height a frame later (wrapped hints, measured segments) still shows
+        // the chosen category's heading instead of a line under it.
+        if self.settings_pending_reveal.get() {
+            self.settings_scroll
+                .scroll_to_top_of_item(self.settings_nav.category.index());
+        }
 
         // Every category on one page that scrolls: settings are read the way a person
         // reads a document, top to bottom, and the navigation is a table of contents -
@@ -334,7 +384,7 @@ impl ShelluneView {
             .w_full()
             .min_w_0()
             .min_h_0()
-            .max_w(metrics.scale(680.0))
+            .max_w(metrics.scale(SECTIONS_MAX_WIDTH))
             .overflow_y_scroll()
             .overflow_x_hidden()
             .gap(metrics.scale(spacing::LOOSE + spacing::BASE))
@@ -393,7 +443,7 @@ impl ShelluneView {
             .w_full()
             .min_w_0()
             .min_h_0()
-            .max_w(metrics.scale(980.0))
+            .max_w(metrics.scale(PAGE_MAX_WIDTH))
             .mx_auto()
             .px(metrics.scale(spacing::LOOSE))
             .debug_selector(|| "settings".to_owned())
@@ -482,7 +532,7 @@ impl ShelluneView {
                 div()
                     .w_full()
                     .min_w_0()
-                    .text_size(metrics.title_size() + metrics.scale(3.0))
+                    .text_size(metrics.heading_size())
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     .when(category == shown.category(), |title| {
@@ -532,16 +582,9 @@ impl ShelluneView {
                         // The chosen setting carries the accent edge, so the place the
                         // navigation points at is found on the page as well.
                         .child(
-                            div()
-                                .flex_none()
-                                .w(px(2.0))
-                                .my(metrics.scale(spacing::SNUG))
-                                .rounded(px(1.0))
-                                .bg(if chosen {
-                                    theme::swatch(palette::ACCENT)
-                                } else {
-                                    theme::clear()
-                                }),
+                            components::accent_mark(chosen, metrics)
+                                .h_auto()
+                                .my(metrics.scale(spacing::SNUG)),
                         )
                         .child(
                             div()
@@ -582,18 +625,7 @@ impl ShelluneView {
                                 .flex()
                                 .items_center()
                                 .gap(metrics.scale(spacing::TIGHT))
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .w(px(2.0))
-                                        .h(metrics.scale(14.0))
-                                        .rounded(px(1.0))
-                                        .bg(if chosen {
-                                            theme::swatch(palette::ACCENT)
-                                        } else {
-                                            theme::clear()
-                                        }),
-                                )
+                                .child(components::accent_mark(chosen, metrics))
                                 .child(
                                     div()
                                         .text_size(metrics.body_size())
@@ -625,103 +657,55 @@ impl ShelluneView {
     }
 
     /// The navigation column: every category, with the items of the chosen one under it.
+    ///
+    /// It is a quiet column of [`components::nav_item`]s beside the page, like the
+    /// sidebar of the host list (ADR-7): each category has its icon, the chosen one the
+    /// selected fill, the accent bar and the medium weight, and its pages are listed under
+    /// it, indented to its words.
     fn settings_navigation(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let locale = self.workspace.locale();
         let ringed = !self.pointer_input || self.settings_nav.nav_focus;
-        // The navigation is chrome, not content: it stands on the chrome layer as a
-        // panel of its own beside the cards it points into (R5).
         let mut column = div()
             .flex()
             .flex_col()
             .flex_none()
             .w(metrics.scale(NAV_WIDTH))
             .min_w_0()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .p(metrics.scale(spacing::TIGHT))
-            .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::CHROME))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
+            .gap(metrics.scale(spacing::HALF))
             .debug_selector(|| "settings.nav".to_owned());
         // The mark follows what is on screen, so scrolling the page moves it.
         let in_view = self.settings_category_in_view();
         for category in Category::ALL {
             let chosen = category == in_view;
             let selector = format!("settings.category.{}", category.id());
-            // A category is a line of the column, not a card: the column is navigation,
-            // and seven bordered boxes made it heavier than the page it navigates. The
-            // chosen category is told by weight and fill; with its pages listed under it,
-            // the page carries the bar instead, so one mark says where the page is.
+            // With its pages listed under it, an open category hands the fill, the bar
+            // and the ring to its chosen page, so one mark says where the page is.
             let expanded = chosen && !Self::single_named_item(category, locale);
-            let hover = theme::swatch(palette::SURFACE_HOVER);
             column = column.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .w_full()
-                    .min_w_0()
-                    .min_h(metrics.scale(32.0))
-                    .px(metrics.scale(spacing::SNUG))
-                    .rounded(px(radius::SMALL))
-                    .border_1()
-                    .border_color(theme::clear())
-                    .cursor_pointer()
-                    .when(chosen && !expanded, |row| {
-                        row.bg(theme::swatch(palette::SURFACE_SELECTED))
-                    })
-                    .when(!chosen, |row| row.hover(move |style| style.bg(hover)))
-                    .when(expanded, |row| row.mt(metrics.scale(spacing::HAIRLINE)))
-                    .id(SharedString::from(selector.clone()))
-                    .debug_selector({
-                        let selector = selector.clone();
-                        move || selector.clone()
-                    })
-                    // One ring, on the one row the keys move: an open category hands
-                    // it to its chosen page, so two outlined rows never compete.
-                    .when(chosen && ringed && !expanded, |row| {
-                        row.border_color(theme::swatch(palette::FOCUS_RING))
-                    })
-                    // The chosen category carries the accent bar beside its fill, so
-                    // the state is not told by the fill alone; an open category hands
-                    // the bar to its chosen page.
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(2.0))
-                            .h(metrics.scale(14.0))
-                            .rounded(px(1.0))
-                            .bg(if chosen && !expanded {
-                                theme::swatch(palette::ACCENT)
-                            } else {
-                                theme::clear()
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(metrics.body_size())
-                            .font_weight(if chosen {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::NORMAL
-                            })
-                            .text_color(theme::swatch(if chosen {
-                                palette::TEXT_PRIMARY
-                            } else {
-                                palette::TEXT_SECONDARY
-                            }))
-                            .child(category.label(locale)),
-                    )
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.settings_select_category(category, cx);
-                    })),
+                components::nav_item(
+                    Some(category.icon()),
+                    category.label(locale),
+                    chosen && !expanded,
+                    chosen && ringed && !expanded,
+                    metrics,
+                )
+                .when(expanded, |row| {
+                    row.text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .font_weight(FontWeight::MEDIUM)
+                })
+                .id(SharedString::from(selector.clone()))
+                .debug_selector({
+                    let selector = selector.clone();
+                    move || selector.clone()
+                })
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.settings_select_category(category, cx);
+                })),
             );
             // A category whose only page carries its own name would put the same label
             // twice in a row; the chosen category already says where the page is (R16).
-            if chosen && !Self::single_named_item(category, locale) {
+            if expanded {
                 for (index, item) in category.items().iter().enumerate() {
                     column = column.child(self.settings_nav_item(category, index, *item, cx));
                 }
@@ -762,61 +746,12 @@ impl ShelluneView {
         let picked = index == self.settings_nav.item_of(category);
         let ringed = !self.pointer_input || self.settings_nav.nav_focus;
         let selector = format!("settings.item.{}", item.id());
-        div()
-            .flex()
-            .items_center()
-            .gap(metrics.scale(spacing::TIGHT))
-            .w_full()
-            .min_w_0()
-            .pl(metrics.scale(spacing::SNUG))
-            .pr(metrics.scale(spacing::TIGHT))
-            .py(metrics.scale(spacing::HAIRLINE + 2.0))
-            .rounded(px(radius::SMALL))
-            .cursor_pointer()
-            .when(picked, |row| {
-                row.bg(theme::swatch(palette::SURFACE_SELECTED))
-            })
-            .when(!picked, |row| {
-                let hover = theme::swatch(palette::SURFACE_HOVER);
-                row.hover(move |style| style.bg(hover))
-            })
-            // The border is always there, clear until it rings, so the ring never
-            // moves the label by a pixel.
-            .border_1()
-            .border_color(theme::clear())
-            .when(picked && ringed, |row| {
-                row.border_color(theme::swatch(palette::FOCUS_RING))
-            })
+        components::nav_item(None, item.label(locale), picked, picked && ringed, metrics)
             .id(SharedString::from(selector.clone()))
             .debug_selector({
                 let selector = selector.clone();
                 move || selector.clone()
             })
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(2.0))
-                    .h(metrics.scale(14.0))
-                    .rounded(px(1.0))
-                    .bg(if picked {
-                        theme::swatch(palette::ACCENT)
-                    } else {
-                        theme::clear()
-                    }),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .whitespace_normal()
-                    .text_size(metrics.label_size())
-                    .text_color(theme::swatch(if picked {
-                        palette::TEXT_PRIMARY
-                    } else {
-                        palette::TEXT_SECONDARY
-                    }))
-                    .child(item.label(locale)),
-            )
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.settings_select_item(category, index, cx);
             }))
@@ -935,7 +870,7 @@ impl ShelluneView {
                 "",
                 components::copy_on_click(
                     div()
-                        .max_w(metrics.scale(360.0))
+                        .max_w(metrics.scale(PATH_MAX_WIDTH))
                         .truncate()
                         .font_family(terminal::monospace_family())
                         .text_size(metrics.caption_size())
@@ -1224,7 +1159,7 @@ impl ShelluneView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .min_w(metrics.scale(44.0))
+                    .min_w(metrics.scale(FONT_VALUE_WIDTH))
                     .min_h(metrics.hit_target())
                     .px(metrics.scale(spacing::HAIRLINE))
                     .rounded(px(radius::SMALL))
@@ -1368,10 +1303,10 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .items_end()
-            .gap(metrics.scale(2.0))
+            .gap(metrics.scale(spacing::HALF))
             .child(
                 div()
-                    .w(metrics.scale(84.0))
+                    .w(metrics.scale(NUMBER_FIELD_WIDTH))
                     .debug_selector(move || format!("settings.policy.{}", field.id()))
                     .child(self.connection_fields.get(field).clone()),
             );
@@ -1380,7 +1315,7 @@ impl ShelluneView {
         {
             control = control.child(
                 div()
-                    .max_w(metrics.scale(220.0))
+                    .max_w(metrics.scale(NUMBER_PROBLEM_WIDTH))
                     .text_size(metrics.caption_size())
                     .text_color(theme::Tone::Danger.text())
                     .debug_selector(move || format!("settings.policy.error.{}", field.id()))
@@ -1471,9 +1406,9 @@ impl ShelluneView {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_w(metrics.scale(200.0))
+                    .min_w(metrics.scale(ROW_LABEL_MIN_WIDTH))
                     .max_w_full()
-                    .gap(metrics.scale(2.0))
+                    .gap(metrics.scale(spacing::HALF))
                     // A row whose page heading already names it has no label of its own;
                     // an empty line here pushed the hint below the control's centre.
                     .when(!label.is_empty(), |column| {
@@ -1717,7 +1652,7 @@ impl ShelluneView {
                         .flex_shrink()
                         .whitespace_normal()
                         .h(gpui::auto())
-                        .min_h(metrics.scale(18.0))
+                        .min_h(metrics.scale(components::KBD_HEIGHT))
                         .debug_selector(move || selector.clone())
                 }))
                 .into_any_element()
@@ -1752,9 +1687,9 @@ impl ShelluneView {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_w(metrics.scale(180.0))
+                    .min_w(metrics.scale(KEYS_NAME_MIN_WIDTH))
                     .max_w_full()
-                    .gap(metrics.scale(2.0))
+                    .gap(metrics.scale(spacing::HALF))
                     .child(
                         div()
                             .w_full()
@@ -2076,6 +2011,10 @@ impl ShelluneView {
             .unwrap_or_default();
         self.settings_nav.category = category;
         self.settings_nav.set_item(category, index);
+        // The page is one scrolled column: the shot has to scroll to the page it
+        // names, as a press in the navigation does, or it photographs the top of the
+        // page under the name of another one.
+        self.settings_reveal(category);
         cx.notify();
     }
 

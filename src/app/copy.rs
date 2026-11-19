@@ -2837,6 +2837,14 @@ pub struct UxStrings {
     pub host_advanced_hint: &'static str,
     /// Host dialog: something in the folded section is set
     pub host_advanced_in_use: &'static str,
+    /// Host dialog: the group of where and who
+    pub host_group_basic: &'static str,
+    /// Host dialog: the group of jump hosts and the ProxyCommand
+    pub host_group_route: &'static str,
+    /// Host dialog: the group of the transfer protocol
+    pub host_group_transfer: &'static str,
+    /// Connection dialog: the group of what the protocol lets the user choose
+    pub host_group_options: &'static str,
     /// Host dialog: the placeholder of the jump host picker's search
     pub host_jump_search: &'static str,
     /// Host dialog: the jump host picker has no saved SSH host left to offer
@@ -3446,6 +3454,10 @@ impl UxStrings {
             self.host_advanced_title,
             self.host_advanced_hint,
             self.host_advanced_in_use,
+            self.host_group_basic,
+            self.host_group_route,
+            self.host_group_transfer,
+            self.host_group_options,
             self.host_jump_search,
             self.host_jump_none_left,
             self.host_jump_no_match,
@@ -3876,6 +3888,10 @@ included",
     host_advanced_title: "Advanced",
     host_advanced_hint: "Jump hosts, ProxyCommand, startup command, file transfer, X11, keepalive",
     host_advanced_in_use: "In use",
+    host_group_basic: "Basics",
+    host_group_route: "Jump hosts and proxy",
+    host_group_transfer: "File transfer",
+    host_group_options: "Options",
     host_jump_search: "Search by name or address",
     host_jump_none_left: "Every other saved SSH host is already in the chain.",
     host_jump_no_match: "No saved SSH host matches this search.",
@@ -4302,6 +4318,10 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     host_advanced_title: "高级设置",
     host_advanced_hint: "跳板机、代理命令、启动命令、文件传输、X11、保活",
     host_advanced_in_use: "已设置",
+    host_group_basic: "基本信息",
+    host_group_route: "跳板与代理",
+    host_group_transfer: "文件传输",
+    host_group_options: "选项",
     host_jump_search: "按名称或地址搜索",
     host_jump_none_left: "其余已保存的 SSH 主机都已在跳板链中。",
     host_jump_no_match: "没有与搜索匹配的 SSH 主机。",

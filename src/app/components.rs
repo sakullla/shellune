@@ -436,6 +436,22 @@ const MARK_STROKE: f32 = 1.5;
 /// The rounding of the small marks: the bar, the squares and the dash.
 const MARK_CORNER: f32 = 1.0;
 
+/// The accent bar a chosen entry carries beside its words, in its place in a row: the
+/// bar when `shown`, a clear slot of the same width otherwise, so the words never move
+/// when the choice does (settings rows and navigation, ADR-7).
+pub fn accent_mark(shown: bool, metrics: Metrics) -> Div {
+    div()
+        .flex_none()
+        .w(px(MARK_BAR_WIDTH))
+        .h(metrics.small_icon_size())
+        .rounded(px(MARK_CORNER))
+        .bg(if shown {
+            theme::swatch(palette::ACCENT)
+        } else {
+            theme::clear()
+        })
+}
+
 /// The 2px leading bar that says "this one is chosen" without relying on colour.
 fn mark_bar(token: Token, metrics: Metrics) -> Div {
     div()
@@ -611,13 +627,16 @@ fn kbd_text_size(metrics: Metrics) -> Pixels {
     metrics.caption_size() - metrics.scale(1.0)
 }
 
+/// The height of a [`kbd`] keycap, in logical pixels before zoom.
+pub const KBD_HEIGHT: f32 = 18.0;
+
 /// A keycap that names a shortcut, such as `Ctrl+K` beside a command (ADR-2).
 pub fn kbd(label: impl Into<SharedString>, metrics: Metrics) -> Div {
     div()
         .flex()
         .flex_none()
         .items_center()
-        .h(metrics.scale(18.0))
+        .h(metrics.scale(KBD_HEIGHT))
         .px(metrics.scale(spacing::HAIRLINE + 1.0))
         .rounded(px(radius::SMALL))
         .bg(theme::swatch(palette::SURFACE))
@@ -986,9 +1005,9 @@ pub(crate) fn settings_row_content_cap(metrics: Metrics) -> Pixels {
 pub(crate) fn segment_reserved_width(label: &str, metrics: Metrics) -> Pixels {
     let text = reserved_text_width(label, metrics.label_size());
     let padding = metrics.scale(spacing::TIGHT + spacing::HALF) * 2.0;
-    let border = px(2.0);
+    let border = px(HAIRLINE_WIDTH) * 2.0;
     let track_pad = metrics.scale(spacing::HALF) * 2.0;
-    let track_border = px(2.0);
+    let track_border = px(HAIRLINE_WIDTH) * 2.0;
     let cap = settings_row_content_cap(metrics) - track_pad - track_border;
     (text + padding + border).min(cap)
 }
@@ -997,7 +1016,7 @@ pub(crate) fn segment_reserved_width(label: &str, metrics: Metrics) -> Pixels {
 pub(crate) fn compact_label_reserved_width(label: &str, metrics: Metrics) -> Pixels {
     let text = reserved_text_width(label, metrics.caption_size());
     let padding = metrics.scale(spacing::TIGHT + 2.0) * 2.0;
-    let border = px(2.0);
+    let border = px(HAIRLINE_WIDTH) * 2.0;
     (text + padding + border).min(settings_row_content_cap(metrics))
 }
 
@@ -1005,7 +1024,7 @@ pub(crate) fn compact_label_reserved_width(label: &str, metrics: Metrics) -> Pix
 pub(crate) fn kbd_reserved_width(label: &str, metrics: Metrics) -> Pixels {
     let text = reserved_text_width(label, kbd_text_size(metrics));
     let padding = metrics.scale(spacing::HAIRLINE + 1.0) * 2.0;
-    let border = px(2.0);
+    let border = px(HAIRLINE_WIDTH) * 2.0;
     (text + padding + border).min(settings_row_content_cap(metrics))
 }
 
@@ -1217,7 +1236,7 @@ pub fn state_card_with_icon(
             cap,
             div()
                 .whitespace_normal()
-                .text_size(metrics.title_size() + px(1.0))
+                .text_size(metrics.title_size())
                 .text_color(theme::swatch(palette::TEXT_PRIMARY))
                 .font_weight(metrics.title_weight())
                 .text_center()
@@ -1402,24 +1421,39 @@ pub fn menu_item_face(state: ControlState) -> ControlFace {
     }
 }
 
-/// The floating card a menu is drawn in: the raised layer, a strong edge and a mid
-/// shadow, so it reads as over the page and not part of it.
-///
-/// Every context and drop-down menu uses this card, so a session row's menu and a tab's
-/// menu are the same object.
-pub fn menu_card(selector: &'static str, metrics: Metrics) -> Div {
+/// The surface every floating layer that is not a dialog is drawn on - a menu, the
+/// command palette, a tooltip, a toast, a floating control bar (ADR-7): the raised
+/// layer, a strong hairline, the card radius (8) and the overlay elevation, so all of
+/// them read as one kind of object above the page.
+pub fn popover_surface() -> Div {
     div()
-        .debug_selector(move || selector.to_owned())
-        .flex()
-        .flex_col()
-        .min_w(metrics.scale(200.0))
-        .gap(metrics.scale(1.0))
-        .p(metrics.scale(spacing::HAIRLINE))
         .rounded(px(radius::LARGE))
         .bg(theme::swatch(palette::RAISED))
         .border_1()
         .border_color(theme::swatch(palette::BORDER_STRONG))
         .elevation(Elevation::Overlay)
+}
+
+/// The width of the command palette, in logical pixels (ADR-7): wide enough for a
+/// title, its detail and the shortcut in force, narrower than a dialog.
+pub const PALETTE_WIDTH: f32 = 560.0;
+
+/// The narrowest a [`menu_card`] is drawn, in logical pixels before zoom.
+pub const MENU_MIN_WIDTH: f32 = 200.0;
+
+/// The floating card a menu is drawn in: the [`popover_surface`], so it reads as over
+/// the page and not part of it.
+///
+/// Every context and drop-down menu uses this card, so a session row's menu and a tab's
+/// menu are the same object.
+pub fn menu_card(selector: &'static str, metrics: Metrics) -> Div {
+    popover_surface()
+        .debug_selector(move || selector.to_owned())
+        .flex()
+        .flex_col()
+        .min_w(metrics.scale(MENU_MIN_WIDTH))
+        .gap(px(HAIRLINE_WIDTH))
+        .p(metrics.scale(spacing::HAIRLINE))
 }
 
 /// One command of a [`menu_card`]: an optional icon and a label.
@@ -1451,9 +1485,11 @@ pub fn menu_entry(
         .flex_none()
         .items_center()
         .gap(metrics.scale(spacing::TIGHT))
-        .h(metrics.scale(30.0))
-        .px(metrics.scale(spacing::TIGHT + 2.0))
-        .rounded(px(radius::MEDIUM - 2.0))
+        // A menu entry is one compact control high (28): menus list many commands,
+        // and a dense, even rhythm is what makes them quick to scan (ADR-7).
+        .h(metrics.compact_control_height())
+        .px(metrics.scale(spacing::TIGHT))
+        .rounded(px(radius::SMALL))
         .text_size(metrics.label_size())
         .text_color(color)
         .when(enabled, |item| {
@@ -1483,9 +1519,9 @@ pub fn menu_shortcut(label: impl Into<SharedString>, metrics: Metrics) -> Div {
 pub fn menu_section(label: impl Into<SharedString>, metrics: Metrics) -> Div {
     div()
         .flex_none()
-        .px(metrics.scale(spacing::TIGHT + 2.0))
-        .pt(metrics.scale(spacing::HAIRLINE + 2.0))
-        .pb(metrics.scale(2.0))
+        .px(metrics.scale(spacing::TIGHT))
+        .pt(metrics.scale(spacing::NARROW))
+        .pb(metrics.scale(spacing::HALF))
         .text_size(metrics.caption_size())
         .font_weight(metrics.medium_weight())
         .text_color(theme::swatch(palette::TEXT_MUTED))
@@ -1512,18 +1548,13 @@ pub fn menu_enter(
 /// The remote desktop's zoom and full-screen controls are drawn on it. The caller
 /// places it and adds the controls; a press on the bar stays on the bar.
 pub fn floating_bar(metrics: Metrics) -> Div {
-    div()
+    popover_surface()
         .occlude()
         .flex()
         .flex_none()
         .items_center()
         .gap(metrics.scale(spacing::HALF))
         .p(metrics.scale(spacing::HAIRLINE))
-        .rounded(px(radius::LARGE))
-        .bg(theme::swatch(palette::RAISED))
-        .border_1()
-        .border_color(theme::swatch(palette::BORDER_STRONG))
-        .elevation(Elevation::Overlay)
 }
 
 /// The hairline between groups of [`menu_entry`]s.
@@ -1532,7 +1563,7 @@ pub fn menu_divider(metrics: Metrics) -> Div {
         .flex_none()
         .h(px(HAIRLINE_WIDTH))
         .mx(metrics.scale(spacing::HAIRLINE))
-        .my(metrics.scale(spacing::HAIRLINE - 1.0))
+        .my(metrics.scale(spacing::HALF))
         .bg(theme::swatch(palette::BORDER))
 }
 
@@ -1558,8 +1589,8 @@ pub fn menu_item(label: impl Into<SharedString>, selected: bool, metrics: Metric
             .items_center()
             .justify_between()
             .gap(metrics.scale(spacing::SNUG))
-            .h(metrics.control_height())
-            .px(metrics.scale(spacing::TIGHT + 2.0))
+            .h(metrics.compact_control_height())
+            .px(metrics.scale(spacing::TIGHT))
             .rounded(px(radius::SMALL))
             .cursor_pointer()
             .child(label.into()),
@@ -1641,7 +1672,7 @@ pub fn dialog_header(
                 .child(
                     div()
                         .whitespace_normal()
-                        .text_size(metrics.title_size() + px(1.0))
+                        .text_size(metrics.title_size())
                         .font_weight(metrics.title_weight())
                         .text_color(theme::swatch(palette::TEXT_PRIMARY))
                         .child(title.into()),
@@ -1775,14 +1806,10 @@ impl Render for Tooltip {
         // A tooltip is its own view, drawn outside the window's render pass; the
         // window's text size comes from the theme so a 200% window gets a 200% tip.
         let metrics = theme::metrics();
-        div()
-            .px(metrics.scale(spacing::TIGHT + 1.0))
-            .py(metrics.scale(spacing::HAIRLINE + 1.0))
-            .rounded(px(radius::SMALL))
-            .bg(theme::swatch(palette::RAISED))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER_STRONG))
-            .elevation(Elevation::Overlay)
+        // The same floating surface as a menu and a toast (ADR-7).
+        popover_surface()
+            .px(metrics.scale(spacing::TIGHT))
+            .py(metrics.scale(spacing::HAIRLINE))
             .text_size(metrics.caption_size())
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
             .child(self.text.clone())
@@ -1996,11 +2023,17 @@ pub fn checkbox(
         .child(label.into())
 }
 
+/// The width of a [`toast`], in logical pixels before zoom.
+pub const TOAST_WIDTH: f32 = 340.0;
+
+/// The side of the small round or square tile an icon sits on beside one line of
+/// words - a toast's tone, a palette result's kind - in logical pixels before zoom.
+pub const ICON_TILE: f32 = 24.0;
+
 /// A finished notification: a tone's icon on its tint, a title and an optional line.
 ///
 /// The caller gives it its id, its close button and its place in the stack; the toast
-/// is the raised card and its words. It floats over the page, so it is drawn on the
-/// raised layer at the mid elevation, like a menu.
+/// is the [`popover_surface`] and its words, like a menu and a tooltip (ADR-7).
 pub fn toast(
     tone: Tone,
     icon: Icon,
@@ -2008,24 +2041,19 @@ pub fn toast(
     detail: Option<SharedString>,
     metrics: Metrics,
 ) -> Div {
-    div()
+    popover_surface()
         .flex()
         .items_start()
-        .gap(metrics.scale(spacing::TIGHT + 2.0))
-        .w(metrics.scale(340.0))
+        .gap(metrics.scale(spacing::TIGHT + spacing::HALF))
+        .w(metrics.scale(TOAST_WIDTH))
         .p(metrics.scale(spacing::SNUG))
-        .rounded(px(radius::LARGE))
-        .bg(theme::swatch(palette::RAISED))
-        .border_1()
-        .border_color(theme::swatch(palette::BORDER_STRONG))
-        .elevation(Elevation::Overlay)
         .child(
             div()
                 .flex()
                 .flex_none()
                 .items_center()
                 .justify_center()
-                .size(metrics.scale(24.0))
+                .size(metrics.scale(ICON_TILE))
                 .rounded_full()
                 .bg(theme::swatch(tone.tint()))
                 .child(icons::icon(icon, metrics.small_icon_size(), tone.text())),
@@ -2036,7 +2064,7 @@ pub fn toast(
                 .flex_col()
                 .flex_1()
                 .min_w_0()
-                .gap(metrics.scale(2.0))
+                .gap(metrics.scale(spacing::HALF))
                 .child(
                     title
                         .text_size(metrics.label_size())
@@ -2640,6 +2668,273 @@ pub fn form_label(label: impl Into<SharedString>, metrics: Metrics) -> Div {
         .font_weight(metrics.medium_weight())
         .text_color(theme::swatch(palette::TEXT_SECONDARY))
         .child(label.into())
+}
+
+/// The narrowest a field of a [`form_row`] is drawn before the row puts its fields
+/// under each other, in logical pixels before zoom.
+pub const FORM_FIELD_MIN_WIDTH: f32 = 200.0;
+
+/// The narrowest a short field - a port, a count - is drawn beside a wide one.
+pub const FORM_SHORT_FIELD_MIN_WIDTH: f32 = 96.0;
+
+/// One row of a dialog's form grid (ADR-7): two (or more) fields side by side that
+/// wrap under each other when the dialog is too narrow for both at their least width,
+/// so a 720x480 window at 200% gets one column and a wide one gets two.
+///
+/// The fields are [`form_field`]s, which carry their share of the row and their floor.
+pub fn form_row(metrics: Metrics) -> Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .items_start()
+        .w_full()
+        .min_w_0()
+        .gap(metrics.scale(spacing::SNUG))
+}
+
+/// One labelled field of a form: the [`form_label`] above the control, as one cell of a
+/// [`form_row`]. `share` is its part of the row's width (0.5 for a half, 1.0 alone) and
+/// `min_width` the least it is drawn at before the row wraps
+/// ([`FORM_FIELD_MIN_WIDTH`] or [`FORM_SHORT_FIELD_MIN_WIDTH`]).
+pub fn form_field(
+    label: impl Into<SharedString>,
+    control: impl IntoElement,
+    share: f32,
+    min_width: f32,
+    metrics: Metrics,
+) -> Div {
+    form_cell(share, min_width, metrics)
+        .child(form_label(label, metrics))
+        .child(control)
+}
+
+/// The bare cell of a [`form_row`]: a column with the row's share and floor, for a
+/// field whose label the caller draws itself.
+pub fn form_cell(share: f32, min_width: f32, metrics: Metrics) -> Div {
+    // The cell starts from nothing and grows by its share: the row breaks a line only
+    // when the floors themselves do not fit, and the room above the floors is shared
+    // out in proportion (three to one for an address and its port).
+    let mut cell = div()
+        .flex()
+        .flex_col()
+        .flex_basis(px(0.0))
+        .min_w(metrics.scale(min_width))
+        .max_w_full()
+        .gap(metrics.scale(spacing::NARROW));
+    cell.style().flex_grow = Some(share.max(f32::EPSILON));
+    cell
+}
+
+/// The heading of one group of a dialog's form ("Sign in with"): body size, the
+/// semibold weight and the primary ink.
+pub fn form_section(title: impl Into<SharedString>, metrics: Metrics) -> Div {
+    div()
+        .text_size(metrics.label_size())
+        .font_weight(metrics.title_weight())
+        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+        .child(title.into())
+}
+
+/// The quiet sentence under a field or a choice: what it does, what it inherits.
+pub fn form_hint(text: impl Into<SharedString>, metrics: Metrics) -> Div {
+    div()
+        .text_size(metrics.caption_size())
+        .text_color(theme::swatch(palette::TEXT_MUTED))
+        .child(text.into())
+}
+
+/// One titled group of a dialog's form - "Basics", "Sign in with", "X11" - (ADR-7):
+/// a hairline card with an icon and a heading at its top and the group's fields under
+/// it. No fill of its own, so the fields inside keep their contrast on both themes;
+/// the edge alone tells where one group ends and the next begins.
+pub fn form_group(icon: Icon, title: impl Into<SharedString>, metrics: Metrics) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(metrics.scale(spacing::SNUG))
+        .w_full()
+        .min_w_0()
+        .px(metrics.scale(spacing::BASE))
+        .py(metrics.scale(spacing::SNUG))
+        .rounded(px(radius::LARGE))
+        .border_1()
+        .border_color(theme::swatch(palette::BORDER))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(metrics.scale(spacing::TIGHT))
+                .min_w_0()
+                .child(icons::icon(
+                    icon,
+                    metrics.small_icon_size(),
+                    theme::swatch(palette::TEXT_SECONDARY),
+                ))
+                .child(form_section(title, metrics).flex_1().min_w_0()),
+        )
+}
+
+/// The hairline between two groups of a dialog's form.
+pub fn form_rule() -> Div {
+    div()
+        .flex_none()
+        .h(px(HAIRLINE_WIDTH))
+        .bg(theme::swatch(palette::BORDER))
+}
+
+/// The head of a folded part of a form - "Advanced" - (ADR-7): a chevron that says
+/// whether it is open, the part's name and a line of what is inside. Flat until
+/// pointed at, like a ghost button, so a folded part does not read as a second card.
+/// The caller adds its id, its click and any "in use" chip.
+pub fn disclosure(
+    open: bool,
+    title: impl Into<SharedString>,
+    hint: impl Into<SharedString>,
+    metrics: Metrics,
+) -> Div {
+    let hover = theme::swatch(palette::SURFACE_HOVER);
+    div()
+        .flex()
+        .items_center()
+        .gap(metrics.scale(spacing::TIGHT))
+        .w_full()
+        .min_w_0()
+        .min_h(metrics.control_height())
+        .px(metrics.scale(spacing::TIGHT))
+        .rounded(px(radius::MEDIUM))
+        .border_1()
+        .border_color(theme::swatch(palette::BORDER))
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover))
+        .child(icons::icon(
+            if open {
+                Icon::ChevronDown
+            } else {
+                Icon::ChevronRight
+            },
+            metrics.small_icon_size(),
+            theme::swatch(palette::TEXT_SECONDARY),
+        ))
+        .child(
+            div()
+                .flex_none()
+                .text_size(metrics.label_size())
+                .font_weight(metrics.medium_weight())
+                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                .child(title.into()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .child(line_text(hint)),
+        )
+}
+
+/// The narrowest the quiet note at the left of a [`modal_footer_noted`] is drawn
+/// before the actions move to a line of their own.
+pub const FOOTER_NOTE_MIN_WIDTH: f32 = 160.0;
+
+/// A [`modal_footer`] with a quiet note at its left ("nothing that already ran is
+/// undone") and the actions at its right (ADR-7).
+///
+/// The note takes the room the actions leave and wraps inside it; when even its floor
+/// does not fit beside them, the actions take a line of their own and stay on the
+/// right, so the primary action is always the last thing at the right edge.
+pub fn modal_footer_noted(note: Div, actions: Div, metrics: Metrics) -> Div {
+    modal_footer(metrics)
+        .justify_between()
+        .child(
+            note.flex_1()
+                .min_w(metrics.scale(FOOTER_NOTE_MIN_WIDTH))
+                .whitespace_normal()
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED)),
+        )
+        .child(
+            actions
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_end()
+                .ml_auto()
+                .min_w_0()
+                .max_w_full()
+                .gap(metrics.scale(spacing::TIGHT)),
+        )
+}
+
+/// One entry of a page's own navigation column - the settings categories and their
+/// pages (ADR-7): a [`sidebar_item`]'s size and corner, with the chosen entry told
+/// three ways - the selected fill, the accent bar beside its words and the medium
+/// weight - and the keyboard's entry ringed.
+///
+/// `icon` is the category's icon; a page under a category has none and is indented to
+/// the category's words instead, so the two levels read as one outline.
+pub fn nav_item(
+    icon: Option<Icon>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    ringed: bool,
+    metrics: Metrics,
+) -> Div {
+    let ink = theme::swatch(if selected {
+        palette::TEXT_PRIMARY
+    } else {
+        palette::TEXT_SECONDARY
+    });
+    let hover_fill = theme::swatch(palette::SURFACE_HOVER);
+    let hover_ink = theme::swatch(palette::TEXT_PRIMARY);
+    let indented = icon.is_none();
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(metrics.scale(spacing::TIGHT))
+        .w_full()
+        .min_w_0()
+        .min_h(if indented {
+            metrics.compact_control_height()
+        } else {
+            metrics.control_height()
+        })
+        .pl(metrics.scale(spacing::HAIRLINE))
+        .pr(metrics.scale(spacing::TIGHT))
+        .rounded(px(radius::MEDIUM))
+        // The edge is always there, clear until it rings, so the ring never moves the
+        // words by a pixel.
+        .border_1()
+        .border_color(if ringed {
+            theme::swatch(palette::FOCUS_RING)
+        } else {
+            theme::clear()
+        })
+        .when(selected, |item| {
+            item.bg(theme::swatch(palette::SURFACE_SELECTED))
+                .font_weight(metrics.medium_weight())
+        })
+        .when(!selected, |item| {
+            item.hover(move |style| style.bg(hover_fill).text_color(hover_ink))
+        })
+        .text_size(metrics.label_size())
+        .text_color(ink)
+        .cursor_pointer()
+        .child(accent_mark(selected, metrics))
+        .map(|item| match icon {
+            Some(icon) => item.child(icons::icon(icon, metrics.icon_size(), ink)),
+            // A page sits under its category's words: the icon's width and its gap.
+            None => item.child(div().flex_none().w(metrics.icon_size())),
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .whitespace_normal()
+                .child(label.into()),
+        )
 }
 
 /// The width of a hairline: a divider, a frame's edge.
@@ -3588,6 +3883,69 @@ mod tests {
                 "the {name} edge is not seen: {dark:.2}/{light:.2}"
             );
         }
+    }
+
+    #[test]
+    fn menus_tooltips_toasts_and_the_palette_share_one_floating_surface() {
+        // ADR-7: every floating layer that is not a dialog is the raised layer, the
+        // strong edge and the card radius (8). Each one is built here and its own style
+        // read back, so a menu drawn with a radius or a fill of its own fails.
+        theme::set_motion(theme::Motion::Reduced);
+        let metrics = Metrics::default();
+        let radius_8 = Some(gpui::AbsoluteLength::Pixels(px(radius::LARGE)));
+        let raised = Some(gpui::Fill::from(theme::swatch(palette::RAISED)));
+        let edge = Some(gpui::Hsla::from(theme::swatch(palette::BORDER_STRONG)));
+        for (name, mut layer) in [
+            ("popover", popover_surface()),
+            ("menu", menu_card("test.menu", metrics)),
+            ("floating bar", floating_bar(metrics)),
+            (
+                "toast",
+                toast(Tone::Positive, Icon::Check, div(), None, metrics),
+            ),
+        ] {
+            let style = layer.style();
+            assert_eq!(style.corner_radii.top_left, radius_8, "{name} radius");
+            assert_eq!(style.background, raised, "{name} fill");
+            assert_eq!(style.border_color, edge, "{name} edge");
+            assert!(
+                style
+                    .box_shadow
+                    .as_ref()
+                    .is_some_and(|shadows| !shadows.is_empty()),
+                "{name} is not lifted"
+            );
+        }
+        // A menu entry and a value of a choice menu are one compact control high (28).
+        let mut entry = menu_entry("Copy", "test.entry", None, true, false, metrics);
+        assert_eq!(
+            entry.style().size.height,
+            Some(metrics.compact_control_height().into()),
+            "a menu entry is 28 high"
+        );
+        let mut value = menu_item("Dark", true, metrics);
+        assert_eq!(
+            value.style().size.height,
+            Some(metrics.compact_control_height().into())
+        );
+    }
+
+    #[test]
+    fn a_form_cell_shares_its_row_from_a_floor() {
+        // ADR-7: two fields of a dialog's form share a row in proportion and keep a
+        // floor, so the row wraps them under each other instead of squeezing them.
+        let metrics = Metrics::default();
+        let mut wide = form_cell(0.75, FORM_FIELD_MIN_WIDTH, metrics);
+        let style = wide.style();
+        assert_eq!(style.flex_grow, Some(0.75));
+        assert_eq!(
+            style.min_size.width,
+            Some(metrics.scale(FORM_FIELD_MIN_WIDTH).into())
+        );
+        let mut short = form_cell(0.25, FORM_SHORT_FIELD_MIN_WIDTH, metrics);
+        assert_eq!(short.style().flex_grow, Some(0.25));
+        let mut row = form_row(metrics);
+        assert_eq!(row.style().flex_wrap, Some(gpui::FlexWrap::Wrap));
     }
 
     fn tone_word(tone: Tone) -> &'static str {

@@ -1839,6 +1839,8 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) {
         self.open_edit_host(host, cx);
+        // Keepalive is one of the advanced groups (T8): a shot about it opens them.
+        self.host_advanced = true;
         self.set_host_connection_choice(choice, cx);
     }
 
