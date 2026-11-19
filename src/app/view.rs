@@ -17860,6 +17860,12 @@ impl ShelluneView {
             && self.workspace.destination() == Destination::LocalShells
     }
 
+    /// The label of the tab of session `id`, for a test.
+    #[cfg(test)]
+    pub fn tab_title_for_test(&self, id: SessionId) -> String {
+        self.tab_title(id)
+    }
+
     /// The label of one tab: the user's own name, or the session's title numbered
     /// when an earlier tab has the same one, so two shells of one program can be told
     /// apart at a glance.
@@ -17867,12 +17873,6 @@ impl ShelluneView {
     /// A name the user typed is shown exactly as typed: numbering it would alter what
     /// they wrote. Two tabs with one name are still told apart by the target, the kind
     /// and the state, which the tooltip and the tab list both write out (R2).
-    /// The label of the tab of session `id`, for a test.
-    #[cfg(test)]
-    pub fn tab_title_for_test(&self, id: SessionId) -> String {
-        self.tab_title(id)
-    }
-
     fn tab_title(&self, id: SessionId) -> String {
         let custom = self
             .workspace
