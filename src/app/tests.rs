@@ -38208,3 +38208,180 @@ async fn the_batch_actions_stay_on_the_right_of_their_footer(cx: &mut TestAppCon
         "the primary action stays at the right edge when the footer wraps: {confirm:?} in {dialog:?}"
     );
 }
+
+/// One dialog, whichever protocol it asks for (R7).
+///
+/// The dialog's entrance is a fade with an eight-pixel settle, keyed by the modal's id.
+/// With one id per protocol the entrance replayed on every switch between SSH and
+/// another protocol: the dialog went transparent and jumped, which over a window-sized
+/// dialog is the whole window flashing. This measures both halves instead of
+/// photographing them - a frame log for "no frame without the dialog", and the
+/// dialog's own place for "no replay" - and the name, group, list and keyboard that a
+/// switch must carry over.
+#[gpui::test]
+async fn switching_protocols_keeps_the_open_dialog_in_place(cx: &mut TestAppContext) {
+    let (view, cx, _dir) = dialog_view(
+        cx,
+        vec![stored_host("edge", "10.0.0.7", 22, "deploy", Some("Prod"))],
+    );
+    click(cx, "hosts.new");
+    cx.run_until_parked();
+    type_into(cx, "hosts.field.name", "kept name");
+    type_into(cx, "hosts.field.group", "Prod");
+    let settle = |cx: &mut VisualTestContext| {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        redraw(cx);
+        cx.run_until_parked();
+    };
+    settle(cx);
+    // What the switch must leave alone: the page under the dialog.
+    let row = bounds_of(cx, "hosts.row.0");
+    let search = bounds_of(cx, "hosts.search");
+    crate::app::view::take_frame_marks();
+
+    for (protocol, selector) in [
+        ("rdp", "connection.protocol.rdp"),
+        ("vnc", "connection.protocol.vnc"),
+        ("ssh", "connection.protocol.ssh"),
+    ] {
+        click(cx, selector);
+        let first = open_form_bounds(cx);
+        assert!(
+            form_backdrop_drawn(cx),
+            "the dimming stays with the dialog through the switch to {protocol}"
+        );
+        assert_eq!(
+            bounds_of(cx, "hosts.row.0"),
+            row,
+            "the host list under the dialog does not move when the form becomes {protocol}"
+        );
+        assert_eq!(
+            bounds_of(cx, "hosts.search"),
+            search,
+            "the page above the list does not move when the form becomes {protocol}"
+        );
+        assert_frames_of_a_switch(&crate::app::view::take_frame_marks(), protocol);
+
+        // What a switch keeps: the name and group already typed.
+        assert_eq!(
+            typed_form_text(&view, cx),
+            ("kept name".to_owned(), "Prod".to_owned())
+        );
+
+        // What a switch must not do: replay the entrance. A replayed fade starts the
+        // dialog eight pixels above where it settles and wholly transparent.
+        settle(cx);
+        let settled = open_form_bounds(cx);
+        assert!(
+            (first.origin.y - settled.origin.y).abs() <= px(0.5),
+            "the dialog replays its entrance on the switch to {protocol}: {first:?} then {settled:?}"
+        );
+    }
+
+    // The keyboard follows the form: after a switch, typing reaches the new form's first
+    // field rather than a field of the form that is gone.
+    click(cx, "connection.protocol.rdp");
+    settle(cx);
+    cx.simulate_keystrokes("1");
+    cx.simulate_keystrokes("0");
+    cx.run_until_parked();
+    assert_eq!(
+        addressed_text(&view, cx),
+        "10",
+        "the keyboard is in the address of the form that is open"
+    );
+}
+
+/// Every frame a protocol switch drew that had a form open drew exactly that form's
+/// dialog and its dimming, and the switch ended on the form it asked for (R7).
+fn assert_frames_of_a_switch(marks: &[crate::app::view::FrameMarks], protocol: &str) {
+    let mut seen = 0;
+    for mark in marks {
+        if !mark.form_open {
+            continue;
+        }
+        seen += 1;
+        assert!(
+            mark.dimmed,
+            "a frame with the form open was drawn without its dimming: {mark:?}"
+        );
+        assert_eq!(
+            u8::from(mark.host_dialog) + u8::from(mark.connection_dialog),
+            1,
+            "a frame with the form open drew the wrong number of dialogs: {mark:?}"
+        );
+        match mark.form_protocol {
+            Some("ssh") => assert!(
+                mark.host_dialog,
+                "the SSH form is drawn in its dialog: {mark:?}"
+            ),
+            Some(_) => assert!(
+                mark.connection_dialog,
+                "another protocol's form is drawn in the same dialog: {mark:?}"
+            ),
+            None => panic!("a frame drew a dialog with no form open: {mark:?}"),
+        }
+    }
+    assert!(seen > 0, "the switch drew no frame with the form open");
+    let last = marks
+        .iter()
+        .rev()
+        .find(|mark| mark.form_open)
+        .expect("a frame with the form open");
+    assert_eq!(
+        last.form_protocol,
+        Some(protocol),
+        "the switch ends on the form it asked for"
+    );
+}
+
+/// The bounds of the open host form's dialog, whichever modal it is drawn in.
+fn open_form_bounds(cx: &mut VisualTestContext) -> gpui::Bounds<Pixels> {
+    cx.debug_bounds("hosts.editor")
+        .or_else(|| cx.debug_bounds("connection.editor"))
+        .expect("the host form is drawn")
+}
+
+/// Whether the dialog's dimming was drawn with it.
+fn form_backdrop_drawn(cx: &mut VisualTestContext) -> bool {
+    cx.debug_bounds("hosts.editor.backdrop").is_some()
+        || cx.debug_bounds("connection.editor.backdrop").is_some()
+}
+
+/// The name and group the open form holds, whichever protocol it is for.
+fn typed_form_text(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> (String, String) {
+    cx.update(|_window, app| {
+        let state = view.read(app).hosts_state();
+        match (state.draft(), state.protocol_draft()) {
+            (Some(draft), _) => (
+                draft.text(crate::app::hosts::HostField::Name).to_owned(),
+                draft.text(crate::app::hosts::HostField::Group).to_owned(),
+            ),
+            (_, Some(draft)) => (
+                draft
+                    .text(crate::app::hosts::ConnectionFormField::Name)
+                    .to_owned(),
+                draft
+                    .text(crate::app::hosts::ConnectionFormField::Group)
+                    .to_owned(),
+            ),
+            (None, None) => panic!("no form is open"),
+        }
+    })
+}
+
+/// The address the open protocol form holds.
+fn addressed_text(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> String {
+    cx.update(|_window, app| {
+        view.read(app)
+            .hosts_state()
+            .protocol_draft()
+            .map(|draft| {
+                draft
+                    .text(crate::app::hosts::ConnectionFormField::Address)
+                    .to_owned()
+            })
+            .expect("a protocol form is open")
+    })
+}

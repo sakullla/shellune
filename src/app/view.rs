@@ -7019,6 +7019,9 @@ impl ShelluneView {
 
     fn open_host_fields(&mut self, cx: &mut Context<Self>) {
         self.jump_picker = None;
+        // The other protocol's fields belong to a form that is no longer drawn; a
+        // switch back to this one builds its fields afresh (R7).
+        self.protocol_fields = None;
         self.host_advanced = self
             .hosts
             .draft()
@@ -7238,6 +7241,10 @@ impl ShelluneView {
     /// Switches the open form to another protocol, keeping the name and group typed.
     fn switch_form_protocol(&mut self, protocol: ProtocolKind, cx: &mut Context<Self>) {
         self.hosts.switch_protocol(protocol);
+        // The form starts at its top: the dialog stays open through the switch, so its
+        // body keeps the scroll the old form had (R7).
+        self.host_body_scroll
+            .set_offset(gpui::point(px(0.0), px(0.0)));
         if self.hosts.is_editing_connection() {
             self.open_protocol_fields(cx);
         } else {
@@ -7251,6 +7258,10 @@ impl ShelluneView {
             self.protocol_fields = None;
             return;
         };
+        // The SSH form's fields belong to a form that is no longer drawn: keeping them
+        // alive would leave a hidden field holding the keyboard after a switch (R7).
+        self.host_fields = None;
+        self.host_connection_fields = None;
         let strings = self.strings();
         let text = |field: ConnectionFormField| draft.text(field).to_owned();
         let name = cx.new(|cx| {
@@ -11940,6 +11951,24 @@ impl ShelluneView {
         }
         self.scrim_exit
             .map(|key| components::modal_scrim_exit(window.viewport_size(), key))
+    }
+
+    /// What one frame drew of the host form, for the tests that prove the dialog is
+    /// never missing between two frames (R7).
+    #[cfg(test)]
+    fn record_frame(&self, forms_drawn: (bool, bool)) {
+        let marks = FrameMarks {
+            form_open: self.hosts.draft().is_some() || self.hosts.protocol_draft().is_some(),
+            host_dialog: forms_drawn.0,
+            connection_dialog: forms_drawn.1,
+            dimmed: self.modal_drawn.get(),
+            form_protocol: match (self.hosts.draft(), self.hosts.protocol_draft()) {
+                (Some(_), _) => Some(ProtocolKind::Ssh.wire_name()),
+                (_, Some(draft)) => Some(draft.protocol().wire_name()),
+                _ => None,
+            },
+        };
+        FRAME_MARKS.with(|frames| frames.borrow_mut().push(marks));
     }
 
     /// Closes whatever floats above the page, one layer at a time, and says whether
@@ -18668,11 +18697,18 @@ impl Render for ShelluneView {
             window.focus(&handle);
         }
         if std::mem::take(&mut self.focus_host_dialog) {
-            let handle = self
-                .host_fields
-                .as_ref()
-                // The address is the first thing the dialog asks for.
-                .map(|fields| fields.address.read(cx).focus_handle().clone());
+            // The address is the first thing either form asks for, and it has to be the
+            // one of the form that is open: focusing the SSH field while another
+            // protocol's form is up leaves the keyboard in a field nobody can see (R7).
+            let handle = if self.hosts.draft().is_some() {
+                self.host_fields
+                    .as_ref()
+                    .map(|fields| fields.address.read(cx).focus_handle().clone())
+            } else {
+                self.protocol_fields
+                    .as_ref()
+                    .map(|fields| fields.address.read(cx).focus_handle().clone())
+            };
             if let Some(handle) = handle {
                 self.remember_focus(window, cx);
                 window.focus(&handle);
@@ -19027,13 +19063,19 @@ impl Render for ShelluneView {
         // inside one can still defer its own right-click menu: gpui refuses a
         // deferred draw inside another. They are built before they are laid down,
         // so the window knows whether a dialog was drawn in this frame.
+        // The two host forms are built first so the frame they were drawn in can be
+        // recorded for the tests that check the dialog never goes missing (R7).
+        let host_dialog = self.host_dialog_overlay(window, cx);
+        let connection_dialog = self.connection_dialog_overlay(window, cx);
+        #[cfg(test)]
+        let forms_drawn = (host_dialog.is_some(), connection_dialog.is_some());
         let layers: Vec<Option<Div>> = vec![
             self.connection_overlay(window, cx),
             self.import_overlay(window, cx),
             self.tool_overlay(window, cx),
             self.batch_overlay(window, cx),
-            self.host_dialog_overlay(window, cx),
-            self.connection_dialog_overlay(window, cx),
+            host_dialog,
+            connection_dialog,
             self.group_dialog_overlay(window, cx),
             self.host_delete_overlay(window, cx),
             self.backup_overlay(window, cx),
@@ -19061,6 +19103,8 @@ impl Render for ShelluneView {
         // every floating layer: a menu or the palette opened while it fades is drawn
         // above it, at full strength, rather than dimmed by a dialog that is gone
         // (R5, R6). The toasts stay above everything, as they were.
+        #[cfg(test)]
+        self.record_frame(forms_drawn);
         let scrim_exit = self.settle_scrim_exit(window, cx);
         root.children(scrim_exit)
             .children(layers.into_iter().flatten())
@@ -19069,6 +19113,41 @@ impl Render for ShelluneView {
             .children(self.startup_crossfade())
             .into_any_element()
     }
+}
+
+/// What one frame drew of the host form (R7).
+///
+/// The window draws several frames while a form changes protocol - the click, the
+/// rebuilt fields and the focus that follows them. A frame in which the form is open
+/// but no dialog is drawn is the frame a person sees as a flash: the dimming goes out
+/// and the page shows through. Tests read this log instead of trying to photograph the
+/// transition.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameMarks {
+    /// Whether a host or connection form was open when the frame was laid out.
+    pub form_open: bool,
+    /// Whether the SSH host dialog was among the frame's layers.
+    pub host_dialog: bool,
+    /// Whether the other protocol's dialog was among the frame's layers.
+    pub connection_dialog: bool,
+    /// Whether the frame drew a modal, and so its dimming.
+    pub dimmed: bool,
+    /// The protocol the open form was for, when one was open.
+    pub form_protocol: Option<&'static str>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FRAME_MARKS: std::cell::RefCell<Vec<FrameMarks>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+/// The frames drawn since the last call, oldest first (R7).
+#[cfg(test)]
+pub(crate) fn take_frame_marks() -> Vec<FrameMarks> {
+    FRAME_MARKS.with(|frames| std::mem::take(&mut *frames.borrow_mut()))
 }
 
 /// A window-sized layer at the top-left of the root, for a dialog or a menu.

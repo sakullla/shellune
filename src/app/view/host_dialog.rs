@@ -35,6 +35,15 @@ use crate::app::theme::{self, Metrics, Tone, palette, radius, spacing};
 // A checkbox with its label is the shared component.
 use crate::app::components::checkbox;
 
+/// The modal both forms of the host editor are drawn in.
+///
+/// One dialog asks for a host, whichever protocol that host speaks: changing the
+/// protocol changes what the dialog asks, not which dialog is up. The id is therefore
+/// shared. GPUI keys the entrance animation by it, and a per-protocol id replayed the
+/// entrance on every switch - the dialog went transparent and slid eight pixels, which
+/// is seen as the whole window flashing (R7).
+const HOST_EDITOR_ID: &str = "hosts.editor";
+
 /// How many candidates the jump picker shows before its list scrolls.
 const JUMP_PICKER_ROWS: f32 = 6.0;
 
@@ -1186,7 +1195,7 @@ impl ShelluneView {
 
         Some(self.modal_with(
             window,
-            "hosts.editor",
+            HOST_EDITOR_ID,
             640.0,
             ModalContent {
                 header,
@@ -1682,7 +1691,7 @@ impl ShelluneView {
 
         Some(self.modal_with(
             window,
-            "connection.editor",
+            HOST_EDITOR_ID,
             640.0,
             ModalContent {
                 header,
