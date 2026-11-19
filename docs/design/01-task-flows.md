@@ -89,7 +89,7 @@
 | 错误说明原因并可行动 | 失败卡片 = 原因 + 建议下一步；能力缺失有明确提示 | `a_failed_section_stays_failed_after_the_primary_action_is_requested` |
 | 连接与文件操作不阻塞其他交互 | 导航与切换不依赖分区状态；分区状态是数据而非锁 | 模型测试：任意状态下导航可切换 |
 | 尊重各系统输入习惯 | Windows/Linux 用 Ctrl+1-4，macOS 用 ⌘1-4；快捷键标签随平台变化 | `shortcuts_follow_each_platform_convention` |
-| 显示缩放环境 | 文字大小 90%/100%/115% 三档，度量全部由同一 tokens 派生 | 最小窗口 + 最大字号下的布局测试 |
+| 显示缩放环境 | 文字大小 90%/100%/115% 三档，度量全部由同一 tokens 派生 | 窄窗口（720 宽）+ 115% 下的布局测试 |
 
 ## 4. 未纳入本次调研的输入
 

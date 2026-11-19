@@ -1873,13 +1873,13 @@ mod tests {
         let (regular_words, regular) =
             shaped_placeholder(cx, 1200.0, theme::Zoom::Regular, "Search");
         let (largest_words, largest) =
-            shaped_placeholder(cx, 1200.0, theme::Zoom::Largest, "Search");
+            shaped_placeholder(cx, 1200.0, theme::Zoom::Comfortable, "Search");
         assert_eq!(regular_words, "Search");
         assert_eq!(largest_words, "Search");
         let ratio = largest / regular;
         assert!(
-            (1.8..=2.2).contains(&ratio),
-            "the hint is {ratio}× as wide at 200% as at 100%"
+            (1.05..=1.25).contains(&ratio),
+            "the hint is {ratio}× as wide at 115% as at 100%"
         );
     }
 

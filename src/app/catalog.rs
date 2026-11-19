@@ -521,7 +521,7 @@ mod tests {
         for (appearance, zoom) in [
             (theme::Appearance::Dark, theme::Zoom::Regular),
             (theme::Appearance::Light, theme::Zoom::Regular),
-            (theme::Appearance::Dark, theme::Zoom::Largest),
+            (theme::Appearance::Light, theme::Zoom::Comfortable),
         ] {
             theme::set_appearance(appearance);
             let (_view, cx) = cx.add_window_view(move |_window, _cx| Catalog { zoom });

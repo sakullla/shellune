@@ -58,22 +58,35 @@ use crate::app::workspace::{
     AttentionKind, AttentionSettings, Failure, PrimaryOutcome, Recovery, Section, SectionState,
     SessionPhase, SessionStatus, SessionStep, Workspace, sanitize_diagnostic,
 };
-use crate::app::{
-    DEFAULT_WINDOW_SIZE, MIN_WINDOW_SIZE, ReopenChoice, ShelluneView, key_bindings, reopen_choice,
-};
+use crate::app::{DEFAULT_WINDOW_SIZE, ReopenChoice, ShelluneView, key_bindings, reopen_choice};
 
 fn design_window() -> Size<Pixels> {
     size(px(DEFAULT_WINDOW_SIZE.0), px(DEFAULT_WINDOW_SIZE.1))
 }
 
-fn minimum_window() -> Size<Pixels> {
-    size(px(MIN_WINDOW_SIZE.0), px(MIN_WINDOW_SIZE.1))
+/// A narrow window the user can still drag to; the product is validated at
+/// [`DEFAULT_WINDOW_SIZE`], and this keeps the layout honest below it.
+fn narrow_window() -> Size<Pixels> {
+    size(px(720.0), px(480.0))
+}
+
+/// Narrower than the regular text fits in: the top row folds to its compact form
+/// here, which is what the compact-row tests exercise now that 200% text is gone.
+fn compact_window() -> Size<Pixels> {
+    size(px(520.0), px(480.0))
+}
+
+/// A window narrower than the regular layout is designed for: half of it, a
+/// side-by-side pane, cannot hold the whole session bar, and the host dialog's
+/// three-field row folds to one column.
+fn tiny_window() -> Size<Pixels> {
+    size(px(440.0), px(480.0))
 }
 
 /// A window tall enough to show the whole settings page at once.
 ///
-/// The shortcut rows sit below the fold of the 720×480 minimum window, where a user
-/// reaches them by scrolling; a test that clicks them uses this instead.
+/// The shortcut rows sit below the fold of the regular window, where a user reaches
+/// them by scrolling; a test that clicks them uses this instead.
 fn tall_window() -> Size<Pixels> {
     size(px(DEFAULT_WINDOW_SIZE.0), px(2400.0))
 }
@@ -295,13 +308,13 @@ async fn the_top_bar_and_the_home_fit_inside_the_design_window(cx: &mut TestAppC
 #[gpui::test]
 async fn the_minimum_window_still_shows_the_top_bar_and_the_home(cx: &mut TestAppContext) {
     let (_view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
 
     let viewport = cx.update(|window, _app| window.viewport_size());
     assert_eq!(
         viewport,
-        minimum_window(),
+        narrow_window(),
         "the test window is not the design minimum"
     );
     for selector in TOP_BAR {
@@ -316,7 +329,7 @@ async fn one_step_of_text_size_is_115_percent_and_stays_inside_the_minimum_windo
     cx: &mut TestAppContext,
 ) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     focus_root(&view, cx);
     cx.dispatch_action(CycleTextSize);
     cx.run_until_parked();
@@ -339,16 +352,15 @@ async fn two_hundred_percent_chinese_keeps_every_page_inside_the_minimum_window(
 ) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     focus_root(&view, cx);
     cx.dispatch_action(ToggleLanguage);
-    cx.dispatch_action(CycleTextSize);
     cx.dispatch_action(CycleTextSize);
     cx.run_until_parked();
 
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
-        Zoom::Largest
+        Zoom::Comfortable
     );
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().locale()),
@@ -380,6 +392,33 @@ async fn two_hundred_percent_chinese_keeps_every_page_inside_the_minimum_window(
     }
 }
 
+/// A preferences file that records the size text used to have - 200% - comes back as
+/// 100%: the three sizes on offer are 90, 100 and 115, and a size no longer offered is
+/// not half-applied (R1).
+#[gpui::test]
+async fn a_two_hundred_percent_preference_comes_back_as_one_hundred(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let saved = shellune_storage::Preferences {
+        text_size: Some(200),
+        ..Default::default()
+    };
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.use_saved_preferences_for_test(&saved, cx)
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Regular,
+        "a size the interface no longer offers falls back to 100%"
+    );
+    // The file a restart would write records the size in force, so the old value does
+    // not come back on the next launch.
+    let written = cx.update(|_window, app| view.read(app).current_preferences_for_test());
+    assert_eq!(written.text_size, Some(100));
+}
+
 /// At the minimum window with the largest text, every settings page, the card it draws and
 /// every control in that card stay inside the window (R8, R16).
 ///
@@ -396,7 +435,7 @@ type SettingsRow<'a> = (&'static str, &'static str, &'a [&'static str]);
 type SettingsCategory<'a> = (&'static str, &'a [SettingsRow<'a>]);
 
 #[gpui::test]
-async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_percent(
+async fn every_settings_row_and_control_stays_inside_its_card_at_the_large_text(
     cx: &mut TestAppContext,
 ) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
@@ -408,12 +447,12 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
     // real minimum window still overflowed.
     assert_eq!(
         viewport,
-        minimum_window(),
+        narrow_window(),
         "the settings page is not being measured at the minimum window"
     );
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
-        Zoom::Largest
+        Zoom::Comfortable
     );
     let (metrics, theme_system, unbind_label) = cx.update(|_window, app| {
         let workspace = view.read(app).workspace();
@@ -472,12 +511,7 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
                 (
                     "text-size",
                     "settings.row.text-size",
-                    &[
-                        "settings.zoom.0",
-                        "settings.zoom.1",
-                        "settings.zoom.2",
-                        "settings.zoom.3",
-                    ][..],
+                    &["settings.zoom.0", "settings.zoom.1", "settings.zoom.2"][..],
                 ),
                 (
                     "motion",
@@ -696,15 +730,15 @@ fn card_selector(item: &'static str) -> &'static str {
     }
 }
 
-/// A control that is wider than its row wraps inside it rather than leaving the window
-/// (R8).
+/// A wide control stays inside its row and its card at the largest text (R8).
 ///
 /// The default-shell choice is the case the walkthrough caught: the names of the shells on
-/// this machine are wider than the row at 200% text, and the track used to keep its full
+/// this machine are the widest control on the page, and the track used to keep its full
 /// width - drawn past the row and past the window's right edge. The shells are fixed here so
-/// the test measures the layout and not the machine it runs on.
+/// the test measures the layout and not the machine it runs on. At 115% the track fits its
+/// row in one line; what has to hold is that it is inside the row and the card.
 #[gpui::test]
-async fn a_settings_control_wider_than_its_row_wraps_inside_it_at_two_hundred_percent(
+async fn a_settings_control_wider_than_its_row_stays_inside_it_at_the_large_text(
     cx: &mut TestAppContext,
 ) {
     let mut workspace = Workspace::new();
@@ -736,15 +770,13 @@ async fn a_settings_control_wider_than_its_row_wraps_inside_it_at_two_hundred_pe
         "the choice kept its width instead of shrinking to the row: {track:?} in {row:?}"
     );
 
-    // So the shells gain a line inside the same track: the first shell is on the first line
-    // and a later one below it, all of them inside the track and the card. Each segment is
-    // measured on its own: the track being inside the card says nothing about a segment that
-    // hangs over its edge.
+    // The shells share the track's one line, and each of them is measured on its own: the
+    // track being inside the card says nothing about a segment that hangs over its edge.
     let first = bounds_of(cx, "settings.shell.0");
     let later = bounds_of(cx, "settings.shell.1");
     assert!(
-        first.origin.y < later.origin.y,
-        "the shells stayed on one line instead of wrapping: {first:?} and {later:?}"
+        (first.origin.y - later.origin.y).abs() < px(1.0),
+        "the shells wrap at 115% instead of sharing the track's line: {first:?} and {later:?}"
     );
     let metrics = cx.update(|_window, app| view.read(app).workspace().metrics());
     for (selector, name) in [
@@ -774,7 +806,7 @@ async fn a_settings_control_wider_than_its_row_wraps_inside_it_at_two_hundred_pe
 /// row then holds a name column, the key and three buttons. The row wraps those parts instead
 /// of letting the buttons leave the window.
 #[gpui::test]
-async fn the_shortcut_rows_keep_their_keys_and_buttons_inside_the_minimum_window(
+async fn the_shortcut_rows_keep_their_keys_and_buttons_inside_the_narrow_window(
     cx: &mut TestAppContext,
 ) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
@@ -1084,7 +1116,7 @@ async fn the_minimum_window_reaches_every_settings_category_and_item_at_115_perc
 ) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     focus_root(&view, cx);
     cx.dispatch_action(ToggleLanguage);
     cx.dispatch_action(CycleTextSize);
@@ -1171,7 +1203,7 @@ fn show_settings_at_the_minimum_window_in_large_text(
     view: &Entity<ShelluneView>,
     cx: &mut VisualTestContext,
 ) {
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     focus_root(view, cx);
     cx.dispatch_action(ToggleLanguage);
     largest_text_size(view, cx);
@@ -1599,8 +1631,8 @@ fn set_look(
 /// The two sizes a wrapping line has to survive, in both languages (R1).
 fn empty_state_looks() -> [(Size<Pixels>, Zoom, Locale); 4] {
     [
-        (minimum_window(), Zoom::Largest, Locale::English),
-        (minimum_window(), Zoom::Largest, Locale::Chinese),
+        (narrow_window(), Zoom::Comfortable, Locale::English),
+        (narrow_window(), Zoom::Comfortable, Locale::Chinese),
         (design_window(), Zoom::Regular, Locale::English),
         (design_window(), Zoom::Regular, Locale::Chinese),
     ]
@@ -1678,10 +1710,10 @@ async fn an_empty_states_line_wraps_above_its_button_at_any_width(cx: &mut TestA
         (630.0, Zoom::Regular),
         (560.0, Zoom::Regular),
         (480.0, Zoom::Regular),
-        (1200.0, Zoom::Largest),
-        (900.0, Zoom::Largest),
-        (590.0, Zoom::Largest),
-        (360.0, Zoom::Largest),
+        (1200.0, Zoom::Comfortable),
+        (900.0, Zoom::Comfortable),
+        (590.0, Zoom::Comfortable),
+        (360.0, Zoom::Comfortable),
     ] {
         let (_view, cx) = cx.add_window_view(move |_window, _cx| EmptyStateHarness {
             width,
@@ -1750,10 +1782,10 @@ async fn a_state_cards_words_wrap_inside_their_own_boxes_at_any_width(cx: &mut T
         (760.0, Zoom::Regular),
         (620.0, Zoom::Regular),
         (420.0, Zoom::Regular),
-        (1600.0, Zoom::Largest),
-        (1200.0, Zoom::Largest),
-        (720.0, Zoom::Largest),
-        (420.0, Zoom::Largest),
+        (1600.0, Zoom::Comfortable),
+        (1200.0, Zoom::Comfortable),
+        (720.0, Zoom::Comfortable),
+        (420.0, Zoom::Comfortable),
     ] {
         let (_view, cx) = cx.add_window_view(move |_window, _cx| StateCardHarness {
             width,
@@ -2038,15 +2070,14 @@ fn text_size_steps_through_every_level_and_wraps() {
     assert_eq!(Zoom::default(), Zoom::Regular);
     assert_eq!(Zoom::Compact.next(), Zoom::Regular);
     assert_eq!(Zoom::Regular.next(), Zoom::Comfortable);
-    assert_eq!(Zoom::Comfortable.next(), Zoom::Largest);
-    assert_eq!(Zoom::Largest.next(), Zoom::Compact);
-    assert_eq!(Zoom::Largest.factor(), 2.0);
-    assert_eq!(Zoom::Largest.label(), "200%");
-    assert!(Zoom::Comfortable.factor() < Zoom::Largest.factor());
+    assert_eq!(Zoom::Comfortable.next(), Zoom::Compact);
+    assert_eq!(Zoom::Comfortable.factor(), 1.15);
+    assert_eq!(Zoom::Comfortable.label(), "115%");
+    assert!(Zoom::Compact.factor() < Zoom::Comfortable.factor());
 
-    let metrics = Metrics::new(Zoom::Largest);
-    assert!(metrics.body_size() > Metrics::new(Zoom::Comfortable).body_size());
-    assert!(metrics.rail_width() > Metrics::new(Zoom::Comfortable).rail_width());
+    let metrics = Metrics::new(Zoom::Comfortable);
+    assert!(metrics.body_size() > Metrics::new(Zoom::Regular).body_size());
+    assert!(metrics.rail_width() > Metrics::new(Zoom::Regular).rail_width());
 }
 
 // ---------------------------------------------------------------------------
@@ -4316,7 +4347,7 @@ async fn the_bar_says_which_of_the_two_has_the_keys(cx: &mut TestAppContext) {
 
     // The line naming the keys and the switches themselves stay inside the smallest
     // window, where the bar has the least room.
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
     let small = cx.update(|window, _app| window.viewport_size());
     assert_fits_inside(
@@ -4375,7 +4406,7 @@ async fn a_resize_recounts_the_matches_on_the_new_wrap(cx: &mut TestAppContext) 
     let (pane, cx) = pane_with("", cx);
     // The narrow width comes first, so the text is written at the width it is wrapped
     // at and the match below straddles a break rather than having to find one.
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
     let narrow = cx.update(|_window, app| pane.read(app).grid());
     assert!(narrow.cols > 8, "the narrow grid still has columns");
@@ -4459,19 +4490,18 @@ async fn the_find_bar_stays_inside_the_window_at_two_hundred_percent(cx: &mut Te
     let pane = cx
         .update(|_window, app| view.read(app).pane_of(id).cloned())
         .expect("the session has a terminal");
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     focus_root(&view, cx);
-    cx.dispatch_action(CycleTextSize);
     cx.dispatch_action(CycleTextSize);
     cx.run_until_parked();
     assert_eq!(
         cx.update(|window, _app| window.viewport_size()),
-        minimum_window(),
+        narrow_window(),
         "the bar is not being measured at the minimum window"
     );
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
-        Zoom::Largest
+        Zoom::Comfortable
     );
 
     click(cx, "terminal.search");
@@ -4647,7 +4677,7 @@ async fn a_find_bar_in_a_split_pane_stays_inside_its_pane(cx: &mut TestAppContex
     let pane = cx
         .update(|_window, app| view.read(app).pane_of(right).cloned())
         .expect("the split has two terminals");
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
     feed_session(cx, &view, right, b"needle line\r\n");
 
@@ -8337,7 +8367,7 @@ async fn a_rejected_hop_reason_and_its_next_step_fit_the_minimum_window(cx: &mut
     );
     let (view, cx) = hosts_view_with_trust(cx, &dir);
     click(cx, "hosts.connect.0");
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     largest_text_size(&view, cx);
     cx.update(|_window, app| {
         view.update(app, |view, cx| {
@@ -8560,7 +8590,7 @@ async fn a_real_ssh_session_opens_a_terminal_that_uses_the_shared_interactions(
     );
 
     // A window resize has to reach the server's pseudo terminal, not only the grid.
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
     cx.update(|_window, app| {
         pane.update(app, |pane, cx| {
@@ -11826,18 +11856,17 @@ async fn two_hundred_percent_file_columns_stay_inside_the_window(cx: &mut TestAp
     );
     focus_root(&view, cx);
     cx.dispatch_action(CycleTextSize);
-    cx.dispatch_action(CycleTextSize);
     cx.run_until_parked();
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
-        Zoom::Largest
+        Zoom::Comfortable
     );
 
-    // 720 and 1120 cannot hold two scaled columns plus a terminal. 2400 can:
-    // expanded rail 416 + two columns 1360 + terminal reserve 384 = 2160.
+    // 720 cannot hold two scaled columns plus a terminal; 1120 at 115% can. 2400
+    // holds them with room to spare.
     for (window, dual) in [
-        (minimum_window(), false),
-        (design_window(), false),
+        (narrow_window(), false),
+        (design_window(), true),
         (size(px(2400.0), px(900.0)), true),
     ] {
         cx.simulate_resize(window);
@@ -11866,7 +11895,7 @@ async fn two_hundred_percent_file_columns_stay_inside_the_window(cx: &mut TestAp
         }
     }
 
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
     click(cx, "files.show.local");
     let viewport = cx.update(|window, _app| window.viewport_size());
@@ -12727,12 +12756,14 @@ async fn the_scp_path_on_a_failed_listing_is_reached_by_scrolling_the_pane(
     );
     pump_files(cx, &view);
 
-    cx.simulate_resize(minimum_window());
+    // Narrow and short: the file pane is one slice tall and the failed card is taller
+    // than that slice, which is why the pane has to turn.
+    cx.simulate_resize(size(px(720.0), px(400.0)));
     cx.run_until_parked();
     largest_text_size(&view, cx);
     cx.run_until_parked();
 
-    let viewport = minimum_window();
+    let viewport = size(px(720.0), px(400.0));
     // The header's upload and download stay in the pane's own toolbar, so either
     // direction can be started without turning anything.
     for selector in ["files.upload", "files.download"] {
@@ -13120,7 +13151,7 @@ async fn the_failed_reads_typed_entries_are_reached_and_pressed_with_the_keyboar
 
     // The page is already as small and as large-typed as it gets, so the slice the entries
     // have to be reached in is the one measured below.
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
     largest_text_size(&view, cx);
     cx.run_until_parked();
@@ -13316,7 +13347,7 @@ async fn every_control_the_keyboard_stops_on_is_turned_into_its_column(cx: &mut 
     // shows, so every stop has to turn the column to its own row - not only the failed
     // card's two typed entries, which are the card's last rows.
     let (view, cx, _id, files, _transfers) = keyboard_remote(cx);
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
     largest_text_size(&view, cx);
     cx.run_until_parked();
@@ -14896,7 +14927,7 @@ async fn the_tab_list_control_appears_only_when_a_tab_is_out_of_sight(cx: &mut T
         return;
     };
     name_tabs(cx, &view, &["web", "db"]);
-    for viewport in [design_window(), minimum_window()] {
+    for viewport in [design_window(), narrow_window()] {
         cx.simulate_resize(viewport);
         cx.run_until_parked();
         assert!(
@@ -14944,11 +14975,11 @@ async fn the_tab_list_control_appears_only_when_a_tab_is_out_of_sight(cx: &mut T
     // reached.
     cx.update(|_window, app| {
         view.update(app, |view, cx| {
-            view.workspace_mut_for_test().set_zoom(Zoom::Largest);
+            view.workspace_mut_for_test().set_zoom(Zoom::Comfortable);
             cx.notify();
         });
     });
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(compact_window());
     cx.run_until_parked();
     assert!(cx.update(|_window, app| view.read(app).header_compact_for_test()));
     assert!(
@@ -14957,7 +14988,7 @@ async fn the_tab_list_control_appears_only_when_a_tab_is_out_of_sight(cx: &mut T
     );
     assert_fits_inside(
         bounds_of(cx, "tabs.list.open"),
-        minimum_window(),
+        compact_window(),
         "the all-tabs control",
     );
 }
@@ -15912,7 +15943,7 @@ async fn the_tab_list_shows_every_tab_and_switches_to_it(cx: &mut TestAppContext
         cx.update(|_window, app| view.read(app).active_session()),
         Some(tabs[1])
     );
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
     // The list is drawn once a tab is out of sight (R2).
     let viewport = crowd_the_strip(cx, &view);
@@ -16141,11 +16172,11 @@ async fn the_tab_name_dialog_and_the_tab_list_fit_the_smallest_window_at_large_t
     let Some((view, cx)) = two_shells(cx) else {
         return;
     };
-    let viewport = minimum_window();
+    let viewport = narrow_window();
     cx.simulate_resize(viewport);
     focus_root(&view, cx);
     for _ in 0..Zoom::ALL.len() {
-        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Comfortable {
             break;
         }
         cx.dispatch_action(CycleTextSize);
@@ -16153,7 +16184,7 @@ async fn the_tab_name_dialog_and_the_tab_list_fit_the_smallest_window_at_large_t
     }
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
-        Zoom::Largest,
+        Zoom::Comfortable,
         "the dialogs are measured at 200% text"
     );
 
@@ -16257,11 +16288,11 @@ async fn the_tab_identity_rows_stay_inside_their_cards_and_are_reached_by_scroll
 
     // The smallest window at the largest text: there is no room to spare anywhere, so a
     // row that does not wrap is a row that is drawn past the card that holds it.
-    let viewport = minimum_window();
+    let viewport = narrow_window();
     cx.simulate_resize(viewport);
     focus_root(&view, cx);
     for _ in 0..Zoom::ALL.len() {
-        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Comfortable {
             break;
         }
         cx.dispatch_action(CycleTextSize);
@@ -16411,7 +16442,7 @@ async fn a_restored_strip_of_named_tabs_stays_pending_and_whole(cx: &mut TestApp
     let (view, cx) = cx.add_window_view(move |_window, cx| {
         ShelluneView::with_store_and_trust(cx, Workspace::new(), store, trust)
     });
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
 
     // Nothing was started: every restored tab is waiting.
@@ -16455,7 +16486,7 @@ async fn a_restored_strip_of_named_tabs_stays_pending_and_whole(cx: &mut TestApp
 
     // The strip cannot show every tab at the smallest window, so the list is how all
     // of them stay reachable.
-    let viewport = minimum_window();
+    let viewport = narrow_window();
     assert_fits_inside(
         bounds_of(cx, "tabs.list.open"),
         viewport,
@@ -17781,7 +17812,13 @@ async fn the_jump_picker_scrolls_itself_into_the_smallest_dialog(cx: &mut TestAp
     focus_root(&view, cx);
     click(cx, "hosts.new");
     click(cx, "hosts.advanced");
-    set_look(&view, cx, minimum_window(), Zoom::Largest, Locale::Chinese);
+    set_look(
+        &view,
+        cx,
+        narrow_window(),
+        Zoom::Comfortable,
+        Locale::Chinese,
+    );
 
     // Scroll the form by hand until the button is on screen, the way a person reaches it.
     let inside = |cx: &mut VisualTestContext, selector: &'static str| {
@@ -18314,7 +18351,7 @@ async fn the_top_row_is_the_caption_and_keeps_its_buttons_inside_the_window(
     cx: &mut TestAppContext,
 ) {
     let (_view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
     assert!(
         cx.debug_bounds("header.drag").is_some() && cx.debug_bounds("brand.drag").is_some(),
@@ -18322,11 +18359,11 @@ async fn the_top_row_is_the_caption_and_keeps_its_buttons_inside_the_window(
     );
     if Platform::current() == Platform::Windows {
         for button in ["window.minimize", "window.maximize", "window.close"] {
-            assert_fits_inside(bounds_of(cx, button), minimum_window(), button);
+            assert_fits_inside(bounds_of(cx, button), narrow_window(), button);
         }
         assert_fits_inside(
             bounds_of(cx, "header.primary"),
-            minimum_window(),
+            narrow_window(),
             "the main action beside the window buttons",
         );
     }
@@ -19153,14 +19190,13 @@ async fn a_narrow_split_keeps_its_pane_heads_buttons_inside_the_pane(cx: &mut Te
         });
     });
     cx.run_until_parked();
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     focus_root(&view, cx);
-    cx.dispatch_action(CycleTextSize);
     cx.dispatch_action(CycleTextSize);
     cx.run_until_parked();
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
-        Zoom::Largest
+        Zoom::Comfortable
     );
 
     // At 720x480 and 200% text a side-by-side pane is narrower than its head: the
@@ -20045,7 +20081,7 @@ async fn icon_controls_keep_a_24_by_24_pointer_target_at_the_smallest_text_size(
     cx: &mut TestAppContext,
 ) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     smallest_text_size(&view, cx);
     click(cx, "nav.settings");
     click(cx, "settings.category.terminal");
@@ -20089,7 +20125,7 @@ fn smallest_text_size(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) {
 fn largest_text_size(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) {
     focus_root(view, cx);
     for _ in 0..Zoom::ALL.len() {
-        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Comfortable {
             break;
         }
         cx.dispatch_action(CycleTextSize);
@@ -20097,7 +20133,7 @@ fn largest_text_size(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) {
     }
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
-        Zoom::Largest
+        Zoom::Comfortable
     );
 }
 
@@ -20170,7 +20206,7 @@ async fn the_session_bar_and_file_row_controls_are_pointer_targets_too(cx: &mut 
     // too: this is where a fixed width would have left the entry covered.
     focus_root(&view, cx);
     for _ in 0..Zoom::ALL.len() {
-        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Comfortable {
             break;
         }
         cx.dispatch_action(CycleTextSize);
@@ -20178,14 +20214,14 @@ async fn the_session_bar_and_file_row_controls_are_pointer_targets_too(cx: &mut 
     }
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
-        Zoom::Largest,
+        Zoom::Comfortable,
         "the file row is measured at 200% text"
     );
     assert_file_actions_keep_their_column(cx);
 
     // And at the smallest window with that text, where the row has the least room to
     // give: the four targets still fit inside it.
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
     assert_file_actions_keep_their_column(cx);
 }
@@ -20506,12 +20542,11 @@ async fn two_hundred_percent_chinese_settings_shortcuts_stay_inside_the_window(
     cx: &mut TestAppContext,
 ) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
-    // The minimum width, with the room the rows need to be laid out: the point is
+    // A narrow width, with the room the rows need to be laid out: the point is
     // that nothing is wider than the window, not how far the page scrolls.
-    cx.simulate_resize(size(px(MIN_WINDOW_SIZE.0), px(2400.0)));
+    cx.simulate_resize(size(px(720.0), px(2400.0)));
     focus_root(&view, cx);
     cx.dispatch_action(ToggleLanguage);
-    cx.dispatch_action(CycleTextSize);
     cx.dispatch_action(CycleTextSize);
     cx.run_until_parked();
     cx.dispatch_action(crate::app::actions::GoToSettings);
@@ -20519,7 +20554,7 @@ async fn two_hundred_percent_chinese_settings_shortcuts_stay_inside_the_window(
     assert_eq!(destination_of(&view, cx), Destination::Settings);
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
-        Zoom::Largest
+        Zoom::Comfortable
     );
     click(cx, "settings.category.keys");
     let viewport = cx.update(|window, _app| window.viewport_size());
@@ -21477,9 +21512,9 @@ async fn a_tab_keeps_its_dot_title_and_close_inside_itself_at_any_width(cx: &mut
     // the list of every tab beside it to reach the other one.
     for (viewport, zoom) in [
         (design_window(), Zoom::Regular),
-        (minimum_window(), Zoom::Regular),
-        (design_window(), Zoom::Largest),
-        (minimum_window(), Zoom::Largest),
+        (narrow_window(), Zoom::Regular),
+        (design_window(), Zoom::Comfortable),
+        (compact_window(), Zoom::Comfortable),
     ] {
         cx.update(|_window, app| {
             view.update(app, |view, cx| {
@@ -21493,8 +21528,8 @@ async fn a_tab_keeps_its_dot_title_and_close_inside_itself_at_any_width(cx: &mut
         let compact = cx.update(|_window, app| view.read(app).header_compact_for_test());
         assert_eq!(
             compact,
-            viewport == minimum_window() && zoom == Zoom::Largest,
-            "only 720x480 at 200% needs the compact row ({viewport:?}, {zoom:?})"
+            viewport == compact_window() && zoom == Zoom::Comfortable,
+            "only a window narrower than the full row needs the compact form ({viewport:?}, {zoom:?})"
         );
         let min = cx.update(|_window, app| view.read(app).tab_min_width_for_test());
         assert_hosts_tab_whole(cx, viewport);
@@ -21628,17 +21663,19 @@ async fn the_top_rows_notices_never_cut_the_current_tab(cx: &mut TestAppContext)
         return;
     };
     let tall = |width: f32| size(px(width), px(720.0));
-    // The widths around the row's thresholds at 200%: the smallest window, where the
-    // row is compact anyway; just past the full row's own threshold, where one notice
-    // used to cut the current tab; the design window; and room enough for the words.
+    // The widths around the row's thresholds: below the full row's width, where the
+    // row is compact and folds its notices; the narrow window at both text sizes, where
+    // a notice is an icon; the width just past the full row's own threshold, where one
+    // notice used to cut the current tab; the design window; and room for the words.
     let cases = [
-        (minimum_window(), Zoom::Regular),
-        (minimum_window(), Zoom::Largest),
-        (tall(1080.0), Zoom::Largest),
-        (tall(1140.0), Zoom::Largest),
-        (design_window(), Zoom::Largest),
-        (tall(1200.0), Zoom::Largest),
-        (tall(1920.0), Zoom::Largest),
+        (tall(680.0), Zoom::Comfortable),
+        (narrow_window(), Zoom::Regular),
+        (narrow_window(), Zoom::Comfortable),
+        (tall(1080.0), Zoom::Comfortable),
+        (tall(1140.0), Zoom::Comfortable),
+        (design_window(), Zoom::Comfortable),
+        (tall(1200.0), Zoom::Comfortable),
+        (tall(1920.0), Zoom::Comfortable),
     ];
 
     // A newer release alone, then with a failed sync beside it: each notice the row
@@ -21674,8 +21711,13 @@ async fn the_top_rows_notices_never_cut_the_current_tab(cx: &mut TestAppContext)
                 compact,
                 "a compact row and only it folds the notices ({viewport:?}, {zoom:?})"
             );
-            if viewport == minimum_window() && zoom == Zoom::Largest {
-                assert_eq!(form, "folded", "720x480 at 200% has no room for a notice");
+            // One notice at the narrow window still leaves the full row: its words do
+            // not fit, so it is an icon. Two fold it into the controls instead.
+            if viewport == narrow_window() && zoom == Zoom::Comfortable && !compact {
+                assert_eq!(
+                    form, "icon",
+                    "the full row shows a notice as an icon when its words do not fit"
+                );
             }
             forms.push(form);
             assert_current_tab_whole_beside_notices(cx, &view, viewport, zoom, form);
@@ -21713,11 +21755,11 @@ async fn the_top_rows_notices_never_cut_the_current_tab(cx: &mut TestAppContext)
         // sync settings for a failed sync, else the update card.
         cx.update(|_window, app| {
             view.update(app, |view, cx| {
-                view.workspace_mut_for_test().set_zoom(Zoom::Largest);
+                view.workspace_mut_for_test().set_zoom(Zoom::Comfortable);
                 cx.notify();
             });
         });
-        cx.simulate_resize(minimum_window());
+        cx.simulate_resize(tall(680.0));
         cx.run_until_parked();
         assert!(cx.update(|_window, app| view.read(app).header_compact_for_test()));
         click(cx, "nav.settings");
@@ -21736,8 +21778,8 @@ async fn the_top_rows_notices_never_cut_the_current_tab(cx: &mut TestAppContext)
         assert_current_tab_whole_beside_notices(
             cx,
             &view,
-            minimum_window(),
-            Zoom::Largest,
+            narrow_window(),
+            Zoom::Comfortable,
             "folded",
         );
     }
@@ -21754,7 +21796,7 @@ async fn twenty_tabs_scroll_and_leave_the_window_buttons_reachable(cx: &mut Test
     let tabs = cx.update(|_window, app| view.read(app).open_tabs());
     assert_eq!(tabs.len(), 20, "twenty tabs are open");
 
-    for viewport in [design_window(), minimum_window()] {
+    for viewport in [design_window(), narrow_window()] {
         cx.simulate_resize(viewport);
         cx.run_until_parked();
         // The newest tab is the current one and the strip has brought it into view; the
@@ -21806,11 +21848,11 @@ async fn twenty_tabs_scroll_and_leave_the_window_buttons_reachable(cx: &mut Test
     // window buttons stay inside the window and take the pointer.
     cx.update(|_window, app| {
         view.update(app, |view, cx| {
-            view.workspace_mut_for_test().set_zoom(Zoom::Largest);
+            view.workspace_mut_for_test().set_zoom(Zoom::Comfortable);
             cx.notify();
         });
     });
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(compact_window());
     cx.run_until_parked();
     assert!(cx.update(|_window, app| view.read(app).header_compact_for_test()));
     assert!(cx.update(|_window, app| view.read(app).tab_list_control_shown_for_test()));
@@ -21820,19 +21862,19 @@ async fn twenty_tabs_scroll_and_leave_the_window_buttons_reachable(cx: &mut Test
         (false, false),
         "the compact strip hides nothing past its ends: it shows one tab"
     );
-    assert_hosts_tab_whole(cx, minimum_window());
+    assert_hosts_tab_whole(cx, compact_window());
     for selector in [
         "tabs.list.open",
         "header.primary",
         "palette.open",
         "nav.settings",
     ] {
-        assert_fits_inside(bounds_of(cx, selector), minimum_window(), selector);
+        assert_fits_inside(bounds_of(cx, selector), compact_window(), selector);
         assert_pointer_target(cx, selector);
     }
     if Platform::current() == Platform::Windows {
         for selector in ["window.minimize", "window.maximize", "window.close"] {
-            assert_fits_inside(bounds_of(cx, selector), minimum_window(), selector);
+            assert_fits_inside(bounds_of(cx, selector), narrow_window(), selector);
             assert_pointer_target(cx, selector);
         }
     }
@@ -21898,13 +21940,13 @@ async fn the_tab_list_keeps_the_marks_readable_in_the_smallest_window_at_large_t
         return;
     };
     let background = cx.update(|_window, app| view.read(app).open_tabs())[0];
-    let viewport = minimum_window();
+    let viewport = compact_window();
     // The marks are first read on the strip of the design window, the narrowest that
     // still draws every tab at this size.
     cx.simulate_resize(design_window());
     focus_root(&view, cx);
     for _ in 0..Zoom::ALL.len() {
-        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Comfortable {
             break;
         }
         cx.dispatch_action(CycleTextSize);
@@ -22706,10 +22748,10 @@ async fn the_shortcut_command_dialog_stays_inside_the_minimum_window_at_200_perc
         "cargo fmt\ncargo test --workspace",
     );
     let (view, cx) = snippet_view(cx, &dir);
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     focus_root(&view, cx);
     for _ in 0..Zoom::ALL.len() {
-        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Comfortable {
             break;
         }
         cx.dispatch_action(CycleTextSize);
@@ -22843,10 +22885,10 @@ async fn a_saved_command_row_keeps_a_readable_preview_and_reaches_its_buttons_at
         "cargo fmt\ncargo test --workspace",
     );
     let (view, cx) = snippet_view(cx, &dir);
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     focus_root(&view, cx);
     for _ in 0..Zoom::ALL.len() {
-        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Comfortable {
             break;
         }
         cx.dispatch_action(CycleTextSize);
@@ -22956,10 +22998,10 @@ async fn the_palette_reaches_the_saved_command_rows_in_the_minimum_window_at_200
         "cargo fmt\ncargo test --workspace",
     );
     let (view, cx) = snippet_view(cx, &dir);
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     focus_root(&view, cx);
     for _ in 0..Zoom::ALL.len() {
-        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Comfortable {
             break;
         }
         cx.dispatch_action(CycleTextSize);
@@ -23344,14 +23386,12 @@ async fn the_session_bar_says_what_x11_forwarding_is_doing(cx: &mut TestAppConte
 ///
 /// The chip sits at the right of the session bar, after the identity and the target, in
 /// the same row as the buttons that belong to the session; the banner that repeats the
-/// reason and the next step hangs under that row. At 720×480 with 200% text the row has
-/// no room to spare, so this measures that neither the state nor the text a keyboard user
-/// reads instead of the tooltip is pushed past the window's edge, and that the session's
-/// own close button stays inside it too.
+/// reason and the next step hangs under that row. In a narrow window at the large text
+/// the row has no room to spare, so this measures that neither the state nor the text a
+/// keyboard user reads instead of the tooltip is pushed past the window's edge, and that
+/// the session's own close button stays inside it too.
 #[gpui::test]
-async fn the_x11_state_and_its_reason_stay_inside_the_minimum_window_at_two_hundred_percent(
-    cx: &mut TestAppContext,
-) {
+async fn the_x11_state_and_its_reason_stay_inside_the_narrow_window(cx: &mut TestAppContext) {
     let (view, cx, _dir) =
         dialog_view(cx, vec![stored_host("web", "127.0.0.1", 1, "deploy", None)]);
     click(cx, "hosts.connect.0");
@@ -23393,10 +23433,12 @@ async fn the_x11_state_and_its_reason_stay_inside_the_minimum_window_at_two_hund
         "the explanation scrolled in a window that has room for all of it"
     );
 
-    cx.simulate_resize(minimum_window());
+    // Narrow: the bar has no room to spare, and the notice box still gets the share of
+    // the window its rule allows.
+    cx.simulate_resize(narrow_window());
     focus_root(&view, cx);
     for _ in 0..Zoom::ALL.len() {
-        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Comfortable {
             break;
         }
         cx.dispatch_action(CycleTextSize);
@@ -23404,8 +23446,8 @@ async fn the_x11_state_and_its_reason_stay_inside_the_minimum_window_at_two_hund
     }
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
-        Zoom::Largest,
-        "200% text is what this measures"
+        Zoom::Comfortable,
+        "115% text is what this measures"
     );
 
     let viewport = cx.update(|window, _app| window.viewport_size());
@@ -23443,7 +23485,7 @@ async fn the_x11_state_and_its_reason_stay_inside_the_minimum_window_at_two_hund
     // screen holds its opening and the rest of it, like the reason behind it, is reached by
     // scrolling. `assert_inside_box` only compares the width; the height a reader gets
     // before scrolling is what `first_screen` below measures.
-    let one_line = Metrics::new(Zoom::Largest).label_size();
+    let one_line = Metrics::new(Zoom::Comfortable).label_size();
     // The banner's own padding is the only thing above it, so the next step is the first
     // text in the box rather than something the reason was put in front of.
     assert!(
@@ -23457,11 +23499,11 @@ async fn the_x11_state_and_its_reason_stay_inside_the_minimum_window_at_two_hund
     );
     let first_screen = (boxed.origin.y + boxed.size.height).min(next.origin.y + next.size.height)
         - next.origin.y.max(boxed.origin.y);
-    // The first screen has to hold a usable opening of the direction — four of its lines at
+    // The first screen has to hold a usable opening of the direction — three of its lines at
     // this size, which is more than the single line a one-line direction needs — for putting
     // it first to mean anything to a reader who cannot scroll.
     assert!(
-        first_screen >= one_line * 4.0,
+        first_screen >= one_line * 3.0,
         "the next step shows too little before any scrolling: \
          {first_screen:?} of {one_line:?} per line in {boxed:?}"
     );
@@ -23532,10 +23574,10 @@ async fn the_short_x11_reason_stays_on_the_first_screen_at_two_hundred_percent(
     cx.run_until_parked();
     cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
     cx.run_until_parked();
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     focus_root(&view, cx);
     for _ in 0..Zoom::ALL.len() {
-        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Comfortable {
             break;
         }
         cx.dispatch_action(CycleTextSize);
@@ -23590,10 +23632,10 @@ async fn a_failed_transfer_shows_its_reason_and_retry_in_the_minimum_window(
         },
     });
     pump_files(cx, &view);
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     largest_text_size(&view, cx);
     cx.run_until_parked();
-    let viewport = minimum_window();
+    let viewport = narrow_window();
     let strip = bounds_of(cx, "files.transfers");
     assert_fits_inside(strip, viewport, "the transfer strip");
     assert_transfer_title_clears_the_scroll_clip(cx);
@@ -23688,7 +23730,7 @@ async fn a_transfer_failure_stays_whole_while_x11_failed_at_two_hundred_percent(
         },
     });
     pump_files(cx, &view);
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     largest_text_size(&view, cx);
     cx.run_until_parked();
     assert!(
@@ -23806,7 +23848,7 @@ async fn a_window_that_widens_and_narrows_again_keeps_the_source_and_both_paths(
     );
 
     // Narrow again: the same side, the same two paths.
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
     assert!(cx.debug_bounds("files.layout.single").is_some());
     assert!(
@@ -23859,12 +23901,11 @@ async fn a_deep_path_is_drawn_inside_its_column_at_two_hundred_percent(cx: &mut 
 
     focus_root(&view, cx);
     cx.dispatch_action(CycleTextSize);
-    cx.dispatch_action(CycleTextSize);
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
-        Zoom::Largest
+        Zoom::Comfortable
     );
 
     // The path is one segment per folder, and every segment stays inside the column:
@@ -23906,7 +23947,6 @@ async fn a_deep_path_is_drawn_inside_its_column_at_two_hundred_percent(cx: &mut 
 
     // At the design window the whole path is readable: every segment is inside the
     // column, the last one included - which is the part a reader looks for (R6).
-    cx.dispatch_action(CycleTextSize);
     cx.dispatch_action(CycleTextSize);
     cx.simulate_resize(design_window());
     cx.run_until_parked();
@@ -24391,7 +24431,7 @@ async fn the_narrow_window_folds_the_sidebar_and_still_reaches_the_groups(cx: &m
     let dir = TempDir::new("scale-narrow");
     let store = dir.store();
     seed_many(&store, 40);
-    let (view, cx) = hosts_view_at(cx, store, minimum_window());
+    let (view, cx) = hosts_view_at(cx, store, narrow_window());
 
     assert!(
         cx.update(|_window, app| view.read(app).home_sidebar_folded()),
@@ -24502,7 +24542,7 @@ async fn the_minimum_window_keeps_the_filter_and_its_menu_inside(cx: &mut TestAp
     let dir = TempDir::new("status-narrow");
     let store = dir.store();
     seed_many(&store, 12);
-    let (_view, cx) = hosts_view_at(cx, store, minimum_window());
+    let (_view, cx) = hosts_view_at(cx, store, narrow_window());
     let viewport = cx.update(|window, _app| window.viewport_size());
     let toolbar = bounds_of(cx, "hosts.toolbar");
     let filter = bounds_of(cx, "hosts.filter");
@@ -25436,7 +25476,7 @@ async fn the_batch_dialog_fits_the_minimum_window(cx: &mut TestAppContext) {
     let dir = TempDir::new("batch-minimum");
     seed(&dir.store(), batch_hosts());
     let (view, cx) = hosts_view(cx, dir.store());
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
     preview_batch(cx, &view, 3);
     write_commands(cx, &["uptime"]);
@@ -25444,7 +25484,7 @@ async fn the_batch_dialog_fits_the_minimum_window(cx: &mut TestAppContext) {
     // The dialog is smaller than the window it sits in, and its own body scrolls, so
     // nothing of it is drawn past the client edge at 720x480 (R8).
     let dialog = bounds_of(cx, "batch.dialog");
-    assert_fits_inside(dialog, minimum_window(), "the batch dialog");
+    assert_fits_inside(dialog, narrow_window(), "the batch dialog");
     for selector in [
         "batch.targets.count",
         "batch.step.field.0",
@@ -26062,7 +26102,7 @@ async fn the_task_centre_fits_the_minimum_window_and_speaks_both_languages(
     ));
     seed_task(&dir.store(), task);
     let (view, cx) = hosts_view(cx, dir.store());
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
 
     focus_root(&view, cx);
@@ -26081,7 +26121,7 @@ async fn the_task_centre_fits_the_minimum_window_and_speaks_both_languages(
         });
         cx.run_until_parked();
         let dialog = bounds_of(cx, "batch.library");
-        assert_fits_inside(dialog, minimum_window(), "the library dialog");
+        assert_fits_inside(dialog, narrow_window(), "the library dialog");
         for selector in ["batch.switch", "batch.library.row.0", "batch.library.new"] {
             assert!(
                 cx.debug_bounds(selector).is_some(),
@@ -26094,7 +26134,7 @@ async fn the_task_centre_fits_the_minimum_window_and_speaks_both_languages(
         });
         cx.run_until_parked();
         let dialog = bounds_of(cx, "batch.history");
-        assert_fits_inside(dialog, minimum_window(), "the history dialog");
+        assert_fits_inside(dialog, narrow_window(), "the history dialog");
         for selector in [
             "batch.switch",
             "batch.history.empty",
@@ -26567,15 +26607,14 @@ async fn two_hundred_percent_chinese_keeps_the_task_centre_inside_the_minimum_wi
             .is_some_and(crate::app::batch::BatchRunPage::is_finished)
     }));
 
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     focus_root(&view, cx);
     cx.dispatch_action(ToggleLanguage);
-    cx.dispatch_action(CycleTextSize);
     cx.dispatch_action(CycleTextSize);
     cx.run_until_parked();
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
-        Zoom::Largest
+        Zoom::Comfortable
     );
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().locale()),
@@ -26590,7 +26629,7 @@ async fn two_hundred_percent_chinese_keeps_the_task_centre_inside_the_minimum_wi
     cx.run_until_parked();
     assert_fits_inside(
         bounds_of(cx, "batch.library"),
-        minimum_window(),
+        narrow_window(),
         "the library dialog at 200% in Chinese",
     );
     for selector in ["batch.switch", "batch.library.row.0", "batch.library.new"] {
@@ -26606,7 +26645,7 @@ async fn two_hundred_percent_chinese_keeps_the_task_centre_inside_the_minimum_wi
     cx.run_until_parked();
     assert_fits_inside(
         bounds_of(cx, "batch.history"),
-        minimum_window(),
+        narrow_window(),
         "the history dialog at 200% in Chinese",
     );
     for selector in ["batch.switch", "batch.history.row.0"] {
@@ -26622,7 +26661,7 @@ async fn two_hundred_percent_chinese_keeps_the_task_centre_inside_the_minimum_wi
     cx.run_until_parked();
     assert_fits_inside(
         bounds_of(cx, "batch.history"),
-        minimum_window(),
+        narrow_window(),
         "the history detail at 200% in Chinese",
     );
     for selector in [
@@ -31717,10 +31756,10 @@ async fn terminal_scrollback_jump_pill_select_all_and_font_reset_work_end_to_end
 }
 
 #[gpui::test]
-async fn minimum_window_at_two_hundred_percent_keeps_hosts_row_and_actions_within_bounds(
+async fn narrow_window_at_comfortable_text_keeps_hosts_row_and_actions_within_bounds(
     cx: &mut TestAppContext,
 ) {
-    let dir = TempDir::new("min-window-hosts-200");
+    let dir = TempDir::new("regular-window-hosts");
     seed(
         &dir.store(),
         vec![stored_host(
@@ -31739,24 +31778,20 @@ async fn minimum_window_at_two_hundred_percent_keeps_hosts_row_and_actions_withi
         ShelluneView::with_store_and_trust(cx, workspace, store, trust)
     });
     cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     focus_root(&view, cx);
     cx.dispatch_action(ToggleLanguage);
     cx.dispatch_action(CycleTextSize);
     cx.dispatch_action(CycleTextSize);
     click(cx, "nav.hosts");
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
 
     let viewport = cx.update(|window, _app| window.viewport_size());
     let row = bounds_of(cx, "hosts.row.0");
     let connect = bounds_of(cx, "hosts.connect.0");
-    assert_within_width(row, viewport, "hosts.row.0 at 720x480 @ 200%");
-    assert_within_width(connect, viewport, "hosts.connect.0 at 720x480 @ 200%");
-    assert!(
-        cx.debug_bounds("hosts.duplicate.0").is_none(),
-        "narrow 200% viewport hides inline duplicate icon so primary actions never overflow"
-    );
+    assert_within_width(row, viewport, "hosts.row.0 at 1120x720 @ 115%");
+    assert_within_width(connect, viewport, "hosts.connect.0 at 1120x720 @ 115%");
 }
 
 // ---------------------------------------------------------------------------
@@ -32759,15 +32794,14 @@ async fn the_minimum_window_at_two_hundred_percent_keeps_the_search_and_the_list
         ShelluneView::with_store_and_trust(cx, workspace, store, trust)
     });
     cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     focus_root(&view, cx);
     cx.dispatch_action(ToggleLanguage);
-    cx.dispatch_action(CycleTextSize);
     cx.dispatch_action(CycleTextSize);
     cx.run_until_parked();
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
-        Zoom::Largest
+        Zoom::Comfortable
     );
     assert!(
         cx.update(|_window, app| view.read(app).home_sidebar_folded()),
@@ -35476,13 +35510,14 @@ async fn the_terminal_bar_keeps_files_split_search_and_more_and_its_tools_are_in
     );
 
     // 720x480 at 200%: the bar follows the text size and still holds its line.
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     largest_text_size(&view, cx);
     cx.run_until_parked();
     let bar = bounds_of(cx, "terminal.bar");
+    let bar_floor = Metrics::new(Zoom::Comfortable).scale(crate::app::terminal::SHELL_BAR_HEIGHT);
     assert!(
-        bar.size.height >= px(crate::app::terminal::SHELL_BAR_HEIGHT * 2.0) - px(0.5),
-        "the bar follows the text size: {bar:?}"
+        bar.size.height >= bar_floor - px(0.5),
+        "the bar follows the text size: {bar:?}, floor {bar_floor:?}"
     );
     assert_bar_controls_inside(cx, &drawn_bar_controls(true));
     assert_pointer_target(cx, "terminal.search");
@@ -35577,7 +35612,7 @@ async fn a_dropped_session_states_itself_in_a_banner_above_its_last_screen(
         "{row:?} under {banner:?}"
     );
 
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     largest_text_size(&view, cx);
     cx.run_until_parked();
     let viewport = cx.update(|window, _app| window.viewport_size());
@@ -35767,7 +35802,7 @@ async fn a_long_diagnostic_unfolds_under_the_banner_scrolls_and_copies(cx: &mut 
         "the copy takes the whole diagnostic: {copied:?}"
     );
 
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     largest_text_size(&view, cx);
     cx.run_until_parked();
     let viewport = cx.update(|window, _app| window.viewport_size());
@@ -35928,7 +35963,7 @@ async fn unfolded_details_leave_rows_of_the_last_screen_in_a_short_pane(cx: &mut
         .collect::<Vec<_>>()
         .join("\n");
     lose_pane_with(&view, cx, id, &long);
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     largest_text_size(&view, cx);
     cx.run_until_parked();
     click(cx, "terminal.failure.details");
@@ -35960,11 +35995,11 @@ async fn the_one_compact_tab_shows_four_letters_of_its_name(cx: &mut TestAppCont
     let id = live_remote(cx, &view);
     cx.update(|_window, app| {
         view.update(app, |view, cx| {
-            view.workspace_mut_for_test().set_zoom(Zoom::Largest);
+            view.workspace_mut_for_test().set_zoom(Zoom::Comfortable);
             cx.notify();
         });
     });
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(compact_window());
     cx.run_until_parked();
     redraw(cx);
     assert!(cx.update(|_window, app| view.read(app).header_compact_for_test()));
@@ -36084,7 +36119,7 @@ fn an_ended_shell_card_reaches_its_step(cx: &mut TestAppContext, split: Option<S
     let layout = format!("{split:?}");
     for (what, small) in [("at the design size", false), ("at 720x480 and 200%", true)] {
         if small {
-            cx.simulate_resize(minimum_window());
+            cx.simulate_resize(narrow_window());
             largest_text_size(&view, cx);
             cx.run_until_parked();
         }
@@ -36201,9 +36236,9 @@ fn bar_entry_selector(control: &'static str) -> &'static str {
     }
 }
 
-/// In a side-by-side split at 720x480 and 200%, the session's menu stays on the bar's
-/// line, and every control of the session that the bar had no room for is in that
-/// menu, where it still does what it does on the bar (R3, R9).
+/// In a side-by-side split of a narrow window at the largest text, the session's menu
+/// stays on the bar's line, and every control of the session that the bar had no room
+/// for is in that menu, where it still does what it does on the bar (R3, R9).
 #[gpui::test]
 async fn a_narrow_split_bar_keeps_the_session_menu_and_offers_what_it_hides_there(
     cx: &mut TestAppContext,
@@ -36242,7 +36277,9 @@ async fn a_narrow_split_bar_keeps_the_session_menu_and_offers_what_it_hides_ther
     cx.run_until_parked();
     assert!(!cx.update(|_window, app| view.read(app).session_more_open()));
 
-    cx.simulate_resize(minimum_window());
+    // The window can be dragged narrower than the old 720 minimum, and the split keeps
+    // half of it: 440 wide is where the pane's bar still has controls it cannot fit.
+    cx.simulate_resize(tiny_window());
     largest_text_size(&view, cx);
     cx.run_until_parked();
     redraw(cx);
@@ -36271,7 +36308,7 @@ async fn a_narrow_split_bar_keeps_the_session_menu_and_offers_what_it_hides_ther
     );
     assert!(
         !left_out.is_empty(),
-        "at 720x480 and 200% a side-by-side pane has no room for every control"
+        "a narrow side-by-side pane has no room for every control"
     );
     assert!(
         left_out.contains(&"pane.split.down"),
@@ -36419,7 +36456,9 @@ async fn a_state_card_in_a_short_pane_starts_at_its_top_and_scrolls_under_the_wh
     cx.update(|_window, app| view.update(app, |view, cx| view.activate(lower, cx)));
     cx.run_until_parked();
 
-    cx.simulate_resize(minimum_window());
+    // Shorter than the compact window: the pane the card is drawn in has to be
+    // shorter than the card for the card to be read by turning.
+    cx.simulate_resize(size(px(520.0), px(380.0)));
     largest_text_size(&view, cx);
     cx.run_until_parked();
 
@@ -36467,7 +36506,7 @@ async fn the_host_dialog_is_the_shared_dialog_and_keeps_its_actions_in_the_minim
 ) {
     let (view, cx, _dir) = dialog_view(cx, Vec::new());
     click(cx, "hosts.new");
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     largest_text_size(&view, cx);
     let viewport = cx.update(|window, _app| window.viewport_size());
 
@@ -36922,13 +36961,13 @@ async fn the_selection_bar_lays_its_actions_in_a_row_inside_it(cx: &mut TestAppC
 }
 
 #[gpui::test]
-async fn the_selection_bar_wraps_its_actions_inside_it_at_720x480_and_200_percent(
+async fn the_selection_bar_keeps_its_actions_inside_it_at_the_narrow_window(
     cx: &mut TestAppContext,
 ) {
-    // At the minimum window and the largest text the four actions are wider than the
-    // column. The group has to wrap inside the bar rather than run past its right edge
-    // and out of the window (R6, R9). The rows are marked in the design window, where
-    // they are on screen, and the bar is measured after the window shrinks.
+    // At the narrow window and the largest text the four actions used to wrap inside the
+    // bar while the bar kept the height of one line, so the last action drew past its
+    // bottom edge and out of the card (R6, R9). The rows are marked in the design
+    // window, where they are on screen, and the bar is measured after the window shrinks.
     let (view, cx) = remote_view(cx);
     let id = live_remote(cx, &view);
     let _ = open_both_sources(
@@ -36949,11 +36988,11 @@ async fn the_selection_bar_wraps_its_actions_inside_it_at_720x480_and_200_percen
     ] {
         click(cx, mark);
     }
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
     largest_text_size(&view, cx);
     cx.run_until_parked();
-    let viewport = minimum_window();
+    let viewport = narrow_window();
     let columns: [(&'static str, [&'static str; 4]); 2] = [
         (
             "files.selection",
@@ -36977,6 +37016,7 @@ async fn the_selection_bar_wraps_its_actions_inside_it_at_720x480_and_200_percen
     for (bar_selector, actions) in columns {
         let bar = bounds_of(cx, bar_selector);
         assert_within_width(bar, viewport, bar_selector);
+        let mut top: Option<Pixels> = None;
         for selector in actions {
             let bounds = bounds_of(cx, selector);
             assert!(
@@ -36987,6 +37027,13 @@ async fn the_selection_bar_wraps_its_actions_inside_it_at_720x480_and_200_percen
                 "{selector} is inside the bar: {bounds:?} in {bar:?}"
             );
             assert_within_width(bounds, viewport, selector);
+            if let Some(top) = top {
+                assert!(
+                    (bounds.top() - top).abs() < px(1.0),
+                    "{selector} sits in the actions' one row at the narrow window"
+                );
+            }
+            top = Some(bounds.top());
         }
     }
 }
@@ -37229,13 +37276,13 @@ async fn the_page_answers_the_pointer_while_the_start_fades_out(cx: &mut TestApp
 async fn the_caption_drags_and_the_window_buttons_answer_during_the_start(cx: &mut TestAppContext) {
     let dir = TempDir::new("startup-caption");
     let (view, cx) = launching_view(cx, Workspace::new(), dir.store());
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
     assert!(starting(&view, cx));
 
     let caption = bounds_of(cx, "startup.caption");
     let drag = bounds_of(cx, "startup.drag");
-    assert_fits_inside(caption, minimum_window(), "the caption of the start");
+    assert_fits_inside(caption, narrow_window(), "the caption of the start");
     assert!(
         drag.size.width > px(0.0) && drag.size.height >= caption.size.height - px(0.5),
         "the blank caption drags the window: {drag:?} in {caption:?}"
@@ -37248,7 +37295,7 @@ async fn the_caption_drags_and_the_window_buttons_answer_during_the_start(cx: &m
     if Platform::current() == Platform::Windows {
         for button in ["window.minimize", "window.maximize", "window.close"] {
             let bounds = bounds_of(cx, button);
-            assert_fits_inside(bounds, minimum_window(), button);
+            assert_fits_inside(bounds, narrow_window(), button);
             assert!(
                 bounds.left() >= drag.right() - px(0.5),
                 "{button} sits beside the caption, not under it"
@@ -37384,9 +37431,9 @@ async fn the_stop_scrolls_to_its_buttons_in_the_smallest_window_at_the_largest_t
     let root = dir.path().join("data");
     std::fs::write(&root, "not a directory").expect("the sentinel file is written");
     let mut workspace = Workspace::new();
-    workspace.set_zoom(Zoom::Largest);
+    workspace.set_zoom(Zoom::Comfortable);
     let (view, cx) = launching_view(cx, workspace, HostStore::at(&root));
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     cx.run_until_parked();
     cx.executor()
         .advance_clock(crate::app::view::BRAND_ENTRANCE);
@@ -37395,7 +37442,7 @@ async fn the_stop_scrolls_to_its_buttons_in_the_smallest_window_at_the_largest_t
     for selector in ["startup.failure.title", "startup.failure.reason"] {
         let bounds = bounds_of(cx, selector);
         assert!(
-            bounds.left() >= px(-0.5) && bounds.right() <= minimum_window().width + px(0.5),
+            bounds.left() >= px(-0.5) && bounds.right() <= narrow_window().width + px(0.5),
             "{selector} stays within the window's width: {bounds:?}"
         );
     }
@@ -37404,13 +37451,13 @@ async fn the_stop_scrolls_to_its_buttons_in_the_smallest_window_at_the_largest_t
     // that failed is named on that first screen too, above the buttons; its reason
     // follows by scrolling.
     let title = bounds_of(cx, "startup.failure.title");
-    assert_fits_inside(title, minimum_window(), "startup.failure.title");
+    assert_fits_inside(title, narrow_window(), "startup.failure.title");
     assert!(
         title.bottom() <= bounds_of(cx, "startup.continue").top(),
         "the failed stage is named above the buttons, not under them: {title:?}"
     );
     for selector in ["startup.continue", "startup.open_folder"] {
-        assert_fits_inside(bounds_of(cx, selector), minimum_window(), selector);
+        assert_fits_inside(bounds_of(cx, selector), narrow_window(), selector);
         assert_pointer_target(cx, selector);
     }
 
@@ -37425,7 +37472,7 @@ async fn the_stop_scrolls_to_its_buttons_in_the_smallest_window_at_the_largest_t
         cx.run_until_parked();
     }
     let next = bounds_of(cx, "startup.continue");
-    assert_fits_inside(next, minimum_window(), "Continue, scrolled into view");
+    assert_fits_inside(next, narrow_window(), "Continue, scrolled into view");
     cx.simulate_click(next.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(!starting(&view, cx), "the scrolled-to button goes on");
@@ -37628,13 +37675,13 @@ async fn the_brand_fits_the_smallest_window_at_the_largest_text(cx: &mut TestApp
     let dir = TempDir::new("startup-fit");
     for locale in Locale::ALL {
         let mut workspace = Workspace::new();
-        workspace.set_zoom(Zoom::Largest);
+        workspace.set_zoom(Zoom::Comfortable);
         workspace.set_locale(locale);
         let store = dir.store();
         let (view, cx) = cx.add_window_view(move |_window, cx| {
             ShelluneView::launching_for_test(cx, workspace, store)
         });
-        cx.simulate_resize(minimum_window());
+        cx.simulate_resize(narrow_window());
         cx.run_until_parked();
         assert!(starting(&view, cx));
         for selector in [
@@ -37645,7 +37692,7 @@ async fn the_brand_fits_the_smallest_window_at_the_largest_text(cx: &mut TestApp
             "startup.progress",
             "startup.stage",
         ] {
-            assert_fits_inside(bounds_of(cx, selector), minimum_window(), selector);
+            assert_fits_inside(bounds_of(cx, selector), narrow_window(), selector);
         }
         let caption = bounds_of(cx, "startup.caption");
         let brand = bounds_of(cx, "startup.splash.brand");
@@ -37908,7 +37955,7 @@ async fn a_menu_entry_is_one_compact_control_high(cx: &mut TestAppContext) {
 
 /// The host dialog's form is a two-column grid that becomes one column when the
 /// dialog is narrow: the address and its port side by side in a wide window, under
-/// each other at 720x480 and 200%, and neither field squeezed below its floor (ADR-7).
+/// each other in a narrow one, and neither field squeezed below its floor (ADR-7).
 #[gpui::test]
 async fn the_host_form_is_two_columns_wide_and_one_column_narrow(cx: &mut TestAppContext) {
     let (view, cx, _dir) = dialog_view(cx, Vec::new());
@@ -37930,7 +37977,8 @@ async fn the_host_form_is_two_columns_wide_and_one_column_narrow(cx: &mut TestAp
         "the name and the group share a row"
     );
 
-    cx.simulate_resize(minimum_window());
+    // Narrower than a window at which two columns still fit the dialog.
+    cx.simulate_resize(tiny_window());
     largest_text_size(&view, cx);
     let dialog = bounds_of(cx, "hosts.editor");
     let address = bounds_of(cx, "hosts.field.address");
@@ -38087,7 +38135,7 @@ async fn the_batch_actions_stay_on_the_right_of_their_footer(cx: &mut TestAppCon
 
     // In the smallest window at the largest text the actions wrap under the note and
     // still end at the right edge.
-    cx.simulate_resize(minimum_window());
+    cx.simulate_resize(narrow_window());
     largest_text_size(&view, cx);
     let dialog = bounds_of(cx, "batch.dialog");
     let confirm = bounds_of(cx, "batch.preview.confirm");

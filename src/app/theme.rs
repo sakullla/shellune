@@ -1418,18 +1418,11 @@ pub enum Zoom {
     Regular,
     /// 115% — larger text for high-density displays.
     Comfortable,
-    /// 200% — text and the metrics that keep it readable, the resize-text ceiling.
-    Largest,
 }
 
 impl Zoom {
     /// Every zoom level in display order.
-    pub const ALL: [Self; 4] = [
-        Self::Compact,
-        Self::Regular,
-        Self::Comfortable,
-        Self::Largest,
-    ];
+    pub const ALL: [Self; 3] = [Self::Compact, Self::Regular, Self::Comfortable];
 
     /// Multiplier applied to every logical length.
     pub fn factor(self) -> f32 {
@@ -1437,7 +1430,6 @@ impl Zoom {
             Self::Compact => 0.9,
             Self::Regular => 1.0,
             Self::Comfortable => 1.15,
-            Self::Largest => 2.0,
         }
     }
 
@@ -1447,7 +1439,6 @@ impl Zoom {
             Self::Compact => "90%",
             Self::Regular => "100%",
             Self::Comfortable => "115%",
-            Self::Largest => "200%",
         }
     }
 
@@ -2582,8 +2573,8 @@ mod tests {
             spacing::SPACIOUS,
         ];
         assert_eq!(steps, [2.0, 4.0, 6.0, 8.0, 12.0, 16.0, 20.0, 24.0, 32.0]);
-        let metrics = super::Metrics::new(super::Zoom::Largest);
-        assert_eq!(metrics.heading_size(), gpui::px(40.0));
+        let metrics = super::Metrics::new(super::Zoom::Comfortable);
+        assert!(metrics.heading_size() > super::Metrics::default().heading_size());
         assert_eq!(metrics.label_size(), metrics.body_size());
         assert_eq!(metrics.medium_weight(), gpui::FontWeight::MEDIUM);
         let regular = super::Metrics::default();

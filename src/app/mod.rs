@@ -161,10 +161,7 @@ pub const TAB_JUMP_COUNT: usize = 9;
 /// card, so a quick start looks the same in both.
 pub const CONNECT_STATE_FLOOR: std::time::Duration = std::time::Duration::from_millis(1000);
 
-/// Minimum window size the layout is designed for.
-pub const MIN_WINDOW_SIZE: (f32, f32) = (720.0, 480.0);
-
-/// Default window size.
+/// Default window size the layout is designed for.
 pub const DEFAULT_WINDOW_SIZE: (f32, f32) = (1120.0, 720.0);
 
 /// The main window, for as long as the application keeps it (R13).
@@ -297,7 +294,6 @@ fn initial_floor(choice: theme::ThemeChoice, appearance: gpui::WindowAppearance)
 
 fn open_main_window(cx: &mut App) -> Result<(), String> {
     let (width, height) = DEFAULT_WINDOW_SIZE;
-    let (min_width, min_height) = MIN_WINDOW_SIZE;
     let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
     // The window is filled with the floor its first frame paints, in the palette the
     // saved theme gives, before that frame exists: a light window no longer opens on
@@ -308,7 +304,9 @@ fn open_main_window(cx: &mut App) -> Result<(), String> {
     )));
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        window_min_size: Some(size(px(min_width), px(min_height))),
+        // No application floor: a narrow window is the window system's business, and
+        // the product is validated at the default size.
+        window_min_size: None,
         // Windows and macOS draw no title bar of their own: the top row of the window
         // is the caption (see `view::titlebar`). Linux keeps the system's.
         titlebar: Some(TitlebarOptions {

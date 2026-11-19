@@ -1034,12 +1034,18 @@ pub(crate) fn reserved_text_width(text: &str, text_size: Pixels) -> Pixels {
     text_size * units
 }
 
-/// Inner width of a settings row at the minimum window for this zoom.
+/// Width a settings row is capped to. A layout bound, not a window minimum: the
+/// product is validated at the default size, and a narrowed window still fits.
+const NARROW_LAYOUT_WIDTH: f32 = 720.0;
+
+/// Inner width of a settings row in a narrow window at this zoom.
 ///
 /// The page keeps `scale(32)` on each side and the row keeps `scale(16)`. A control
-/// floor wider than what remains cannot sit inside the card.
+/// floor wider than what remains cannot sit inside the card. The width is a layout
+/// cap, not a window minimum: the product is validated at the default size, and
+/// nothing wider than this is reserved so a narrowed window still fits its rows.
 pub(crate) fn settings_row_content_cap(metrics: Metrics) -> Pixels {
-    let window = px(crate::app::MIN_WINDOW_SIZE.0);
+    let window = px(NARROW_LAYOUT_WIDTH);
     let page_pad = metrics.scale(spacing::LOOSE + 8.0) * 2.0;
     let row_pad = metrics.scale(spacing::BASE) * 2.0;
     window - page_pad - row_pad

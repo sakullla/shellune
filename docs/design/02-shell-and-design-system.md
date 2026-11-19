@@ -385,13 +385,13 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 
 **紧凑顶栏（R2、R9，`view/shell.rs::header_compact`）。** 当窗口宽度小于 `HEADER_FULL_ROW`（460）加上每条顶栏
 提示一个图标位 `NOTICE_ICON_ROOM`（30）——两者随缩放——再加本行自绘的窗口按钮宽度（Windows 为 3×46，
-`titlebar::window_controls_width`）时——没有提示时实际只在 200% 字号、窗口窄于约 1058 时出现，720×480 @200% 即属此列——整行放不下品牌、带字与计数的主机标签、一个最小宽度的会话标签和其余控件，
+`titlebar::window_controls_width`）时——115% 字号下窗口窄于约 700 时即属此列——整行放不下品牌、带字与计数的主机标签、一个最小宽度的会话标签和其余控件，
 顶栏改画紧凑形态：不画品牌标记（左侧仍留拖动区）；主机标签只画图标（像浏览器的固定标签，字与计数进悬停提示）；
 新建控件只留"+"（▾ 里的 Shell 在命令面板与主机主页的"本地终端"菜单里，快速连接在主机主页）；搜索、设置与"+"
 取指针目标尺寸（`hit_target`）；拖动区最窄为不随缩放的 24；标签条**收拢**为只显示当前标签（完整、可见，
 不滚动、不画两端），其余标签经"全部标签"列表到达。紧凑形态下会话标签与待启动标签不画类型图标（类型在悬停提示里），
 把位置留给标题，最小宽度为 `Metrics::tab_compact_min_width`（80，随缩放）。T9 起紧凑形态下标签的关闭按钮也不占行内位置：
-它浮在标签右端（标签自身的底色上），只在指针悬停标签时出现，标题因此拿到这块宽度——720×480 @200% 时至少显示名字的
+它浮在标签右端（标签自身的底色上），只在指针悬停标签时出现，标题因此拿到这块宽度——紧凑形态至少显示名字的
 前四个字加省略号（`the_one_compact_tab_shows_four_letters_of_its_name`）；关闭仍可经中键、右键菜单与快捷键。是否紧凑只由窗口宽度、字号与有哪些提示决定，
 不读取上一帧布局，所以不会在两种形态之间来回跳。
 
@@ -405,7 +405,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 - **折叠**（`Folded`）：紧凑顶栏没有任何余量，提示折进已有控件：同步与新版本折进设置按钮，按钮右上角画首条提示
   色调与形状的状态标记，悬停提示追加提示文字，点击先去同步设置、否则去更新卡片；批量任务折进任务中心入口
   （`topbar.batch`），同样画标记，点击回到正在运行的任务（其页面可切到已保存任务）。
-测试 `the_top_rows_notices_never_cut_the_current_tab` 在 720×480 @100%/200% 与 1080–1920 @200% 下逐一断言三种形态与当前
+测试 `the_top_rows_notices_never_cut_the_current_tab` 在 680–1920 宽、100% 与 115% 下逐一断言三种形态与当前
 标签完整；截图场景 `tabs-notices` 覆盖三种形态。
 
 会话的信息与工具在**终端底栏**（`TerminalPane::bar`）。底栏只有左右两侧（ADR-7），随窗口文字大小缩放
@@ -1026,7 +1026,7 @@ gpui 没有 hover 过渡、没有元素缩放，也不报告系统的"减少动�
 **等宽端点**：地址、端口、路径、远端命令用终端等宽字体（`components::endpoint`），周围标签仍用界面字体。
 
 **尺寸**：控件 32（紧凑 28、大号 36，`Metrics::{compact_control_height, control_height, large_control_height}`），
-行 52，标签 30，头部 46，指针目标 ≥ 24。所有长度经 `Metrics` 按文字大小（90% / 100% / 115% / 200%）缩放；终端外框与
+行 52，标签 30，头部 46，指针目标 ≥ 24。所有长度经 `Metrics` 按文字大小（90% / 100% / 115%）缩放；终端外框与
 tooltip 这类在窗口渲染之外绘制的部件用 `theme::metrics()` 取得同一缩放。
 
 **边框**：1px 发丝线；焦点与校验失败 2px；按下时底边加粗到 2px。卡片用弱边，浮层用强边 + Overlay。
@@ -1219,7 +1219,11 @@ resize 都按同一条 recount 路径重新计数，视口停在读者原处，�
 外观（R6）：右键菜单是共享的 `menu_card` + `menu_entry`（删除为危险项）；行首的标记方框是共享的 `checkbox_box`
 （整格 24×24 指针目标，悬停整格时方框变 accent 边）；多选横幅是一行：左边"已选 N 项"与操作说明（可换行，不再被
 省略成"…"），右边四个动作按钮并排，栏太窄时整组换到下一行，整组仍放不下时按钮在栏内继续逐个折行（动作组可收缩到栏宽、
-不设最小宽度；`flex_none` 的整组会保持单行宽度而冲出栏的右边，720×480 @200% 时测试断言每个动作都在栏内与窗口内），
+不设最小宽度；`flex_none` 的整组会保持单行宽度而冲出栏的右边）。按钮之间的间距是每个按钮自己的右外边距，不是组上的
+`gap`：随文字缩放的 `gap` 不计入换行组的自身内容宽度，组因此把本可放下的最后一个按钮折到下一行，而栏仍按一行算高，
+按钮就画到了栏的下边界之外（720 宽、115% 时实测）。现在栏随它真正占的行数长高，720 宽、115% 下四个动作仍在同一行且都
+在栏内；测试 `the_selection_bar_keeps_its_actions_inside_it_at_the_narrow_window` 断言每个动作都在栏内与窗口内，
+`the_selection_bar_lays_its_actions_in_a_row_inside_it` 断言四个动作并排、都在栏内，
 而不是每个按钮各占一整行；读取失败是共享的 `card`，
 头部是危险色调的图标块与一句"无法读取此目录"；SCP 问题里"递归复制"是共享的勾选框（仍是键盘停靠点，焦点环不挪位）。
 **行内问题仍留在栏内**（新建文件夹、改名、删除、上传 / 下载确认）：它是该栏键盘停靠序列的一部分（`files_question_stops`），
@@ -1800,19 +1804,21 @@ Windows 安装器的启动与重启）。
 最近一次输入来自键盘时画出（相当于 `:focus-visible`）：鼠标点击已经表明落点，再画环只是噪音；按任意键后
 环回来。
 
-### 大文字与最小窗口（720×480、200%）
+### 大文字与窄窗口（720 宽、115%）
 
-界面文字大小最大为 200%，窗口最小为 720×480 逻辑像素，两者同时成立时一行放不下"标题 + 说明 + 右对齐控件"。
+界面文字大小只有 90 / 100 / 115 三档。旧的 200% 已取消：偏好文件里记着 200 时，启动与恢复都按 100% 打开，写回的值
+也是 100（`a_two_hundred_percent_preference_comes_back_as_one_hundred`）。窗口没有最小尺寸：默认 1120×720，用户可以
+继续把它收窄，布局按内容换行而不是靠裁切。720 宽、115% 是收窄后的验收宽度——一行放不下"标题 + 说明 + 右对齐控件"。
 设置页因此只有纵向滚动，横向必须靠换行容纳，不能靠裁切：被画到**卡片**右缘之外的行内控件既点不到，也没有横向
 滚动条把它找回来。
 
-- **设置行**（`view/settings.rs::settings_row`）：标题列最小 200（随缩放，200% 时 400），控件列可以收缩到比控件自身
+- **设置行**（`view/settings.rs::settings_row`）：标题列最小 200（随缩放），控件列可以收缩到比控件自身
   宽度更窄（`min_w(0)`，不再是 `flex_none`）。一行放不下时整个控件换到标题下面一行，此时控件列占满行宽；
   行本身始终在卡片内，卡片始终在窗口内。
 - **分段控件**（`components::segmented`）与**快捷键行**（`view/settings.rs::settings_keys_row`）：轨道可以窄于自身内容（`min_w(0)`），
-  外面那层可收缩的列把它压到行宽，内部再按 `flex_wrap` 换行。单个分段（Shell 名称、200% 等）和单个 keycap
-  保持完整不被截断，多出来的换到轨道内的下一行，所以"默认 Shell"这类名称很长的分段在 200% 下会变成两行，
-  而不是把轨道推出卡片。
+  外面那层可收缩的列把它压到行宽，内部再按 `flex_wrap` 换行。单个分段（Shell 名称等）和单个 keycap
+  保持完整不被截断，多出来的换到轨道内的下一行，所以"默认 Shell"这类名称很长的分段在更窄的窗口下会变成两行，
+  而不是把轨道推出卡片；115% 下三个 Shell 名称在 720 宽的卡片里仍是同一行。
 - **快捷键行**：名称列最小 180（随缩放），按键与三个操作按钮作为一组整体换行，因此长组合键（如
   `Ctrl+Alt+Shift+F12`）不会把按钮挤出卡片。
 - **换行文本**：居中、有宽度上限、会换行的文字（空状态的标题与说明等）一律经 `components::capped_text(max_w, text)`
@@ -1824,33 +1830,33 @@ Windows 安装器的启动与重启）。
   锁定测试：`an_empty_states_line_wraps_above_its_button_at_any_width`（直接按多种列宽与缩放布局 `empty_state`，
   断言说明盒子的高度不小于按其宽度换行后画出的高度、按钮在其下）与
   `the_forwards_and_host_list_empty_states_keep_their_button_below_the_words`（`forwards.empty`、
-  `hosts.recent.empty`、`hosts.nomatch` 在 720×480@200% 与 1120×720、中英文下标题、说明、按钮依次不重叠）。
+  `hosts.recent.empty`、`hosts.nomatch` 在 720 宽 115% 与 1120×720、中英文下标题、说明、按钮依次不重叠）。
   分区的加载中 / 失败 / 空卡片（`state_card_with_icon`：`section_card` 的空分支、`snippets.empty`、终端空页、远程桌面
   状态卡）同理：标题、说明与下一步各经 `capped_text`（上限 480）。原先是文字列自身 `w_full().max_w(480)`，说明在
   整卡宽下按一行求高、按 480 画两行，卡片因此矮了一行，下一步与说明压进卡片底部留白甚至越过卡片。锁定测试
-  `a_state_cards_words_wrap_inside_their_own_boxes_at_any_width`（多种列宽、100% 与 200%：标题、说明、下一步依次
+  `a_state_cards_words_wrap_inside_their_own_boxes_at_any_width`（多种列宽、100% 与 115%：标题、说明、下一步依次
   不重叠，说明盒子不矮于画出的行，卡片底部留白完整、卡片在后续内容之前结束）。
 - 新增设置行或行内控件时沿用这三条：控件外面不要再套 `flex_none` 容器；可能比行宽的内容自带 `flex_wrap` 与
   `min_w(0)`；控件仍按 `Metrics::hit_target()` 等因素绘制，不靠缩小命中区换取宽度。
-- 该约束由三处测试锁定（`src/app/tests.rs`，均为 720×480、200%、中文）：
-  `every_settings_row_and_control_stays_inside_its_card_at_two_hundred_percent`（每行、每个控件、以及分段控件里的
+- 该约束由三处测试锁定（`src/app/tests.rs`，均为 720 宽、115%、中文）：
+  `every_settings_row_and_control_stays_inside_its_card_at_the_large_text`（每行、每个控件、以及分段控件里的
   每一个分段都在所属卡片内，卡片在窗口内）、
-  `a_settings_control_wider_than_its_row_wraps_inside_it_at_two_hundred_percent`（比行宽的控件在行内换行，每个分段
-  仍在卡片内）、`the_shortcut_rows_keep_their_keys_and_buttons_inside_the_minimum_window`（长组合键下 keycap 与
+  `a_settings_control_wider_than_its_row_stays_inside_it_at_the_large_text`（比行宽的控件留在行与卡片内，
+  每个分段仍在卡片内）、`the_shortcut_rows_keep_their_keys_and_buttons_inside_the_narrow_window`（长组合键下 keycap 与
   三个按钮都在卡片内）。测试读的是实测 bounds（卡片有 `settings.card.<id>` 选择器），不使用被裁切后的旧值；
   子项之间的切换由 `going_back_to_a_category_shows_the_item_that_was_open` 等测试读取页面身份
   （`settings_page_id`）断言，不依赖会残留上一帧的 debug bounds。
 
-#### 走查时怎么确定窗口真的是 720×480
+#### 走查时怎么确定窗口真的是 720 宽
 
-720×480 是**逻辑**像素。Windows 在 150% 缩放下客户区要设成 1080×720 **物理**像素；应用内
-`window.viewport_size()` 报 `720x480`、`scale_factor()` 报 `1.5` 才算对上了最小窗口。非 DPI 感知的工具（未调用
+720×480 是**逻辑**像素的参考窄窗口（不再是窗口下限）。Windows 在 150% 缩放下客户区要设成 1080×720 **物理**像素；
+应用内 `window.viewport_size()` 报 `720x480`、`scale_factor()` 报 `1.5` 才算对上了这个宽度。非 DPI 感知的工具（未调用
 `SetProcessDPIAware` 或等价 API）把 `1080×720` 当成逻辑像素，得到的是 1080×720 逻辑像素的窗口（物理 1620×1080），
-比最小窗口大 2.25 倍；再把它裁成 1095×729 的截图，右侧控件看起来就像"越过了窗口右缘"，其实只是截图被裁掉，
+比参考窗口宽 1.5 倍；再把它裁成 1095×729 的截图，右侧控件看起来就像"越过了窗口右缘"，其实只是截图被裁掉，
 控件仍在卡片内。走查记录请同时写下 `viewport_size` / `scale_factor` 的证据（或使用 DPI 感知工具），不要只凭截图
 判断右缘。
 
-#### 2026-11-11 Windows 实窗
+#### 2026-11-11 Windows 实窗（当时字号 200%，该档已取消）
 
 这次进程在 `SHELLUNE_LOG_VIEWPORT=1` 时把下面两行原样写到 stdout。数字没有改过：
 

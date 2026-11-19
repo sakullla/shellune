@@ -772,7 +772,6 @@ fn start(
         .first()
         .copied()
         .ok_or_else(|| "the run has no shots".to_owned())?;
-    let (min_width, min_height) = super::MIN_WINDOW_SIZE;
     let window_options = WindowOptions {
         // Created far outside the desktop: a window at (0, 0) can sit under the pointer,
         // and the hover that implies differs from one run to the next (R2).
@@ -780,7 +779,7 @@ fn start(
             point(px(OFF_DESKTOP), px(OFF_DESKTOP)),
             size(px(first.variant.width), px(first.variant.height)),
         ))),
-        window_min_size: Some(size(px(min_width), px(min_height))),
+        window_min_size: None,
         titlebar: Some(TitlebarOptions {
             title: Some(product::NAME.into()),
             appears_transparent: view::custom_titlebar(Platform::current()),

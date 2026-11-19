@@ -16749,51 +16749,69 @@ impl ShelluneView {
                     ),
             );
         // The group may shrink to the bar's width: a flex_none group keeps its one-line
-        // width and its own wrap never happens, so at 720x480 with 200% text the last
-        // actions ran past the bar and the window. Shrinking with no minimum lets the
-        // buttons wrap onto further lines inside the bar (R6, R9).
+        // width and its own wrap never happens, so at the narrow window the last actions
+        // ran past the bar and the window. Shrinking with no minimum lets the buttons
+        // wrap onto further lines inside the bar (R6, R9).
+        //
+        // The spacing is a margin on each button rather than the group's `gap`: the
+        // wrapping group measures its content without the gaps, then wraps a button that
+        // would have fitted once the gap is counted, and the line the buttons did not
+        // use was not added to the bar's height either (a button drawn past its bottom
+        // edge at 720 wide and 115%).
+        let spacing = metrics.scale(spacing::HAIRLINE);
         let mut actions = div()
             .flex()
             .flex_shrink()
             .min_w_0()
             .max_w_full()
             .flex_wrap()
-            .items_center()
-            .gap(metrics.scale(spacing::HAIRLINE));
+            .items_center();
         let is_remote = source == FileSource::Remote;
         let action_id = |name: &str| SharedString::from(format!("{prefix}.mark.{name}"));
         if is_remote {
-            actions = actions.child(self.text_button(
-                action_id("download"),
-                copy::fill(strings.files_download_selected, &[("count", &count)]),
-                Variant::Secondary,
-                cx,
-                move |view, cx| view.files_download_marked(id, cx),
-            ));
+            actions = actions.child(
+                self.text_button(
+                    action_id("download"),
+                    copy::fill(strings.files_download_selected, &[("count", &count)]),
+                    Variant::Secondary,
+                    cx,
+                    move |view, cx| view.files_download_marked(id, cx),
+                )
+                .mr(spacing),
+            );
         } else {
-            actions = actions.child(self.text_button(
-                action_id("upload"),
-                copy::fill(strings.files_upload_selected, &[("count", &count)]),
-                Variant::Secondary,
-                cx,
-                move |view, cx| view.files_upload_marked(id, cx),
-            ));
+            actions = actions.child(
+                self.text_button(
+                    action_id("upload"),
+                    copy::fill(strings.files_upload_selected, &[("count", &count)]),
+                    Variant::Secondary,
+                    cx,
+                    move |view, cx| view.files_upload_marked(id, cx),
+                )
+                .mr(spacing),
+            );
         }
         actions = actions
-            .child(self.text_button(
-                action_id("copy"),
-                copy::fill(strings.files_copy_selected, &[("count", &count)]),
-                Variant::Secondary,
-                cx,
-                move |view, cx| view.files_copy_marked(id, source, cx),
-            ))
-            .child(self.text_button(
-                action_id("delete"),
-                copy::fill(strings.files_delete_selected, &[("count", &count)]),
-                Variant::Danger,
-                cx,
-                move |view, cx| view.files_ask_delete_marked(id, source, cx),
-            ))
+            .child(
+                self.text_button(
+                    action_id("copy"),
+                    copy::fill(strings.files_copy_selected, &[("count", &count)]),
+                    Variant::Secondary,
+                    cx,
+                    move |view, cx| view.files_copy_marked(id, source, cx),
+                )
+                .mr(spacing),
+            )
+            .child(
+                self.text_button(
+                    action_id("delete"),
+                    copy::fill(strings.files_delete_selected, &[("count", &count)]),
+                    Variant::Danger,
+                    cx,
+                    move |view, cx| view.files_ask_delete_marked(id, source, cx),
+                )
+                .mr(spacing),
+            )
             .child(self.text_button(
                 action_id("clear"),
                 strings.files_clear_marks,
@@ -19730,7 +19748,6 @@ fn zoom_percent(zoom: theme::Zoom) -> u16 {
         theme::Zoom::Compact => 90,
         theme::Zoom::Regular => 100,
         theme::Zoom::Comfortable => 115,
-        theme::Zoom::Largest => 200,
     }
 }
 
