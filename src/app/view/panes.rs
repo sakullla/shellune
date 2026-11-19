@@ -637,6 +637,10 @@ impl ShelluneView {
         let starting = status
             .as_ref()
             .is_some_and(|status| status.phase() == crate::app::workspace::SessionPhase::Starting);
+        // A start that comes up inside the floor draws no card at all.
+        if starting && !self.starting_state_due(id) {
+            return div();
+        }
         let tone = status
             .as_ref()
             .map_or(Tone::Neutral, |status| status.tone());

@@ -36423,6 +36423,19 @@ async fn a_state_card_in_a_short_pane_starts_at_its_top_and_scrolls_under_the_wh
     largest_text_size(&view, cx);
     cx.run_until_parked();
 
+    // A start that comes up inside the floor draws no card; this one is still
+    // connecting a moment later, so the card appears once the floor has passed.
+    assert!(
+        cx.debug_bounds("session.state.card").is_none(),
+        "a just-started connection draws no state card"
+    );
+    // The floor is wall-clock time, so the test waits it out rather than advancing
+    // the simulated clock.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    cx.run_until_parked();
+    redraw(cx);
+    cx.run_until_parked();
+
     let viewport = cx.update(|window, _app| window.viewport_size());
     let window = gpui::Bounds::new(point(px(0.0), px(0.0)), viewport);
     let floor = bounds_of(cx, "pane.state");

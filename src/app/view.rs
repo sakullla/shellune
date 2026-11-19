@@ -491,6 +491,12 @@ pub struct ShelluneView {
     scripted_serials: Vec<(String, crate::app::serial::SerialLink)>,
     /// The session whose terminal is on screen.
     active: Option<SessionId>,
+    /// When each session first reported that it was starting.
+    ///
+    /// A session that comes up inside [`crate::app::CONNECT_STATE_FLOOR`] never draws
+    /// its state card: the terminal takes the pane's place without a "connecting"
+    /// frame in between. Cleared as soon as the session leaves the starting phase.
+    connecting_since: std::cell::RefCell<std::collections::HashMap<SessionId, std::time::Instant>>,
     /// Why the last local start failed, when it did.
     ///
     /// Kept beside the sessions instead of replacing them: a shell path that did not
@@ -2681,6 +2687,7 @@ impl ShelluneView {
             shell_path,
             custom_shell_open: false,
             shell_menu_open: false,
+            connecting_since: std::cell::RefCell::new(std::collections::HashMap::new()),
             files_menu: None,
             toasts: Vec::new(),
             next_toast: 0,
@@ -4369,6 +4376,25 @@ impl ShelluneView {
 
     fn active_pane(&self) -> Option<&Entity<TerminalPane>> {
         self.active.and_then(|id| self.pane_for(id))
+    }
+
+    /// Whether a session's starting state has lasted long enough to be drawn.
+    ///
+    /// The first draw of a start records the moment; a session that comes up inside
+    /// [`crate::app::CONNECT_STATE_FLOOR`] never draws its state card, so a quick
+    /// start goes straight to the terminal instead of flashing "connecting".
+    fn starting_state_due(&self, id: SessionId) -> bool {
+        let starting = self
+            .workspace
+            .status(id)
+            .is_some_and(|status| status.phase() == crate::app::workspace::SessionPhase::Starting);
+        let mut starts = self.connecting_since.borrow_mut();
+        if !starting {
+            starts.remove(&id);
+            return false;
+        }
+        let since = *starts.entry(id).or_insert_with(std::time::Instant::now);
+        since.elapsed() >= crate::app::CONNECT_STATE_FLOOR
     }
 
     /// The desktop surface of one session, whether or not it is on screen.

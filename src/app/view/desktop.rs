@@ -271,6 +271,13 @@ pub struct DesktopPane {
     phase: DesktopPhase,
     /// The step of the connection the status card names (R19).
     stage: DesktopStage,
+    /// When this attempt started, while it is still connecting.
+    ///
+    /// `None` on a pane that was handed a link (tests, the capture) and on every
+    /// pane that is not connecting, so the status card is always drawn there. A real
+    /// attempt records the moment it starts, and a link that comes up in under
+    /// [`crate::app::CONNECT_STATE_FLOOR`] never draws the card at all.
+    connecting_since: Option<std::time::Instant>,
     /// The step the session stopped on, kept so the reason can name it.
     failed_stage: Option<DesktopStage>,
     /// How the picture is scaled into the pane (R18).
@@ -335,6 +342,7 @@ impl DesktopPane {
             input: InputQueue::new(),
             phase: DesktopPhase::NotStarted,
             stage: DesktopStage::NotStarted,
+            connecting_since: None,
             failed_stage: None,
             zoom: DesktopZoom::Fit,
             pan: (0.0, 0.0),
@@ -542,6 +550,7 @@ impl DesktopPane {
         }
         if self.availability.is_built() {
             self.stage = DesktopStage::Connecting;
+            self.connecting_since = Some(std::time::Instant::now());
             let (width, height) = self.asked_size;
             match NativeLink::open(&self.target, password, width, height) {
                 Ok(link) => {
@@ -580,6 +589,7 @@ impl DesktopPane {
         self.link = Some(link);
         self.phase = DesktopPhase::Connecting;
         self.stage = DesktopStage::Connecting;
+        self.connecting_since = Some(std::time::Instant::now());
         self.failed_stage = None;
         self.surface.reset();
         self.image = None;
@@ -606,6 +616,7 @@ impl DesktopPane {
             self.failed_stage = Some(self.stage);
         }
         self.phase = DesktopPhase::Ended(failure.session_failure(reason, &target, was_live));
+        self.connecting_since = None;
         self.polling = false;
         // Nothing is held after a session ended: the remote side would otherwise
         // keep a modifier down for a connection that is gone.
@@ -706,6 +717,7 @@ impl DesktopPane {
                     // picture: that is the moment it is live, not the state event.
                     self.phase = DesktopPhase::Live;
                     self.stage = DesktopStage::Establishing;
+                    self.connecting_since = None;
                 }
                 true
             }
@@ -1789,14 +1801,22 @@ impl Render for DesktopPane {
                 body = body.child(surface);
             }
             None => {
-                body = body.child(
+                // A link that comes up in under the floor shows its picture instead of
+                // a card that flashes on the way; the pane keeps its space either way.
+                let early = matches!(self.phase, DesktopPhase::Connecting)
+                    && self
+                        .connecting_since
+                        .is_some_and(|since| since.elapsed() < crate::app::CONNECT_STATE_FLOOR);
+                body = body.child(if early {
+                    div().flex_1()
+                } else {
                     div()
                         .flex_1()
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(self.status_card(metrics)),
-                );
+                        .child(self.status_card(metrics))
+                });
             }
         }
         // The controls belong to the pane, not to the session: they are drawn over

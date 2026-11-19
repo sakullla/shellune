@@ -154,6 +154,13 @@ pub fn apply_keymap(cx: &mut App, keymap: &Keymap) {
 /// Number of tabs that have a jump shortcut.
 pub const TAB_JUMP_COUNT: usize = 9;
 
+/// A connection that comes up faster than this never draws its intermediate state.
+///
+/// A link that takes under a second should show its picture, not a status card that
+/// flashes on the way; the same floor covers the desktop pane and a session's state
+/// card, so a quick start looks the same in both.
+pub const CONNECT_STATE_FLOOR: std::time::Duration = std::time::Duration::from_millis(1000);
+
 /// Minimum window size the layout is designed for.
 pub const MIN_WINDOW_SIZE: (f32, f32) = (720.0, 480.0);
 
