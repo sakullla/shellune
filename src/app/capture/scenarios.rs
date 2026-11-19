@@ -30,6 +30,7 @@ use shellune_storage::{
     HostEdit, HostStore, KeymapEntry, KeymapPreferences, Preferences, PreferencesStore,
     SnippetStore,
 };
+use shellune_terminal::SelectionType;
 
 use crate::app::ShelluneView;
 use crate::app::copy::Locale;
@@ -44,6 +45,15 @@ use crate::app::terminal::PaneState;
 use crate::app::theme::{self, Motion, Zoom};
 use crate::app::view::settings::Item;
 use crate::app::workspace::{AttentionKind, SectionState, Workspace};
+
+/// Where the tab menu scenario right-clicks: on the first terminal tab.
+const TAB_MENU_AT: (f32, f32) = (220.0, 40.0);
+
+/// Where the host menu scenario right-clicks: on the first saved host's row.
+const HOST_MENU_AT: (f32, f32) = (560.0, 330.0);
+
+/// Where the file menu scenario right-clicks: on the server file's row.
+const FILES_MENU_AT: (f32, f32) = (900.0, 330.0);
 
 /// What kind of surface a scenario shows, so the gallery can group them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,10 +244,21 @@ pub struct Scenario {
 impl Scenario {
     /// Every shot this scenario is taken in: the dark and light pair at the design
     /// window, then whatever else it declares.
+    ///
+    /// Every scenario is also shot in Chinese and at 200% text at least once (ADR-9):
+    /// one that declares neither gets the light palette in Chinese and the dark one at
+    /// 200% text, both at the design window, so no surface goes without a look at its
+    /// longer words or its largest type.
     #[must_use]
     pub fn shots(&self) -> Vec<Variant> {
         let mut shots = vec![Variant::dark(), Variant::light()];
         shots.extend_from_slice(self.variants);
+        if !shots.iter().any(|shot| shot.locale == Locale::Chinese) {
+            shots.push(Variant::light().chinese());
+        }
+        if !shots.iter().any(|shot| shot.zoom == Zoom::Largest) {
+            shots.push(Variant::dark().largest());
+        }
         shots
     }
 }
@@ -1359,6 +1380,56 @@ fn show_terminal_search(
     Ok(())
 }
 
+/// The local terminal with a selection that starts on the left half of a character and
+/// runs over two lines into a line of wide characters (R4, ADR-5).
+fn show_terminal_selection(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_terminal(view, window, cx)?;
+    view.capture_select_in_terminal("42 passed", "部署完成", SelectionType::Simple, cx);
+    Ok(())
+}
+
+fn terminal_selection_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    terminal_ready(view, cx)?;
+    let text = view
+        .capture_terminal_selection(cx)
+        .ok_or_else(|| "the terminal has no selection".to_owned())?;
+    if !text.starts_with("42 passed") || !text.ends_with("部署完成") {
+        return Err(format!(
+            "the selection is {text:?}, not the two lines from \"42 passed\" to \"部署完成\""
+        ));
+    }
+    Ok(())
+}
+
+/// The local terminal with an Alt-drag block selection over four test names (R4, ADR-5).
+fn show_terminal_block_selection(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_terminal(view, window, cx)?;
+    view.capture_select_in_terminal("grid", "paste", SelectionType::Block, cx);
+    Ok(())
+}
+
+fn terminal_block_selection_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    terminal_ready(view, cx)?;
+    let text = view
+        .capture_terminal_selection(cx)
+        .ok_or_else(|| "the terminal has no selection".to_owned())?;
+    let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+    if lines.first() != Some(&"grid:") || lines.last() != Some(&"paste") || lines.len() != 4 {
+        return Err(format!(
+            "the block selection is {text:?}, not the four columns from \"grid\" to \"paste\""
+        ));
+    }
+    Ok(())
+}
+
 fn terminal_search_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
     if !view.capture_search_open(cx) {
         return Err("the find bar is not open with a query".to_owned());
@@ -1695,6 +1766,20 @@ fn show_forward_form(
     Ok(())
 }
 
+/// Opens the tunnel form through the first saved host with its host picker unfolded.
+fn show_forward_host_picker(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let host = saved_hosts()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the host fixture is empty".to_owned())?;
+    view.capture_forward_host_picker(&host, window, cx);
+    Ok(())
+}
+
 /// Shows several tabs, then lists all of them over the terminal (R17).
 fn show_tab_list(
     view: &mut ShelluneView,
@@ -1769,6 +1854,14 @@ fn files_question_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
 fn forward_form_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
     if !view.capture_forward_form_open() {
         return Err("the tunnel form is not open".to_owned());
+    }
+    Ok(())
+}
+
+fn forward_host_picker_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    forward_form_ready(view, _cx)?;
+    if !view.capture_forward_host_picker_open() {
+        return Err("the through-host picker is not unfolded".to_owned());
     }
     Ok(())
 }
@@ -2784,7 +2877,10 @@ fn show_tab_menu(
     cx: &mut Context<ShelluneView>,
 ) -> Result<(), String> {
     show_disconnected(view, window, cx)?;
-    view.capture_open_tab_menu(gpui::point(gpui::px(220.0), gpui::px(40.0)), cx)
+    view.capture_open_tab_menu(
+        gpui::point(gpui::px(TAB_MENU_AT.0), gpui::px(TAB_MENU_AT.1)),
+        cx,
+    )
 }
 
 fn tab_menu_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
@@ -2798,7 +2894,10 @@ fn show_host_menu(
     _window: &mut Window,
     cx: &mut Context<ShelluneView>,
 ) -> Result<(), String> {
-    view.capture_open_host_menu(gpui::point(gpui::px(560.0), gpui::px(330.0)), cx)
+    view.capture_open_host_menu(
+        gpui::point(gpui::px(HOST_MENU_AT.0), gpui::px(HOST_MENU_AT.1)),
+        cx,
+    )
 }
 
 fn host_menu_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
@@ -2821,7 +2920,7 @@ fn show_files_menu(
     view.capture_open_files_menu(
         id,
         "构建 产物.tar.zst",
-        gpui::point(gpui::px(900.0), gpui::px(330.0)),
+        gpui::point(gpui::px(FILES_MENU_AT.0), gpui::px(FILES_MENU_AT.1)),
         cx,
     );
     Ok(())
@@ -3312,6 +3411,46 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: nothing,
         install: show_terminal_search,
         ready: terminal_search_ready,
+    },
+    Scenario {
+        id: "terminal-selection",
+        title: "终端 · 半格选择",
+        category: Category::Terminal,
+        fixture: "one display-only session fed a fixed transcript, with a selection laid from the \
+                  left half of the \"4\" in \"42 passed\" to the right half of the last wide \
+                  character of \"部署完成\"",
+        evidence: "shows how a selection is drawn: it takes the character whose left half it \
+                   starts on, runs to the end of each line it crosses and covers both columns \
+                   of a wide character; the selection is laid by the capture, so the shot proves \
+                   nothing about the drag threshold, Shift, the window-wide capture or edge \
+                   scrolling, which the GPUI tests cover",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::light().chinese(),
+            Variant::dark().largest(),
+            Variant::light().smallest().largest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: nothing,
+        install: show_terminal_selection,
+        ready: terminal_selection_ready,
+    },
+    Scenario {
+        id: "terminal-selection-block",
+        title: "终端 · Alt 块选",
+        category: Category::Terminal,
+        fixture: "one display-only session fed a fixed transcript, with a block selection laid \
+                  from \"grid\" down to \"paste\" in the test list",
+        evidence: "shows a block selection as the rectangle Alt/Option+drag keeps: the same \
+                   columns on every line; laid by the capture, so the modifier itself is not \
+                   part of it",
+        quick: false,
+        variants: &[Variant::dark().chinese(), Variant::dark().largest()],
+        start: || page(Destination::LocalShells),
+        prepare: nothing,
+        install: show_terminal_block_selection,
+        ready: terminal_block_selection_ready,
     },
     Scenario {
         id: "connect-failed",
@@ -3838,6 +3977,26 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: seed_hosts,
         install: show_forward_form,
         ready: forward_form_ready,
+    },
+    Scenario {
+        id: "forwards-host-picker",
+        title: "转发 · 隧道表单的主机选择器",
+        category: Category::Overlay,
+        fixture: "the saved hosts and an empty rule book, with the form of a new tunnel and \
+                  its through-host picker unfolded",
+        evidence: "shows the searchable list a tunnel's host is chosen from, the chosen host \
+                   marked and the search holding the keyboard; nothing was saved, bound or \
+                   dialled",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::light().chinese(),
+            Variant::dark().smallest().largest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_forward_host_picker,
+        ready: forward_host_picker_ready,
     },
     Scenario {
         id: "settings",

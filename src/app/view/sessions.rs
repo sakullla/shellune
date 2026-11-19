@@ -20,6 +20,12 @@ use crate::app::theme::{self, palette, spacing};
 // every other context menu.
 use crate::app::components::{menu_card, menu_divider, menu_entry};
 
+/// The width a session row's menu is kept inside the window by, before zoom.
+const SESSION_MENU_WIDTH: f32 = 210.0;
+
+/// The width a split's menu is kept inside the window by, before zoom.
+const SPLIT_MENU_WIDTH: f32 = 220.0;
+
 impl ShelluneView {
     /// Whether the session record is closed: its tab is gone and only the record is
     /// left.
@@ -160,7 +166,7 @@ impl ShelluneView {
             .flex()
             .flex_none()
             .items_center()
-            .gap(metrics.scale(2.0))
+            .gap(metrics.scale(spacing::HALF))
             .when(closed, |row| {
                 row.child(
                     components::icon_only_button(Icon::Trash, metrics)
@@ -337,7 +343,7 @@ impl ShelluneView {
                             .position(clamp_menu(
                                 position,
                                 viewport,
-                                metrics.scale(210.0),
+                                metrics.scale(SESSION_MENU_WIDTH),
                                 px(0.0),
                             ))
                             .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
@@ -518,7 +524,7 @@ impl ShelluneView {
                             .position(clamp_menu(
                                 position,
                                 viewport,
-                                metrics.scale(220.0),
+                                metrics.scale(SPLIT_MENU_WIDTH),
                                 px(0.0),
                             ))
                             .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))

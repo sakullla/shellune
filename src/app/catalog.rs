@@ -27,6 +27,14 @@ const COLUMNS: usize = 4;
 /// basis measured every line of a column at nothing.
 const COLUMN_SHARES: [f32; COLUMNS] = [0.21, 0.21, 0.31, 0.21];
 
+/// The narrowest each column becomes, in logical pixels before zoom.
+///
+/// At the design window and 100% text every column is at least this wide already, so
+/// the four stand side by side as before. At 200% text a column keeps the room its
+/// components need and the page wraps the columns into rows, instead of squeezing a
+/// list row's name or a dialog's title down to nothing.
+const COLUMN_MIN_WIDTHS: [f32; COLUMNS] = [220.0, 220.0, 300.0, 220.0];
+
 /// One titled group of the catalogue.
 fn section(title: &'static str, metrics: Metrics) -> Div {
     div()
@@ -445,8 +453,10 @@ pub fn design_catalog(metrics: Metrics) -> gpui::Stateful<Div> {
     ];
     let mut grid = div()
         .flex()
+        .flex_wrap()
         .items_start()
         .justify_between()
+        .gap_y(metrics.scale(spacing::LOOSE))
         .w_full()
         .min_w_0();
     for (index, sections) in columns.into_iter().enumerate() {
@@ -457,7 +467,7 @@ pub fn design_catalog(metrics: Metrics) -> gpui::Stateful<Div> {
                 .flex_col()
                 .flex_none()
                 .w(gpui::relative(COLUMN_SHARES[index]))
-                .min_w_0()
+                .min_w(metrics.scale(COLUMN_MIN_WIDTHS[index]))
                 .gap(metrics.scale(spacing::LOOSE))
                 .children(sections),
         );
@@ -550,11 +560,24 @@ mod tests {
             // Words that end in an ellipsis are shaped at the width they are drawn at:
             // a list row's name is not cut to its ellipsis in a column that has room.
             let title = cx.debug_bounds("list.row.title").expect("a row is drawn");
-            if zoom == theme::Zoom::Regular {
+            assert!(
+                title.size.width > px(40.0) * zoom.factor(),
+                "the row's name is cut short at {zoom:?}: {title:?}"
+            );
+            // At 200% text the columns wrap into rows rather than run past the window
+            // or squeeze their components (T9).
+            for (index, column) in columns.iter().enumerate() {
                 assert!(
-                    title.size.width > px(40.0),
-                    "the row's name is cut short at {zoom:?}: {title:?}"
+                    column.right() <= px(1120.0) + px(0.5),
+                    "column {index} runs past the window at {zoom:?}: {column:?}"
                 );
+                for other in &columns[index + 1..] {
+                    assert!(
+                        column.right() <= other.left() + px(0.5)
+                            || column.bottom() <= other.top() + px(0.5),
+                        "two columns overlap at {zoom:?}: {column:?} and {other:?}"
+                    );
+                }
             }
             // The capture shoots the page at the design window: at 100% the whole page,
             // every section to its last line, is on the one screen.

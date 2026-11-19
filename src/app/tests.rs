@@ -959,13 +959,24 @@ async fn the_chosen_settings_entry_is_ringed_only_while_the_column_has_the_keybo
     };
     assert!(!ringed(cx), "a pointer-opened page draws no ring");
 
-    // A key pressed while the page has the keyboard is not the column having it.
+    // T9: the arrows walk the column, so the column has the keyboard and is ringed;
+    // Enter hands the keyboard back to the page.
+    let before = cx.update(|_window, app| view.read(app).settings_page_id());
     cx.simulate_keystrokes("down");
     cx.run_until_parked();
-    assert!(
-        !ringed(cx),
-        "the chosen entry is not ringed just because the last input was a key"
+    assert_ne!(
+        cx.update(|_window, app| view.read(app).settings_page_id()),
+        before,
+        "the arrow moved the navigation"
     );
+    assert!(
+        cx.update(|_w, app| view.read(app).settings_nav_focused_for_test()),
+        "moving the navigation with the arrows gives the column the keyboard"
+    );
+    assert!(ringed(cx), "and the chosen entry shows it with the ring");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(!ringed(cx), "Enter gives the keyboard back to the page");
 
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
@@ -7338,6 +7349,46 @@ async fn the_import_panel_opens_on_the_platform_file_and_reads_a_named_one(
 }
 
 #[gpui::test]
+async fn the_import_panels_fields_follow_a_language_switch(cx: &mut TestAppContext) {
+    let dir = TempDir::new("import-language");
+    let config = dir.path().join("config");
+    std::fs::write(&config, IMPORT_CONFIG).expect("the test writes the configuration");
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.open_import_for_test(&config.display().to_string(), cx);
+        });
+    });
+    cx.run_until_parked();
+    let placeholders = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| view.read(app).import_placeholders(app))
+            .expect("the import panel is open")
+    };
+    let locale = cx.update(|_window, app| view.read(app).workspace().locale());
+    let before = placeholders(cx);
+    assert_eq!(
+        before.1,
+        copy::ux_for(locale).import_search_placeholder,
+        "the search field opens in the window's language"
+    );
+
+    // The panel stays open across the switch: both of its fields change language with
+    // the rest of the window instead of keeping the words they were made with.
+    focus_root(&view, cx);
+    cx.dispatch_action(ToggleLanguage);
+    cx.run_until_parked();
+    let switched = cx.update(|_window, app| view.read(app).workspace().locale());
+    assert_ne!(switched, locale);
+    let after = placeholders(cx);
+    assert_eq!(
+        after.1,
+        copy::ux_for(switched).import_search_placeholder,
+        "the search field follows the switch"
+    );
+    assert_ne!(after.0, before.0, "the path field follows the switch");
+}
+
+#[gpui::test]
 async fn an_import_preview_shows_its_limits_and_saves_only_the_hosts_it_offered(
     cx: &mut TestAppContext,
 ) {
@@ -12292,6 +12343,47 @@ fn open_transfers(
     });
     cx.run_until_parked();
     (files, transfers)
+}
+
+/// An upload says where its file lands only when that differs from the directory typed
+/// above it: with no file chosen the field already says it all; with a file the
+/// question adds "will be saved to <directory>/<name>" (T7 rule, T9 test).
+#[gpui::test]
+async fn an_upload_says_where_it_lands_only_once_a_file_names_it(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_files, _transfers) = open_transfers(cx, &view, id);
+
+    click(cx, "files.upload");
+    assert!(cx.debug_bounds("files.question.remote").is_some());
+    assert!(
+        cx.debug_bounds("files.question.target").is_none(),
+        "no file yet: the landing place is the typed directory, which is not repeated"
+    );
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/notes.txt");
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("files.question.target").is_some(),
+        "a file name makes the final path differ from the directory, so it is said"
+    );
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("");
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("files.question.target").is_none(),
+        "clearing the file takes the line away again"
+    );
 }
 
 #[gpui::test]
@@ -19046,6 +19138,48 @@ async fn a_damaged_snapshot_is_left_unchanged(cx: &mut TestAppContext) {
 // ---------------------------------------------------------------------------
 
 #[gpui::test]
+async fn a_narrow_split_keeps_its_pane_heads_buttons_inside_the_pane(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
+        return;
+    }
+    click(cx, "header.primary");
+    cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.split_active_for_test(SplitAxis::LeftRight, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_resize(minimum_window());
+    focus_root(&view, cx);
+    cx.dispatch_action(CycleTextSize);
+    cx.dispatch_action(CycleTextSize);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Largest
+    );
+
+    // At 720x480 and 200% text a side-by-side pane is narrower than its head: the
+    // name and the "Active" chip give way, and zoom and close stay whole in the pane.
+    let pane = bounds_of(cx, "pane.active");
+    for control in ["pane.zoom", "pane.close"] {
+        let button = bounds_of(cx, control);
+        assert!(
+            button.left() >= pane.left() && button.right() <= pane.right() + px(0.5),
+            "{control} {button:?} is cut by the edge of its pane {pane:?}"
+        );
+        assert!(
+            button.size.width >= px(theme::HIT_TARGET) - px(0.5),
+            "{control} keeps its pointer target, {button:?}"
+        );
+    }
+}
+
+#[gpui::test]
 async fn a_single_pane_has_no_frame_and_a_split_marks_each_pane(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
@@ -21420,13 +21554,23 @@ async fn a_tab_keeps_its_dot_title_and_close_inside_itself_at_any_width(cx: &mut
         assert_tab_in_view(cx, "session.tab.0");
         assert_tab_holds_its_parts(cx, 0, min, metrics);
         // The long name is cut inside its own tab: the title ends before the close
-        // button starts.
+        // button starts. In a compact row the close floats over the end of the title
+        // and shows under the pointer, so the title has that room (T9); both still
+        // stay inside the tab.
         let title = bounds_of(cx, "session.tab.title.0");
         let close = bounds_of(cx, "session.tab.close.0");
-        assert!(
-            title.origin.x + title.size.width <= close.origin.x + px(0.5),
-            "the long title stops before its close button at {zoom:?}: {title:?} then {close:?}"
-        );
+        if compact {
+            let tab = bounds_of(cx, "session.tab.0");
+            assert!(
+                title.right() <= tab.right() + px(0.5) && close.right() <= tab.right() + px(0.5),
+                "the title and the close stay inside the tab at {zoom:?}: {title:?} {close:?} in {tab:?}"
+            );
+        } else {
+            assert!(
+                title.origin.x + title.size.width <= close.origin.x + px(0.5),
+                "the long title stops before its close button at {zoom:?}: {title:?} then {close:?}"
+            );
+        }
         assert!(
             cx.debug_bounds("session.tab.dot.0.pulse").is_none(),
             "a live tab's dot is still"
@@ -32228,6 +32372,18 @@ async fn a_group_only_a_desktop_names_is_in_the_sidebar_and_renamed_from_the_mor
         tree(cx),
         vec![("Branch".to_owned(), 1), ("Prod".to_owned(), 1)]
     );
+    // T9: the renamed group's keyboard stop went with its old name.
+    let stops = cx.update(|_window, app| view.read(app).group_focus_paths_for_test());
+    assert!(
+        !stops.contains(&office),
+        "the old name keeps no keyboard stop: {stops:?}"
+    );
+    assert!(
+        stops
+            .iter()
+            .all(|path| ["Branch", "Prod"].contains(&path.to_canonical().as_str())),
+        "{stops:?}"
+    );
 }
 
 #[gpui::test]
@@ -32324,8 +32480,31 @@ async fn a_focused_sidebar_group_renames_with_f2_deletes_with_delete_and_offers_
     click(cx, "hosts.group.rename.open");
     assert_eq!(
         editor(cx),
-        Some(crate::app::hosts::GroupAction::Rename(staging))
+        Some(crate::app::hosts::GroupAction::Rename(staging.clone()))
     );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // T9: a deleted group's keyboard stop goes with it.
+    let stops = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| view.read(app).group_focus_paths_for_test())
+    };
+    assert!(stops(cx).contains(&staging), "the drawn row has its stop");
+    click(cx, "hosts.tree.1");
+    cx.simulate_keystrokes("delete");
+    cx.run_until_parked();
+    assert_eq!(
+        editor(cx),
+        Some(crate::app::hosts::GroupAction::Delete(staging.clone()))
+    );
+    click(cx, "hosts.group.confirm");
+    assert_eq!(editor(cx), None, "the delete went through");
+    assert!(
+        !stops(cx).contains(&staging),
+        "the deleted group keeps no keyboard stop: {:?}",
+        stops(cx)
+    );
+    assert!(stops(cx).contains(&prod), "the other group keeps its stop");
 }
 
 #[gpui::test]
@@ -35679,6 +35858,147 @@ async fn a_reconnect_runs_under_a_banner_over_the_last_screen_and_can_be_cancell
     );
 }
 
+/// A banner the user closed opens again once a reconnect starts: cancelling it goes
+/// back to the same reason, and that reason is stated again rather than left hidden
+/// under the close from before (T9, ADR-6).
+#[gpui::test]
+async fn a_closed_banner_comes_back_after_a_reconnect_is_cancelled(cx: &mut TestAppContext) {
+    let dir = TempDir::new("banner-closed-reconnect");
+    let (view, cx, id, remember) = connected_remote_tab(cx, &dir, X11Forwarding::Off, Vec::new());
+    lose_remote_session(&view, cx, id);
+    remember();
+    assert!(banner_shown(cx, &view, id));
+    click(cx, "terminal.failure.dismiss");
+    assert!(!banner_shown(cx, &view, id), "the close hides the banner");
+
+    cx.update(|_window, app| view.update(app, |view, cx| view.reconnect_session(id, cx)));
+    cx.run_until_parked();
+    assert_eq!(session_state(cx, &view, id), Some(SessionState::Connecting));
+    assert!(banner_shown(cx, &view, id), "the reconnect states itself");
+    click(cx, "terminal.reconnecting.cancel");
+    assert!(matches!(
+        session_state(cx, &view, id),
+        Some(SessionState::Failed(_) | SessionState::Disconnected(_))
+    ));
+    assert!(
+        banner_shown(cx, &view, id),
+        "after the cancel the reason is stated again, though the same banner was closed before"
+    );
+    redraw(cx);
+    assert!(cx.debug_bounds("terminal.failure").is_some());
+
+    // The reconnecting banner closed during one attempt is back for the next one.
+    cx.update(|_window, app| view.update(app, |view, cx| view.reconnect_session(id, cx)));
+    cx.run_until_parked();
+    assert!(banner_shown(cx, &view, id));
+    click(cx, "terminal.reconnecting.dismiss");
+    assert!(
+        !banner_shown(cx, &view, id),
+        "the close hides the reconnecting banner"
+    );
+    cx.update(|_window, app| view.update(app, |view, cx| view.cancel_reconnect_for_test(id, cx)));
+    cx.run_until_parked();
+    assert!(
+        banner_shown(cx, &view, id),
+        "the cancel states the reason again"
+    );
+    cx.update(|_window, app| view.update(app, |view, cx| view.reconnect_session(id, cx)));
+    cx.run_until_parked();
+    assert_eq!(session_state(cx, &view, id), Some(SessionState::Connecting));
+    assert!(
+        banner_shown(cx, &view, id),
+        "the next reconnect states itself, though its banner was closed the time before"
+    );
+    redraw(cx);
+    assert!(cx.debug_bounds("terminal.reconnecting").is_some());
+}
+
+/// In a short pane the unfolded details keep to a share of its height: at 720x480 and
+/// 200% text at least three rows of the last screen stay under them (T9, ADR-6).
+#[gpui::test]
+async fn unfolded_details_leave_rows_of_the_last_screen_in_a_short_pane(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    while cx.update(|_window, app| view.read(app).workspace().motion()) != Motion::Reduced {
+        cx.update(|_window, app| view.update(app, |view, cx| view.cycle_motion(cx)));
+        cx.run_until_parked();
+    }
+    let id = live_remote(cx, &view);
+    let long = (0..14)
+        .map(|line| format!("{line}: {LONG_LOSS}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    lose_pane_with(&view, cx, id, &long);
+    cx.simulate_resize(minimum_window());
+    largest_text_size(&view, cx);
+    cx.run_until_parked();
+    click(cx, "terminal.failure.details");
+    redraw(cx);
+    redraw(cx);
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the ended session keeps its terminal");
+    let line = cx.update(|_window, app| pane.read(app).cell_size().height);
+    let detail = bounds_of(cx, "terminal.failure.detail");
+    let grid = bounds_of(cx, "terminal.viewport");
+    let rows = (f32::from(grid.size.height) / line).floor();
+    assert!(
+        rows >= 3.0,
+        "{rows} rows of {line}px left under the details {detail:?}: {grid:?}"
+    );
+    assert!(
+        detail.bottom() <= grid.top() + px(0.5),
+        "the details stay above the grid: {detail:?} {grid:?}"
+    );
+}
+
+/// The one tab of a compact row - 720x480 at 200% text - shows at least four letters of
+/// its name: its close button gives the title its room and shows under the pointer
+/// (T9, R2).
+#[gpui::test]
+async fn the_one_compact_tab_shows_four_letters_of_its_name(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.workspace_mut_for_test().set_zoom(Zoom::Largest);
+            cx.notify();
+        });
+    });
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(cx.update(|_window, app| view.read(app).header_compact_for_test()));
+    let title = cx.update(|_window, app| view.read(app).tab_title_for_test(id));
+    let index = cx
+        .update(|_window, app| view.read(app).open_tabs())
+        .iter()
+        .position(|open| *open == id)
+        .expect("the session has a tab");
+    assert_eq!(index, 0, "the session's tab is the first");
+    let four: String = title.chars().take(4).chain(['\u{2026}']).collect();
+    let need = cx.update(|window, app| {
+        let metrics = view.read(app).workspace().metrics();
+        crate::app::view::tab_title_width(window, &four, metrics)
+    });
+    let label = bounds_of(cx, "session.tab.title.0");
+    let tab = bounds_of(cx, "session.tab.0");
+    assert!(
+        label.size.width + px(2.0) >= need,
+        "the title {title:?} shows less than {four:?} ({need:?}): {label:?} in {tab:?}"
+    );
+    assert!(
+        label.right() <= tab.right() + px(0.5),
+        "the title stays inside its tab"
+    );
+    // The close is still the tab's own target under the pointer.
+    let close = bounds_of(cx, "session.tab.close.0");
+    assert!(
+        close.left() >= tab.left() && close.right() <= tab.right() + px(0.5),
+        "{close:?} in {tab:?}"
+    );
+    assert!(close.size.width >= px(theme::HIT_TARGET) - px(0.5));
+}
+
 /// A reason as long as the ones a shell or a jump host really reports: one unbroken
 /// path, then a sentence.
 const LONG_LOSS: &str = concat!(
@@ -37065,6 +37385,20 @@ async fn the_stop_scrolls_to_its_buttons_in_the_smallest_window_at_the_largest_t
             bounds.left() >= px(-0.5) && bounds.right() <= minimum_window().width + px(0.5),
             "{selector} stays within the window's width: {bounds:?}"
         );
+    }
+    // T9: both ways on are on the first screen, before any scrolling: the words above
+    // them scroll, the buttons stay. The brand steps back while stopped, so the stage
+    // that failed is named on that first screen too, above the buttons; its reason
+    // follows by scrolling.
+    let title = bounds_of(cx, "startup.failure.title");
+    assert_fits_inside(title, minimum_window(), "startup.failure.title");
+    assert!(
+        title.bottom() <= bounds_of(cx, "startup.continue").top(),
+        "the failed stage is named above the buttons, not under them: {title:?}"
+    );
+    for selector in ["startup.continue", "startup.open_folder"] {
+        assert_fits_inside(bounds_of(cx, selector), minimum_window(), selector);
+        assert_pointer_target(cx, selector);
     }
 
     let floor = bounds_of(cx, "startup.splash").center();

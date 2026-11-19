@@ -254,7 +254,8 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   连续页面。没有标题的设置行不再留一行空白，说明文字与右侧控件垂直居中。偏好保存在 `preferences.json`。
   **视觉（R5，T8 / ADR-7 更新）**：左侧导航不再是带框面板，而是页面左侧一列 `components::nav_item`（宽 200，与首页侧栏
   同尺寸：分类一个控件高 32、圆角 6、16px 图标；当前分类为 selected 底 + 2px accent 竖条（`accent_mark`）+ MEDIUM，
-  展开时底色、竖条与焦点环交给当前子项；焦点环只在导航列本身拿到键盘（在页面上按 Esc 进入）时画，指针或在页面里按键都不画
+  展开时底色、竖条与焦点环交给当前子项；焦点环只在导航列本身拿到键盘时画：在页面上按 Esc 进入，或（T9 起）在快捷键页以外用方向键移动导航
+  （`settings_page_key` 此时把 `nav_focus` 置为 true）；Enter 把键盘交还页面，环随之消失；指针打开的页面不画
   （`the_chosen_settings_entry_is_ringed_only_while_the_column_has_the_keyboard`）；子项不带图标、缩进到分类文字、一个紧凑控件高 28）；分类标题用页标题字号
   （`heading_size`，20）；每组设置是共享的 `components::card`（surface + 弱边 + 圆角 8 + Raised，行自带
   内边距与分隔线）。开 / 关类设置全部是开关（`ShelluneView::switch_control` → `components::switch`）：整块
@@ -381,7 +382,9 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 新建控件只留"+"（▾ 里的 Shell 在命令面板与主机主页的"本地终端"菜单里，快速连接在主机主页）；搜索、设置与"+"
 取指针目标尺寸（`hit_target`）；拖动区最窄为不随缩放的 24；标签条**收拢**为只显示当前标签（完整、可见，
 不滚动、不画两端），其余标签经"全部标签"列表到达。紧凑形态下会话标签与待启动标签不画类型图标（类型在悬停提示里），
-把位置留给标题，最小宽度为 `Metrics::tab_compact_min_width`（80，随缩放）。是否紧凑只由窗口宽度、字号与有哪些提示决定，
+把位置留给标题，最小宽度为 `Metrics::tab_compact_min_width`（80，随缩放）。T9 起紧凑形态下标签的关闭按钮也不占行内位置：
+它浮在标签右端（标签自身的底色上），只在指针悬停标签时出现，标题因此拿到这块宽度——720×480 @200% 时至少显示名字的
+前四个字加省略号（`the_one_compact_tab_shows_four_letters_of_its_name`）；关闭仍可经中键、右键菜单与快捷键。是否紧凑只由窗口宽度、字号与有哪些提示决定，
 不读取上一帧布局，所以不会在两种形态之间来回跳。
 
 **顶栏提示（R2、R9，`view/shell.rs::topbar_notice_form`）。** 发现新版本（`topbar.update`）、同步失败或冲突
@@ -425,8 +428,9 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 文件视图或没有终端时，左中两组画成独立底栏（`standalone_session_bar`）。"X11 关"是默认状态，不再显示。
 
 **终端状态横幅**（ADR-6、R5，`view/banner.rs`）。会话结束（断开、失败、程序退出）、在终端已经显示过内容之后失败，
-或正在重连时，状态不再是叠在最后一屏上的卡片，而是终端**上方**的一行横幅（`terminal.failure`，重连中为
-`terminal.reconnecting`；外层 `terminal.banner`）：网格整体下移到横幅之下，最后一屏完整可读、可滚动、可选择与复制，
+或正在重连时，状态不再是叠在最后一屏上的卡片，而是终端**上方**的一行横幅（结束 / 失败时这一行就是
+`terminal.failure`；重连中外层是 `terminal.reconnecting`，其中的一行是 `terminal.banner`、下面一条不定进度条；
+`terminal.banner` 只在重连中存在，失败横幅外面没有它）：网格整体下移到横幅之下，最后一屏完整可读、可滚动、可选择与复制，
 不被任何东西盖住。视图经 `hand_banner` → `TerminalPane::set_status_banner(元素, 焦点)` 交给窗格，窗格把它画在
 自己那一列的网格之上（`banner_slot`）。
 
@@ -436,14 +440,19 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   （`terminal.failure.next`：重新连接，或无法重连时的关闭会话；重连中为 `terminal.reconnecting.cancel` 取消）、
   "显示详情 / 收起详情"（`terminal.failure.details`）与关闭（`terminal.failure.dismiss`，悬停提示带 Esc）。
   窗格（或文件视图占位时的窗口）窄于 `BANNER_WORDS_WIDTH`（560，随缩放）时命令改为图标按钮，名字在悬停提示里，
-  句子保住这一行的空间。重连中横幅用不定进度条作徽记。
+  句子保住这一行的空间；其中“重新连接”用 `components::primary_icon_button`（主按钮的 accent 底与字色），与旁边的
+  ghost 图标区分开（T9）。重连中横幅是 warning 色调、刷新图标，行下是一条不定进度条（`progress_bar(Indeterminate)`）。
 - **详情**在横幅下方展开（`terminal.failure.detail`）："诊断"标题与"复制诊断"（`terminal.failure.copy`），下面是等宽字的
   完整诊断（`terminal.failure.diagnostic`，`copyable_lines`：每行一个按横幅宽度换行的块，点任何一行复制全部），
-  最高 `DIAGNOSTIC_MAX_HEIGHT`（160，随缩放）、超出时纵向滚动。展开后长诊断需要多布局一帧（`window.on_next_frame`
+  最高 `DIAGNOSTIC_MAX_HEIGHT`（160，随缩放），同时不超过窗格高度的 `DIAGNOSTIC_MAX_SHARE`（40%，外层
+  `terminal.failure.room` 以相对高度限制，T9），超出时纵向滚动；720×480 @200% 展开后网格仍至少留 3 行
+  （`unfolded_details_leave_rows_of_the_last_screen_in_a_short_pane`）。展开后长诊断需要多布局一帧（`window.on_next_frame`
   请求重画）。复制的是会话陈述的整段诊断（哪个会话停止 + 原因），经 `sanitize_diagnostic` 清理。
 - **键盘**：横幅出现时不抢键盘。终端不再接收输入时，在终端里按 Tab 到达横幅第一个控件；Tab / Shift+Tab 在
   `BannerStop`（下一步、详情、复制、关闭）之间走，走过最后一个回到终端；Enter 或 Space 按下当前控件；Esc 关闭横幅
-  （`dismiss_active_banner`，接在视图的 Esc 链上），直到会话陈述别的状态（`banner_closed` 按会话记住关闭时的状态键）。
+  （`dismiss_active_banner`，接在视图的 Esc 链上），直到会话陈述别的状态（`banner_closed` 按会话记住关闭时的状态键）。开始重连（`reconnect_session`，远程会话另经
+  `keep_reconnect_screen`）时清除该记录：重连中横幅、取消后回到的同一原因、下一次重连都会重新显示，不被上一次的关闭藏住
+  （`a_closed_banner_comes_back_after_a_reconnect_is_cancelled`）。
 - **重连在最后一屏上进行。** `reconnect_session` 用 `keep_reconnect_screen` 留住旧窗格与失败记录
   （`reconnect_screens`）；新连接建立前，标签里仍画旧窗格的最后一屏，上方是"正在重新连接"横幅与取消
   （`cancel_reconnect`），连接卡片与 `layout_terminal` 在 `connection_behind_screen()` 时让位；新窗格接上
@@ -464,7 +473,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 铺满的文件视图占着终端的位置，此时卡片画在内容上方居中。所有状态卡与连接卡片（`remote.page.card`）进入时
 `Enter::Rise`（BASE），按会话 id 只播放一次；减少动效时直接画在最终位置。
 
-**选择器变更（T6，供 T9 汇总）**：删除 `terminal.status.overlay`、`terminal.status.scroll`（状态卡改为横幅）、底栏常驻工具 `terminal.grid.size`、`terminal.mode`、`terminal.font.decrease/.increase/.reset`（同名动作在菜单里：`terminal.more.size`、`terminal.more.mode`、`terminal.more.copy`、`terminal.more.font.decrease/.increase/.reset`）；新增 `terminal.banner`、`terminal.failure.copy/.detail/.dismiss`、`terminal.reconnecting(.headline/.cancel/.dismiss)`、`session.more.scroll`；保留 `terminal.failure(.headline/.next/.details/.diagnostic)`、`terminal.bar(.left/.middle/.controls/.tools)`、`terminal.search`、`terminal.more(.menu)`、`session.more(.menu)`、`session.tab.<n>`。
+**选择器变更（T6，供 T9 汇总）**：删除 `terminal.status.overlay`、`terminal.status.scroll`（状态卡改为横幅）、底栏常驻工具 `terminal.grid.size`、`terminal.mode`、`terminal.font.decrease/.increase/.reset`（同名动作在菜单里：`terminal.more.size`、`terminal.more.mode`、`terminal.more.copy`、`terminal.more.font.decrease/.increase/.reset`）；新增 `terminal.banner`（仅重连中的横幅行）、`terminal.failure.copy/.detail/.dismiss`、`terminal.reconnecting(.headline/.cancel/.dismiss)`、`session.more.scroll`；保留 `terminal.failure(.headline/.next/.details/.diagnostic)`、`terminal.bar(.left/.middle/.controls/.tools)`、`terminal.search`、`terminal.more(.menu)`、`session.more(.menu)`、`session.tab.<n>`。
 
 **连接在标签里进行。** 按"连接"后标签立即出现并切过去，连接卡片（`connection_page`，与对话框同一份内容
 `connection_content`）画在终端区域中央：四步进度、需要回答的问题、失败原因与重试都在这里，不再是盖住主页的
@@ -798,8 +807,12 @@ COM1 等）不算文件夹里的文件。不满足的一律 `ERROR_ACCESS_DENIED
 
   四个阶段都结束后显示 “Ready / 准备就绪”。读到的结果先存在 `StartupRun` 里，启动结束时才按与同步启动相同的顺序采纳
   （主机 → 分组 → 信任 → 转发 → 布局；先主机后布局，缺失主机的窗格照常标记）。
-- **进度条**：第 i 个阶段结束后目标为 i/4（`StartupRun::target`）。条用 `components::progress_bar_toward`，从上一个目标
-  以 `Motion::BASE` 200ms、ease-out-cubic 缓动到新目标；宽 200（随缩放，窄窗时不超过可用宽度），`startup.progress`。
+- **进度条**：第 i 个阶段结束后目标为 i/4（`StartupRun::target`）。条用
+  `components::progress_line(id, from, to, duration, still, metrics)`（2px 高、全圆角、accent 填充，组件内选择器
+  `progress.line`），从目标改变那一刻**当前画到的位置**（`BarMotion::at`，同一条 ease-out-cubic 曲线算出；T9 起，
+  原先是上一阶段的目标值）以 `Motion::BASE` 200ms、ease-out-cubic 缓动到新目标（`BarMotion::retarget`，阶段结束与
+  “继续”时调用）；外层宽 200（随缩放，窄窗时不超过可用宽度），`startup.progress`。两个阶段相隔不到 200ms 时（本机常见
+  情况，四阶段合计十几毫秒），新的一段从半路接着走，不再向前跳（`the_bar_sets_off_from_where_it_is_drawn`）。
   阶段说明为 caption 字号、次要文字色，每换一个阶段以 `Motion::FAST` 淡入（`startup.stage`）。
 - **品牌时刻**：图标从 96% 大小放大到 100%，整组淡入，用时 `BRAND_ENTRANCE` 250ms（`startup.splash.mark`、
   `startup.splash.brand`、`startup.splash.name`）。计时从构造视图时开始；阶段比它慢就等阶段，比它快也不额外等待。
@@ -807,24 +820,35 @@ COM1 等）不算文件夹里的文件。不满足的一律 `ERROR_ACCESS_DENIED
 - **进入首页**：阶段全部完成且品牌时刻已过时进入 Ready。启动页作为一层只读画面（全满的进度条与 “Ready”）在
   `SPLASH_EXIT` 200ms 内淡出（`startup.crossfade`，不接收指针，首页从第一帧就可点击）；同时首页内容区（标签栏下方的
   `destination_panel`）在 `PAGE_ENTRANCE` 300ms 内淡入并从下方 `PAGE_TRAVEL` 8px 上移到位（`theme::arrive`）。
+  主机首页分两块错开进入（`ShelluneView::home_entrance` → `theme::arrive_after`）：侧栏先（`startup.page.sidebar`），
+  列表晚 `PAGE_STAGGER` 40ms（`startup.page.list`），各自淡入并上移；减少动效时只淡入。
 - **减少动效**（用户偏好或系统设置，`Choreography::for_motion`）：只保留淡入淡出——图标不缩放、首页不位移、进度条直接
   跳到目标值；品牌时刻（250ms 淡入）、启动页淡出与首页淡入照常。系统设置要靠辅助程序回答的平台（Linux，
   `SYSTEM_MOTION_QUERY_BLOCKS`）在后台询问，回答到达前只画 canvas 与标题行，最多等 `SYSTEM_MOTION_WAIT`（400ms），
   品牌时刻从回答到达（或超时）时开始计时；超时按用户自己的偏好继续，迟到的回答仍用于之后的帧。Windows 与 macOS 同步读取。
 - **阶段失败**：阶段 1 在 `preferences.json` 存在但不是可读的设置文件时失败（默认设置照常生效）；阶段 2、3 在任一文件读取
   失败时失败（原因取存储层给出的第一条）；阶段 4 不会失败（字体缺失时终端本就按比例回退）。失败时启动页停在该阶段：
-  进度条停在该阶段开始处，下方是危险色标题（`startup.failure.title`，如“无法读取主机簿”）、完整原因（换行，
-  `startup.failure.reason`）、一句说明（`startup.failure.hint`）和两个按钮：
+  品牌下方的进度条与阶段说明整块换成停止面板（`startup_stop_panel`，`startup.failure`，停下期间不画进度条）：危险色
+  标题（`startup.failure.title`，如“无法读取主机簿”）、完整原因（换行，`startup.failure.reason`）与一句说明
+  （`startup.failure.hint`）；面板下方是两个按钮（`startup.failure.actions`，T9 起不在面板里，而是在可滚动的文字区之外）：
   - **继续**（主按钮，`startup.continue`；启动页有焦点时 Enter 同效）：剩余阶段继续执行，之后的失败不再停下；进入首页后
     读不到的部分按原有降级显示（例如首页的 `state.card` 与原因）。
   - **打开配置文件夹**（`startup.open_folder`）：以 `file://` 地址（`folder_url`，百分号编码）交给系统文件管理器打开数据目录；
     启动页仍等待“继续”。
-  停下的启动页不会自行超时，也不会闪退。200% 文字的 720×480 窗口里失败内容高于可用区域时，启动页主体可滚动，按钮总能滚到
-  可见处（测试）。
+  停下的启动页不会自行超时，也不会闪退。布局（T9，`splash_body`）：标题行之下的区域把“品牌 + 停止面板”与按钮行一起
+  垂直居中；内容放得下时按钮紧跟在说明下方，放不下时（200% 文字的 720×480）只有品牌与文字的部分（`startup.body`）收缩并
+  纵向滚动，按钮行不收缩、始终在首屏可见（`the_stop_scrolls_to_its_buttons_in_the_smallest_window_at_the_largest_text`
+  先断言两个按钮不滚动就在窗口内且可点，再断言滚动后仍可点）。
 - **阶段耗时**：开发构建（`debug_assertions`）或设置了环境变量 `SHELLUNE_STARTUP_LOG` 的任意构建，在 stderr 逐个写出
   `shellune start: stage i/4 <阶段>: <毫秒>`，最后写出 `page shown after <毫秒>`（从构造视图算起）。单元测试不输出。
-  本机实测（Windows，开发构建，真实数据副本：主机簿 8.4KB、已知主机 6KB，三次）：阶段 1 约 1.2ms、阶段 2 约 8ms、
-  阶段 3 约 6ms、阶段 4 约 1–4ms；四个阶段合计约 17ms，首页在约 255ms 出现，即由 250ms 品牌时刻决定。
+  本机实测（Windows，真实数据副本经 `APPDATA` 隔离、`SHELLUNE_STARTUP_LOG=1`，各三次，T9 于 2026-11-19 重测）：
+
+  | 构建 | 阶段 1 设置与主题 | 阶段 2 主机簿与已知主机 | 阶段 3 转发分组与工作区 | 阶段 4 字体预热与首帧 | 四阶段合计 | 首页出现 |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 开发（`cargo build -p shellune`） | 1.1–1.4ms | 7.5–8.5ms | 5.3–6.9ms | 1.2–1.3ms | 约 16.5ms | 258–266ms |
+  | 发布（`cargo build --release -p shellune`） | 0.7–0.9ms | 3.7–4.2ms | 4.2–4.7ms | 1.4–3.6ms | 约 10–13ms | 252–268ms |
+
+  两种构建首页都在约 250–270ms 出现，由 250ms 品牌时刻决定，阶段本身不是瓶颈。未测进程启动到第一帧的时间。
 - **推迟到 Ready 的工作**：任务中心的存储与中断恢复（`batch.recover`）、自动同步的首次拉取（`start_sync`）、
   更新清理与 20 秒后的检查（`start_updates`）、工作区布局恢复，都在采纳之后由 `begin_work` 一次启动；启动期间
   `layout_persist` 为关，不会把空布局写回 `workspace.json`。
@@ -1022,7 +1046,35 @@ tooltip 这类在窗口渲染之外绘制的部件用 `theme::metrics()` 取得�
 | T4 之后 | 220 | 82 | 首页改为侧栏 + 单列表：卡片带、快速连接栏、分组列与分组头删除；新代码的尺寸都是命名常量（`SIDEBAR_WIDTH` 等）或 spacing 令牌 |
 | T6 之后 | 203 | 75 | 标签改为胶囊（标签底色、分隔线与远程画面取色删除）；底栏终端工具收进菜单（折叠测量与 `tools_width` 删除）；状态卡改为横幅，横幅只用 spacing 令牌与命名常量（`DIAGNOSTIC_MAX_HEIGHT`、`BANNER_WORDS_WIDTH`）；标签条溢出容差 `STRIP_ROUNDING_SLACK` |
 | T7 之后 | 163 | 66 | 文件栏头、面包屑、文件行、问题、传输条与进度条、远程桌面状态卡与证书卡、隧道表单改用组件与 spacing / 度量令牌；余下的长度是命名常量（`FILES_SIZE_WIDTH`、`FILES_SELECTION_WORDS_MIN`、`NOTICE_WIDTH`、`ZOOM_LABEL_WIDTH`、`FORWARD_PORT_WIDTH`、`FORWARD_ROW_WORDS_MIN`、`LIST_ROW_MIN_HEIGHT`、`TOOLBAR_MIN_HEIGHT`、`HAIRLINE_WIDTH`）；状态卡徽记、浮动条、竖线与选中竖条的裸数换成等值的度量（外观不变） |
-| T8 之后（当前基线） | 99 | 43 | 设置、对话框、菜单、命令面板、toast、tooltip 与批量任务迁移：设置导航改用 `nav_item`，选中竖条改用 `accent_mark`，设置页、批量任务、命令面板、标签菜单 / 标签列表、主机表单与快捷命令编辑器余下的长度改为命名常量（`SECTIONS_MAX_WIDTH`、`PAGE_MAX_WIDTH`、`ROW_LABEL_MIN_WIDTH`、`KEYS_NAME_MIN_WIDTH`、`NUMBER_FIELD_WIDTH`、`LIST_MAX_HEIGHT`、`RUN_OUTPUT_HEIGHT`、`PALETTE_WIDTH`、`PALETTE_LIST_MAX_HEIGHT`、`MENU_MIN_WIDTH`、`MENU_MIN_HEIGHT`、`TAB_MENU_MIN_WIDTH`、`TOAST_WIDTH`、`ICON_TILE`、`KBD_HEIGHT`、`FORM_FIELD_MIN_WIDTH` 等）或度量（菜单项、命令面板脚注与跳板选择器行改为 `compact_control_height`，命令面板结果行为 `large_control_height`）；对话框标题、状态卡标题回到字阶（`title_size`），宽度计算里的 2px 边框写作 `HAIRLINE_WIDTH × 2`。已低于 ADR-9 的 `scale` 目标（≤ 140），`px` 距目标（≤ 45）已达成 |
+| T8 之后 | 99 | 43 | 设置、对话框、菜单、命令面板、toast、tooltip 与批量任务迁移：设置导航改用 `nav_item`，选中竖条改用 `accent_mark`，设置页、批量任务、命令面板、标签菜单 / 标签列表、主机表单与快捷命令编辑器余下的长度改为命名常量（`SECTIONS_MAX_WIDTH`、`PAGE_MAX_WIDTH`、`ROW_LABEL_MIN_WIDTH`、`KEYS_NAME_MIN_WIDTH`、`NUMBER_FIELD_WIDTH`、`LIST_MAX_HEIGHT`、`RUN_OUTPUT_HEIGHT`、`PALETTE_WIDTH`、`PALETTE_LIST_MAX_HEIGHT`、`MENU_MIN_WIDTH`、`MENU_MIN_HEIGHT`、`TAB_MENU_MIN_WIDTH`、`TOAST_WIDTH`、`ICON_TILE`、`KBD_HEIGHT`、`FORM_FIELD_MIN_WIDTH` 等）或度量（菜单项、命令面板脚注与跳板选择器行改为 `compact_control_height`，命令面板结果行为 `large_control_height`）；对话框标题、状态卡标题回到字阶（`title_size`），宽度计算里的 2px 边框写作 `HAIRLINE_WIDTH × 2`。已低于 ADR-9 的 `scale` 目标（≤ 140），`px` 距目标（≤ 45）已达成 |
+| **T9 之后（最终基线）** | **13** | **2** | 收尾清理（取值不变，外观不变）：组件库余下的长度全部命名（`STATUS_DOT_SIZE`、`ATTENTION_MARK_SIZE`、`CHIP_HEIGHT`、`KBD_TEXT_SIZE`、`BADGE_SIZE`、`KIND_BADGE_HEIGHT`、`BANNER_EDGE_WIDTH`、`FIELD_ROW_LABEL_WIDTH`、`STATE_EMBLEM_SIZE`、`STATE_EMBLEM_ICON_SIZE`、`STATE_CARD_WORDS_MAX_WIDTH`、`LOADING_TRACK_WIDTH`、`LOADING_FILL_WIDTH`、`LOADING_BAR_THICKNESS`、`SWITCH_WIDTH`、`SWITCH_HEIGHT`、`SWITCH_INSET`、`CHECKBOX_SIZE`、`CHECKBOX_TICK_SIZE`、`EMPTY_EMBLEM_SIZE`、`EMPTY_EMBLEM_ICON_SIZE`、`EMPTY_WORDS_MAX_WIDTH`、`MODAL_ICON_TILE`、`SKELETON_LINE_HEIGHT`、`SWITCH_WORD_MIN_WIDTH`）；终端与输入框（`SESSION_SLOT_MIN_WIDTH`、`SEARCH_PANEL_MAX_HEIGHT(_CAP)`、`SEARCH_QUERY_MIN_WIDTH`、`SEARCH_FOCUS_HALO`、`SCROLL_THUMB_INSET/WIDTH`、`LAYOUT_SLACK`、`CARET_INSET`、`COMPOSITION_UNDERLINE`、`FOCUS_HALO`、`FIELD_MENU_MIN_WIDTH`）；标签条、顶栏、分屏与各页的零散尺寸（`STRIP_FADE_WIDTH`、`TAB_ICON_SIZE`、`TAB_TITLE_LINE_HEIGHT`、`TAB_ACCENT_MARK_WIDTH/HEIGHT`、`HOST_AVATAR_SIZE`、`SHELL_PICKER_WIDTH`、`BRAND_MARK_SIZE`、`BAR_ICON_SIZE`、`DIVIDER_BAND`、`PANE_HEAD_HEIGHT`、`CAPTION_GLYPH_SIZE`、`DOWNLOAD_BAR_HEIGHT` 等）；与已有令牌同值的改写成令牌（`scale(2.0)` → `spacing::HALF`、`scale(16.0)` 图标槽 → `icon_size()`、`scale(28.0)` → `compact_control_height()`、`scale(24.0)` → `HIT_TARGET` / `ICON_TILE`、`px(16.0)` → `spacing::BASE`），窗格活动竖条改用 `accent_mark`，独立的发丝线与边框宽写作 `HAIRLINE_WIDTH`，`x / px(1.0)` 取数改为 `f32::from(x)`；截图工具的窗口位置与右键坐标也命名（`OFF_DESKTOP`、`TAB_MENU_AT`、`HOST_MENU_AT`、`FILES_MENU_AT`）。余下的 13 个 `scale(<数字>)` 是 `theme.rs` 里 `Metrics` 度量本身的定义（`rail_width`、`header_height`、`list_row_height`、`icon_size`、`small_icon_size`、`control_height`、`compact_control_height`、`large_control_height`、`tab_height`、`tab_min_width`、`tab_compact_min_width`、`name_min_width`、`tab_max_width`），余下的 2 个 `px(<数字>)` 是已命名的 `STRIP_ROUNDING_SLACK`（`Pixels` 常量）与标签条滚动步长的 1px 下限。相对迁移前（280 / 91）分别降到 4.6% 与 2.2%，远低于 ADR-9 的一半（≤ 140 / ≤ 45） |
+
+### 终端选择（R4，ADR-5，`src/app/terminal.rs` + `crates/terminal`）
+
+选区的边界在格与格之间，而不在格子上；规则与常见终端一致，由 alacritty 的 `Selection` 按半格计算。
+
+| 规则 | 行为 |
+| --- | --- |
+| 半格 | 指针在格子左半部为 `Side::Left`，右半部为 `Side::Right`，正好在中线算 Left。`cell_at` 返回 `((行, 列), Side)`；x < 0 取第 0 列的 Left，超出右边界取末列的 Right，y 越界夹到首行或末行。按下与拖动都传实际的 Side：从字符左半部起拖包含该字符，从右半部起拖不包含，与拖动方向无关 |
+| 拖动阈值 | 按下只记录起点（同时清除旧高亮）；移动超过 `SELECTION_DRAG_THRESHOLD`（3px，欧氏距离）或进入另一格才开始选择。松开时还没开始就按单击处理：清除选择，不复制 |
+| 双击 / 三击 | 双击选词、三击选行，按下即生效，松开即复制（行选择照旧带结尾换行） |
+| Shift+单击 | 已有选择时把终点移到点击处，继续拖动继续扩展；没有选择时从光标格的 Left 选到点击处。程序接管鼠标（鼠标上报模式）时，Shift+拖动从按下点开始做本地选择（程序自己管光标），整个过程不向程序上报 |
+| Alt / Option+拖动 | 块选（`SelectionType::Block`）：每行同一组列 |
+| 窗口级捕获 | viewport 的 canvas 每帧注册 `window.on_mouse_event`（MouseMove / MouseUp，Bubble 阶段），只有本窗格持有拖动时才生效：指针离开终端或窗口后选择仍跟随，松开也能收到；收到 `pressed_button ≠ Left` 的移动按在该处松开处理。与 ADR-5 措辞（“开始后注册、松开时注销”）的差别：按下后第一帧重绘之前可能已有移动事件，按需注册会漏掉，每帧注册、无拖动时不做事在效果上等价 |
+| 边缘自动滚动 | 指针越过 viewport 上下边缘时，每 `SELECTION_AUTOSCROLL_INTERVAL`（50ms）滚动 ceil(越界距离 / 行高) 行，限制在 1–`SELECTION_AUTOSCROLL_MAX_LINES`（5）行，终点同时更新到边缘行；回到区域内或松开即停。只在主屏有历史时滚动（备用屏没有历史） |
+| 选区颜色 | `SELECTION` 令牌（深浅各一），不再是视图里的字面量 |
+
+未覆盖：程序接管鼠标后由程序处理的普通拖动（非 Shift）仍只靠悬停分发，没有窗口级捕获（不在 ADR-5 范围）。
+
+测试（`src/app/tests.rs`）：`a_drag_from_the_left_half_of_a_character_includes_it`（截图里 `test-c9685ba2` 的 `t` 用例）、
+`the_half_of_a_cell_decides_whether_it_is_selected`、`a_press_becomes_a_selection_past_the_drag_threshold`、
+`shift_click_extends_the_selection`、`alt_drag_selects_a_block`、`a_drag_that_leaves_the_grid_keeps_selecting`、
+`a_drag_past_the_edge_scrolls_the_history`、`shift_drag_selects_locally_while_a_program_has_the_mouse`、
+`double_and_triple_clicks_select_a_word_and_a_line`、`a_mouse_selection_is_copied_when_it_is_released`。截图场景（T9 新增）：
+`terminal-selection`（从 “42 passed” 的 “4” 左半部到 “部署完成” 末字右半部，跨两行与宽字符；深浅、中英、1120×720 与
+720×480 的 200%）与 `terminal-selection-block`（“grid” 到 “paste” 的块选；深浅、中文、200%）。选区由截图工具经
+`TerminalPane::capture_select` 按文字定位后铺上，网格改宽时重新铺一次；截图证明不了阈值、Shift、窗口级捕获与自动滚动，
+这些由上面的 GPUI 测试覆盖。
 
 ### 终端内搜索（`crates/terminal` + `src/app/terminal.rs`）
 
@@ -1186,7 +1238,8 @@ resize 都按同一条 recount 路径重新计数，视口停在读者原处，�
   头部是 `form_heading`（动作图标在色调 tint 上 + 一句，`files.question.heading`），字段上方是 `form_label`，协议分段只有
   自己的宽度。新建文件夹 / 改名 / 删除仍以等宽字体写出目标的完整路径（`files.question.target`）；上传 / 下载的远端路径
   已在“远端目录 / 远端路径”输入框里，**不再在下方重复**——只有上传时“目录 + 所选文件名”得出的最终路径与输入不同，才以
-  MUTED 小字写“将保存到 …”（`transfers_lands_at`，同一选择器）。按钮行占满表单宽度、靠右，**取消在左、主按钮在最右**，
+  MUTED 小字写“将保存到 …”（`transfers_lands_at`，同一选择器；显示与不显示两种条件见
+  `an_upload_says_where_it_lands_only_once_a_file_names_it`）。按钮行占满表单宽度、靠右，**取消在左、主按钮在最右**，
   键盘停靠顺序随之是“…… → 取消 → 确定”（`files_question_stops`）；传输覆盖确认是“保留 → 替换”。
 - **按钮顺序（全应用，T7 起）**：一组回答按钮靠右排列，主按钮（Primary / Danger 的那一个）在最右，取消 / 拒绝 / 保留
   紧挨在它左边；Tab 顺序与视觉顺序一致。已按此调整：文件栏问题、传输覆盖（栏内与传输中心）、片段编辑器“取消 → 保存”、
@@ -1327,13 +1380,14 @@ SCP 失败就报 SCP 的失败，SFTP 失败就报 SFTP 的失败，不会静默
 **捕获。** `files-dual`、`files-empty`、`transfers-running`、`transfers-failed`、`forwards-empty`、`forwards-running`
 六个场景由夹具数据构造：两侧目录来自脚本化通道（不读磁盘、不连服务器），传输任务通过队列自己的事件进入“进行中 /
 失败”，转发规则在不绑定任何套接字的情况下标记为监听中。每个场景都有浅色与深色，T7 起另有浅色中文与
-720×480 @200%；T7 新增 `files-question`（上传问题的行内表单）与 `forwards-form`（新建隧道表单）；
+720×480 @200%；T7 新增 `files-question`（上传问题的行内表单）与 `forwards-form`（新建隧道表单），T9 新增
+`forwards-host-picker`（隧道表单的主机选择器展开态，`capture_forward_host_picker_open` 判断就绪）；
 就绪判断读的是渲染所用的同一份模型（`capture_files_listing`、`capture_transfer_count`、`capture_forward_counts`、
 `capture_files_question_open`、`capture_forward_form_open`）。
 
 **选择器变更（T7，供 T9 汇总）**：传输对话框无任务时 `state.card` → `transfers.empty`（测试
 `transfers_and_forwards_open_over_the_page_and_close_again` 同步）；远程桌面结束时窗口画的 `terminal.failure` 从卡片变成横幅，
-选择器同名（`terminal.failure`、`.next`、`.details`、`.copy`、`.detail` 与 `terminal.banner`）；新增 `files.toolbar`、
+选择器同名（`terminal.failure`、`.next`、`.details`、`.copy`、`.detail`；`terminal.banner` 只在重连中出现）；新增 `files.toolbar`、
 `files(.local).loading.skeleton.<n>`（骨架行的动画 id）、`transfers.progress.bar.<n>`、`desktop.status.headline`、
 `desktop.status.detail`、`desktop.certificate.fingerprint`；其余文件、传输、转发、桌面选择器不变。
 ### X11 转发（`crates/ssh/src/x11.rs`、连接表单、会话头）
@@ -1961,7 +2015,7 @@ toast 相同的 `components::popover_surface` 上（raised + 强边 + 圆角 8 +
 | --- | --- |
 | `button` / `button_sized` / `button_with_state` | 五种变体（v2）：Primary（实心 accent + Raised）、Secondary（面板底 + 强边）、Ghost（无底，悬停出底）、Danger（danger tint）、Icon（方形仅图标，外观同 Ghost，必须带 tooltip）；`ButtonSize` 紧凑 28 / 常规 32 / 大号 36，圆角 6，MEDIUM 字重，标签 13（紧凑为 12）。旧的 Soft 已删除，原用处改为 Secondary |
 | `button_face(variant, state)` | 五种变体 × 八态外观表（测试逐格校验文字与边的对比度：有不透明底的读自己的底，底是遮罩的读它叠在五个层上的结果，无底的读五个层与叠在各层上的选中底，两套主题；同一变体的八态互不相同） |
-| `icon_label_button` / `compact_button` / `icon_only_button` / `danger_icon_button` / `icon_button` | 带图标按钮、紧凑按钮（`ButtonSize::Compact`，28）、方形图标按钮（`Variant::Icon`，≥ 24 指针目标） |
+| `icon_label_button` / `compact_button` / `icon_only_button` / `danger_icon_button` / `primary_icon_button` / `icon_button` | 带图标按钮、紧凑按钮（`ButtonSize::Compact`，28）、方形图标按钮（`Variant::Icon`，≥ 24 指针目标）；`primary_icon_button` 是去掉文字的主动作（主按钮的 accent 底与字色，窄横幅的“重新连接”，T9） |
 | `field_face` + `field_frame` | 输入框：surface 底、弱边，焦点 2px 焦点环，校验失败 2px 危险边 |
 | `segmented` + `segment` | 互斥选择：凹槽 + 选中滑块（滑块 Raised） |
 | `switch(on)` | 设置开关：34×20 胶囊轨道，圆钮在左（关，`TRACK_OFF`）或右（开，`TRACK_ON`），悬停用对应 `*_HOVER`，圆钮 Raised；状态先由位置表达，圆钮在每种轨道上 ≥ 3:1 |
@@ -1978,7 +2032,7 @@ toast 相同的 `components::popover_surface` 上（raised + 强边 + 圆角 8 +
 | `toolbar` | 页面或栏的头部工具条：一行、居中对齐、间距 8、最小高 44、底部发丝线；调用方放标题、搜索框和命令，`flex_1` 的子元素占剩余空间 |
 | `inline_banner(tone, icon, message)` | 内容上方的状态横幅（ADR-6 用）：色调 tint 底 + 底部色调发丝线，最小高 36；色调图标 + 一句话（省略号截断）+ 调用方追加的紧凑按钮与关闭按钮。不遮挡下方内容 |
 | `progress_bar(id, Progress)` | 细进度条（高 4、全圆角）：确定型按比例填充；不确定型一段 30% 宽的填充以 `PROGRESS_SWEEP` 1200ms 循环扫过，减少动效时静止居中（`progress.determinate` / `.indeterminate` / `.still`） |
-| `progress_bar_toward(id, from, to, duration)` | 确定型进度条从 `from` 以 ease-out-cubic 缓动到 `to`（新的 `id` 重播，同一 `id` 画在 `to`）；减少动效时直接画 `to`。启动页用它追阶段目标（第 1.5 节） |
+| `progress_line(id, from, to, duration, still, metrics)` | 启动页的确定型细进度条（2px 高、全圆角、accent 填充、`LOADING_TRACK` 轨道，`progress.line`）：填充从 `from` 以 ease-out-cubic 缓动到 `to`（新的 `id` 重播，同一 `id` 画在 `to`）；减少动效或 `still` 时直接画 `to`。启动页用它追阶段目标（第 1.5 节） |
 | `skeleton_text(fraction)` / `skeleton_row(id)` | 骨架屏：文字行（高 10、圆角 4、selected 底）与列表行（头像块 + 两行）；允许动效时缓慢呼吸，减少动效时静止 |
 | `kbd(label)` | 键帽：高 `KBD_HEIGHT`（18）、圆角 4、面板底 + 强边（底边 2px），字号 caption − 1；取代旧 `keycap` |
 | `checkbox_target(checked)` / `labelled_switch(on, word, selector)` | 指针大小的勾选目标（首页多选列）；带状态词的开关（设置页），取代两处本地实现 |
@@ -2066,3 +2120,110 @@ raised 与强边、开关与勾选框的轨道与勾可读、每个共享组件�
 
 - 产品名与两句简介由 `product.rs` 提供；简介按界面语言显示在空的本地终端页。
 - 其余文案全部在 `copy.rs` 的双语表中；英文计数用 `copy::counted` 处理单复数。
+
+## 7. 2026-11 全应用重做的交付汇总（T9，ADR-9）
+
+本节只做索引与汇总：规则本身写在各自的章节里，这里给出位置、最终数字与仍未关闭的事项。各节与代码不一致时以代码为准。
+
+### 7.1 交付项与位置
+
+| 交付项 | 位置 | 说明 |
+| --- | --- | --- |
+| 设计 token 表（R1，ADR-1） | §2.1 颜色、§2.2 层级、§2.3 动效、§2.4 形状间距与字 | 深浅两张独立的表；交互填充为半透明叠加（§2.1）；偏离 ADR-1 的值在 §2.1 写明 |
+| 组件规范（R1，ADR-2） | §5 组件清单 | 按钮五变体与 28 / 32 / 36 高、`search_field`、`list_row`、`sidebar_item`、`toolbar`、`inline_banner`、`progress_bar` / `progress_line`、`skeleton`、`kbd` 等；`design-catalog` 截图逐个画出 |
+| 首页入口新旧对照表（R2，ADR-3） | §1 “首页入口新旧对照”（T4） | 15 个入口；分组的键盘与 `⋯` 菜单路径为 T4 返修后增加 |
+| 启动阶段与实测耗时（R3，ADR-4） | §1.5 | 四阶段、进度条、失败停下、交接动效、减少动效；本机实测见 7.4 |
+| 终端选择规则（R4，ADR-5） | §2 “终端选择” | 半格、阈值、双击 / 三击、Shift、Alt 块选、窗口级捕获、边缘自动滚动；截图 `terminal-selection*` |
+| 终端状态横幅规则（R5，ADR-6） | §1.0 “终端状态横幅”、§1.4（远程桌面同一横幅） | 一行横幅 + 可展开详情（最高 160 且不超过窗格 40%）+ 复制诊断；Tab 可达、Esc 关闭，开始重连时关闭记录清除；窄横幅的重连为 accent 图标；重连中为不定进度 + 取消 |
+| 发布流程原生构建（R6，ADR-8） | `packaging/README.md`、`vendor/README.md`（T2） | 运行链接见 7.5 |
+| 按钮顺序规则（ADR-7） | §“文件视图（SFTP）”中的“按钮顺序（全应用，T7 起）” | 一组回答按钮靠右，主按钮（Primary / Danger）在最右，取消 / 拒绝 / 保留在它左边；Tab 顺序与视觉一致；T8 对话框三段式沿用 |
+| 选择器变更表（ADR-9） | 7.2 | 汇总 T1–T9 的删除、改名与新增 |
+| 守卫最终基线（ADR-9） | §2.5、7.3 | `scale` 13 / `px` 2（迁移前 280 / 91） |
+| 截图（R7，ADR-9） | 7.4 | 全部场景重拍，深浅、中英、200% |
+
+### 7.2 选择器变更表（T1–T9）
+
+测试读的是 `debug_selector`。下表列出这次重做删除、改名与新增的选择器；没有列出的选择器名字与含义不变。
+`<n>` 是行号，`{id}` 是会话或窗格编号。各任务的明细在对应章节（T4 见 §1、T6 见 §1.0、T7 见“文件、传输与转发的任务连续性”节末）。
+
+| 界面 | 删除 | 改名（旧 → 新） | 新增 | 任务 |
+| --- | --- | --- | --- | --- |
+| 组件库 | — | — | `catalog`、`catalog.column.<n>`、`catalog.section.<标题>`、`catalog.type.<字阶>`（设计目录）；`list.row.title`、`progress.determinate`、`progress.indeterminate`、`progress.still`、`progress.line`、`skeleton.row` | T3、T5 |
+| 首页 | `home.quick`、`home.quick.results`、`home.quick.result.<n>`、`home.quick.empty`、`home.dashboard`、`home.cards`、`home.all`、`home.recent*`、`home.favorite*`、`home.group.<n>`、`welcome.quick`、`hosts.view.groups`、`hosts.count`、`hosts.surface`、`hosts.statuses`、`hosts.tree.all`、`hosts.group.chooser`、`hosts.group.option.<名>`、`hosts.group.actions`、`hosts.group.<n>`（列表分组头）与其 `.toggle`、`hosts.filter.favorites(.chip)`、`hosts.filter.group`、`hosts.forwards.<n>` | `hosts.group.tag.<n>` → `hosts.tag.<n>`；`hosts.connection.open.<n>` → `hosts.connection.state.<n>` | `home.sidebar`、`home.sidebar.folded`、`home.sidebar.toggle`、`home.sidebar.groups`、`hosts.view.favorites`、`hosts.favorites.all`、`hosts.filter`、`hosts.filter.menu`、`hosts.filter.status`、`hosts.filter.sort`、`hosts.sort.*`、`hosts.more`、`hosts.more.menu`、`hosts.more.group.rename`、`hosts.more.group.delete`、`hosts.tree.<n>.more`、`hosts.group.menu`、`hosts.direct`、`hosts.nomatch.connect`、`hosts.empty.local`、`hosts.favorites.empty`、`hosts.group.empty`、`hosts.state.<n>`、`startup.page.sidebar`、`startup.page.list` | T4、T5 |
+| 首页（位置移动，名字不变） | — | — | `hosts.import`、`hosts.batch.open.list` 从工具栏按钮移进 `⋯` 菜单；`hosts.group.rename.open` / `hosts.group.delete.open` 从列表上方按钮移进分组菜单；`home.local` 从标题行移到侧栏底部 | T4 |
+| 启动 | `startup.splash.tagline` | — | `startup.splash.mark`、`startup.progress`、`startup.stage`、`startup.failure`、`startup.failure.title`、`startup.failure.reason`、`startup.failure.hint`、`startup.continue`、`startup.open_folder` | T5 |
+| 终端横幅（T9） | — | — | `terminal.failure.room`（展开详情的外层，按窗格高度 40% 限高；`terminal.failure.detail` 仍是滚动的那一层） | T9 |
+| 启动失败（T9） | — | 两个按钮从 `startup.failure` 面板内移到其下方的 `startup.failure.actions` 行（`startup.continue` / `startup.open_folder` 名字不变） | `startup.failure.actions` | T9 |
+| 标签（T9） | — | 紧凑形态下 `session.tab.close.<n>` 从行内移到标签右端的浮层，悬停才显示（名字不变） | — | T9 |
+| 截图场景（T9） | — | — | `forwards-host-picker`、`terminal-selection`、`terminal-selection-block` | T9 |
+| 终端横幅与底栏 | `terminal.status.overlay`、`terminal.status.scroll`；底栏常驻工具 `terminal.grid.size`、`terminal.mode`、`terminal.copy`、`terminal.font.decrease`、`terminal.font.increase`、`terminal.font.reset` | 同名动作移进菜单：`terminal.more.size`、`terminal.more.mode`、`terminal.more.copy`、`terminal.more.font.decrease/.increase/.reset` | `terminal.banner`（仅重连中的横幅行）、`terminal.failure.copy`、`terminal.failure.detail`、`terminal.failure.dismiss`、`terminal.reconnecting`、`terminal.reconnecting.headline`、`terminal.reconnecting.cancel`、`terminal.reconnecting.dismiss`、`session.more.scroll`；保留 `terminal.failure(.headline/.next/.details/.diagnostic)` | T6 |
+| 分屏窗格 | — | — | （T9）窗格头 `pane.active.mark` 改用 `accent_mark`，名字不变 | T9 |
+| 文件、传输、远程桌面 | 传输对话框无任务时的 `state.card` | `state.card` → `transfers.empty`（同一位置） | `files.toolbar`、`files(.local).loading.skeleton.<n>`、`transfers.progress.bar.<n>`、`desktop.status.headline`、`desktop.status.detail`、`desktop.certificate.fingerprint`；远程桌面结束时的 `terminal.failure*` 从卡片变成横幅（同名） | T7 |
+| 端口转发 | 隧道表单里主机分段控件的各段 `forwards.host.<n>` | `forwards.host` 名字不变，从分段控件变成字段式选择器 | `forwards.host.picker`、`forwards.host.search`、`forwards.host.options`、`forwards.host.option.<n>`、`forwards.host.name`、`forwards.host.none` | T7 |
+| 对话框与设置 | — | — | 主机表单分组 `hosts.group.basic/.auth/.route/.startup/.keepalive/.transfer/.x11`；连接表单分组 `connection.group.basic/.options` | T8 |
+| 终端选择 | — | — | 无新选择器（选择是网格内的状态，测试直接读 `TerminalPane` 的选区） | T1 |
+
+### 7.3 守卫最终基线
+
+§2.5 的表是逐任务的记录。最终：`scale(<数字>)` **13**、`px(<非零数字>)` **2**（`theme.rs` 的 `SCALE_BASELINE` / `PX_BASELINE`，
+`bare_lengths_only_ever_go_down` 断言）。迁移前（`d59a63f`，同一口径）为 280 / 91，ADR-9 要求降到一半以下（≤ 140 / ≤ 45），
+最终为 4.6% / 2.2%。余下的 13 个 `scale(<数字>)` 是 `Metrics` 度量本身的定义，2 个 `px(<数字>)` 是 `STRIP_ROUNDING_SLACK`
+与标签条滚动步长的 1px 下限。颜色字面量只在 `theme.rs` 与 `capture.rs`（`views_name_tokens_instead_of_colour_literals`）。
+
+### 7.4 截图与实测
+
+- **全部场景重拍（T9）**：`shellune --ui-capture` 在 T9 终版代码上全量运行（Windows、150% DPI 的隐藏窗口，2026-11-19）：
+  91 个场景、计划 461 张、拍成 461 张，`failures` 为空，用时约 23 分钟；其中深色 311、浅色 150、中文 115、200% 文字 100。每个场景至少有深色、浅色、中文与 200% 文字各一张：
+  场景没有声明中文或 200% 变体时，`Scenario::shots` 补一张浅色中文与一张深色 200%（设计窗口 1120×720），
+  `a_full_run_shoots_every_scenario_in_both_palettes` 断言每个场景都有这四类且文件名不重复。原有场景的 720×480、115%
+  等变体照旧。
+- **T9 收尾修复后的补拍**：A1–A9 改动涉及的场景以 `--only terminal-banner*,tabs*,startup*,forwards*,settings*` 重拍：
+  25 个场景（含新增的 `forwards-host-picker`）、125 张全部拍成，manifest `status` 为 ok、`failures` 为空，用时约 7 分钟。
+  全量运行因此是 92 个场景、466 张（`a_full_run_shoots_every_scenario_in_both_palettes` 断言计划不重名、每个场景四类齐全）。
+- **人工抽查**：T9 抽查中发现并修复了三处：设计目录在 200% 文字时四列互相挤压（改为每列有最小宽度、放不下时换行，
+  `every_section_of_the_catalogue_stays_inside_its_column` 测试量列不越界不重叠）；720×480 @200% 左右分屏时窗格头的缩放 / 关闭按钮被窗格边裁掉
+  （名字与“活动”标记让位，`a_narrow_split_keeps_its_pane_heads_buttons_inside_the_pane`）；导入面板打开期间切换语言，
+  两个输入框的占位文字不跟随（`the_import_panels_fields_follow_a_language_switch`）。终版重拍后再抽查
+  `design-catalog`（深色 200%）、`home-hosts`（深色中文）、`home-narrow`（720×480 @200%）、`startup-failed`（浅色中文）、
+  `terminal-selection`（浅色中文，放大核对选区从 “42” 的 “4” 起、到 “部署完成” 末字止）、`terminal-selection-block`
+  （深色 200%）、`terminal-banner-long`（720×480 @200%）、`settings`（深色 200%）、`files-dual`（720×480 @200%）、
+  `overlay-palette`（浅色中文）、`batch-running`（深色 200%）、`desktop-rdp`（720×480 @200%），没有重叠，截断都是带省略号
+  的设计截断（标签名、地址、横幅句子）。看到但未改的见 7.6。
+- **截图证明不了的**：动效（缩放、缓动、淡入淡出与错开）、拖动阈值、Shift、窗口级捕获与自动滚动、键盘路径；这些由 GPUI 测试覆盖
+  （各节“测试”条目）。截图读回的是隐藏窗口的 GPU 后备缓冲，不经过 DWM。
+- **启动实测**（T9 重测，Windows、真实数据副本、开发与发布构建各三次，表见 §1.5“阶段耗时”）：四阶段合计开发约 16.5ms、
+  发布约 10–13ms；首页两者都在约 250–270ms 出现，由 250ms 品牌入场决定。未测进程启动到首帧的时间。
+
+### 7.5 发布流程与 Actions 运行（R6，T2）
+
+- CI（三平台原生构建 + 原生桌面测试，代码终版 482e987）：<https://github.com/sakullla/shellune/actions/runs/44331740848>
+  ——Windows 全部步骤通过；macOS arm64 与 Linux x86_64 原生构建、Format、Clippy、原生桌面测试（`desktop_native` 30/30、
+  `rdp_vnc` 3/3，`SHELLUNE_REQUIRE_NATIVE=1`）通过，Test 步骤当时因 `src/app/tests.rs` 的 3–4 个旧用例失败
+  （`an_ended_shell_*` 三个状态卡用例与 macOS 上的 `a_delete_question_keeps_every_key_but_escape`）。这些用例已随 T6 的横幅
+  与 T8 的按平台快捷键读取改写。Owner 把 T1–T8 的提交（f6af526）推到 `ci/ui-redo-check` 重跑三平台 CI：
+  <https://github.com/sakullla/shellune/actions/runs/44443090557>。三平台全部通过，macOS 上 874 个界面测试全部通过。macOS 首轮有一次
+  `tests/serial.rs` 的 `an_unplugged_device_is_reported_as_a_disconnect_and_the_port_is_released` 失败，原因是状态仍为 Open，
+  属于时序偶发；该串口代码本次重做没有改动，重跑失败作业后通过。T9 的提交在交付前随主线推送时再跑一次。
+- Release 演练（workflow_dispatch，ec4fd74，不发布）：<https://github.com/sakullla/shellune/actions/runs/44328823642>
+  ——三平台成功，便携 zip、`.app` 与 deb 都带 `third-party/` 许可证。
+- 文档补交（8cc9f92）的 CI：<https://github.com/sakullla/shellune/actions/runs/44334569122>。
+
+### 7.6 T9 收尾修复与仍未关闭的事项
+
+T9 关闭了各任务审查留下的这些事项（每项有测试）：横幅详情在 720×480 @200% 几乎占满窗格（A1，限高 40%）；窄横幅的
+“重新连接”图标与其他图标同色（A2，`primary_icon_button`）；关闭横幅后重连、取消，横幅保持隐藏（A3）；720×480 @200%
+唯一的标签只显示一个字母（A4）；启动失败页的按钮需要滚动才能看到、进度条在阶段间向前跳（A5、A6）；首页分组改名 / 删除后
+焦点句柄不清理（A7，`prune_group_focus`）；上传“将保存到 …”缺测试、隧道表单主机选择器展开态没有截图（A8）；设置导航用
+方向键移动时不画焦点环（A9）。Owner 验收时另修一处：720×480 @200% 下，启动失败页的品牌占满首屏，失败标题被挤到滚动区外。
+现在停住时品牌会退后：logo 变为 `BRAND_MARK_STOPPED` 40，产品名用标题字号，保证“哪一阶段失败”出现在按钮上方；
+失败原因可滚动查看（由 `the_stop_scrolls_to_its_buttons_in_the_smallest_window_at_the_largest_text` 断言）。
+
+仍未关闭（均非阻断）：
+
+- 文件视图：720×480 @200%（相当于 360×240 的逻辑空间）时两栏头部、面包屑与底栏几乎占满高度，列表区只剩很少的空间。
+- 启动失败：原因句取自存储层，界面为中文时也是英文（`startup.failure.reason`；标题与说明随语言）。
+- 终端选择：阈值之前锚点按视口坐标记录，流式输出期间缓慢越过阈值时锚点可能落到新内容上；`pressed_button ≠ Left` 的松开分支与
+  向下自动滚动没有专门测试。
+- 主机 / 连接表单：`ConnectionFormField::is_basic` 与对话框各自的分组判断重复，靠 `*_tab_follows_the_drawn_order` 测试兜底。
+- 发布：macOS 上 shim 目标版本未设 `MACOSX_DEPLOYMENT_TARGET`（链接警告）；POSIX 上 VNC 套接字未设 close-on-exec。
+- 串口集成测试 `an_unplugged_device_is_reported_as_a_disconnect_and_the_port_is_released` 在 macOS CI 上偶发失败（见 7.5），属于既有的时序问题。

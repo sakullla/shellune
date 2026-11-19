@@ -58,6 +58,65 @@ use crate::app::theme::{self, Metrics, Tone, palette as shell_palette, radius, s
 /// the point where typing feels delayed.
 pub const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(12);
 
+/// How close two measured lengths of the bar must be, in pixels, to count as the
+/// same: layout rounding moves an edge by a fraction of a pixel between frames, and
+/// that must not ask for another frame.
+const LAYOUT_SLACK: f32 = 0.5;
+
+/// The narrowest the session slot of the terminal bar becomes, in logical pixels
+/// before zoom: its mark and a letter or two.
+const SESSION_SLOT_MIN_WIDTH: f32 = 40.0;
+
+/// The tallest the search results panel grows, in logical pixels before zoom, and the
+/// floor it keeps at every text size.
+const SEARCH_PANEL_MAX_HEIGHT: f32 = 180.0;
+
+/// The ceiling on the search results panel at large text, so the grid stays readable
+/// behind it.
+const SEARCH_PANEL_MAX_HEIGHT_CAP: f32 = 260.0;
+
+/// The narrowest the search query field becomes once it holds a query.
+const SEARCH_QUERY_MIN_WIDTH: f32 = 80.0;
+
+/// The soft ring outside the search query field while it has the keyboard.
+const SEARCH_FOCUS_HALO: f32 = 2.0;
+
+/// The gap between the scroll position thumb and the grid's right edge.
+const SCROLL_THUMB_INSET: f32 = 2.0;
+
+/// The width of the scroll position thumb.
+const SCROLL_THUMB_WIDTH: f32 = 4.0;
+
+/// A selection a capture asked for: from the first character of one text to the last
+/// character of another, as the grid shows them.
+#[cfg(feature = "ui-capture")]
+#[derive(Clone, Copy, Debug)]
+struct CaptureSelection {
+    from: &'static str,
+    to: &'static str,
+    kind: SelectionType,
+}
+
+/// The first and the last grid column `needle` covers in a row of cells, if the row
+/// holds it. A wide character covers two columns and has one cell.
+#[cfg(feature = "ui-capture")]
+fn columns_of(cells: &[RenderedCell], needle: &str) -> Option<(usize, usize)> {
+    let mut text = String::new();
+    let mut starts = Vec::with_capacity(cells.len());
+    let mut column = 0;
+    for cell in cells {
+        let width = cell.width.max(1);
+        starts.push((text.len(), column, width));
+        text.push_str(&cell.text);
+        column += width;
+    }
+    let at = text.rfind(needle)?;
+    let end = at + needle.len();
+    let first = starts.iter().rev().find(|(offset, ..)| *offset <= at)?;
+    let last = starts.iter().rev().find(|(offset, ..)| *offset < end)?;
+    Some((first.1, last.1 + last.2 - 1))
+}
+
 /// How far the pointer moves, in pixels, before a press becomes a drag.
 ///
 /// Below it, and inside the cell the button went down on, the press is a click: a
@@ -600,6 +659,9 @@ pub struct TerminalPane {
     menu: Option<gpui::Point<Pixels>>,
     marked: Option<String>,
     last_copy: Option<String>,
+    /// The selection a capture asked for, put back whenever the grid changes size.
+    #[cfg(feature = "ui-capture")]
+    capture_selection: Option<CaptureSelection>,
     locale: Locale,
     polling: bool,
     /// A multi-line or high-risk paste that has not been confirmed.
@@ -824,6 +886,8 @@ impl TerminalPane {
             menu: None,
             marked: None,
             last_copy: None,
+            #[cfg(feature = "ui-capture")]
+            capture_selection: None,
             locale,
             polling: false,
             pending_paste: None,
@@ -898,6 +962,8 @@ impl TerminalPane {
             menu: None,
             marked: None,
             last_copy: None,
+            #[cfg(feature = "ui-capture")]
+            capture_selection: None,
             locale,
             polling: false,
             pending_paste: None,
@@ -971,6 +1037,8 @@ impl TerminalPane {
             menu: None,
             marked: None,
             last_copy: None,
+            #[cfg(feature = "ui-capture")]
+            capture_selection: None,
             locale,
             polling: false,
             pending_paste: None,
@@ -1127,6 +1195,8 @@ impl TerminalPane {
             menu: None,
             marked: None,
             last_copy: None,
+            #[cfg(feature = "ui-capture")]
+            capture_selection: None,
             locale,
             polling: false,
             pending_paste: None,
@@ -1321,6 +1391,8 @@ impl TerminalPane {
             menu: None,
             marked: None,
             last_copy: None,
+            #[cfg(feature = "ui-capture")]
+            capture_selection: None,
             locale,
             polling: false,
             pending_paste: None,
@@ -1438,8 +1510,55 @@ impl TerminalPane {
         self.core.selection_kind()
     }
 
+    /// Selects from the first character of `from` to the last of `to`, for a capture
+    /// (R4, ADR-5).
+    ///
+    /// Each end is found in the visible grid - the lowest row that holds it - and taken
+    /// on its outer half: the left half of the first character, the right half of the
+    /// last, the way a drag from the left half of a character takes it. The request is
+    /// kept and laid again after a resize, because a new width clears a selection.
+    /// Nothing is copied.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_select(
+        &mut self,
+        from: &'static str,
+        to: &'static str,
+        kind: SelectionType,
+        cx: &mut Context<Self>,
+    ) {
+        self.capture_selection = Some(CaptureSelection { from, to, kind });
+        self.apply_capture_selection();
+        cx.notify();
+    }
+
+    /// Lays the selection a capture asked for on the grid as it is now.
+    #[cfg(feature = "ui-capture")]
+    fn apply_capture_selection(&mut self) {
+        let Some(request) = self.capture_selection else {
+            return;
+        };
+        let snapshot = self.core.snapshot();
+        let find = |needle: &str| {
+            snapshot
+                .rows
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(row, cells)| columns_of(&cells.cells, needle).map(|span| (row, span)))
+        };
+        let (Some((from_row, (from_column, _))), Some((to_row, (_, to_column)))) =
+            (find(request.from), find(request.to))
+        else {
+            self.core.clear_selection();
+            return;
+        };
+        self.core
+            .begin_selection(from_row, from_column, Side::Left, request.kind);
+        self.core.extend_selection(to_row, to_column, Side::Right);
+    }
+
     /// The selected text, without copying it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "ui-capture"))]
     pub fn selected_text(&self) -> Option<String> {
         self.core.selection_text()
     }
@@ -2624,6 +2743,9 @@ impl TerminalPane {
         }
         self.grid = grid;
         self.core.resize(grid);
+        // A new width clears the selection; a capture's is laid on the new grid again.
+        #[cfg(feature = "ui-capture")]
+        self.apply_capture_selection();
         // A narrower or wider grid re-wraps the primary screen, so rows the find bar
         // counted are split or joined: the count and the places it steps through are
         // counted again, without moving the reader (R1).
@@ -3281,11 +3403,11 @@ impl TerminalPane {
     fn apply_bar_room(&mut self, room: BarRoom, cx: &mut Context<Self>) {
         let old = self.bar_room.get();
         let close = |a: Option<Pixels>, b: Option<Pixels>| match (a, b) {
-            (Some(a), Some(b)) => (a - b).abs() < px(0.5),
+            (Some(a), Some(b)) => (a - b).abs() < px(LAYOUT_SLACK),
             (None, None) => true,
             _ => false,
         };
-        let near = |a: Pixels, b: Pixels| (a - b).abs() < px(0.5);
+        let near = |a: Pixels, b: Pixels| (a - b).abs() < px(LAYOUT_SLACK);
         if close(old.width, room.width)
             && near(old.controls, room.controls)
             && near(old.pinned, room.pinned)
@@ -3496,7 +3618,7 @@ impl TerminalPane {
             });
         };
         let weak = cx.entity().downgrade();
-        let middle_gap = metrics.scale(2.0);
+        let middle_gap = metrics.scale(spacing::HALF);
         // Every control keeps its own width whether or not it fits, so their sum is the
         // natural width however much of it is shown.
         let natural = move |bounds: &[Bounds<Pixels>]| {
@@ -3552,7 +3674,7 @@ impl TerminalPane {
                         Some(group) => {
                             let clipped = previous
                                 .first_right
-                                .is_some_and(|right| right > group.right() + px(0.5));
+                                .is_some_and(|right| right > group.right() + px(LAYOUT_SLACK));
                             BarRoom {
                                 pinned,
                                 clipped,
@@ -3586,7 +3708,7 @@ impl TerminalPane {
             // Where the session is keeps at least its mark and a letter or two: in a pane
             // too narrow for everything, the session's controls give way before it.
             .min_w(if has_slot {
-                metrics.scale(40.0)
+                metrics.scale(SESSION_SLOT_MIN_WIDTH)
             } else {
                 px(0.0)
             })
@@ -4215,7 +4337,7 @@ impl TerminalPane {
                 .absolute()
                 .left(px(cursor.column as f32 * cell.width))
                 .top(px(cursor.row as f32 * cell.height))
-                .px(px(2.0))
+                .px(px(spacing::HALF))
                 // Opaque, so the cells under the composition do not show through it.
                 .bg(theme::swatch_over(
                     shell_palette::SURFACE_SELECTED,
@@ -4343,7 +4465,11 @@ impl TerminalPane {
             .right(px(0.0))
             // The bar grows with the text; the panel stops at a height that still
             // leaves the grid readable behind it and scrolls inside itself.
-            .max_h(metrics.scale(180.0).clamp(px(180.0), px(260.0)))
+            .max_h(
+                metrics
+                    .scale(SEARCH_PANEL_MAX_HEIGHT)
+                    .clamp(px(SEARCH_PANEL_MAX_HEIGHT), px(SEARCH_PANEL_MAX_HEIGHT_CAP)),
+            )
             .flex()
             .flex_col()
             .id("terminal.blocks")
@@ -4433,10 +4559,12 @@ impl TerminalPane {
         let proportional =
             crate::app::components::reserved_text_width(strings.terminal_search, caption);
         let mono = px(strings.terminal_search.chars().count() as f32
-            * (caption / px(1.0))
+            * f32::from(caption)
             * shellune_terminal::MONOSPACE_ADVANCE_RATIO);
         let query_text_floor = proportional.max(mono);
-        let query_field_floor = query_text_floor + metrics.scale(spacing::HAIRLINE) * 2.0 + px(2.0);
+        let query_field_floor = query_text_floor
+            + metrics.scale(spacing::HAIRLINE) * 2.0
+            + px(components::HAIRLINE_WIDTH * 2.0);
         let mut bar = div()
             .flex()
             .flex_wrap()
@@ -4457,7 +4585,9 @@ impl TerminalPane {
                     .when(empty_query, |field| {
                         field.flex_none().min_w(query_field_floor)
                     })
-                    .when(!empty_query, |field| field.flex_1().min_w(px(80.0)))
+                    .when(!empty_query, |field| {
+                        field.flex_1().min_w(px(SEARCH_QUERY_MIN_WIDTH))
+                    })
                     .max_w_full()
                     .rounded(px(radius::SMALL))
                     .border_1()
@@ -4471,7 +4601,7 @@ impl TerminalPane {
                             color: theme::faded(accent, 0.22).into(),
                             offset: point(px(0.0), px(0.0)),
                             blur_radius: px(0.0),
-                            spread_radius: px(2.0),
+                            spread_radius: px(SEARCH_FOCUS_HALO),
                         }])
                     })
                     .px(metrics.scale(spacing::HAIRLINE))
@@ -4748,10 +4878,10 @@ impl TerminalPane {
         Some(
             div()
                 .absolute()
-                .right(px(2.0))
+                .right(px(SCROLL_THUMB_INSET))
                 .top(gpui::relative(top_pct))
                 .h(gpui::relative(fraction))
-                .w(px(4.0))
+                .w(px(SCROLL_THUMB_WIDTH))
                 .rounded_full()
                 .bg(theme::faded(theme::swatch(shell_palette::TEXT_MUTED), 0.45))
                 .debug_selector(|| "terminal.scrollbar.thumb".to_owned()),
@@ -4792,7 +4922,7 @@ impl TerminalPane {
             .gap(metrics.scale(spacing::HAIRLINE + 2.0))
             .min_h(metrics.hit_target())
             .px(metrics.scale(spacing::SNUG))
-            .py(metrics.scale(2.0))
+            .py(metrics.scale(spacing::HALF))
             .rounded(px(theme::radius::LARGE))
             .bg(theme::swatch(shell_palette::RAISED))
             .border_1()

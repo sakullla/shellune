@@ -32,6 +32,11 @@ use crate::app::workspace::{SessionPhase, SessionStatus, SessionStep};
 /// The tallest the unfolded diagnostic grows before it scrolls, in logical pixels.
 pub(crate) const DIAGNOSTIC_MAX_HEIGHT: f32 = 160.0;
 
+/// The largest share of its pane's height the unfolded diagnostic takes, whatever
+/// [`DIAGNOSTIC_MAX_HEIGHT`] allows at the window's text size: a short pane - 720x480
+/// at 200% - keeps rows of its last screen under the details (T9).
+pub(crate) const DIAGNOSTIC_MAX_SHARE: f32 = 0.4;
+
 /// The narrowest a banner draws its commands with their words, in logical pixels; a
 /// narrower one - a split pane, a small window at 200% - draws them as icons named by
 /// their tooltips, so the sentence keeps its room on the one line.
@@ -209,6 +214,9 @@ impl ShelluneView {
 
     /// Keeps the last screen of a remote session that is about to reconnect (ADR-6).
     pub(super) fn keep_reconnect_screen(&mut self, id: SessionId) {
+        // A banner closed before the reconnect is open again: whatever the attempt ends
+        // in - a cancel back to the same reason included - is news (T9).
+        self.banner_closed.remove(&id);
         let failure = self
             .workspace
             .session(id)
@@ -558,9 +566,7 @@ impl ShelluneView {
                     None => strings.session_reconnect.to_owned(),
                 };
                 let button = if narrow {
-                    components::icon_only_button(Icon::Refresh, metrics)
-                        .size(metrics.hit_target())
-                        .text_color(theme::swatch(palette::ACCENT))
+                    components::primary_icon_button(Icon::Refresh, metrics)
                 } else {
                     components::icon_label_button(
                         Icon::Refresh,
@@ -702,8 +708,19 @@ impl ShelluneView {
                     // a click anywhere on it copies the whole reason.
                     self.copyable_lines("terminal.failure.diagnostic", reason, cx),
                 );
+            // The box keeps to a share of the pane as well as to its own most: in a
+            // short pane the details give way before the last screen does.
+            let room = div()
+                .flex()
+                .flex_col()
+                .flex_shrink()
+                .min_h_0()
+                .w_full()
+                .max_h(gpui::relative(DIAGNOSTIC_MAX_SHARE))
+                .debug_selector(|| "terminal.failure.room".to_owned())
+                .child(detail);
             unfolded = Some(theme::enter(
-                detail,
+                room,
                 SharedString::from(format!("session.banner.detail.{id:?}")),
                 theme::Enter::Rise,
             ));
@@ -779,6 +796,12 @@ impl ShelluneView {
         self.banner_focus
             .iter()
             .position(|handle| handle.is_focused(window))
+    }
+
+    /// Stops the reconnect of session `id`, the way its banner's Cancel does, for a test.
+    #[cfg(test)]
+    pub fn cancel_reconnect_for_test(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.cancel_reconnect(id, cx);
     }
 
     /// Whether the last screen of session `id` is kept for a reconnect, for a test.

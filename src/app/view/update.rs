@@ -59,6 +59,9 @@ pub(super) const TOPBAR_FULL_CHIP_WIDTH: f32 = 900.0;
 /// How often an update that waits for held saves looks again.
 const HELD_WRITES_POLL: Duration = Duration::from_millis(200);
 
+/// The height of the download bar under the update card's head, before zoom.
+const DOWNLOAD_BAR_HEIGHT: f32 = 4.0;
+
 /// The update state of one window.
 pub(super) struct UpdateCenter {
     /// The update calls; `None` when this window never updates (a capture, a test that
@@ -696,7 +699,7 @@ impl ShelluneView {
             .flex_col()
             .w_full()
             .min_w_0()
-            .gap(metrics.scale(2.0))
+            .gap(metrics.scale(spacing::HALF))
             .px(metrics.scale(spacing::BASE))
             .py(metrics.scale(spacing::SNUG))
             .debug_selector(|| "settings.update.release".to_owned())
@@ -777,7 +780,7 @@ impl ShelluneView {
                 .flex_row()
                 .w_full()
                 .min_w_0()
-                .h(metrics.scale(4.0))
+                .h(metrics.scale(DOWNLOAD_BAR_HEIGHT))
                 .rounded_full()
                 .overflow_hidden()
                 .bg(theme::swatch(palette::LOADING_TRACK))

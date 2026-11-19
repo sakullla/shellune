@@ -33,6 +33,35 @@ use crate::app::workspace::{AttentionKind, SectionState};
 /// The least width a saved command's name and preview keep before its actions wrap.
 const SNIPPET_DETAIL_MIN_WIDTH: f32 = 160.0;
 
+/// The ring of the bar's colour around a notice badge, so the dot stands off the
+/// control it marks; unscaled, like a border.
+const NOTICE_BADGE_RIM: f32 = 1.5;
+
+/// The edge of the app's mark at the start of the top bar, before zoom.
+const BRAND_MARK_SIZE: f32 = 22.0;
+
+/// The height of a segment of the files/terminal view switch, before zoom.
+const VIEW_SEGMENT_HEIGHT: f32 = 20.0;
+
+/// The padding of the files/terminal view switch's track, before zoom.
+const VIEW_TRACK_PADDING: f32 = 1.0;
+
+/// The height of the small actions on a session's card (save the host, close).
+const SESSION_ACTION_HEIGHT: f32 = 22.0;
+
+/// The edge of a square icon button of the top bar, before zoom.
+const BAR_ICON_SIZE: f32 = 30.0;
+
+/// The padding a segmented control's floor reserves on each side: the track's own
+/// padding and a pixel of rounding room.
+const SEGMENTED_FLOOR_PADDING: f32 = 3.0;
+
+/// The edge of the dot of a connection step still to come, before zoom.
+const STEP_DOT_SIZE: f32 = 6.0;
+
+/// The edge of the dot that pulses beside the connection step that is running.
+const PULSE_DOT_SIZE: f32 = 8.0;
+
 /// The widest the card of a connection in flight grows.
 const CONNECTION_CARD_MAX_WIDTH: f32 = 600.0;
 
@@ -160,9 +189,9 @@ pub(super) fn notice_badge(tone: Tone, selector: &'static str, metrics: theme::M
         .child(
             div()
                 .absolute()
-                .top(metrics.scale(2.0))
-                .right(metrics.scale(2.0))
-                .p(px(1.5))
+                .top(metrics.scale(spacing::HALF))
+                .right(metrics.scale(spacing::HALF))
+                .p(px(NOTICE_BADGE_RIM))
                 .rounded_full()
                 .bg(theme::swatch(palette::CHROME))
                 .child(components::status_dot(tone, metrics)),
@@ -212,7 +241,7 @@ impl ShelluneView {
                     .left_0()
                     .right_0()
                     .bottom_0()
-                    .h(px(1.0))
+                    .h(px(components::HAIRLINE_WIDTH))
                     .bg(theme::swatch(palette::BORDER)),
             )
             .child(self.top_bar(window, cx))
@@ -247,7 +276,7 @@ impl ShelluneView {
             // gives the mark's room to the current tab (R2, R9).
             .when(platform != Platform::MacOs && !compact, |row| {
                 row.pr(metrics.scale(spacing::TIGHT))
-                    .child(brand_mark(metrics.scale(22.0), metrics))
+                    .child(brand_mark(metrics.scale(BRAND_MARK_SIZE), metrics))
             });
 
         // The tabs stand in the middle of the head (ADR-7). The hosts tab is pinned and
@@ -274,7 +303,7 @@ impl ShelluneView {
             .flex()
             .flex_none()
             .items_center()
-            .gap(metrics.scale(2.0))
+            .gap(metrics.scale(spacing::HALF))
             .pr(metrics.scale(spacing::HAIRLINE))
             .child(
                 self.bar_icon(
@@ -316,7 +345,7 @@ impl ShelluneView {
                     .min_w(if compact {
                         px(theme::HIT_TARGET)
                     } else {
-                        metrics.scale(24.0)
+                        metrics.scale(theme::HIT_TARGET)
                     }),
             )
             // The task centre sits beside the page tools: its entry is always there, and
@@ -431,7 +460,7 @@ impl ShelluneView {
                         palette::TEXT_SECONDARY
                     });
                     components::segment("", selected, metrics)
-                        .h(metrics.scale(20.0))
+                        .h(metrics.scale(VIEW_SEGMENT_HEIGHT))
                         .px(metrics.scale(spacing::HAIRLINE + 2.0))
                         .flex()
                         .items_center()
@@ -444,7 +473,7 @@ impl ShelluneView {
             components::segmented(metrics)
                 .flex_none()
                 .flex_nowrap()
-                .p(metrics.scale(1.0))
+                .p(metrics.scale(VIEW_TRACK_PADDING))
                 .child(
                     view_segment(
                         "files.close",
@@ -540,7 +569,7 @@ impl ShelluneView {
                     cx,
                     move |view, cx| view.save_quick_host(id, cx),
                 )
-                .h(metrics.scale(22.0))
+                .h(metrics.scale(SESSION_ACTION_HEIGHT))
                 .text_size(metrics.caption_size())
                 .into_any_element(),
             );
@@ -556,7 +585,7 @@ impl ShelluneView {
                     cx,
                     move |view, cx| view.request_close_session(id, cx),
                 )
-                .h(metrics.scale(22.0))
+                .h(metrics.scale(SESSION_ACTION_HEIGHT))
                 .text_size(metrics.caption_size())
                 .into_any_element(),
             );
@@ -717,7 +746,7 @@ impl ShelluneView {
                         .flex()
                         .flex_none()
                         .items_center()
-                        .gap(metrics.scale(2.0))
+                        .gap(metrics.scale(spacing::HALF))
                         .children(controls)
                         .children(pinned),
                 ),
@@ -876,7 +905,7 @@ impl ShelluneView {
         let size = if self.header_compact() {
             metrics.hit_target()
         } else {
-            metrics.scale(30.0)
+            metrics.scale(BAR_ICON_SIZE)
         };
         components::icon_only_button(icon, metrics)
             .size(size)
@@ -964,7 +993,7 @@ impl ShelluneView {
         let size = if compact {
             metrics.hit_target()
         } else {
-            metrics.scale(28.0)
+            metrics.compact_control_height()
         };
         let new_shell = self.keymap.label("shell.new");
         let tooltip = match new_shell {
@@ -1161,9 +1190,9 @@ impl ShelluneView {
             .iter()
             .map(|(label, _)| components::segment_reserved_width(label, metrics))
             .fold(px(0.0), |sum, width| sum + width)
-            + metrics.scale(2.0) * options.len().saturating_sub(1) as f32
-            + metrics.scale(3.0) * 2.0
-            + px(2.0);
+            + metrics.scale(spacing::HALF) * options.len().saturating_sub(1) as f32
+            + metrics.scale(SEGMENTED_FLOOR_PADDING) * 2.0
+            + px(components::HAIRLINE_WIDTH * 2.0);
         let mut control = components::segmented(metrics)
             .min_w(floor.min(components::settings_row_content_cap(metrics)))
             .debug_selector(move || id.to_owned());
@@ -1474,12 +1503,16 @@ impl ShelluneView {
                 )
                 .into_any_element()
             } else if now && waiting.is_some() {
-                components::status_mark(Tone::Warning, metrics.scale(10.0)).into_any_element()
+                components::status_mark(
+                    Tone::Warning,
+                    metrics.scale(components::ATTENTION_MARK_SIZE),
+                )
+                .into_any_element()
             } else if now {
                 progress_pulse(metrics)
             } else {
                 div()
-                    .size(metrics.scale(6.0))
+                    .size(metrics.scale(STEP_DOT_SIZE))
                     .rounded_full()
                     .bg(theme::swatch(palette::BORDER_STRONG))
                     .into_any_element()
@@ -1496,7 +1529,7 @@ impl ShelluneView {
                         .flex_none()
                         .items_center()
                         .justify_center()
-                        .size(metrics.scale(16.0))
+                        .size(metrics.icon_size())
                         .child(mark),
                 )
                 .child(
@@ -2839,7 +2872,7 @@ impl ShelluneView {
 /// claims a percentage nobody measured. Still when motion is reduced.
 fn progress_pulse(metrics: theme::Metrics) -> AnyElement {
     let dot = div()
-        .size(metrics.scale(8.0))
+        .size(metrics.scale(PULSE_DOT_SIZE))
         .rounded_full()
         .bg(theme::swatch(palette::ACCENT));
     if theme::motion_allowed() {

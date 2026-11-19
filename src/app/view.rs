@@ -1628,6 +1628,29 @@ impl ShelluneView {
         cx.notify();
     }
 
+    /// Selects text in the terminal on screen, from the first character of `from` to
+    /// the last of `to`, for a capture (R4, ADR-5). Nothing is copied.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_select_in_terminal(
+        &mut self,
+        from: &'static str,
+        to: &'static str,
+        kind: shellune_terminal::SelectionType,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.active_pane() {
+            pane.update(cx, |pane, cx| pane.capture_select(from, to, kind, cx));
+        }
+    }
+
+    /// The text selected in the terminal on screen, for a capture (R4).
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_terminal_selection(&self, cx: &gpui::App) -> Option<String> {
+        self.active_pane()
+            .and_then(|pane| pane.read(cx).selected_text())
+    }
+
     /// Opens the find bar with a query, for a capture (R2).
     #[cfg(feature = "ui-capture")]
     pub fn capture_open_search(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -2354,6 +2377,28 @@ impl ShelluneView {
     #[must_use]
     pub fn capture_forward_form_open(&self) -> bool {
         self.forwards.editor().is_some()
+    }
+
+    /// Opens the form of a new tunnel through `host` with its through-host picker
+    /// unfolded, the way a press on the host control does, for a capture (T9).
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_forward_host_picker(
+        &mut self,
+        host: &HostConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.capture_forward_form(host, cx);
+        if !self.forward_host_picker_shown() {
+            self.toggle_forward_host_picker(window, cx);
+        }
+    }
+
+    /// Whether the tunnel form shows its through-host picker, for a capture.
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_forward_host_picker_open(&self) -> bool {
+        self.forward_host_picker_shown()
     }
 
     /// Draws the host list in one place of the sidebar, the way a press on it does
@@ -3992,6 +4037,8 @@ impl ShelluneView {
                     self.recheck_open_hosts();
                     self.hosts.retain_selected(&self.book);
                 }
+                // A renamed or deleted group takes its row's keyboard stop with it.
+                self.prune_group_focus();
                 self.group_problem = None;
                 let message = outcome.message;
                 self.close_group_dialog(cx);
@@ -4076,6 +4123,19 @@ impl ShelluneView {
     #[cfg(test)]
     pub fn import_state(&self) -> &ImportPanel {
         &self.import
+    }
+
+    /// The placeholders of the import panel's path and search fields, while it is open.
+    #[cfg(test)]
+    pub fn import_placeholders(&self, cx: &gpui::App) -> Option<(String, String)> {
+        let path = self.import_path.as_ref()?.read(cx).placeholder().to_owned();
+        let search = self
+            .import_search
+            .as_ref()?
+            .read(cx)
+            .placeholder()
+            .to_owned();
+        Some((path, search))
     }
 
     /// The terminal on screen, if the selected session has one.
@@ -4480,6 +4540,20 @@ impl ShelluneView {
         ];
         for (field, label) in labels {
             field.update(cx, |field, cx| field.set_placeholder(label, cx));
+        }
+        // The import panel's two fields live only while it is open (T9: a language
+        // switch with the panel open left both in the old language).
+        let import = [
+            (&self.import_path, strings.import_path_placeholder),
+            (
+                &self.import_search,
+                copy::ux_for(self.workspace.locale()).import_search_placeholder,
+            ),
+        ];
+        for (field, label) in import {
+            if let Some(field) = field {
+                field.update(cx, |field, cx| field.set_placeholder(label, cx));
+            }
         }
         self.relabel_jump_picker(cx);
         self.relabel_sync_fields(cx);
@@ -6227,6 +6301,9 @@ impl ShelluneView {
         if !may_reconnect(session) {
             return;
         }
+        // A banner closed before the reconnect is open again for whatever comes next
+        // (T9): a refused reconnect or a cancel back to the same reason is news.
+        self.banner_closed.remove(&id);
         let kind = session.kind().clone();
         match kind {
             SessionKind::Local { shell } => {
@@ -7550,7 +7627,10 @@ impl ShelluneView {
         // The preview can describe thousands of hosts, so it is narrowed by the same
         // idea the servers page uses: type, and the rows answer (R18).
         let search = cx.new(|cx| {
-            let mut field = TextField::new(copy::ux().import_search_placeholder, cx);
+            let mut field = TextField::new(
+                copy::ux_for(self.workspace.locale()).import_search_placeholder,
+                cx,
+            );
             field.set_leading_icon(Icon::Search, cx);
             field.set_clearable(true, cx);
             field
@@ -10270,11 +10350,15 @@ impl ShelluneView {
                 div()
                     .flex()
                     .gap(metrics.scale(spacing::SNUG))
-                    .child(div().w(metrics.scale(120.0)).child(self.remote_field(
-                        SharedString::from("quick.port"),
-                        strings.host_field_port,
-                        self.quick_port.clone(),
-                    )))
+                    .child(
+                        div()
+                            .w(metrics.scale(QUICK_PORT_WIDTH))
+                            .child(self.remote_field(
+                                SharedString::from("quick.port"),
+                                strings.host_field_port,
+                                self.quick_port.clone(),
+                            )),
+                    )
                     .child(div().flex_1().child(self.remote_field(
                         SharedString::from("quick.user"),
                         strings.host_field_user,
@@ -11054,7 +11138,7 @@ impl ShelluneView {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(metrics.scale(1.0))
+                    .gap(metrics.scale(IMPORT_LINE_GAP))
                     .debug_selector(|| "hosts.import.error".to_owned())
                     .child(
                         div()
@@ -11197,7 +11281,7 @@ impl ShelluneView {
         let mut block = div()
             .flex()
             .flex_col()
-            .gap(metrics.scale(1.0))
+            .gap(metrics.scale(IMPORT_LINE_GAP))
             .w_full()
             .debug_selector(|| "hosts.import.limits".to_owned())
             .child(
@@ -11289,7 +11373,7 @@ impl ShelluneView {
         let mut row = div()
             .flex()
             .flex_col()
-            .gap(metrics.scale(1.0))
+            .gap(metrics.scale(IMPORT_LINE_GAP))
             .w_full()
             .px(metrics.scale(spacing::SNUG))
             .py(metrics.scale(spacing::TIGHT))
@@ -11643,7 +11727,8 @@ impl ShelluneView {
         } else {
             0.0
         };
-        self.viewport_width < metrics.rail_width() + metrics.scale(280.0) + px(caption)
+        self.viewport_width
+            < metrics.rail_width() + metrics.scale(RAIL_PAGE_MIN_WIDTH) + px(caption)
     }
 
     /// The theme the user chose.
@@ -12057,7 +12142,7 @@ impl ShelluneView {
         let divider = || components::menu_divider(metrics);
 
         let mut menu = components::menu_card("shell.picker", metrics)
-            .w(metrics.scale(320.0))
+            .w(metrics.scale(SHELL_PICKER_WIDTH))
             .child(section(ux.home_local_section));
 
         if self.workspace.shells().is_empty() {
@@ -12266,7 +12351,7 @@ impl ShelluneView {
             .flex_none()
             .items_center()
             .gap(metrics.scale(spacing::TIGHT + 2.0))
-            .h(metrics.scale(34.0))
+            .h(metrics.scale(SHELL_ENTRY_HEIGHT))
             .px(metrics.scale(spacing::TIGHT))
             .rounded(px(radius::MEDIUM - 2.0))
             .text_size(metrics.label_size())
@@ -12279,7 +12364,7 @@ impl ShelluneView {
                     .flex_none()
                     .items_center()
                     .justify_center()
-                    .size(metrics.scale(24.0))
+                    .size(metrics.scale(components::ICON_TILE))
                     .rounded(px(radius::SMALL))
                     .bg(theme::swatch(if accent {
                         palette::ACCENT_TINT
@@ -12306,7 +12391,7 @@ impl ShelluneView {
             .children(detail.map(|detail| {
                 div()
                     .flex_none()
-                    .max_w(metrics.scale(130.0))
+                    .max_w(metrics.scale(SHELL_DETAIL_MAX_WIDTH))
                     .truncate()
                     .font_family(terminal::monospace_family())
                     .text_size(metrics.caption_size())
@@ -12319,7 +12404,7 @@ impl ShelluneView {
                     .flex_none()
                     .items_center()
                     .justify_center()
-                    .size(metrics.scale(16.0))
+                    .size(metrics.icon_size())
                     .when(selected, |slot| {
                         slot.child(icons::icon(
                             Icon::Check,
@@ -14237,7 +14322,7 @@ impl ShelluneView {
         }
         // The offset is zero at the top and minus what does not fit at the bottom.
         let y = y.min(px(0.0)).max(-scroll.max_offset().height);
-        if (y - offset.y).abs() > px(0.5) {
+        if (y - offset.y).abs() > px(SCROLL_SLACK) {
             scroll.set_offset(gpui::point(offset.x, y));
         }
     }
@@ -17729,19 +17814,40 @@ impl ShelluneView {
             // what clears the mark (R7).
             .children(marks);
 
-        tab.child(body).child(
-            tab_close_button(
-                ("session.tab.close", index),
-                format!("session.tab.close.{index}"),
-                format!("session.tab.{index}"),
-                selected,
-                metrics,
-            )
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                cx.stop_propagation();
-                this.request_close_tab_anchor(id, cx);
-            })),
+        // The one tab of a compact row gives its close button's room to its title: the
+        // button shows under the pointer, over the end of the title, on the tab's own
+        // fill (T9). Closing is also in the tab's menu, its middle click and its key.
+        let compact = self.header_compact();
+        let close = tab_close_button(
+            ("session.tab.close", index),
+            format!("session.tab.close.{index}"),
+            format!("session.tab.{index}"),
+            selected && !compact,
+            metrics,
         )
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            cx.stop_propagation();
+            this.request_close_tab_anchor(id, cx);
+        }));
+        if compact {
+            let fill = if selected {
+                palette::RAISED
+            } else {
+                palette::SURFACE_HOVER
+            };
+            tab.child(body).child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right(metrics.scale(spacing::HALF))
+                    .flex()
+                    .items_center()
+                    .child(close.bg(theme::swatch(fill))),
+            )
+        } else {
+            tab.child(body).child(close)
+        }
     }
 
     /// Whether the strip's tab at `index` is the one on screen.
@@ -17761,6 +17867,12 @@ impl ShelluneView {
     /// A name the user typed is shown exactly as typed: numbering it would alter what
     /// they wrote. Two tabs with one name are still told apart by the target, the kind
     /// and the state, which the tooltip and the tab list both write out (R2).
+    /// The label of the tab of session `id`, for a test.
+    #[cfg(test)]
+    pub fn tab_title_for_test(&self, id: SessionId) -> String {
+        self.tab_title(id)
+    }
+
     fn tab_title(&self, id: SessionId) -> String {
         let custom = self
             .workspace
@@ -17878,7 +17990,7 @@ impl ShelluneView {
                 if let Some(target) = reveal.and_then(|index| revealed_offset(&check, index, fade))
                 {
                     let mut offset = check.offset();
-                    if (offset.x - target).abs() > px(0.5) {
+                    if (offset.x - target).abs() > px(SCROLL_SLACK) {
                         offset.x = target;
                         check.set_offset(offset);
                         moved = true;
@@ -17955,7 +18067,7 @@ impl ShelluneView {
         let fade = div()
             .absolute()
             .top_0()
-            .bottom(px(1.0))
+            .bottom(px(components::HAIRLINE_WIDTH))
             .w(strip_fade_width(metrics))
             .flex()
             .items_center()
@@ -18976,7 +19088,7 @@ fn tab_body(metrics: Metrics) -> Div {
 fn tab_icon(icon: Icon, selected: bool, metrics: Metrics) -> gpui::Svg {
     icons::icon(
         icon,
-        metrics.scale(13.0),
+        metrics.scale(TAB_ICON_SIZE),
         theme::swatch(if selected {
             palette::ACCENT
         } else {
@@ -19006,7 +19118,7 @@ fn tab_title_label(
     selector: String,
     metrics: Metrics,
 ) -> Div {
-    let line = metrics.scale(20.0);
+    let line = metrics.scale(TAB_TITLE_LINE_HEIGHT);
     div()
         .relative()
         // A width of its own rather than a flex basis: what a row asks for is read
@@ -19034,7 +19146,7 @@ fn tab_title_label(
 ///
 /// It is shaped by the window's own text system, the one that paints the line, and
 /// rounded up so the line is never cut by a fraction of a pixel.
-fn tab_title_width(window: &Window, title: &str, metrics: Metrics) -> gpui::Pixels {
+pub(crate) fn tab_title_width(window: &Window, title: &str, metrics: Metrics) -> gpui::Pixels {
     if title.is_empty() {
         return px(0.0);
     }
@@ -19045,7 +19157,7 @@ fn tab_title_width(window: &Window, title: &str, metrics: Metrics) -> gpui::Pixe
         .text_system()
         .layout_line(title, metrics.label_size(), &[run], None)
         .width;
-    width.ceil() + px(1.0)
+    width.ceil() + px(TITLE_WIDTH_SLACK)
 }
 
 /// The close button of a tab: a full pointer target, shown on the current tab and on
@@ -19131,9 +19243,56 @@ pub(super) fn strip_overflows(handle: &gpui::ScrollHandle) -> bool {
 /// is no hidden tab: it must not draw a scroll button or the list of every tab.
 const STRIP_ROUNDING_SLACK: gpui::Pixels = px(1.5);
 
+/// How far a fade reaches into the strip from an end that tabs run on past, in
+/// logical pixels before zoom.
+const STRIP_FADE_WIDTH: f32 = 48.0;
+
+/// The edge of a tab's icon, in logical pixels before zoom: a step under a row icon,
+/// so the icon stands level with the title's capitals.
+const TAB_ICON_SIZE: f32 = 13.0;
+
+/// The line box a tab's title is laid out in, in logical pixels before zoom.
+const TAB_TITLE_LINE_HEIGHT: f32 = 20.0;
+
+/// What a measured tab title is widened by after rounding up, so the last glyph's
+/// antialiasing is not cut by the title's clip.
+const TITLE_WIDTH_SLACK: f32 = 1.0;
+
+/// The width of the colour mark beside a tab's status dot, before zoom.
+const TAB_ACCENT_MARK_WIDTH: f32 = 3.0;
+
+/// The height of the colour mark beside a tab's status dot, before zoom.
+const TAB_ACCENT_MARK_HEIGHT: f32 = 16.0;
+
+/// The edge of a host's initials tile, in logical pixels before zoom.
+const HOST_AVATAR_SIZE: f32 = 36.0;
+
+/// How far a scroll offset may be from the one wanted, in pixels, before it is set
+/// again: closer than half a pixel draws the same frame.
+const SCROLL_SLACK: f32 = 0.5;
+
+/// The width of the port field beside the quick-connect address, before zoom.
+const QUICK_PORT_WIDTH: f32 = 120.0;
+
+/// The gap between the lines of one import message, before zoom.
+const IMPORT_LINE_GAP: f32 = 1.0;
+
+/// The narrowest a page beside the full rail may become before the rail folds to
+/// icons, in logical pixels before zoom.
+const RAIL_PAGE_MIN_WIDTH: f32 = 280.0;
+
+/// The width of the local shell picker, before zoom.
+const SHELL_PICKER_WIDTH: f32 = 320.0;
+
+/// The height of one entry of the local shell picker, before zoom.
+const SHELL_ENTRY_HEIGHT: f32 = 34.0;
+
+/// The widest a shell's program path grows in the picker before it is cut.
+const SHELL_DETAIL_MAX_WIDTH: f32 = 130.0;
+
 /// How far a fade reaches into the strip from an end that tabs run on past (R2).
 fn strip_fade_width(metrics: Metrics) -> gpui::Pixels {
-    metrics.scale(48.0)
+    metrics.scale(STRIP_FADE_WIDTH)
 }
 
 /// The scroll offset that shows the strip's tab at `index` whole and clear of the
@@ -19192,8 +19351,8 @@ fn scroll_strip(handle: &gpui::ScrollHandle, end: StripEnd) {
 fn tab_accent_mark(accent: TabAccent, metrics: Metrics, selector: String) -> Div {
     div()
         .flex_none()
-        .w(metrics.scale(3.0))
-        .h(metrics.scale(16.0))
+        .w(metrics.scale(TAB_ACCENT_MARK_WIDTH))
+        .h(metrics.scale(TAB_ACCENT_MARK_HEIGHT))
         .rounded_full()
         .bg(theme::tab_accent_color(accent))
         .debug_selector(move || selector.clone())
@@ -19582,8 +19741,8 @@ fn log_viewport_for_walkthrough(window: &Window, text_size_percent: u16) {
         return;
     }
     let size = window.viewport_size();
-    let width = size.width / px(1.0);
-    let height = size.height / px(1.0);
+    let width = f32::from(size.width);
+    let height = f32::from(size.height);
     let scale = window.scale_factor();
     let line = format!(
         "shellune-viewport viewport_size={width}x{height} scale_factor={scale} text_size={text_size_percent}%"
@@ -19827,8 +19986,7 @@ fn host_avatar(name: &str, reached: bool, metrics: Metrics) -> Div {
         .flex_none()
         .items_center()
         .justify_center()
-        .w(metrics.scale(36.0))
-        .h(metrics.scale(36.0))
+        .size(metrics.scale(HOST_AVATAR_SIZE))
         .rounded(px(radius::MEDIUM))
         .bg(theme::swatch(background))
         .text_size(metrics.label_size())

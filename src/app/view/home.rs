@@ -675,6 +675,26 @@ impl ShelluneView {
             .clone()
     }
 
+    /// Lets go of the keyboard stops of groups that are no longer in the tree: a group
+    /// renamed or deleted takes its row's handle with it (T9).
+    pub(super) fn prune_group_focus(&self) {
+        let paths: std::collections::HashSet<GroupPath> =
+            crate::app::hosts::drawn_paths(&self.book, &self.groups)
+                .into_iter()
+                .collect();
+        self.group_focus
+            .borrow_mut()
+            .retain(|path, _| paths.contains(path));
+    }
+
+    /// The groups that hold a keyboard stop of their own, for a test.
+    #[cfg(test)]
+    pub fn group_focus_paths_for_test(&self) -> Vec<GroupPath> {
+        let mut paths: Vec<GroupPath> = self.group_focus.borrow().keys().cloned().collect();
+        paths.sort();
+        paths
+    }
+
     /// The sidebar group whose row holds the keys, if one does.
     pub(super) fn focused_group(&self, window: &Window) -> Option<GroupPath> {
         self.group_focus
@@ -2492,6 +2512,9 @@ fn connection_row_element(
         .child(row_tools_slot(tools, cursor))
 }
 
+/// The edge of a row's favourite star target, before zoom.
+const STAR_TARGET_SIZE: f32 = 26.0;
+
 /// The favourite mark of a row: a filled star that stays in view on a favourite, an
 /// outline that appears with the pointer or the keyboard cursor on any other (R1).
 ///
@@ -2513,7 +2536,7 @@ fn favorite_star(
         .flex_none()
         .items_center()
         .justify_center()
-        .size(metrics.scale(26.0))
+        .size(metrics.scale(STAR_TARGET_SIZE))
         .rounded(px(radius::SMALL))
         .cursor_pointer()
         .hover(move |style| style.bg(hover))

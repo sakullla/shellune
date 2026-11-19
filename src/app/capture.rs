@@ -791,6 +791,10 @@ fn disable_direct_composition() {
     }
 }
 
+/// Where the capture window is created, on both axes: far outside any desktop.
+#[cfg(target_os = "windows")]
+const OFF_DESKTOP: f32 = -30_000.0;
+
 #[cfg(target_os = "windows")]
 fn start(
     cx: &mut App,
@@ -808,7 +812,7 @@ fn start(
         // Created far outside the desktop: a window at (0, 0) can sit under the pointer,
         // and the hover that implies differs from one run to the next (R2).
         window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-            point(px(-30_000.0), px(-30_000.0)),
+            point(px(OFF_DESKTOP), px(OFF_DESKTOP)),
             size(px(first.variant.width), px(first.variant.height)),
         ))),
         window_min_size: Some(size(px(min_width), px(min_height))),
@@ -1832,6 +1836,25 @@ mod tool_tests {
                     scenario.id
                 );
             }
+            // ADR-9: every surface is seen in Chinese and at 200% text at least once.
+            let own = || shots.iter().filter(|shot| shot.scenario.id == scenario.id);
+            assert!(
+                own().any(|shot| shot.variant.locale == crate::app::copy::Locale::Chinese),
+                "{} has no Chinese shot",
+                scenario.id
+            );
+            assert!(
+                own().any(|shot| shot.variant.zoom == crate::app::theme::Zoom::Largest),
+                "{} has no shot at 200% text",
+                scenario.id
+            );
+            let mut stems: Vec<String> = own()
+                .map(|shot| shot.variant.file_stem(scenario.id))
+                .collect();
+            let count = stems.len();
+            stems.sort_unstable();
+            stems.dedup();
+            assert_eq!(stems.len(), count, "{} names two shots alike", scenario.id);
         }
         // No shot is ever taken in the palette the machine happens to be in.
         assert!(

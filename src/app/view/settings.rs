@@ -761,8 +761,8 @@ impl ShelluneView {
     ///
     /// The chosen entry always says so with the selected fill and the accent bar, like
     /// the host list's sidebar (ADR-7); the ring is the keyboard's alone and is drawn
-    /// only while the column itself holds the keyboard - not merely because the last
-    /// input was a key while the page has it.
+    /// only while the column itself holds the keyboard: after Escape, or once the arrows
+    /// walk it (T9), until Enter hands the keyboard back to the page.
     fn settings_nav_ringed(&self) -> bool {
         self.settings_nav.nav_focus
     }
@@ -1977,6 +1977,13 @@ impl ShelluneView {
             }
             "enter" if on_shortcuts => self.run_key_row_control(cx),
             _ => return,
+        }
+        // Outside the shortcut page the arrows walk the navigation column, so the column
+        // has the keyboard now and shows where it is with its ring (T9); Enter or Escape
+        // hands the keyboard back to the page.
+        if !on_shortcuts && event.keystroke.key != "enter" {
+            self.settings_nav.nav_focus = true;
+            cx.notify();
         }
         // Stepping into the page takes the keyboard off a field, so the following arrows
         // move the page instead of a caret.

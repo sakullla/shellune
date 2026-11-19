@@ -295,6 +295,9 @@ fn sync_error_text(error: &SyncError, strings: &SyncStrings) -> String {
     }
 }
 
+/// The width of the sync passphrase field in its settings row, before zoom.
+const PASSPHRASE_FIELD_WIDTH: f32 = 240.0;
+
 /// The engine's wording of a credential-store failure, up to its detail. The store's
 /// error cannot be built outside the storage crate, so this one sentence is spelled
 /// out (it is the `#[error]` text of `SyncError::Credentials`).
@@ -1377,7 +1380,7 @@ impl ShelluneView {
             label,
             hint,
             div()
-                .w(metrics.scale(240.0))
+                .w(metrics.scale(PASSPHRASE_FIELD_WIDTH))
                 .max_w(components::settings_row_content_cap(metrics))
                 .debug_selector(move || selector.to_owned())
                 .child(field.clone()),

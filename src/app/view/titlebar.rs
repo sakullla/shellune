@@ -31,6 +31,9 @@ pub fn custom_titlebar(platform: Platform) -> bool {
 /// buttons with the display, not with the window's text size, so neither does this.
 const CAPTION_BUTTON_WIDTH: f32 = 46.0;
 
+/// The edge of the glyph on a window button, unscaled like the button itself.
+const CAPTION_GLYPH_SIZE: f32 = 12.0;
+
 /// The room the window buttons this row draws itself take at its right end (R2).
 ///
 /// Only Windows draws them; elsewhere the system's own buttons sit outside the row
@@ -63,7 +66,7 @@ const TRAFFIC_LIGHT_INSET: f32 = 16.0;
 /// will open at.
 #[must_use]
 pub fn traffic_light_position(metrics: Metrics) -> (f32, f32) {
-    let header = metrics.header_height() / px(1.0);
+    let header = f32::from(metrics.header_height());
     let top = ((header - TRAFFIC_LIGHT_SIZE) / 2.0).max(0.0).round();
     (TRAFFIC_LIGHT_INSET, top)
 }
@@ -168,8 +171,12 @@ impl ShelluneView {
                 .hover(move |style| style.bg(hover_bg))
                 .active(move |style| style.bg(pressed_bg))
                 .child(
-                    icons::icon(icon, px(12.0), theme::swatch(palette::TEXT_SECONDARY))
-                        .group_hover(id, move |style| style.text_color(hover_text)),
+                    icons::icon(
+                        icon,
+                        px(CAPTION_GLYPH_SIZE),
+                        theme::swatch(palette::TEXT_SECONDARY),
+                    )
+                    .group_hover(id, move |style| style.text_color(hover_text)),
                 )
         };
         Some(

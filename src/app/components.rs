@@ -22,6 +22,7 @@ use gpui::{
 use crate::app::icons::{self, Icon};
 use crate::app::theme::{
     self, Elevated, Elevation, Enter, Metrics, StatusMark, Token, Tone, palette, radius, spacing,
+    type_scale,
 };
 
 /// The visual weight of a button.
@@ -520,9 +521,16 @@ pub fn status_mark(tone: Tone, size: Pixels) -> Div {
         .child(shape)
 }
 
+/// The edge of a [`status_dot`], in logical pixels before zoom.
+const STATUS_DOT_SIZE: f32 = 7.0;
+
+/// The edge of the mark a waiting card or a pending update shows, in logical pixels
+/// before zoom: a step larger than a [`status_dot`], because it stands alone.
+pub const ATTENTION_MARK_SIZE: f32 = 10.0;
+
 /// A small status indicator in the tone's own silhouette.
 pub fn status_dot(tone: Tone, metrics: Metrics) -> Div {
-    status_mark(tone, metrics.scale(7.0))
+    status_mark(tone, metrics.scale(STATUS_DOT_SIZE))
 }
 
 /// A named status dot that breathes while the state it marks is still on its way, such
@@ -588,7 +596,7 @@ fn chip_frame(tone: Tone, metrics: Metrics) -> Div {
         .flex()
         .items_center()
         .gap(metrics.scale(spacing::NARROW))
-        .h(metrics.scale(20.0))
+        .h(metrics.scale(CHIP_HEIGHT))
         .px(metrics.scale(spacing::TIGHT))
         .rounded(px(radius::SMALL))
         .bg(tone.chip_background())
@@ -602,6 +610,9 @@ fn chip_frame(tone: Tone, metrics: Metrics) -> Div {
         })
 }
 
+/// The height of a [`chip`] and a [`tag`], in logical pixels before zoom.
+const CHIP_HEIGHT: f32 = 20.0;
+
 /// A quiet label for a grouping such as a host's group: no mark, because it is not a
 /// state.
 pub fn tag(label: impl Into<SharedString>, metrics: Metrics) -> Div {
@@ -609,7 +620,7 @@ pub fn tag(label: impl Into<SharedString>, metrics: Metrics) -> Div {
         .flex()
         .flex_none()
         .items_center()
-        .h(metrics.scale(20.0))
+        .h(metrics.scale(CHIP_HEIGHT))
         .px(metrics.scale(spacing::NARROW))
         .rounded(px(radius::SMALL))
         .bg(theme::swatch(palette::SURFACE_SELECTED))
@@ -624,8 +635,11 @@ pub fn tag(label: impl Into<SharedString>, metrics: Metrics) -> Div {
 /// The caption size a keycap's label is set in: a step under the caption, so a
 /// shortcut beside a word reads as a hint and not as a second word.
 fn kbd_text_size(metrics: Metrics) -> Pixels {
-    metrics.caption_size() - metrics.scale(1.0)
+    metrics.scale(KBD_TEXT_SIZE)
 }
+
+/// The keycap label's size, in logical pixels before zoom: one under the caption.
+const KBD_TEXT_SIZE: f32 = type_scale::CAPTION - 1.0;
 
 /// The height of a [`kbd`] keycap, in logical pixels before zoom.
 pub const KBD_HEIGHT: f32 = 18.0;
@@ -648,6 +662,13 @@ pub fn kbd(label: impl Into<SharedString>, metrics: Metrics) -> Div {
         .child(label.into())
 }
 
+/// The height and the narrowest width of a [`badge`]: a keycap's height, so a count
+/// and a shortcut beside one another stand on one line.
+const BADGE_SIZE: f32 = KBD_HEIGHT;
+
+/// The height of a [`kind_badge`], in logical pixels before zoom.
+const KIND_BADGE_HEIGHT: f32 = 16.0;
+
 /// A count in a small block, for the sidebar and section headings.
 pub fn badge(count: usize, tone: Tone, metrics: Metrics) -> Div {
     let (background, text) = match tone {
@@ -659,8 +680,8 @@ pub fn badge(count: usize, tone: Tone, metrics: Metrics) -> Div {
         .flex_none()
         .items_center()
         .justify_center()
-        .min_w(metrics.scale(18.0))
-        .h(metrics.scale(18.0))
+        .min_w(metrics.scale(BADGE_SIZE))
+        .h(metrics.scale(BADGE_SIZE))
         .px(metrics.scale(spacing::NARROW))
         .rounded(px(radius::SMALL))
         .font_weight(gpui::FontWeight::MEDIUM)
@@ -681,7 +702,7 @@ pub fn kind_badge(label: impl Into<SharedString>, remote: bool, metrics: Metrics
         .flex()
         .flex_none()
         .items_center()
-        .h(metrics.scale(16.0))
+        .h(metrics.scale(KIND_BADGE_HEIGHT))
         .px(metrics.scale(spacing::HAIRLINE + 1.0))
         .rounded(px(radius::SMALL))
         .bg(theme::swatch(background))
@@ -813,6 +834,29 @@ pub fn danger_icon_button(icon: Icon, metrics: Metrics) -> Div {
         theme::swatch(Tone::Danger.tint()),
         theme::swatch(palette::DANGER),
     )
+}
+
+/// [`icon_only_button`] for the one main action of a narrow row - a banner's reconnect
+/// drawn without its words: it keeps the primary button's accent fill and ink, so the
+/// next step stands apart from the ghost icons beside it.
+pub fn primary_icon_button(icon: Icon, metrics: Metrics) -> Div {
+    let resting = button_face(Variant::Primary, ControlState::Resting);
+    let hovered = button_face(Variant::Primary, ControlState::Hovered).fill_color();
+    let ink = resting.text_color();
+    let size = metrics.hit_target();
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .w(size)
+        .h(size)
+        .rounded(px(radius::MEDIUM))
+        .bg(resting.fill_color())
+        .text_color(ink)
+        .cursor_pointer()
+        .hover(move |style| style.bg(hovered))
+        .child(icons::icon(icon, metrics.small_icon_size(), ink))
 }
 
 /// [`icon_only_button`] for a switch that stays on: while `on` it sits on the accent
@@ -1039,6 +1083,9 @@ pub fn section_label(label: impl Into<SharedString>, metrics: Metrics) -> Div {
         .child(label.into())
 }
 
+/// The width of a [`banner`]'s tone bar on its left edge, in logical pixels before zoom.
+const BANNER_EDGE_WIDTH: f32 = 3.0;
+
 /// A tinted block that carries a notice, a question or a failure in one tone.
 ///
 /// The left edge carries the tone as a solid bar, so a warning is told apart from a
@@ -1056,7 +1103,7 @@ pub fn banner(tone: Tone, metrics: Metrics) -> Div {
         .rounded(px(radius::MEDIUM))
         .bg(tone.chip_background())
         .border_1()
-        .border_l(metrics.scale(3.0))
+        .border_l(metrics.scale(BANNER_EDGE_WIDTH))
         .border_color(theme::faded(tone.text(), 0.35))
         .text_size(metrics.label_size())
 }
@@ -1079,7 +1126,7 @@ pub fn notice(
                 .flex()
                 .items_center()
                 .gap(metrics.scale(spacing::TIGHT))
-                .child(status_mark(tone, metrics.scale(7.0)))
+                .child(status_dot(tone, metrics))
                 .child(
                     div()
                         .flex_1()
@@ -1093,13 +1140,16 @@ pub fn notice(
         )
         .child(
             div()
-                .pl(metrics.scale(spacing::TIGHT + 7.0))
+                .pl(metrics.scale(spacing::TIGHT + STATUS_DOT_SIZE))
                 .whitespace_normal()
                 .text_size(metrics.caption_size())
                 .text_color(theme::swatch(palette::TEXT_SECONDARY))
                 .child(body.into()),
         )
 }
+
+/// The width of the label column of a [`field_row`], in logical pixels before zoom.
+const FIELD_ROW_LABEL_WIDTH: f32 = 104.0;
 
 /// A label beside the control it names, for the forms.
 pub fn field_row(label: impl Into<SharedString>, metrics: Metrics) -> Div {
@@ -1111,7 +1161,7 @@ pub fn field_row(label: impl Into<SharedString>, metrics: Metrics) -> Div {
         .child(
             div()
                 .flex_none()
-                .w(metrics.scale(104.0))
+                .w(metrics.scale(FIELD_ROW_LABEL_WIDTH))
                 .text_size(metrics.label_size())
                 .text_color(theme::swatch(palette::TEXT_MUTED))
                 .child(label.into()),
@@ -1193,6 +1243,16 @@ pub fn state_card(
     state_card_with_icon(tone, emblem_icon, title, body, next_step, metrics)
 }
 
+/// The edge of a state card's emblem tile, in logical pixels before zoom.
+const STATE_EMBLEM_SIZE: f32 = 44.0;
+
+/// The edge of the icon inside a state card's emblem tile.
+const STATE_EMBLEM_ICON_SIZE: f32 = 20.0;
+
+/// The widest a state card's lines of words grow, so a long reason wraps into a
+/// readable column instead of one line across a wide pane.
+const STATE_CARD_WORDS_MAX_WIDTH: f32 = 480.0;
+
 /// [`state_card`] with a chosen emblem: the destination's own icon reads better than
 /// a dot when a page is simply empty.
 pub fn state_card_with_icon(
@@ -1208,14 +1268,14 @@ pub fn state_card_with_icon(
         .flex_none()
         .items_center()
         .justify_center()
-        .w(metrics.scale(44.0))
-        .h(metrics.scale(44.0))
+        .size(metrics.scale(STATE_EMBLEM_SIZE))
         .rounded(px(radius::LARGE))
         .bg(tone.chip_background())
         .border_1()
         .border_color(theme::faded(tone.text(), 0.28))
         .child(match emblem_icon {
-            Some(icon) => icons::icon(icon, metrics.scale(20.0), tone.text()).into_any_element(),
+            Some(icon) => icons::icon(icon, metrics.scale(STATE_EMBLEM_ICON_SIZE), tone.text())
+                .into_any_element(),
             None => attention_dot(tone, metrics),
         });
 
@@ -1224,7 +1284,7 @@ pub fn state_card_with_icon(
     // paints it at the cap, so a sentence that fits across the card but not inside the
     // cap kept a one-line box, painted two lines and ran into the padding and the step
     // under it (R1, R5).
-    let cap = metrics.scale(480.0);
+    let cap = metrics.scale(STATE_CARD_WORDS_MAX_WIDTH);
     let mut text = div()
         .flex()
         .flex_col()
@@ -1297,7 +1357,7 @@ pub fn state_card_with_icon(
 /// and the card's words stay either way. The fade is not a loop: a load that takes
 /// time is still told by the warning copy, not by something that keeps moving.
 fn attention_dot(tone: Tone, metrics: Metrics) -> AnyElement {
-    let dot = status_mark(tone, metrics.scale(10.0));
+    let dot = status_mark(tone, metrics.scale(ATTENTION_MARK_SIZE));
     if tone == Tone::Warning && theme::motion_allowed() {
         dot.debug_selector(|| "state.motion.pulse".to_owned())
             .with_animation(
@@ -1356,7 +1416,7 @@ pub fn row(metrics: Metrics) -> Div {
             .justify_between()
             .gap(metrics.scale(spacing::SNUG))
             .w_full()
-            .min_h(metrics.list_row_height() + metrics.scale(4.0))
+            .min_h(metrics.list_row_height() + metrics.scale(spacing::HAIRLINE))
             .px(metrics.scale(spacing::BASE - 2.0))
             .py(metrics.scale(spacing::TIGHT + 2.0))
             .rounded(px(radius::LARGE)),
@@ -1378,7 +1438,7 @@ pub fn row_with_state(state: ControlState, metrics: Metrics) -> Div {
             .justify_between()
             .gap(metrics.scale(spacing::SNUG))
             .w_full()
-            .min_h(metrics.list_row_height() + metrics.scale(4.0))
+            .min_h(metrics.list_row_height() + metrics.scale(spacing::HAIRLINE))
             .px(metrics.scale(spacing::BASE - 2.0))
             .py(metrics.scale(spacing::TIGHT + 2.0))
             .rounded(px(radius::LARGE)),
@@ -1726,6 +1786,16 @@ pub fn copy_on_click(base: Div, text: impl Into<String>) -> Div {
         })
 }
 
+/// The length of a [`loading_indicator`]'s track, in logical pixels before zoom.
+const LOADING_TRACK_WIDTH: f32 = 36.0;
+
+/// The length of the filled part of a [`loading_indicator`].
+const LOADING_FILL_WIDTH: f32 = 14.0;
+
+/// The thickness of a [`loading_indicator`], in device-independent pixels: a line,
+/// so it stays a line at every text size.
+const LOADING_BAR_THICKNESS: f32 = 2.0;
+
 /// A short in-flight bar: the work is running, and the word beside it says what.
 ///
 /// The bar never carries the meaning on its own - a loading button also says what it is
@@ -1734,13 +1804,13 @@ pub fn copy_on_click(base: Div, text: impl Into<String>) -> Div {
 pub fn loading_indicator(metrics: Metrics) -> AnyElement {
     let bar = div()
         .flex_none()
-        .w(metrics.scale(36.0))
-        .h(px(2.0))
+        .w(metrics.scale(LOADING_TRACK_WIDTH))
+        .h(px(LOADING_BAR_THICKNESS))
         .rounded_full()
         .bg(theme::swatch(palette::LOADING_TRACK))
         .child(
             div()
-                .w(metrics.scale(14.0))
+                .w(metrics.scale(LOADING_FILL_WIDTH))
                 .h_full()
                 .rounded_full()
                 .bg(theme::swatch(palette::LOADING_FILL)),
@@ -1917,6 +1987,15 @@ pub fn status_card(
         )
 }
 
+/// The length of a [`switch`]'s track, in logical pixels before zoom.
+const SWITCH_WIDTH: f32 = 34.0;
+
+/// The height of a [`switch`]'s track, in logical pixels before zoom.
+const SWITCH_HEIGHT: f32 = 20.0;
+
+/// The gap between a [`switch`]'s knob and its track.
+const SWITCH_INSET: f32 = 3.0;
+
 /// An on/off switch for a setting that takes effect at once.
 ///
 /// The knob's side says the state before its colour does: off sits left on a grey
@@ -1925,9 +2004,9 @@ pub fn status_card(
 /// the switch only draws.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn switch(on: bool, metrics: Metrics) -> Div {
-    let width = metrics.scale(34.0);
-    let height = metrics.scale(20.0);
-    let inset = metrics.scale(3.0);
+    let width = metrics.scale(SWITCH_WIDTH);
+    let height = metrics.scale(SWITCH_HEIGHT);
+    let inset = metrics.scale(SWITCH_INSET);
     let knob = height - inset * 2.0;
     let track = if on {
         palette::TRACK_ON
@@ -1965,6 +2044,12 @@ pub fn switch(on: bool, metrics: Metrics) -> Div {
 /// The hover group a [`checkbox_box`] follows, so the label's row lights the box.
 pub const CHECK_GROUP: &str = "checkbox";
 
+/// The edge of a [`checkbox_box`], in logical pixels before zoom.
+const CHECKBOX_SIZE: f32 = 16.0;
+
+/// The edge of the tick inside a checked [`checkbox_box`].
+const CHECKBOX_TICK_SIZE: f32 = 12.0;
+
 /// The box of a checkbox alone: a hollow square that fills with the accent and a tick
 /// when checked.
 ///
@@ -1978,13 +2063,13 @@ pub fn checkbox_box(checked: bool, metrics: Metrics) -> Div {
         .flex_none()
         .items_center()
         .justify_center()
-        .size(metrics.scale(16.0))
+        .size(metrics.scale(CHECKBOX_SIZE))
         .rounded(px(radius::SMALL - 2.0))
         .border_1();
     if checked {
         boxed.bg(accent).border_color(accent).child(icons::icon(
             Icon::Check,
-            metrics.scale(12.0),
+            metrics.scale(CHECKBOX_TICK_SIZE),
             theme::swatch(palette::ON_ACCENT),
         ))
     } else {
@@ -2168,6 +2253,15 @@ pub fn status_card_slot(card: Div, metrics: Metrics) -> Div {
     capped(metrics.scale(STATUS_CARD_WIDTH), card)
 }
 
+/// The edge of an [`empty_state`]'s icon tile, in logical pixels before zoom.
+const EMPTY_EMBLEM_SIZE: f32 = 48.0;
+
+/// The edge of the icon inside an [`empty_state`]'s tile.
+const EMPTY_EMBLEM_ICON_SIZE: f32 = 22.0;
+
+/// The widest an [`empty_state`]'s title and line grow before they wrap.
+const EMPTY_WORDS_MAX_WIDTH: f32 = 420.0;
+
 /// An empty page or section: an icon on the accent tint, a title, an optional line and
 /// an optional next step.
 ///
@@ -2197,17 +2291,17 @@ pub fn empty_state(
                 .flex_none()
                 .items_center()
                 .justify_center()
-                .size(metrics.scale(48.0))
+                .size(metrics.scale(EMPTY_EMBLEM_SIZE))
                 .rounded(px(radius::XLARGE))
                 .bg(theme::swatch(palette::ACCENT_TINT))
                 .child(icons::icon(
                     icon,
-                    metrics.scale(22.0),
+                    metrics.scale(EMPTY_EMBLEM_ICON_SIZE),
                     theme::swatch(palette::ACCENT_ON_TINT),
                 )),
         )
         .child(capped_text(
-            metrics.scale(420.0),
+            metrics.scale(EMPTY_WORDS_MAX_WIDTH),
             div()
                 .whitespace_normal()
                 .text_center()
@@ -2219,7 +2313,7 @@ pub fn empty_state(
         ))
         .children(body.map(|body| {
             capped_text(
-                metrics.scale(420.0),
+                metrics.scale(EMPTY_WORDS_MAX_WIDTH),
                 div()
                     .debug_selector(|| "empty.state.body".to_owned())
                     .whitespace_normal()
@@ -2288,6 +2382,9 @@ pub fn modal_footer(metrics: Metrics) -> Div {
         .border_color(theme::swatch(palette::BORDER))
 }
 
+/// The edge of a [`modal_icon`] tile, in logical pixels before zoom.
+const MODAL_ICON_TILE: f32 = 32.0;
+
 /// The icon tile at the head of a [`modal`]: the accent tint for an ordinary dialog,
 /// the tone's tint for a question about something that cannot be undone.
 pub fn modal_icon(icon: Icon, tone: Option<Tone>, metrics: Metrics) -> Div {
@@ -2303,7 +2400,7 @@ pub fn modal_icon(icon: Icon, tone: Option<Tone>, metrics: Metrics) -> Div {
         .flex_none()
         .items_center()
         .justify_center()
-        .size(metrics.scale(32.0))
+        .size(metrics.scale(MODAL_ICON_TILE))
         .rounded(px(radius::MEDIUM))
         .bg(fill)
         .child(icons::icon(icon, metrics.icon_size(), ink))
@@ -2352,7 +2449,7 @@ pub fn modal_with(
     // The inset stays a small edge gap. Scaling it with the text turned a 200% minimum
     // window into a short dialog, and the failure's next line was drawn past the client
     // edge where it could not be read (R4).
-    let margin = metrics.scale(spacing::LOOSE).min(px(16.0));
+    let margin = metrics.scale(spacing::LOOSE).min(px(spacing::BASE));
     let width = metrics.scale(width).min(viewport.width - margin * 2.0);
     let max_height = viewport.height - margin * 2.0;
     let dialog = dialog_surface()
@@ -3357,6 +3454,9 @@ pub fn progress_line(
         .into_any_element()
 }
 
+/// The height of a [`skeleton_text`] line, in logical pixels before zoom.
+const SKELETON_LINE_HEIGHT: f32 = 10.0;
+
 /// A placeholder line of text while the words load: a rounded block at `fraction` of
 /// the width it is given (ADR-2).
 #[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
@@ -3364,7 +3464,7 @@ pub fn skeleton_text(fraction: f32, metrics: Metrics) -> Div {
     div()
         .flex_none()
         .w(gpui::relative(fraction.clamp(0.05, 1.0)))
-        .h(metrics.scale(10.0))
+        .h(metrics.scale(SKELETON_LINE_HEIGHT))
         .rounded(px(radius::SMALL))
         .bg(theme::swatch(palette::SURFACE_SELECTED))
 }
@@ -3422,6 +3522,10 @@ pub fn checkbox_target(checked: bool, metrics: Metrics) -> Div {
         .child(checkbox_box(checked, metrics))
 }
 
+/// The narrowest a [`labelled_switch`]'s state word becomes, so the switch does not
+/// shift sideways when the word changes between "On" and "Off".
+const SWITCH_WORD_MIN_WIDTH: f32 = 24.0;
+
 /// A [`switch`] with its state word before it, for a setting that is on or off.
 ///
 /// The word says the state in text as well, so it is not told by the knob's side and
@@ -3442,7 +3546,7 @@ pub fn labelled_switch(
         .cursor_pointer()
         .child(
             div()
-                .min_w(metrics.scale(24.0))
+                .min_w(metrics.scale(SWITCH_WORD_MIN_WIDTH))
                 .text_size(metrics.label_size())
                 .text_color(theme::swatch(if on {
                     palette::TEXT_PRIMARY
@@ -3916,6 +4020,21 @@ mod tests {
                 "{name} is not lifted"
             );
         }
+        // The main action drawn as an icon keeps the primary fill and ink; a plain icon
+        // button rests without a fill, so the two are told apart (T9, ADR-6).
+        let primary = button_face(Variant::Primary, ControlState::Resting);
+        let mut main = primary_icon_button(Icon::Refresh, metrics);
+        assert_eq!(
+            main.style().background,
+            Some(gpui::Fill::from(primary.fill_color())),
+            "the main icon action sits on the primary fill"
+        );
+        assert_eq!(
+            main.style().text.as_ref().and_then(|text| text.color),
+            Some(gpui::Hsla::from(primary.text_color()))
+        );
+        let mut plain = icon_only_button(Icon::Refresh, metrics);
+        assert_ne!(plain.style().background, main.style().background);
         // A menu entry and a value of a choice menu are one compact control high (28).
         let mut entry = menu_entry("Copy", "test.entry", None, true, false, metrics);
         assert_eq!(

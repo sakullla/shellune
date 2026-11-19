@@ -2948,7 +2948,7 @@ pub fn group_path_from_text(text: &str) -> Result<Option<GroupPath>, String> {
 /// adding it to the tree; drawing either under a parent that does not exist, or not at
 /// all, would hide it, so the paths are added here instead of being invented again by
 /// the renderer (R2, R7).
-fn drawn_paths(book: &HostBook, groups: &GroupBook) -> Vec<GroupPath> {
+pub(crate) fn drawn_paths(book: &HostBook, groups: &GroupBook) -> Vec<GroupPath> {
     let mut paths: BTreeSet<GroupPath> = groups.paths().iter().cloned().collect();
     let named = book
         .hosts()

@@ -46,6 +46,19 @@ const BREAK: &str = "\\n";
 /// Width of the caret.
 const CARET_WIDTH: f32 = 1.5;
 
+/// How far the caret and the selection stop short of the field's top and bottom.
+const CARET_INSET: f32 = 2.0;
+
+/// The thickness of the line under text being composed by an input method.
+const COMPOSITION_UNDERLINE: f32 = 1.0;
+
+/// The soft ring outside a field that has the keyboard.
+const FOCUS_HALO: f32 = 3.0;
+
+/// The narrowest a field's own menu (cut, copy, paste) becomes, in logical pixels
+/// before zoom.
+const FIELD_MENU_MIN_WIDTH: f32 = 180.0;
+
 /// What a path field's browse button chooses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Browse {
@@ -627,6 +640,13 @@ impl TextField {
         self.masked
     }
 
+    /// The words shown while the field is empty.
+    #[cfg(test)]
+    #[must_use]
+    pub fn placeholder(&self) -> &str {
+        &self.placeholder
+    }
+
     /// The current text.
     #[must_use]
     pub fn text(&self) -> &str {
@@ -978,7 +998,7 @@ impl TextField {
             )
         };
         let menu = components::menu_card("field.menu", metrics)
-            .min_w(metrics.scale(180.0))
+            .min_w(metrics.scale(FIELD_MENU_MIN_WIDTH))
             .child(
                 item(strings.field_cut, key("X"), can_copy, "field.menu.cut").when(
                     can_copy,
@@ -1111,7 +1131,7 @@ impl Render for TextField {
                     color: theme::faded(accent, 0.22).into(),
                     offset: point(px(0.0), px(0.0)),
                     blur_radius: px(0.0),
-                    spread_radius: px(3.0),
+                    spread_radius: px(FOCUS_HALO),
                 }])
             })
             .when(!focused && !bare, |field| {
@@ -1160,7 +1180,7 @@ impl Render for TextField {
                     theme::swatch(palette::TEXT_MUTED),
                 )
                 .flex_none()
-                .mr(metrics.scale(2.0))
+                .mr(metrics.scale(spacing::HALF))
             }))
             .child(
                 div()
@@ -1372,7 +1392,7 @@ impl Element for LineElement {
                         len: end - start,
                         underline: Some(UnderlineStyle {
                             color: Some(run.color),
-                            thickness: px(1.0),
+                            thickness: px(COMPOSITION_UNDERLINE),
                             wavy: false,
                         }),
                         ..run.clone()
@@ -1433,8 +1453,8 @@ impl Element for LineElement {
             let end = line.x_for_index(field.display_offset(selection_range.end));
             fill(
                 Bounds::from_corners(
-                    point(origin.x + start, bounds.top() + px(2.0)),
-                    point(origin.x + end, bounds.bottom() - px(2.0)),
+                    point(origin.x + start, bounds.top() + px(CARET_INSET)),
+                    point(origin.x + end, bounds.bottom() - px(CARET_INSET)),
                 ),
                 theme::faded(theme::swatch(palette::ACCENT), selection_alpha),
             )
@@ -1442,8 +1462,8 @@ impl Element for LineElement {
         let caret = (focused && selection.is_none()).then(|| {
             fill(
                 Bounds::new(
-                    point(origin.x + caret_x, bounds.top() + px(2.0)),
-                    size(px(CARET_WIDTH), bounds.size.height - px(4.0)),
+                    point(origin.x + caret_x, bounds.top() + px(CARET_INSET)),
+                    size(px(CARET_WIDTH), bounds.size.height - px(CARET_INSET * 2.0)),
                 ),
                 theme::swatch(palette::ACCENT),
             )
@@ -1619,7 +1639,7 @@ impl EntityInputHandler for TextField {
         let x = element_bounds.left() - self.scroll + layout.x_for_index(start);
         Some(Bounds::from_corners(
             point(x, element_bounds.top()),
-            point(x + px(1.0), element_bounds.bottom()),
+            point(x + px(components::HAIRLINE_WIDTH), element_bounds.bottom()),
         ))
     }
 

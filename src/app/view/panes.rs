@@ -23,6 +23,21 @@ use crate::app::nav::Destination;
 use crate::app::theme::{self, Tone, palette, radius, spacing};
 use crate::app::view::{ShelluneView, SplitDrag};
 
+/// The width of the band between two split panes that the pointer drags, before zoom.
+const DIVIDER_BAND: f32 = 12.0;
+
+/// The gap between the grip dots on a split divider, before zoom.
+const DIVIDER_GRIP_GAP: f32 = 1.0;
+
+/// The height of a split pane's own head, before zoom.
+const PANE_HEAD_HEIGHT: f32 = 26.0;
+
+/// The edge of the emblem on a pane still waiting to start, before zoom.
+const PENDING_EMBLEM_SIZE: f32 = 40.0;
+
+/// The widest the explanation on a waiting pane grows before it wraps.
+const PENDING_WORDS_MAX_WIDTH: f32 = 420.0;
+
 impl ShelluneView {
     /// Reads `workspace.json` into pending panes.
     ///
@@ -782,15 +797,17 @@ impl ShelluneView {
             .flex_none()
             .items_center()
             .justify_center()
-            .gap(metrics.scale(1.0))
+            .gap(metrics.scale(DIVIDER_GRIP_GAP))
             .when(across, |bar| {
-                bar.w(metrics.scale(12.0))
+                bar.w(metrics.scale(DIVIDER_BAND))
                     .h_full()
                     .flex_col()
                     .cursor_col_resize()
             })
             .when(!across, |bar| {
-                bar.h(metrics.scale(12.0)).w_full().cursor_row_resize()
+                bar.h(metrics.scale(DIVIDER_BAND))
+                    .w_full()
+                    .cursor_row_resize()
             })
             .bg(theme::swatch(palette::CHROME))
             .hover(|bar| bar.bg(theme::swatch(palette::SURFACE_HOVER)))
@@ -1070,30 +1087,31 @@ impl ShelluneView {
             .layout()
             .active_tab()
             .is_some_and(|tab| tab.zoomed() == Some(pane));
+        // A pane narrower than its head - a side-by-side split at 200% text - lets the
+        // name and the "Active" chip give way with an ellipsis, so zoom and close stay
+        // whole inside the pane instead of being cut at its edge.
         div()
             .flex()
             .flex_none()
             .items_center()
+            .min_w_0()
             .gap(metrics.scale(spacing::HAIRLINE))
-            .h(metrics.scale(26.0))
+            .h(metrics.scale(PANE_HEAD_HEIGHT))
             .px(metrics.scale(spacing::TIGHT))
             // The active pane is marked by its own fill and an accent bar, not only by
             // the weight of a word: the frame around it is the other half of the mark.
             .when(active, |row| row.bg(theme::swatch(palette::SURFACE)))
             .when(active, |row| {
                 row.child(
-                    div()
-                        .flex_none()
-                        .w(px(2.0))
-                        .h(metrics.scale(14.0))
-                        .rounded_full()
-                        .bg(theme::swatch(palette::ACCENT))
+                    crate::app::components::accent_mark(true, metrics)
                         .debug_selector(|| "pane.active.mark".to_owned()),
                 )
             })
             .child(
                 div()
-                    .flex_none()
+                    .flex_shrink()
+                    .min_w_0()
+                    .truncate()
                     .text_size(metrics.caption_size())
                     .when(active, |label| {
                         label
@@ -1112,7 +1130,7 @@ impl ShelluneView {
             // The word, not only the accent: which pane holds the keys is never said by
             // colour alone (R8).
             .when(active, |row| {
-                row.child(crate::app::components::chip(
+                row.child(crate::app::components::chip_within(
                     strings.pane_active,
                     Tone::Accent,
                     metrics,
@@ -1214,6 +1232,7 @@ impl ShelluneView {
         crate::app::components::icon_only_button(icon, metrics)
             // The pane header is 28px tall; the button keeps the 24x24 minimum so a
             // reduced text size cannot shrink the target (R4).
+            .flex_none()
             .w(metrics.hit_target())
             .h(metrics.hit_target())
             .id(SharedString::from(format!("pane.{name}.{pane}")))
@@ -1248,7 +1267,7 @@ impl ShelluneView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(metrics.scale(40.0))
+                    .size(metrics.scale(PENDING_EMBLEM_SIZE))
                     .mb(metrics.scale(spacing::HAIRLINE))
                     .rounded(px(radius::MEDIUM))
                     .bg(theme::swatch(palette::ACCENT_TINT))
@@ -1274,7 +1293,7 @@ impl ShelluneView {
             )
             .child(
                 div()
-                    .max_w(metrics.scale(420.0))
+                    .max_w(metrics.scale(PENDING_WORDS_MAX_WIDTH))
                     .mb(metrics.scale(spacing::HAIRLINE))
                     .text_size(metrics.label_size())
                     .text_color(theme::swatch(palette::TEXT_SECONDARY))

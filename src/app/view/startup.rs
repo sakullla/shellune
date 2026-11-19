@@ -85,6 +85,11 @@ pub const BRAND_ZOOM_FROM: f32 = 0.96;
 /// The logo's edge on the start, in logical pixels before zoom.
 pub const BRAND_MARK: f32 = 64.0;
 
+/// The logo's edge while a failed stage holds the start, in logical pixels before
+/// zoom: smaller, so at 200% text in the smallest window the stage and its reason
+/// stay on the first screen instead of scrolling below the brand.
+pub const BRAND_MARK_STOPPED: f32 = 40.0;
+
 /// The widest the progress bar is, in logical pixels before zoom.
 const BAR_WIDTH: f32 = 200.0;
 
@@ -239,6 +244,46 @@ pub(super) struct StartupRun {
     frame_drawn: bool,
     /// The brand has had its entrance.
     entrance_over: bool,
+    /// Where the bar's fill is going and where it set off from.
+    bar: BarMotion,
+}
+
+/// The bar's fill on its way to the share of the stages behind the start: it eases from
+/// `from` to `to` over [`Motion::BASE`] from `since` (ADR-4).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct BarMotion {
+    /// Where the fill set off: where it was drawn when its target last changed.
+    pub(super) from: f32,
+    /// Where it is going.
+    pub(super) to: f32,
+    /// When it set off; `None` before the first stage reported.
+    since: Option<Instant>,
+}
+
+impl BarMotion {
+    /// Where the fill is drawn at `now`, on the ease-out-cubic curve the bar uses.
+    pub(super) fn at(&self, now: Instant) -> f32 {
+        let Some(since) = self.since else {
+            return self.to;
+        };
+        let t = (now.saturating_duration_since(since).as_secs_f32() / Motion::BASE.as_secs_f32())
+            .clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - t).powi(3);
+        self.from + (self.to - self.from) * eased
+    }
+
+    /// Sends the fill to `to`, setting off from where it is drawn at `now`; a target it
+    /// already has changes nothing.
+    pub(super) fn retarget(&mut self, to: f32, now: Instant) {
+        if (to - self.to).abs() < f32::EPSILON {
+            return;
+        }
+        *self = Self {
+            from: self.at(now),
+            to,
+            since: Some(now),
+        };
+    }
 }
 
 impl StartupRun {
@@ -597,6 +642,8 @@ impl ShelluneView {
             took,
             failure: outcome.err(),
         });
+        let target = self.startup_run.target();
+        self.startup_run.bar.retarget(target, Instant::now());
         cx.notify();
         if self.startup_run.stop().is_none() {
             self.run_next_stage(cx);
@@ -705,6 +752,8 @@ impl ShelluneView {
             return;
         }
         self.startup_run.continued = true;
+        let target = self.startup_run.target();
+        self.startup_run.bar.retarget(target, Instant::now());
         cx.notify();
         self.run_next_stage(cx);
     }
@@ -858,8 +907,14 @@ impl ShelluneView {
             });
         }
         let metrics = self.metrics();
-        let brand = self.splash_brand_shown().then(|| self.splash_column(cx));
+        let brand = self.splash_brand_shown().then(|| self.splash_column());
         let stopped = self.startup_run.stop().is_some();
+        // The stop's two buttons stand under the words that scroll, so they are on the
+        // first screen even at 200% text in the smallest window (T9).
+        let buttons = (stopped && self.splash_brand_shown()).then(|| {
+            let strings = copy::startup_for(self.workspace.locale());
+            self.startup_stop_buttons(strings, metrics, cx)
+        });
         div()
             .id("startup.splash")
             .debug_selector(|| "startup.splash".to_owned())
@@ -882,21 +937,29 @@ impl ShelluneView {
                 }))
             })
             .child(self.startup_caption(window, cx))
-            .child(splash_body(brand))
+            .child(splash_body(brand, buttons))
             .into_any_element()
     }
 
     /// The brand and, under it, the progress of the stages or the stop a failed stage
     /// made.
-    fn splash_column(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn splash_column(&self) -> AnyElement {
         let metrics = self.metrics();
         let locale = self.workspace.locale();
         let strings = copy::startup_for(locale);
         let still = self.splash_still();
         let choreography = Choreography::for_motion(self.effective_motion());
+        let stopped = self.startup_run.stop().is_some();
         let status = match self.startup_run.stop() {
-            Some((stage, reason)) => self.startup_stop_panel(stage, reason, strings, metrics, cx),
+            Some((stage, reason)) => Self::startup_stop_panel(stage, reason, strings, metrics),
             None => self.startup_progress(strings, metrics, still, choreography),
+        };
+        // A stop is about what failed: the brand steps back so the stage and its
+        // reason are on the first screen even at 200% text in the smallest window.
+        let (mark, name_size) = if stopped {
+            (BRAND_MARK_STOPPED, metrics.title_size())
+        } else {
+            (BRAND_MARK, metrics.hero_size())
         };
         let column = div()
             .flex()
@@ -909,11 +972,11 @@ impl ShelluneView {
             .max_w_full()
             .px(metrics.scale(spacing::LOOSE))
             .debug_selector(|| "startup.splash.brand".to_owned())
-            .child(brand_mark(metrics, still, choreography))
+            .child(brand_mark(metrics.scale(mark), still, choreography))
             .child(
                 div()
                     .mt(metrics.scale(spacing::HAIRLINE))
-                    .text_size(metrics.hero_size())
+                    .text_size(name_size)
                     .font_weight(metrics.title_weight())
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     .debug_selector(|| "startup.splash.name".to_owned())
@@ -940,10 +1003,12 @@ impl ShelluneView {
         let caption = run
             .current()
             .map_or(strings.stage_done, |stage| stage.caption(strings));
+        // The fill sets off from where it was drawn when the stage ended, not from the
+        // previous target: stages closer than the easing do not make it jump (T9).
         let bar = components::progress_line(
             ("startup.progress", done),
-            stage_share(done.saturating_sub(1)),
-            run.target(),
+            run.bar.from,
+            run.bar.to,
             Motion::BASE,
             still || !choreography.bar_eases,
             metrics,
@@ -980,12 +1045,10 @@ impl ShelluneView {
 
     /// The stop a failed stage makes: which stage, why, and the two ways on (R3).
     fn startup_stop_panel(
-        &self,
         stage: StartupStage,
         reason: &str,
         strings: &StartupStrings,
         metrics: Metrics,
-        cx: &mut Context<Self>,
     ) -> AnyElement {
         let width = metrics.scale(FAILURE_WIDTH);
         let line = |text: SharedString, selector: &'static str| {
@@ -1030,36 +1093,47 @@ impl ShelluneView {
                 .text_size(metrics.caption_size())
                 .text_color(theme::swatch(palette::TEXT_SECONDARY)),
             )
+            .into_any_element()
+    }
+
+    /// The two ways on from a stop: go on, or open the data folder (R3).
+    fn startup_stop_buttons(
+        &self,
+        strings: &StartupStrings,
+        metrics: Metrics,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_none()
+            .flex_wrap()
+            .justify_center()
+            .w_full()
+            .px(metrics.scale(spacing::LOOSE))
+            .gap(metrics.scale(spacing::TIGHT))
+            .pt(metrics.scale(spacing::NARROW))
+            .pb(metrics.scale(spacing::SNUG))
+            .debug_selector(|| "startup.failure.actions".to_owned())
             .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .justify_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .mt(metrics.scale(spacing::NARROW))
-                    .child(
-                        components::button(strings.continue_start, Variant::Primary, metrics)
-                            .id("startup.continue")
-                            .debug_selector(|| "startup.continue".to_owned())
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.continue_startup(cx);
-                            })),
-                    )
-                    .child(
-                        components::icon_label_button(
-                            icons::Icon::FolderOpen,
-                            strings.open_folder,
-                            Variant::Secondary,
-                            metrics,
-                        )
-                        .id("startup.open_folder")
-                        .debug_selector(|| "startup.open_folder".to_owned())
-                        .on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                this.open_data_folder(cx);
-                            },
-                        )),
-                    ),
+                components::button(strings.continue_start, Variant::Primary, metrics)
+                    .id("startup.continue")
+                    .debug_selector(|| "startup.continue".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.continue_startup(cx);
+                    })),
+            )
+            .child(
+                components::icon_label_button(
+                    icons::Icon::FolderOpen,
+                    strings.open_folder,
+                    Variant::Secondary,
+                    metrics,
+                )
+                .id("startup.open_folder")
+                .debug_selector(|| "startup.open_folder".to_owned())
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.open_data_folder(cx);
+                })),
             )
             .into_any_element()
     }
@@ -1099,7 +1173,7 @@ impl ShelluneView {
             .w_full()
             .max_w_full()
             .px(metrics.scale(spacing::LOOSE))
-            .child(brand_mark(metrics, true, choreography))
+            .child(brand_mark(metrics.scale(BRAND_MARK), true, choreography))
             .child(
                 div()
                     .mt(metrics.scale(spacing::HAIRLINE))
@@ -1146,7 +1220,7 @@ impl ShelluneView {
             .debug_selector(|| "startup.crossfade".to_owned())
             // The caption's room, so the brand stays exactly where the start drew it.
             .child(div().flex_none().h(metrics.header_height()))
-            .child(splash_body(Some(picture.into_any_element())));
+            .child(splash_body(Some(picture.into_any_element()), None));
         Some(
             layer
                 .with_animation(
@@ -1237,31 +1311,39 @@ impl<A: Future + Unpin, L: Future + Unpin> Future for Bounded<'_, A, L> {
 /// rather than on the whole window keeps the brand clear of the caption at 200% text
 /// in the smallest window. A stop that is taller than the floor there scrolls rather
 /// than losing its buttons off the edge.
-fn splash_body(brand: Option<AnyElement>) -> impl IntoElement {
+fn splash_body(brand: Option<AnyElement>, buttons: Option<AnyElement>) -> impl IntoElement {
+    // The floor centres the start and, under it, a stop's buttons; when the two are
+    // taller than the floor the words above the buttons scroll and the buttons stay.
     div()
-        .id("startup.body")
         .flex()
         .flex_col()
         .flex_1()
         .min_h_0()
-        .overflow_y_scroll()
+        .justify_center()
         .child(
             div()
+                .id("startup.body")
                 .flex()
                 .flex_col()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .w_full()
-                .min_h_full()
-                .children(brand),
+                .flex_shrink()
+                .min_h_0()
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_none()
+                        .items_center()
+                        .w_full()
+                        .children(brand),
+                ),
         )
+        .children(buttons)
 }
 
 /// The logo, zooming from [`Choreography::brand_zoom_from`] of its size into place
 /// unless the start is `still` or the motion is reduced.
-fn brand_mark(metrics: Metrics, still: bool, choreography: Choreography) -> AnyElement {
-    let size = metrics.scale(BRAND_MARK);
+fn brand_mark(size: gpui::Pixels, still: bool, choreography: Choreography) -> AnyElement {
     let mark = div()
         .flex_none()
         .size(size)
@@ -1313,6 +1395,35 @@ mod tests {
     fn the_bar_targets_a_quarter_per_stage_behind_the_start() {
         let shares: Vec<f32> = (0..=5).map(stage_share).collect();
         assert_eq!(shares, vec![0.0, 0.25, 0.5, 0.75, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn the_bar_sets_off_from_where_it_is_drawn() {
+        // T9: two stages 100ms apart - closer than the 200ms easing - send the fill on
+        // from where it was drawn, not back to the previous target or ahead of it.
+        let start = Instant::now();
+        let mut bar = BarMotion::default();
+        bar.retarget(stage_share(1), start);
+        assert!(bar.from.abs() < f32::EPSILON);
+        let halfway = start + Motion::BASE / 2;
+        let drawn = bar.at(halfway);
+        assert!(drawn > 0.0 && drawn < 0.25, "{drawn}");
+        assert!(
+            (drawn - 0.25 * 0.875).abs() < 1e-4,
+            "ease-out-cubic at half time"
+        );
+        bar.retarget(stage_share(2), halfway);
+        assert!((bar.from - drawn).abs() < 1e-6, "{bar:?}");
+        assert!((bar.to - 0.5).abs() < f32::EPSILON);
+        assert!(
+            (bar.at(halfway) - drawn).abs() < 1e-6,
+            "no jump at the hand-over"
+        );
+        assert!((bar.at(halfway + Motion::BASE) - 0.5).abs() < f32::EPSILON);
+        // The same target again changes nothing.
+        let kept = bar;
+        bar.retarget(stage_share(2), halfway + Motion::BASE);
+        assert_eq!(bar, kept);
     }
 
     #[test]
