@@ -1,14 +1,19 @@
-//! Compiles the C shim and links it to the vendored protocol libraries.
+//! Compiles the VNC C shim and links it to the vendored library.
 //!
 //! Two shapes are possible, and the crate works in both:
 //!
 //! * **native**: `packaging/native/build_native.py` has produced
 //!   `target/native/dist/shellune-native.txt` describing the include directories,
 //!   the static libraries and the system libraries they need. The shim is compiled
-//!   with `SD_WITH_RDP` and `SD_WITH_VNC`.
+//!   with `SD_WITH_VNC`.
 //! * **stub**: that file does not exist. The same symbols are compiled from
 //!   `shim/sd_stub.c`, and `sd_backend_available` reports that the protocol
 //!   is not built. Nothing claims a capability the binary does not have.
+//!
+//! RDP is not part of this shim: `src/rdp` implements it in Rust. A manifest that
+//! still names FreeRDP is accepted (the VNC prefix may have been built beside it)
+//! but its archives are deliberately not linked, so no RDP session can run the old
+//! library.
 //!
 //! Set `SHELLUNE_DESKTOP_NATIVE` to point at another installed prefix.
 //!
@@ -36,14 +41,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", config_path.display());
 
     let mut build = cc::Build::new();
-    for file in [
-        "sd_shim.c",
-        "sd_clip.c",
-        "sd_rdp.c",
-        "sd_rdp_drive.c",
-        "sd_vnc.c",
-        "sd_stub.c",
-    ] {
+    for file in ["sd_shim.c", "sd_clip.c", "sd_vnc.c", "sd_stub.c"] {
         let path = manifest_dir.join("shim").join(file);
         println!("cargo:rerun-if-changed={}", path.display());
         build.file(path);
@@ -85,6 +83,12 @@ fn main() {
     }
 }
 
+/// Whether an archive belongs to FreeRDP rather than LibVNCClient.
+fn is_freerdp_archive(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("freerdp") || name.contains("winpr")
+}
+
 /// The platform a manifest's archives were built for. A manifest without the line
 /// was written before macOS and Linux were built, by the Windows-only script.
 fn manifest_platform(text: &str) -> &str {
@@ -109,8 +113,10 @@ fn configure_native(text: &str, target_os: &str, build: &mut cc::Build) -> Vec<S
     let mut protocols = 0;
     let mut links = Vec::new();
     // FreeRDP and WinPR mark their API as dllimport unless the consumer says it is
-    // building them. This build links the static archives, so the same defines their
-    // own static targets use keep the declarations plain instead of importing.
+    // building them. LibVNCClient's build prefix still carries their headers, and
+    // the shim includes them on macOS/Linux for the Win32 subset it is written
+    // against, so the same defines keep those declarations plain even though the
+    // archives themselves are not linked.
     build.define("FREERDP_EXPORTS", None);
     build.define("WINPR_EXPORTS", None);
     if target_os == "windows" {
@@ -137,6 +143,14 @@ fn configure_native(text: &str, target_os: &str, build: &mut cc::Build) -> Vec<S
                 links.push(format!("cargo:rustc-link-search=native={value}"));
             }
             "lib" => {
+                // The archive names FreeRDP and WinPR were built under. They are
+                // skipped rather than linked: nothing in this crate calls them now,
+                // and linking them would put the old RDP implementation back into
+                // the binary. packaging/native still builds them for the VNC prefix,
+                // so the manifest keeps naming them until the final cleanup task.
+                if is_freerdp_archive(value) {
+                    continue;
+                }
                 links.push(format!("cargo:rustc-link-lib=static={value}"));
             }
             "syslib" => {
@@ -146,10 +160,10 @@ fn configure_native(text: &str, target_os: &str, build: &mut cc::Build) -> Vec<S
                 links.push(format!("cargo:rustc-link-lib=framework={value}"));
             }
             "protocol" => match value {
-                "rdp" => {
-                    build.define("SD_WITH_RDP", None);
-                    protocols += 1;
-                }
+                // RDP is in Rust now. The manifest still lists it because the
+                // packaging script predates that; defining SD_WITH_RDP here would
+                // put FreeRDP back in the binary.
+                "rdp" => {}
                 "vnc" => {
                     build.define("SD_WITH_VNC", None);
                     protocols += 1;

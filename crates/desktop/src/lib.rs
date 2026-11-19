@@ -1,11 +1,14 @@
-//! RDP and VNC sessions behind one thin native shim.
+//! RDP and VNC sessions behind one API.
 //!
-//! The protocol libraries (FreeRDP 3.x, LibVNCClient) are compiled from the pinned
-//! sources under `vendor/` by `packaging/native/build_native.py`; this crate
-//! never sees their headers or structs, only the opaque handle, a flat event struct
-//! and a handful of integer calls declared in `ffi.rs`.
+//! RDP is implemented in this crate (`rdp`): its own socket, TLS, MCS, share and
+//! channel code, with no protocol library underneath.
 //!
-//! Three rules hold at this boundary and the tests exercise them:
+//! VNC still runs through the native shim: LibVNCClient is compiled from the
+//! pinned sources under `vendor/` by `packaging/native/build_native.py`, and this
+//! crate never sees its headers or structs, only the opaque handle, a flat event
+//! struct and a handful of integer calls declared in `ffi.rs`.
+//!
+//! Three rules hold at that boundary and the tests exercise them:
 //!
 //! 1. A panic never crosses the C ABI. The callback trampoline catches it, counts
 //!    it and drops the event; the protocol worker keeps running.
@@ -22,6 +25,7 @@
 
 mod ffi;
 mod mailbox;
+mod rdp;
 
 use mailbox::Mailbox;
 use std::ffi::{CStr, CString, c_void};
@@ -496,6 +500,10 @@ fn status(code: i32) -> Result<(), Error> {
 /// What this build can do for a protocol: the linked library versions and the
 /// security types that were actually compiled in, or why nothing is linked.
 pub fn backend_info(protocol: Protocol) -> Result<String, Error> {
+    if protocol == Protocol::Rdp {
+        // The RDP engine is this crate; there is no native library to report.
+        return Ok("shellune RDP client (native, no external library)".to_owned());
+    }
     check_abi()?;
     let mut buffer = [0 as c_char; 512];
     let code = unsafe { ffi::sd_backend_info(protocol.raw(), buffer.as_mut_ptr(), buffer.len()) };
@@ -534,21 +542,26 @@ struct Inbox {
 
 impl Inbox {
     fn deliver(&self, event: Event) {
-        match &self.sink {
-            Sink::Channel(sender) => {
-                // Compositing is bounded and never waits for the UI: the shim
-                // holds its dispatch lock while this callback runs.
-                sender.deliver(event);
-            }
-            Sink::Handler(handler) => {
-                // A poisoned lock means the previous call panicked. The trampoline
-                // already contained it, so recover the handler and keep delivering.
-                let mut handler = match handler.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                handler(event);
-            }
+        deliver(&self.sink, event);
+    }
+}
+
+/// Sends one event to whichever sink this handle was built with. Both engines use
+/// it, so the mailbox and handler rules stay in one place.
+fn deliver(sink: &Sink, event: Event) {
+    match sink {
+        Sink::Channel(sender) => {
+            // Compositing is bounded and never waits for the UI.
+            sender.deliver(event);
+        }
+        Sink::Handler(handler) => {
+            // A poisoned lock means the previous call panicked. The trampoline
+            // already contained it, so recover the handler and keep delivering.
+            let mut handler = match handler.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            handler(event);
         }
     }
 }
@@ -560,10 +573,18 @@ impl Inbox {
 /// channel it feeds is dropped.
 pub struct DesktopClient {
     protocol: Protocol,
-    handle: *mut ffi::sd_client,
-    inbox: *mut Inbox,
+    backend: Backend,
     receiver: Option<Arc<Mailbox>>,
     state: State,
+}
+
+/// Which engine answers a handle. VNC runs in the shim; RDP is Rust throughout.
+enum Backend {
+    Shim {
+        handle: *mut ffi::sd_client,
+        inbox: *mut Inbox,
+    },
+    Rdp(Box<rdp::Client>),
 }
 
 // The handle is only touched through the shim, which serialises dispatch and state
@@ -598,6 +619,17 @@ impl DesktopClient {
         sink: Sink,
         receiver: Option<Arc<Mailbox>>,
     ) -> Result<DesktopClient, Error> {
+        if protocol == Protocol::Rdp {
+            let sink = Arc::new(sink);
+            let emit_sink = Arc::clone(&sink);
+            let emit: rdp::Emit = Arc::new(move |event| deliver(&emit_sink, event));
+            return Ok(DesktopClient {
+                protocol,
+                backend: Backend::Rdp(Box::new(rdp::Client::new(emit))),
+                receiver,
+                state: State::Idle,
+            });
+        }
         check_abi()?;
         backend_info(protocol)?;
 
@@ -616,11 +648,36 @@ impl DesktopClient {
         }
         Ok(DesktopClient {
             protocol,
-            handle,
-            inbox: user as *mut Inbox,
+            backend: Backend::Shim {
+                handle,
+                inbox: user as *mut Inbox,
+            },
             receiver,
             state: State::Idle,
         })
+    }
+
+    /// The RDP engine when this handle is one; `None` for VNC.
+    fn rdp(&self) -> Option<&rdp::Client> {
+        match &self.backend {
+            Backend::Rdp(client) => Some(client),
+            Backend::Shim { .. } => None,
+        }
+    }
+
+    fn rdp_mut(&mut self) -> Option<&mut rdp::Client> {
+        match &mut self.backend {
+            Backend::Rdp(client) => Some(client),
+            Backend::Shim { .. } => None,
+        }
+    }
+
+    /// The shim handle. Only a VNC handle has one.
+    fn shim(&self) -> Result<*mut ffi::sd_client, Error> {
+        match &self.backend {
+            Backend::Shim { handle, .. } => Ok(*handle),
+            Backend::Rdp(_) => Err(Error::State),
+        }
     }
 
     pub fn protocol(&self) -> Protocol {
@@ -628,12 +685,19 @@ impl DesktopClient {
     }
 
     pub fn state(&self) -> State {
-        self.state
+        match self.rdp() {
+            Some(client) => client.state(),
+            None => self.state,
+        }
     }
 
     pub fn set_server(&mut self, host: &str, port: u16) -> Result<(), Error> {
+        if let Some(client) = self.rdp_mut() {
+            client.set_server(host, port);
+            return Ok(());
+        }
         let host = CString::new(host).map_err(|_| Error::Argument)?;
-        status(unsafe { ffi::sd_client_set_server(self.handle, host.as_ptr(), port) })
+        status(unsafe { ffi::sd_client_set_server(self.shim()?, host.as_ptr(), port) })
     }
 
     pub fn set_credentials(
@@ -642,6 +706,10 @@ impl DesktopClient {
         password: Option<&str>,
         domain: Option<&str>,
     ) -> Result<(), Error> {
+        if let Some(client) = self.rdp_mut() {
+            client.set_credentials(user, password, domain);
+            return Ok(());
+        }
         let user = user
             .map(CString::new)
             .transpose()
@@ -656,7 +724,7 @@ impl DesktopClient {
             .map_err(|_| Error::Argument)?;
         status(unsafe {
             ffi::sd_client_set_credentials(
-                self.handle,
+                self.shim()?,
                 user.as_ref()
                     .map_or(std::ptr::null(), |value| value.as_ptr()),
                 password
@@ -670,11 +738,25 @@ impl DesktopClient {
     }
 
     pub fn set_size(&mut self, width: u32, height: u32) -> Result<(), Error> {
-        status(unsafe { ffi::sd_client_set_size(self.handle, width, height) })
+        if let Some(client) = self.rdp_mut() {
+            // A desktop whose frame cannot fit the accepted size is refused here,
+            // before an attempt allocates it.
+            if u64::from(width) * u64::from(height) * 4 > MAX_FRAME_BYTES as u64
+                || width == 0
+                || height == 0
+                || width > u32::from(u16::MAX)
+                || height > u32::from(u16::MAX)
+            {
+                return Err(Error::Argument);
+            }
+            client.set_size(width, height);
+            return Ok(());
+        }
+        status(unsafe { ffi::sd_client_set_size(self.shim()?, width, height) })
     }
 
     pub fn set_vnc_security(&mut self, security: VncSecurity) -> Result<(), Error> {
-        status(unsafe { ffi::sd_client_set_vnc_security(self.handle, security.0) })
+        status(unsafe { ffi::sd_client_set_vnc_security(self.shim()?, security.0) })
     }
 
     /// Selects the pixel depth VNC frames are delivered in. Only four bytes per
@@ -683,14 +765,18 @@ impl DesktopClient {
     /// [`Error::Argument`] instead of configuring a depth whose frames would all be
     /// dropped.
     pub fn set_vnc_colour_depth(&mut self, bytes_per_pixel: u32) -> Result<(), Error> {
-        status(unsafe { ffi::sd_client_set_vnc_colour_depth(self.handle, bytes_per_pixel) })
+        status(unsafe { ffi::sd_client_set_vnc_colour_depth(self.shim()?, bytes_per_pixel) })
     }
 
     /// Clipboard sharing for the next attempt; on unless turned off. Off means
     /// nothing is received and nothing is sent, and [`DesktopClient::push_clipboard`]
     /// answers [`Error::Unavailable`].
     pub fn set_clipboard(&mut self, enabled: bool) -> Result<(), Error> {
-        status(unsafe { ffi::sd_client_set_clipboard(self.handle, i32::from(enabled)) })
+        if let Some(client) = self.rdp_mut() {
+            client.set_clipboard(enabled);
+            return Ok(());
+        }
+        status(unsafe { ffi::sd_client_set_clipboard(self.shim()?, i32::from(enabled)) })
     }
 
     /// A local folder the RDP server sees as the drive `name` (normally
@@ -702,6 +788,16 @@ impl DesktopClient {
     /// junction in it, or naming a DOS device, are answered with access denied.
     /// VNC ignores it.
     pub fn set_drive(&mut self, name: &str, path: Option<&str>) -> Result<(), Error> {
+        if let Some(client) = self.rdp_mut() {
+            if name != DRIVE_NAME {
+                return Err(Error::Argument);
+            }
+            let folder = path
+                .filter(|path| !path.is_empty())
+                .map(std::path::PathBuf::from);
+            client.set_drive(folder);
+            return Ok(());
+        }
         let name = CString::new(name).map_err(|_| Error::Argument)?;
         let path = path
             .filter(|path| !path.is_empty())
@@ -710,7 +806,7 @@ impl DesktopClient {
             .map_err(|_| Error::Argument)?;
         status(unsafe {
             ffi::sd_client_set_drive(
-                self.handle,
+                self.shim()?,
                 name.as_ptr(),
                 path.as_ref()
                     .map_or(std::ptr::null(), |value| value.as_ptr()),
@@ -719,7 +815,12 @@ impl DesktopClient {
     }
 
     pub fn connect(&mut self) -> Result<(), Error> {
-        let code = unsafe { ffi::sd_client_connect(self.handle) };
+        if let Some(client) = self.rdp_mut() {
+            client.connect()?;
+            self.state = State::Connecting;
+            return Ok(());
+        }
+        let code = unsafe { ffi::sd_client_connect(self.shim()?) };
         if code == ffi::SD_OK {
             self.state = State::Connecting;
         }
@@ -729,7 +830,12 @@ impl DesktopClient {
     /// Aborts a connect in progress or closes a live session. Safe from any thread
     /// and safe to call twice.
     pub fn cancel(&mut self) -> Result<(), Error> {
-        let code = unsafe { ffi::sd_client_cancel(self.handle) };
+        if let Some(client) = self.rdp_mut() {
+            client.cancel();
+            self.state = State::Closing;
+            return Ok(());
+        }
+        let code = unsafe { ffi::sd_client_cancel(self.shim()?) };
         if code == ffi::SD_OK {
             self.state = State::Closing;
         }
@@ -738,9 +844,12 @@ impl DesktopClient {
 
     /// Waits for the worker to exit, which is the moment the protocol context is
     /// gone. Returns [`Error::Timeout`] when it outlives `timeout`.
-    pub fn wait_for_worker(&self, timeout: Duration) -> Result<(), Error> {
+    pub fn wait_for_worker(&mut self, timeout: Duration) -> Result<(), Error> {
         let millis = timeout.as_millis().min(u32::MAX as u128) as u32;
-        match unsafe { ffi::sd_client_wait(self.handle, millis) } {
+        if let Some(client) = self.rdp_mut() {
+            return client.wait(millis);
+        }
+        match unsafe { ffi::sd_client_wait(self.shim()?, millis) } {
             ffi::SD_OK => Ok(()),
             ffi::SD_ERR_STATE => Err(Error::Timeout),
             ffi::SD_ERR_ARGUMENT => Err(Error::Argument),
@@ -749,17 +858,23 @@ impl DesktopClient {
     }
 
     pub fn answer_certificate(&self, request_id: u32, accept: bool) -> Result<(), Error> {
+        if let Some(client) = self.rdp() {
+            return client.answer_certificate(request_id, accept);
+        }
         status(unsafe {
-            ffi::sd_client_answer_certificate(self.handle, request_id, i32::from(accept))
+            ffi::sd_client_answer_certificate(self.shim()?, request_id, i32::from(accept))
         })
     }
 
     /// Submits a key press or release. `scancode` drives RDP, `keysym` drives
     /// VNC; each backend uses the form its protocol speaks.
     pub fn key(&self, scancode: u32, keysym: u32, down: bool, extended: bool) -> Result<(), Error> {
+        if let Some(client) = self.rdp() {
+            return client.key(scancode, down, extended);
+        }
         status(unsafe {
             ffi::sd_client_key(
-                self.handle,
+                self.shim()?,
                 scancode,
                 keysym,
                 i32::from(down),
@@ -769,7 +884,10 @@ impl DesktopClient {
     }
 
     pub fn pointer(&self, x: u16, y: u16, buttons: PointerButtons) -> Result<(), Error> {
-        status(unsafe { ffi::sd_client_pointer(self.handle, x, y, buttons.0) })
+        if let Some(client) = self.rdp() {
+            return client.pointer(x, y, buttons.0);
+        }
+        status(unsafe { ffi::sd_client_pointer(self.shim()?, x, y, buttons.0) })
     }
 
     /// Offers the local clipboard to the remote side, replacing whatever was offered
@@ -784,6 +902,30 @@ impl DesktopClient {
     pub fn push_clipboard(&self, entries: &[ClipboardEntry]) -> Result<(), Error> {
         if entries.len() > ffi::SD_MAX_CLIPBOARD_ENTRIES {
             return Err(Error::Argument);
+        }
+        // A bad group is refused by both backends before anything is queued.
+        let mut kinds = 0u32;
+        for entry in entries {
+            let bit = 1 << entry.kind.raw();
+            if kinds & bit != 0 {
+                return Err(Error::Argument);
+            }
+            kinds |= bit;
+            match entry.kind {
+                ClipboardKind::Text => {
+                    if std::str::from_utf8(&entry.bytes).is_err() {
+                        return Err(Error::Argument);
+                    }
+                }
+                kind => {
+                    if entry.bytes.is_empty() || entry.bytes.len() > kind.bound() {
+                        return Err(Error::Argument);
+                    }
+                }
+            }
+        }
+        if let Some(client) = self.rdp() {
+            return client.push_clipboard(entries);
         }
         let mut raw = Vec::with_capacity(entries.len());
         let mut cut_kinds = 0u32;
@@ -806,7 +948,12 @@ impl DesktopClient {
             });
         }
         let code = unsafe {
-            ffi::sd_client_clipboard_set_cut(self.handle, raw.as_ptr(), raw.len() as u32, cut_kinds)
+            ffi::sd_client_clipboard_set_cut(
+                self.shim()?,
+                raw.as_ptr(),
+                raw.len() as u32,
+                cut_kinds,
+            )
         };
         clipboard_status(code)
     }
@@ -822,9 +969,12 @@ impl DesktopClient {
     /// reach FreeRDP without a server. RDP builds only.
     #[doc(hidden)]
     pub fn describe_rdp_settings(&self) -> Result<String, Error> {
+        if let Some(client) = self.rdp() {
+            return Ok(client.describe());
+        }
         let mut buffer = [0 as c_char; 1024];
         let code =
-            unsafe { ffi::sd_probe_rdp_settings(self.handle, buffer.as_mut_ptr(), buffer.len()) };
+            unsafe { ffi::sd_probe_rdp_settings(self.shim()?, buffer.as_mut_ptr(), buffer.len()) };
         status(code)?;
         Ok(unsafe { CStr::from_ptr(buffer.as_ptr()) }
             .to_string_lossy()
@@ -866,40 +1016,40 @@ impl DesktopClient {
 
 impl Drop for DesktopClient {
     fn drop(&mut self) {
+        let Backend::Shim { handle, inbox } = &mut self.backend else {
+            // The RDP engine cancels and joins its own worker when it drops.
+            return;
+        };
+        let handle = *handle;
+        let inbox = *inbox;
+        if handle.is_null() {
+            return;
+        }
         // 1. stop new protocol work, 2. unregister the callback, 3. wait for the
         // worker and its context to go, 4. release the handle, 5. release the inbox.
         //
         // The detach comes before the wait on purpose: the callback must not be
         // reachable while the worker tears its context down (see the crate docs).
         // It is idempotent, so the shim's own detach during free changes nothing.
-        let _ = unsafe { ffi::sd_client_cancel(self.handle) };
-        unsafe { ffi::sd_client_detach(self.handle) };
-        let stopped =
-            unsafe { ffi::sd_client_wait(self.handle, SHUTDOWN_TIMEOUT.as_millis() as u32) }
-                == ffi::SD_OK;
+        let _ = unsafe { ffi::sd_client_cancel(handle) };
+        unsafe { ffi::sd_client_detach(handle) };
+        let stopped = unsafe { ffi::sd_client_wait(handle, SHUTDOWN_TIMEOUT.as_millis() as u32) }
+            == ffi::SD_OK;
 
         if !stopped {
             LEAKED_HANDLES.fetch_add(1, Ordering::Relaxed);
             // The worker still owns the context and may still call the inbox: leak
             // both rather than free memory a library thread is writing to.
-            if !self.inbox.is_null() {
-                unsafe { drop(Box::from_raw(self.inbox)) };
-                self.inbox = std::ptr::null_mut();
-            }
             return;
         }
 
-        let freed = unsafe { ffi::sd_client_free(self.handle) };
+        let freed = unsafe { ffi::sd_client_free(handle) };
         if freed != ffi::SD_OK {
             LEAKED_HANDLES.fetch_add(1, Ordering::Relaxed);
             eprintln!("shellune-desktop: the shim refused to free a handle (code {freed})");
         }
-        if !self.inbox.is_null() {
-            unsafe { drop(Box::from_raw(self.inbox)) };
-            self.inbox = std::ptr::null_mut();
-        }
-        if freed == ffi::SD_OK {
-            self.handle = std::ptr::null_mut();
+        if !inbox.is_null() {
+            unsafe { drop(Box::from_raw(inbox)) };
         }
     }
 }
@@ -1086,132 +1236,27 @@ pub fn abi_layout() -> [usize; 7] {
     ]
 }
 
-/// Runs single pieces of the shim's clipboard handling without a session or a
-/// server, through the probes in the C header. These are the functions the
-/// backends call, not copies of them; they exist so tests can prove the RDP format
-/// choice, the fetch sequence and the text encodings on a machine with no server.
+/// Runs single pieces of the engines without a session or a server: the text
+/// encodings the backends use, the RDP clipboard channel, and the folder checks a
+/// mapped drive makes. The functions behind them are the ones a session runs, not
+/// copies, so a test proves the shipped behaviour on a machine with no server.
 #[doc(hidden)]
 pub mod probe {
-    use super::{ClipboardKind, Error, Event, ffi, translate};
-    use std::ffi::{CString, c_void};
-    use std::os::raw::c_char;
+    use super::{Error, Event, ffi};
 
-    /// One server-to-client message of a scripted RDP clipboard exchange.
-    pub enum Step<'a> {
-        /// A format list: (format id, registered name).
-        FormatList(&'a [(u32, Option<&'a str>)]),
-        /// The answer to the request in flight; `None` is CB_RESPONSE_FAIL.
-        Response(Option<&'a [u8]>),
+    /// The formats one local copy offers on the cliprdr channel, and the bytes each
+    /// carries, through the session's own conversion.
+    pub fn rdp_clipboard_offer(entries: &[super::ClipboardEntry]) -> Vec<(u16, Vec<u8>)> {
+        super::rdp::probe_offer(entries)
     }
 
-    struct Names {
-        _owned: Vec<Option<CString>>,
-        pointers: Vec<*const c_char>,
-        ids: Vec<u32>,
-    }
-
-    fn names(formats: &[(u32, Option<&str>)]) -> Names {
-        let owned: Vec<Option<CString>> = formats
-            .iter()
-            .map(|(_, name)| name.and_then(|name| CString::new(name).ok()))
-            .collect();
-        let pointers = owned
-            .iter()
-            .map(|name| name.as_ref().map_or(std::ptr::null(), |name| name.as_ptr()))
-            .collect();
-        Names {
-            _owned: owned,
-            pointers,
-            ids: formats.iter().map(|(id, _)| *id).collect(),
-        }
-    }
-
-    /// The formats an RDP format list is fetched as, in request order.
-    pub fn rdp_select(formats: &[(u32, Option<&str>)]) -> Vec<(u32, ClipboardKind)> {
-        let list = names(formats);
-        let mut ids = [0u32; 2];
-        let mut kinds = [0u32; 2];
-        let mut count = 0u32;
-        let code = unsafe {
-            ffi::sd_probe_rdp_select(
-                list.ids.as_ptr(),
-                list.pointers.as_ptr(),
-                list.ids.len() as u32,
-                ids.as_mut_ptr(),
-                kinds.as_mut_ptr(),
-                &mut count,
-            )
-        };
-        assert_eq!(code, ffi::SD_OK, "sd_probe_rdp_select");
-        (0..count.min(2) as usize)
-            .filter_map(|i| ClipboardKind::from_raw(kinds[i]).map(|kind| (ids[i], kind)))
-            .collect()
-    }
-
-    extern "C" fn collect(user: *mut c_void, event: *const ffi::sd_event) {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if user.is_null() || event.is_null() {
-                return;
-            }
-            let events = unsafe { &mut *(user as *mut Vec<Event>) };
-            if let Some(event) = unsafe { translate(&*event) } {
-                events.push(event);
-            }
-        }));
-    }
-
-    /// Plays the steps through the RDP fetch sequence. Returns every format id the
-    /// client would request, in order, and the events a session would deliver.
-    pub fn rdp_fetch(steps: &[Step<'_>]) -> (Vec<u32>, Vec<Event>) {
-        let lists: Vec<Option<Names>> = steps
-            .iter()
-            .map(|step| match step {
-                Step::FormatList(formats) => Some(names(formats)),
-                Step::Response(_) => None,
-            })
-            .collect();
-        let raw: Vec<ffi::sd_probe_step> = steps
-            .iter()
-            .zip(&lists)
-            .map(|(step, list)| match (step, list) {
-                (Step::FormatList(_), Some(list)) => ffi::sd_probe_step {
-                    kind: ffi::SD_PROBE_STEP_FORMAT_LIST,
-                    count: list.ids.len() as u32,
-                    ids: list.ids.as_ptr(),
-                    names: list.pointers.as_ptr(),
-                    ok: 0,
-                    len: 0,
-                    data: std::ptr::null(),
-                },
-                (Step::Response(answer), _) => ffi::sd_probe_step {
-                    kind: ffi::SD_PROBE_STEP_RESPONSE,
-                    count: 0,
-                    ids: std::ptr::null(),
-                    names: std::ptr::null(),
-                    ok: i32::from(answer.is_some()),
-                    len: answer.map_or(0, |data| data.len() as u32),
-                    data: answer.map_or(std::ptr::null(), |data| data.as_ptr()),
-                },
-                (Step::FormatList(_), None) => unreachable!("every list has its names"),
-            })
-            .collect();
-        let mut requested = vec![0u32; steps.len() * 2 + 2];
-        let mut count = 0u32;
-        let mut events: Vec<Event> = Vec::new();
-        let code = unsafe {
-            ffi::sd_probe_rdp_fetch(
-                raw.as_ptr(),
-                raw.len() as u32,
-                requested.as_mut_ptr(),
-                requested.len() as u32,
-                &mut count,
-                collect,
-                &mut events as *mut Vec<Event> as *mut c_void,
-            )
-        };
-        assert_eq!(code, ffi::SD_OK, "sd_probe_rdp_fetch");
-        requested.truncate((count as usize).min(requested.len()));
-        (requested, events)
+    /// Plays canned CLIPRDR messages through the session's receive path after
+    /// offering `offered`; returns the events emitted and the bytes replied with.
+    pub fn rdp_clipboard_receive(
+        offered: &[super::ClipboardEntry],
+        messages: &[(u16, u16, Vec<u8>)],
+    ) -> (Vec<Event>, Vec<u8>) {
+        super::rdp::probe_receive(offered, messages)
     }
 
     fn convert(conversion: i32, input: &[u8]) -> Option<Vec<u8>> {
@@ -1274,33 +1319,21 @@ pub mod probe {
         pub body: &'a [u8],
     }
 
-    /// Loads the drive for the folder `base` the way the rdpdr channel does
-    /// (FreeRDP's own drive service, as patched) and sends it the requests in order;
-    /// returns the NTSTATUS each would answer the server with. Releasing the device at
-    /// the end closes, and deletes on close, what is still open. `None` without the
-    /// RDP backend.
+    /// Runs the drive channel over `requests`, in order, against the folder
+    /// `base`; returns the NTSTATUS each was answered with. This is the channel a
+    /// session serves, not a copy of it.
     pub fn rdp_drive_requests(base: &str, requests: &[DriveRequest<'_>]) -> Option<Vec<u32>> {
-        let base = CString::new(base).ok()?;
-        let raw: Vec<ffi::sd_probe_drive_request> = requests
+        let folder = std::path::Path::new(base);
+        let canned: Vec<super::rdp::ProbeRequest<'_>> = requests
             .iter()
-            .map(|request| ffi::sd_probe_drive_request {
+            .map(|request| super::rdp::ProbeRequest {
                 major: request.major,
                 minor: request.minor,
-                use_file: i32::from(request.on_file),
-                len: request.body.len() as u32,
-                body: request.body.as_ptr(),
+                on_file: request.on_file,
+                body: request.body,
             })
             .collect();
-        let mut statuses = vec![0u32; requests.len()];
-        let code = unsafe {
-            ffi::sd_probe_rdp_drive_requests(
-                base.as_ptr(),
-                raw.as_ptr(),
-                raw.len() as u32,
-                statuses.as_mut_ptr(),
-            )
-        };
-        (code == ffi::SD_OK).then_some(statuses)
+        Some(super::rdp::probe_requests(folder, &canned))
     }
 
     /// One step of a scripted RDP session; times are milliseconds after it connected.
@@ -1343,7 +1376,7 @@ pub mod probe {
             })
             .collect();
         super::status(unsafe {
-            ffi::sd_probe_rdp_session(client.handle, raw.as_ptr(), raw.len() as u32)
+            ffi::sd_probe_rdp_session(client.shim()?, raw.as_ptr(), raw.len() as u32)
         })
     }
 
@@ -1351,10 +1384,7 @@ pub mod probe {
     /// `Some(None)` when it can be offered, `Some(Some(problem))` when not, `None`
     /// without the RDP backend.
     pub fn rdp_drive_folder(path: &str) -> Option<Option<super::DriveProblem>> {
-        let path = CString::new(path).ok()?;
-        let mut problem = 0i32;
-        let code = unsafe { ffi::sd_probe_rdp_drive_folder(path.as_ptr(), &mut problem) };
-        (code == ffi::SD_OK).then(|| (problem != 0).then(|| super::DriveProblem::from_raw(problem)))
+        Some(super::folder_problem(path))
     }
 }
 
@@ -1485,5 +1515,42 @@ mod clipboard_cut_tests {
             Notice::DriveRefused(DriveRefusal::Declined(0xC000_0022))
         );
         assert_eq!(Notice::from_raw(77, 0), Notice::Unknown(77));
+    }
+}
+
+/// What an attempt would say about a folder offered as a drive.
+///
+/// The check a mapped folder gets before the server sees it: absolute, inside the
+/// accessible file system, a directory that can be listed.
+fn folder_problem(path: &str) -> Option<DriveProblem> {
+    if path.is_empty() {
+        return Some(DriveProblem::Missing);
+    }
+    if path.len() >= 1024 || path.encode_utf16().count() >= 1024 {
+        return Some(DriveProblem::TooLong);
+    }
+    let lower = path.to_ascii_lowercase();
+    let device_namespace = lower.starts_with(r"\\?\") || lower.starts_with(r"\\.\");
+    if matches!(path, "*" | "%" | "DynamicDrives") || device_namespace {
+        return Some(DriveProblem::NotAbsolute);
+    }
+    let candidate = std::path::Path::new(path);
+    if !candidate.is_absolute() {
+        return Some(DriveProblem::NotAbsolute);
+    }
+    match std::fs::metadata(candidate) {
+        Ok(meta) if !meta.is_dir() => Some(DriveProblem::NotAFolder),
+        Ok(_) => match std::fs::read_dir(candidate) {
+            Ok(_) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                Some(DriveProblem::NoAccess)
+            }
+            Err(_) => Some(DriveProblem::Other(-1)),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(DriveProblem::Missing),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Some(DriveProblem::NoAccess)
+        }
+        Err(_) => Some(DriveProblem::Missing),
     }
 }

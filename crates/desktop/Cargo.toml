@@ -1,17 +1,41 @@
 [package]
 name = "shellune-desktop"
-description = "Native RDP and VNC sessions behind a thin C shim."
+description = "Self-implemented RDP and VNC sessions behind one small client API."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-# The C shim is compiled and linked by build.rs; the native protocol libraries it
-# calls are built from the pinned sources in vendor/ by
-# packaging/native/build_native.py. Without them build.rs compiles the stub and
-# every call reports "unavailable" instead of pretending to connect.
+# The VNC shim is compiled and linked by build.rs; the library it calls is built
+# from the pinned sources in vendor/ by packaging/native/build_native.py. Without
+# it build.rs compiles the stub and every VNC call reports "unavailable" instead of
+# pretending to connect. RDP is implemented in Rust (src/rdp) and needs no native
+# library.
 links = "shellune_desktop_shim"
 build = "build.rs"
+
+[dependencies]
+# TLS is the generic transport the RDP client establishes before its own MCS and
+# security layers; the protocol itself is in src/rdp. rustls is the same stack the
+# SSH client already links, so no new cryptography implementation enters the build.
+rustls = { version = "0.23.46", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+# SHA-256 is the certificate fingerprint and the CredSSP pubkey binding; HMAC-MD5
+# and MD5 are the NTLMv2 primitives the NLA exchange needs.
+sha2 = { workspace = true }
+hmac = "0.12.1"
+md-5 = "0.10.6"
+# The platform trust store decides whether a certificate is already trusted;
+# only an untrusted or changed one becomes a question for the user.
+rustls-platform-verifier = "0.7.1"
+# CredSSP/NLA, the authentication layer of every current Windows RDP server. It
+# implements NTLMv2 and the TSRequest exchange; the protocol client around it is
+# ours. Without a NLA path an endpoint that requires Network Level Authentication
+# could not be reached at all.
+sspi = { version = "0.23.1", default-features = false }
+# The subject and issuer of a certificate are shown beside its fingerprint.
+x509-parser = "0.18.1"
+# Passwords and derived session keys are wiped when the attempt ends.
+zeroize = { workspace = true }
 
 [build-dependencies]
 cc = "1.2.25"

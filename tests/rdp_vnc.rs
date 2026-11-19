@@ -283,7 +283,9 @@ fn verify(endpoint: &Endpoint) -> Outcome {
                     failure: reported,
                     ..
                 } => match state {
-                    State::Connected => break,
+                    // Connected is not a picture: keep waiting for the frame the
+                    // matrix is there to see.
+                    State::Connected => {}
                     State::Failed(_) | State::Closed => {
                         failure = Some(reported);
                         break;

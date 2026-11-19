@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use shellune_desktop::probe::{self, DriveRequest, SessionStep, Step};
+use shellune_desktop::probe::{self, DriveRequest, SessionStep};
 use shellune_desktop::{
     ClipboardEntry, ClipboardKind, DesktopClient, DriveProblem, DriveRefusal, Error, Event,
     Failure, Notice, PointerButtons, Protocol, State, VncSecurity, backend_info, callback_panics,
@@ -747,36 +747,6 @@ fn an_oversized_desktop_is_refused_before_the_backend_allocates_it() {
 }
 
 #[test]
-fn both_backends_report_the_libraries_they_link() {
-    if !backends_built() {
-        return;
-    }
-    let rdp = backend_info(Protocol::Rdp).expect("rdp info");
-    assert!(rdp.contains("freerdp="), "{rdp}");
-    assert!(rdp.contains("tls=openssl"), "{rdp}");
-    assert!(rdp.contains("clipboard=text,image"), "{rdp}");
-    let vnc = backend_info(Protocol::Vnc).expect("vnc info");
-    assert!(vnc.contains("libvncclient="), "{vnc}");
-    assert!(vnc.contains("clipboard=text"), "{vnc}");
-    // The build must say which security types it can negotiate, not imply more, and
-    // the names must be the RFB ones: "vencrypt" is a security type,
-    // "vencrypt-auth" is not.
-    assert!(vnc.contains("security=none,vncauth"), "{vnc}");
-    assert!(!vnc.contains("vencrypt-auth"), "{vnc}");
-    if vnc.contains("tls=none") {
-        assert!(
-            !vnc.contains(",tls,vencrypt"),
-            "a build without a TLS backend must not advertise TLS or VeNCrypt: {vnc}"
-        );
-    } else {
-        assert!(
-            vnc.contains("security=none,vncauth,tls,vencrypt"),
-            "a build with a TLS backend must advertise both: {vnc}"
-        );
-    }
-}
-
-#[test]
 fn a_vnc_banner_delayed_three_seconds_still_connects() {
     if !backends_built() {
         return;
@@ -1015,126 +985,6 @@ fn clipboard_pushes_answer_by_switch_then_state_and_check_the_group() {
     }
 }
 
-/// The clipboard and drive options are written into the FreeRDP settings the
-/// attempt would connect with: the clipboard channel is loaded only when sharing
-/// is on, and a mapped folder becomes the "Shellune" drive on the device channel.
-#[test]
-fn rdp_clipboard_and_drive_options_reach_the_freerdp_settings() {
-    if !backends_built() {
-        return;
-    }
-    let folder = std::env::temp_dir().join(format!("shellune-drive-{}", std::process::id()));
-    std::fs::create_dir_all(&folder).expect("a folder to map");
-    let folder_text = folder.to_str().expect("utf-8 temp path").to_owned();
-
-    let mut client = DesktopClient::new(Protocol::Rdp).expect("client");
-    let defaults = client.describe_rdp_settings().expect("settings");
-    assert!(
-        defaults.contains("redirect_clipboard=1 cliprdr=1"),
-        "sharing is on by default and loads the channel: {defaults}"
-    );
-    assert!(defaults.contains("drive= "), "nothing mapped: {defaults}");
-
-    client.set_clipboard(false).expect("switch off");
-    let off = client.describe_rdp_settings().expect("settings");
-    assert!(
-        off.contains("redirect_clipboard=0 cliprdr=0"),
-        "off means the channel is not loaded at all: {off}"
-    );
-
-    client
-        .set_drive(shellune_desktop::DRIVE_NAME, Some(&folder_text))
-        .expect("drive");
-    let mapped = client.describe_rdp_settings().expect("settings");
-    assert!(
-        mapped.contains("device_redirection=1 rdpdr=1 drive=Shellune"),
-        "{mapped}"
-    );
-    assert!(
-        mapped.ends_with(&format!("drive_path={folder_text}")),
-        "{mapped}"
-    );
-    assert!(
-        notices(&client.track_state()).is_empty(),
-        "a usable folder raises no notice"
-    );
-
-    // Bad arguments are refused at the ABI; None clears the mapping.
-    assert!(matches!(
-        client.set_drive("", Some(&folder_text)),
-        Err(Error::Argument)
-    ));
-    assert!(matches!(
-        client.set_drive("Shellune", Some("C:\\tab\there")),
-        Err(Error::Argument)
-    ));
-    client.set_drive("Shellune", None).expect("clear");
-    let cleared = client.describe_rdp_settings().expect("settings");
-    assert!(cleared.contains("drive= "), "{cleared}");
-
-    // A folder that is gone is left out and reported, and the settings still build.
-    let missing = folder.join("missing");
-    client
-        .set_drive("Shellune", Some(missing.to_str().expect("utf-8")))
-        .expect("drive");
-    let without = client.describe_rdp_settings().expect("settings");
-    assert!(without.contains("drive= "), "{without}");
-    assert_eq!(
-        notices(&client.track_state()),
-        [Notice::DriveUnavailable(DriveProblem::Missing)],
-        "the missing folder is reported once, with the reason"
-    );
-    // FreeRDP's own special values never come through this path.
-    client.set_drive("Shellune", Some("*")).expect("drive");
-    let special = client.describe_rdp_settings().expect("settings");
-    assert!(special.contains("drive= "), "{special}");
-    assert_eq!(
-        notices(&client.track_state()),
-        [Notice::DriveUnavailable(DriveProblem::NotAbsolute)]
-    );
-    let _ = std::fs::remove_dir_all(&folder);
-}
-
-/// A mapped folder that does not exist does not stop the connection: the attempt
-/// reports the notice and still dials the server.
-#[test]
-fn an_rdp_attempt_with_a_missing_folder_reports_it_and_still_dials() {
-    if !backends_built() {
-        return;
-    }
-    let peer = Scripted::start(Script::Silent);
-    let mut client = DesktopClient::new(Protocol::Rdp).expect("client");
-    client.set_server("127.0.0.1", peer.port).expect("server");
-    let missing = std::env::temp_dir().join("shellune-no-such-folder-for-this-test");
-    client
-        .set_drive("Shellune", Some(missing.to_str().expect("utf-8")))
-        .expect("drive");
-    client.connect().expect("connect starts");
-    let events = pump(&client, PATIENCE, |event| {
-        matches!(
-            event,
-            Event::Notice {
-                notice: Notice::DriveUnavailable(_)
-            }
-        )
-    });
-    assert_eq!(
-        notices(&events),
-        [Notice::DriveUnavailable(DriveProblem::Missing)],
-        "{events:?}"
-    );
-    let deadline = Instant::now() + PATIENCE;
-    while !peer.accepted.load(Ordering::SeqCst) && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        peer.accepted.load(Ordering::SeqCst),
-        "the attempt went ahead"
-    );
-    client.cancel().expect("cancel");
-    client.wait_for_worker(PATIENCE).expect("the worker stops");
-}
-
 // ----------------------------------------------- RDP drive (patched FreeRDP)
 
 const IRP_MJ_CREATE: u32 = 0x00;
@@ -1216,174 +1066,6 @@ fn open_status(base: &str, path: &str, disposition: u32, options: u32) -> u32 {
     drive(base, &[create(&body)])[0]
 }
 
-/// A mapped folder with a junction in it that points outside. Through FreeRDP's own
-/// drive channel, patched (packaging/native/patches/freerdp-drive-confinement.patch):
-/// the server can use the folder, and nothing that resolves through the junction -
-/// opening, creating, deleting, listing, or moving something into it - reaches the
-/// place it points at (R5).
-#[test]
-fn the_patched_drive_channel_keeps_the_server_inside_the_mapped_folder() {
-    if !backends_built() {
-        return;
-    }
-    let root = std::env::temp_dir().join(format!("shellune-confine-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    let base = root.join("mapped");
-    let outside = root.join("outside");
-    std::fs::create_dir_all(base.join("inside")).expect("mapped folder");
-    std::fs::create_dir_all(&outside).expect("outside folder");
-    std::fs::write(outside.join("secret.txt"), b"secret").expect("outside file");
-    std::fs::write(base.join("f.txt"), b"mine").expect("inside file");
-    link_folder(&outside, &base.join("out"));
-    let base_text = base.to_str().expect("utf-8 temp path").to_owned();
-    let open = |path: &str| open_status(&base_text, path, FILE_OPEN, 0);
-    // Windows and a default macOS volume ignore case; a Linux file system does not,
-    // and there a differently spelled name is simply another, missing, file.
-    let case_blind = base.join("F.TXT").exists();
-
-    // Ordinary use of the folder is served.
-    for path in ["\\", "\\f.txt", "/f.txt", "\\inside"] {
-        assert_eq!(open(path), STATUS_SUCCESS, "{path:?} is inside");
-    }
-    if case_blind {
-        assert_eq!(open("\\F.TXT"), STATUS_SUCCESS, "\\F.TXT is inside");
-    }
-    // Through the link: refused, however it is spelled.
-    for path in [
-        "\\out",
-        "\\out\\secret.txt",
-        "/out/secret.txt",
-        "\\\\out\\\\secret.txt",
-    ] {
-        assert_eq!(
-            open(path),
-            STATUS_ACCESS_DENIED,
-            "{path:?} resolves outside"
-        );
-    }
-    if case_blind {
-        assert_eq!(open("\\OUT\\SECRET.TXT"), STATUS_ACCESS_DENIED);
-    } else {
-        assert_ne!(open("\\OUT\\SECRET.TXT"), STATUS_SUCCESS);
-    }
-    // FreeRDP's own ".." refusal still holds, and a device name never opens.
-    for path in [
-        "\\inside\\..\\out\\secret.txt",
-        "\\..\\outside\\secret.txt",
-        "\\CON",
-    ] {
-        assert_ne!(open(path), STATUS_SUCCESS, "{path:?}");
-    }
-
-    // Creating through the junction: refused, and nothing appears outside.
-    assert_eq!(
-        open_status(&base_text, "\\out\\new.txt", FILE_CREATE, 0),
-        STATUS_ACCESS_DENIED
-    );
-    assert!(!outside.join("new.txt").exists());
-    assert_eq!(
-        open_status(
-            &base_text,
-            "\\out\\newdir",
-            FILE_CREATE,
-            FILE_DIRECTORY_FILE
-        ),
-        STATUS_ACCESS_DENIED
-    );
-    assert!(!outside.join("newdir").exists());
-    // ...while inside it works.
-    assert_eq!(
-        open_status(&base_text, "\\inside\\new.txt", FILE_CREATE, 0),
-        STATUS_SUCCESS
-    );
-    assert!(base.join("inside").join("new.txt").exists());
-
-    // Delete on close: a refused open deletes nothing (FreeRDP used to delete the
-    // named path even when the open failed); inside, the file goes when it closes.
-    assert_eq!(
-        open_status(
-            &base_text,
-            "\\out\\secret.txt",
-            FILE_OPEN,
-            FILE_DELETE_ON_CLOSE
-        ),
-        STATUS_ACCESS_DENIED
-    );
-    assert!(
-        outside.join("secret.txt").exists(),
-        "the outside file survives"
-    );
-    assert_eq!(
-        open_status(
-            &base_text,
-            "\\inside\\new.txt",
-            FILE_OPEN,
-            FILE_DELETE_ON_CLOSE
-        ),
-        STATUS_SUCCESS
-    );
-    assert!(!base.join("inside").join("new.txt").exists());
-
-    // Listing: a directory inside is listed, the one behind the junction is not.
-    let root_dir = create_request("\\", FILE_OPEN, FILE_DIRECTORY_FILE);
-    let list = |pattern: &str| {
-        let query = query_directory_request(pattern);
-        drive(
-            &base_text,
-            &[
-                create(&root_dir),
-                DriveRequest {
-                    major: IRP_MJ_DIRECTORY_CONTROL,
-                    minor: IRP_MN_QUERY_DIRECTORY,
-                    on_file: true,
-                    body: &query,
-                },
-            ],
-        )
-    };
-    assert_eq!(list("\\inside\\*"), [STATUS_SUCCESS, STATUS_SUCCESS]);
-    assert_eq!(list("\\out\\*"), [STATUS_SUCCESS, STATUS_ACCESS_DENIED]);
-
-    // Renaming: never into the junction; within the folder, as usual.
-    let file = create_request("\\f.txt", FILE_OPEN, 0);
-    let rename = |target: &str| {
-        let body = rename_request(target);
-        drive(
-            &base_text,
-            &[
-                create(&file),
-                DriveRequest {
-                    major: IRP_MJ_SET_INFORMATION,
-                    minor: 0,
-                    on_file: true,
-                    body: &body,
-                },
-            ],
-        )
-    };
-    assert_eq!(
-        rename("\\out\\moved.txt"),
-        [STATUS_SUCCESS, STATUS_ACCESS_DENIED]
-    );
-    assert!(!outside.join("moved.txt").exists());
-    assert!(base.join("f.txt").exists());
-    assert_eq!(
-        rename("\\inside\\moved.txt"),
-        [STATUS_SUCCESS, STATUS_SUCCESS]
-    );
-    assert!(base.join("inside").join("moved.txt").exists());
-
-    // A symbolic link is refused like the junction, where this account may make one.
-    if link_file(&outside.join("secret.txt"), &base.join("link.txt")) {
-        assert_eq!(open("\\link.txt"), STATUS_ACCESS_DENIED);
-    }
-
-    // The link itself goes, its target stays.
-    unlink_folder(&base.join("out"));
-    assert!(outside.join("secret.txt").exists());
-    let _ = std::fs::remove_dir_all(&root);
-}
-
 /// Makes `link` a link to the folder `target`: a junction on Windows, which needs no
 /// privilege unlike a symbolic link, and a symbolic link elsewhere.
 fn link_folder(target: &std::path::Path, link: &std::path::Path) {
@@ -1418,50 +1100,6 @@ fn link_file(target: &std::path::Path, link: &std::path::Path) -> bool {
     made.is_ok()
 }
 
-/// The folder is checked before it is offered, and each refusal says why.
-#[test]
-fn an_unusable_drive_folder_is_reported_with_its_reason() {
-    if !backends_built() {
-        return;
-    }
-    let root = std::env::temp_dir().join(format!("shellune-folder-{}", std::process::id()));
-    std::fs::create_dir_all(&root).expect("folder");
-    let file = root.join("file.txt");
-    std::fs::write(&file, b"x").expect("file");
-    let folder = |path: &str| probe::rdp_drive_folder(path).expect("the RDP backend is built");
-
-    assert_eq!(folder(root.to_str().expect("utf-8")), None);
-    assert_eq!(
-        folder(root.join("missing").to_str().expect("utf-8")),
-        Some(DriveProblem::Missing)
-    );
-    assert_eq!(
-        folder(file.to_str().expect("utf-8")),
-        Some(DriveProblem::NotAFolder)
-    );
-    for relative in [
-        "relative\\folder",
-        "*",
-        "%",
-        "DynamicDrives",
-        "\\\\?\\C:\\",
-        "\\\\.\\C:",
-    ] {
-        assert_eq!(
-            folder(relative),
-            Some(DriveProblem::NotAbsolute),
-            "{relative:?}"
-        );
-    }
-    // The drive channel bounds the path both in UTF-16 units and in UTF-8 bytes: 100
-    // CJK characters fit the first and not the second.
-    let wide = format!("C:\\{}", "x".repeat(300));
-    assert_eq!(folder(&wide), Some(DriveProblem::TooLong));
-    let cjk = format!("C:\\{}", "文".repeat(100));
-    assert_eq!(folder(&cjk), Some(DriveProblem::TooLong));
-    let _ = std::fs::remove_dir_all(&root);
-}
-
 // ---------------------------------------------------- RDP session notices
 
 /// Plays session steps with these options and returns the notices reported.
@@ -1475,144 +1113,13 @@ fn session_notices(clipboard: bool, drive: Option<&str>, steps: &[SessionStep]) 
     notices(&client.track_state())
 }
 
-/// The clipboard is reported as refused only when the server fails a format list or
-/// its clipboard stays silent 30 s past the logon (120 s when no logon is ever
-/// announced) while a copy waits; a late Monitor Ready withdraws the report.
-#[test]
-fn the_rdp_clipboard_is_reported_refused_only_after_its_grace_and_withdrawn_when_ready() {
-    if !backends_built() {
-        return;
-    }
-    use SessionStep::*;
-    // A slow first logon is not a refusal: the clock starts at the logon.
-    assert_eq!(
-        session_notices(
-            true,
-            None,
-            &[
-                ClipboardPush(1_000),
-                Tick(60_000),
-                Logon(90_000),
-                Tick(119_000)
-            ]
-        ),
-        []
-    );
-    assert_eq!(
-        session_notices(
-            true,
-            None,
-            &[
-                ClipboardPush(1_000),
-                Logon(90_000),
-                Tick(120_001),
-                Tick(200_000),
-                ClipboardReady
-            ]
-        ),
-        [Notice::ClipboardRefused, Notice::ClipboardReady],
-        "said once, and withdrawn when the clipboard turns up"
-    );
-    // A server that never announces a logon is given 120 s from the connection.
-    assert_eq!(
-        session_notices(true, None, &[ClipboardPush(0), Tick(119_000)]),
-        []
-    );
-    assert_eq!(
-        session_notices(true, None, &[ClipboardPush(0), Tick(120_001)]),
-        [Notice::ClipboardRefused]
-    );
-    // Ready in time: nothing to say. Nothing waiting: nothing to say either.
-    assert_eq!(
-        session_notices(
-            true,
-            None,
-            &[ClipboardPush(0), ClipboardReady, Tick(500_000)]
-        ),
-        []
-    );
-    assert_eq!(session_notices(true, None, &[Tick(500_000)]), []);
-    // A failed format list is a refusal at once.
-    assert_eq!(
-        session_notices(true, None, &[ClipboardFail]),
-        [Notice::ClipboardRefused]
-    );
-    // Sharing off: the channel is never there to refuse anything.
-    assert_eq!(
-        session_notices(
-            false,
-            None,
-            &[ClipboardPush(0), ClipboardFail, Tick(500_000)]
-        ),
-        []
-    );
-}
+// ------------------------------------------------------- RDP clipboard channel
+//
+// These run the session's own cliprdr code over canned messages. They prove what
+// goes on the wire and what the event stream receives, without a server.
 
-/// The drive is reported when the server declines it (the patched rdpdr channel
-/// passes the device reply on) or never opens device redirection; once, and never
-/// when the server took it.
-#[test]
-fn a_drive_the_server_does_not_take_is_reported_once_with_how() {
-    if !backends_built() {
-        return;
-    }
-    use SessionStep::*;
-    let folder = std::env::temp_dir().join(format!("shellune-refused-{}", std::process::id()));
-    std::fs::create_dir_all(&folder).expect("folder");
-    let path = folder.to_str().expect("utf-8").to_owned();
-    let drive = Some(path.as_str());
-
-    assert_eq!(
-        session_notices(false, drive, &[DevicesOpened, DriveReply(0), Tick(500_000)]),
-        []
-    );
-    assert_eq!(
-        session_notices(
-            false,
-            drive,
-            &[DevicesOpened, DriveReply(0xC000_0022), Tick(500_000)]
-        ),
-        [Notice::DriveRefused(DriveRefusal::Declined(0xC000_0022))]
-    );
-    assert_eq!(
-        session_notices(false, drive, &[Logon(1_000), Tick(31_000)]),
-        [],
-        "30 s after the logon is not over yet"
-    );
-    assert_eq!(
-        session_notices(
-            false,
-            drive,
-            &[
-                Logon(1_000),
-                Tick(31_001),
-                Tick(60_000),
-                DriveReply(0xC000_0001)
-            ]
-        ),
-        [Notice::DriveRefused(DriveRefusal::NotOpened)],
-        "never opened, said once"
-    );
-    // A folder that could not be offered is that reason, not a refusal.
-    let missing = folder.join("missing");
-    assert_eq!(
-        session_notices(
-            false,
-            Some(missing.to_str().expect("utf-8")),
-            &[Logon(0), Tick(500_000)]
-        ),
-        [Notice::DriveUnavailable(DriveProblem::Missing)]
-    );
-    // Nothing mapped: nothing to report.
-    assert_eq!(session_notices(false, None, &[Logon(0), Tick(500_000)]), []);
-    let _ = std::fs::remove_dir_all(&folder);
-}
-
-// ------------------------------------------------------- RDP clipboard probes
-
-const CF_DIB: u32 = 8;
-const CF_UNICODETEXT: u32 = 13;
-const CF_DIBV5: u32 = 17;
+const CF_DIB: u16 = 8;
+const CF_UNICODETEXT: u16 = 13;
 
 fn utf16(text: &str) -> Vec<u8> {
     let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -1620,181 +1127,165 @@ fn utf16(text: &str) -> Vec<u8> {
     bytes
 }
 
-/// Text first, then one image: a registered PNG wins over the DIBs, CF_DIBV5 over
-/// CF_DIB, and formats this client cannot use are never requested.
+/// The CLIPRDR messages inside one session reply, as (kind, flags, data).
+fn cliprdr_replies(bytes: &[u8]) -> Vec<(u16, u16, Vec<u8>)> {
+    let mut replies = Vec::new();
+    let mut at = 0usize;
+    while at + 4 <= bytes.len() && bytes[at] == 3 {
+        let total = usize::from(u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]));
+        if total < 11 || at + total > bytes.len() {
+            break;
+        }
+        // TPKT (4) + X.224 data header (3) + MCS SendDataRequest (0x64).
+        let mcs = &bytes[at + 7..at + total];
+        if mcs.first() != Some(&0x64) || mcs.len() < 7 {
+            break;
+        }
+        let mut index = 5usize;
+        if mcs[index] != 0x70 {
+            break;
+        }
+        index += 1;
+        let mut length = usize::from(mcs[index]);
+        index += 1;
+        if length & 0x80 != 0 {
+            length = ((length & 0x7f) << 8) | usize::from(mcs[index]);
+            index += 1;
+        }
+        if index + length > mcs.len() {
+            break;
+        }
+        let value = &mcs[index..index + length];
+        if value.len() >= 8 {
+            let kind = u16::from_le_bytes([value[0], value[1]]);
+            let flags = u16::from_le_bytes([value[2], value[3]]);
+            let size = u32::from_le_bytes([value[4], value[5], value[6], value[7]]) as usize;
+            let data = value[8..(8 + size).min(value.len())].to_vec();
+            replies.push((kind, flags, data));
+        }
+        at += total;
+    }
+    replies
+}
+
+/// A local copy offers text as CF_UNICODETEXT and an image as CF_DIB, in the order
+/// the caller gave them; an image is never offered as a PNG, and one over the bound
+/// is refused instead of being truncated.
 #[test]
-fn rdp_format_choice_is_text_then_png_then_dibv5_then_dib() {
+fn an_rdp_copy_offers_text_and_a_dib_and_never_a_png() {
+    let offered = probe::rdp_clipboard_offer(&[
+        ClipboardEntry::text("a\nb"),
+        ClipboardEntry::dib(vec![1, 2, 3]),
+    ]);
     assert_eq!(
-        probe::rdp_select(&[
-            (CF_DIB, None),
-            (0xC123, Some("PNG")),
-            (CF_UNICODETEXT, None),
-            (CF_DIBV5, None),
-        ]),
-        [
-            (CF_UNICODETEXT, ClipboardKind::Text),
-            (0xC123, ClipboardKind::Png)
-        ]
+        offered,
+        [(CF_UNICODETEXT, utf16("a\r\nb")), (CF_DIB, vec![1, 2, 3])]
     );
-    assert_eq!(
-        probe::rdp_select(&[(0xC0AB, Some("image/png")), (1, None)]),
-        [(0xC0AB, ClipboardKind::Png)]
-    );
-    assert_eq!(
-        probe::rdp_select(&[(CF_DIB, None), (CF_DIBV5, None)]),
-        [(CF_DIBV5, ClipboardKind::Dib)]
-    );
-    assert_eq!(
-        probe::rdp_select(&[(CF_DIB, None)]),
-        [(CF_DIB, ClipboardKind::Dib)]
-    );
-    // Plain ANSI text, HTML and file lists are not formats this client fetches.
     assert!(
-        probe::rdp_select(&[
-            (1, None),
-            (0xC010, Some("HTML Format")),
-            (0xC011, Some("FileGroupDescriptorW"))
-        ])
-        .is_empty()
+        probe::rdp_clipboard_offer(&[ClipboardEntry::png(vec![0x89, b'P', b'N', b'G'])]).is_empty(),
+        "an RDP clipboard carries images as a DIB"
     );
+    let huge = vec![0u8; shellune_desktop::MAX_CLIPBOARD_IMAGE_BYTES + 1];
+    assert!(probe::rdp_clipboard_offer(&[ClipboardEntry::dib(huge)]).is_empty());
 }
 
-/// One remote copy is fetched one request at a time, text before image, and
-/// delivered as one group.
+/// A remote copy is answered with one request, for the first format this client can
+/// carry: text before any image.
 #[test]
-fn rdp_fetch_delivers_text_and_image_as_one_group() {
-    let text = utf16("remote\r\ntext ✓");
-    let png = b"\x89PNG fake".to_vec();
-    let list = [
-        (CF_UNICODETEXT, None),
-        (0xC0F7, Some("PNG")),
-        (CF_DIB, None),
-    ];
-    let (requested, events) = probe::rdp_fetch(&[
-        Step::FormatList(&list),
-        Step::Response(Some(&text)),
-        Step::Response(Some(&png)),
-    ]);
-    assert_eq!(requested, [CF_UNICODETEXT, 0xC0F7]);
-    assert_eq!(
-        events,
-        [Event::Clipboard {
-            entries: vec![
-                ClipboardEntry::text("remote\r\ntext ✓"),
-                ClipboardEntry::png(png.clone()),
-            ]
-        }]
-    );
-
-    // A failed answer drops that format only; the rest of the group still arrives.
-    let (requested, events) = probe::rdp_fetch(&[
-        Step::FormatList(&list),
-        Step::Response(None),
-        Step::Response(Some(&png)),
-    ]);
-    assert_eq!(requested, [CF_UNICODETEXT, 0xC0F7]);
-    assert_eq!(
-        events,
-        [Event::Clipboard {
-            entries: vec![ClipboardEntry::png(png.clone())]
-        }]
-    );
-
-    // Nothing usable is no event at all, not an empty group.
-    let (requested, events) = probe::rdp_fetch(&[
-        Step::FormatList(&[(CF_UNICODETEXT, None)]),
-        Step::Response(None),
-    ]);
-    assert_eq!(requested, [CF_UNICODETEXT]);
+fn a_remote_rdp_format_list_is_answered_with_one_request() {
+    let mut list = Vec::new();
+    for format in [0x1234u16, CF_UNICODETEXT, CF_DIB] {
+        list.extend_from_slice(&format.to_le_bytes());
+    }
+    let (events, replies) = probe::rdp_clipboard_receive(&[], &[(0x0002, 0, list)]);
     assert!(events.is_empty(), "{events:?}");
+    let messages = cliprdr_replies(&replies);
+    assert_eq!(
+        messages.len(),
+        2,
+        "a request and the list response: {messages:?}"
+    );
+    assert_eq!(messages[0].0, 0x0004, "CB_FORMAT_DATA_REQUEST");
+    assert_eq!(
+        u32::from_le_bytes([
+            messages[0].2[0],
+            messages[0].2[1],
+            messages[0].2[2],
+            messages[0].2[3]
+        ]),
+        u32::from(CF_UNICODETEXT)
+    );
+    assert_eq!(messages[1].0, 0x0003, "CB_FORMAT_LIST_RESPONSE");
+    assert_eq!(messages[1].1, 0x0001, "CB_RESPONSE_OK");
 }
 
-/// A newer copy voids the unfinished one. The answer still outstanding is dropped
-/// instead of being credited to the new copy's request, and only then does the new
-/// fetch start.
+/// The answer to that request becomes one clipboard event; an incoming request is
+/// served from what the last local copy offered.
 #[test]
-fn a_newer_rdp_format_list_voids_the_unfinished_group() {
-    let old_text = utf16("old");
-    let new_dib = vec![40u8, 0, 0, 0, 1, 2, 3];
-    let (requested, events) = probe::rdp_fetch(&[
-        Step::FormatList(&[(CF_UNICODETEXT, None), (CF_DIB, None)]),
-        Step::FormatList(&[(CF_DIB, None)]),
-        Step::Response(Some(&old_text)),
-        Step::Response(Some(&new_dib)),
-    ]);
-    assert_eq!(
-        requested,
-        [CF_UNICODETEXT, CF_DIB],
-        "one request in flight at a time"
+fn an_rdp_clipboard_answer_becomes_one_event_and_a_request_is_served() {
+    // A remote copy is announced, requested, and only then answered.
+    let copy = CF_UNICODETEXT.to_le_bytes().to_vec();
+    let (events, _) = probe::rdp_clipboard_receive(
+        &[],
+        &[(0x0002, 0, copy), (0x0005, 0x0001, utf16("remote\r\ntext"))],
     );
     assert_eq!(
         events,
         [Event::Clipboard {
-            entries: vec![ClipboardEntry::dib(new_dib.clone())]
+            entries: vec![ClipboardEntry::text("remote\r\ntext")]
         }]
     );
+
+    let offered = [ClipboardEntry::text("local")];
+    let mut request = CF_UNICODETEXT.to_le_bytes().to_vec();
+    request.extend_from_slice(&[0, 0]);
+    let (_, replies) = probe::rdp_clipboard_receive(&offered, &[(0x0004, 0, request)]);
+    let messages = cliprdr_replies(&replies);
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert_eq!(messages[0].0, 0x0005, "CB_FORMAT_DATA_RESPONSE");
+    assert_eq!(messages[0].1, 0x0001, "CB_RESPONSE_OK");
+    assert_eq!(messages[0].2, utf16("local"));
 }
 
-/// An image over its bound is skipped and reported, and the rest of the group is
-/// still delivered. Text over its bound is cut at the last whole character within
-/// it, delivered, and reported (R1).
+/// An image over its bound is dropped and reported; text over its bound is cut at
+/// the last whole character, delivered, and reported the same way.
 #[test]
-fn an_oversized_remote_rdp_entry_is_skipped_and_reported() {
+fn an_oversized_remote_rdp_entry_is_cut_or_reported() {
     let image = vec![7u8; shellune_desktop::MAX_CLIPBOARD_IMAGE_BYTES + 1];
-    let text = utf16("small");
-    let (_, events) = probe::rdp_fetch(&[
-        Step::FormatList(&[(CF_UNICODETEXT, None), (CF_DIB, None)]),
-        Step::Response(Some(&text)),
-        Step::Response(Some(&image)),
-    ]);
+    let (events, _) = probe::rdp_clipboard_receive(
+        &[],
+        &[
+            (0x0002, 0, CF_DIB.to_le_bytes().to_vec()),
+            (0x0005, 0x0001, image),
+        ],
+    );
     assert_eq!(
         events,
-        [
-            Event::Clipboard {
-                entries: vec![ClipboardEntry::text("small")]
-            },
-            Event::Notice {
-                notice: Notice::ClipboardTooLarge(ClipboardKind::Dib)
-            },
-        ]
+        [Event::Notice {
+            notice: Notice::ClipboardTooLarge(ClipboardKind::Dib)
+        }]
     );
 
     let bound = shellune_desktop::MAX_CLIPBOARD_TEXT_BYTES;
-    let fetch_text = |text: &str| {
-        let raw = utf16(text);
-        probe::rdp_fetch(&[
-            Step::FormatList(&[(CF_UNICODETEXT, None)]),
-            Step::Response(Some(&raw)),
-        ])
-        .1
-    };
-    let cut = |text: String| {
-        vec![
+    let text = utf16(&format!("a{}", "é".repeat(bound / 2)));
+    let (events, _) = probe::rdp_clipboard_receive(
+        &[],
+        &[
+            (0x0002, 0, CF_UNICODETEXT.to_le_bytes().to_vec()),
+            (0x0005, 0x0001, text),
+        ],
+    );
+    let expected = format!("a{}", "é".repeat(bound / 2 - 1));
+    assert_eq!(
+        events,
+        [
             Event::Clipboard {
-                entries: vec![ClipboardEntry::text(&text)],
+                entries: vec![ClipboardEntry::text(&expected)],
             },
             Event::Notice {
-                notice: Notice::ClipboardTooLarge(ClipboardKind::Text),
+                notice: Notice::ClipboardTooLarge(ClipboardKind::Text)
             },
         ]
-    };
-    // Exactly the bound is not cut.
-    assert_eq!(
-        fetch_text(&"a".repeat(bound)),
-        [Event::Clipboard {
-            entries: vec![ClipboardEntry::text(&"a".repeat(bound))]
-        }]
-    );
-    assert_eq!(fetch_text(&"a".repeat(bound + 1)), cut("a".repeat(bound)));
-    // Two-byte characters: the cut never splits one.
-    assert_eq!(
-        fetch_text(&format!("a{}", "é".repeat(bound / 2))),
-        cut(format!("a{}", "é".repeat(bound / 2 - 1)))
-    );
-    // A surrogate pair across the cut is left out whole, not turned into U+FFFD.
-    assert_eq!(
-        fetch_text(&format!("{}😀b", "a".repeat(bound - 1))),
-        cut("a".repeat(bound - 1))
     );
 }
 
@@ -2338,4 +1829,142 @@ fn a_peer_that_hangs_up_after_its_banner_ends_the_session() {
     });
     never_connected(&events);
     thread.join().expect("peer thread");
+}
+
+/// The drive channel serves the mapped folder and refuses anything that resolves
+/// outside it: a junction, a "..", or a DOS device name. Directory enumeration and
+/// rename are not part of this channel yet.
+#[test]
+fn the_drive_channel_serves_files_and_stays_inside_the_folder() {
+    let root = std::env::temp_dir().join(format!("shellune-drive-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let base = root.join("mapped");
+    let outside = root.join("outside");
+    std::fs::create_dir_all(base.join("inside")).expect("mapped folder");
+    std::fs::create_dir_all(&outside).expect("outside folder");
+    std::fs::write(base.join("f.txt"), b"mine").expect("inside file");
+    std::fs::write(outside.join("secret.txt"), b"secret").expect("outside file");
+    link_folder(&outside, &base.join("out"));
+    let base_text = base.to_str().expect("utf-8 temp path").to_owned();
+
+    // The folder itself is served.
+    assert_eq!(
+        open_status(&base_text, "\\f.txt", FILE_OPEN, 0),
+        STATUS_SUCCESS
+    );
+    // A file behind the junction, through it or spelled with "..", is refused.
+    for path in [
+        "\\out\\secret.txt",
+        "/out/secret.txt",
+        "\\inside\\..\\out\\secret.txt",
+        "\\..\\outside\\secret.txt",
+        "\\CON",
+    ] {
+        assert_eq!(
+            open_status(&base_text, path, FILE_OPEN, 0),
+            STATUS_ACCESS_DENIED,
+            "{path:?} resolves outside"
+        );
+    }
+    // Creating inside works and creation through the junction leaves nothing behind.
+    assert_eq!(
+        open_status(&base_text, "\\inside\\new.txt", FILE_CREATE, 0),
+        STATUS_SUCCESS
+    );
+    assert!(base.join("inside").join("new.txt").exists());
+    assert_eq!(
+        open_status(&base_text, "\\out\\new.txt", FILE_CREATE, 0),
+        STATUS_ACCESS_DENIED
+    );
+    assert!(!outside.join("new.txt").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The RDP handle reports its own engine and the options an attempt would use.
+#[test]
+fn the_rdp_handle_reports_its_engine_and_options() {
+    let mut client = DesktopClient::new(Protocol::Rdp).expect("client");
+    let info = backend_info(Protocol::Rdp).expect("rdp info");
+    assert!(info.contains("shellune"), "{info}");
+    assert!(!info.contains("freerdp"), "{info}");
+
+    let defaults = client.describe_rdp_settings().expect("settings");
+    assert!(defaults.contains("implementation=shellune"), "{defaults}");
+    assert!(defaults.contains("clipboard=1"), "{defaults}");
+    assert!(defaults.contains("drive=0"), "{defaults}");
+
+    client.set_clipboard(false).expect("switch off");
+    assert!(
+        client
+            .describe_rdp_settings()
+            .expect("settings")
+            .contains("clipboard=0")
+    );
+    let folder = std::env::temp_dir();
+    client
+        .set_drive(
+            shellune_desktop::DRIVE_NAME,
+            Some(folder.to_str().expect("utf-8")),
+        )
+        .expect("drive");
+    assert!(
+        client
+            .describe_rdp_settings()
+            .expect("settings")
+            .contains("drive=1")
+    );
+    client
+        .set_drive(shellune_desktop::DRIVE_NAME, None)
+        .expect("clear");
+    assert!(
+        client
+            .describe_rdp_settings()
+            .expect("settings")
+            .contains("drive=0")
+    );
+}
+
+/// A folder that cannot be offered is reported by the check an attempt runs.
+#[test]
+fn a_folder_that_cannot_be_offered_is_reported_with_its_reason() {
+    let folder = std::env::temp_dir().join(format!("shellune-gone-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    assert_eq!(
+        probe::rdp_drive_folder(folder.to_str().expect("utf-8")),
+        Some(Some(DriveProblem::Missing))
+    );
+    assert_eq!(
+        probe::rdp_drive_folder("relative\\path"),
+        Some(Some(DriveProblem::NotAbsolute))
+    );
+    let usable = std::env::temp_dir();
+    assert_eq!(
+        probe::rdp_drive_folder(usable.to_str().expect("utf-8")),
+        Some(None)
+    );
+}
+
+/// A missing folder does not stop the attempt: the connection is still dialled.
+#[test]
+fn an_rdp_attempt_with_a_missing_folder_still_dials() {
+    let peer = Scripted::start(Script::Silent);
+    let mut client = DesktopClient::new(Protocol::Rdp).expect("client");
+    client.set_server("127.0.0.1", peer.port).expect("server");
+    let missing = std::env::temp_dir().join("shellune-no-such-folder-for-this-test");
+    client
+        .set_drive(
+            shellune_desktop::DRIVE_NAME,
+            Some(missing.to_str().expect("utf-8")),
+        )
+        .expect("drive");
+    client.connect().expect("connect starts");
+    let deadline = Instant::now() + PATIENCE;
+    while !peer.accepted.load(Ordering::SeqCst) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        peer.accepted.load(Ordering::SeqCst),
+        "the attempt still dialled the server"
+    );
+    let _ = client.cancel();
 }

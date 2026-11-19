@@ -5,6 +5,8 @@
 //! the wrong field.
 
 #![allow(non_camel_case_types)]
+// The declarations mirror the header, so some exist only for the C build.
+#![allow(dead_code)]
 
 use std::os::raw::{c_char, c_void};
 
