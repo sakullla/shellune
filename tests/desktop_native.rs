@@ -1,13 +1,13 @@
 //! The native desktop boundary (R18-R20, R23).
 //!
-//! Everything here runs the real shim against the real libraries built from
-//! `vendor/`: LibVNCClient over real sockets, FreeRDP over real sockets. There is
-//! no RDP or VNC server on this machine, so the peer is a scripted TCP server that
-//! speaks exactly the bytes the test needs and nothing more. That is enough to
-//! prove the parts this task owns - the ABI, cancellation, close ordering, the
-//! failure classification and a first frame with input - and it is *not* evidence
-//! that any particular real server works. The endpoint matrix belongs to T5 and is
-//! reported as unverified until it actually runs.
+//! Everything here runs the real shim against the real code: LibVNCClient for
+//! VNC, and this crate's own RDP client for desktop remoting. No server is started
+//! here, so the peer is a scripted TCP server that speaks exactly the bytes the
+//! test needs and nothing more. That is enough to prove the parts this file owns -
+//! the ABI, cancellation, close ordering, the failure classification, the drive
+//! channel and a first frame with input - and it is *not* evidence that any
+//! particular real server works. The endpoint matrix in tests/rdp_vnc.rs is that
+//! evidence, and it runs when its `SHELLUNE_*` endpoint variables are set.
 //!
 //! When the native libraries were not built, every test here reports SKIP and says
 //! which command produces them. Nothing is faked into a pass. With
@@ -994,9 +994,14 @@ const IRP_MN_QUERY_DIRECTORY: u32 = 0x01;
 const FILE_RENAME_INFORMATION: u32 = 10;
 const FILE_OPEN: u32 = 1;
 const FILE_CREATE: u32 = 2;
+const FILE_OPEN_IF: u32 = 3;
 const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
 const STATUS_SUCCESS: u32 = 0;
+const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
+const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
+const STATUS_NO_MORE_FILES: u32 = 0x8000_001A;
 const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 
 fn wide_path(path: &str) -> Vec<u8> {
@@ -1020,12 +1025,13 @@ fn create_request(path: &str, disposition: u32, options: u32) -> Vec<u8> {
     body
 }
 
-/// DR_DRIVE_QUERY_DIRECTORY_REQ after the common header: the first query of a listing.
-fn query_directory_request(path: &str) -> Vec<u8> {
+/// DR_DRIVE_QUERY_DIRECTORY_REQ after the common header: the first query of a
+/// listing, or a continuation of one.
+fn query_directory_page(path: &str, initial: bool) -> Vec<u8> {
     let name = wide_path(path);
     let mut body = Vec::new();
     body.extend_from_slice(&3u32.to_le_bytes()); // FileBothDirectoryInformation
-    body.push(1); // InitialQuery
+    body.push(u8::from(initial)); // InitialQuery
     body.extend_from_slice(&(name.len() as u32).to_le_bytes());
     body.extend_from_slice(&[0u8; 23]);
     body.extend_from_slice(&name);
@@ -1055,9 +1061,47 @@ fn create(body: &[u8]) -> DriveRequest<'_> {
     }
 }
 
+fn query(body: &[u8]) -> DriveRequest<'_> {
+    DriveRequest {
+        major: IRP_MJ_DIRECTORY_CONTROL,
+        minor: IRP_MN_QUERY_DIRECTORY,
+        on_file: true,
+        body,
+    }
+}
+
 /// The statuses the patched drive channel answers `requests` with.
 fn drive(base: &str, requests: &[DriveRequest<'_>]) -> Vec<u32> {
     probe::rdp_drive_requests(base, requests).expect("the RDP backend is built")
+}
+
+/// The statuses and the data each answer carried.
+fn drive_replies(base: &str, requests: &[DriveRequest<'_>]) -> Vec<(u32, Vec<u8>)> {
+    probe::rdp_drive_replies(base, requests).expect("the RDP backend is built")
+}
+
+/// The names in one FILE_BOTH_DIR_INFORMATION page, following NextEntryOffset.
+fn entry_names(data: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut at = 0usize;
+    while at + 94 <= data.len() {
+        let next = u32::from_le_bytes(data[at..at + 4].try_into().expect("offset")) as usize;
+        let length =
+            u32::from_le_bytes(data[at + 60..at + 64].try_into().expect("length")) as usize;
+        let start = at + 94;
+        let end = start + length;
+        assert!(end <= data.len(), "entry name runs past the page");
+        let units: Vec<u16> = data[start..end]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        names.push(String::from_utf16_lossy(&units));
+        if next == 0 {
+            break;
+        }
+        at += next;
+    }
+    names
 }
 
 /// What one create request is answered with.
@@ -1365,6 +1409,145 @@ fn an_oversized_remote_rdp_entry_is_cut_or_reported() {
     );
 }
 
+/// The create dispositions mean what MS-SMB2 says they mean: opening an existing
+/// file works with 1 and 3 and is refused with 2, which is "create, never open".
+#[test]
+fn the_create_disposition_decides_whether_an_existing_file_may_be_opened() {
+    let root = std::env::temp_dir().join(format!("shellune-disposition-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("folder");
+    std::fs::write(root.join("there.txt"), b"x").expect("file");
+    let base = root.to_str().expect("utf-8").to_owned();
+
+    // FILE_OPEN: an existing file opens.
+    assert_eq!(
+        open_status(&base, "\\there.txt", FILE_OPEN, 0),
+        STATUS_SUCCESS
+    );
+    // FILE_CREATE: an existing file must be refused.
+    assert_eq!(
+        open_status(&base, "\\there.txt", FILE_CREATE, 0),
+        STATUS_OBJECT_NAME_COLLISION
+    );
+    // FILE_OPEN_IF: an existing file opens, a missing one is created.
+    assert_eq!(
+        open_status(&base, "\\there.txt", FILE_OPEN_IF, 0),
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        open_status(&base, "\\new.txt", FILE_OPEN_IF, 0),
+        STATUS_SUCCESS
+    );
+    assert!(root.join("new.txt").exists());
+    // FILE_CREATE on a missing name creates it.
+    assert_eq!(
+        open_status(&base, "\\fresh.txt", FILE_CREATE, 0),
+        STATUS_SUCCESS
+    );
+    assert!(root.join("fresh.txt").exists());
+    // FILE_OPEN on a missing name is refused.
+    assert_eq!(
+        open_status(&base, "\\missing.txt", FILE_OPEN, 0),
+        STATUS_OBJECT_NAME_NOT_FOUND
+    );
+
+    // The same meanings for a directory: 1 opens it, 2 refuses an existing name,
+    // 3 opens it, and only 2/3 create a missing one.
+    std::fs::create_dir(root.join("there")).expect("directory");
+    assert_eq!(
+        open_status(&base, "\\there", FILE_OPEN, FILE_DIRECTORY_FILE),
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        open_status(&base, "\\there", FILE_CREATE, FILE_DIRECTORY_FILE),
+        STATUS_OBJECT_NAME_COLLISION
+    );
+    assert_eq!(
+        open_status(&base, "\\there", FILE_OPEN_IF, FILE_DIRECTORY_FILE),
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        open_status(&base, "\\made", FILE_OPEN_IF, FILE_DIRECTORY_FILE),
+        STATUS_SUCCESS
+    );
+    assert!(root.join("made").is_dir());
+    assert_eq!(
+        open_status(&base, "\\absent", FILE_OPEN, FILE_DIRECTORY_FILE),
+        STATUS_OBJECT_NAME_NOT_FOUND
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A listing larger than one answer is paged the way the protocol says: the first
+/// query reports that the buffer overflowed, continuation queries on the same open
+/// carry the rest, and every entry is delivered exactly once before the listing
+/// ends with NO_MORE_FILES.
+#[test]
+fn a_listing_larger_than_one_answer_is_paged_without_losing_an_entry() {
+    let root = std::env::temp_dir().join(format!("shellune-paging-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("folder");
+    let filler = "x".repeat(40);
+    let mut expected = Vec::new();
+    for index in 0..400 {
+        let name = format!("entry-{index:04}-{filler}.txt");
+        std::fs::write(root.join(&name), b"x").expect("entry");
+        expected.push(name);
+    }
+    expected.sort();
+    let base = root.to_str().expect("utf-8").to_owned();
+
+    let mut bodies = vec![
+        create_request("\\", FILE_OPEN, FILE_DIRECTORY_FILE),
+        query_directory_page("\\*", true),
+    ];
+    for _ in 0..12 {
+        bodies.push(query_directory_page("\\*", false));
+    }
+    let mut requests = vec![create(&bodies[0])];
+    for body in &bodies[1..] {
+        requests.push(query(body));
+    }
+    let replies = drive_replies(&base, &requests);
+    assert_eq!(replies[0].0, STATUS_SUCCESS, "the folder opens");
+
+    let mut names = Vec::new();
+    let mut pages = 0usize;
+    let mut finished = false;
+    for (status, data) in &replies[1..] {
+        if finished {
+            assert_eq!(
+                *status, STATUS_NO_MORE_FILES,
+                "nothing follows the last page"
+            );
+            continue;
+        }
+        assert!(data.len() <= 16 * 1024, "a page stays inside the budget");
+        match *status {
+            STATUS_BUFFER_OVERFLOW => {
+                assert!(!data.is_empty(), "an overflow page still carries entries");
+                names.extend(entry_names(data));
+                pages += 1;
+            }
+            STATUS_SUCCESS => {
+                names.extend(entry_names(data));
+                pages += 1;
+                finished = true;
+            }
+            other => panic!("unexpected listing status {other:#010X}"),
+        }
+    }
+    assert!(
+        finished,
+        "the listing never finished inside the requests given"
+    );
+    assert!(pages > 1, "the listing fit in one answer and never paged");
+    assert_eq!(names.len(), expected.len(), "every entry is delivered once");
+    names.sort();
+    assert_eq!(names, expected);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A server that declines the device says so, once, with the code it gave; a
 /// server that takes it says nothing.
 #[test]
@@ -1548,7 +1731,7 @@ fn the_patched_drive_channel_keeps_the_server_inside_the_mapped_folder() {
     // Listing: a directory inside is listed, the one behind the junction is not.
     let root_dir = create_request("\\", FILE_OPEN, FILE_DIRECTORY_FILE);
     let list = |pattern: &str| {
-        let query = query_directory_request(pattern);
+        let query = query_directory_page(pattern, true);
         drive(
             &base_text,
             &[
@@ -1603,4 +1786,543 @@ fn the_patched_drive_channel_keeps_the_server_inside_the_mapped_folder() {
     unlink_folder(&base.join("out"));
     assert!(outside.join("secret.txt").exists());
     let _ = std::fs::remove_dir_all(&root);
+}
+/// The text encodings the backends use: CF_UNICODETEXT is UTF-16LE with CRLF line
+/// ends and a terminating NUL; RFB cut text is Latin-1.
+#[test]
+fn clipboard_text_encodings_round_trip() {
+    assert_eq!(
+        probe::utf8_to_cf_unicode("a\nb\r\nc😀"),
+        utf16("a\r\nb\r\nc😀")
+    );
+    assert_eq!(probe::utf8_to_cf_unicode(""), [0, 0]);
+    assert_eq!(
+        probe::cf_unicode_to_utf8(&utf16("héllo\r\n世界😀")).as_deref(),
+        Some("héllo\r\n世界😀".as_bytes())
+    );
+    // Up to the first NUL; an odd trailing byte and a lone surrogate do no harm.
+    let mut raw = utf16("ab");
+    raw.extend_from_slice(&utf16("ignored"));
+    assert_eq!(probe::cf_unicode_to_utf8(&raw).as_deref(), Some(&b"ab"[..]));
+    assert_eq!(
+        probe::cf_unicode_to_utf8(&[0x00, 0xD8, 0x41, 0x00, 0x42]).as_deref(),
+        Some("\u{FFFD}A".as_bytes())
+    );
+
+    assert_eq!(
+        probe::utf8_to_latin1("café ÿ").as_deref(),
+        Some(&b"caf\xe9 \xff"[..])
+    );
+    assert_eq!(probe::utf8_to_latin1("日本"), None);
+    assert_eq!(
+        probe::utf8_to_latin1("€"),
+        None,
+        "the euro sign is not Latin-1"
+    );
+    assert_eq!(
+        probe::latin1_to_utf8(b"caf\xe9").as_deref(),
+        Some("café".as_bytes())
+    );
+}
+
+fn connect_vnc(peer: &Scripted, clipboard: bool) -> DesktopClient {
+    let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
+    client.set_server("127.0.0.1", peer.port).expect("server");
+    client.set_size(2, 2).expect("size");
+    client.set_clipboard(clipboard).expect("clipboard switch");
+    client.connect().expect("connect starts");
+    client
+}
+
+fn cut_texts(peer: &Scripted) -> Vec<ClientMessage> {
+    peer.messages()
+        .into_iter()
+        .filter(|message| {
+            matches!(
+                message,
+                ClientMessage::CutText(_) | ClientMessage::ExtendedCutText { .. }
+            )
+        })
+        .collect()
+}
+
+/// A server with the extended clipboard gets and gives UTF-8: the client asks for
+/// the extension, receives the peer's text without its terminating NUL, and sends
+/// its own as Notify + Provide. Images are not RFB's to carry.
+#[test]
+fn a_vnc_peer_with_extended_clipboard_exchanges_utf8_both_ways() {
+    if !backends_built() {
+        return;
+    }
+    let peer = Scripted::start(Script::Session {
+        width: 2,
+        height: 2,
+        pixel: [9, 9, 9, 0],
+        clipboard: Some(Cut::Utf8("远端 ✓ text")),
+        extended: true,
+    });
+    let mut client = connect_vnc(&peer, true);
+    let events = pump(&client, PATIENCE, |event| {
+        matches!(event, Event::Clipboard { .. })
+    });
+    assert_eq!(texts(&events), ["远端 ✓ text"], "{events:?}");
+    assert!(
+        peer.messages().iter().any(
+            |message| matches!(message, ClientMessage::Encodings(list) if list.contains(&EXTENDED_CLIPBOARD))
+        ),
+        "the client asked for the extension: {:?}",
+        peer.messages()
+    );
+
+    when_connected(&mut client, |client| {
+        client.push_clipboard(&[
+            ClipboardEntry::text("本机 ✓ naïve"),
+            ClipboardEntry::png(b"\x89PNG".to_vec()),
+        ])
+    });
+    let provided = ClientMessage::ExtendedCutText {
+        flags: EXT_PROVIDE | EXT_TEXT,
+        text: Some("本机 ✓ naïve".to_owned()),
+    };
+    assert!(peer.wait_for(provided.clone()), "{:?}", peer.messages());
+    assert_eq!(
+        cut_texts(&peer),
+        [
+            ClientMessage::ExtendedCutText {
+                flags: EXT_NOTIFY | EXT_TEXT,
+                text: None
+            },
+            provided
+        ],
+        "exactly one text went out, and no classic cut text"
+    );
+    drop(client);
+    assert_eq!(leaked_handles(), 0);
+}
+
+/// A server without the extended clipboard speaks Latin-1: its cut text is decoded
+/// as such, text that fits is sent as Latin-1, and text that does not is not sent at
+/// all and reported once.
+#[test]
+fn a_vnc_peer_without_extended_clipboard_gets_latin1_or_a_notice() {
+    if !backends_built() {
+        return;
+    }
+    let peer = Scripted::start(Script::Session {
+        width: 2,
+        height: 2,
+        pixel: [9, 9, 9, 0],
+        clipboard: Some(Cut::Latin1(b"caf\xe9 cr\xe8me")),
+        extended: false,
+    });
+    let mut client = connect_vnc(&peer, true);
+    let events = pump(&client, PATIENCE, |event| {
+        matches!(event, Event::Clipboard { .. })
+    });
+    assert_eq!(texts(&events), ["café crème"], "{events:?}");
+
+    when_connected(&mut client, |client| client.clipboard("naïve"));
+    assert!(
+        peer.wait_for(ClientMessage::CutText(b"na\xefve".to_vec())),
+        "{:?}",
+        peer.messages()
+    );
+
+    client.clipboard("日本語").expect("queued");
+    let events = pump(&client, PATIENCE, |event| {
+        matches!(event, Event::Notice { .. })
+    });
+    assert_eq!(
+        notices(&events),
+        [Notice::ClipboardLatin1Only],
+        "{events:?}"
+    );
+    client.clipboard("Grüße").expect("queued");
+    assert!(
+        peer.wait_for(ClientMessage::CutText(b"Gr\xfc\xdfe".to_vec())),
+        "{:?}",
+        peer.messages()
+    );
+    client.clipboard("中文").expect("queued");
+    client.clipboard("ok").expect("queued");
+    assert!(peer.wait_for(ClientMessage::CutText(b"ok".to_vec())));
+    assert_eq!(
+        cut_texts(&peer),
+        [
+            ClientMessage::CutText(b"na\xefve".to_vec()),
+            ClientMessage::CutText(b"Gr\xfc\xdfe".to_vec()),
+            ClientMessage::CutText(b"ok".to_vec()),
+        ],
+        "text outside Latin-1 never reached the server"
+    );
+    let later = pump(&client, Duration::from_millis(300), |_| false);
+    assert!(
+        notices(&later).is_empty(),
+        "the notice is said once per session: {later:?}"
+    );
+}
+
+/// Text over the bound is cut at the last whole character within it, both ways, and
+/// each cut is reported (R1). A Latin-1 server's cut text may hold 1 MiB, which is
+/// up to 2 MiB once it is UTF-8.
+#[test]
+fn vnc_text_over_the_bound_is_cut_and_reported_both_ways() {
+    if !backends_built() {
+        return;
+    }
+    let bound = shellune_desktop::MAX_CLIPBOARD_TEXT_BYTES;
+    let remote: &'static [u8] = Box::leak(vec![0xE9u8; bound].into_boxed_slice());
+    let peer = Scripted::start(Script::Session {
+        width: 2,
+        height: 2,
+        pixel: [9, 9, 9, 0],
+        clipboard: Some(Cut::Latin1(remote)),
+        extended: false,
+    });
+    let mut client = connect_vnc(&peer, true);
+    let mut events = pump(&client, PATIENCE, |event| {
+        matches!(event, Event::Clipboard { .. })
+    });
+    events.extend(pump(&client, PATIENCE, |event| {
+        matches!(event, Event::Notice { .. })
+    }));
+    assert_eq!(texts(&events), ["é".repeat(bound / 2)]);
+    assert_eq!(
+        notices(&events),
+        [Notice::ClipboardTooLarge(ClipboardKind::Text)]
+    );
+
+    // One byte over the bound, with the cut inside a two-byte character.
+    let local = format!("a{}", "é".repeat(bound / 2));
+    when_connected(&mut client, |client| client.clipboard(&local));
+    let mut expected = vec![b'a'];
+    expected.extend(std::iter::repeat_n(0xE9u8, bound / 2 - 1));
+    assert!(
+        peer.wait_for(ClientMessage::CutText(expected)),
+        "the server got the text cut to the bound"
+    );
+    let events = pump(&client, PATIENCE, |event| {
+        matches!(event, Event::Notice { .. })
+    });
+    assert_eq!(
+        notices(&events),
+        [Notice::ClipboardTooLarge(ClipboardKind::Text)]
+    );
+}
+
+/// Sharing off: the client does not ask for the extension, drops the server's cut
+/// text, and refuses to send.
+#[test]
+fn a_vnc_session_with_clipboard_off_neither_sends_nor_receives() {
+    if !backends_built() {
+        return;
+    }
+    let peer = Scripted::start(Script::Session {
+        width: 2,
+        height: 2,
+        pixel: [9, 9, 9, 0],
+        clipboard: Some(Cut::Latin1(b"secret")),
+        extended: true,
+    });
+    let client = connect_vnc(&peer, false);
+    let mut events = pump(&client, PATIENCE, |event| {
+        matches!(event, Event::Frame { .. })
+    });
+    events.extend(pump(&client, Duration::from_millis(500), |_| false));
+    assert!(states(&events).contains(&State::Connected), "{events:?}");
+    assert!(texts(&events).is_empty(), "nothing received: {events:?}");
+    assert!(matches!(
+        client.clipboard("local"),
+        Err(Error::Unavailable(_))
+    ));
+    assert!(
+        !peer.messages().iter().any(
+            |message| matches!(message, ClientMessage::Encodings(list) if list.contains(&EXTENDED_CLIPBOARD))
+        ),
+        "the extension was not requested: {:?}",
+        peer.messages()
+    );
+    assert!(cut_texts(&peer).is_empty(), "{:?}", peer.messages());
+}
+
+/// Covers a clipboard and first frame buffered together. The worker must consume
+/// library-buffered bytes without waiting for another socket notification.
+#[test]
+fn a_scripted_vnc_peer_delivers_a_frame_clipboard_and_accepts_input() {
+    if !backends_built() {
+        return;
+    }
+    let pixel = [0x11u8, 0x22, 0x33, 0x00];
+    let peer = Scripted::start(Script::Session {
+        width: 4,
+        height: 3,
+        pixel,
+        clipboard: Some(Cut::Latin1(b"from the peer")),
+        extended: false,
+    });
+
+    let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
+    client.set_server("127.0.0.1", peer.port).expect("server");
+    client.set_size(4, 3).expect("size");
+    client.connect().expect("connect starts");
+
+    let events = pump(&client, PATIENCE, |event| {
+        matches!(event, Event::Frame { .. })
+    });
+    assert!(
+        states(&events).contains(&State::Connected),
+        "the handshake completed: {events:?}"
+    );
+
+    let frame = events
+        .iter()
+        .find_map(|event| match event {
+            Event::Frame {
+                width,
+                height,
+                pixels,
+                stride,
+                desktop_width,
+                ..
+            } => Some((*width, *height, pixels.clone(), *stride, *desktop_width)),
+            _ => None,
+        })
+        .expect("a frame arrived");
+    assert_eq!(frame.0, 4);
+    assert_eq!(frame.1, 3);
+    assert_eq!(frame.3, 16, "four pixels of four bytes per row");
+    assert_eq!(frame.4, 4, "the desktop is four pixels wide");
+    assert_eq!(frame.2.len(), 4 * 3 * 4);
+    for chunk in frame.2.as_chunks::<4>().0 {
+        assert_eq!(chunk, &pixel, "BGRA bytes as the peer sent them");
+    }
+
+    // Text clipboard from the peer, whether it arrived before or after the frame.
+    let mut clipboard = events.clone();
+    clipboard.extend(pump(&client, Duration::from_secs(2), |event| {
+        matches!(event, Event::Clipboard { .. })
+    }));
+    assert!(
+        clipboard
+            .iter()
+            .any(|event| texts(std::slice::from_ref(event)) == ["from the peer"]),
+        "clipboard text: {clipboard:?}"
+    );
+
+    // A frame can arrive while the handshake is still finishing, so wait for the
+    // state the input path requires before sending anything.
+    // `pump` consumed Connected above. `state()` is a cache maintained only by
+    // track_state(), so waiting for it here would wait for an already-read event.
+
+    // Input: the keysym form for VNC, and a pointer position with a left press.
+    // A first frame may already have arrived while the handshake was finishing, so the
+    // input calls wait for the connected state the shim requires instead of assuming
+    // the event order.
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        match client.key(0, 0x61, true, false) {
+            Ok(()) => break,
+            Err(_) if Instant::now() < deadline => {
+                client.track_state();
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("key down never became valid: {error}"),
+        }
+    }
+    client.key(0, 0x61, false, false).expect("key up");
+    client.pointer(2, 1, PointerButtons::LEFT).expect("pointer");
+    assert!(
+        peer.wait_for(ClientMessage::Key {
+            keysym: 0x61,
+            down: true
+        }),
+        "the peer saw the key press: {:?}",
+        peer.messages()
+    );
+    assert!(
+        peer.wait_for(ClientMessage::Pointer {
+            x: 2,
+            y: 1,
+            mask: 1
+        }),
+        "the peer saw the pointer: {:?}",
+        peer.messages()
+    );
+    assert!(
+        peer.messages()
+            .iter()
+            .any(|message| matches!(message, ClientMessage::Encodings(_))),
+        "the client asked for encodings: {:?}",
+        peer.messages()
+    );
+
+    // Closing a live session must stop the worker and release the handle.
+    drop(client);
+    assert_eq!(leaked_handles(), 0);
+}
+
+#[test]
+fn a_panicking_consumer_callback_cannot_unwind_into_the_library() {
+    if !backends_built() {
+        return;
+    }
+    let peer = Scripted::start(Script::Session {
+        width: 2,
+        height: 2,
+        pixel: [0x40, 0x50, 0x60, 0x00],
+        clipboard: None,
+        extended: false,
+    });
+
+    let before = callback_panics();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    let first = Arc::new(AtomicBool::new(true));
+    let mut client = DesktopClient::with_handler(Protocol::Vnc, move |event| {
+        if matches!(event, Event::State { .. }) && first.swap(false, Ordering::SeqCst) {
+            // Exactly the failure mode the trampoline has to absorb. One state event is
+            // guaranteed, unlike a frame from this fixture.
+            panic!("a consumer callback panicked on purpose");
+        }
+        record.lock().expect("record").push(event);
+    })
+    .expect("client");
+    client.set_server("127.0.0.1", peer.port).expect("server");
+    client.set_size(2, 2).expect("size");
+    client.connect().expect("connect starts");
+
+    let deadline = Instant::now() + PATIENCE;
+    while callback_panics() == before && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        callback_panics() > before,
+        "the trampoline must count the panic instead of letting it unwind"
+    );
+
+    // The session kept running afterwards: cancelling still produces events.
+    client.cancel().expect("cancel");
+    client.wait_for_worker(PATIENCE).expect("the worker stops");
+    drop(client);
+    assert_eq!(leaked_handles(), 0);
+    let delivered = seen.lock().expect("record").len();
+    assert!(
+        delivered > 0,
+        "events before and after the panic still reached the consumer"
+    );
+}
+
+/// A live session is cancelled, its callback unregistered and its context freed in
+/// that order, and the whole sequence finishes without waiting for a protocol
+/// timeout. That the detach comes before the wait is what the crate documents; the
+/// observable part here is that the drop is prompt and the handle is released.
+#[test]
+fn dropping_a_session_detaches_before_it_frees() {
+    if !backends_built() {
+        return;
+    }
+    let peer = Scripted::start(Script::Session {
+        width: 2,
+        height: 2,
+        pixel: [0x01, 0x02, 0x03, 0x00],
+        clipboard: None,
+        extended: false,
+    });
+    let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
+    client.set_server("127.0.0.1", peer.port).expect("server");
+    client.set_size(2, 2).expect("size");
+    client.connect().expect("connect starts");
+    pump(&client, PATIENCE, |event| {
+        matches!(event, Event::Frame { .. })
+    });
+
+    let started = Instant::now();
+    drop(client);
+    assert!(
+        started.elapsed() < PATIENCE,
+        "the drop waited for the protocol timeout instead of cancelling"
+    );
+    assert_eq!(leaked_handles(), 0, "the handle was released");
+}
+
+/// A handshake that fails must not leave a pointer to the freed session behind.
+/// The cancel lands while the failure is being classified, which is exactly the
+/// window where the old code left client->backend dangling: the shim must clear the
+/// pointer before it frees, and an abort that arrives anyway must do nothing.
+#[test]
+fn cancelling_a_failing_vnc_handshake_touches_no_freed_session() {
+    if !backends_built() {
+        return;
+    }
+    // 18 is TLS; a build without a TLS backend refuses it, so the handshake fails
+    // quickly and deterministically.
+    for attempt in 0..3 {
+        let peer = Scripted::start(Script::SecurityTypes(vec![18]));
+        let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
+        client.set_server("127.0.0.1", peer.port).expect("server");
+        client
+            .set_vnc_security(VncSecurity::DEFAULT)
+            .expect("security mask");
+        client.connect().expect("connect starts");
+        // Racing the failure on purpose: on some runs this aborts a live connect,
+        // on others it arrives after the handshake already failed.
+        let _ = client.cancel();
+
+        let events = pump(&client, PATIENCE, |event| {
+            matches!(
+                event,
+                Event::State {
+                    state: State::Failed(_) | State::Closed,
+                    ..
+                }
+            )
+        });
+        never_connected(&events);
+        let last = states(&events).last().copied();
+        assert!(
+            matches!(last, Some(State::Failed(_) | State::Closed)),
+            "attempt {attempt}: a cancelled or failed handshake ends in Failed or Closed: {events:?}"
+        );
+        client.wait_for_worker(PATIENCE).expect("the worker stops");
+        drop(client);
+        assert_eq!(
+            leaked_handles(),
+            0,
+            "attempt {attempt}: the handle was released"
+        );
+    }
+}
+
+/// A peer that closes right after its banner ends the session as a failure, and the
+/// test reports SKIP like every other one when the backends are not built.
+#[test]
+fn a_peer_that_hangs_up_after_its_banner_ends_the_session() {
+    if !backends_built() {
+        return;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("address").port();
+    let thread = thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = stream.write_all(b"RFB 003.008\n");
+            let mut version = [0u8; 12];
+            let _ = stream.read_exact(&mut version);
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    });
+
+    let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
+    client.set_server("127.0.0.1", port).expect("server");
+    client.connect().expect("connect starts");
+    let events = pump(&client, PATIENCE, |event| {
+        matches!(
+            event,
+            Event::State {
+                state: State::Failed(_),
+                ..
+            }
+        )
+    });
+    never_connected(&events);
+    thread.join().expect("peer thread");
 }

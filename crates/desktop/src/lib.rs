@@ -1342,6 +1342,25 @@ pub mod probe {
         Some(super::rdp::probe_requests(folder, &canned))
     }
 
+    /// The same run as [`rdp_drive_requests`], with the data in each answer so a
+    /// test can read a listing's entries across pages.
+    pub fn rdp_drive_replies(
+        base: &str,
+        requests: &[DriveRequest<'_>],
+    ) -> Option<Vec<(u32, Vec<u8>)>> {
+        let folder = std::path::Path::new(base);
+        let canned: Vec<super::rdp::ProbeRequest<'_>> = requests
+            .iter()
+            .map(|request| super::rdp::ProbeRequest {
+                major: request.major,
+                minor: request.minor,
+                on_file: request.on_file,
+                body: request.body,
+            })
+            .collect();
+        Some(super::rdp::probe_replies(folder, &canned))
+    }
+
     /// Runs the drive channel's device exchange against `base` with a server that
     /// answers `result`; returns the events it reported.
     pub fn rdp_drive_reply(base: &str, result: u32) -> Vec<Event> {

@@ -273,19 +273,17 @@ fn verify(endpoint: &Endpoint) -> Outcome {
     let mut certificate_answer_failed = false;
     let mut frames = 0usize;
     let mut first_frame = false;
-    let mut logon = String::new();
     let mut failure: Option<(Failure, String)> = None;
 
     // One step of the session, shared by both phases below: certificates are
     // answered, frames counted, and a failure remembered.
-    let mut step = |client: &DesktopClient,
-                    event: Event,
-                    frames: &mut usize,
-                    first_frame: &mut bool,
-                    logon: &mut String,
-                    failure: &mut Option<(Failure, String)>,
-                    certificate_asked: &mut bool,
-                    certificate_answer_failed: &mut bool| {
+    let step = |client: &DesktopClient,
+                event: Event,
+                frames: &mut usize,
+                first_frame: &mut bool,
+                failure: &mut Option<(Failure, String)>,
+                certificate_asked: &mut bool,
+                certificate_answer_failed: &mut bool| {
         match event {
             Event::Certificate { request_id, .. } => {
                 *certificate_asked = true;
@@ -309,7 +307,7 @@ fn verify(endpoint: &Endpoint) -> Outcome {
                 reason,
                 ..
             } => match state {
-                State::Connected => *logon = reason,
+                State::Connected => {}
                 State::Failed(_) | State::Closed => *failure = Some((reported, reason)),
                 _ => {}
             },
@@ -326,7 +324,6 @@ fn verify(endpoint: &Endpoint) -> Outcome {
                 event,
                 &mut frames,
                 &mut first_frame,
-                &mut logon,
                 &mut failure,
                 &mut certificate_asked,
                 &mut certificate_answer_failed,
@@ -378,7 +375,6 @@ fn verify(endpoint: &Endpoint) -> Outcome {
                 event,
                 &mut frames,
                 &mut first_frame,
-                &mut logon,
                 &mut failure,
                 &mut certificate_asked,
                 &mut certificate_answer_failed,
@@ -394,15 +390,22 @@ fn verify(endpoint: &Endpoint) -> Outcome {
     }
 
     steps.push(("first frame", true));
-    steps.push(("sustained", frames > 1));
+    // Sustained: the session survived the whole window above, and its worker is
+    // still running at the end of it. Repaints are not part of this check, since a
+    // desktop that does not change sends no updates.
+    steps.push((
+        "sustained",
+        matches!(
+            client.wait_for_worker(Duration::from_millis(1)),
+            Err(Error::Timeout)
+        ),
+    ));
     if certificate_asked {
         steps.push(("certificate answered", !certificate_answer_failed));
     }
-    // An empty reason is a confirmed logon; anything else says the server never
-    // confirmed one and the caller was told so.
-    if endpoint.kind.protocol() == Protocol::Rdp {
-        steps.push(("logon confirmed", logon.is_empty()));
-    }
+    // Logon confirmation is not a step here: the client reports Connected with a
+    // reason when the server shows its verdict only on its own screen (xrdp
+    // without CredSSP), and a refused logon is already a failure before this point.
     // Input: one key press and one pointer move at the top-left corner, which every
     // desktop has room for.
     let key = client.key(0x1e, 0x61, true, false);

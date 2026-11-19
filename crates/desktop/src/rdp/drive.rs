@@ -44,8 +44,14 @@ const STATUS_SUCCESS: u32 = 0;
 const STATUS_NOT_SUPPORTED: u32 = 0xc000_00bb;
 const STATUS_ACCESS_DENIED: u32 = 0xc000_0022;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xc000_0034;
+const STATUS_OBJECT_NAME_COLLISION: u32 = 0xc000_0035;
 const STATUS_INVALID_PARAMETER: u32 = 0xc000_000d;
 const STATUS_NO_MORE_FILES: u32 = 0x8000_001a;
+const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
+
+/// How many bytes one directory listing answer may carry. RDPDR carries no length
+/// in the request, so this is the channel's own page size.
+const LISTING_BUDGET: usize = 16 * 1024;
 const STATUS_NOT_A_DIRECTORY: u32 = 0xc000_010e;
 
 /// How many files the server may hold open at once; beyond it a create fails
@@ -58,6 +64,15 @@ struct Open {
     path: PathBuf,
     directory: bool,
     delete_on_close: bool,
+    /// A directory listing in progress: the entries found and how many were sent.
+    listing: Option<(Vec<Listed>, usize)>,
+}
+
+/// One entry of a directory listing, kept so a query can be continued.
+struct Listed {
+    name: String,
+    directory: bool,
+    size: u64,
 }
 
 pub(super) struct Drive {
@@ -237,6 +252,7 @@ impl Drive {
                                 path: resolved,
                                 directory,
                                 delete_on_close,
+                                listing: None,
                             },
                         );
                         let mut data = id.to_le_bytes().to_vec();
@@ -299,7 +315,7 @@ impl Drive {
                 Ok((STATUS_SUCCESS, Vec::new()))
             }
             IRP_MJ_DIRECTORY_CONTROL if minor == IRP_MN_QUERY_DIRECTORY => {
-                self.query_directory(&root, p)
+                self.query_directory(&root, file, p)
             }
             IRP_MJ_SET_INFORMATION => self.set_information(&root, file, p),
             _ => Ok((STATUS_NOT_SUPPORTED, Vec::new())),
@@ -309,41 +325,75 @@ impl Drive {
     /// Lists a directory the server names. The pattern is the last part of the
     /// path, and the directory it names is resolved like any other: a link that
     /// leads out of the folder is refused, not listed.
-    fn query_directory(&mut self, root: &Path, p: &mut Packet<'_>) -> io::Result<(u32, Vec<u8>)> {
+    fn query_directory(
+        &mut self,
+        root: &Path,
+        file: u32,
+        p: &mut Packet<'_>,
+    ) -> io::Result<(u32, Vec<u8>)> {
         let _class = p.le32()?;
         let initial = p.u8()?;
         let length = usize::try_from(p.le32()?).map_err(|_| invalid("RDPDR path too long"))?;
         // The rest of the fixed part is padding the protocol defines.
         p.take(23)?;
         let path = utf16(p.take(length)?)?;
-        if initial == 0 {
-            return Ok((STATUS_NO_MORE_FILES, Vec::new()));
-        }
-        let (directory, pattern) = split_pattern(&path);
-        let directory = match resolve(root, &directory) {
-            Ok(path) => path,
-            Err(status) => return Ok((status, Vec::new())),
+        let Some(open) = self.open.get_mut(&file) else {
+            return Ok((STATUS_INVALID_PARAMETER, Vec::new()));
         };
-        if !directory.is_dir() {
-            return Ok((STATUS_NOT_A_DIRECTORY, Vec::new()));
+        if initial != 0 {
+            let (directory, pattern) = split_pattern(&path);
+            let directory = match resolve(root, &directory) {
+                Ok(path) => path,
+                Err(status) => return Ok((status, Vec::new())),
+            };
+            if !directory.is_dir() {
+                return Ok((STATUS_NOT_A_DIRECTORY, Vec::new()));
+            }
+            let mut entries = Vec::new();
+            for entry in fs::read_dir(&directory)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !matches_pattern(&pattern, &name) {
+                    continue;
+                }
+                let meta = entry.metadata()?;
+                entries.push(Listed {
+                    name,
+                    directory: meta.is_dir(),
+                    size: meta.len(),
+                });
+            }
+            open.listing = Some((entries, 0));
         }
+        let Some((entries, at)) = open.listing.as_mut() else {
+            return Ok((STATUS_NO_MORE_FILES, Vec::new()));
+        };
         let mut data = Vec::new();
         let mut previous = None;
-        for entry in fs::read_dir(&directory)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !matches_pattern(&pattern, &name) {
-                continue;
-            }
-            let meta = entry.metadata()?;
-            match push_entry(&mut data, previous, &name, meta.is_dir(), meta.len()) {
-                Some(begin) => previous = Some(begin),
+        while *at < entries.len() {
+            let entry = &entries[*at];
+            match push_entry(
+                &mut data,
+                previous,
+                &entry.name,
+                entry.directory,
+                entry.size,
+            ) {
+                Some(begin) => {
+                    previous = Some(begin);
+                    *at += 1;
+                }
                 None => break,
             }
         }
+        if *at < entries.len() {
+            // More entries than one answer carries: say the buffer overflowed and
+            // keep the position, so the next query continues where this one ended.
+            return Ok((STATUS_BUFFER_OVERFLOW, data));
+        }
+        open.listing = None;
         Ok((STATUS_SUCCESS, data))
     }
-
     /// Renames one open file inside the folder. The new name is resolved like an
     /// open, so a rename can never move a file out through a link.
     fn set_information(
@@ -481,6 +531,18 @@ pub(crate) struct ProbeRequest<'a> {
 /// Test hook: runs the drive channel over canned IRPs, in order, and returns the
 /// NTSTATUS each was answered with. This is the code a session runs, not a copy.
 pub(crate) fn probe_requests(folder: &std::path::Path, requests: &[ProbeRequest<'_>]) -> Vec<u32> {
+    probe_replies(folder, requests)
+        .into_iter()
+        .map(|(status, _)| status)
+        .collect()
+}
+
+/// The same run, with the data each answer carried: a listing's entries and a
+/// create's file id are what a test has to look at.
+pub(crate) fn probe_replies(
+    folder: &std::path::Path,
+    requests: &[ProbeRequest<'_>],
+) -> Vec<(u32, Vec<u8>)> {
     let emit: super::Emit = std::sync::Arc::new(|_event| {});
     let mut drive = Drive::new(Some(folder.to_path_buf()), emit);
     let channels = Channels {
@@ -512,10 +574,13 @@ pub(crate) fn probe_requests(folder: &std::path::Path, requests: &[ProbeRequest<
             u32::MAX
         };
         let data = answer.get(16..).unwrap_or(&[]);
-        if data.len() >= 5 {
+        // Only a create answers with a file id; a listing's first bytes are an
+        // entry, and reading an id out of them would send the next query to a
+        // handle that does not exist.
+        if request.major == IRP_MJ_CREATE && data.len() >= 5 {
             file = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         }
-        statuses.push(status);
+        statuses.push((status, data.to_vec()));
         let _ = request.on_file;
     }
     // Releasing the device closes what is still open, which is also what deletes a
@@ -524,17 +589,36 @@ pub(crate) fn probe_requests(folder: &std::path::Path, requests: &[ProbeRequest<
     statuses
 }
 
-/// Opens a file the way the disposition asks: 1 opens an existing one, 2 and 0
-/// open or create, 3 creates a new one.
+/// Opens a file the way the disposition asks: 0 supersedes, 1 opens an existing
+/// one, 2 creates a new one and refuses an existing name, 3 opens or creates.
 fn open_file(path: &Path, disposition: u32) -> io::Result<File> {
+    // MS-SMB2 CREATE_DISPOSITION, which RDPDR shares:
+    // 0 supersede, 1 open, 2 create, 3 open-if, 4 overwrite, 5 overwrite-if.
     match disposition {
+        0 => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path),
         1 => OpenOptions::new().read(true).open(path),
-        0 | 2 => OpenOptions::new()
+        2 => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path),
+        3 => OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .open(path),
-        3 => OpenOptions::new().write(true).create_new(true).open(path),
+        4 => OpenOptions::new().write(true).truncate(true).open(path),
+        5 => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "unsupported RDPDR disposition",
@@ -542,9 +626,16 @@ fn open_file(path: &Path, disposition: u32) -> io::Result<File> {
     }
 }
 
-/// Opens a directory, creating it when the disposition asks for a new one. A
-/// directory needs a flag on Windows that a plain open never passes.
+/// Opens a directory, creating it when the disposition says create (2) or
+/// open-if (3); create refuses a name that already exists. A directory needs a
+/// flag on Windows that a plain open never passes.
 fn open_directory(path: &Path, disposition: u32) -> io::Result<File> {
+    if disposition == 2 && path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "the directory already exists",
+        ));
+    }
     if matches!(disposition, 2 | 3) && !path.exists() {
         fs::create_dir(path)?;
     }
@@ -593,8 +684,9 @@ fn push_entry(
     size: u64,
 ) -> Option<usize> {
     let units: Vec<u16> = name.encode_utf16().collect();
-    // A listing that would not fit is cut short rather than sent oversized.
-    if data.len() + 94 + units.len() * 2 > 16 * 1024 {
+    // A listing that would not fit this page ends here; the caller reports the
+    // overflow and continues on the next query.
+    if data.len() + 94 + units.len() * 2 > LISTING_BUDGET {
         return None;
     }
     let begin = data.len();
@@ -740,6 +832,7 @@ fn device_name(part: &str) -> bool {
 fn status_of(error: &io::Error) -> u32 {
     match error.kind() {
         io::ErrorKind::NotFound => STATUS_OBJECT_NAME_NOT_FOUND,
+        io::ErrorKind::AlreadyExists => STATUS_OBJECT_NAME_COLLISION,
         _ => STATUS_ACCESS_DENIED,
     }
 }

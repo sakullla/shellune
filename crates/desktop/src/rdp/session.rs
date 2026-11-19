@@ -20,6 +20,75 @@ use std::time::Duration;
 
 /// How long the handshake may take before the attempt is abandoned.
 const HANDSHAKE: Duration = Duration::from_secs(20);
+/// A PDU arrives as a byte stream. A read that times out in the middle of one must
+/// not lose what was already read, so bytes are kept here until a whole TPKT is
+/// buffered; only then is it handed out.
+#[derive(Default)]
+struct Frames {
+    pending: Vec<u8>,
+}
+
+impl Frames {
+    fn push(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+    }
+
+    /// The next complete PDU body, when one is buffered.
+    fn take(&mut self) -> io::Result<Option<Incoming>> {
+        if self.pending.len() < 4 {
+            return Ok(None);
+        }
+        let slow = self.pending[0] == 3;
+        let (header, total) = if slow {
+            if self.pending[1] != 0 {
+                return Err(wire::invalid("invalid TPKT version"));
+            }
+            let length = usize::from(u16::from_be_bytes([self.pending[2], self.pending[3]]));
+            (4usize, length)
+        } else {
+            // Fast-path: one header byte, a 16-bit length, then the updates.
+            let length = usize::from(u16::from_be_bytes([self.pending[1], self.pending[2]]));
+            (3usize, length)
+        };
+        if total < header {
+            return Err(wire::invalid("short RDP pdu"));
+        }
+        if self.pending.len() < total {
+            return Ok(None);
+        }
+        let rest = self.pending.split_off(total);
+        let frame = std::mem::replace(&mut self.pending, rest);
+        let body = frame[header..].to_vec();
+        Ok(Some(if slow {
+            Incoming::Slow(body)
+        } else {
+            Incoming::Fast
+        }))
+    }
+}
+
+/// Reads from the transport until one complete PDU is buffered. A read that times
+/// out in the middle of a PDU returns the error with the bytes kept, so the next
+/// call continues the same PDU instead of parsing from its middle.
+fn next_frame(transport: &mut impl Read, frames: &mut Frames) -> io::Result<Incoming> {
+    loop {
+        if let Some(incoming) = frames.take()? {
+            return Ok(incoming);
+        }
+        let mut chunk = [0u8; 16 * 1024];
+        match transport.read(&mut chunk) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the server closed the connection",
+                ));
+            }
+            Ok(read) => frames.push(&chunk[..read]),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// A dropped session is retried once before it is reported as failed.
 const ATTEMPTS: u8 = 2;
 /// How long the server has to confirm or refuse the logon. A server that says
@@ -159,6 +228,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_pdu_split_by_a_timeout_is_still_parsed() {
+        // A TPKT with a 6-byte body: version 3, length 10.
+        let pdu = vec![3, 0, 0, 10, b'a', b'b', b'c', b'd', b'e', b'f'];
+        let mut frames = Frames::default();
+        frames.push(&pdu[..5]);
+        assert!(frames.take().unwrap().is_none(), "half a PDU is not a PDU");
+        frames.push(&pdu[5..]);
+        match frames.take().unwrap() {
+            Some(Incoming::Slow(body)) => assert_eq!(body, b"abcdef"),
+            other => panic!("expected the body, got {}", other.is_some()),
+        }
+        assert!(frames.take().unwrap().is_none(), "nothing left");
+    }
+
+    #[test]
+    fn two_pdus_in_one_read_arrive_one_at_a_time() {
+        let one = vec![3, 0, 0, 6, 1, 2];
+        let two = vec![3, 0, 0, 5, 9];
+        let mut frames = Frames::default();
+        frames.push(&one);
+        frames.push(&two);
+        match frames.take().unwrap() {
+            Some(Incoming::Slow(body)) => assert_eq!(body, [1, 2]),
+            _ => panic!("first PDU"),
+        }
+        match frames.take().unwrap() {
+            Some(Incoming::Slow(body)) => assert_eq!(body, [9]),
+            _ => panic!("second PDU"),
+        }
+        assert!(frames.take().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_timeout_in_the_middle_of_a_pdu_keeps_what_arrived() {
+        // A peer sends the first five bytes of a PDU, waits past the read timeout,
+        // then sends the rest. The read really times out, and the second call still
+        // parses the whole PDU because the first five bytes were kept.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("peer accepted");
+            stream.write_all(&[3, 0, 0, 10, b'a']).expect("first half");
+            std::thread::sleep(Duration::from_millis(250));
+            stream.write_all(b"bcdef").expect("second half");
+        });
+        let mut stream = std::net::TcpStream::connect(address).expect("client");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("timeout");
+        let mut frames = Frames::default();
+        let timed_out = match next_frame(&mut stream, &mut frames) {
+            Err(error) => matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            Ok(_) => false,
+        };
+        assert!(
+            timed_out,
+            "the read has to time out in the middle of the PDU"
+        );
+        // The loop the session runs: every timeout leaves the bytes in place and the
+        // next attempt continues, until the rest of the same PDU arrives.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let incoming = loop {
+            match next_frame(&mut stream, &mut frames) {
+                Ok(incoming) => break incoming,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) && std::time::Instant::now() < deadline => {}
+                Err(error) => panic!("the rest of the PDU: {error}"),
+            }
+        };
+        match incoming {
+            Incoming::Slow(body) => assert_eq!(body, b"abcdef"),
+            Incoming::Fast => panic!("the PDU was slow-path"),
+        }
+        peer.join().expect("peer thread");
+    }
+
+    #[test]
     fn a_logon_confirmation_maps_to_its_outcome() {
         // PDUTYPE2_SAVE_SESSION_INFO confirms the logon.
         assert_eq!(logon_pdu(38, &[1, 0, 0, 0]), Some(Logon::Confirmed));
@@ -187,6 +339,8 @@ struct Active {
     share: Share,
     /// Set when the server says the logon succeeded or failed.
     logon: Option<Logon>,
+    /// Bytes of a PDU that has not fully arrived yet.
+    frames: Frames,
     /// Whether Connected has been published.
     connected: bool,
     /// When an unconfirmed logon stops being waited for.
@@ -307,6 +461,7 @@ fn connect(
         drive: Drive::new(config.drive.clone(), Arc::clone(emit)),
         buttons: 0,
         logon: None,
+        frames: Frames::default(),
         connected: false,
         logon_deadline: std::time::Instant::now() + LOGON_WAIT,
     };
@@ -396,9 +551,14 @@ impl Active {
     /// Sets a short read wait on the socket under the TLS layer, so the loop
     /// returns to its cancellation and deadline checks between updates.
     fn set_poll_timeout(&self, wait: Duration) {
-        if let Transport::Secure(secure) = &self.transport {
-            if let Transport::Plain(socket) = &secure.sock {
+        match &self.transport {
+            Transport::Plain(socket) => {
                 let _ = socket.set_read_timeout(Some(wait));
+            }
+            Transport::Secure(secure) => {
+                if let Transport::Plain(socket) = &secure.sock {
+                    let _ = socket.set_read_timeout(Some(wait));
+                }
             }
         }
     }
@@ -504,39 +664,11 @@ impl Active {
         }
     }
 
+    /// Reads bytes until a whole PDU is buffered. A timeout part-way through keeps
+    /// what arrived, so the next call continues the same PDU instead of starting in
+    /// the middle of it.
     fn read(&mut self) -> io::Result<Incoming> {
-        let mut first = [0u8; 1];
-        self.transport.read_exact(&mut first)?;
-        if first[0] == 3 {
-            let mut header = [0u8; 3];
-            self.transport.read_exact(&mut header)?;
-            if header[0] != 0 {
-                return Err(wire::invalid("invalid TPKT version"));
-            }
-            let length = usize::from(u16::from_be_bytes([header[1], header[2]]));
-            let mut body = vec![
-                0;
-                length
-                    .checked_sub(4)
-                    .ok_or_else(|| wire::invalid("short TPKT"))?
-            ];
-            self.transport.read_exact(&mut body)?;
-            Ok(Incoming::Slow(body))
-        } else {
-            // Fast-path: header byte, 16-bit length, then the updates. Nothing is
-            // parsed because the client never advertises that output path.
-            let mut length = [0u8; 2];
-            self.transport.read_exact(&mut length)?;
-            let total = usize::from(u16::from_be_bytes(length));
-            let mut body = vec![
-                0;
-                total
-                    .checked_sub(3)
-                    .ok_or_else(|| wire::invalid("short fast-path PDU"))?
-            ];
-            self.transport.read_exact(&mut body)?;
-            Ok(Incoming::Fast)
-        }
+        next_frame(&mut self.transport, &mut self.frames)
     }
 
     fn read_slow(&mut self) -> Result<Option<Vec<u8>>, Ended> {
