@@ -665,7 +665,7 @@ impl ShelluneView {
     fn settings_navigation(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let locale = self.workspace.locale();
-        let ringed = !self.pointer_input || self.settings_nav.nav_focus;
+        let ringed = self.settings_nav_ringed();
         let mut column = div()
             .flex()
             .flex_col()
@@ -744,7 +744,7 @@ impl ShelluneView {
         let metrics = self.metrics();
         let locale = self.workspace.locale();
         let picked = index == self.settings_nav.item_of(category);
-        let ringed = !self.pointer_input || self.settings_nav.nav_focus;
+        let ringed = self.settings_nav_ringed();
         let selector = format!("settings.item.{}", item.id());
         components::nav_item(None, item.label(locale), picked, picked && ringed, metrics)
             .id(SharedString::from(selector.clone()))
@@ -755,6 +755,16 @@ impl ShelluneView {
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.settings_select_item(category, index, cx);
             }))
+    }
+
+    /// Whether the chosen navigation entry draws the focus ring.
+    ///
+    /// The chosen entry always says so with the selected fill and the accent bar, like
+    /// the host list's sidebar (ADR-7); the ring is the keyboard's alone and is drawn
+    /// only while the column itself holds the keyboard - not merely because the last
+    /// input was a key while the page has it.
+    fn settings_nav_ringed(&self) -> bool {
+        self.settings_nav.nav_focus
     }
 
     /// Whether a category has one page, named exactly like the category.
@@ -1980,6 +1990,13 @@ impl ShelluneView {
     #[must_use]
     pub fn settings_key_rows(&self, cx: &App) -> Vec<&'static str> {
         self.key_rows(cx).into_iter().map(|spec| spec.id).collect()
+    }
+
+    /// Whether the chosen navigation entry is drawn with the focus ring.
+    #[cfg(test)]
+    #[must_use]
+    pub fn settings_nav_ringed_for_test(&self) -> bool {
+        self.settings_nav_ringed()
     }
 
     /// Whether the category column has the keyboard, for the tests that walk it.

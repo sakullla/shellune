@@ -254,7 +254,8 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   连续页面。没有标题的设置行不再留一行空白，说明文字与右侧控件垂直居中。偏好保存在 `preferences.json`。
   **视觉（R5，T8 / ADR-7 更新）**：左侧导航不再是带框面板，而是页面左侧一列 `components::nav_item`（宽 200，与首页侧栏
   同尺寸：分类一个控件高 32、圆角 6、16px 图标；当前分类为 selected 底 + 2px accent 竖条（`accent_mark`）+ MEDIUM，
-  展开时底色、竖条与焦点环交给当前子项；子项不带图标、缩进到分类文字、一个紧凑控件高 28）；分类标题用页标题字号
+  展开时底色、竖条与焦点环交给当前子项；焦点环只在导航列本身拿到键盘（在页面上按 Esc 进入）时画，指针或在页面里按键都不画
+  （`the_chosen_settings_entry_is_ringed_only_while_the_column_has_the_keyboard`）；子项不带图标、缩进到分类文字、一个紧凑控件高 28）；分类标题用页标题字号
   （`heading_size`，20）；每组设置是共享的 `components::card`（surface + 弱边 + 圆角 8 + Raised，行自带
   内边距与分隔线）。开 / 关类设置全部是开关（`ShelluneView::switch_control` → `components::switch`）：整块
   （状态词“开 / 关” + 开关）是一个 ≥ 24px 的指针目标，按一下翻转并立即生效，选择器为
@@ -1994,7 +1995,7 @@ toast 相同的 `components::popover_surface` 上（raised + 强边 + 圆角 8 +
 | `form_row` + `form_field(label, control, share, min)` / `form_cell(share, min)` | 对话框的两列自适应表单（T8 / ADR-7）：一行两个（或多个）字段，每格从 0 起按 `share` 比例分剩余宽度、保底 `FORM_FIELD_MIN_WIDTH`（200，短字段如端口 `FORM_SHORT_FIELD_MIN_WIDTH` 96），底线放不下时整格换行，所以宽窗口两列、720×480@200% 一列；标签是 `form_label`。主机表单（地址 / 端口、名称 / 分组）、远程桌面 / 串口表单的成对字段、批量任务的“同时运行 / 任务名称”、快捷命令编辑器用它。测试 `the_host_form_is_two_columns_wide_and_one_column_narrow` |
 | `form_section(title)` / `form_hint(text)` / `form_rule()` | 表单分组标题（body、600、主色）、字段下说明（caption、muted）、分组间发丝线 |
 | `disclosure(open, title, hint)` | 表单的折叠段头（“高级”，T8）：箭头 + 名称 + 一行内容说明（省略号），扁平、弱边、悬停出底，调用方加 id、点击与“已使用”chip；主机表单的高级设置默认折叠 |
-| `nav_item(icon, label, selected, ringed)` / `accent_mark(shown)` | 页面自带的导航列（设置，T8）：分类项一个控件高、带图标，子项无图标、缩进、一个紧凑控件高；选中 = selected 底 + 2px accent 竖条 + MEDIUM，键盘所在项另画焦点环（常驻透明边，不挪字）；`accent_mark` 是那条竖条本身（不选时为同宽透明占位），设置卡片行首也用它 |
+| `nav_item(icon, label, selected, ringed)` / `accent_mark(shown)` | 页面自带的导航列（设置，T8）：分类项一个控件高、带图标，子项无图标、缩进、一个紧凑控件高；选中 = selected 底 + 2px accent 竖条 + MEDIUM，键盘所在项另画焦点环（常驻透明边，不挪字；设置导航仅在导航列持有键盘时传 `ringed`）；`accent_mark` 是那条竖条本身（不选时为同宽透明占位），设置卡片行首也用它 |
 | `dialog_face` / `dialog_panel` / `dialog_header` | 对话框表面令牌与内嵌标题块 |
 | `toast(tone, icon, title, detail)` | 通知：`popover_surface`，宽 `TOAST_WIDTH`（340），色调图标圆底（`ICON_TILE` 24）；关闭按钮与位置由调用方加，进入时 Fade |
 | `empty_state(icon, title, body, action)` | 空状态：accent tint 图标块（圆角 12）+ 标题 + 可选说明（可换任意行）+ 可选动作；标题与说明经 `capped_text` 居中、上限 420，动作总在文字下方（`empty.state.title` / `.body` / `.action`）；不带状态色调；调用方在外层加自己的选择器 |
@@ -2032,7 +2033,7 @@ T7 又把文件视图、传输、端口转发与远程桌面里的手写外形�
 `inline_form`；桌面的 `state_card_with_icon` 与证书 `card` → `status_card` + `status_card_slot`；两处 `w(px(1))` 竖线 →
 `column_divider`。
 
-**T8（ADR-7）：设置、对话框、菜单、命令面板、tooltip、toast 与批量任务。** 行为、选择器与键盘路径不变，只换外观：
+**T8（ADR-7）：设置、对话框、菜单、命令面板、tooltip、toast 与批量任务。** 行为与选择器不变，只换外观；键盘路径仅对话框 Tab 顺序随分组调整（见下）：
 
 - **设置**：导航列改为 `nav_item`（见 1.0 “设置页”与上表），分类标题 20，卡片行首的选中竖条与自带页的小标题竖条改为
   `accent_mark`。截图工具打开某个设置页时同样滚到该分类（`capture_settings_page` 调 `settings_reveal`；此前
@@ -2041,6 +2042,13 @@ T7 又把文件视图、传输、端口转发与远程桌面里的手写外形�
   16（`title_size`，ADR-1），头部上内边距 16。表单用 `form_row` / `form_field` 两列自适应，组标题与分隔线用
   `form_section` / `form_rule`，“高级”用 `disclosure` 且默认折叠。表单正文行距 12。批量任务库的底部改为“关闭 → 新建任务”，
   主按钮回到最右。
+- **主机与连接对话框分组与 Tab 顺序**：SSH 主机对话框按 `form_group` 分为“基本信息”（地址、端口、用户，下一行名称、分组）、
+  “登录方式”（密钥文件、密码/口令）与折叠的“高级”各组；RDP/VNC/串口连接对话框分为“基本信息”与“选项”两组。Tab 顺序随分组
+  调整为与绘制顺序一致：SSH 为地址 → 端口 → 用户 → 名称 → 分组 → 密钥文件 → 密码 → （展开高级时）代理 → 启动命令 → 保活三项；
+  连接表单先走“基本信息”组的输入框（如 RDP 地址 → 端口 → 用户 → 域 → 名称 → 分组），再走“选项”组（RDP 共享文件夹、串口数据位），
+  归组由 `ConnectionFormField::is_basic` 决定；`ssh_host_dialog_tab_follows_the_drawn_order`、`rdp_` / `vnc_` / `serial_connection_dialog_tab_follows_the_drawn_order`
+  按输入框 bounds 的 y/x 排序后与 Tab / Shift+Tab 实际走过的顺序比较。登录方式分段控件不在文字框 Tab 环内（与 T8 前相同）。
+  除此之外，T8 只改了一处键盘相关的显示：设置导航的焦点环（见 1.0）。
 - **菜单**：`menu_entry` 与 `menu_item` 28 高（`a_menu_entry_is_one_compact_control_high`），菜单卡、跳板选择器的
   候选行同为 28；菜单卡与命令面板、tooltip、toast、远程桌面浮动条共用 `popover_surface`。
 - **命令面板**：宽 560、raised 浮层 + 圆角 8，结果 36 高并带生效键帽（`the_palette_is_560_wide_and_its_results_name_their_keys`）。

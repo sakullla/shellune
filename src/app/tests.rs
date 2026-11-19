@@ -944,6 +944,41 @@ async fn escape_walks_from_the_shortcut_page_to_the_categories_and_their_items(
     assert!(cx.debug_bounds("settings.card.import").is_some());
 }
 
+/// The chosen settings entry is marked by its fill and accent bar; the focus ring is
+/// drawn only while the navigation column itself has the keyboard (ADR-7).
+#[gpui::test]
+async fn the_chosen_settings_entry_is_ringed_only_while_the_column_has_the_keyboard(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    click(cx, "nav.settings");
+    let ringed = |cx: &mut VisualTestContext| {
+        cx.update(|_w, app| view.read(app).settings_nav_ringed_for_test())
+    };
+    assert!(!ringed(cx), "a pointer-opened page draws no ring");
+
+    // A key pressed while the page has the keyboard is not the column having it.
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert!(
+        !ringed(cx),
+        "the chosen entry is not ringed just because the last input was a key"
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        ringed(cx),
+        "the column has the keyboard and shows where it is"
+    );
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(!ringed(cx), "the ring leaves with the keyboard");
+}
+
 /// The shortcut page narrows by action name, by the combination in force and by scope (R16).
 #[gpui::test]
 async fn the_shortcut_page_searches_by_name_by_combination_and_by_scope(cx: &mut TestAppContext) {
@@ -31188,6 +31223,192 @@ async fn host_dialog_tab_and_shift_tab_walk_fields_in_visual_order(cx: &mut Test
     assert_eq!(saved[0].address(), "10.0.0.42");
     assert_eq!(saved[0].user(), "ubuntu");
     assert_eq!(saved[0].port().get(), 2200);
+}
+
+/// Walks Tab and Shift+Tab through a dialog's text fields and checks that each stop is
+/// the next field on screen - top to bottom, then left to right (ADR-7).
+///
+/// The fields are sorted by their drawn bounds; the walk starts in the first one,
+/// types a marker after every Tab and reads it back from the field it should have
+/// reached, then checks the ring closes in both directions.
+fn assert_tab_follows_drawn_order(
+    cx: &mut VisualTestContext,
+    what: &str,
+    selectors: &[&'static str],
+    text_of: impl Fn(&mut VisualTestContext, &'static str) -> String,
+) {
+    redraw(cx);
+    let mut drawn: Vec<(&'static str, gpui::Bounds<Pixels>)> = selectors
+        .iter()
+        .map(|selector| (*selector, bounds_of(cx, selector)))
+        .collect();
+    drawn.sort_by(|(_, a), (_, b)| {
+        (a.top(), a.left())
+            .partial_cmp(&(b.top(), b.left()))
+            .expect("bounds are numbers")
+    });
+    let drawn: Vec<&'static str> = drawn.into_iter().map(|(selector, _)| selector).collect();
+    assert!(drawn.len() > 3, "{what} has more than one row of fields");
+
+    let mark = |cx: &mut VisualTestContext, keys: &str, target: &'static str, label: &str| {
+        cx.simulate_keystrokes(keys);
+        cx.run_until_parked();
+        let marker = format!("~{label}");
+        cx.simulate_input(&marker);
+        cx.run_until_parked();
+        let text = text_of(cx, target);
+        assert!(
+            text.contains(&marker),
+            "{what}: {keys} ({label}) should reach {target}, which holds {text:?}; drawn order {drawn:?}"
+        );
+    };
+    click(cx, drawn[0]);
+    for (step, selector) in drawn.iter().enumerate().skip(1) {
+        mark(cx, "tab", selector, &step.to_string());
+    }
+    // The ring closes: Tab from the last field returns to the first, Shift+Tab goes back.
+    mark(cx, "tab", drawn[0], "wrap");
+    mark(cx, "shift-tab", drawn[drawn.len() - 1], "back");
+}
+
+/// The SSH host dialog: the basics group (address, port, user, name, group), then the
+/// sign-in group (key file, passphrase), then every folded-away group in its order.
+#[gpui::test]
+async fn ssh_host_dialog_tab_follows_the_drawn_order(cx: &mut TestAppContext) {
+    use crate::app::hosts::{ConnectionField, HostField};
+
+    let dir = TempDir::new("ssh-dialog-tab");
+    seed(&dir.store(), Vec::new());
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+
+    click(cx, "hosts.new");
+    // A key with a passphrase shows both sign-in fields; an override shows the three
+    // keepalive numbers, so every text field the dialog can draw is on screen.
+    click(cx, "hosts.auth.remote.method.key");
+    click(cx, "hosts.key.passphrase");
+    click(cx, "hosts.advanced");
+    click(cx, "hosts.editor.connection.override");
+
+    let host_fields = [
+        HostField::Address,
+        HostField::Port,
+        HostField::User,
+        HostField::Name,
+        HostField::Group,
+        HostField::IdentityFile,
+        HostField::Secret,
+        HostField::ProxyCommand,
+        HostField::StartupCommand,
+    ];
+    let connection_fields = [
+        ConnectionField::KeepaliveInterval,
+        ConnectionField::KeepaliveMisses,
+        ConnectionField::ConnectTimeout,
+    ];
+    let connection_selector = |field: ConnectionField| match field {
+        ConnectionField::KeepaliveInterval => "hosts.connection.keepalive-interval",
+        ConnectionField::KeepaliveMisses => "hosts.connection.keepalive-misses",
+        ConnectionField::ConnectTimeout => "hosts.connection.connect-timeout",
+    };
+    let mut selectors: Vec<&'static str> = host_fields
+        .iter()
+        .map(|field| field.debug_selector())
+        .collect();
+    selectors.extend(
+        connection_fields
+            .iter()
+            .map(|field| connection_selector(*field)),
+    );
+
+    assert_tab_follows_drawn_order(cx, "ssh", &selectors, |cx, selector| {
+        let draft = cx
+            .update(|_window, app| view.read(app).hosts_state().draft().cloned())
+            .expect("the host form is open");
+        if let Some(field) = host_fields
+            .iter()
+            .find(|field| field.debug_selector() == selector)
+        {
+            return draft.text(*field).to_owned();
+        }
+        let field = connection_fields
+            .iter()
+            .find(|field| connection_selector(**field) == selector)
+            .expect("every selector is a field of the form");
+        draft.connection().text(*field).to_owned()
+    });
+}
+
+/// Opens a new connection form of one protocol and walks its typed fields.
+fn assert_connection_tab_follows_drawn_order(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+    protocol: &'static str,
+) {
+    use crate::app::hosts::ConnectionFormField;
+
+    click(cx, "hosts.new");
+    click(cx, protocol);
+    let fields: Vec<ConnectionFormField> = cx.update(|_window, app| {
+        view.read(app)
+            .hosts_state()
+            .protocol_draft()
+            .map(|draft| {
+                draft
+                    .fields()
+                    .iter()
+                    .copied()
+                    .filter(|field| field.is_text())
+                    .collect()
+            })
+            .expect("the connection form is open")
+    });
+    let selectors: Vec<&'static str> = fields.iter().map(|field| field.debug_selector()).collect();
+    assert_tab_follows_drawn_order(cx, protocol, &selectors, |cx, selector| {
+        let field = *fields
+            .iter()
+            .find(|field| field.debug_selector() == selector)
+            .expect("every selector is a field of the form");
+        cx.update(|_window, app| {
+            view.read(app)
+                .hosts_state()
+                .protocol_draft()
+                .map(|draft| draft.text(field).to_owned())
+                .expect("the connection form is open")
+        })
+    });
+    click(cx, "connection.cancel");
+}
+
+/// RDP: address, port, user, domain, name, group in the basics group, then the folder.
+#[gpui::test]
+async fn rdp_connection_dialog_tab_follows_the_drawn_order(cx: &mut TestAppContext) {
+    let dir = TempDir::new("rdp-dialog-tab");
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    assert_connection_tab_follows_drawn_order(&view, cx, "connection.protocol.rdp");
+}
+
+/// VNC: address, port, name, group - one group of typed fields.
+#[gpui::test]
+async fn vnc_connection_dialog_tab_follows_the_drawn_order(cx: &mut TestAppContext) {
+    let dir = TempDir::new("vnc-dialog-tab");
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    assert_connection_tab_follows_drawn_order(&view, cx, "connection.protocol.vnc");
+}
+
+/// Serial: device, baud, name, group in the basics group, then the data bits.
+#[gpui::test]
+async fn serial_connection_dialog_tab_follows_the_drawn_order(cx: &mut TestAppContext) {
+    let dir = TempDir::new("serial-dialog-tab");
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    assert_connection_tab_follows_drawn_order(&view, cx, "connection.protocol.serial");
 }
 
 #[gpui::test]

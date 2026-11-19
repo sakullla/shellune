@@ -7016,6 +7016,10 @@ impl ShelluneView {
     }
 
     /// Wires Tab and Shift+Tab across whichever SSH host fields are currently visible.
+    ///
+    /// The ring follows the order the dialog draws the fields in (ADR-7): the basics
+    /// group - address, port, user, then name and group - before the sign-in group,
+    /// then the folded-away groups in their own order.
     fn bind_host_dialog_tab_ring(&self, cx: &mut Context<Self>) {
         let (Some(fields), Some(conn_fields)) = (
             self.host_fields.as_ref(),
@@ -7027,10 +7031,10 @@ impl ShelluneView {
             fields.address.clone(),
             fields.port.clone(),
             fields.user.clone(),
-            fields.identity.clone(),
-            fields.secret.clone(),
             fields.name.clone(),
             fields.group.clone(),
+            fields.identity.clone(),
+            fields.secret.clone(),
             fields.proxy.clone(),
             fields.startup.clone(),
             conn_fields.interval.clone(),
@@ -7053,6 +7057,8 @@ impl ShelluneView {
                     fields.address.clone(),
                     fields.port.clone(),
                     fields.user.clone(),
+                    fields.name.clone(),
+                    fields.group.clone(),
                 ];
                 if draft.auth().needs_key_path() {
                     visible.push(fields.identity.clone());
@@ -7060,8 +7066,6 @@ impl ShelluneView {
                 if draft.needs_secret() {
                     visible.push(fields.secret.clone());
                 }
-                visible.push(fields.name.clone());
-                visible.push(fields.group.clone());
                 if view.host_advanced {
                     visible.push(fields.proxy.clone());
                     visible.push(fields.startup.clone());
@@ -7217,12 +7221,15 @@ impl ShelluneView {
             baud,
             data_bits,
         });
-        let typed: Vec<ConnectionFormField> = draft
+        let mut typed: Vec<ConnectionFormField> = draft
             .fields()
             .iter()
             .copied()
             .filter(|field| field.is_text())
             .collect();
+        // The basics group is drawn above the options group, so Tab walks it first;
+        // the sort is stable and keeps each group in the order it is drawn.
+        typed.sort_by_key(|field| !field.is_basic());
         let mut ring = Vec::with_capacity(typed.len());
         for field in typed {
             if let Some(entity) = self

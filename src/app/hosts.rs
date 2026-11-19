@@ -3176,6 +3176,34 @@ impl ConnectionFormField {
                 | Self::DataBits
         )
     }
+
+    /// Whether the form draws the field in its first group - where, who and what to
+    /// call it - rather than among the choices the protocol offers (ADR-7).
+    ///
+    /// Tab walks the first group before the second, so the keyboard visits the fields
+    /// in the order they appear on screen.
+    #[must_use]
+    pub fn is_basic(self) -> bool {
+        match self {
+            Self::Name
+            | Self::Group
+            | Self::Address
+            | Self::Port
+            | Self::User
+            | Self::Domain
+            | Self::Device
+            | Self::Baud => true,
+            Self::Certificate
+            | Self::Security
+            | Self::Clipboard
+            | Self::DriveFolder
+            | Self::DataBits
+            | Self::Parity
+            | Self::StopBits
+            | Self::Flow
+            | Self::LocalEcho => false,
+        }
+    }
 }
 
 /// A connection form built for the protocol it names.
