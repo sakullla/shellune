@@ -605,6 +605,55 @@ fn integration_session() -> Option<Session> {
     Session::start()
 }
 
+#[test]
+fn history_completion_in_a_local_bash_line_editor() {
+    let bash = if cfg!(windows) {
+        git_install_path("bash")
+    } else {
+        Some("bash".to_owned())
+    };
+    let Some(mut session) =
+        bash.and_then(|bash| Session::start_program(&bash, &["--noprofile", "--norc", "-i"]))
+    else {
+        eprintln!("SKIPPED local completion: Bash PTY unavailable");
+        return;
+    };
+    // Real Bash/Readline owns the edit buffer and its command-name Tab binding.
+    // These per-process prompt markers never modify a startup file.
+    session.run(r#"PS1='\[\e]133;A\a\]local> \[\e]133;B\a\]'; PS0=$'\e]133;C\a'; PROMPT_COMMAND="printf '\033]133;D;0\a'""#);
+    session.run("echo local-completion");
+    session.poll_until("Bash recorded the executed command", |session, _, _| {
+        session
+            .core
+            .command_blocks()
+            .iter()
+            .any(|block| block.command == "echo local-completion" && block.status.is_success())
+    });
+    session.write(b"echo loc");
+    session.poll_until(
+        "the echoed local prefix has a history candidate",
+        |session, _, _| session.core.history_completion() == Some("al-completion"),
+    );
+    let suffix = session.core.history_completion().unwrap().to_owned();
+    session.write(suffix.as_bytes());
+    session.write(b"-edited\r");
+    session.poll_until("the edit and its output", |session, _, _| {
+        session.core.command_blocks().iter().any(|block| {
+            block.command == "echo local-completion-edited"
+                && block.output.contains("local-completion-edited")
+        })
+    });
+    session.write(b"pushdxyz");
+    session.wait_for("unmatched prefix echoed", contains("local> pushdxyz"));
+    assert_eq!(session.core.history_completion(), None);
+    session.write(b"\x15pushd\t/");
+    session.wait_for(
+        "Bash Tab completes the builtin name",
+        contains("local> pushd /"),
+    );
+    session.close();
+}
+
 fn osc(payload: &str) -> String {
     format!("\u{1b}]{payload}\u{7}")
 }

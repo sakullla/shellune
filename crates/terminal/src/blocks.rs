@@ -605,6 +605,18 @@ impl BlockBook {
         self.open.as_ref().and_then(|open| open.input_at)
     }
 
+    /// The latest executed command with a printable continuation. Control bytes
+    /// in a shell-reported command must never become input through completion.
+    pub(crate) fn history_suffix(&self, prefix: &str) -> Option<&str> {
+        self.finished.iter().rev().find_map(|block| {
+            if block.duration.is_none() && !matches!(block.status, BlockStatus::Exited(_)) {
+                return None;
+            }
+            let suffix = block.command.strip_prefix(prefix)?;
+            (!suffix.is_empty() && !suffix.chars().any(char::is_control)).then_some(suffix)
+        })
+    }
+
     pub(crate) fn output_anchor(&self) -> Option<GridAnchor> {
         self.open.as_ref().and_then(|open| open.output_at)
     }

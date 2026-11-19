@@ -736,6 +736,105 @@ fn remote_shell_integration_markers_are_command_blocks_and_not_the_process_exit(
     );
 }
 
+#[test]
+fn history_completion_and_remote_path_tab_in_an_ssh_shell() {
+    // A supplied disposable loopback sshd also exercises this case on hosts
+    // without the default WSL distribution. Its host key is pinned out of band.
+    let mut session = if let Ok(port) = std::env::var("SHELLUNE_COMPLETION_FIXTURE_PORT") {
+        let setting = |name| {
+            std::env::var(format!("SHELLUNE_COMPLETION_FIXTURE_{name}"))
+                .expect("missing SSH fixture setting")
+        };
+        RemoteSession::connect(ConnectRequest::new(
+            "127.0.0.1",
+            port.parse().expect("invalid SSH fixture port"),
+            setting("USER"),
+            AuthMethod::password(setting("PASSWORD")),
+            PtySize::new(100, 30),
+            trusted(&setting("FP")),
+        ))
+    } else {
+        if skip("remote completion") {
+            return;
+        }
+        let server = shared().as_ref().expect("a server");
+        connect(
+            server,
+            password(server),
+            trusted(&server.host_key_fingerprint()),
+        )
+    };
+    assert!(matches!(
+        wait_for_outcome(&mut session),
+        RemoteEvent::Connected
+    ));
+    let mut core = TerminalCore::new(100, 30, 2000);
+    // Run a real interactive line editor, with a file which exists only inside
+    // the disposable SSH server. Prompt hooks are scoped to the child shell.
+    session.write(b"exec bash --noprofile --norc -i\n").unwrap();
+    session.write(br#"cd "$(mktemp -d)" && touch shellune-remote-only; PS1='\[\e]133;A\a\]remote> \[\e]133;B\a\]'; PS0=$'\e]133;C\a'; PROMPT_COMMAND="printf '\033]133;D;0\a'"
+"#).unwrap();
+    session.write(b"echo remote-completion\n").unwrap();
+    wait_remote(
+        &mut session,
+        &mut core,
+        "the remote command entered history",
+        |core| {
+            core.command_blocks()
+                .iter()
+                .any(|block| block.command == "echo remote-completion" && block.status.is_success())
+        },
+    );
+    session.write(b"echo rem").unwrap();
+    wait_remote(
+        &mut session,
+        &mut core,
+        "the remote history candidate",
+        |core| core.history_completion() == Some("ote-completion"),
+    );
+    session
+        .write(core.history_completion().unwrap().as_bytes())
+        .unwrap();
+    session.write(b"-edited\n").unwrap();
+    wait_remote(
+        &mut session,
+        &mut core,
+        "the edited command executed remotely",
+        |core| {
+            core.command_blocks().iter().any(|block| {
+                block.command == "echo remote-completion-edited"
+                    && block.output.contains("remote-completion-edited")
+            })
+        },
+    );
+    session.write(b"cat shellune-remo").unwrap();
+    wait_remote(
+        &mut session,
+        &mut core,
+        "the remote-only path prefix",
+        |core| {
+            core.snapshot()
+                .text()
+                .iter()
+                .any(|line| line.contains("remote> cat shellune-remo"))
+        },
+    );
+    assert_eq!(core.history_completion(), None);
+    session.write(b"\t").unwrap();
+    wait_remote(
+        &mut session,
+        &mut core,
+        "remote Bash completes its own filename",
+        |core| {
+            core.snapshot()
+                .text()
+                .iter()
+                .any(|line| line.contains("remote> cat shellune-remote-only"))
+        },
+    );
+    session.write(b"\x15exit\n").unwrap();
+}
+
 fn pump_remote(session: &mut RemoteSession, core: &mut TerminalCore) -> bool {
     let mut exited = false;
     for event in session.drain() {

@@ -17,6 +17,7 @@
 //! * a snapshot is a faithful picture of the grid: hidden cells stay hidden, wide
 //!   characters occupy two columns, and a selection is reported per cell.
 
+use std::hash::{DefaultHasher, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -362,6 +363,25 @@ impl Snapshot {
     }
 }
 
+// The shell echoes edits asynchronously, especially over SSH. Only fingerprints
+// are kept while waiting: completion never records a stream of user keystrokes.
+#[derive(Default)]
+enum CompletionEcho {
+    #[default]
+    Ready,
+    Appended(DefaultHasher),
+    Changed(u64),
+    NextPrompt,
+}
+
+fn prefix_hash(text: &str) -> DefaultHasher {
+    let mut hash = DefaultHasher::new();
+    for byte in text.bytes() {
+        hash.write_u8(byte);
+    }
+    hash
+}
+
 /// Terminal state for one session.
 pub struct TerminalCore {
     term: Term<EffectSink>,
@@ -379,6 +399,7 @@ pub struct TerminalCore {
     directory: Option<WorkingDirectory>,
     /// Command blocks built from those markers. Not from prompt text.
     blocks: BlockBook,
+    completion_echo: CompletionEcho,
     /// Classic, or command blocks when the shell actually reports them.
     presentation: TerminalMode,
     /// Lines dropped from the front of history, so anchors survive a full scrollback.
@@ -415,6 +436,7 @@ impl TerminalCore {
             splitter: IntegrationSplitter::new(),
             directory: None,
             blocks: BlockBook::new(),
+            completion_echo: CompletionEcho::Ready,
             presentation: TerminalMode::Classic,
             lines_dropped: 0,
             last_history: 0,
@@ -924,7 +946,7 @@ impl TerminalCore {
                         let scraped = self
                             .blocks
                             .input_anchor()
-                            .and_then(|anchor| self.text_between(anchor, self.anchor_now()));
+                            .and_then(|anchor| self.command_between(anchor, self.anchor_now()));
                         self.blocks.set_scraped_command(scraped);
                     }
                     if self.blocks.in_output() {
@@ -936,6 +958,7 @@ impl TerminalCore {
             }
             IntegrationEvent::InputStart => {
                 self.blocks.input_start(self.anchor_now());
+                self.completion_echo = CompletionEcho::Ready;
                 false
             }
             IntegrationEvent::CommandText(command) => {
@@ -948,7 +971,7 @@ impl TerminalCore {
                 } else {
                     self.blocks
                         .input_anchor()
-                        .and_then(|anchor| self.text_between(anchor, self.anchor_now()))
+                        .and_then(|anchor| self.command_between(anchor, self.anchor_now()))
                 };
                 self.blocks.output_start(scraped, self.anchor_now(), now);
                 false
@@ -986,6 +1009,101 @@ impl TerminalCore {
         GridAnchor {
             stable: self.stable_line(point.line.0),
             column: point.column.0,
+        }
+    }
+
+    /// Visible, echoed text from the shell's explicit input marker to the end
+    /// of the edited line. Leave multiline editors and ambiguous grids alone.
+    fn completion_prefix(&self) -> Option<String> {
+        if !self.blocks.in_input()
+            || self.blocks.failed()
+            || self.on_alternate_screen()
+            || self.display_offset() != 0
+            || !self.mode().contains(TermMode::SHOW_CURSOR)
+        {
+            return None;
+        }
+        let anchor = self.blocks.input_anchor()?;
+        let grid = self.term.grid();
+        let cursor = &grid.cursor;
+        let point = cursor.point;
+        if anchor.stable != self.stable_line(point.line.0)
+            || anchor.column > point.column.0
+            || cursor.input_needs_wrap
+        {
+            return None;
+        }
+        let row = &grid[point.line];
+        // An arrow key in the middle of a command belongs to the line editor.
+        if (point.column.0..self.grid.cols).any(|column| {
+            let cell = &row[Column(column)];
+            cell.c != ' ' || cell.zerowidth().is_some()
+        }) {
+            return None;
+        }
+        let mut prefix = String::new();
+        for column in anchor.column..point.column.0 {
+            let cell = &row[Column(column)];
+            if cell.flags.contains(Flags::HIDDEN) || cell.c.is_control() {
+                return None;
+            }
+            if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                prefix.push(cell.c);
+                if let Some(combining) = cell.zerowidth() {
+                    prefix.extend(combining.iter());
+                }
+            }
+        }
+        Some(prefix)
+    }
+
+    /// Printable suffix the user can accept at the current shell prompt.
+    #[must_use]
+    pub fn history_completion(&self) -> Option<&str> {
+        let prefix = self.completion_prefix()?;
+        if prefix.trim().is_empty() {
+            return None;
+        }
+        let seen = prefix_hash(&prefix).finish();
+        match &self.completion_echo {
+            CompletionEcho::Appended(expected) if expected.finish() != seen => None,
+            CompletionEcho::Changed(previous) if *previous == seen => None,
+            CompletionEcho::NextPrompt => None,
+            _ => self.blocks.history_suffix(&prefix),
+        }
+    }
+
+    /// Hold a hint until the PTY echoes this edit. A submission closes the
+    /// input period immediately even if an SSH round trip is still pending.
+    pub fn note_command_input(&mut self, bytes: &[u8]) {
+        if !self.blocks.in_input() || matches!(self.completion_echo, CompletionEcho::NextPrompt) {
+            return;
+        }
+        if bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n' | 3)) {
+            self.completion_echo = CompletionEcho::NextPrompt;
+            return;
+        }
+        let Some(prefix) = self.completion_prefix() else {
+            return;
+        };
+        if std::str::from_utf8(bytes).is_ok_and(|text| !text.chars().any(char::is_control)) {
+            let mut hash = match std::mem::take(&mut self.completion_echo) {
+                CompletionEcho::Appended(previous) => previous,
+                _ => prefix_hash(&prefix),
+            };
+            for &byte in bytes {
+                hash.write_u8(byte);
+            }
+            self.completion_echo = CompletionEcho::Appended(hash);
+        } else {
+            self.completion_echo = CompletionEcho::Changed(prefix_hash(&prefix).finish());
+        }
+    }
+
+    /// Dismiss the current suggestion without sending Escape to the shell.
+    pub fn dismiss_history_completion(&mut self) {
+        if let Some(prefix) = self.completion_prefix() {
+            self.completion_echo = CompletionEcho::Changed(prefix_hash(&prefix).finish());
         }
     }
 
@@ -1033,6 +1151,32 @@ impl TerminalCore {
         } else {
             text
         })
+    }
+
+    fn command_between(&self, from: GridAnchor, to: GridAnchor) -> Option<String> {
+        let start = self.point_of(from)?;
+        let end = self.point_of(to)?;
+        let grid = self.term.grid();
+        for line in start.line.0..=end.line.0 {
+            let left = if line == start.line.0 {
+                start.column.0
+            } else {
+                0
+            };
+            let right = if line == end.line.0 {
+                end.column.0
+            } else {
+                grid.last_column().0
+            };
+            if (left..=right).any(|column| {
+                grid[Line(line)][Column(column)]
+                    .flags
+                    .contains(Flags::HIDDEN)
+            }) {
+                return None;
+            }
+        }
+        self.text_between(from, to)
     }
 
     fn text_between(&self, from: GridAnchor, to: GridAnchor) -> Option<String> {
@@ -2195,6 +2339,62 @@ mod tests {
         assert_eq!(blocks[1].status, BlockStatus::Exited(2));
         assert!(!blocks[1].status.is_success());
         assert_eq!(blocks[1].output, "again");
+    }
+
+    #[test]
+    fn history_completion_needs_a_live_prompt_and_echoed_input() {
+        let mut terminal = TerminalCore::new(80, 8, 100);
+        terminal.feed(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07echo hello\x1b]133;C\x07\r\nhello\r\n\x1b]133;D;0\x07",
+        );
+        terminal.feed(b"$ ech");
+        assert_eq!(terminal.history_completion(), None);
+        terminal.feed(b"\r\n\x1b]133;A\x07$ \x1b]133;B\x07");
+        terminal.note_command_input(b"e");
+        terminal.note_command_input(b"c");
+        terminal.feed(b"e");
+        assert_eq!(terminal.history_completion(), None);
+        terminal.feed(b"c");
+        assert_eq!(terminal.history_completion(), Some("ho hello"));
+        terminal.dismiss_history_completion();
+        assert_eq!(terminal.history_completion(), None);
+        terminal.note_command_input(b"h");
+        terminal.feed(b"h");
+        assert_eq!(terminal.history_completion(), Some("o hello"));
+        terminal.feed(b"\x1b[D");
+        assert_eq!(terminal.history_completion(), None);
+        terminal.feed(b"\x1b[C");
+        terminal.note_command_input(b"o hello");
+        assert_eq!(terminal.history_completion(), None);
+        terminal.feed(b"o hello");
+        assert_eq!(terminal.history_completion(), None);
+        terminal.feed(b"\x08 \x08");
+        assert_eq!(
+            terminal.history_completion(),
+            None,
+            "unexpected edits invalidate the expected echo"
+        );
+        terminal.note_command_input(b"\r");
+        terminal.feed(b"\x1b]133;C\x07\r\nPassword: ");
+        assert_eq!(terminal.history_completion(), None);
+        terminal.feed(b"\x1b]133;A\x07\r\n\x1b]133;B\x07ech");
+        assert_eq!(terminal.history_completion(), Some("o hello"));
+        terminal.feed(b"\x1b[?1049h");
+        assert_eq!(terminal.history_completion(), None);
+        let mut other = TerminalCore::new(80, 8, 100);
+        other.feed(b"\x1b]133;B\x07ech");
+        assert_eq!(other.history_completion(), None);
+    }
+
+    #[test]
+    fn history_completion_excludes_concealed_and_multiline_commands() {
+        let mut terminal = TerminalCore::new(80, 8, 100);
+        terminal.feed(b"\x1b]133;B\x07echo \x1b[8msecret\x1b[0m\x1b]133;C\x07\x1b]133;D;0\x07\r\n");
+        terminal.feed(
+            b"\x1b]133;B\x07\x1b]633;E;echo first\\x0asecond\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n",
+        );
+        terminal.feed(b"\x1b]133;B\x07echo");
+        assert_eq!(terminal.history_completion(), None);
     }
 
     #[test]

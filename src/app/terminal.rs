@@ -1903,7 +1903,9 @@ impl TerminalPane {
     /// when both really happened, which is the case a device that also echoes produces.
     fn write_user(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         let Some(serial) = self.serial.as_ref() else {
-            self.write(bytes, cx);
+            if self.write(bytes, cx) {
+                self.core.note_command_input(bytes);
+            }
             return;
         };
         let format = serial.format();
@@ -2106,6 +2108,21 @@ impl TerminalPane {
             }
         }
 
+        if plain
+            && !modifiers.shift
+            && matches!(keystroke.key.as_str(), "right" | "escape")
+            && let Some(suffix) = self.history_completion()
+        {
+            if keystroke.key == "right" {
+                let text = suffix.to_owned();
+                self.write_input(text.as_bytes(), cx);
+            } else {
+                self.core.dismiss_history_completion();
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if let Some(key) = Key::from_name(&keystroke.key)
             && let Some(bytes) = encode_key(key, modifiers, self.core.mode())
         {
@@ -4328,6 +4345,20 @@ impl TerminalPane {
         element.children(pieces)
     }
 
+    fn history_completion(&self) -> Option<&str> {
+        if !self.state.accepts_input()
+            || matches!(self.origin, PaneOrigin::Serial { .. })
+            || self.marked.is_some()
+            || self.search_open
+            || self.pending_paste.is_some()
+            || self.menu.is_some()
+            || self.more_menu.is_some()
+        {
+            return None;
+        }
+        self.core.history_completion()
+    }
+
     fn composition_overlay(&self, snapshot: &Snapshot) -> Option<gpui::Div> {
         let marked = self.marked.as_ref()?;
         let cell = self.cell.sanitized();
@@ -4974,6 +5005,25 @@ impl TerminalPane {
         }
         if let Some(overlay) = self.composition_overlay(&snapshot) {
             rows = rows.child(overlay);
+        } else if focused
+            && let Some(cursor) = snapshot.cursor
+            && let Some(suffix) = self.history_completion()
+        {
+            let cell = self.cell.sanitized();
+            rows = rows.child(
+                div()
+                    .absolute()
+                    .left(px(cursor.column as f32 * cell.width))
+                    .top(px(cursor.row as f32 * cell.height))
+                    .right_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .line_height(px(cell.height))
+                    .text_size(px(self.font_size))
+                    .text_color(theme::swatch(shell_palette::TEXT_MUTED))
+                    .debug_selector(|| "terminal.history-completion".to_owned())
+                    .child(SharedString::from(format!("{suffix}  →"))),
+            );
         }
 
         div()
@@ -5861,6 +5911,50 @@ mod ink_tests {
     #[test]
     fn text_hidden_on_purpose_stays_hidden() {
         assert_eq!(ink(rgb(0x334455), rgb(0x334455), false), rgb(0x334455));
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[gpui::test]
+    async fn history_completion_accepts_edits_and_preserves_tab(cx: &mut gpui::TestAppContext) {
+        let (pane, cx) = cx.add_window_view(|_, cx| {
+            TerminalPane::without_process(
+                LocalShell::new("Test shell", "test-shell"),
+                EventTag::new(shellune_core::SessionId::new(), 0),
+                GridSize::new(80, 24),
+                shellune_terminal::DEFAULT_FONT_SIZE,
+                Locale::English,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            window.focus(pane.read(app).focus_handle());
+            pane.update(app, |pane, cx| {
+                pane.feed_for_test(b"\x1b]133;B\x07echo hello\x1b]133;C\x07\r\nhello\r\n\x1b]133;D;0\x07$ \x1b]133;B\x07ec", cx);
+            });
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("terminal.history-completion").is_some());
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("terminal.history-completion").is_none());
+        cx.update(|_, app| pane.update(app, |pane, cx| pane.feed_for_test(b"h", cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("right");
+        cx.simulate_input("!");
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).sent().to_vec()),
+            b"o hello!"
+        );
+        cx.simulate_keystrokes("tab enter");
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).sent().to_vec()),
+            b"o hello!\t\r"
+        );
     }
 }
 
