@@ -29,21 +29,41 @@ const IRP_MJ_CREATE: u32 = 0;
 const IRP_MJ_CLOSE: u32 = 2;
 const IRP_MJ_READ: u32 = 3;
 const IRP_MJ_WRITE: u32 = 4;
+const IRP_MJ_SET_INFORMATION: u32 = 6;
+const IRP_MJ_DIRECTORY_CONTROL: u32 = 12;
+const IRP_MN_QUERY_DIRECTORY: u32 = 1;
+
+/// Create options this channel honours.
+const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
+
+/// The information class of a rename.
+const FILE_RENAME_INFORMATION: u32 = 10;
 
 const STATUS_SUCCESS: u32 = 0;
 const STATUS_NOT_SUPPORTED: u32 = 0xc000_00bb;
 const STATUS_ACCESS_DENIED: u32 = 0xc000_0022;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xc000_0034;
 const STATUS_INVALID_PARAMETER: u32 = 0xc000_000d;
+const STATUS_NO_MORE_FILES: u32 = 0x8000_001a;
+const STATUS_NOT_A_DIRECTORY: u32 = 0xc000_010e;
 
 /// How many files the server may hold open at once; beyond it a create fails
 /// instead of growing without bound.
 const MAX_OPEN: usize = 64;
 
+/// One file the server has open, with what it takes to close it properly.
+struct Open {
+    handle: File,
+    path: PathBuf,
+    directory: bool,
+    delete_on_close: bool,
+}
+
 pub(super) struct Drive {
     folder: Option<PathBuf>,
     emit: super::Emit,
-    open: HashMap<u32, File>,
+    open: HashMap<u32, Open>,
     next_file: u32,
 }
 
@@ -107,8 +127,8 @@ impl Drive {
                 let file = p.le32()?;
                 let completion = p.le32()?;
                 let major = p.le32()?;
-                let _minor = p.le32()?;
-                let (status, data) = self.request(major, file, &mut p)?;
+                let minor = p.le32()?;
+                let (status, data) = self.request(major, minor, file, &mut p)?;
                 let mut answer = Vec::with_capacity(data.len() + 12);
                 answer.extend_from_slice(&device.to_le_bytes());
                 answer.extend_from_slice(&completion.to_le_bytes());
@@ -167,7 +187,13 @@ impl Drive {
         self.send(ch, out, id, PAKID_CORE_DEVICELIST_ANNOUNCE, &[&list])
     }
 
-    fn request(&mut self, major: u32, file: u32, p: &mut Packet<'_>) -> io::Result<(u32, Vec<u8>)> {
+    fn request(
+        &mut self,
+        major: u32,
+        minor: u32,
+        file: u32,
+        p: &mut Packet<'_>,
+    ) -> io::Result<(u32, Vec<u8>)> {
         let Some(root) = self.folder.clone() else {
             return Ok((STATUS_ACCESS_DENIED, Vec::new()));
         };
@@ -178,7 +204,7 @@ impl Drive {
                 let _attributes = p.le32()?;
                 let _shared = p.le32()?;
                 let disposition = p.le32()?;
-                let _options = p.le32()?;
+                let options = p.le32()?;
                 let length =
                     usize::try_from(p.le32()?).map_err(|_| invalid("RDPDR path too long"))?;
                 let path = utf16(p.take(length)?)?;
@@ -189,24 +215,30 @@ impl Drive {
                     Ok(path) => path,
                     Err(status) => return Ok((status, Vec::new())),
                 };
-                let opened = match disposition {
-                    1 => OpenOptions::new().read(true).open(&resolved),
-                    0 | 2 => OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create(true)
-                        .open(&resolved),
-                    3 => OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&resolved),
-                    _ => return Ok((STATUS_INVALID_PARAMETER, Vec::new())),
+                let directory = options & FILE_DIRECTORY_FILE != 0
+                    || resolved
+                        .metadata()
+                        .map(|meta| meta.is_dir())
+                        .unwrap_or(false);
+                let delete_on_close = options & FILE_DELETE_ON_CLOSE != 0;
+                let opened = if directory {
+                    open_directory(&resolved, disposition)
+                } else {
+                    open_file(&resolved, disposition)
                 };
                 match opened {
                     Ok(handle) => {
                         let id = self.next_file;
                         self.next_file = self.next_file.wrapping_add(1).max(1);
-                        self.open.insert(id, handle);
+                        self.open.insert(
+                            id,
+                            Open {
+                                handle,
+                                path: resolved,
+                                directory,
+                                delete_on_close,
+                            },
+                        );
                         let mut data = id.to_le_bytes().to_vec();
                         data.push(1); // FILE_OPENED
                         Ok((STATUS_SUCCESS, data))
@@ -220,12 +252,15 @@ impl Drive {
                     return Ok((STATUS_INVALID_PARAMETER, Vec::new()));
                 }
                 let offset = u64::from_le_bytes(p.take(8)?.try_into().unwrap());
-                let Some(handle) = self.open.get_mut(&file) else {
+                let Some(open) = self.open.get_mut(&file) else {
                     return Ok((STATUS_INVALID_PARAMETER, Vec::new()));
                 };
+                if open.directory {
+                    return Ok((STATUS_INVALID_PARAMETER, Vec::new()));
+                }
                 let mut buffer = vec![0; length];
-                handle.seek(SeekFrom::Start(offset))?;
-                let read = handle.read(&mut buffer)?;
+                open.handle.seek(SeekFrom::Start(offset))?;
+                let read = open.handle.read(&mut buffer)?;
                 buffer.truncate(read);
                 Ok((STATUS_SUCCESS, buffer))
             }
@@ -233,11 +268,14 @@ impl Drive {
                 let length = usize::try_from(p.le32()?).unwrap_or(0);
                 let offset = u64::from_le_bytes(p.take(8)?.try_into().unwrap());
                 let data = p.take(length)?;
-                let Some(handle) = self.open.get_mut(&file) else {
+                let Some(open) = self.open.get_mut(&file) else {
                     return Ok((STATUS_INVALID_PARAMETER, Vec::new()));
                 };
-                handle.seek(SeekFrom::Start(offset))?;
-                handle.write_all(data)?;
+                if open.directory {
+                    return Ok((STATUS_INVALID_PARAMETER, Vec::new()));
+                }
+                open.handle.seek(SeekFrom::Start(offset))?;
+                open.handle.write_all(data)?;
                 Ok((
                     STATUS_SUCCESS,
                     u32::try_from(data.len())
@@ -247,10 +285,95 @@ impl Drive {
                 ))
             }
             IRP_MJ_CLOSE => {
-                self.open.remove(&file);
+                if let Some(open) = self.open.remove(&file) {
+                    if open.delete_on_close {
+                        let Open { handle, path, .. } = open;
+                        drop(handle);
+                        let _ = if path.is_dir() {
+                            fs::remove_dir_all(&path)
+                        } else {
+                            fs::remove_file(&path)
+                        };
+                    }
+                }
                 Ok((STATUS_SUCCESS, Vec::new()))
             }
+            IRP_MJ_DIRECTORY_CONTROL if minor == IRP_MN_QUERY_DIRECTORY => {
+                self.query_directory(&root, p)
+            }
+            IRP_MJ_SET_INFORMATION => self.set_information(&root, file, p),
             _ => Ok((STATUS_NOT_SUPPORTED, Vec::new())),
+        }
+    }
+
+    /// Lists a directory the server names. The pattern is the last part of the
+    /// path, and the directory it names is resolved like any other: a link that
+    /// leads out of the folder is refused, not listed.
+    fn query_directory(&mut self, root: &Path, p: &mut Packet<'_>) -> io::Result<(u32, Vec<u8>)> {
+        let _class = p.le32()?;
+        let initial = p.u8()?;
+        let length = usize::try_from(p.le32()?).map_err(|_| invalid("RDPDR path too long"))?;
+        // The rest of the fixed part is padding the protocol defines.
+        p.take(23)?;
+        let path = utf16(p.take(length)?)?;
+        if initial == 0 {
+            return Ok((STATUS_NO_MORE_FILES, Vec::new()));
+        }
+        let (directory, pattern) = split_pattern(&path);
+        let directory = match resolve(root, &directory) {
+            Ok(path) => path,
+            Err(status) => return Ok((status, Vec::new())),
+        };
+        if !directory.is_dir() {
+            return Ok((STATUS_NOT_A_DIRECTORY, Vec::new()));
+        }
+        let mut data = Vec::new();
+        let mut previous = None;
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !matches_pattern(&pattern, &name) {
+                continue;
+            }
+            let meta = entry.metadata()?;
+            match push_entry(&mut data, previous, &name, meta.is_dir(), meta.len()) {
+                Some(begin) => previous = Some(begin),
+                None => break,
+            }
+        }
+        Ok((STATUS_SUCCESS, data))
+    }
+
+    /// Renames one open file inside the folder. The new name is resolved like an
+    /// open, so a rename can never move a file out through a link.
+    fn set_information(
+        &mut self,
+        root: &Path,
+        file: u32,
+        p: &mut Packet<'_>,
+    ) -> io::Result<(u32, Vec<u8>)> {
+        let class = p.le32()?;
+        let length = usize::try_from(p.le32()?).map_err(|_| invalid("RDPDR rename too long"))?;
+        p.take(24)?;
+        if class != FILE_RENAME_INFORMATION {
+            return Ok((STATUS_NOT_SUPPORTED, Vec::new()));
+        }
+        let mut info = Packet(p.take(length)?);
+        let _replace_if_exists = info.u8()?;
+        let _root_directory = info.u8()?;
+        let name_length =
+            usize::try_from(info.le32()?).map_err(|_| invalid("RDPDR name too long"))?;
+        let name = utf16(info.take(name_length)?)?;
+        let Some(open) = self.open.get(&file) else {
+            return Ok((STATUS_INVALID_PARAMETER, Vec::new()));
+        };
+        let target = match resolve(root, &name) {
+            Ok(path) => path,
+            Err(status) => return Ok((status, Vec::new())),
+        };
+        match fs::rename(&open.path, &target) {
+            Ok(()) => Ok((STATUS_SUCCESS, Vec::new())),
+            Err(error) => Ok((status_of(&error), Vec::new())),
         }
     }
 
@@ -271,8 +394,20 @@ impl Drive {
         ch.send(out, channel, &message)
     }
 
+    /// Ends the channel: every handle is closed, and a file opened to be deleted on
+    /// close goes now rather than staying behind.
     pub(super) fn close(&mut self, _ch: &Channels, _out: &mut impl Write) -> io::Result<()> {
-        self.open.clear();
+        for (_, open) in self.open.drain() {
+            if open.delete_on_close {
+                let Open { handle, path, .. } = open;
+                drop(handle);
+                let _ = if path.is_dir() {
+                    fs::remove_dir_all(&path)
+                } else {
+                    fs::remove_file(&path)
+                };
+            }
+        }
         Ok(())
     }
 }
@@ -381,12 +516,143 @@ pub(crate) fn probe_requests(folder: &std::path::Path, requests: &[ProbeRequest<
             file = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         }
         statuses.push(status);
-        if !request.on_file {
-            // A request that does not name the open file still owns the handle it
-            // was answered with; keep it for the next one.
-        }
+        let _ = request.on_file;
     }
+    // Releasing the device closes what is still open, which is also what deletes a
+    // file that was opened to be deleted on close.
+    let _ = drive.close(&channels, &mut out);
     statuses
+}
+
+/// Opens a file the way the disposition asks: 1 opens an existing one, 2 and 0
+/// open or create, 3 creates a new one.
+fn open_file(path: &Path, disposition: u32) -> io::Result<File> {
+    match disposition {
+        1 => OpenOptions::new().read(true).open(path),
+        0 | 2 => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path),
+        3 => OpenOptions::new().write(true).create_new(true).open(path),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported RDPDR disposition",
+        )),
+    }
+}
+
+/// Opens a directory, creating it when the disposition asks for a new one. A
+/// directory needs a flag on Windows that a plain open never passes.
+fn open_directory(path: &Path, disposition: u32) -> io::Result<File> {
+    if matches!(disposition, 2 | 3) && !path.exists() {
+        fs::create_dir(path)?;
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0200_0000); // FILE_FLAG_BACKUP_SEMANTICS
+    }
+    options.open(path)
+}
+
+/// Splits a device path into the directory and the last name part, which is a
+/// pattern in a listing request.
+fn split_pattern(path: &str) -> (String, String) {
+    let normalized = path.replace('/', "\\");
+    match normalized.rfind('\\') {
+        Some(index) => (
+            normalized[..index].to_owned(),
+            normalized[index + 1..].to_owned(),
+        ),
+        None => (normalized, "*".to_owned()),
+    }
+}
+
+/// Matches the name patterns an RDP client sends: `*`, `*.*` and an exact name.
+/// Anything more elaborate is left out rather than guessed at.
+fn matches_pattern(pattern: &str, name: &str) -> bool {
+    if pattern.is_empty() || pattern == "*" || pattern == "*.*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return name.starts_with(prefix);
+    }
+    pattern.eq_ignore_ascii_case(name)
+}
+
+/// Appends one FILE_BOTH_DIR_INFORMATION entry, linking it to the one before.
+/// Returns the offset of the new entry, or `None` when the response is full.
+fn push_entry(
+    data: &mut Vec<u8>,
+    previous: Option<usize>,
+    name: &str,
+    directory: bool,
+    size: u64,
+) -> Option<usize> {
+    let units: Vec<u16> = name.encode_utf16().collect();
+    // A listing that would not fit is cut short rather than sent oversized.
+    if data.len() + 94 + units.len() * 2 > 16 * 1024 {
+        return None;
+    }
+    let begin = data.len();
+    if let Some(previous) = previous {
+        let offset = u32::try_from(begin - previous).unwrap_or(0);
+        data[previous..previous + 4].copy_from_slice(&offset.to_le_bytes());
+    }
+    data.resize(begin + 94 + units.len() * 2, 0);
+    let entry = &mut data[begin..];
+    entry[0..4].copy_from_slice(&0u32.to_le_bytes()); // NextEntryOffset, set later
+    entry[4..8].copy_from_slice(&0u32.to_le_bytes()); // FileIndex
+    entry[40..48].copy_from_slice(&if directory { 0 } else { size }.to_le_bytes());
+    entry[48..56].copy_from_slice(&size.to_le_bytes());
+    let attributes: u32 = if directory { 0x10 } else { 0x80 };
+    entry[56..60].copy_from_slice(&attributes.to_le_bytes());
+    let bytes = u32::try_from(units.len() * 2).unwrap_or(0);
+    entry[60..64].copy_from_slice(&bytes.to_le_bytes());
+    entry[64..68].copy_from_slice(&0u32.to_le_bytes()); // EaSize
+    entry[68] = 0; // ShortNameLength
+    entry[69] = 0; // Reserved
+    for (slot, unit) in entry[94..].chunks_exact_mut(2).zip(units.iter()) {
+        slot.copy_from_slice(&unit.to_le_bytes());
+    }
+    Some(begin)
+}
+
+/// Test hook: runs the drive channel's device exchange with a server that replies
+/// with `result` (0 accepts the device), and returns the events it reported.
+pub(crate) fn probe_drive_reply(folder: &str, result: u32) -> Vec<Event> {
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&events);
+    let emit: super::Emit = std::sync::Arc::new(move |event| {
+        if let Ok(mut slot) = sink.lock() {
+            slot.push(event);
+        }
+    });
+    let mut drive = Drive::new(Some(std::path::PathBuf::from(folder)), emit);
+    let channels = Channels {
+        user: 1005,
+        global: 1003,
+        clipboard: None,
+        drive: Some(1006),
+    };
+    let mut out = Vec::new();
+    // SERVER_ANNOUNCE: component, packet id, kind, version, client id.
+    let mut announce = vec![0x72, 0x44, 0, 0];
+    announce.extend_from_slice(&PAKID_CORE_SERVER_ANNOUNCE.to_le_bytes());
+    announce.extend_from_slice(&1u16.to_le_bytes());
+    announce.extend_from_slice(&2u32.to_le_bytes());
+    let _ = drive.on_data(&channels, &mut out, &announce);
+    // DEVICE_REPLY: component, packet id, kind, device id, result.
+    let mut reply = vec![0x72, 0x44, 0, 0];
+    reply.extend_from_slice(&PAKID_CORE_DEVICE_REPLY.to_le_bytes());
+    reply.extend_from_slice(&DEVICE_ID.to_le_bytes());
+    reply.extend_from_slice(&result.to_le_bytes());
+    let _ = drive.on_data(&channels, &mut out, &reply);
+    let events = events.lock().map(|slot| slot.clone()).unwrap_or_default();
+    events
 }
 
 fn folders(folder: &Path) -> Result<(), DriveProblem> {

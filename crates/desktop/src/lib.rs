@@ -1242,12 +1242,18 @@ pub fn abi_layout() -> [usize; 7] {
 /// copies, so a test proves the shipped behaviour on a machine with no server.
 #[doc(hidden)]
 pub mod probe {
-    use super::{Error, Event, ffi};
+    use super::{Event, ffi};
 
     /// The formats one local copy offers on the cliprdr channel, and the bytes each
     /// carries, through the session's own conversion.
     pub fn rdp_clipboard_offer(entries: &[super::ClipboardEntry]) -> Vec<(u16, Vec<u8>)> {
         super::rdp::probe_offer(entries)
+    }
+
+    /// Runs the channel's offer path over `entries` and returns what it sent and the
+    /// events it reported.
+    pub fn rdp_clipboard_offer_events(entries: &[super::ClipboardEntry]) -> (Vec<u8>, Vec<Event>) {
+        super::rdp::probe_offer_events(entries)
     }
 
     /// Plays canned CLIPRDR messages through the session's receive path after
@@ -1336,48 +1342,10 @@ pub mod probe {
         Some(super::rdp::probe_requests(folder, &canned))
     }
 
-    /// One step of a scripted RDP session; times are milliseconds after it connected.
-    pub enum SessionStep {
-        /// The server says the user logged on.
-        Logon(u32),
-        /// The worker's periodic check runs.
-        Tick(u32),
-        /// The UI pushes a local copy.
-        ClipboardPush(u32),
-        /// The server's clipboard says it is ready (Monitor Ready).
-        ClipboardReady,
-        /// The server fails this client's format list.
-        ClipboardFail,
-        /// The server opens device redirection (Server Announce).
-        DevicesOpened,
-        /// The server answers the drive with this result code.
-        DriveReply(u32),
-    }
-
-    /// Plays the steps against an RDP session's own handlers with this client's
-    /// clipboard and drive options; the notices arrive on the client's event stream
-    /// as a session's would.
-    pub fn rdp_session(client: &super::DesktopClient, steps: &[SessionStep]) -> Result<(), Error> {
-        let raw: Vec<ffi::sd_probe_session_step> = steps
-            .iter()
-            .map(|step| {
-                let (kind, at_ms, value) = match *step {
-                    SessionStep::Logon(at) => (ffi::SD_PROBE_SESSION_LOGON, at, 0),
-                    SessionStep::Tick(at) => (ffi::SD_PROBE_SESSION_TICK, at, 0),
-                    SessionStep::ClipboardPush(at) => (ffi::SD_PROBE_SESSION_CLIP_PUSH, at, 0),
-                    SessionStep::ClipboardReady => (ffi::SD_PROBE_SESSION_CLIP_READY, 0, 0),
-                    SessionStep::ClipboardFail => (ffi::SD_PROBE_SESSION_CLIP_FAIL, 0, 0),
-                    SessionStep::DevicesOpened => (ffi::SD_PROBE_SESSION_RDPDR_ANNOUNCE, 0, 0),
-                    SessionStep::DriveReply(result) => {
-                        (ffi::SD_PROBE_SESSION_DRIVE_REPLY, 0, result)
-                    }
-                };
-                ffi::sd_probe_session_step { kind, at_ms, value }
-            })
-            .collect();
-        super::status(unsafe {
-            ffi::sd_probe_rdp_session(client.shim()?, raw.as_ptr(), raw.len() as u32)
-        })
+    /// Runs the drive channel's device exchange against `base` with a server that
+    /// answers `result`; returns the events it reported.
+    pub fn rdp_drive_reply(base: &str, result: u32) -> Vec<Event> {
+        super::rdp::probe_drive_reply(base, result)
     }
 
     /// Checks a folder the way an RDP attempt does before offering it as a drive:

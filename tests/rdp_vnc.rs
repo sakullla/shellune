@@ -41,6 +41,8 @@ const PATIENCE: Duration = Duration::from_secs(20);
 enum Kind {
     /// A Windows host with Remote Desktop.
     WindowsRdp,
+    /// An xrdp server that must not present a refused password as a session.
+    XrdpWrongPassword,
     /// An xrdp server.
     Xrdp,
     /// A VNC server that uses None or VncAuth.
@@ -55,9 +57,10 @@ enum Kind {
 
 impl Kind {
     /// Every endpoint this matrix requires, in the order the report lists them.
-    const ALL: [Kind; 6] = [
+    const ALL: [Kind; 7] = [
         Kind::WindowsRdp,
         Kind::Xrdp,
+        Kind::XrdpWrongPassword,
         Kind::Vnc,
         Kind::VncSecond,
         Kind::VncTls,
@@ -69,6 +72,7 @@ impl Kind {
         match self {
             Self::WindowsRdp => "RDP on Windows",
             Self::Xrdp => "RDP on xrdp",
+            Self::XrdpWrongPassword => "RDP with a refused password",
             Self::Vnc => "VNC (None or VncAuth)",
             Self::VncSecond => "VNC (second server)",
             Self::VncTls => "VNC over TLS or VeNCrypt",
@@ -79,7 +83,7 @@ impl Kind {
     /// The protocol the endpoint speaks.
     fn protocol(self) -> Protocol {
         match self {
-            Self::WindowsRdp | Self::Xrdp => Protocol::Rdp,
+            Self::WindowsRdp | Self::Xrdp | Self::XrdpWrongPassword => Protocol::Rdp,
             _ => Protocol::Vnc,
         }
     }
@@ -105,6 +109,12 @@ impl Kind {
                 "SHELLUNE_RDP_XRDP_PORT",
                 Some("SHELLUNE_RDP_XRDP_USER"),
                 "SHELLUNE_RDP_XRDP_PASSWORD",
+            ),
+            Self::XrdpWrongPassword => (
+                "SHELLUNE_RDP_XRDP_HOST",
+                "SHELLUNE_RDP_XRDP_PORT",
+                Some("SHELLUNE_RDP_XRDP_USER"),
+                "SHELLUNE_RDP_XRDP_BAD_PASSWORD",
             ),
             Self::Vnc => (
                 "SHELLUNE_VNC_HOST",
@@ -135,7 +145,7 @@ impl Kind {
 
     /// Whether this endpoint is expected to be refused.
     fn expects_refusal(self) -> bool {
-        matches!(self, Self::VncWrongPassword)
+        matches!(self, Self::VncWrongPassword | Self::XrdpWrongPassword)
     }
 }
 
@@ -215,6 +225,11 @@ enum Outcome {
     Failed(String),
 }
 
+/// How long a session has to keep running without a failure before the endpoint
+/// counts as verified: a picture alone is not a working session, as a server that
+/// drops the connection after a few seconds would still deliver one.
+const SUSTAIN: Duration = Duration::from_secs(10);
+
 /// Runs the matrix for one endpoint.
 fn verify(endpoint: &Endpoint) -> Outcome {
     if let Err(Error::Unavailable(reason)) = backend_info(endpoint.kind.protocol()) {
@@ -251,113 +266,187 @@ fn verify(endpoint: &Endpoint) -> Outcome {
     }
 
     let mut steps: Vec<(&'static str, bool)> = Vec::new();
-    let mut failure: Option<Failure> = None;
-    let mut first_frame = false;
     let mut certificate_asked = false;
     // Whether every certificate question the server asked was answered, and whether
     // the answer went through. A step that is never taken is not a step that passed:
     // a server that asks for nothing has no answer to prove.
     let mut certificate_answer_failed = false;
-    let deadline = Instant::now() + PATIENCE;
-    while Instant::now() < deadline {
-        match client.recv_timeout(Duration::from_millis(100)) {
-            Ok(event) => match event {
-                Event::Certificate { request_id, .. } => {
-                    certificate_asked = true;
-                    // The matrix trusts the certificate it was pointed at: the
-                    // decision itself is a user's, and the pane asks for it. An
-                    // answer that does not go through leaves the server waiting,
-                    // which is a failed run and not a silent one.
-                    if client.answer_certificate(request_id, true).is_err() {
-                        certificate_answer_failed = true;
-                    }
+    let mut frames = 0usize;
+    let mut first_frame = false;
+    let mut logon = String::new();
+    let mut failure: Option<(Failure, String)> = None;
+
+    // One step of the session, shared by both phases below: certificates are
+    // answered, frames counted, and a failure remembered.
+    let mut step = |client: &DesktopClient,
+                    event: Event,
+                    frames: &mut usize,
+                    first_frame: &mut bool,
+                    logon: &mut String,
+                    failure: &mut Option<(Failure, String)>,
+                    certificate_asked: &mut bool,
+                    certificate_answer_failed: &mut bool| {
+        match event {
+            Event::Certificate { request_id, .. } => {
+                *certificate_asked = true;
+                // The matrix trusts the certificate it was pointed at: the decision
+                // itself is a user's, and the pane asks for it. An answer that does
+                // not go through leaves the server waiting, which is a failed run
+                // and not a silent one.
+                if client.answer_certificate(request_id, true).is_err() {
+                    *certificate_answer_failed = true;
                 }
-                Event::Frame { width, height, .. } => {
-                    if width > 0 && height > 0 {
-                        first_frame = true;
-                        break;
-                    }
+            }
+            Event::Frame { width, height, .. } => {
+                if width > 0 && height > 0 {
+                    *frames += 1;
+                    *first_frame = true;
                 }
-                Event::State {
-                    state,
-                    failure: reported,
-                    ..
-                } => match state {
-                    // Connected is not a picture: keep waiting for the frame the
-                    // matrix is there to see.
-                    State::Connected => {}
-                    State::Failed(_) | State::Closed => {
-                        failure = Some(reported);
-                        break;
-                    }
-                    _ => {}
-                },
-                Event::Clipboard { .. } | Event::Notice { .. } => {}
+            }
+            Event::State {
+                state,
+                failure: reported,
+                reason,
+                ..
+            } => match state {
+                State::Connected => *logon = reason,
+                State::Failed(_) | State::Closed => *failure = Some((reported, reason)),
+                _ => {}
             },
-            Err(_) => continue,
+            Event::Clipboard { .. } | Event::Notice { .. } => {}
+        }
+    };
+
+    // Phase one: the first picture, or the refusal this endpoint exists to show.
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline && failure.is_none() && !first_frame {
+        if let Ok(event) = client.recv_timeout(Duration::from_millis(100)) {
+            step(
+                &client,
+                event,
+                &mut frames,
+                &mut first_frame,
+                &mut logon,
+                &mut failure,
+                &mut certificate_asked,
+                &mut certificate_answer_failed,
+            );
         }
     }
-    if endpoint.kind.expects_refusal() {
-        // For this endpoint a refusal is the required answer, so it is the one that
-        // is reported as passed - with the step it happened on, so the run cannot
-        // claim a sign-in it was meant to lose.
-        steps.push(("refused", failure == Some(Failure::Authentication)));
-        return match failure {
-            Some(Failure::Authentication) => Outcome::Verified(steps),
-            Some(other) => Outcome::Failed(format!(
-                "the wrong password was reported as {other:?}, not as a refused credential"
+    if let Some((reported, reason)) = failure.take() {
+        if endpoint.kind.expects_refusal() {
+            return refusal_outcome(endpoint, reported, &reason);
+        }
+        return match reported {
+            // The TLS endpoint exists to prove that an encrypted VNC session can be
+            // opened. A server that answers with a security type this build cannot
+            // negotiate never opened one.
+            Failure::UnsupportedSecurity if endpoint.kind == Kind::VncTls => Outcome::Unverified(
+                "the server offered no security type this build can negotiate, so no TLS or VeNCrypt session was opened and encryption was not verified".to_owned(),
+            ),
+            other => Outcome::Failed(format!(
+                "{} reported {other:?} before the session was live ({reason})",
+                endpoint.kind.label()
             )),
-            None => Outcome::Failed("the server accepted a deliberately wrong password".to_owned()),
         };
     }
-    let Some(failure) = failure else {
-        if !first_frame {
-            // A connection without a picture is not a verified desktop: the matrix
-            // is about what the user sees.
-            steps.push(("first frame", false));
-            return Outcome::Failed("the session connected but drew no frame".to_owned());
+    if !first_frame {
+        steps.push(("first frame", false));
+        return Outcome::Failed("the session connected but drew no frame".to_owned());
+    }
+    // A session that comes up with a password the server was supposed to refuse is
+    // exactly the silent pass this matrix must never produce.
+    if endpoint.kind.expects_refusal() {
+        return match endpoint.kind {
+            Kind::XrdpWrongPassword => Outcome::Failed(
+                "the session came up with a deliberately wrong password: this server \
+                 refuses credentials only on its own screen, so the client cannot tell \
+                 a refused logon from an accepted one here"
+                    .to_owned(),
+            ),
+            _ => Outcome::Failed("the server accepted a deliberately wrong password".to_owned()),
+        };
+    }
+
+    // Phase two: the session has to stay up. A connection that drops mid-paint, or
+    // that stops delivering updates, is not a working desktop.
+    let until = Instant::now() + SUSTAIN;
+    while Instant::now() < until && failure.is_none() {
+        if let Ok(event) = client.recv_timeout(Duration::from_millis(100)) {
+            step(
+                &client,
+                event,
+                &mut frames,
+                &mut first_frame,
+                &mut logon,
+                &mut failure,
+                &mut certificate_asked,
+                &mut certificate_answer_failed,
+            );
         }
-        steps.push(("first frame", true));
-        // One step per thing the run really did. The certificate step is only
-        // present when a certificate was asked for, and it is true only if the
-        // answer reached the server: an endpoint that asks for nothing does not get
-        // a pass it never earned.
-        if certificate_asked {
-            steps.push(("certificate answered", !certificate_answer_failed));
-        }
-        // Input: one key press and one pointer move at the top-left corner, which
-        // every desktop has room for.
-        let key = client.key(0x1e, 0x61, true, false);
-        let release = client.key(0x1e, 0x61, false, false);
-        let pointer = client.pointer(1, 1, PointerButtons(0).with(PointerButtons::LEFT));
-        let moved = client.pointer(2, 2, PointerButtons(0));
-        steps.push((
-            "input",
-            key.is_ok() && release.is_ok() && pointer.is_ok() && moved.is_ok(),
+    }
+    if let Some((reported, reason)) = failure {
+        return Outcome::Failed(format!(
+            "the session reported {reported:?} after {} frames and {:.1}s ({reason})",
+            frames,
+            SUSTAIN.as_secs_f32()
         ));
-        // Both backends share the clipboard now: RDP through cliprdr, VNC through
-        // the (extended) cut text.
-        let shared = client.clipboard("shellune endpoint matrix");
-        steps.push(("clipboard", shared.is_ok()));
-        let cancelled = client.cancel().is_ok();
-        let stopped = client.wait_for_worker(PATIENCE).is_ok();
-        steps.push(("cancel", cancelled && stopped));
-        return Outcome::Verified(steps);
-    };
-    // A failure is the right answer only where it was the expected one.
-    match failure {
-        // The TLS endpoint exists to prove that an encrypted VNC session can be
-        // opened. A server that answers with a security type this build cannot
-        // negotiate never opened one, so the run proved nothing about encryption:
-        // it is reported as not verified, never as passed.
-        Failure::UnsupportedSecurity if endpoint.kind == Kind::VncTls => Outcome::Unverified(
-            "the server offered no security type this build can negotiate, so no TLS or              VeNCrypt session was opened and encryption was not verified"
-                .to_owned(),
-        ),
-        other => Outcome::Failed(format!(
-            "{} reported {other:?} before the session was live",
-            endpoint.kind.label()
-        )),
+    }
+
+    steps.push(("first frame", true));
+    steps.push(("sustained", frames > 1));
+    if certificate_asked {
+        steps.push(("certificate answered", !certificate_answer_failed));
+    }
+    // An empty reason is a confirmed logon; anything else says the server never
+    // confirmed one and the caller was told so.
+    if endpoint.kind.protocol() == Protocol::Rdp {
+        steps.push(("logon confirmed", logon.is_empty()));
+    }
+    // Input: one key press and one pointer move at the top-left corner, which every
+    // desktop has room for.
+    let key = client.key(0x1e, 0x61, true, false);
+    let release = client.key(0x1e, 0x61, false, false);
+    let pointer = client.pointer(1, 1, PointerButtons(0).with(PointerButtons::LEFT));
+    let moved = client.pointer(2, 2, PointerButtons(0));
+    steps.push((
+        "input",
+        key.is_ok() && release.is_ok() && pointer.is_ok() && moved.is_ok(),
+    ));
+    // Both backends share the clipboard now: RDP through cliprdr, VNC through the
+    // (extended) cut text.
+    let shared = client.clipboard("shellune endpoint matrix");
+    steps.push(("clipboard", shared.is_ok()));
+    let cancelled = client.cancel().is_ok();
+    let stopped = client.wait_for_worker(PATIENCE).is_ok();
+    steps.push(("cancel", cancelled && stopped));
+    Outcome::Verified(steps)
+}
+
+/// What a deliberately wrong password has to produce.
+fn refusal_outcome(endpoint: &Endpoint, reported: Failure, reason: &str) -> Outcome {
+    match endpoint.kind {
+        Kind::VncWrongPassword => {
+            if reported == Failure::Authentication {
+                Outcome::Verified(vec![("refused", true)])
+            } else {
+                Outcome::Failed(format!(
+                    "the wrong password was reported as {reported:?}, not as a refused credential"
+                ))
+            }
+        }
+        // An RDP server that does not negotiate CredSSP cannot refuse a password at
+        // the protocol level: xrdp draws its own login screen instead. What must
+        // never happen is a session that looks logged on.
+        _ => {
+            if reported == Failure::Authentication {
+                Outcome::Verified(vec![("refused", true)])
+            } else {
+                Outcome::Unverified(format!(
+                    "the wrong password was reported as {reported:?} ({reason}): this server                      refuses credentials only on its own screen, not in the protocol"
+                ))
+            }
+        }
     }
 }
 

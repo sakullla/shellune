@@ -18,7 +18,10 @@ pub(super) struct Bitmap<'a> {
     pub(super) bitmaps: (u16, u16),
     pub(super) bpp: u16,
     pub(super) compressed: bool,
+    /// The rectangle's bytes, from its first header byte to the end of the update.
+    /// A decoder consumes what the stream needs; `length` is what the server said.
     pub(super) data: &'a [u8],
+    pub(super) length: usize,
 }
 
 /// Reads the common BITMAP_DATA header used by both the slow and fast paths.
@@ -48,18 +51,13 @@ pub(super) fn rect<'a>(p: &mut Packet<'a>) -> io::Result<Bitmap<'a>> {
     }
     let bpp = p.le16()?;
     let flags = p.le16()?;
-    let mut length = usize::try_from(p.le32()?).map_err(|_| invalid("RDP bitmap too long"))?;
-    // Some servers count the two-byte pad of the compressed bitmap header in the
-    // length but never send it, leaving the next bitmap two bytes early. The
-    // length field then equals the body size plus eight while only six header
-    // bytes were written; subtracting the two keeps the stream aligned.
-    if p.0.len() >= 8
-        && matches!(p.0[6], 0x10 | 0x30)
-        && usize::from(u16::from_le_bytes([p.0[0], p.0[1]])) + 8 == length
-    {
-        length -= 2;
+    let length = usize::try_from(p.le32()?).map_err(|_| invalid("RDP bitmap too long"))?;
+    if length == 0 {
+        return Err(invalid("empty RDP bitmap"));
     }
-    let data = p.take(length)?;
+    // The declared length is not trusted for the cursor: some servers count header
+    // bytes they never write, and the decoder knows exactly how much it consumed.
+    let data = p.0;
     Ok(Bitmap {
         x: left,
         y: top,
@@ -69,6 +67,7 @@ pub(super) fn rect<'a>(p: &mut Packet<'a>) -> io::Result<Bitmap<'a>> {
         bpp,
         compressed: flags & 1 != 0,
         data,
+        length,
     })
 }
 
@@ -92,7 +91,7 @@ impl<'a> Rle<'a> {
     }
 }
 
-fn legacy_rle(data: &[u8], width: usize, height: usize) -> io::Result<Vec<u8>> {
+fn legacy_rle(data: &[u8], width: usize, height: usize) -> io::Result<(Vec<u8>, usize)> {
     let stride = width * 4;
     let mut out = vec![0u8; stride * height];
     let mut rle = Rle { data, at: 0 };
@@ -253,12 +252,17 @@ fn legacy_rle(data: &[u8], width: usize, height: usize) -> io::Result<Vec<u8>> {
             x += 1;
         }
     }
-    Ok(out)
+    Ok((out, rle.at))
 }
 
 /// The 32-bit planar RLE: a marker byte, then four bit planes (alpha, red,
 /// green, blue) whose rows are stored bottom-up with per-row deltas.
-fn planar_rle(data: &[u8], width: usize, height: usize, planes: &[usize]) -> io::Result<Vec<u8>> {
+fn planar_rle(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    planes: &[usize],
+) -> io::Result<(Vec<u8>, usize)> {
     let mut rle = Rle { data, at: 1 };
     let stride = width * 4;
     let mut out = vec![0u8; stride * height];
@@ -312,7 +316,7 @@ fn planar_rle(data: &[u8], width: usize, height: usize, planes: &[usize]) -> io:
     for pixel in out.chunks_exact_mut(4) {
         pixel[3] = 0xff;
     }
-    Ok(out)
+    Ok((out, rle.at))
 }
 
 /// A signed delta, zig-zagged into one byte: 0 stays 0, 1 is -1, 2 is 1, ...
@@ -324,42 +328,62 @@ fn delta(byte: u8) -> i32 {
     }
 }
 
-/// Decodes one compressed rectangle into a packed BGRA image, top row first.
-pub(super) fn decompress(bitmap: &Bitmap<'_>) -> io::Result<Vec<u8>> {
+/// Decodes one compressed rectangle into a packed BGRA image, top row first,
+/// together with the number of bytes the stream used. The consumed count is what
+/// the caller advances by: servers disagree about whether the compressed header's
+/// two-byte pad is counted in the rectangle's length.
+pub(super) fn decompress(bitmap: &Bitmap<'_>) -> io::Result<(Vec<u8>, usize)> {
     let width = usize::from(bitmap.bitmaps.0);
     let height = usize::from(bitmap.bitmaps.1);
+    let mut failure = None;
     if bitmap.bpp == 32 {
-        // The planar (RDP 6.0) stream starts with a marker byte: 0x10 carries an
-        // alpha plane, 0x30 does not. Some servers put the three trailing 16-bit
-        // size fields of the bitmap header in front of it, which is where the
-        // marker is looked for when it is not first.
-        if let Some((start, marker)) = planar_marker(bitmap.data) {
+        if let Some((start, marker)) = planar_marker(bitmap.data, width, height) {
             let planes: &[usize] = if marker == 0x30 {
                 &[2, 1, 0]
             } else {
                 &[3, 2, 1, 0]
             };
-            return planar_rle(&bitmap.data[start..], width, height, planes);
+            match planar_rle(&bitmap.data[start..], width, height, planes) {
+                Ok((pixels, used)) => return Ok((pixels, start + used)),
+                Err(error) => failure = Some(error),
+            }
         }
     }
     match bitmap.bpp {
-        24 | 32 => legacy_rle(bitmap.data, width, height),
-        _ => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "compressed bitmap depth was not negotiated",
-        )),
+        24 | 32 => match legacy_rle(bitmap.data, width, height) {
+            Ok(result) => Ok(result),
+            Err(error) => Err(failure.unwrap_or(error)),
+        },
+        _ => Err(failure.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "compressed bitmap depth was not negotiated",
+            )
+        })),
     }
 }
 
-/// Finds the planar marker: at the start, or after the three 16-bit fields some
-/// servers keep from the bitmap header.
-fn planar_marker(data: &[u8]) -> Option<(usize, u8)> {
-    match data.first() {
-        Some(&marker @ (0x10 | 0x30)) => return Some((0, marker)),
-        _ => {}
+/// Finds the planar marker and the number of header bytes before it.
+///
+/// A bare marker is the protocol's own form. Some servers put the last three
+/// 16-bit fields of the compressed header in front of it — xrdp writes six of the
+/// eight bytes — so those are recognised by the scan width and the uncompressed
+/// size they must carry.
+fn planar_marker(data: &[u8], width: usize, height: usize) -> Option<(usize, u8)> {
+    let sizes_match = |scan: &[u8], raw: &[u8]| {
+        usize::from(u16::from_le_bytes([scan[0], scan[1]])) == width * 4
+            && usize::from(u16::from_le_bytes([raw[0], raw[1]])) == width * height * 4
+    };
+    if data.len() > 8 && data[0] == 0 && data[1] == 0 && matches!(data[8], 0x10 | 0x30) {
+        if sizes_match(&data[2..4], &data[4..6]) {
+            return Some((8, data[8]));
+        }
     }
-    match data.get(6) {
-        Some(&marker @ (0x10 | 0x30)) => Some((6, marker)),
+    if data.len() > 6 && matches!(data[6], 0x10 | 0x30) && sizes_match(&data[2..4], &data[4..6]) {
+        return Some((6, data[6]));
+    }
+    match data.first() {
+        Some(&marker @ (0x10 | 0x30)) => Some((0, marker)),
         _ => None,
     }
 }
@@ -367,12 +391,15 @@ fn planar_marker(data: &[u8]) -> Option<(usize, u8)> {
 /// Copies one rectangle into the desktop buffer. `stride` is the buffer's row
 /// length in bytes; `desktop_height` bounds the copy so a lying header cannot
 /// write past the buffer.
+/// Copies one rectangle into the desktop buffer and reports how many of its bytes
+/// the stream used. `stride` is the buffer's row length in bytes;
+/// `desktop_height` bounds the copy so a lying header cannot write past the buffer.
 pub(super) fn draw(
     frame: &mut [u8],
     stride: usize,
     desktop_height: u16,
     bitmap: &Bitmap<'_>,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     if bitmap.width == 0 || bitmap.height == 0 {
         return Err(invalid("empty RDP bitmap rectangle"));
     }
@@ -392,7 +419,7 @@ pub(super) fn draw(
     let row_bytes = usize::from(bitmap.width) * 4;
     // A decoded bitmap is packed BGRA at the bitmap's own size; only the part
     // that lands on the desktop is copied.
-    let pixels = if bitmap.compressed {
+    let (pixels, consumed) = if bitmap.compressed {
         decompress(bitmap).map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -403,7 +430,7 @@ pub(super) fn draw(
             )
         })?
     } else {
-        unpack(bitmap)?
+        (unpack(bitmap)?, bitmap.length)
     };
     let bitmap_row = usize::from(bitmap.bitmaps.0) * 4;
     if pixels.len() < bitmap_row * usize::from(bitmap.bitmaps.1) {
@@ -414,7 +441,7 @@ pub(super) fn draw(
         let start = row + line * stride;
         frame[start..start + row_bytes].copy_from_slice(&pixels[source..source + row_bytes]);
     }
-    Ok(())
+    Ok(consumed)
 }
 
 /// Expands an uncompressed rectangle into packed BGRA at its own size.
@@ -482,6 +509,7 @@ mod tests {
             bitmaps: (width, height),
             bpp,
             compressed: true,
+            length: data.len(),
             data,
         }
     }
@@ -489,7 +517,8 @@ mod tests {
     #[test]
     fn a_legacy_rle_fill_and_copy_decode() {
         // Two rows of four black pixels: a fill order per row.
-        let pixels = decompress(&bitmap(4, 2, 32, &[0x04, 0x04])).unwrap();
+        let (pixels, used) = decompress(&bitmap(4, 2, 32, &[0x04, 0x04])).unwrap();
+        assert_eq!(used, 2);
         assert_eq!(pixels, vec![0, 0, 0, 0xff].repeat(8));
 
         // One row of four copied pixels, then the same again for the next row.
@@ -501,7 +530,7 @@ mod tests {
         for value in [13u8, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24] {
             data.push(value);
         }
-        let pixels = decompress(&bitmap(4, 2, 32, &data)).unwrap();
+        let (pixels, _) = decompress(&bitmap(4, 2, 32, &data)).unwrap();
         // The stream's first row is the bitmap's last one.
         assert_eq!(&pixels[16..20], &[1, 2, 3, 0xff]);
         assert_eq!(&pixels[0..4], &[13, 14, 15, 0xff]);
@@ -517,7 +546,8 @@ mod tests {
             data.push(plane[0]);
             data.push(plane[1]);
         }
-        let pixels = decompress(&bitmap(2, 1, 32, &data)).unwrap();
+        let (pixels, used) = decompress(&bitmap(2, 1, 32, &data)).unwrap();
+        assert_eq!(used, data.len());
         assert_eq!(&pixels[0..4], &[40, 30, 20, 0xff]);
         assert_eq!(&pixels[4..8], &[41, 31, 21, 0xff]);
     }

@@ -21,6 +21,10 @@ pub(super) fn login(
     security: Security,
 ) -> io::Result<()> {
     let auto = !user.is_empty() && !password.is_empty() && security == Security::Tls;
+    // INFO_MOUSE, INFO_UNICODE, INFO_LOGONNOTIFY, INFO_ENABLEWINDOWSKEY,
+    // INFO_LOGONERRORS and INFO_MOUSE_HAS_WHEEL; INFO_AUTOLOGON is what makes the
+    // credentials count. INFO_COMPRESSION stays off: the client renders raw
+    // rectangles and would have to refuse compressed output.
     let flags = 0x0003_0173u32 | if auto { 8 } else { 0 };
     let mut pdu = Zeroizing::new(vec![0x40, 0, 0, 0]); // SEC_INFO_PKT
     pdu.extend_from_slice(&0x409u32.to_le_bytes());

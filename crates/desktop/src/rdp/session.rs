@@ -22,6 +22,12 @@ use std::time::Duration;
 const HANDSHAKE: Duration = Duration::from_secs(20);
 /// A dropped session is retried once before it is reported as failed.
 const ATTEMPTS: u8 = 2;
+/// How long the server has to confirm or refuse the logon. A server that says
+/// nothing in this window is reported as unconfirmed rather than accepted.
+const LOGON_WAIT: Duration = Duration::from_secs(10);
+/// One read wait once the desktop is up: the loop returns to its cancellation and
+/// deadline checks after each, and a partial record stays buffered.
+const POLL: Duration = Duration::from_millis(200);
 
 /// Ends one attempt with the business failure it maps to.
 struct Ended {
@@ -97,7 +103,8 @@ pub(super) fn run(
         }
         match connect(config, emit, control, &commands) {
             Ok(mut active) => {
-                publish(emit, control, &State::Connected, Failure::None, "");
+                // The pump publishes Connected, and only once the logon is settled:
+                // a refused set of credentials must never look like a desktop.
                 match active.pump(emit, control, &commands) {
                     Ok(()) => {
                         publish(emit, control, &State::Closed, Failure::None, "");
@@ -147,10 +154,43 @@ pub(super) fn run(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_logon_confirmation_maps_to_its_outcome() {
+        // PDUTYPE2_SAVE_SESSION_INFO confirms the logon.
+        assert_eq!(logon_pdu(38, &[1, 0, 0, 0]), Some(Logon::Confirmed));
+        // PDUTYPE2_SET_ERROR_INFO with zero is a confirmation ...
+        assert_eq!(logon_pdu(47, &[0, 0, 0, 0]), Some(Logon::Confirmed));
+        // ... and with a code is a refusal that keeps the code.
+        assert_eq!(logon_pdu(47, &5u32.to_le_bytes()), Some(Logon::Refused(5)));
+        // Anything else is not a logon result.
+        assert_eq!(logon_pdu(2, &[0, 0, 0, 0]), None);
+        assert_eq!(logon_pdu(47, &[0, 0]), None);
+    }
+}
+
+/// What the server said about the logon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Logon {
+    /// The server confirmed the logon.
+    Confirmed,
+    /// The server refused it, with the error code it gave.
+    Refused(u32),
+}
+
 struct Active {
     transport: Transport,
     channels: Channels,
     share: Share,
+    /// Set when the server says the logon succeeded or failed.
+    logon: Option<Logon>,
+    /// Whether Connected has been published.
+    connected: bool,
+    /// When an unconfirmed logon stops being waited for.
+    logon_deadline: std::time::Instant,
     frame: Vec<u8>,
     stride: usize,
     width: u16,
@@ -266,6 +306,9 @@ fn connect(
         clipboard: Clipboard::new(config.clipboard, Arc::clone(emit)),
         drive: Drive::new(config.drive.clone(), Arc::clone(emit)),
         buttons: 0,
+        logon: None,
+        connected: false,
+        logon_deadline: std::time::Instant::now() + LOGON_WAIT,
     };
     active.await_activation(control)?;
     // A synchronize event is how a client reports the keyboard toggle state;
@@ -275,8 +318,30 @@ fn connect(
         .input(&active.channels, &mut active.transport, 0, 0, 0, 0)
         .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
     super::trace("desktop activated");
+    // From here on the loop must come back often enough to notice a cancel and to
+    // decide that a logon was never confirmed.
+    active.set_poll_timeout(POLL);
     let _ = commands;
     Ok(active)
+}
+
+/// The logon outcome a share data PDU carries: PDUTYPE2_SAVE_SESSION_INFO
+/// confirms it, PDUTYPE2_SET_ERROR_INFO reports a code — zero is success and
+/// anything else is a refusal.
+fn logon_pdu(kind: u8, payload: &[u8]) -> Option<Logon> {
+    match kind {
+        38 => Some(Logon::Confirmed),
+        47 => {
+            let bytes = payload.get(..4)?;
+            let code = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            Some(if code == 0 {
+                Logon::Confirmed
+            } else {
+                Logon::Refused(code)
+            })
+        }
+        _ => None,
+    }
 }
 
 impl Active {
@@ -324,6 +389,49 @@ impl Active {
         }
     }
 
+    /// Publishes Connected once, and only when the logon is settled: confirmed by
+    /// the server, or unconfirmed after the wait because the server reports logon
+    /// results only on its own screen (xrdp without CredSSP). A refusal is an
+    /// authentication failure and never a session.
+    /// Sets a short read wait on the socket under the TLS layer, so the loop
+    /// returns to its cancellation and deadline checks between updates.
+    fn set_poll_timeout(&self, wait: Duration) {
+        if let Transport::Secure(secure) = &self.transport {
+            if let Transport::Plain(socket) = &secure.sock {
+                let _ = socket.set_read_timeout(Some(wait));
+            }
+        }
+    }
+
+    fn announce_logon(&mut self, emit: &Emit, control: &Control) -> Result<(), Ended> {
+        if self.connected {
+            return Ok(());
+        }
+        match self.logon {
+            Some(Logon::Refused(code)) => Err(Ended::new(
+                Failure::Authentication,
+                format!("the server refused the logon (code {code})"),
+            )),
+            Some(Logon::Confirmed) => {
+                publish(emit, control, &State::Connected, Failure::None, "");
+                self.connected = true;
+                Ok(())
+            }
+            None if std::time::Instant::now() > self.logon_deadline => {
+                publish(
+                    emit,
+                    control,
+                    &State::Connected,
+                    Failure::None,
+                    "logon not confirmed: the server authenticates through its own screen",
+                );
+                self.connected = true;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
     fn pump(
         &mut self,
         emit: &Emit,
@@ -335,12 +443,21 @@ impl Active {
                 let _ = self.drive.close(&self.channels, &mut self.transport);
                 return Err(Ended::new(Failure::Cancelled, "cancelled"));
             }
+            self.announce_logon(emit, control)?;
             self.drain(emit, commands)?;
             self.clipboard
                 .poll(&self.channels, &mut self.transport)
                 .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
             match self.read() {
-                Ok(Incoming::Slow(body)) => self.slow(&body, emit)?,
+                Ok(Incoming::Slow(body)) => {
+                    self.slow(&body, emit)?;
+                    if let Some(Logon::Refused(code)) = self.logon {
+                        return Err(Ended::new(
+                            Failure::Authentication,
+                            format!("the server refused the logon (code {code})"),
+                        ));
+                    }
+                }
                 Ok(Incoming::Fast) => {
                     return Err(Ended::new(
                         Failure::ProtocolFailure,
@@ -507,6 +624,10 @@ impl Active {
                     .share
                     .data(header.body)
                     .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+                if let Some(logon) = logon_pdu(kind, payload) {
+                    super::trace(&format!("logon pdu kind={kind} {logon:?}"));
+                    self.logon = Some(logon);
+                }
                 if kind == 2 {
                     self.bitmap_update(payload, emit)?;
                 }
@@ -545,7 +666,11 @@ impl Active {
                     "the server sent a bitmap depth it did not negotiate",
                 ));
             }
-            update::draw(&mut self.frame, self.stride, self.height, &bitmap)
+            let used = update::draw(&mut self.frame, self.stride, self.height, &bitmap)
+                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+            // Advance by what the stream used, not by the length the server
+            // declared: one of them counts a header pad the other does not write.
+            p.take(used)
                 .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
             let pixels = update::region(&self.frame, self.stride, &bitmap);
             if pixels.len() > MAX_FRAME_BYTES {

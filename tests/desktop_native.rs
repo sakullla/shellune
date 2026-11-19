@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use shellune_desktop::probe::{self, DriveRequest, SessionStep};
+use shellune_desktop::probe::{self, DriveRequest};
 use shellune_desktop::{
     ClipboardEntry, ClipboardKind, DesktopClient, DriveProblem, DriveRefusal, Error, Event,
     Failure, Notice, PointerButtons, Protocol, State, VncSecurity, backend_info, callback_panics,
@@ -1100,17 +1100,93 @@ fn link_file(target: &std::path::Path, link: &std::path::Path) -> bool {
     made.is_ok()
 }
 
-// ---------------------------------------------------- RDP session notices
-
-/// Plays session steps with these options and returns the notices reported.
-fn session_notices(clipboard: bool, drive: Option<&str>, steps: &[SessionStep]) -> Vec<Notice> {
+/// The RDP handle reports its own engine and the options an attempt would use.
+#[test]
+fn the_rdp_handle_reports_its_engine_and_options() {
     let mut client = DesktopClient::new(Protocol::Rdp).expect("client");
-    client.set_clipboard(clipboard).expect("clipboard switch");
-    if let Some(path) = drive {
-        client.set_drive("Shellune", Some(path)).expect("drive");
+    let info = backend_info(Protocol::Rdp).expect("rdp info");
+    assert!(info.contains("shellune"), "{info}");
+    assert!(!info.contains("freerdp"), "{info}");
+
+    let defaults = client.describe_rdp_settings().expect("settings");
+    assert!(defaults.contains("implementation=shellune"), "{defaults}");
+    assert!(defaults.contains("clipboard=1"), "{defaults}");
+    assert!(defaults.contains("drive=0"), "{defaults}");
+
+    client.set_clipboard(false).expect("switch off");
+    assert!(
+        client
+            .describe_rdp_settings()
+            .expect("settings")
+            .contains("clipboard=0")
+    );
+    let folder = std::env::temp_dir();
+    client
+        .set_drive(
+            shellune_desktop::DRIVE_NAME,
+            Some(folder.to_str().expect("utf-8")),
+        )
+        .expect("drive");
+    assert!(
+        client
+            .describe_rdp_settings()
+            .expect("settings")
+            .contains("drive=1")
+    );
+    client
+        .set_drive(shellune_desktop::DRIVE_NAME, None)
+        .expect("clear");
+    assert!(
+        client
+            .describe_rdp_settings()
+            .expect("settings")
+            .contains("drive=0")
+    );
+}
+
+/// A folder that cannot be offered is reported by the check an attempt runs.
+#[test]
+fn a_folder_that_cannot_be_offered_is_reported_with_its_reason() {
+    let folder = std::env::temp_dir().join(format!("shellune-gone-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    assert_eq!(
+        probe::rdp_drive_folder(folder.to_str().expect("utf-8")),
+        Some(Some(DriveProblem::Missing))
+    );
+    assert_eq!(
+        probe::rdp_drive_folder("relative\\path"),
+        Some(Some(DriveProblem::NotAbsolute))
+    );
+    let usable = std::env::temp_dir();
+    assert_eq!(
+        probe::rdp_drive_folder(usable.to_str().expect("utf-8")),
+        Some(None)
+    );
+}
+
+/// A missing folder does not stop the attempt: the connection is still dialled.
+#[test]
+fn an_rdp_attempt_with_a_missing_folder_still_dials() {
+    let peer = Scripted::start(Script::Silent);
+    let mut client = DesktopClient::new(Protocol::Rdp).expect("client");
+    client.set_server("127.0.0.1", peer.port).expect("server");
+    let missing = std::env::temp_dir().join("shellune-no-such-folder-for-this-test");
+    client
+        .set_drive(
+            shellune_desktop::DRIVE_NAME,
+            Some(missing.to_str().expect("utf-8")),
+        )
+        .expect("drive");
+    client.connect().expect("connect starts");
+    let deadline = Instant::now() + PATIENCE;
+    while !peer.accepted.load(Ordering::SeqCst) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
     }
-    probe::rdp_session(&client, steps).expect("the RDP backend is built");
-    notices(&client.track_state())
+    assert!(
+        peer.accepted.load(Ordering::SeqCst),
+        "the attempt still dialled the server"
+    );
+    let _ = client.cancel();
 }
 
 // ------------------------------------------------------- RDP clipboard channel
@@ -1289,682 +1365,242 @@ fn an_oversized_remote_rdp_entry_is_cut_or_reported() {
     );
 }
 
-/// The text encodings the backends use: CF_UNICODETEXT is UTF-16LE with CRLF line
-/// ends and a terminating NUL; RFB cut text is Latin-1.
+/// A server that declines the device says so, once, with the code it gave; a
+/// server that takes it says nothing.
 #[test]
-fn clipboard_text_encodings_round_trip() {
+fn a_declined_drive_is_reported_with_how_it_was_declined() {
+    let folder = std::env::temp_dir();
+    let path = folder.to_str().expect("utf-8");
+    assert_eq!(probe::rdp_drive_reply(path, 0), []);
     assert_eq!(
-        probe::utf8_to_cf_unicode("a\nb\r\nc😀"),
-        utf16("a\r\nb\r\nc😀")
-    );
-    assert_eq!(probe::utf8_to_cf_unicode(""), [0, 0]);
-    assert_eq!(
-        probe::cf_unicode_to_utf8(&utf16("héllo\r\n世界😀")).as_deref(),
-        Some("héllo\r\n世界😀".as_bytes())
-    );
-    // Up to the first NUL; an odd trailing byte and a lone surrogate do no harm.
-    let mut raw = utf16("ab");
-    raw.extend_from_slice(&utf16("ignored"));
-    assert_eq!(probe::cf_unicode_to_utf8(&raw).as_deref(), Some(&b"ab"[..]));
-    assert_eq!(
-        probe::cf_unicode_to_utf8(&[0x00, 0xD8, 0x41, 0x00, 0x42]).as_deref(),
-        Some("\u{FFFD}A".as_bytes())
-    );
-
-    assert_eq!(
-        probe::utf8_to_latin1("café ÿ").as_deref(),
-        Some(&b"caf\xe9 \xff"[..])
-    );
-    assert_eq!(probe::utf8_to_latin1("日本"), None);
-    assert_eq!(
-        probe::utf8_to_latin1("€"),
-        None,
-        "the euro sign is not Latin-1"
-    );
-    assert_eq!(
-        probe::latin1_to_utf8(b"caf\xe9").as_deref(),
-        Some("café".as_bytes())
+        probe::rdp_drive_reply(path, 0xC000_0022),
+        [Event::Notice {
+            notice: Notice::DriveRefused(DriveRefusal::Declined(0xC000_0022))
+        }]
     );
 }
 
-// ---------------------------------------------------------- VNC clipboard
-
-fn connect_vnc(peer: &Scripted, clipboard: bool) -> DesktopClient {
-    let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
-    client.set_server("127.0.0.1", peer.port).expect("server");
-    client.set_size(2, 2).expect("size");
-    client.set_clipboard(clipboard).expect("clipboard switch");
-    client.connect().expect("connect starts");
-    client
-}
-
-fn cut_texts(peer: &Scripted) -> Vec<ClientMessage> {
-    peer.messages()
-        .into_iter()
-        .filter(|message| {
-            matches!(
-                message,
-                ClientMessage::CutText(_) | ClientMessage::ExtendedCutText { .. }
-            )
-        })
-        .collect()
-}
-
-/// A server with the extended clipboard gets and gives UTF-8: the client asks for
-/// the extension, receives the peer's text without its terminating NUL, and sends
-/// its own as Notify + Provide. Images are not RFB's to carry.
+/// A refused format list is reported, and the server offering formats again
+/// withdraws the report.
 #[test]
-fn a_vnc_peer_with_extended_clipboard_exchanges_utf8_both_ways() {
-    if !backends_built() {
-        return;
+fn a_refused_rdp_clipboard_is_reported_and_withdrawn() {
+    // A format list first, so the client is waiting for the answer.
+    let copy = CF_UNICODETEXT.to_le_bytes().to_vec();
+    let (events, _) =
+        probe::rdp_clipboard_receive(&[], &[(0x0002, 0, copy), (0x0003, 0x0002, Vec::new())]);
+    assert_eq!(
+        events,
+        [Event::Notice {
+            notice: Notice::ClipboardRefused
+        }]
+    );
+
+    // The server offers a format list again: the clipboard is usable.
+    let mut list = Vec::new();
+    for format in [CF_UNICODETEXT] {
+        list.extend_from_slice(&format.to_le_bytes());
     }
-    let peer = Scripted::start(Script::Session {
-        width: 2,
-        height: 2,
-        pixel: [9, 9, 9, 0],
-        clipboard: Some(Cut::Utf8("远端 ✓ text")),
-        extended: true,
-    });
-    let mut client = connect_vnc(&peer, true);
-    let events = pump(&client, PATIENCE, |event| {
-        matches!(event, Event::Clipboard { .. })
-    });
-    assert_eq!(texts(&events), ["远端 ✓ text"], "{events:?}");
-    assert!(
-        peer.messages().iter().any(
-            |message| matches!(message, ClientMessage::Encodings(list) if list.contains(&EXTENDED_CLIPBOARD))
-        ),
-        "the client asked for the extension: {:?}",
-        peer.messages()
+    let (events, _) = probe::rdp_clipboard_receive(
+        &[],
+        &[
+            (0x0002, 0, CF_UNICODETEXT.to_le_bytes().to_vec()),
+            (0x0003, 0x0002, Vec::new()),
+            (0x0002, 0, list),
+        ],
     );
-
-    when_connected(&mut client, |client| {
-        client.push_clipboard(&[
-            ClipboardEntry::text("本机 ✓ naïve"),
-            ClipboardEntry::png(b"\x89PNG".to_vec()),
-        ])
-    });
-    let provided = ClientMessage::ExtendedCutText {
-        flags: EXT_PROVIDE | EXT_TEXT,
-        text: Some("本机 ✓ naïve".to_owned()),
-    };
-    assert!(peer.wait_for(provided.clone()), "{:?}", peer.messages());
     assert_eq!(
-        cut_texts(&peer),
+        events,
         [
-            ClientMessage::ExtendedCutText {
-                flags: EXT_NOTIFY | EXT_TEXT,
-                text: None
+            Event::Notice {
+                notice: Notice::ClipboardRefused
             },
-            provided
-        ],
-        "exactly one text went out, and no classic cut text"
-    );
-    drop(client);
-    assert_eq!(leaked_handles(), 0);
-}
-
-/// A server without the extended clipboard speaks Latin-1: its cut text is decoded
-/// as such, text that fits is sent as Latin-1, and text that does not is not sent at
-/// all and reported once.
-#[test]
-fn a_vnc_peer_without_extended_clipboard_gets_latin1_or_a_notice() {
-    if !backends_built() {
-        return;
-    }
-    let peer = Scripted::start(Script::Session {
-        width: 2,
-        height: 2,
-        pixel: [9, 9, 9, 0],
-        clipboard: Some(Cut::Latin1(b"caf\xe9 cr\xe8me")),
-        extended: false,
-    });
-    let mut client = connect_vnc(&peer, true);
-    let events = pump(&client, PATIENCE, |event| {
-        matches!(event, Event::Clipboard { .. })
-    });
-    assert_eq!(texts(&events), ["café crème"], "{events:?}");
-
-    when_connected(&mut client, |client| client.clipboard("naïve"));
-    assert!(
-        peer.wait_for(ClientMessage::CutText(b"na\xefve".to_vec())),
-        "{:?}",
-        peer.messages()
-    );
-
-    client.clipboard("日本語").expect("queued");
-    let events = pump(&client, PATIENCE, |event| {
-        matches!(event, Event::Notice { .. })
-    });
-    assert_eq!(
-        notices(&events),
-        [Notice::ClipboardLatin1Only],
-        "{events:?}"
-    );
-    client.clipboard("Grüße").expect("queued");
-    assert!(
-        peer.wait_for(ClientMessage::CutText(b"Gr\xfc\xdfe".to_vec())),
-        "{:?}",
-        peer.messages()
-    );
-    client.clipboard("中文").expect("queued");
-    client.clipboard("ok").expect("queued");
-    assert!(peer.wait_for(ClientMessage::CutText(b"ok".to_vec())));
-    assert_eq!(
-        cut_texts(&peer),
-        [
-            ClientMessage::CutText(b"na\xefve".to_vec()),
-            ClientMessage::CutText(b"Gr\xfc\xdfe".to_vec()),
-            ClientMessage::CutText(b"ok".to_vec()),
-        ],
-        "text outside Latin-1 never reached the server"
-    );
-    let later = pump(&client, Duration::from_millis(300), |_| false);
-    assert!(
-        notices(&later).is_empty(),
-        "the notice is said once per session: {later:?}"
+            Event::Notice {
+                notice: Notice::ClipboardReady
+            },
+        ]
     );
 }
 
-/// Text over the bound is cut at the last whole character within it, both ways, and
-/// each cut is reported (R1). A Latin-1 server's cut text may hold 1 MiB, which is
-/// up to 2 MiB once it is UTF-8.
+/// Text over the local bound is cut and reported when it is offered.
 #[test]
-fn vnc_text_over_the_bound_is_cut_and_reported_both_ways() {
-    if !backends_built() {
-        return;
-    }
+fn an_oversized_local_rdp_copy_is_cut_and_reported() {
     let bound = shellune_desktop::MAX_CLIPBOARD_TEXT_BYTES;
-    let remote: &'static [u8] = Box::leak(vec![0xE9u8; bound].into_boxed_slice());
-    let peer = Scripted::start(Script::Session {
-        width: 2,
-        height: 2,
-        pixel: [9, 9, 9, 0],
-        clipboard: Some(Cut::Latin1(remote)),
-        extended: false,
-    });
-    let mut client = connect_vnc(&peer, true);
-    let mut events = pump(&client, PATIENCE, |event| {
-        matches!(event, Event::Clipboard { .. })
-    });
-    events.extend(pump(&client, PATIENCE, |event| {
-        matches!(event, Event::Notice { .. })
-    }));
-    assert_eq!(texts(&events), ["é".repeat(bound / 2)]);
+    let (_, events) =
+        probe::rdp_clipboard_offer_events(&[ClipboardEntry::text(&"x".repeat(bound + 1))]);
     assert_eq!(
-        notices(&events),
-        [Notice::ClipboardTooLarge(ClipboardKind::Text)]
+        events,
+        [Event::Notice {
+            notice: Notice::ClipboardTooLarge(ClipboardKind::Text)
+        }]
     );
-
-    // One byte over the bound, with the cut inside a two-byte character.
-    let local = format!("a{}", "é".repeat(bound / 2));
-    when_connected(&mut client, |client| client.clipboard(&local));
-    let mut expected = vec![b'a'];
-    expected.extend(std::iter::repeat_n(0xE9u8, bound / 2 - 1));
-    assert!(
-        peer.wait_for(ClientMessage::CutText(expected)),
-        "the server got the text cut to the bound"
-    );
-    let events = pump(&client, PATIENCE, |event| {
-        matches!(event, Event::Notice { .. })
-    });
-    assert_eq!(
-        notices(&events),
-        [Notice::ClipboardTooLarge(ClipboardKind::Text)]
-    );
+    let (_, quiet) = probe::rdp_clipboard_offer_events(&[ClipboardEntry::text("short")]);
+    assert!(quiet.is_empty(), "{quiet:?}");
 }
 
-/// Sharing off: the client does not ask for the extension, drops the server's cut
-/// text, and refuses to send.
+/// A mapped folder with a junction in it that points outside. Through FreeRDP's own
+/// drive channel, patched (packaging/native/patches/freerdp-drive-confinement.patch):
+/// the server can use the folder, and nothing that resolves through the junction -
+/// opening, creating, deleting, listing, or moving something into it - reaches the
+/// place it points at (R5).
 #[test]
-fn a_vnc_session_with_clipboard_off_neither_sends_nor_receives() {
+fn the_patched_drive_channel_keeps_the_server_inside_the_mapped_folder() {
     if !backends_built() {
         return;
     }
-    let peer = Scripted::start(Script::Session {
-        width: 2,
-        height: 2,
-        pixel: [9, 9, 9, 0],
-        clipboard: Some(Cut::Latin1(b"secret")),
-        extended: true,
-    });
-    let client = connect_vnc(&peer, false);
-    let mut events = pump(&client, PATIENCE, |event| {
-        matches!(event, Event::Frame { .. })
-    });
-    events.extend(pump(&client, Duration::from_millis(500), |_| false));
-    assert!(states(&events).contains(&State::Connected), "{events:?}");
-    assert!(texts(&events).is_empty(), "nothing received: {events:?}");
-    assert!(matches!(
-        client.clipboard("local"),
-        Err(Error::Unavailable(_))
-    ));
-    assert!(
-        !peer.messages().iter().any(
-            |message| matches!(message, ClientMessage::Encodings(list) if list.contains(&EXTENDED_CLIPBOARD))
-        ),
-        "the extension was not requested: {:?}",
-        peer.messages()
-    );
-    assert!(cut_texts(&peer).is_empty(), "{:?}", peer.messages());
-}
-
-/// Covers a clipboard and first frame buffered together. The worker must consume
-/// library-buffered bytes without waiting for another socket notification.
-#[test]
-fn a_scripted_vnc_peer_delivers_a_frame_clipboard_and_accepts_input() {
-    if !backends_built() {
-        return;
-    }
-    let pixel = [0x11u8, 0x22, 0x33, 0x00];
-    let peer = Scripted::start(Script::Session {
-        width: 4,
-        height: 3,
-        pixel,
-        clipboard: Some(Cut::Latin1(b"from the peer")),
-        extended: false,
-    });
-
-    let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
-    client.set_server("127.0.0.1", peer.port).expect("server");
-    client.set_size(4, 3).expect("size");
-    client.connect().expect("connect starts");
-
-    let events = pump(&client, PATIENCE, |event| {
-        matches!(event, Event::Frame { .. })
-    });
-    assert!(
-        states(&events).contains(&State::Connected),
-        "the handshake completed: {events:?}"
-    );
-
-    let frame = events
-        .iter()
-        .find_map(|event| match event {
-            Event::Frame {
-                width,
-                height,
-                pixels,
-                stride,
-                desktop_width,
-                ..
-            } => Some((*width, *height, pixels.clone(), *stride, *desktop_width)),
-            _ => None,
-        })
-        .expect("a frame arrived");
-    assert_eq!(frame.0, 4);
-    assert_eq!(frame.1, 3);
-    assert_eq!(frame.3, 16, "four pixels of four bytes per row");
-    assert_eq!(frame.4, 4, "the desktop is four pixels wide");
-    assert_eq!(frame.2.len(), 4 * 3 * 4);
-    for chunk in frame.2.as_chunks::<4>().0 {
-        assert_eq!(chunk, &pixel, "BGRA bytes as the peer sent them");
-    }
-
-    // Text clipboard from the peer, whether it arrived before or after the frame.
-    let mut clipboard = events.clone();
-    clipboard.extend(pump(&client, Duration::from_secs(2), |event| {
-        matches!(event, Event::Clipboard { .. })
-    }));
-    assert!(
-        clipboard
-            .iter()
-            .any(|event| texts(std::slice::from_ref(event)) == ["from the peer"]),
-        "clipboard text: {clipboard:?}"
-    );
-
-    // A frame can arrive while the handshake is still finishing, so wait for the
-    // state the input path requires before sending anything.
-    // `pump` consumed Connected above. `state()` is a cache maintained only by
-    // track_state(), so waiting for it here would wait for an already-read event.
-
-    // Input: the keysym form for VNC, and a pointer position with a left press.
-    // A first frame may already have arrived while the handshake was finishing, so the
-    // input calls wait for the connected state the shim requires instead of assuming
-    // the event order.
-    let deadline = Instant::now() + PATIENCE;
-    loop {
-        match client.key(0, 0x61, true, false) {
-            Ok(()) => break,
-            Err(_) if Instant::now() < deadline => {
-                client.track_state();
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) => panic!("key down never became valid: {error}"),
-        }
-    }
-    client.key(0, 0x61, false, false).expect("key up");
-    client.pointer(2, 1, PointerButtons::LEFT).expect("pointer");
-    assert!(
-        peer.wait_for(ClientMessage::Key {
-            keysym: 0x61,
-            down: true
-        }),
-        "the peer saw the key press: {:?}",
-        peer.messages()
-    );
-    assert!(
-        peer.wait_for(ClientMessage::Pointer {
-            x: 2,
-            y: 1,
-            mask: 1
-        }),
-        "the peer saw the pointer: {:?}",
-        peer.messages()
-    );
-    assert!(
-        peer.messages()
-            .iter()
-            .any(|message| matches!(message, ClientMessage::Encodings(_))),
-        "the client asked for encodings: {:?}",
-        peer.messages()
-    );
-
-    // Closing a live session must stop the worker and release the handle.
-    drop(client);
-    assert_eq!(leaked_handles(), 0);
-}
-
-#[test]
-fn a_panicking_consumer_callback_cannot_unwind_into_the_library() {
-    if !backends_built() {
-        return;
-    }
-    let peer = Scripted::start(Script::Session {
-        width: 2,
-        height: 2,
-        pixel: [0x40, 0x50, 0x60, 0x00],
-        clipboard: None,
-        extended: false,
-    });
-
-    let before = callback_panics();
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let record = Arc::clone(&seen);
-    let first = Arc::new(AtomicBool::new(true));
-    let mut client = DesktopClient::with_handler(Protocol::Vnc, move |event| {
-        if matches!(event, Event::State { .. }) && first.swap(false, Ordering::SeqCst) {
-            // Exactly the failure mode the trampoline has to absorb. One state event is
-            // guaranteed, unlike a frame from this fixture.
-            panic!("a consumer callback panicked on purpose");
-        }
-        record.lock().expect("record").push(event);
-    })
-    .expect("client");
-    client.set_server("127.0.0.1", peer.port).expect("server");
-    client.set_size(2, 2).expect("size");
-    client.connect().expect("connect starts");
-
-    let deadline = Instant::now() + PATIENCE;
-    while callback_panics() == before && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        callback_panics() > before,
-        "the trampoline must count the panic instead of letting it unwind"
-    );
-
-    // The session kept running afterwards: cancelling still produces events.
-    client.cancel().expect("cancel");
-    client.wait_for_worker(PATIENCE).expect("the worker stops");
-    drop(client);
-    assert_eq!(leaked_handles(), 0);
-    let delivered = seen.lock().expect("record").len();
-    assert!(
-        delivered > 0,
-        "events before and after the panic still reached the consumer"
-    );
-}
-
-/// A live session is cancelled, its callback unregistered and its context freed in
-/// that order, and the whole sequence finishes without waiting for a protocol
-/// timeout. That the detach comes before the wait is what the crate documents; the
-/// observable part here is that the drop is prompt and the handle is released.
-#[test]
-fn dropping_a_session_detaches_before_it_frees() {
-    if !backends_built() {
-        return;
-    }
-    let peer = Scripted::start(Script::Session {
-        width: 2,
-        height: 2,
-        pixel: [0x01, 0x02, 0x03, 0x00],
-        clipboard: None,
-        extended: false,
-    });
-    let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
-    client.set_server("127.0.0.1", peer.port).expect("server");
-    client.set_size(2, 2).expect("size");
-    client.connect().expect("connect starts");
-    pump(&client, PATIENCE, |event| {
-        matches!(event, Event::Frame { .. })
-    });
-
-    let started = Instant::now();
-    drop(client);
-    assert!(
-        started.elapsed() < PATIENCE,
-        "the drop waited for the protocol timeout instead of cancelling"
-    );
-    assert_eq!(leaked_handles(), 0, "the handle was released");
-}
-
-/// A handshake that fails must not leave a pointer to the freed session behind.
-/// The cancel lands while the failure is being classified, which is exactly the
-/// window where the old code left client->backend dangling: the shim must clear the
-/// pointer before it frees, and an abort that arrives anyway must do nothing.
-#[test]
-fn cancelling_a_failing_vnc_handshake_touches_no_freed_session() {
-    if !backends_built() {
-        return;
-    }
-    // 18 is TLS; a build without a TLS backend refuses it, so the handshake fails
-    // quickly and deterministically.
-    for attempt in 0..3 {
-        let peer = Scripted::start(Script::SecurityTypes(vec![18]));
-        let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
-        client.set_server("127.0.0.1", peer.port).expect("server");
-        client
-            .set_vnc_security(VncSecurity::DEFAULT)
-            .expect("security mask");
-        client.connect().expect("connect starts");
-        // Racing the failure on purpose: on some runs this aborts a live connect,
-        // on others it arrives after the handshake already failed.
-        let _ = client.cancel();
-
-        let events = pump(&client, PATIENCE, |event| {
-            matches!(
-                event,
-                Event::State {
-                    state: State::Failed(_) | State::Closed,
-                    ..
-                }
-            )
-        });
-        never_connected(&events);
-        let last = states(&events).last().copied();
-        assert!(
-            matches!(last, Some(State::Failed(_) | State::Closed)),
-            "attempt {attempt}: a cancelled or failed handshake ends in Failed or Closed: {events:?}"
-        );
-        client.wait_for_worker(PATIENCE).expect("the worker stops");
-        drop(client);
-        assert_eq!(
-            leaked_handles(),
-            0,
-            "attempt {attempt}: the handle was released"
-        );
-    }
-}
-
-/// A peer that closes right after its banner ends the session as a failure, and the
-/// test reports SKIP like every other one when the backends are not built.
-#[test]
-fn a_peer_that_hangs_up_after_its_banner_ends_the_session() {
-    if !backends_built() {
-        return;
-    }
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("address").port();
-    let thread = thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let _ = stream.write_all(b"RFB 003.008\n");
-            let mut version = [0u8; 12];
-            let _ = stream.read_exact(&mut version);
-            let _ = stream.shutdown(Shutdown::Both);
-        }
-    });
-
-    let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
-    client.set_server("127.0.0.1", port).expect("server");
-    client.connect().expect("connect starts");
-    let events = pump(&client, PATIENCE, |event| {
-        matches!(
-            event,
-            Event::State {
-                state: State::Failed(_),
-                ..
-            }
-        )
-    });
-    never_connected(&events);
-    thread.join().expect("peer thread");
-}
-
-/// The drive channel serves the mapped folder and refuses anything that resolves
-/// outside it: a junction, a "..", or a DOS device name. Directory enumeration and
-/// rename are not part of this channel yet.
-#[test]
-fn the_drive_channel_serves_files_and_stays_inside_the_folder() {
-    let root = std::env::temp_dir().join(format!("shellune-drive-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("shellune-confine-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let base = root.join("mapped");
     let outside = root.join("outside");
     std::fs::create_dir_all(base.join("inside")).expect("mapped folder");
     std::fs::create_dir_all(&outside).expect("outside folder");
-    std::fs::write(base.join("f.txt"), b"mine").expect("inside file");
     std::fs::write(outside.join("secret.txt"), b"secret").expect("outside file");
+    std::fs::write(base.join("f.txt"), b"mine").expect("inside file");
     link_folder(&outside, &base.join("out"));
     let base_text = base.to_str().expect("utf-8 temp path").to_owned();
+    let open = |path: &str| open_status(&base_text, path, FILE_OPEN, 0);
+    // Windows and a default macOS volume ignore case; a Linux file system does not,
+    // and there a differently spelled name is simply another, missing, file.
+    let case_blind = base.join("F.TXT").exists();
 
-    // The folder itself is served.
-    assert_eq!(
-        open_status(&base_text, "\\f.txt", FILE_OPEN, 0),
-        STATUS_SUCCESS
-    );
-    // A file behind the junction, through it or spelled with "..", is refused.
+    // Ordinary use of the folder is served.
+    for path in ["\\", "\\f.txt", "/f.txt", "\\inside"] {
+        assert_eq!(open(path), STATUS_SUCCESS, "{path:?} is inside");
+    }
+    if case_blind {
+        assert_eq!(open("\\F.TXT"), STATUS_SUCCESS, "\\F.TXT is inside");
+    }
+    // Through the link: refused, however it is spelled.
     for path in [
+        "\\out",
         "\\out\\secret.txt",
         "/out/secret.txt",
-        "\\inside\\..\\out\\secret.txt",
-        "\\..\\outside\\secret.txt",
-        "\\CON",
+        "\\\\out\\\\secret.txt",
     ] {
         assert_eq!(
-            open_status(&base_text, path, FILE_OPEN, 0),
+            open(path),
             STATUS_ACCESS_DENIED,
             "{path:?} resolves outside"
         );
     }
-    // Creating inside works and creation through the junction leaves nothing behind.
-    assert_eq!(
-        open_status(&base_text, "\\inside\\new.txt", FILE_CREATE, 0),
-        STATUS_SUCCESS
-    );
-    assert!(base.join("inside").join("new.txt").exists());
+    if case_blind {
+        assert_eq!(open("\\OUT\\SECRET.TXT"), STATUS_ACCESS_DENIED);
+    } else {
+        assert_ne!(open("\\OUT\\SECRET.TXT"), STATUS_SUCCESS);
+    }
+    // FreeRDP's own ".." refusal still holds, and a device name never opens.
+    for path in [
+        "\\inside\\..\\out\\secret.txt",
+        "\\..\\outside\\secret.txt",
+        "\\CON",
+    ] {
+        assert_ne!(open(path), STATUS_SUCCESS, "{path:?}");
+    }
+
+    // Creating through the junction: refused, and nothing appears outside.
     assert_eq!(
         open_status(&base_text, "\\out\\new.txt", FILE_CREATE, 0),
         STATUS_ACCESS_DENIED
     );
     assert!(!outside.join("new.txt").exists());
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// The RDP handle reports its own engine and the options an attempt would use.
-#[test]
-fn the_rdp_handle_reports_its_engine_and_options() {
-    let mut client = DesktopClient::new(Protocol::Rdp).expect("client");
-    let info = backend_info(Protocol::Rdp).expect("rdp info");
-    assert!(info.contains("shellune"), "{info}");
-    assert!(!info.contains("freerdp"), "{info}");
-
-    let defaults = client.describe_rdp_settings().expect("settings");
-    assert!(defaults.contains("implementation=shellune"), "{defaults}");
-    assert!(defaults.contains("clipboard=1"), "{defaults}");
-    assert!(defaults.contains("drive=0"), "{defaults}");
-
-    client.set_clipboard(false).expect("switch off");
-    assert!(
-        client
-            .describe_rdp_settings()
-            .expect("settings")
-            .contains("clipboard=0")
+    assert_eq!(
+        open_status(
+            &base_text,
+            "\\out\\newdir",
+            FILE_CREATE,
+            FILE_DIRECTORY_FILE
+        ),
+        STATUS_ACCESS_DENIED
     );
-    let folder = std::env::temp_dir();
-    client
-        .set_drive(
-            shellune_desktop::DRIVE_NAME,
-            Some(folder.to_str().expect("utf-8")),
+    assert!(!outside.join("newdir").exists());
+    // ...while inside it works.
+    assert_eq!(
+        open_status(&base_text, "\\inside\\new.txt", FILE_CREATE, 0),
+        STATUS_SUCCESS
+    );
+    assert!(base.join("inside").join("new.txt").exists());
+
+    // Delete on close: a refused open deletes nothing (FreeRDP used to delete the
+    // named path even when the open failed); inside, the file goes when it closes.
+    assert_eq!(
+        open_status(
+            &base_text,
+            "\\out\\secret.txt",
+            FILE_OPEN,
+            FILE_DELETE_ON_CLOSE
+        ),
+        STATUS_ACCESS_DENIED
+    );
+    assert!(
+        outside.join("secret.txt").exists(),
+        "the outside file survives"
+    );
+    assert_eq!(
+        open_status(
+            &base_text,
+            "\\inside\\new.txt",
+            FILE_OPEN,
+            FILE_DELETE_ON_CLOSE
+        ),
+        STATUS_SUCCESS
+    );
+    assert!(!base.join("inside").join("new.txt").exists());
+
+    // Listing: a directory inside is listed, the one behind the junction is not.
+    let root_dir = create_request("\\", FILE_OPEN, FILE_DIRECTORY_FILE);
+    let list = |pattern: &str| {
+        let query = query_directory_request(pattern);
+        drive(
+            &base_text,
+            &[
+                create(&root_dir),
+                DriveRequest {
+                    major: IRP_MJ_DIRECTORY_CONTROL,
+                    minor: IRP_MN_QUERY_DIRECTORY,
+                    on_file: true,
+                    body: &query,
+                },
+            ],
         )
-        .expect("drive");
-    assert!(
-        client
-            .describe_rdp_settings()
-            .expect("settings")
-            .contains("drive=1")
-    );
-    client
-        .set_drive(shellune_desktop::DRIVE_NAME, None)
-        .expect("clear");
-    assert!(
-        client
-            .describe_rdp_settings()
-            .expect("settings")
-            .contains("drive=0")
-    );
-}
+    };
+    assert_eq!(list("\\inside\\*"), [STATUS_SUCCESS, STATUS_SUCCESS]);
+    assert_eq!(list("\\out\\*"), [STATUS_SUCCESS, STATUS_ACCESS_DENIED]);
 
-/// A folder that cannot be offered is reported by the check an attempt runs.
-#[test]
-fn a_folder_that_cannot_be_offered_is_reported_with_its_reason() {
-    let folder = std::env::temp_dir().join(format!("shellune-gone-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&folder);
-    assert_eq!(
-        probe::rdp_drive_folder(folder.to_str().expect("utf-8")),
-        Some(Some(DriveProblem::Missing))
-    );
-    assert_eq!(
-        probe::rdp_drive_folder("relative\\path"),
-        Some(Some(DriveProblem::NotAbsolute))
-    );
-    let usable = std::env::temp_dir();
-    assert_eq!(
-        probe::rdp_drive_folder(usable.to_str().expect("utf-8")),
-        Some(None)
-    );
-}
-
-/// A missing folder does not stop the attempt: the connection is still dialled.
-#[test]
-fn an_rdp_attempt_with_a_missing_folder_still_dials() {
-    let peer = Scripted::start(Script::Silent);
-    let mut client = DesktopClient::new(Protocol::Rdp).expect("client");
-    client.set_server("127.0.0.1", peer.port).expect("server");
-    let missing = std::env::temp_dir().join("shellune-no-such-folder-for-this-test");
-    client
-        .set_drive(
-            shellune_desktop::DRIVE_NAME,
-            Some(missing.to_str().expect("utf-8")),
+    // Renaming: never into the junction; within the folder, as usual.
+    let file = create_request("\\f.txt", FILE_OPEN, 0);
+    let rename = |target: &str| {
+        let body = rename_request(target);
+        drive(
+            &base_text,
+            &[
+                create(&file),
+                DriveRequest {
+                    major: IRP_MJ_SET_INFORMATION,
+                    minor: 0,
+                    on_file: true,
+                    body: &body,
+                },
+            ],
         )
-        .expect("drive");
-    client.connect().expect("connect starts");
-    let deadline = Instant::now() + PATIENCE;
-    while !peer.accepted.load(Ordering::SeqCst) && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        rename("\\out\\moved.txt"),
+        [STATUS_SUCCESS, STATUS_ACCESS_DENIED]
+    );
+    assert!(!outside.join("moved.txt").exists());
+    assert!(base.join("f.txt").exists());
+    assert_eq!(
+        rename("\\inside\\moved.txt"),
+        [STATUS_SUCCESS, STATUS_SUCCESS]
+    );
+    assert!(base.join("inside").join("moved.txt").exists());
+
+    // A symbolic link is refused like the junction, where this account may make one.
+    if link_file(&outside.join("secret.txt"), &base.join("link.txt")) {
+        assert_eq!(open("\\link.txt"), STATUS_ACCESS_DENIED);
     }
-    assert!(
-        peer.accepted.load(Ordering::SeqCst),
-        "the attempt still dialled the server"
-    );
-    let _ = client.cancel();
+
+    // The link itself goes, its target stays.
+    unlink_folder(&base.join("out"));
+    assert!(outside.join("secret.txt").exists());
+    let _ = std::fs::remove_dir_all(&root);
 }

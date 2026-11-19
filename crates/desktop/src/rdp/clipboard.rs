@@ -37,6 +37,9 @@ pub(super) struct Clipboard {
     /// When the last announcement went out, so a channel that was not ready yet
     /// is retried instead of staying silent.
     announced: Option<std::time::Instant>,
+    /// Whether the server has refused this client's formats since the last time it
+    /// offered any of its own.
+    refused: bool,
 }
 
 impl Clipboard {
@@ -48,6 +51,7 @@ impl Clipboard {
             pending: None,
             ready: false,
             announced: None,
+            refused: false,
         }
     }
 
@@ -104,9 +108,22 @@ impl Clipboard {
             ));
         }
         let stored = formats(entries)?;
+        // Text over the bound is cut, and the caller is told it was.
+        let cut = entries.iter().any(|entry| {
+            entry.kind == ClipboardKind::Text
+                && std::str::from_utf8(&entry.bytes)
+                    .map(|text| cut_text(text, MAX_CLIPBOARD_TEXT_BYTES).len() < entry.bytes.len())
+                    .unwrap_or(false)
+        });
         let list: Vec<u16> = stored.iter().map(|(id, _)| *id).collect();
         self.offered = stored;
-        self.send(ch, out, id, CB_FORMAT_LIST, 0, &words(&list))
+        self.send(ch, out, id, CB_FORMAT_LIST, 0, &words(&list))?;
+        if cut {
+            (self.emit)(Event::Notice {
+                notice: crate::Notice::ClipboardTooLarge(ClipboardKind::Text),
+            });
+        }
+        Ok(())
     }
 
     pub(super) fn on_data(
@@ -129,6 +146,12 @@ impl Clipboard {
         let data = p.take(length)?;
         match kind {
             CB_FORMAT_LIST => {
+                if self.refused {
+                    self.refused = false;
+                    (self.emit)(Event::Notice {
+                        notice: crate::Notice::ClipboardReady,
+                    });
+                }
                 let chosen = preferred(data)?;
                 if let Some(format) = chosen {
                     self.pending = Some(format);
@@ -202,7 +225,15 @@ impl Clipboard {
                 self.ready = true;
                 self.announce(ch, out)?;
             }
-            CB_MONITOR_READY | CB_FORMAT_LIST_RESPONSE => {}
+            CB_FORMAT_LIST_RESPONSE => {
+                if flags & CB_RESPONSE_OK == 0 && !self.refused {
+                    self.refused = true;
+                    (self.emit)(Event::Notice {
+                        notice: crate::Notice::ClipboardRefused,
+                    });
+                }
+            }
+            CB_MONITOR_READY => {}
             _ => {}
         }
         Ok(())
@@ -263,6 +294,29 @@ fn formats(entries: &[ClipboardEntry]) -> io::Result<Vec<(u16, Vec<u8>)>> {
 /// channel uses. Errors are reported as an empty list.
 pub(crate) fn probe_offer(entries: &[ClipboardEntry]) -> Vec<(u16, Vec<u8>)> {
     formats(entries).unwrap_or_default()
+}
+
+/// Test hook: runs the channel's offer path over `entries` and returns what it
+/// sent and the events it reported.
+pub(crate) fn probe_offer_events(entries: &[ClipboardEntry]) -> (Vec<u8>, Vec<Event>) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    let emit: super::Emit = Arc::new(move |event| {
+        if let Ok(mut slot) = sink.lock() {
+            slot.push(event);
+        }
+    });
+    let mut clipboard = Clipboard::new(true, emit);
+    let channels = Channels {
+        user: 1005,
+        global: 1003,
+        clipboard: Some(1004),
+        drive: None,
+    };
+    let mut out = Vec::new();
+    let _ = clipboard.offer(&channels, &mut out, entries);
+    let events = events.lock().map(|slot| slot.clone()).unwrap_or_default();
+    (out, events)
 }
 
 /// Test hook: runs the channel's receive path over canned messages, after offering

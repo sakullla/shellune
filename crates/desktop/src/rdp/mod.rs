@@ -12,8 +12,8 @@ mod share;
 mod update;
 mod wire;
 
-pub(crate) use clipboard::{probe_offer, probe_receive};
-pub(crate) use drive::{ProbeRequest, probe_requests};
+pub(crate) use clipboard::{probe_offer, probe_offer_events, probe_receive};
+pub(crate) use drive::{ProbeRequest, probe_drive_reply, probe_requests};
 
 use crate::{ClipboardEntry, Event, Failure, State, ffi};
 use std::net::TcpStream;
