@@ -2206,7 +2206,8 @@ raised 与强边、开关与勾选框的轨道与勾可读、每个共享组件�
   与 T8 的按平台快捷键读取改写。Owner 把 T1–T8 的提交（f6af526）推到 `ci/ui-redo-check` 重跑三平台 CI：
   <https://github.com/sakullla/shellune/actions/runs/44443090557>。三平台全部通过，macOS 上 874 个界面测试全部通过。macOS 首轮有一次
   `tests/serial.rs` 的 `an_unplugged_device_is_reported_as_a_disconnect_and_the_port_is_released` 失败，原因是状态仍为 Open，
-  属于时序偶发；该串口代码本次重做没有改动，重跑失败作业后通过。T9 的提交在交付前随主线推送时再跑一次。
+  属于时序偶发；该串口代码本次重做没有改动，重跑失败作业后通过。
+  交付候选 365c54c（含 T9）也跑了一次 CI：<https://github.com/sakullla/shellune/actions/runs/44472528511>，三平台全部通过。
 - Release 演练（workflow_dispatch，ec4fd74，不发布）：<https://github.com/sakullla/shellune/actions/runs/44328823642>
   ——三平台成功，便携 zip、`.app` 与 deb 都带 `third-party/` 许可证。
 - 文档补交（8cc9f92）的 CI：<https://github.com/sakullla/shellune/actions/runs/44334569122>。
@@ -2222,6 +2223,9 @@ T9 关闭了各任务审查留下的这些事项（每项有测试）：横幅�
 失败原因可滚动查看（由 `the_stop_scrolls_to_its_buttons_in_the_smallest_window_at_the_largest_text` 断言）。
 
 仍未关闭（均非阻断）：
+
+- 启动失败页：在 720×480 @200%（逻辑 360×240）下，首屏只显示失败标题和两个按钮，原因与提示要滚动才能看到，而且没有“下方还有内容”的滚动提示。
+- 截图矩阵：92 个场景中有 56 个没有 720×480 @200% 的截图，只有 1120×720 @200% 的截图；最小窗口下是否溢出由 GPUI 测试检查。
 
 - 文件视图：720×480 @200%（相当于 360×240 的逻辑空间）时两栏头部、面包屑与底栏几乎占满高度，列表区只剩很少的空间。
 - 启动失败：原因句取自存储层，界面为中文时也是英文（`startup.failure.reason`；标题与说明随语言）。
