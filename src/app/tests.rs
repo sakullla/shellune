@@ -38291,6 +38291,19 @@ async fn switching_protocols_keeps_the_open_dialog_in_place(cx: &mut TestAppCont
         "10",
         "the keyboard is in the address of the form that is open"
     );
+
+    // The entrance is still played when the form opens: what was wrong was replaying it
+    // on a switch, not the dialog arriving.
+    click(cx, "connection.cancel");
+    settle(cx);
+    click(cx, "hosts.new");
+    let arriving = open_form_bounds(cx);
+    settle(cx);
+    let arrived = open_form_bounds(cx);
+    assert!(
+        arriving.origin.y < arrived.origin.y - px(1.0),
+        "the dialog still settles into place when it opens: {arriving:?} then {arrived:?}"
+    );
 }
 
 /// Every frame a protocol switch drew that had a form open drew exactly that form's
