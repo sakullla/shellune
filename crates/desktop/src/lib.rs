@@ -412,8 +412,8 @@ pub fn backend_info(protocol: Protocol) -> Result<String, Error> {
     Ok(match protocol {
         Protocol::Rdp => "shellune RDP client (native, no external library)".to_owned(),
         Protocol::Vnc => "shellune VNC client (native, no external library) \
-             security=none,vncauth,vencrypt-x509 anonymous-tls=refused encodings=raw,copyrect \
-             clipboard=text"
+             security=none,vncauth,vencrypt-x509 anonymous-tls=refused \
+             encodings=raw,copyrect,hextile clipboard=text"
             .to_owned(),
     })
 }

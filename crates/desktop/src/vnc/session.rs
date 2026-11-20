@@ -17,8 +17,10 @@ use std::time::Duration;
 /// One read wait once the desktop is up: the loop returns to its cancellation
 /// check after each, and a partial message stays buffered.
 const POLL: Duration = Duration::from_millis(200);
-/// One read: large enough for a screenful of raw pixels in a few reads.
-const CHUNK: usize = 64 * 1024;
+/// One read. A message is re-parsed from its start until it is complete, so a
+/// large buffer keeps a screenful of hextile to a couple of passes instead of a
+/// dozen; the read itself still returns as soon as any bytes are available.
+const CHUNK: usize = 256 * 1024;
 
 /// Runs one attempt, retrying once if the server drops an established session.
 pub(super) fn run(
@@ -219,6 +221,16 @@ impl Desktop {
     }
 }
 
+/// What one session did, for the trace line: how many bytes it read, how many
+/// server messages it decoded and how many frame events it emitted.
+#[derive(Default)]
+struct Stats {
+    bytes: u64,
+    messages: u64,
+    frames: u64,
+    started: Option<std::time::Instant>,
+}
+
 struct Session {
     transport: Transport,
     incoming: Incoming,
@@ -229,6 +241,7 @@ struct Session {
     extended: bool,
     /// The Latin-1 notice is said once per session.
     latin1_reported: bool,
+    stats: Stats,
 }
 
 impl Session {
@@ -241,10 +254,26 @@ impl Session {
             clipboard: config.clipboard,
             extended: false,
             latin1_reported: false,
+            stats: Stats::default(),
         }
     }
 
     fn run(&mut self, control: &Arc<Control>, commands: &Receiver<Command>) -> Result<(), Ended> {
+        self.stats.started = Some(std::time::Instant::now());
+        let outcome = self.pump(control, commands);
+        if let Some(started) = self.stats.started {
+            super::trace(&format!(
+                "session stats bytes={} messages={} frames={} elapsed_ms={}",
+                self.stats.bytes,
+                self.stats.messages,
+                self.stats.frames,
+                started.elapsed().as_millis()
+            ));
+        }
+        outcome
+    }
+
+    fn pump(&mut self, control: &Arc<Control>, commands: &Receiver<Command>) -> Result<(), Ended> {
         self.transport.set_read_timeout(Some(POLL));
         self.configure()?;
         publish(&self.emit, control, &State::Connected, Failure::None, "");
@@ -263,6 +292,7 @@ impl Session {
                     ));
                 }
                 Ok(read) => {
+                    self.stats.bytes += read as u64;
                     self.incoming.push(&chunk[..read]);
                     self.messages()?;
                 }
@@ -292,9 +322,11 @@ impl Session {
         format.extend_from_slice(&[0, 0, 0]);
         self.send(&format)?;
 
-        // Only encodings this client decodes are requested. Raw is first so a
-        // server that supports none of the others still has a way to answer.
-        let mut encodings: Vec<i32> = vec![0, 1, -223, -224];
+        // Only encodings this client decodes are requested. Hextile is offered
+        // first: it carries a screen of text and UI in a fraction of raw's bytes,
+        // and TigerVNC and libvncserver both speak it. Raw stays in the list so a
+        // server that supports nothing else still has a way to answer.
+        let mut encodings: Vec<i32> = vec![5, 0, 1, -223, -224];
         if self.clipboard {
             encodings.push(EXTENDED_CLIPBOARD);
         }
@@ -339,6 +371,7 @@ impl Session {
             let Some(message) = message else {
                 return Ok(());
             };
+            self.stats.messages += 1;
             match message {
                 Message::Update(rects) => {
                     super::trace(&format!("update of {} rectangles", rects.len()));
@@ -348,6 +381,7 @@ impl Session {
                             .apply(rect)
                             .map_err(|reason| Ended::new(Failure::ProtocolFailure, reason))?
                         {
+                            self.stats.frames += 1;
                             (self.emit)(event);
                         }
                     }

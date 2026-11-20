@@ -831,18 +831,18 @@ fn the_vnc_endpoint_takes_pointer_keyboard_and_clipboard() {
     // earlier run holds a keyboard grab, so it is dismissed first.
     observer.run("xdotool key Escape").ok();
     observer
-        .run("pkill -f '^xterm -geometry 40x5' || true; rm -f /tmp/shellune-key.txt")
+        .run("pkill -f '^xterm -T shellune-key-capture' || true; rm -f /tmp/shellune-key.txt")
         .unwrap_or_else(|error| panic!("xterm cleanup: {error}"));
     observer
         .run(
-            "nohup xterm -geometry 40x5+100+100 -e sh -c 'cat > /tmp/shellune-key.txt' \
-             >/dev/null 2>&1 </dev/null &",
+            "nohup xterm -T shellune-key-capture -geometry 40x5+100+100 \
+             -e sh -c 'cat > /tmp/shellune-key.txt' >/dev/null 2>&1 </dev/null &",
         )
         .unwrap_or_else(|error| panic!("xterm start: {error}"));
     let mut window = String::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && window.is_empty() {
-        if let Ok(found) = observer.run("xdotool search --class xterm | head -1") {
+        if let Ok(found) = observer.run("xdotool search --name shellune-key-capture | head -1") {
             window = found.trim().to_owned();
         }
         if window.is_empty() {
@@ -869,7 +869,7 @@ fn the_vnc_endpoint_takes_pointer_keyboard_and_clipboard() {
             .run("cat /tmp/shellune-key.txt")
             .unwrap_or_default();
     }
-    let _ = observer.run("pkill -f '^xterm -geometry 40x5' || true");
+    let _ = observer.run("pkill -f '^xterm -T shellune-key-capture' || true");
     assert!(
         typed.contains('a'),
         "the terminal read {typed:?}, so the key press did not reach the desktop"

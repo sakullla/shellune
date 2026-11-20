@@ -886,6 +886,8 @@ fn the_vnc_engine_reports_itself_and_links_no_protocol_library() {
     // Anonymous TLS is not a capability this build has, and the report says so
     // rather than claiming a type the handshake would refuse.
     assert!(info.contains("anonymous-tls=refused"), "{info}");
+    // Hextile is what a real server is asked for first; the report says so.
+    assert!(info.contains("hextile"), "{info}");
 }
 
 #[test]
