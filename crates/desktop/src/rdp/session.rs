@@ -124,6 +124,28 @@ impl Ended {
     }
 }
 
+/// The slow-path keyboard flags of one key event (MS-RDPBCGR 2.2.8.1.2.2.1,
+/// TS_KEYBOARD_EVENT).
+///
+/// These are not the fast-path bits: RELEASE is 0x8000 (not 0x01) and EXTENDED is
+/// 0x0100 (not 0x02). A release sent with the fast-path bit reads as a press to the
+/// server, so every character typed arrived twice - once on the way down and once on
+/// the way up - until this was fixed.
+fn keyboard_flags(down: bool, extended: bool) -> u16 {
+    /// The key is going up; without it the server reads a press.
+    const KBD_FLAGS_RELEASE: u16 = 0x8000;
+    /// The key is one of the extended set (arrows, navigation, right-hand modifiers).
+    const KBD_FLAGS_EXTENDED: u16 = 0x0100;
+    let mut flags = 0;
+    if !down {
+        flags |= KBD_FLAGS_RELEASE;
+    }
+    if extended {
+        flags |= KBD_FLAGS_EXTENDED;
+    }
+    flags
+}
+
 enum Transport {
     Plain(TcpStream),
     Secure(Box<security::SecureStream<Transport>>),
@@ -829,12 +851,15 @@ impl Active {
     /// Share Data PDU. Every server accepts it, which a fast-path PDU is not
     /// guaranteed to be.
     fn key(&mut self, scancode: u8, down: bool, extended: bool) -> io::Result<()> {
+        // Slow-path keyboard flags are the 0x0100/0x8000 family, not the fast
+        // path's 0x01/0x02: a release marked with the wrong bit arrives as a second
+        // press, which types every character twice.
         let mut flags = 0u16;
         if !down {
-            flags |= 0x01; // KBDFLAGS_RELEASE
+            flags |= 0x8000; // KBDFLAGS_RELEASE
         }
         if extended {
-            flags |= 0x02; // KBDFLAGS_EXTENDED
+            flags |= 0x0100; // KBDFLAGS_EXTENDED
         }
         self.share.input(
             &self.channels,
