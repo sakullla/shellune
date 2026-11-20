@@ -1248,6 +1248,14 @@ impl ShelluneView {
 
     /// One typed field of the protocol form.
     fn protocol_field(&self, field: ConnectionFormField) -> Div {
+        self.protocol_field_sized(field, 0.5)
+    }
+
+    /// One typed field of the protocol form, taking the share of the row it is given.
+    ///
+    /// A password is the only field of its line, so it takes the whole row rather than
+    /// half of one beside nothing (ADR-7).
+    fn protocol_field_sized(&self, field: ConnectionFormField, grow: f32) -> Div {
         let metrics = self.metrics();
         let label = field.label(self.strings());
         let entity = self
@@ -1257,7 +1265,7 @@ impl ShelluneView {
             .cloned();
         // Every protocol field shares its row evenly and stacks under its neighbour when
         // the dialog is too narrow for both (ADR-7).
-        let mut cell = components::form_cell(0.5, components::FORM_FIELD_MIN_WIDTH, metrics)
+        let mut cell = components::form_cell(grow, components::FORM_FIELD_MIN_WIDTH, metrics)
             .child(components::form_label(label, metrics));
         if let Some(entity) = entity {
             cell = cell.child(
@@ -1344,6 +1352,36 @@ impl ShelluneView {
                     ));
                 }
                 ConnectionFormField::Domain => {}
+                ConnectionFormField::Secret => {
+                    // The password a RDP or VNC server asks for, typed here because the
+                    // record has nowhere to keep it and the attempt starts after the
+                    // form closes. The box decides whether it is kept in the store.
+                    let remembered = draft.remember();
+                    basic = basic.child(
+                        self.protocol_field_sized(ConnectionFormField::Secret, 1.0)
+                            .child(
+                                checkbox(
+                                    "connection.field.remember",
+                                    strings.host_remember_password,
+                                    remembered,
+                                    metrics,
+                                )
+                                .tooltip(components::tooltip(strings.host_remember_note))
+                                .on_click(cx.listener(
+                                    move |this, _event, _window, cx| {
+                                        let next = this
+                                            .hosts
+                                            .protocol_draft()
+                                            .is_some_and(|draft| !draft.remember());
+                                        if let Some(draft) = this.hosts.protocol_draft_mut() {
+                                            draft.set_remember(next);
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    );
+                }
                 ConnectionFormField::Certificate => {
                     let mut choices = components::segmented(metrics);
                     for policy in RdpCertificatePolicy::ALL {

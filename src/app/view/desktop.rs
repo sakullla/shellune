@@ -296,6 +296,10 @@ pub struct DesktopPane {
     certificate: Option<CertificateQuestion>,
     /// What the protocol layer said about why it ended, kept verbatim.
     layer_reason: Option<String>,
+    /// What the last start was handed to sign in with, for the tests that prove the
+    /// password reaches the link. `None` until a start; `Some(None)` is "no password".
+    #[cfg(test)]
+    started_password: Option<Option<String>>,
     /// Why the last send failed, when it did, shown once beside the surface.
     send_problem: Option<String>,
     polling: bool,
@@ -352,6 +356,8 @@ impl DesktopPane {
             last_sent: None,
             certificate: None,
             layer_reason: None,
+            #[cfg(test)]
+            started_password: None,
             send_problem: None,
             polling: false,
             watching_focus: false,
@@ -540,11 +546,26 @@ impl DesktopPane {
             .filter(|reason| !reason.trim().is_empty())
     }
 
+    /// What the last [`Self::start`] was handed to sign in with, for the tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn started_password(&self) -> Option<Option<&str>> {
+        self.started_password
+            .as_ref()
+            .map(|password| password.as_deref())
+    }
+
     /// Starts the session: dials it and takes the first frames.
     ///
     /// A protocol this build cannot speak ends the session with the reason instead
     /// of leaving a pane that looks like it is connecting.
     pub fn start(&mut self, password: Option<&str>, cx: &mut Context<Self>) {
+        // Recorded before the link check: a pane a test mounted on a scripted link is
+        // started the way the window starts one, and says what it was handed.
+        #[cfg(test)]
+        {
+            self.started_password = Some(password.map(str::to_owned));
+        }
         if self.link.is_some() {
             return;
         }

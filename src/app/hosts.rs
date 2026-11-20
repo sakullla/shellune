@@ -3021,6 +3021,11 @@ pub enum ConnectionFormField {
     User,
     /// The Windows domain that user belongs to.
     Domain,
+    /// The password a desktop connection signs in with.
+    ///
+    /// Typed here rather than only asked for at the start: a RDP or VNC server refuses
+    /// an attempt that arrives without one, and the record has nowhere to keep it.
+    Secret,
     /// What a RDP connection does with an untrusted certificate.
     Certificate,
     /// How much a VNC connection insists on encryption.
@@ -3052,13 +3057,14 @@ impl ConnectionFormField {
     /// shows only the fields it has; the forms are built from
     /// [`Self::of_protocol`], which is why nothing outside a test asks for this list.
     #[cfg(test)]
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::Name,
         Self::Group,
         Self::Address,
         Self::Port,
         Self::User,
         Self::Domain,
+        Self::Secret,
         Self::Certificate,
         Self::Security,
         Self::Clipboard,
@@ -3083,6 +3089,7 @@ impl ConnectionFormField {
                 Self::Port,
                 Self::User,
                 Self::Domain,
+                Self::Secret,
                 Self::Certificate,
                 Self::Clipboard,
                 Self::DriveFolder,
@@ -3092,6 +3099,7 @@ impl ConnectionFormField {
             ProtocolKind::Vnc => &[
                 Self::Address,
                 Self::Port,
+                Self::Secret,
                 Self::Security,
                 Self::Clipboard,
                 Self::Name,
@@ -3121,6 +3129,7 @@ impl ConnectionFormField {
             Self::Port => strings.host_field_port,
             Self::User => strings.host_field_user,
             Self::Domain => strings.connection_field_domain,
+            Self::Secret => strings.auth_password,
             Self::Certificate => strings.connection_field_certificate,
             Self::Security => strings.connection_field_security,
             Self::Clipboard => strings.connection_field_clipboard,
@@ -3145,6 +3154,7 @@ impl ConnectionFormField {
             Self::Port => "connection.field.port",
             Self::User => "connection.field.user",
             Self::Domain => "connection.field.domain",
+            Self::Secret => "connection.field.secret",
             Self::Certificate => "connection.field.certificate",
             Self::Security => "connection.field.security",
             Self::Clipboard => "connection.field.clipboard",
@@ -3170,6 +3180,7 @@ impl ConnectionFormField {
                 | Self::Port
                 | Self::User
                 | Self::Domain
+                | Self::Secret
                 | Self::DriveFolder
                 | Self::Device
                 | Self::Baud
@@ -3191,6 +3202,7 @@ impl ConnectionFormField {
             | Self::Port
             | Self::User
             | Self::Domain
+            | Self::Secret
             | Self::Device
             | Self::Baud => true,
             Self::Certificate
@@ -3220,12 +3232,17 @@ pub struct ProtocolDraft {
     port: String,
     user: String,
     domain: String,
+    /// The password typed for this connection, never part of the record.
+    secret: String,
     certificate: RdpCertificatePolicy,
     security: VncSecurity,
     /// Whether the clipboard is shared; on unless the record turned it off.
     clipboard: bool,
     /// The local folder offered to a RDP desktop; blank maps nothing.
     drive_folder: String,
+    /// Whether the system store already holds this connection's password, so a form
+    /// left blank in the field keeps it instead of forgetting it.
+    has_saved_secret: bool,
     device: String,
     baud: String,
     data_bits: String,
@@ -3253,10 +3270,12 @@ impl ProtocolDraft {
             port,
             user: String::new(),
             domain: String::new(),
+            secret: String::new(),
             certificate: RdpCertificatePolicy::default(),
             security: VncSecurity::default(),
             clipboard: true,
             drive_folder: String::new(),
+            has_saved_secret: false,
             device: String::new(),
             baud: shellune_core::DEFAULT_SERIAL_BAUD.to_string(),
             data_bits: shellune_core::MAX_SERIAL_DATA_BITS.to_string(),
@@ -3264,8 +3283,8 @@ impl ProtocolDraft {
             stop_bits: SerialStopBits::default(),
             flow: SerialFlow::default(),
             local_echo: false,
-            // The form has no credential field: a password is asked for when the
-            // session is started, so nothing here claims the store already holds one.
+            // Nothing is kept until the box is ticked: the password is used for the
+            // attempt it was typed for, and only a ticked box puts it in the store.
             remember: false,
         }
     }
@@ -3296,6 +3315,7 @@ impl ProtocolDraft {
                 draft.clipboard = config.clipboard();
                 draft.drive_folder = config.drive_folder().unwrap_or_default().to_owned();
                 draft.remember = config.remembers_secret();
+                draft.has_saved_secret = config.remembers_secret();
                 draft
             }
             ConnectionRecord::Vnc(config) => {
@@ -3312,6 +3332,7 @@ impl ProtocolDraft {
                 draft.security = config.security();
                 draft.clipboard = config.clipboard();
                 draft.remember = config.remembers_secret();
+                draft.has_saved_secret = config.remembers_secret();
                 draft
             }
             ConnectionRecord::Serial(config) => {
@@ -3369,6 +3390,7 @@ impl ProtocolDraft {
             ConnectionFormField::Port => &self.port,
             ConnectionFormField::User => &self.user,
             ConnectionFormField::Domain => &self.domain,
+            ConnectionFormField::Secret => &self.secret,
             ConnectionFormField::DriveFolder => &self.drive_folder,
             ConnectionFormField::Device => &self.device,
             ConnectionFormField::Baud => &self.baud,
@@ -3393,6 +3415,7 @@ impl ProtocolDraft {
             ConnectionFormField::Port => &mut self.port,
             ConnectionFormField::User => &mut self.user,
             ConnectionFormField::Domain => &mut self.domain,
+            ConnectionFormField::Secret => &mut self.secret,
             ConnectionFormField::DriveFolder => &mut self.drive_folder,
             ConnectionFormField::Device => &mut self.device,
             ConnectionFormField::Baud => &mut self.baud,
@@ -3517,10 +3540,51 @@ impl ProtocolDraft {
         true
     }
 
+    /// Whether the password typed here is to be kept in the system store.
+    #[must_use]
+    pub fn remember(&self) -> bool {
+        self.remember
+    }
+
+    /// Chooses whether the password is kept.
+    pub fn set_remember(&mut self, remember: bool) -> bool {
+        if self.remember == remember {
+            return false;
+        }
+        self.remember = remember;
+        true
+    }
+
+    /// Whether the form will keep a password in the system store when saved.
+    ///
+    /// Only when there is one to keep: a password typed now, or one already saved. A
+    /// connection saved with the box ticked and nothing typed has nothing to keep, so
+    /// the record does not claim the store holds one.
+    #[must_use]
+    pub fn keeps_secret(&self) -> bool {
+        self.remember && (!self.secret.is_empty() || self.has_saved_secret)
+    }
+
+    /// The password typed in this form, when one was typed.
+    ///
+    /// The record never carries it: it goes to the pane that dials, and to the
+    /// system store only when the box is ticked.
+    #[must_use]
+    pub fn typed_secret(&self) -> Option<&str> {
+        (!self.secret.is_empty()).then_some(self.secret.as_str())
+    }
+
+    /// Forgets the typed password, once it has been handed on.
+    pub fn clear_secret(&mut self) {
+        self.secret.clear();
+    }
+
     /// Turns this form into a copy of a saved connection (R9).
     pub fn rename_for_copy(&mut self, name: &str) {
         self.editing = None;
         self.name = name.to_owned();
+        self.secret.clear();
+        self.has_saved_secret = false;
     }
 
     /// The record this form would save, or the reason it cannot be saved.
@@ -3554,7 +3618,7 @@ impl ProtocolDraft {
                 config
                     .set_drive_folder(Some(self.drive_folder.as_str()))
                     .map_err(problem_of)?;
-                config.set_remember_secret(self.remember);
+                config.set_remember_secret(self.keeps_secret());
                 ConnectionRecord::Rdp(config)
             }
             ProtocolKind::Vnc => {
@@ -3565,7 +3629,7 @@ impl ProtocolDraft {
                 config.set_port(port.get().into()).map_err(problem_of)?;
                 config.set_security(self.security);
                 config.set_clipboard(self.clipboard);
-                config.set_remember_secret(self.remember);
+                config.set_remember_secret(self.keeps_secret());
                 ConnectionRecord::Vnc(config)
             }
             ProtocolKind::Serial => {
@@ -3866,6 +3930,10 @@ mod tests {
         let rdp = ConnectionFormField::of_protocol(ProtocolKind::Rdp);
         assert!(rdp.contains(&ConnectionFormField::Domain));
         assert!(rdp.contains(&ConnectionFormField::Certificate));
+        assert!(
+            rdp.contains(&ConnectionFormField::Secret),
+            "a RDP server asks for a password"
+        );
         for withheld in [
             ConnectionFormField::Device,
             ConnectionFormField::Baud,
@@ -3877,6 +3945,10 @@ mod tests {
 
         let vnc = ConnectionFormField::of_protocol(ProtocolKind::Vnc);
         assert!(vnc.contains(&ConnectionFormField::Security));
+        assert!(
+            vnc.contains(&ConnectionFormField::Secret),
+            "a VNC server can ask for a password too"
+        );
         for withheld in [
             ConnectionFormField::User,
             ConnectionFormField::Domain,
@@ -3903,6 +3975,7 @@ mod tests {
             ConnectionFormField::Port,
             ConnectionFormField::Certificate,
             ConnectionFormField::Security,
+            ConnectionFormField::Secret,
         ] {
             assert!(
                 !serial.contains(&withheld),
@@ -3952,6 +4025,40 @@ mod tests {
             Some("Prod/East".to_owned())
         );
         assert!(edit.record().as_ssh().is_none(), "it is not an SSH host");
+    }
+
+    #[test]
+    fn a_desktop_form_keeps_its_password_out_of_the_record() {
+        let mut draft = ProtocolDraft::create(ProtocolKind::Vnc);
+        draft.set_text(ConnectionFormField::Address, "10.0.0.7");
+        draft.set_text(ConnectionFormField::Secret, "pw");
+        assert_eq!(draft.typed_secret(), Some("pw"));
+        assert!(
+            !draft.keeps_secret(),
+            "nothing is kept until the box is ticked"
+        );
+        let edit = draft.build().expect("a valid VNC connection");
+        assert!(
+            !edit.record().remembers_secret(),
+            "a password typed without ticking the box is not claimed as kept"
+        );
+
+        // Ticking the box keeps it, and the record says so.
+        draft.set_remember(true);
+        assert!(draft.keeps_secret());
+        let edit = draft.build().expect("a valid VNC connection");
+        assert!(edit.record().remembers_secret());
+        let record = edit.record().clone();
+
+        // Reopened for an edit, the password is not put back in the field, and a blank
+        // field keeps what the store holds.
+        let reopened = ProtocolDraft::edit(&record);
+        assert_eq!(
+            reopened.text(ConnectionFormField::Secret),
+            "",
+            "the password is never shown back"
+        );
+        assert!(reopened.keeps_secret(), "a blank field keeps the saved one");
     }
 
     #[test]

@@ -39,7 +39,7 @@ use crate::app::actions::{
 };
 use crate::app::copy::{self, CHINESE, ENGLISH, Locale, Strings};
 use crate::app::files::{FileSource, FilesStop};
-use crate::app::hosts::HomeSection;
+use crate::app::hosts::{ConnectionFormField, HomeSection};
 use crate::app::keymap::Keymap;
 use crate::app::layout::Direction;
 use crate::app::nav::{Destination, Platform};
@@ -29099,6 +29099,263 @@ async fn the_rdp_form_saves_the_clipboard_switch_and_the_folder_and_vnc_has_only
     assert!(
         !vnc.expect("the VNC connection was saved").clipboard(),
         "a VNC connection keeps its switch too"
+    );
+}
+
+/// Saves an RDP connection on a closed port, with the password typed in the form.
+fn save_desktop_password_form(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    protocol: &'static str,
+    password: &str,
+    remember: bool,
+) -> shellune_core::HostId {
+    click(cx, "hosts.new");
+    click(cx, protocol);
+    type_into(cx, "connection.field.address", "127.0.0.1");
+    clear_field(cx, "connection.field.port", 4);
+    type_into(cx, "connection.field.port", "1");
+    type_into(cx, "connection.field.secret", password);
+    if remember {
+        click(cx, "connection.field.remember");
+    }
+    click(cx, "connection.save");
+    cx.update(|_window, app| {
+        view.read(app)
+            .book()
+            .connections()
+            .last()
+            .map(shellune_core::ConnectionRecord::id)
+    })
+    .expect("the connection was saved")
+}
+
+#[gpui::test]
+async fn the_desktop_form_asks_for_a_password_and_hides_it(cx: &mut TestAppContext) {
+    let dir = TempDir::new("desktop-secret-form");
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.simulate_resize(size(px(1400.0), px(1300.0)));
+    cx.run_until_parked();
+
+    click(cx, "hosts.new");
+    click(cx, "connection.protocol.rdp");
+    assert!(
+        cx.debug_bounds("connection.field.secret").is_some(),
+        "a RDP server asks for a password, so the form does"
+    );
+    assert!(
+        cx.debug_bounds("connection.field.remember").is_some(),
+        "the password can be kept, the way a host's can"
+    );
+    type_into(cx, "connection.field.secret", "rdp-pass");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).connection_secret_masked_for_test(app)),
+        Some(true),
+        "the password is not drawn as it is typed"
+    );
+
+    // VNC asks for one too; a serial port has nothing to sign in to.
+    click(cx, "connection.protocol.vnc");
+    let vnc = cx
+        .update(|_window, app| view.read(app).hosts_state().protocol_draft().cloned())
+        .expect("the VNC form is open");
+    assert!(vnc.fields().contains(&ConnectionFormField::Secret));
+    assert_eq!(
+        vnc.text(ConnectionFormField::Secret),
+        "",
+        "a password typed for RDP is not carried into the VNC form"
+    );
+
+    click(cx, "connection.protocol.serial");
+    let serial = cx
+        .update(|_window, app| view.read(app).hosts_state().protocol_draft().cloned())
+        .expect("the serial form is open");
+    assert!(
+        !serial.fields().contains(&ConnectionFormField::Secret),
+        "a serial port has no password"
+    );
+}
+
+#[gpui::test]
+async fn switching_protocols_does_not_carry_a_password_between_forms(cx: &mut TestAppContext) {
+    let dir = TempDir::new("desktop-secret-switch");
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.simulate_resize(size(px(1400.0), px(1300.0)));
+    cx.run_until_parked();
+
+    let secret_text = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .hosts_state()
+                .protocol_draft()
+                .map(|draft| draft.text(ConnectionFormField::Secret).to_owned())
+        })
+    };
+
+    click(cx, "hosts.new");
+    click(cx, "connection.protocol.rdp");
+    type_into(cx, "connection.field.secret", "rdp-secret");
+
+    // A VNC form is a new one: the RDP password is not in it.
+    click(cx, "connection.protocol.vnc");
+    assert_eq!(secret_text(cx), Some(String::new()));
+    type_into(cx, "connection.field.secret", "vnc-secret");
+
+    // The SSH form is the host form, and it starts with nothing typed either.
+    click(cx, "connection.protocol.ssh");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().protocol_draft().is_some()),
+        false,
+        "the SSH form is the host form"
+    );
+    let ssh_secret = cx.update(|_window, app| {
+        view.read(app)
+            .hosts_state()
+            .draft()
+            .map(|draft| draft.text(crate::app::hosts::HostField::Secret).to_owned())
+    });
+    assert_eq!(ssh_secret, Some(String::new()));
+    type_into(cx, "hosts.field.secret", "ssh-secret");
+
+    // And back: the SSH password stays in the form it was typed into.
+    click(cx, "connection.protocol.rdp");
+    assert_eq!(
+        secret_text(cx),
+        Some(String::new()),
+        "a password typed for SSH is not carried into a desktop form"
+    );
+    assert!(cx.update(|_window, app| { view.read(app).hosts_state().draft().is_none() }));
+}
+
+#[gpui::test]
+async fn a_desktop_connection_starts_with_the_password_typed_in_its_form(cx: &mut TestAppContext) {
+    let dir = TempDir::new("desktop-secret-connect");
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.simulate_resize(size(px(1400.0), px(1300.0)));
+    cx.run_until_parked();
+
+    let id = save_desktop_password_form(cx, &view, "connection.protocol.rdp", "rdp-pass", false);
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.connect_saved_connection(id, cx));
+    });
+    cx.run_until_parked();
+
+    let session = cx
+        .update(|_window, app| view.read(app).open_tabs().last().copied())
+        .expect("the connection opened a tab");
+    cx.update(|_window, app| {
+        let pane = view
+            .read(app)
+            .desktop_of(session)
+            .expect("the desktop surface is mounted")
+            .read(app);
+        assert_eq!(
+            pane.started_password(),
+            Some(Some("rdp-pass")),
+            "the attempt dials with the password that was just typed, even unkept"
+        );
+    });
+}
+
+#[gpui::test]
+async fn a_kept_desktop_password_is_stored_and_forgotten_with_the_box(cx: &mut TestAppContext) {
+    let dir = TempDir::new("desktop-secret-remember");
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.simulate_resize(size(px(1400.0), px(1300.0)));
+    cx.run_until_parked();
+
+    let id = save_desktop_password_form(cx, &view, "connection.protocol.rdp", "kept-pass", true);
+    let record = cx
+        .update(|_window, app| view.read(app).book().connection(id))
+        .expect("the connection was saved");
+    assert!(
+        record.remembers_secret(),
+        "the box was ticked, so the record says a password is kept"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).saved_secret_for_test(id)),
+        Some("kept-pass".to_owned()),
+        "the password is in the credential store"
+    );
+    let file = std::fs::read_to_string(dir.path().join(shellune_storage::FILE_NAME))
+        .expect("the connection file was written");
+    assert!(
+        !file.contains("kept-pass"),
+        "the password never reaches the connection file"
+    );
+
+    // The start reads it from the store: the form is closed and has nothing to give.
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.connect_saved_connection(id, cx));
+    });
+    cx.run_until_parked();
+    let session = cx
+        .update(|_window, app| view.read(app).open_tabs().last().copied())
+        .expect("the connection opened a tab");
+    cx.update(|_window, app| {
+        let pane = view
+            .read(app)
+            .desktop_of(session)
+            .expect("the desktop surface is mounted")
+            .read(app);
+        assert_eq!(
+            pane.started_password(),
+            Some(Some("kept-pass")),
+            "a kept password is loaded for the attempt"
+        );
+    });
+
+    // Unticking the box forgets it, and the record stops claiming one is kept.
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.edit_connection_for_test(id, cx));
+    });
+    cx.run_until_parked();
+    click(cx, "connection.field.remember");
+    click(cx, "connection.save");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).saved_secret_for_test(id)),
+        None,
+        "turning remembering off removes the secret"
+    );
+    assert!(cx.update(|_window, app| {
+        view.read(app)
+            .book()
+            .connection(id)
+            .is_some_and(|record| !record.remembers_secret())
+    }));
+}
+
+#[gpui::test]
+async fn a_saved_desktop_password_is_never_shown_back_and_a_blank_field_keeps_it(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("desktop-secret-edit");
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.simulate_resize(size(px(1400.0), px(1300.0)));
+    cx.run_until_parked();
+
+    let id = save_desktop_password_form(cx, &view, "connection.protocol.vnc", "vnc-pass", true);
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.edit_connection_for_test(id, cx));
+    });
+    cx.run_until_parked();
+    let draft = cx
+        .update(|_window, app| view.read(app).hosts_state().protocol_draft().cloned())
+        .expect("the form is open");
+    assert_eq!(
+        draft.text(ConnectionFormField::Secret),
+        "",
+        "the saved password is not put back in the field"
+    );
+    assert!(
+        draft.keeps_secret(),
+        "a blank field on an edit keeps the saved password"
+    );
+    click(cx, "connection.save");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).saved_secret_for_test(id)),
+        Some("vnc-pass".to_owned()),
+        "saving without typing keeps what was saved"
     );
 }
 

@@ -59,8 +59,8 @@ use crate::app::files::{
 use crate::app::forwarding::{ForwardCenter, ForwardConfirm};
 use crate::app::hosts::{
     ConnectionChoice, ConnectionDraft, ConnectionField, ConnectionFormField, GroupAction,
-    HostDraft, HostField, HostsPanel, ImportPanel, group_path_from_text, import_message,
-    unimported_hosts,
+    HostDraft, HostField, HostsPanel, ImportPanel, ProtocolDraft, group_path_from_text,
+    import_message, unimported_hosts,
 };
 use crate::app::icons::{self, Icon};
 use crate::app::keymap::{self, Keymap, Problem};
@@ -553,6 +553,12 @@ pub struct ShelluneView {
     /// The typed fields of the form for a connection whose protocol is not SSH,
     /// present only while that form is open (R2, R18).
     protocol_fields: Option<ProtocolFields>,
+    /// Passwords typed in the connection form and not kept: one attempt each.
+    ///
+    /// A password the store is not asked to keep still has to reach the pane that
+    /// dials, and the connection is started after the form closes: this is where the
+    /// typed value waits for that one start, and a start takes it away.
+    desktop_secrets: std::collections::HashMap<HostId, shellune_core::SecretString>,
     /// The SSH configuration import panel and what the last read of a file showed.
     import: ImportPanel,
     /// The configuration path field, present only while that panel is open.
@@ -1168,6 +1174,8 @@ struct ProtocolFields {
     port: Entity<TextField>,
     user: Entity<TextField>,
     domain: Entity<TextField>,
+    /// The password of a RDP or VNC connection, masked like the SSH one.
+    secret: Entity<TextField>,
     drive_folder: Entity<TextField>,
     device: Entity<TextField>,
     baud: Entity<TextField>,
@@ -1184,6 +1192,7 @@ impl ProtocolFields {
             ConnectionFormField::Port => Some(&self.port),
             ConnectionFormField::User => Some(&self.user),
             ConnectionFormField::Domain => Some(&self.domain),
+            ConnectionFormField::Secret => Some(&self.secret),
             ConnectionFormField::DriveFolder => Some(&self.drive_folder),
             ConnectionFormField::Device => Some(&self.device),
             ConnectionFormField::Baud => Some(&self.baud),
@@ -2869,6 +2878,7 @@ impl ShelluneView {
             rail_collapsed: false,
             host_connection_fields: None,
             protocol_fields: None,
+            desktop_secrets: std::collections::HashMap::new(),
             theme_choice: theme::ThemeChoice::default(),
             terminal_scheme: theme::TerminalScheme::default(),
             connection_choice: None,
@@ -4263,7 +4273,10 @@ impl ShelluneView {
         let tag = session.tag();
         let locale = self.workspace.locale();
         let pane = cx.new(|cx| desktop::DesktopPane::new(target, locale, cx));
-        pane.update(cx, |pane, cx| pane.start(None, cx));
+        // The same password rule the window's own start uses: a typed one first, then
+        // a kept one, and nothing when there is neither.
+        let password = self.desktop_password(record);
+        pane.update(cx, |pane, cx| pane.start(password.as_deref(), cx));
         self.attach_desktop(tag, pane, cx);
         session.id()
     }
@@ -4808,10 +4821,31 @@ impl ShelluneView {
         self.start_desktop_session(session.id(), cx);
     }
 
+    /// The password one start of this record signs in with, when there is one.
+    ///
+    /// A password typed in the form and not kept is used first: it was typed for this
+    /// connection, and the form closed before the attempt began. Only then is the
+    /// system store asked, and only when the record says it keeps one. Nothing is
+    /// kept in the pane, logged or drawn.
+    fn desktop_password(&mut self, record: &shellune_core::ConnectionRecord) -> Option<String> {
+        if let Some(secret) = self.desktop_secrets.remove(&record.id()) {
+            return Some(secret.expose().to_owned());
+        }
+        if record.remembers_secret() {
+            return self
+                .secrets
+                .load(record.id())
+                .ok()
+                .flatten()
+                .map(|secret| secret.expose().to_owned());
+        }
+        None
+    }
+
     /// Starts the saved desktop connection of one session.
     ///
-    /// The saved password, when the record says one may be in the store, goes from
-    /// the store into the link: the pane never keeps it, and nothing about it is
+    /// The password - the one typed in the form, or the one the record keeps - goes
+    /// from there into the link: the pane never keeps it, and nothing about it is
     /// logged or drawn.
     pub(super) fn start_desktop_session(&mut self, session: SessionId, cx: &mut Context<Self>) {
         let record = self
@@ -4833,15 +4867,7 @@ impl ShelluneView {
             self.refuse_desktop(session, reason, cx);
             return;
         };
-        let password = if record.remembers_secret() {
-            self.secrets
-                .load(record.id())
-                .ok()
-                .flatten()
-                .map(|secret| secret.expose().to_owned())
-        } else {
-            None
-        };
+        let password = self.desktop_password(&record);
         // The record says the attempt is being made before the socket is opened, so
         // a tab never shows an idle session while a connection is dialling.
         self.workspace.session_starting(session);
@@ -6451,6 +6477,15 @@ impl ShelluneView {
         }
     }
 
+    /// Whether the password field of the open connection form is masked, for the
+    /// tests that check a desktop password is not shown as it is typed.
+    #[cfg(test)]
+    pub fn connection_secret_masked_for_test(&self, cx: &gpui::App) -> Option<bool> {
+        self.protocol_fields
+            .as_ref()
+            .map(|fields| fields.secret.read(cx).is_masked())
+    }
+
     /// What the credential store holds for a host, for tests.
     #[cfg(test)]
     pub fn saved_secret_for_test(&self, id: HostId) -> Option<String> {
@@ -7294,6 +7329,24 @@ impl ShelluneView {
                 cx,
             )
         });
+        // The password is never shown back: a saved one is announced by the placeholder,
+        // and a blank field keeps it. The field is masked the way the SSH form's is.
+        let secret_saved = draft
+            .editing()
+            .and_then(|id| self.book.connection(id))
+            .is_some_and(|record| record.remembers_secret());
+        let secret_placeholder = if secret_saved {
+            strings.host_secret_saved_placeholder
+        } else {
+            copy::ux().host_password_optional
+        };
+        let secret = cx.new(|cx| {
+            let mut field =
+                TextField::with_text(secret_placeholder, text(ConnectionFormField::Secret), cx);
+            field.set_masked(true, cx);
+            field.set_revealable(true, cx);
+            field
+        });
         // A folder is chosen rather than typed out: the field browses for one, and a
         // blank field maps nothing (R5, R6).
         let drive_folder = cx.new(|cx| {
@@ -7333,6 +7386,7 @@ impl ShelluneView {
             port,
             user,
             domain,
+            secret,
             drive_folder,
             device,
             baud,
@@ -7421,6 +7475,10 @@ impl ShelluneView {
                 return None;
             }
         };
+        let saved = draft.editing().and_then(|id| self.book.connection(id));
+        if !self.store_connection_secret(&draft, edit.record(), saved.as_ref(), cx) {
+            return None;
+        }
         let mut next = self.book.clone();
         let outcome = match edit.replaces() {
             Some(id) => next.update_connection(edit.record().clone(), id),
@@ -7500,6 +7558,54 @@ impl ShelluneView {
             let _ = self.secrets.forget(host.id());
         }
         if let Some(draft) = self.hosts.draft_mut() {
+            draft.clear_secret();
+        }
+        true
+    }
+
+    /// Puts the password typed in the connection form where the next start finds it.
+    ///
+    /// A kept password goes to the system store, exactly as a host's does. One that is
+    /// not kept is handed to the next start of this connection, which is why it waits
+    /// here rather than being dropped with the form: the form closes before the attempt
+    /// begins, and a RDP or VNC server refuses a session that arrives without it.
+    /// Returns whether saving may go on; a store that refuses keeps the form open.
+    fn store_connection_secret(
+        &mut self,
+        draft: &ProtocolDraft,
+        record: &shellune_core::ConnectionRecord,
+        saved: Option<&shellune_core::ConnectionRecord>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let typed = draft.typed_secret().map(shellune_core::SecretString::new);
+        let id = record.id();
+        if record.remembers_secret() {
+            if let Some(secret) = &typed {
+                if let Err(error) = self.secrets.save(id, secret) {
+                    let message = format!("{}: {error}", self.strings().host_secret_failed);
+                    self.hosts.set_message(message, true);
+                    cx.notify();
+                    return false;
+                }
+            }
+            // The store is the one place now: a copy here would outlive its use.
+            self.desktop_secrets.remove(&id);
+        } else {
+            // Turning remembering off removes what the store held; a store that cannot
+            // be reached leaves an entry nobody reads, which is not a reason to fail.
+            if saved.is_some_and(shellune_core::ConnectionRecord::remembers_secret) {
+                let _ = self.secrets.forget(id);
+            }
+            match typed {
+                Some(secret) => {
+                    self.desktop_secrets.insert(id, secret);
+                }
+                None => {
+                    self.desktop_secrets.remove(&id);
+                }
+            }
+        }
+        if let Some(draft) = self.hosts.protocol_draft_mut() {
             draft.clear_secret();
         }
         true
@@ -7591,7 +7697,8 @@ impl ShelluneView {
                 }
             }
         };
-        // A deleted connection's secret has nobody left to use it.
+        // A deleted connection's secret has nobody left to use it, wherever it waits.
+        self.desktop_secrets.remove(&id);
         if remembers_secret {
             let _ = self.secrets.forget(id);
         }
