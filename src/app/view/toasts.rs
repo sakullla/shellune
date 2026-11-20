@@ -40,9 +40,9 @@ pub(super) struct Toast {
 pub(super) fn tone_icon(tone: Tone) -> Icon {
     match tone {
         Tone::Positive => Icon::Check,
-        Tone::Danger => Icon::Close,
-        Tone::Warning => Icon::Refresh,
-        Tone::Neutral | Tone::Accent | Tone::Planned | Tone::Info => Icon::More,
+        Tone::Danger => Icon::AlertCircle,
+        Tone::Warning => Icon::AlertTriangle,
+        Tone::Neutral | Tone::Accent | Tone::Planned | Tone::Info => Icon::Info,
     }
 }
 
@@ -78,7 +78,7 @@ impl ShelluneView {
     }
 
     /// Puts text on the clipboard and says so.
-    pub(super) fn copy_text(&mut self, text: String, cx: &mut Context<Self>) {
+    pub(crate) fn copy_text(&mut self, text: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
         self.toast(
             Tone::Positive,
@@ -135,6 +135,9 @@ impl ShelluneView {
     pub(super) fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
         let before = self.toasts.len();
         self.toasts.retain(|toast| toast.id != id);
+        if self.toasts.is_empty() {
+            self.toasts_hovered = false;
+        }
         if self.toasts.len() != before {
             cx.notify();
         }
@@ -146,12 +149,18 @@ impl ShelluneView {
             return None;
         }
         let metrics = self.metrics();
+        // Lift the stack above the bottom session bar so a toast never covers
+        // `terminal.search` or `session.more` in the bottom-right corner.
+        let bottom_clearance = metrics
+            .hit_target()
+            .max(metrics.scale(crate::app::terminal::SHELL_BAR_HEIGHT))
+            + metrics.scale(spacing::SNUG);
         let mut stack = div()
             .id("toasts")
             .debug_selector(|| "toasts".to_owned())
             .absolute()
             .right(metrics.scale(spacing::LOOSE))
-            .bottom(metrics.scale(spacing::LOOSE))
+            .bottom(bottom_clearance)
             .flex()
             .flex_col()
             .items_end()
@@ -176,6 +185,10 @@ impl ShelluneView {
             .id(("toast", id as usize))
             .debug_selector(move || format!("toast.{index}"))
             .occlude()
+            .on_hover(cx.listener(|view, hovered: &bool, _window, cx| {
+                view.toasts_hovered = *hovered;
+                cx.notify();
+            }))
             .child(
                 components::icon_only_button(Icon::Close, metrics)
                     .flex_none()
@@ -213,5 +226,29 @@ impl ShelluneView {
             .iter()
             .map(|toast| (toast.tone, toast.title.clone()))
             .collect()
+    }
+
+    /// Whether the pointer is recorded as hovering over the toast stack, for a test.
+    #[cfg(test)]
+    pub fn toasts_hovered(&self) -> bool {
+        self.toasts_hovered
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tone_icon;
+    use crate::app::icons::Icon;
+    use crate::app::theme::Tone;
+
+    #[test]
+    fn tone_icon_uses_dedicated_semantic_icons() {
+        assert_eq!(tone_icon(Tone::Positive), Icon::Check);
+        assert_eq!(tone_icon(Tone::Warning), Icon::AlertTriangle);
+        assert_eq!(tone_icon(Tone::Danger), Icon::AlertCircle);
+        assert_eq!(tone_icon(Tone::Info), Icon::Info);
+        assert_eq!(tone_icon(Tone::Neutral), Icon::Info);
+        assert_eq!(tone_icon(Tone::Accent), Icon::Info);
+        assert_eq!(tone_icon(Tone::Planned), Icon::Info);
     }
 }

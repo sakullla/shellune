@@ -1028,7 +1028,7 @@ tooltip 这类在窗口渲染之外绘制的部件用 `theme::metrics()` 取得�
 **边框**：1px 发丝线；焦点与校验失败 2px；按下时底边加粗到 2px。卡片用弱边，浮层用强边 + Overlay。
 
 图标是 `icons.rs` 内嵌的 24 格线条 SVG（1.6 描边），按元素文字颜色着色：控件 14px、行与标题 16px、
-状态徽记 20–22px。
+状态徽记 20–22px；通知与状态语义配备专属图标（成功 `Check`、警告 `AlertTriangle`、危险/错误 `AlertCircle`、信息 `Info`）。
 
 ### 2.5 守卫测试与裸尺寸基线
 
@@ -2060,7 +2060,7 @@ toast 相同的 `components::popover_surface` 上（raised + 强边 + 圆角 8 +
 | `disclosure(open, title, hint)` | 表单的折叠段头（“高级”，T8）：箭头 + 名称 + 一行内容说明（省略号），扁平、弱边、悬停出底，调用方加 id、点击与“已使用”chip；主机表单的高级设置默认折叠 |
 | `nav_item(icon, label, selected, ringed)` / `accent_mark(shown)` | 页面自带的导航列（设置，T8）：分类项一个控件高、带图标，子项无图标、缩进、一个紧凑控件高；选中 = selected 底 + 2px accent 竖条 + MEDIUM，键盘所在项另画焦点环（常驻透明边，不挪字；设置导航仅在导航列持有键盘时传 `ringed`）；`accent_mark` 是那条竖条本身（不选时为同宽透明占位），设置卡片行首也用它 |
 | `dialog_face` / `dialog_panel` / `dialog_header` | 对话框表面令牌与内嵌标题块 |
-| `toast(tone, icon, title, detail)` | 通知：`popover_surface`，宽 `TOAST_WIDTH`（340），色调图标圆底（`ICON_TILE` 24）；关闭按钮与位置由调用方加，进入时 Fade |
+| `toast(tone, icon, title, detail)` | 通知：`popover_surface`，宽 `TOAST_WIDTH`（340），色调图标圆底（`ICON_TILE` 24，按语义使用 `Check` / `AlertTriangle` / `AlertCircle` / `Info`）；`toast_stack` 底部抬高至会话底栏之上（`SHELL_BAR_HEIGHT + spacing::SNUG` 净空）避免遮挡右下角 `terminal.search` / `session.more`，关闭按钮与位置由调用方加，进入时 Fade |
 | `empty_state(icon, title, body, action)` | 空状态：accent tint 图标块（圆角 12）+ 标题 + 可选说明（可换任意行）+ 可选动作；标题与说明经 `capped_text` 居中、上限 420，动作总在文字下方（`empty.state.title` / `.body` / `.action`）；不带状态色调；调用方在外层加自己的选择器 |
 | `capped_text(max_w, text)` | 居中、有宽度上限的换行文字：按上限宽度求高度，盒子与画出的行数一致（见 4“换行文本”） |
 | `enter_in_turn(element, id, turn)` + `turn_timing` / `turn_curve` | 一组物体依次淡入：第 `turn` 个晚 `TURN_DELAY`×turn（到 `LAST_TURN` 为止），淡入 BASE，只动透明度；减少动效时直接画终态 |

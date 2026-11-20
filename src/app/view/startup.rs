@@ -41,14 +41,14 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    Animation, AnimationExt, AnyElement, Context, Div, KeyDownEvent, SharedString, Task, Window,
-    div,
+    Animation, AnimationExt, AnyElement, Context, Div, KeyDownEvent, ScrollHandle, SharedString,
+    Task, Window, div,
 };
 
 use shellune_core::{ForwardBook, GroupBook, WorkspaceSnapshot};
 use shellune_storage::{
-    ForwardStore, GroupService, HostBook, HostStore, HostTrust, PreferencesProblem,
-    PreferencesStore, TrustStore, WorkspaceStore,
+    ForwardStore, GroupService, HostBook, HostStore, HostTrust, PersistError, PreferencesProblem,
+    PreferencesStore, StorageError, TrustStore, WorkspaceStore,
 };
 
 use super::ShelluneView;
@@ -212,15 +212,15 @@ pub struct StageReport {
 
 /// What stage 2 read.
 struct HostsRead {
-    hosts: Result<HostBook, String>,
-    trust: Result<HostTrust, String>,
+    hosts: Result<HostBook, StorageError>,
+    trust: Result<HostTrust, StorageError>,
 }
 
 /// What stage 3 read.
 struct WorkspaceRead {
-    forwards: Result<ForwardBook, String>,
-    groups: Result<GroupBook, String>,
-    layout: Result<WorkspaceSnapshot, String>,
+    forwards: Result<ForwardBook, PersistError>,
+    groups: Result<GroupBook, PersistError>,
+    layout: Result<WorkspaceSnapshot, PersistError>,
 }
 
 /// The progress of a start: the stages that reported, what they read, and what the
@@ -374,32 +374,107 @@ struct StartupStores {
     layout: WorkspaceStore,
 }
 
-fn words<T, E: std::fmt::Display>(read: Result<T, E>) -> Result<T, String> {
-    read.map_err(|error| error.to_string())
+fn append_detail(summary: &str, detail: &str, strings: &StartupStrings) -> String {
+    let detail = detail.trim();
+    if detail.is_empty() {
+        summary.to_owned()
+    } else {
+        copy::fill(
+            strings.error_detail,
+            &[("summary", summary), ("detail", detail)],
+        )
+    }
+}
+
+/// Formats a stage-2 storage error in the interface language while keeping the file name.
+fn localize_storage_error(error: &StorageError, locale: copy::Locale) -> String {
+    let strings = copy::startup_for(locale);
+    let file = error
+        .path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    match error {
+        StorageError::Read { reason, .. } => {
+            let summary = copy::fill(strings.storage_read_failed, &[("file", &file)]);
+            append_detail(&summary, reason, strings)
+        }
+        StorageError::Corrupt { reason, .. } => {
+            let summary = copy::fill(strings.storage_corrupt, &[("file", &file)]);
+            append_detail(&summary, reason, strings)
+        }
+        StorageError::UnsupportedVersion {
+            found, supported, ..
+        } => copy::fill(
+            strings.storage_unsupported_version,
+            &[
+                ("file", &file),
+                ("found", &found.to_string()),
+                ("supported", &supported.to_string()),
+            ],
+        ),
+        StorageError::CreateDirectory { reason, .. }
+        | StorageError::Write { reason, .. }
+        | StorageError::Replace { reason, .. }
+        | StorageError::Encode { reason } => {
+            let summary = copy::fill(strings.storage_failed, &[("file", &file)]);
+            append_detail(&summary, reason, strings)
+        }
+    }
+}
+
+/// Formats a stage-3 persistence error in the interface language while keeping the file name.
+fn localize_persist_error(error: &PersistError, locale: copy::Locale) -> String {
+    let strings = copy::startup_for(locale);
+    let file = error
+        .path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    match error {
+        PersistError::Read { reason, .. } => {
+            let summary = copy::fill(strings.storage_read_failed, &[("file", &file)]);
+            append_detail(&summary, reason, strings)
+        }
+        PersistError::Corrupt { reason, .. } => {
+            let summary = copy::fill(strings.storage_corrupt, &[("file", &file)]);
+            append_detail(&summary, reason, strings)
+        }
+        PersistError::UnsupportedVersion {
+            found, supported, ..
+        } => copy::fill(
+            strings.storage_unsupported_version,
+            &[
+                ("file", &file),
+                ("found", &found.to_string()),
+                ("supported", &supported.to_string()),
+            ],
+        ),
+        PersistError::CreateDirectory { reason, .. }
+        | PersistError::Write { reason, .. }
+        | PersistError::Replace { reason, .. }
+        | PersistError::Encode { reason, .. } => {
+            let summary = copy::fill(strings.storage_failed, &[("file", &file)]);
+            append_detail(&summary, reason, strings)
+        }
+    }
 }
 
 impl StartupStores {
     /// Stage 2: the host book, then the trust file.
     fn read_hosts(&self) -> HostsRead {
         HostsRead {
-            hosts: words(self.hosts.load()),
-            trust: words(self.trust.load()),
+            hosts: self.hosts.load(),
+            trust: self.trust.load(),
         }
     }
 
     /// Stage 3: the tunnels, the group tree, then the saved layout.
     fn read_workspace(&self) -> WorkspaceRead {
         WorkspaceRead {
-            forwards: words(self.forwards.load()),
-            groups: words(self.groups.groups().load()),
-            layout: words(self.layout.load()),
+            forwards: self.forwards.load(),
+            groups: self.groups.groups().load(),
+            layout: self.layout.load(),
         }
     }
-}
-
-/// The first failure among `reads`, if any.
-fn first_failure<'a>(reads: impl IntoIterator<Item = Option<&'a String>>) -> Option<String> {
-    reads.into_iter().flatten().next().cloned()
 }
 
 impl ShelluneView {
@@ -560,6 +635,12 @@ impl ShelluneView {
         self.startup_run.stop().map(|(stage, _)| stage)
     }
 
+    /// The scroll handle of the startup failure body, for tests.
+    #[cfg(test)]
+    pub fn startup_scroll(&self) -> &ScrollHandle {
+        &self.startup_scroll
+    }
+
     /// Times the brand's entrance and ends the start once both it and the stages are
     /// over (R3).
     ///
@@ -675,8 +756,13 @@ impl ShelluneView {
                 cx.spawn(async move |this, cx| {
                     let read = read.await;
                     let _ = this.update(cx, |view, cx| {
-                        let failure =
-                            first_failure([read.hosts.as_ref().err(), read.trust.as_ref().err()]);
+                        let locale = view.workspace.locale();
+                        let failure = read
+                            .hosts
+                            .as_ref()
+                            .err()
+                            .or_else(|| read.trust.as_ref().err())
+                            .map(|error| localize_storage_error(error, locale));
                         view.startup_run.hosts = Some(read);
                         view.report_stage(StartupStage::Hosts, failure.map_or(Ok(()), Err), cx);
                     });
@@ -690,11 +776,14 @@ impl ShelluneView {
                 cx.spawn(async move |this, cx| {
                     let read = read.await;
                     let _ = this.update(cx, |view, cx| {
-                        let failure = first_failure([
-                            read.forwards.as_ref().err(),
-                            read.groups.as_ref().err(),
-                            read.layout.as_ref().err(),
-                        ]);
+                        let locale = view.workspace.locale();
+                        let failure = read
+                            .forwards
+                            .as_ref()
+                            .err()
+                            .or_else(|| read.groups.as_ref().err())
+                            .or_else(|| read.layout.as_ref().err())
+                            .map(|error| localize_persist_error(error, locale));
                         view.startup_run.workspace = Some(read);
                         view.report_stage(StartupStage::Workspace, failure.map_or(Ok(()), Err), cx);
                     });
@@ -773,12 +862,23 @@ impl ShelluneView {
         if self.startup == Startup::Ready {
             return;
         }
+        let locale = self.workspace.locale();
         let (hosts, trust) = match self.startup_run.hosts.take() {
-            Some(read) => (Some(read.hosts), Some(read.trust)),
+            Some(read) => (
+                Some(read.hosts.map_err(|e| localize_storage_error(&e, locale))),
+                Some(read.trust.map_err(|e| localize_storage_error(&e, locale))),
+            ),
             None => (None, None),
         };
         let (forwards, groups, layout) = match self.startup_run.workspace.take() {
-            Some(read) => (Some(read.forwards), Some(read.groups), Some(read.layout)),
+            Some(read) => (
+                Some(
+                    read.forwards
+                        .map_err(|e| localize_persist_error(&e, locale)),
+                ),
+                Some(read.groups.map_err(|e| localize_persist_error(&e, locale))),
+                Some(read.layout.map_err(|e| localize_persist_error(&e, locale))),
+            ),
             None => (None, None, None),
         };
         if let Some(read) = hosts {
@@ -927,17 +1027,28 @@ impl ShelluneView {
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
             .key_context("Shellune")
             .track_focus(&self.root_focus)
-            // A stopped start goes on with Enter, the way its main button does.
+            // A stopped start goes on with Enter, and scrolls its details with arrow/page keys.
             .when(stopped, |el| {
                 el.on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                    if event.keystroke.key == "enter" && !event.keystroke.modifiers.modified() {
-                        this.continue_startup(cx);
-                        cx.stop_propagation();
+                    if event.keystroke.modifiers.modified() {
+                        return;
+                    }
+                    match event.keystroke.key.as_str() {
+                        "enter" => {
+                            this.continue_startup(cx);
+                            cx.stop_propagation();
+                        }
+                        "up" | "down" | "pageup" | "pagedown" | "home" | "end" => {
+                            super::scroll_by_key(&this.startup_scroll, &event.keystroke.key);
+                            cx.notify();
+                            cx.stop_propagation();
+                        }
+                        _ => {}
                     }
                 }))
             })
             .child(self.startup_caption(window, cx))
-            .child(splash_body(brand, buttons))
+            .child(splash_body(brand, buttons, Some(&self.startup_scroll)))
             .into_any_element()
     }
 
@@ -1105,35 +1216,56 @@ impl ShelluneView {
     ) -> AnyElement {
         div()
             .flex()
+            .flex_col()
             .flex_none()
-            .flex_wrap()
-            .justify_center()
+            .items_center()
             .w_full()
+            .border_t_1()
+            .border_color(theme::swatch(palette::BORDER))
             .px(metrics.scale(spacing::LOOSE))
-            .gap(metrics.scale(spacing::TIGHT))
-            .pt(metrics.scale(spacing::NARROW))
+            .pt(metrics.scale(spacing::TIGHT))
             .pb(metrics.scale(spacing::SNUG))
+            .gap(metrics.scale(spacing::TIGHT))
             .debug_selector(|| "startup.failure.actions".to_owned())
             .child(
-                components::button(strings.continue_start, Variant::Primary, metrics)
-                    .id("startup.continue")
-                    .debug_selector(|| "startup.continue".to_owned())
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.continue_startup(cx);
-                    })),
+                div()
+                    .max_w_full()
+                    .text_center()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "startup.failure.scroll_hint".to_owned())
+                    .child(SharedString::from(strings.scroll_hint)),
             )
             .child(
-                components::icon_label_button(
-                    icons::Icon::FolderOpen,
-                    strings.open_folder,
-                    Variant::Secondary,
-                    metrics,
-                )
-                .id("startup.open_folder")
-                .debug_selector(|| "startup.open_folder".to_owned())
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.open_data_folder(cx);
-                })),
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .justify_center()
+                    .w_full()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        components::button(strings.continue_start, Variant::Primary, metrics)
+                            .id("startup.continue")
+                            .debug_selector(|| "startup.continue".to_owned())
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.continue_startup(cx);
+                            })),
+                    )
+                    .child(
+                        components::icon_label_button(
+                            icons::Icon::FolderOpen,
+                            strings.open_folder,
+                            Variant::Secondary,
+                            metrics,
+                        )
+                        .id("startup.open_folder")
+                        .debug_selector(|| "startup.open_folder".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.open_data_folder(cx);
+                            },
+                        )),
+                    ),
             )
             .into_any_element()
     }
@@ -1220,7 +1352,7 @@ impl ShelluneView {
             .debug_selector(|| "startup.crossfade".to_owned())
             // The caption's room, so the brand stays exactly where the start drew it.
             .child(div().flex_none().h(metrics.header_height()))
-            .child(splash_body(Some(picture.into_any_element()), None));
+            .child(splash_body(Some(picture.into_any_element()), None, None));
         Some(
             layer
                 .with_animation(
@@ -1311,7 +1443,11 @@ impl<A: Future + Unpin, L: Future + Unpin> Future for Bounded<'_, A, L> {
 /// rather than on the whole window keeps the brand clear of the caption at 200% text
 /// in the smallest window. A stop that is taller than the floor there scrolls rather
 /// than losing its buttons off the edge.
-fn splash_body(brand: Option<AnyElement>, buttons: Option<AnyElement>) -> impl IntoElement {
+fn splash_body(
+    brand: Option<AnyElement>,
+    buttons: Option<AnyElement>,
+    scroll: Option<&ScrollHandle>,
+) -> impl IntoElement {
     // The floor centres the start and, under it, a stop's buttons; when the two are
     // taller than the floor the words above the buttons scroll and the buttons stay.
     div()
@@ -1323,11 +1459,13 @@ fn splash_body(brand: Option<AnyElement>, buttons: Option<AnyElement>) -> impl I
         .child(
             div()
                 .id("startup.body")
+                .debug_selector(|| "startup.body".to_owned())
                 .flex()
                 .flex_col()
                 .flex_shrink()
                 .min_h_0()
                 .overflow_y_scroll()
+                .when_some(scroll, |el, handle| el.track_scroll(handle))
                 .child(
                     div()
                         .flex()

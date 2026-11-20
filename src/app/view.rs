@@ -405,6 +405,13 @@ pub const DOCK_MIN_WIDTH: f32 = (FILES_PANEL_WIDTH * 2.0 + 120.0) * 2.0 + 40.0;
 /// segment keeps the others on the same row and leaves the full path in the segment's
 /// tooltip, so a deep directory is readable instead of being cut off at the edge (R6).
 const CRUMB_ROOM: f32 = 240.0;
+/// Viewport height at or below which the single-column file view compresses chrome
+/// padding and caps the transfer strip tighter so the directory list keeps room.
+const FILES_SHORT_VIEWPORT_HEIGHT: f32 = 560.0;
+/// Maximum share of viewport height the transfer strip may claim in a normal window.
+const FILES_TRANSFER_CAP_SHARE: f32 = 0.42;
+/// Maximum share of viewport height the transfer strip may claim in a short single-column window.
+const FILES_SHORT_TRANSFER_CAP_SHARE: f32 = 0.34;
 
 /// How many placeholder rows a column draws while its listing is on the way.
 const FILES_LOADING_ROWS: usize = 3;
@@ -932,6 +939,7 @@ pub struct ShelluneView {
     startup: startup::Startup,
     /// The stages of the start: which ended, what they read, what the start waits for.
     startup_run: startup::StartupRun,
+    startup_scroll: gpui::ScrollHandle,
     /// Whether the start is still fading out over the page that replaced it.
     splash_fading: bool,
     /// Whether the page is still fading in (and, with full motion, rising) under it.
@@ -2914,6 +2922,7 @@ impl ShelluneView {
             desktop_fullscreen: None,
             startup: startup::Startup::Ready,
             startup_run: startup::StartupRun::default(),
+            startup_scroll: gpui::ScrollHandle::new(),
             splash_fading: false,
             page_entering: false,
             system_motion_pending: false,
@@ -12912,6 +12921,7 @@ impl ShelluneView {
         let strings = self.strings();
         let ux = copy::ux();
         let wide = self.files_side_by_side();
+        let compact = !wide && window.viewport_size().height <= px(FILES_SHORT_VIEWPORT_HEIGHT);
         let shown = self.files.shown(id).unwrap_or(FileSource::Remote);
 
         let mut panes = div()
@@ -12931,13 +12941,13 @@ impl ShelluneView {
                 }
             });
         if wide || shown == FileSource::Local {
-            panes = panes.child(self.files_panel(id, FileSource::Local, cx));
+            panes = panes.child(self.files_panel(id, FileSource::Local, compact, cx));
         }
         if wide {
             panes = panes.child(components::column_divider());
         }
         if wide || shown == FileSource::Remote {
-            panes = panes.child(self.files_panel(id, FileSource::Remote, cx));
+            panes = panes.child(self.files_panel(id, FileSource::Remote, compact, cx));
         }
 
         let switch = (!wide).then(|| {
@@ -12997,6 +13007,10 @@ impl ShelluneView {
         // the view's own toolbar, on the chrome layer above the column it switches.
         let toolbar = switch.map(|switch| {
             components::toolbar(metrics)
+                .when(compact, |el| {
+                    el.min_h(metrics.compact_control_height())
+                        .py(metrics.scale(spacing::HAIRLINE))
+                })
                 .bg(theme::swatch(palette::CHROME))
                 .debug_selector(|| "files.toolbar".to_owned())
                 .child(switch)
@@ -13011,7 +13025,12 @@ impl ShelluneView {
         // above its first line, and at 720×480 with 200% text that cut the title
         // and the count flat (R4).
         let transfers = self.transfers_strip_shown(id).then(|| {
-            let cap = window.viewport_size().height * 0.42;
+            let cap_share = if compact {
+                FILES_SHORT_TRANSFER_CAP_SHARE
+            } else {
+                FILES_TRANSFER_CAP_SHARE
+            };
+            let cap = window.viewport_size().height * cap_share;
             let scroll = self.transfers_scroll.clone();
             div()
                 .id("files.transfers")
@@ -13038,7 +13057,11 @@ impl ShelluneView {
                 // Top padding keeps the title's glyphs inside the strip. The bottom
                 // padding is smaller so the failure and its Retry still fit the scroller
                 // at 720×480 and 200% text (R4).
-                .pt(metrics.scale(spacing::TIGHT))
+                .pt(metrics.scale(if compact {
+                    spacing::HAIRLINE
+                } else {
+                    spacing::TIGHT
+                }))
                 .pb(metrics.scale(spacing::HAIRLINE))
                 .bg(theme::swatch(palette::CHROME))
                 .border_b_1()
@@ -15102,6 +15125,7 @@ impl ShelluneView {
         &self,
         id: SessionId,
         source: FileSource,
+        compact: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let metrics = self.metrics();
@@ -15208,6 +15232,10 @@ impl ShelluneView {
         // window at 200% text), the tools take a line of their own instead of running
         // past the column's edge (R4).
         let header = components::toolbar(metrics)
+            .when(compact, |el| {
+                el.min_h(metrics.compact_control_height())
+                    .py(metrics.scale(spacing::HAIRLINE))
+            })
             .flex_wrap()
             .debug_selector({
                 let header_id = header_id.clone();
@@ -15540,10 +15568,22 @@ impl ShelluneView {
             .flex_col()
             .flex_1()
             .min_w_0()
-            .gap(metrics.scale(spacing::TIGHT))
+            .gap(metrics.scale(if compact {
+                spacing::HAIRLINE
+            } else {
+                spacing::TIGHT
+            }))
             .px(metrics.scale(spacing::SNUG))
-            .pt(metrics.scale(spacing::TIGHT))
-            .pb(metrics.scale(spacing::SNUG))
+            .pt(metrics.scale(if compact {
+                spacing::HAIRLINE
+            } else {
+                spacing::TIGHT
+            }))
+            .pb(metrics.scale(if compact {
+                spacing::HAIRLINE
+            } else {
+                spacing::SNUG
+            }))
             .child(crumb_row);
         // The batch of one column sits under its path, where the rows it acts on are:
         // what it covers is stated once, above the listing it came from (R14).
@@ -20013,7 +20053,7 @@ fn zoom_percent(zoom: theme::Zoom) -> u16 {
 }
 
 /// Moves a scroll handle by one page, one line, or to either end.
-fn scroll_by_key(handle: &gpui::ScrollHandle, key: &str) {
+pub(super) fn scroll_by_key(handle: &gpui::ScrollHandle, key: &str) {
     let offset = handle.offset();
     let page = handle.bounds().size.height;
     let line = page * 0.2;

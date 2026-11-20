@@ -124,11 +124,17 @@ pub enum Icon {
     Clock,
     /// A funnel: narrow and order a list.
     Filter,
+    /// A triangle with an exclamation mark: a warning.
+    AlertTriangle,
+    /// A circle with an "i": neutral information.
+    Info,
+    /// A circle with an exclamation mark: an error or danger.
+    AlertCircle,
 }
 
 impl Icon {
     /// Every icon, for the asset listing and the tests.
-    pub const ALL: [Self; 53] = [
+    pub const ALL: [Self; 56] = [
         Self::Terminal,
         Self::Server,
         Self::Layers,
@@ -182,6 +188,9 @@ impl Icon {
         Self::Follow,
         Self::Clock,
         Self::Filter,
+        Self::AlertTriangle,
+        Self::Info,
+        Self::AlertCircle,
     ];
 
     /// The asset path GPUI asks the source for.
@@ -240,6 +249,9 @@ impl Icon {
             Self::Follow => "icons/follow.svg",
             Self::Clock => "icons/clock.svg",
             Self::Filter => "icons/filter.svg",
+            Self::AlertTriangle => "icons/alert-triangle.svg",
+            Self::Info => "icons/info.svg",
+            Self::AlertCircle => "icons/alert-circle.svg",
         }
     }
 
@@ -367,6 +379,15 @@ impl Icon {
             }
             Self::Clock => r#"<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>"#,
             Self::Filter => r#"<path d="M4 5.5h16l-6.2 7.3V18l-3.6 1.8v-7z"/>"#,
+            Self::AlertTriangle => {
+                r#"<path d="M10.3 4.3L2.8 17.5A2 2 0 0 0 4.5 20.5h15a2 2 0 0 0 1.7-3L13.7 4.3a2 2 0 0 0-3.4 0z"/><path d="M12 9.5v4.5"/><path d="M12 17h.01"/>"#
+            }
+            Self::Info => {
+                r#"<circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/>"#
+            }
+            Self::AlertCircle => {
+                r#"<circle cx="12" cy="12" r="9"/><path d="M12 8v4.5"/><path d="M12 16h.01"/>"#
+            }
         }
     }
 
@@ -416,4 +437,45 @@ pub fn icon(icon: Icon, size: Pixels, color: Rgba) -> Svg {
         .flex_none()
         .size(size)
         .text_color(color)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{Assets, Icon};
+    use gpui::AssetSource;
+
+    #[test]
+    fn every_icon_has_a_unique_path_and_valid_svg_asset() {
+        let assets = Assets;
+        let mut paths = HashSet::new();
+        for icon in Icon::ALL {
+            let path = icon.path();
+            assert!(paths.insert(path), "duplicate icon path: {path}");
+            let bytes = assets
+                .load(path)
+                .expect("asset load succeeds")
+                .expect("icon asset exists");
+            let svg = String::from_utf8(bytes.into_owned()).expect("svg is valid utf-8");
+            assert!(svg.starts_with("<svg "), "{path}: {svg}");
+            assert!(svg.contains(r#"viewBox="0 0 24 24""#), "{path}: {svg}");
+            assert!(svg.contains(r#"stroke-width="1.6""#), "{path}: {svg}");
+            assert!(svg.ends_with("</svg>"), "{path}: {svg}");
+        }
+    }
+
+    #[test]
+    fn semantic_toast_icons_are_registered_in_the_set() {
+        for icon in [Icon::AlertTriangle, Icon::Info, Icon::AlertCircle] {
+            assert!(
+                Icon::ALL.contains(&icon),
+                "{icon:?} must be listed in Icon::ALL"
+            );
+            assert!(
+                Assets.load(icon.path()).expect("load succeeds").is_some(),
+                "{icon:?} must resolve from Assets"
+            );
+        }
+    }
 }

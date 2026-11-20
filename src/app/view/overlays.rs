@@ -112,13 +112,19 @@ fn kind_badge_parts(
 }
 
 /// How a host is described in the palette: its target, then a jump or ProxyCommand.
-fn host_palette_detail(host: &HostConfig) -> String {
+fn host_palette_detail(host: &HostConfig, locale: crate::app::copy::Locale) -> String {
+    let ux = copy::ux_for(locale);
     let mut detail = host.target();
     if !host.jumps().is_empty() {
-        detail.push_str(&format!(" · {} jump", host.jumps().len()));
+        detail.push_str(" · ");
+        detail.push_str(&copy::fill(
+            ux.palette_host_jumps,
+            &[("count", &host.jumps().len().to_string())],
+        ));
     }
     if host.proxy_command().is_some() {
-        detail.push_str(" · ProxyCommand");
+        detail.push_str(" · ");
+        detail.push_str(ux.palette_host_proxy_command);
     }
     detail
 }
@@ -333,7 +339,7 @@ impl ShelluneView {
                 command: Command::Connect(host.id()),
                 group: Group::Recent,
                 title: host.name().to_owned(),
-                detail: host_palette_detail(host),
+                detail: host_palette_detail(host, locale),
                 shortcut: None,
                 icon: Icon::Plug,
                 current: false,
@@ -347,7 +353,7 @@ impl ShelluneView {
                 command: Command::Connect(host.id()),
                 group: Group::Hosts,
                 title: host.name().to_owned(),
-                detail: host_palette_detail(host),
+                detail: host_palette_detail(host, locale),
                 shortcut: None,
                 icon: Icon::Plug,
                 current: false,
@@ -618,6 +624,15 @@ impl ShelluneView {
             .into_iter()
             .find(|entry| entry.title == title)
             .and_then(|entry| entry.shortcut)
+    }
+
+    /// The detail line the palette lists for one entry, for localization tests.
+    #[cfg(test)]
+    pub fn palette_detail(&self, title: &str) -> Option<String> {
+        self.palette_entries()
+            .into_iter()
+            .find(|entry| entry.title == title)
+            .map(|entry| entry.detail)
     }
 
     /// Moves the highlight and keeps it in view.

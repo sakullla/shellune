@@ -3250,6 +3250,10 @@ pub struct UxStrings {
     pub banner_diagnostic: &'static str,
     /// The command that copies the whole diagnostic
     pub banner_copy_diagnostic: &'static str,
+    /// Palette detail suffix when a host connects through jump hosts: `{count}`
+    pub palette_host_jumps: &'static str,
+    /// Palette detail suffix when a host uses a ProxyCommand
+    pub palette_host_proxy_command: &'static str,
 }
 
 impl UxStrings {
@@ -3670,6 +3674,8 @@ impl UxStrings {
             self.banner_dismiss,
             self.banner_diagnostic,
             self.banner_copy_diagnostic,
+            self.palette_host_jumps,
+            self.palette_host_proxy_command,
         ]
     }
 }
@@ -4105,6 +4111,8 @@ included",
     banner_dismiss: "Dismiss (Esc)",
     banner_diagnostic: "Diagnostics",
     banner_copy_diagnostic: "Copy diagnostics",
+    palette_host_jumps: "{count} jump",
+    palette_host_proxy_command: "ProxyCommand",
 };
 
 /// Simplified Chinese.
@@ -4535,6 +4543,8 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     banner_dismiss: "关闭（Esc）",
     banner_diagnostic: "诊断信息",
     banner_copy_diagnostic: "复制诊断",
+    palette_host_jumps: "{count} 个跳板",
+    palette_host_proxy_command: "代理命令",
 };
 
 /// The redesigned-shell strings of the current language.
@@ -5296,6 +5306,24 @@ startup_strings! {
     /// Reason of a settings file that is not a settings document
     settings_unreadable: "{file} is not a settings file this version can read. The default settings are in use until one is changed.",
         "{file} 不是此版本能读取的设置文件。在修改任一设置之前，将使用默认设置。";
+    /// Reason when a data file could not be read from disk
+    storage_read_failed: "{file} could not be read.",
+        "无法读取 {file}。";
+    /// Reason when a data file is damaged or invalid
+    storage_corrupt: "{file} is damaged or not a valid data file.",
+        "{file} 已损坏或格式无效。";
+    /// Reason when a data file uses a newer format version
+    storage_unsupported_version: "{file} uses format {found}, which is newer than this version supports ({supported}).",
+        "{file} 使用了更新的格式版本（{found}），当前版本最高支持 {supported}。";
+    /// Fallback reason when a data file could not be loaded
+    storage_failed: "{file} could not be loaded.",
+        "无法加载 {file}。";
+    /// Appends technical error detail after a localized summary
+    error_detail: "{summary} ({detail})",
+        "{summary}（详情：{detail}）";
+    /// Visual cue above the stop buttons indicating the details area can scroll
+    scroll_hint: "Scroll or use ↑/↓ / PageUp / PageDown for full details",
+        "滚动或按 ↑/↓ / PageUp / PageDown 查看完整详情";
     /// Under the reason: what the two buttons do
     failed_hint: "Continue opens Shellune with what could be read. The files are in the data folder.",
         "选择“继续”将以已读取的内容打开 Shellune。相关文件都在配置文件夹中。";
@@ -5482,7 +5510,9 @@ mod ux_tests {
         for (en, zh) in english.iter().zip(chinese.iter()) {
             assert!(!en.trim().is_empty() && !zh.trim().is_empty());
             assert_ne!(en, zh, "{en} is not translated");
-            assert_eq!(en.contains("{file}"), zh.contains("{file}"), "{en} / {zh}");
+            for name in ["{file}", "{found}", "{supported}", "{summary}", "{detail}"] {
+                assert_eq!(en.contains(name), zh.contains(name), "{en} / {zh}: {name}");
+            }
         }
     }
 

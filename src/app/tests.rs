@@ -39945,3 +39945,284 @@ async fn desktop_controls_dock_top_center_keep_expand_handle_visible_and_block_p
         "closing a fullscreen desktop session must exit window fullscreen"
     );
 }
+
+#[gpui::test]
+async fn toast_stack_clears_session_bar_and_resets_hover_when_dismissed(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    show_remote_terminal(cx, &view, id);
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let search = bounds_of(cx, "terminal.search");
+    let more = bounds_of(cx, "session.more");
+
+    // Emit a toast via copy_text and verify the toast stack sits strictly above
+    // terminal.search and session.more in the bottom-right corner.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.copy_text("copied-for-clearance-check".to_owned(), cx);
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    cx.run_until_parked();
+
+    let toasts = bounds_of(cx, "toasts");
+    assert!(
+        toasts.bottom() <= search.top() + px(0.5),
+        "toast stack must sit above terminal.search: toasts={toasts:?}, search={search:?}"
+    );
+    assert!(
+        toasts.bottom() <= more.top() + px(0.5),
+        "toast stack must sit above session.more: toasts={toasts:?}, more={more:?}"
+    );
+
+    // Hover the toast stack, then dismiss the only toast; hover state must reset to false.
+    hover(cx, "toasts");
+    redraw(cx);
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).toasts_hovered()),
+        "hovering the toast stack sets toasts_hovered"
+    );
+    click(cx, "toast.close.0");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).toast_titles().is_empty()),
+        "clicking close removes the toast"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).toasts_hovered()),
+        "clearing the last toast must reset toasts_hovered"
+    );
+}
+
+#[gpui::test]
+async fn palette_host_detail_localizes_jumps_and_proxy_command(cx: &mut TestAppContext) {
+    let dir = TempDir::new("palette-host-detail-i18n");
+    let store = HostStore::at(dir.path());
+    let bastion = HostConfig::new("bastion", "bastion.example.com", 22, "ops").expect("valid host");
+    let mut via_jump = HostConfig::new("via-jump", "app.internal", 22, "ops").expect("valid host");
+    via_jump.set_jumps([bastion.id()]);
+    let mut via_proxy =
+        HostConfig::new("via-proxy", "proxy.internal", 22, "ops").expect("valid host");
+    via_proxy.set_proxy_command(Some("nc %h %p"));
+    let mut book = HostBook::new();
+    book.insert(bastion).expect("insert bastion");
+    book.insert(via_jump).expect("insert via-jump");
+    book.insert(via_proxy).expect("insert via-proxy");
+    store.save(&book).expect("save host book");
+
+    let mut workspace = Workspace::new();
+    workspace.set_locale(Locale::Chinese);
+    let (view, cx) =
+        cx.add_window_view(|_window, cx| ShelluneView::with_store(cx, workspace, store));
+    cx.run_until_parked();
+
+    let (zh_jump, zh_proxy) = cx.update(|_window, app| {
+        let view = view.read(app);
+        (
+            view.palette_detail("via-jump").expect("via-jump entry"),
+            view.palette_detail("via-proxy").expect("via-proxy entry"),
+        )
+    });
+    assert!(
+        zh_jump.contains("1 个跳板") && !zh_jump.contains("jump"),
+        "Chinese palette detail must localize jumps: {zh_jump}"
+    );
+    assert!(
+        zh_proxy.contains("代理命令") && !zh_proxy.contains("ProxyCommand"),
+        "Chinese palette detail must localize ProxyCommand: {zh_proxy}"
+    );
+
+    cx.dispatch_action(ToggleLanguage);
+    cx.run_until_parked();
+    let (en_jump, en_proxy) = cx.update(|_window, app| {
+        let view = view.read(app);
+        (
+            view.palette_detail("via-jump").expect("via-jump entry"),
+            view.palette_detail("via-proxy").expect("via-proxy entry"),
+        )
+    });
+    assert!(
+        en_jump.contains("1 jump"),
+        "English palette detail must show jump count: {en_jump}"
+    );
+    assert!(
+        en_proxy.contains("ProxyCommand"),
+        "English palette detail must show ProxyCommand: {en_proxy}"
+    );
+}
+
+#[gpui::test]
+async fn startup_stage_failures_are_localized_in_chinese(cx: &mut TestAppContext) {
+    use crate::app::view::StartupStage;
+
+    let dir = TempDir::new("startup-i18n-zh");
+    let root = dir.path().join("data");
+    std::fs::write(&root, "not a directory").expect("sentinel file written");
+    let mut workspace = Workspace::new();
+    workspace.set_locale(Locale::Chinese);
+    let (view, cx) = launching_view(cx, workspace, HostStore::at(&root));
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(crate::app::view::BRAND_ENTRANCE);
+    cx.run_until_parked();
+
+    assert_eq!(startup_stop(&view, cx), Some(StartupStage::Hosts));
+    let stage2_reason = startup_failure(&view, cx);
+    assert!(
+        stage2_reason.contains("hosts.json"),
+        "stage 2 failure keeps the file name: {stage2_reason}"
+    );
+    assert!(
+        stage2_reason.contains("无法读取") && !stage2_reason.contains("the saved hosts at"),
+        "stage 2 failure must be localized in Chinese: {stage2_reason}"
+    );
+
+    // Continue past stage 2; stage 3 also fails and its report must be localized in Chinese.
+    click(cx, "startup.continue");
+    cx.run_until_parked();
+    let stage3_reason = cx.update(|_window, app| {
+        view.read(app)
+            .startup_reports()
+            .into_iter()
+            .find(|r| r.stage == StartupStage::Workspace)
+            .and_then(|r| r.failure)
+            .expect("stage 3 failure recorded")
+    });
+    assert!(
+        stage3_reason.contains("无法读取")
+            && !stage3_reason.contains("the forwarding rules at")
+            && !stage3_reason.contains("the workspace snapshot at"),
+        "stage 3 failure must be localized in Chinese: {stage3_reason}"
+    );
+}
+
+#[gpui::test]
+async fn startup_failure_body_scrolls_with_keyboard_and_shows_scroll_hint(cx: &mut TestAppContext) {
+    use crate::app::view::StartupStage;
+
+    let dir = TempDir::new("startup-kbd-scroll");
+    let root = dir.path().join(
+        "nested-very-long-directory-segment-for-wrapping-startup-error-reason-in-short-window",
+    );
+    std::fs::create_dir_all(&root).expect("dir created");
+    // Corrupt hosts.json with a long invalid payload so the failure body overflows in a short window.
+    std::fs::write(root.join("hosts.json"), "{ invalid json").expect("corrupt hosts written");
+
+    let mut workspace = Workspace::new();
+    workspace.set_zoom(Zoom::Comfortable);
+    let (view, cx) = launching_view(cx, workspace, HostStore::at(&root));
+    cx.simulate_resize(size(px(720.0), px(320.0)));
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(crate::app::view::BRAND_ENTRANCE);
+    cx.run_until_parked();
+
+    assert_eq!(startup_stop(&view, cx), Some(StartupStage::Hosts));
+    assert!(
+        cx.debug_bounds("startup.body").is_some(),
+        "startup.body is mounted"
+    );
+    let hint = bounds_of(cx, "startup.failure.scroll_hint");
+    let cont = bounds_of(cx, "startup.continue");
+    assert!(
+        hint.bottom() <= cont.top() + px(0.5),
+        "scroll hint sits above the action buttons: hint={hint:?}, cont={cont:?}"
+    );
+
+    let max_offset = cx.update(|_window, app| view.read(app).startup_scroll().max_offset().height);
+    assert!(
+        max_offset > px(0.0),
+        "startup.body overflows in a very short window so keyboard scroll can be verified"
+    );
+
+    // Focus the splash root and press PageDown, then Home.
+    cx.update(|window, app| window.focus(view.read(app).root_focus()));
+    cx.run_until_parked();
+    press_key(cx, "pagedown");
+    cx.run_until_parked();
+    let after_down = cx.update(|_window, app| view.read(app).startup_scroll().offset().y);
+    assert!(
+        after_down < px(0.0),
+        "PageDown must scroll startup.body downward: offset={after_down:?}"
+    );
+
+    press_key(cx, "home");
+    cx.run_until_parked();
+    let after_home = cx.update(|_window, app| view.read(app).startup_scroll().offset().y);
+    assert!(
+        after_home.abs() <= px(0.5),
+        "Home must return startup.body to top: offset={after_home:?}"
+    );
+}
+
+#[gpui::test]
+async fn short_narrow_single_column_file_view_preserves_list_room(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (files, transfers) = open_transfers(cx, &view, id);
+    // Provide a remote directory listing so files.remote.list is rendered.
+    let request = match files.requests().last().expect("list request sent") {
+        shellune_core::BrowseRequest::Home { request }
+        | shellune_core::BrowseRequest::List { request, .. } => *request,
+        other => panic!("expected home/list request, got {other:?}"),
+    };
+    files.reply(
+        request,
+        "/home/ops",
+        &[
+            ("file-0.txt", shellune_core::FileKind::File),
+            ("file-1.txt", shellune_core::FileKind::File),
+            ("file-2.txt", shellune_core::FileKind::File),
+            ("file-3.txt", shellune_core::FileKind::File),
+            ("file-4.txt", shellune_core::FileKind::File),
+            ("file-5.txt", shellune_core::FileKind::File),
+        ],
+    );
+    pump_files(cx, &view);
+
+    // Start a transfer so files.transfers is also visible at the top.
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/report.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let task = transfers.starts()[0].transfer;
+    transfers.push(shellune_core::TransferEvent {
+        transfer: task,
+        update: shellune_core::TransferUpdate::Failed {
+            failure: shellune_core::TransferFailure::NotFound,
+            residue: None,
+            resume: None,
+        },
+    });
+    pump_files(cx, &view);
+
+    cx.simulate_resize(narrow_window());
+    largest_text_size(&view, cx);
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("files.layout.single").is_some(),
+        "narrow window uses single-column file layout"
+    );
+    let viewport = narrow_window();
+    let strip = bounds_of(cx, "files.transfers");
+    assert_fits_inside(strip, viewport, "files.transfers");
+    assert!(
+        strip.size.height <= viewport.height * 0.34 + px(1.0),
+        "short single-column window caps files.transfers height tighter: {strip:?}"
+    );
+    let list = bounds_of(cx, "files.list");
+    let min_row = Metrics::new(Zoom::Comfortable).list_row_height();
+    assert!(
+        list.size.height >= min_row,
+        "remote file list must retain at least one row of usable height at 720x480 @ 115%: \
+         list={list:?}, min_row={min_row:?}"
+    );
+}
