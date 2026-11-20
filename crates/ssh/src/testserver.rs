@@ -1089,14 +1089,10 @@ impl Harness {
     /// Returns what the script wrote to the error stream, so a failed fixture names
     /// itself instead of silently producing an empty directory.
     pub fn as_user(&self, script: &str) -> Result<String, String> {
-        let file = self.dir.join("fixture.sh");
         let command = format!(
-            "cat > '{file}' <<'SHELLUNE_EOF'
+            "runuser -u '{user}' -- bash -s <<'SHELLUNE_EOF'
 {script}
-SHELLUNE_EOF
-chmod 755 '{file}'
-runuser -u '{user}' -- bash '{file}'",
-            file = linux_path(&file),
+SHELLUNE_EOF",
             user = self.user,
         );
         self.wsl(&["bash", "-c", &command])
