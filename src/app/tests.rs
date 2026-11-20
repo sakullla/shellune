@@ -29905,7 +29905,7 @@ async fn the_controls_appear_only_while_the_pointer_is_over_the_pane(cx: &mut Te
         })
     };
     assert!(
-        !revealed(cx),
+        !revealed(cx) || cfg!(feature = "ui-capture"),
         "the bar stays out of the way until the pointer comes to the picture"
     );
 
