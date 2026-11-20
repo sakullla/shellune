@@ -434,37 +434,44 @@ def png_chunk(kind: bytes, payload: bytes) -> bytes:
 
 def validate_png(path: Path) -> None:
     """Verify the encoder's RGB PNG including its chunk CRCs and scanline stream."""
-    data = path.read_bytes()
-    if not data.startswith(PNG_SIGNATURE):
-        raise ValueError(f"{path}: invalid PNG signature")
-    at = len(PNG_SIGNATURE)
-    expected = None
-    payloads = []
-    while at + 12 <= len(data):
-        length, kind = struct.unpack_from(">I4s", data, at)
-        end = at + 8 + length
-        if end + 4 > len(data):
-            break
-        payload = memoryview(data)[at + 8:end]
-        (crc,) = struct.unpack_from(">I", data, end)
-        if zlib.crc32(payload, zlib.crc32(kind)) != crc:
-            raise ValueError(f"{path}: damaged {kind!r} checksum")
-        if kind == b"IHDR" and at == len(PNG_SIGNATURE) and length == 13:
-            width, height, depth, colour, compression, scan_filter, interlace = struct.unpack(">IIBBBBB", payload)
-            if not width or not height or (depth, colour, compression, scan_filter, interlace) != (8, 2, 0, 0, 0):
-                raise ValueError(f"{path}: invalid RGB header")
-            expected = (width * 3 + 1) * height
-        elif kind == b"IDAT":
-            payloads.append(payload)
-        elif kind == b"IEND" and length == 0 and end + 4 == len(data):
-            if expected is None or not payloads:
+    block = 65536
+    with path.open("rb") as source:
+        if source.read(8) != PNG_SIGNATURE:
+            raise ValueError(f"{path}: invalid PNG signature")
+        expected = None
+        decoded = 0
+        stream = zlib.decompressobj()
+        while len(header := source.read(8)) == 8:
+            length, kind = struct.unpack(">I4s", header)
+            crc = zlib.crc32(kind)
+            if expected is None:
+                if kind != b"IHDR" or length != 13 or len(ihdr := source.read(13)) != 13:
+                    break
+                width, height, *format_fields = struct.unpack(">IIBBBBB", ihdr)
+                if not width or not height or format_fields != [8, 2, 0, 0, 0]:
+                    raise ValueError(f"{path}: invalid RGB header")
+                expected = (width * 3 + 1) * height
+                crc = zlib.crc32(ihdr, crc)
+            else:
+                remaining = length
+                while remaining:
+                    part = source.read(min(remaining, block))
+                    if not part:
+                        raise ValueError(f"{path}: truncated {kind!r} chunk")
+                    remaining -= len(part)
+                    crc = zlib.crc32(part, crc)
+                    if kind == b"IDAT":
+                        while part:
+                            decoded += len(stream.decompress(part, block))
+                            if stream.unused_data or decoded > expected:
+                                raise ValueError(f"{path}: excess image data")
+                            part = stream.unconsumed_tail
+            if source.read(4) != struct.pack(">I", crc):
+                raise ValueError(f"{path}: damaged {kind!r} checksum")
+            if kind == b"IEND":
+                if length == 0 and stream.eof and decoded == expected and not source.read(1):
+                    return
                 break
-            stream = zlib.decompressobj()
-            raw = stream.decompress(b"".join(payloads), expected + 1)
-            if stream.eof and not stream.unused_data and len(raw) == expected:
-                return
-            break
-        at = end + 4
     raise ValueError(f"{path}: incomplete PNG image")
 
 
@@ -843,6 +850,22 @@ def self_test() -> int:
         stored = sample.read_bytes()
         validate_png(sample)
         assert sample.read_bytes() == stored, "validation changed the image"
+        # One scanline stream may be divided across many IDAT chunks.
+        header = stored[:33]
+        raw = bytes((64 * 3 + 1) * 64)
+        encoded = zlib.compress(raw)
+        multi = root / "multi.png"
+        multi.write_bytes(header + b"".join(png_chunk(b"IDAT", bytes([b])) for b in encoded)
+                          + png_chunk(b"IEND", b""))
+        validate_png(multi)
+        for invalid in (encoded[:-1], encoded + b"x", zlib.compress(raw + b"x")):
+            multi.write_bytes(header + png_chunk(b"IDAT", invalid) + png_chunk(b"IEND", b""))
+            try:
+                validate_png(multi)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("invalid scanline stream accepted")
         damaged = root / "damaged.png"
         damaged.write_bytes(b"not a png at all")
         try:

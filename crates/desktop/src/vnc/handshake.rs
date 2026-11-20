@@ -235,8 +235,8 @@ pub(super) fn open(config: &Config, emit: &Emit, control: &Arc<Control>) -> Resu
     send(&mut transport, &[1])?;
     let (width, height) = server_init(&mut transport)?;
     super::trace(&format!("desktop {width}x{height}"));
-    let bytes = usize::from(width) * usize::from(height) * 4;
-    if width == 0 || height == 0 || bytes > MAX_FRAME_BYTES {
+    let bytes = u64::from(width) * u64::from(height) * 4;
+    if width == 0 || height == 0 || bytes > MAX_FRAME_BYTES as u64 {
         return Err(Ended::new(
             Failure::Limit,
             format!("a {width}x{height} desktop exceeds the {MAX_FRAME_BYTES} byte bound"),

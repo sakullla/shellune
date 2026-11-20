@@ -17,10 +17,8 @@ use std::time::Duration;
 /// One read wait once the desktop is up: the loop returns to its cancellation
 /// check after each, and a partial message stays buffered.
 const POLL: Duration = Duration::from_millis(200);
-/// One read. A message is re-parsed from its start until it is complete, so a
-/// large buffer keeps a screenful of hextile to a couple of passes instead of a
-/// dozen; the read itself still returns as soon as any bytes are available.
-const CHUNK: usize = 256 * 1024;
+/// The decoder retains an incomplete tile or pixel band across reads.
+const CHUNK: usize = 32 * 1024;
 
 /// Runs one attempt, retrying once if the server drops an established session.
 pub(super) fn run(
@@ -109,15 +107,15 @@ impl Desktop {
     }
 
     fn resize(&mut self, width: u16, height: u16) -> Result<(), String> {
-        let bytes = usize::from(width) * usize::from(height) * 4;
-        if width == 0 || height == 0 || bytes > MAX_FRAME_BYTES {
+        let bytes = u64::from(width) * u64::from(height) * 4;
+        if width == 0 || height == 0 || bytes > MAX_FRAME_BYTES as u64 {
             return Err(format!(
                 "the server resized the desktop to {width}x{height}, past the {MAX_FRAME_BYTES} byte bound"
             ));
         }
         self.width = width;
         self.height = height;
-        self.pixels = vec![0; bytes];
+        self.pixels = vec![0; bytes as usize];
         Ok(())
     }
 
@@ -147,7 +145,7 @@ impl Desktop {
                     let from = line * row;
                     self.pixels[at..at + row].copy_from_slice(&pixels[from..from + row]);
                 }
-                Ok(Some(self.region(x, y, width, height)))
+                Ok(Some(self.frame(x, y, width, height, pixels)))
             }
             Rect::Copy {
                 x,
@@ -172,7 +170,7 @@ impl Desktop {
                     let from = line * row;
                     self.pixels[at..at + row].copy_from_slice(&patch[from..from + row]);
                 }
-                Ok(Some(self.region(x, y, width, height)))
+                Ok(Some(self.frame(x, y, width, height, patch)))
             }
         }
     }
@@ -200,14 +198,7 @@ impl Desktop {
         Ok((x, y, width, height))
     }
 
-    fn region(&self, x: u16, y: u16, width: u16, height: u16) -> Event {
-        let stride = self.stride();
-        let row = usize::from(width) * 4;
-        let mut pixels = Vec::with_capacity(row * usize::from(height));
-        for line in 0..usize::from(height) {
-            let at = (usize::from(y) + line) * stride + usize::from(x) * 4;
-            pixels.extend_from_slice(&self.pixels[at..at + row]);
-        }
+    fn frame(&self, x: u16, y: u16, width: u16, height: u16, pixels: Vec<u8>) -> Event {
         Event::Frame {
             x: i32::from(x),
             y: i32::from(y),
@@ -215,7 +206,7 @@ impl Desktop {
             height: i32::from(height),
             desktop_width: u32::from(self.width),
             desktop_height: u32::from(self.height),
-            stride: row as u32,
+            stride: u32::from(width) * 4,
             pixels,
         }
     }
@@ -361,7 +352,7 @@ impl Session {
         }
     }
 
-    /// Consumes every whole message that arrived.
+    /// Publishes available pixel bands and requests the next update at the end.
     fn messages(&mut self) -> Result<(), Ended> {
         loop {
             let message = self
@@ -371,22 +362,21 @@ impl Session {
             let Some(message) = message else {
                 return Ok(());
             };
-            self.stats.messages += 1;
+            if !matches!(message, Message::Rectangle(_)) {
+                self.stats.messages += 1;
+            }
             match message {
-                Message::Update(rects) => {
-                    super::trace(&format!("update of {} rectangles", rects.len()));
-                    for rect in rects {
-                        if let Some(event) = self
-                            .desktop
-                            .apply(rect)
-                            .map_err(|reason| Ended::new(Failure::ProtocolFailure, reason))?
-                        {
-                            self.stats.frames += 1;
-                            (self.emit)(event);
-                        }
+                Message::Rectangle(rect) => {
+                    if let Some(event) = self
+                        .desktop
+                        .apply(rect)
+                        .map_err(|reason| Ended::new(Failure::ProtocolFailure, reason))?
+                    {
+                        self.stats.frames += 1;
+                        (self.emit)(event);
                     }
-                    self.request(true)?;
                 }
+                Message::UpdateEnd => self.request(true)?,
                 Message::CutText(bytes) => {
                     super::trace(&format!("classic cut text of {} bytes", bytes.len()));
                     if self.clipboard {
@@ -394,15 +384,7 @@ impl Session {
                     }
                 }
                 Message::ExtendedCutText(payload) => {
-                    if std::env::var_os("SHELLUNE_VNC_TRACE").is_some() {
-                        let head: Vec<String> =
-                            payload.iter().map(|byte| format!("{byte:02x}")).collect();
-                        eprintln!(
-                            "vnc trace: extended cut text of {} bytes [{}]",
-                            payload.len(),
-                            head.join(" ")
-                        );
-                    }
+                    super::trace(&format!("extended cut text of {} bytes", payload.len()));
                     if !self.clipboard {
                         continue;
                     }
@@ -504,15 +486,10 @@ impl Session {
 
     fn send(&mut self, message: &[u8]) -> Result<(), Ended> {
         if std::env::var_os("SHELLUNE_VNC_TRACE").is_some() {
-            let head: Vec<String> = message
-                .iter()
-                .take(20)
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
             eprintln!(
-                "vnc trace: send {} bytes [{}]",
-                message.len(),
-                head.join(" ")
+                "vnc trace: send type={} bytes={}",
+                message[0],
+                message.len()
             );
         }
         self.transport

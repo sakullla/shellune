@@ -1,5 +1,4 @@
-//! RFB messages as a byte stream: one parser that consumes only whole messages,
-//! so a read that times out in the middle leaves the bytes in place.
+//! Incremental RFB decoder. Pixel updates can span arbitrarily many socket reads.
 use crate::MAX_FRAME_BYTES;
 use std::io::{self, Read};
 
@@ -34,7 +33,8 @@ pub(crate) enum Rect {
 
 /// What the server sent.
 pub(crate) enum Message {
-    Update(Vec<Rect>),
+    Rectangle(Rect),
+    UpdateEnd,
     Bell,
     /// Classic cut text: ISO 8859-1 bytes.
     CutText(Vec<u8>),
@@ -95,207 +95,286 @@ enum Parsed {
     Complete(Message, usize),
 }
 
-/// Buffers bytes until one whole server message is available.
+/// A pixel rectangle is published in bands. A slow full-screen update can
+/// therefore paint before its last byte arrives, with bounded scratch storage.
+const BAND_ROWS: usize = 64;
+
+struct PixelRectangle {
+    x: u16,
+    y: u16,
+    width: usize,
+    height: usize,
+    row: usize,
+    hextile: Option<Tiles>,
+}
+
+#[derive(Default)]
+struct Tiles {
+    x: usize,
+    y: usize,
+    background: [u8; 4],
+    foreground: [u8; 4],
+    band: Vec<u8>,
+}
+
+impl PixelRectangle {
+    fn next_band(&mut self, cursor: &mut Cursor<'_>) -> Result<Option<Rect>, String> {
+        let rows = (self.height - self.row).min(BAND_ROWS);
+        let size = rows * self.width * BYTES_PER_PIXEL;
+        let pixels = if let Some(tiles) = self.hextile.as_mut() {
+            tiles.band.resize(size, 0);
+            while tiles.y < rows {
+                let mut tile = Cursor::new(&cursor.data[cursor.at..]);
+                if !tiles.decode(&mut tile, self.width, rows)? {
+                    return Ok(None);
+                }
+                cursor.at += tile.at;
+                tiles.x += 16;
+                if tiles.x >= self.width {
+                    tiles.x = 0;
+                    tiles.y += 16;
+                }
+            }
+            tiles.y = 0;
+            std::mem::take(&mut tiles.band)
+        } else {
+            let Some(bytes) = cursor.take(size) else {
+                return Ok(None);
+            };
+            bytes.to_vec()
+        };
+        let y = self.y + self.row as u16;
+        self.row += rows;
+        Ok(Some(Rect::Raw {
+            x: self.x,
+            y,
+            width: self.width as u16,
+            height: rows as u16,
+            pixels,
+        }))
+    }
+}
+
+impl Tiles {
+    /// Commit colours and pixels only once the complete tile is available.
+    fn decode(
+        &mut self,
+        cursor: &mut Cursor<'_>,
+        width: usize,
+        rows: usize,
+    ) -> Result<bool, String> {
+        let tile_w = (width - self.x).min(16);
+        let tile_h = (rows - self.y).min(16);
+        let Some(&flags) = cursor.take(1).and_then(|s| s.first()) else {
+            return Ok(false);
+        };
+        if flags & HEXTILE_RAW != 0 {
+            let Some(raw) = cursor.take(tile_w * tile_h * 4) else {
+                return Ok(false);
+            };
+            for (dy, row) in raw.chunks_exact(tile_w * 4).enumerate() {
+                let at = ((self.y + dy) * width + self.x) * 4;
+                self.band[at..at + row.len()].copy_from_slice(row);
+            }
+            return Ok(true);
+        }
+        let mut background = self.background;
+        let mut foreground = self.foreground;
+        for (flag, colour) in [
+            (HEXTILE_BACKGROUND, &mut background),
+            (HEXTILE_FOREGROUND, &mut foreground),
+        ] {
+            if flags & flag != 0 {
+                let Some(value) = cursor.take(4) else {
+                    return Ok(false);
+                };
+                colour.copy_from_slice(value);
+            }
+        }
+        let coloured = flags & HEXTILE_COLOURED != 0;
+        let entry = if coloured { 6 } else { 2 };
+        let subrects = if flags & HEXTILE_SUBRECTS != 0 {
+            let Some(count) = cursor.take(1) else {
+                return Ok(false);
+            };
+            let Some(data) = cursor.take(usize::from(count[0]) * entry) else {
+                return Ok(false);
+            };
+            data
+        } else {
+            &[]
+        };
+        self.background = background;
+        self.foreground = foreground;
+        paint(
+            &mut self.band,
+            width,
+            self.x,
+            self.y,
+            tile_w,
+            tile_h,
+            &background,
+        );
+        for sub in subrects.chunks_exact(entry) {
+            let (colour, geometry) = sub.split_at(entry - 2);
+            let x = usize::from(geometry[0] >> 4);
+            let y = usize::from(geometry[0] & 15);
+            let w = usize::from(geometry[1] >> 4) + 1;
+            let h = usize::from(geometry[1] & 15) + 1;
+            if x + w > tile_w || y + h > tile_h {
+                return Err(format!(
+                    "a hextile sub-rectangle {w}x{h} at {x},{y} is outside its {tile_w}x{tile_h} tile"
+                ));
+            }
+            paint(
+                &mut self.band,
+                width,
+                self.x + x,
+                self.y + y,
+                w,
+                h,
+                if coloured { colour } else { &foreground },
+            );
+        }
+        Ok(true)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Incoming {
     pending: Vec<u8>,
+    offset: usize,
+    remaining: Option<u16>,
+    pixels: Option<PixelRectangle>,
 }
 
 impl Incoming {
     pub(crate) fn push(&mut self, bytes: &[u8]) {
+        if self.offset != 0 {
+            self.pending.drain(..self.offset);
+            self.offset = 0;
+        }
         self.pending.extend_from_slice(bytes);
     }
 
-    /// The next whole message, `Ok(None)` when more bytes are needed, or the reason
-    /// the stream cannot be read as RFB.
     pub(crate) fn take(&mut self) -> Result<Option<Message>, String> {
-        match parse(&self.pending)? {
-            Parsed::Incomplete => Ok(None),
-            Parsed::Complete(message, used) => {
-                self.pending.drain(..used);
-                Ok(Some(message))
+        loop {
+            // A large clipboard transfer should not reserve its peak buffer
+            // for the rest of an idle desktop session.
+            if self.offset == self.pending.len() && self.pending.capacity() > 1024 * 1024 {
+                self.pending = Vec::new();
+                self.offset = 0;
             }
-        }
-    }
-}
-
-fn parse(data: &[u8]) -> Result<Parsed, String> {
-    let Some(&kind) = data.first() else {
-        return Ok(Parsed::Incomplete);
-    };
-    let mut cursor = Cursor::new(data);
-    cursor.take(1);
-    match kind {
-        0 => framebuffer_update(&mut cursor),
-        1 => colour_map(&mut cursor),
-        2 => Ok(Parsed::Complete(Message::Bell, 1)),
-        3 => cut_text(&mut cursor),
-        other => Err(format!(
-            "the server sent RFB message type {other}, which this client does not read"
-        )),
-    }
-}
-
-fn framebuffer_update(cursor: &mut Cursor<'_>) -> Result<Parsed, String> {
-    // One padding byte, then the number of rectangles.
-    if cursor.take(1).is_none() {
-        return Ok(Parsed::Incomplete);
-    }
-    let Some(count) = cursor.u16() else {
-        return Ok(Parsed::Incomplete);
-    };
-    let mut rects = Vec::with_capacity(usize::from(count));
-    for _ in 0..count {
-        let (Some(x), Some(y), Some(width), Some(height), Some(encoding)) = (
-            cursor.u16(),
-            cursor.u16(),
-            cursor.u16(),
-            cursor.u16(),
-            cursor.i32(),
-        ) else {
-            return Ok(Parsed::Incomplete);
-        };
-        match encoding {
-            RAW => {
-                let size = usize::from(width) * usize::from(height) * 4;
-                if size > MAX_FRAME_BYTES {
-                    return Err(format!(
-                        "an update of {width}x{height} exceeds the {MAX_FRAME_BYTES} byte bound"
-                    ));
+            let data = &self.pending[self.offset..];
+            let mut cursor = Cursor::new(data);
+            if let Some(rect) = &mut self.pixels {
+                let band = rect.next_band(&mut cursor)?;
+                self.offset += cursor.at;
+                if rect.row == rect.height {
+                    self.pixels = None;
                 }
-                let Some(pixels) = cursor.take(size) else {
-                    return Ok(Parsed::Incomplete);
-                };
-                rects.push(Rect::Raw {
-                    x,
-                    y,
-                    width,
-                    height,
-                    pixels: pixels.to_vec(),
-                });
+                return Ok(band.map(Message::Rectangle));
             }
-            HEXTILE => {
-                let Some(pixels) = hextile(cursor, width, height)? else {
-                    return Ok(Parsed::Incomplete);
-                };
-                rects.push(Rect::Raw {
-                    x,
-                    y,
-                    width,
-                    height,
-                    pixels,
-                });
-            }
-            COPY_RECT => {
-                let (Some(source_x), Some(source_y)) = (cursor.u16(), cursor.u16()) else {
-                    return Ok(Parsed::Incomplete);
-                };
-                rects.push(Rect::Copy {
-                    x,
-                    y,
-                    width,
-                    height,
-                    source_x,
-                    source_y,
-                });
-            }
-            DESKTOP_SIZE => rects.push(Rect::Resize { width, height }),
-            LAST_RECT => break,
-            other => {
-                return Err(format!(
-                    "the server used encoding {other}, which this client did not request"
-                ));
-            }
-        }
-    }
-    Ok(Parsed::Complete(Message::Update(rects), cursor.at))
-}
-
-/// Decodes one hextile rectangle into four-byte pixels.
-///
-/// Tiles are 16x16 (the last row and column are shorter). Each tile replaces its
-/// area with the background it names or inherits, then paints its sub-rectangles.
-/// A raw tile carries its own pixels and leaves the remembered colours alone.
-fn hextile(cursor: &mut Cursor<'_>, width: u16, height: u16) -> Result<Option<Vec<u8>>, String> {
-    let w = usize::from(width);
-    let h = usize::from(height);
-    let size = w
-        .checked_mul(h)
-        .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
-        .unwrap_or(usize::MAX);
-    if w == 0 || h == 0 || size > MAX_FRAME_BYTES {
-        return Err(format!(
-            "a hextile update of {width}x{height} exceeds the {MAX_FRAME_BYTES} byte bound"
-        ));
-    }
-    let mut out = vec![0u8; size];
-    let mut background = [0u8; BYTES_PER_PIXEL];
-    let mut foreground = [0u8; BYTES_PER_PIXEL];
-    for tile_y in (0..h).step_by(16) {
-        for tile_x in (0..w).step_by(16) {
-            let tile_w = (w - tile_x).min(16);
-            let tile_h = (h - tile_y).min(16);
-            let Some(byte) = cursor.take(1) else {
-                return Ok(None);
-            };
-            let subencoding = byte[0];
-            if subencoding & HEXTILE_RAW != 0 {
-                let Some(bytes) = cursor.take(tile_w * tile_h * BYTES_PER_PIXEL) else {
+            if let Some(remaining) = self.remaining {
+                if remaining == 0 {
+                    self.remaining = None;
+                    return Ok(Some(Message::UpdateEnd));
+                }
+                let (Some(x), Some(y), Some(width), Some(height), Some(encoding)) = (
+                    cursor.u16(),
+                    cursor.u16(),
+                    cursor.u16(),
+                    cursor.u16(),
+                    cursor.i32(),
+                ) else {
                     return Ok(None);
                 };
-                for row in 0..tile_h {
-                    let at = ((tile_y + row) * w + tile_x) * BYTES_PER_PIXEL;
-                    let from = row * tile_w * BYTES_PER_PIXEL;
-                    out[at..at + tile_w * BYTES_PER_PIXEL]
-                        .copy_from_slice(&bytes[from..from + tile_w * BYTES_PER_PIXEL]);
+                let rect = match encoding {
+                    RAW | HEXTILE => {
+                        let bytes = u64::from(width) * u64::from(height) * 4;
+                        if bytes == 0
+                            || bytes > MAX_FRAME_BYTES as u64
+                            || x.checked_add(width).is_none()
+                            || y.checked_add(height).is_none()
+                        {
+                            return Err(format!(
+                                "invalid pixel rectangle of {width}x{height} at {x},{y}"
+                            ));
+                        }
+                        self.pixels = Some(PixelRectangle {
+                            x,
+                            y,
+                            width: usize::from(width),
+                            height: usize::from(height),
+                            row: 0,
+                            hextile: (encoding == HEXTILE).then(Tiles::default),
+                        });
+                        None
+                    }
+                    COPY_RECT => {
+                        let (Some(source_x), Some(source_y)) = (cursor.u16(), cursor.u16()) else {
+                            return Ok(None);
+                        };
+                        Some(Rect::Copy {
+                            x,
+                            y,
+                            width,
+                            height,
+                            source_x,
+                            source_y,
+                        })
+                    }
+                    DESKTOP_SIZE => Some(Rect::Resize { width, height }),
+                    LAST_RECT => {
+                        self.remaining = None;
+                        self.offset += cursor.at;
+                        return Ok(Some(Message::UpdateEnd));
+                    }
+                    other => {
+                        return Err(format!(
+                            "the server used encoding {other}, which this client did not request"
+                        ));
+                    }
+                };
+                self.remaining = Some(remaining - 1);
+                self.offset += cursor.at;
+                if let Some(rect) = rect {
+                    return Ok(Some(Message::Rectangle(rect)));
                 }
                 continue;
             }
-            if subencoding & HEXTILE_BACKGROUND != 0 {
-                let Some(pixel) = cursor.take(BYTES_PER_PIXEL) else {
-                    return Ok(None);
-                };
-                background.copy_from_slice(pixel);
-            }
-            if subencoding & HEXTILE_FOREGROUND != 0 {
-                let Some(pixel) = cursor.take(BYTES_PER_PIXEL) else {
-                    return Ok(None);
-                };
-                foreground.copy_from_slice(pixel);
-            }
-            paint(&mut out, w, tile_x, tile_y, tile_w, tile_h, &background);
-            if subencoding & HEXTILE_SUBRECTS != 0 {
-                let Some(count) = cursor.take(1) else {
-                    return Ok(None);
-                };
-                let coloured = subencoding & HEXTILE_COLOURED != 0;
-                for _ in 0..count[0] {
-                    let colour = if coloured {
-                        let Some(pixel) = cursor.take(BYTES_PER_PIXEL) else {
-                            return Ok(None);
-                        };
-                        pixel
-                    } else {
-                        &foreground
-                    };
-                    let Some(geometry) = cursor.take(2) else {
+            let Some(&kind) = data.first() else {
+                return Ok(None);
+            };
+            cursor.take(1);
+            let parsed = match kind {
+                0 => {
+                    cursor.take(1);
+                    let Some(count) = cursor.u16() else {
                         return Ok(None);
                     };
-                    let x = usize::from(geometry[0] >> 4);
-                    let y = usize::from(geometry[0] & 0xF);
-                    let wide = usize::from(geometry[1] >> 4) + 1;
-                    let tall = usize::from(geometry[1] & 0xF) + 1;
-                    if x + wide > tile_w || y + tall > tile_h {
-                        return Err(format!(
-                            "a hextile sub-rectangle {wide}x{tall} at {x},{y} is outside its {tile_w}x{tile_h} tile"
-                        ));
-                    }
-                    paint(&mut out, w, tile_x + x, tile_y + y, wide, tall, colour);
+                    self.remaining = Some(count);
+                    self.offset += cursor.at;
+                    continue;
                 }
-            }
+                1 => colour_map(&mut cursor)?,
+                2 => Parsed::Complete(Message::Bell, 1),
+                3 => cut_text(&mut cursor)?,
+                other => {
+                    return Err(format!(
+                        "the server sent RFB message type {other}, which this client does not read"
+                    ));
+                }
+            };
+            return match parsed {
+                Parsed::Incomplete => Ok(None),
+                Parsed::Complete(message, used) => {
+                    self.offset += used;
+                    Ok(Some(message))
+                }
+            };
         }
     }
-    Ok(Some(out))
 }
 
 /// Fills a rectangle of the desktop buffer with one four-byte pixel.
@@ -308,18 +387,19 @@ fn paint(
     height: usize,
     pixel: &[u8],
 ) {
+    let colour: [u8; BYTES_PER_PIXEL] = pixel.try_into().expect("four-byte wire pixel");
     for row in 0..height {
         let start = ((y + row) * desktop_width + x) * BYTES_PER_PIXEL;
-        for column in 0..width {
-            let at = start + column * BYTES_PER_PIXEL;
-            out[at..at + BYTES_PER_PIXEL].copy_from_slice(pixel);
-        }
+        out[start..start + width * BYTES_PER_PIXEL]
+            .as_chunks_mut::<BYTES_PER_PIXEL>()
+            .0
+            .fill(colour);
     }
 }
 
 fn colour_map(cursor: &mut Cursor<'_>) -> Result<Parsed, String> {
     // A true-colour session never uses the map, but a server may still send it.
-    if cursor.take(1).is_none() {
+    if cursor.take(3).is_none() {
         return Ok(Parsed::Incomplete);
     }
     let Some(count) = cursor.u16() else {
@@ -372,21 +452,21 @@ mod tests {
         incoming.push(&update[..7]);
         assert!(incoming.take().expect("parsed").is_none());
         incoming.push(&update[7..]);
-        let Some(Message::Update(rects)) = incoming.take().expect("parsed") else {
+        let Some(Message::Rectangle(rect)) = incoming.take().expect("parsed") else {
             panic!("an update");
         };
-        assert_eq!(rects.len(), 1);
         let Rect::Raw {
             width,
             height,
             pixels,
             ..
-        } = &rects[0]
+        } = &rect
         else {
             panic!("raw");
         };
         assert_eq!((*width, *height), (2, 1));
         assert_eq!(pixels, &[9, 8, 7, 6, 5, 4, 3, 2]);
+        assert!(matches!(incoming.take().unwrap(), Some(Message::UpdateEnd)));
         assert!(incoming.take().expect("parsed").is_none());
     }
 
@@ -416,10 +496,10 @@ mod tests {
     fn decoded_pixels(body: &[u8], width: u16, height: u16) -> Vec<u8> {
         let mut incoming = Incoming::default();
         incoming.push(&hextile_message(width, height, body));
-        let Some(Message::Update(rects)) = incoming.take().expect("parsed") else {
+        let Some(Message::Rectangle(rect)) = incoming.take().expect("parsed") else {
             panic!("an update");
         };
-        let Rect::Raw { pixels, .. } = &rects[0] else {
+        let Rect::Raw { pixels, .. } = &rect else {
             panic!("raw pixels");
         };
         pixels.clone()
@@ -478,10 +558,9 @@ mod tests {
         incoming.push(&message[..message.len() - 2]);
         assert!(incoming.take().expect("parsed").is_none());
         incoming.push(&message[message.len() - 2..]);
-        let Some(Message::Update(rects)) = incoming.take().expect("parsed") else {
+        let Some(Message::Rectangle(Rect::Raw { .. })) = incoming.take().expect("parsed") else {
             panic!("an update");
         };
-        assert_eq!(rects.len(), 1);
     }
 
     #[test]
@@ -494,6 +573,76 @@ mod tests {
     }
 
     #[test]
+    fn fragmented_hextile_publishes_a_band_before_the_last_tile() {
+        // Eight solid 16x16 tiles make up the first 32x64 band. The next
+        // band inherits its background, then one subrect spans part of a tile.
+        let mut body = vec![2, 11, 22, 33, 44];
+        body.extend_from_slice(&[0; 7]);
+        body.extend_from_slice(&[0, 4 | 8, 9, 8, 7, 6, 1, 0, 0]);
+        let update = hextile_message(32, 65, &body);
+        let mut incoming = Incoming::default();
+        let mut bands = 0;
+        for (i, byte) in update.iter().enumerate() {
+            incoming.push(std::slice::from_ref(byte));
+            if let Some(Message::Rectangle(Rect::Raw {
+                y, height, pixels, ..
+            })) = incoming.take().unwrap()
+            {
+                if bands == 0 {
+                    assert!(i + 1 < update.len());
+                    assert_eq!((y, height), (0, 64));
+                    assert!(
+                        pixels
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .all(|pixel| *pixel == [11, 22, 33, 44])
+                    );
+                } else {
+                    assert_eq!((y, height), (64, 1));
+                    assert_eq!(&pixels[..4], &[11, 22, 33, 44]);
+                    assert_eq!(&pixels[64..68], &[9, 8, 7, 6]);
+                }
+                bands += 1;
+            }
+        }
+        assert_eq!(bands, 2);
+        assert!(matches!(incoming.take().unwrap(), Some(Message::UpdateEnd)));
+        assert!(incoming.take().unwrap().is_none());
+    }
+
+    #[test]
+    fn fragmented_raw_bands_and_nonzero_colour_map_stay_in_sync() {
+        let mut stream = vec![1, 0, 0, 2, 0, 1, 0, 1, 0, 2, 0, 3];
+        let mut update = hextile_message(1, 65, &[]);
+        update[12..16].copy_from_slice(&RAW.to_be_bytes());
+        stream.extend_from_slice(&update);
+        let pixels: Vec<_> = (0u8..=64).flat_map(|i| [i; 4]).collect();
+        stream.extend_from_slice(&pixels);
+        stream.push(2); // A bell immediately follows the update.
+        let mut incoming = Incoming::default();
+        let mut painted = Vec::new();
+        let mut events = Vec::new();
+        for part in stream.chunks(3) {
+            incoming.push(part);
+            while let Some(message) = incoming.take().unwrap() {
+                events.push(match message {
+                    Message::Ignored => "map",
+                    Message::Rectangle(Rect::Raw { pixels, .. }) => {
+                        painted.extend(pixels);
+                        "band"
+                    }
+                    Message::UpdateEnd => "end",
+                    Message::Bell => "bell",
+                    _ => panic!("unexpected event"),
+                });
+            }
+        }
+        assert_eq!(painted, pixels);
+        assert_eq!(events, ["map", "band", "band", "end", "bell"]);
+    }
+
+    #[test]
     fn last_rect_ends_the_update_early() {
         let mut update = vec![0u8, 0];
         update.extend_from_slice(&2u16.to_be_bytes());
@@ -501,9 +650,9 @@ mod tests {
         update.extend_from_slice(&(-224i32).to_be_bytes());
         let mut incoming = Incoming::default();
         incoming.push(&update);
-        let Some(Message::Update(rects)) = incoming.take().expect("parsed") else {
+        let Some(rect) = incoming.take().expect("parsed") else {
             panic!("an update");
         };
-        assert!(rects.is_empty());
+        assert!(matches!(rect, Message::UpdateEnd));
     }
 }

@@ -54,7 +54,11 @@ impl Control {
     /// Keeps a second handle to the socket so a cancel can unblock a read.
     pub(crate) fn attach(&self, socket: &TcpStream) {
         if let Ok(mut slot) = self.socket.lock() {
-            *slot = socket.try_clone().ok();
+            if self.cancelled() {
+                let _ = socket.shutdown(std::net::Shutdown::Both);
+            } else {
+                *slot = socket.try_clone().ok();
+            }
         }
     }
 

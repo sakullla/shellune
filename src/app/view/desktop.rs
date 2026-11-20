@@ -25,7 +25,8 @@ use crate::app::desktop::{
     ALT_LEFT, Availability, Buttons, CONTROL_LEFT, ClipboardEntry, ClipboardKind,
     DESKTOP_POLL_INTERVAL, DesktopLink, DesktopSurface, DesktopTarget, DesktopZoom, DriveProblem,
     InputQueue, KeyCodes, LinkEvent, LinkFailure, LinkState, NativeLink, Notice, SHIFT_LEFT,
-    availability, clamp_pan, content_rect, encryption_note, key_codes, to_remote_in,
+    availability, clamp_pan, content_rect, content_rect_in, encryption_note, key_codes,
+    to_remote_in,
 };
 use crate::app::desktop_clipboard;
 use crate::app::icons::{self, Icon};
@@ -53,22 +54,6 @@ struct CertificateQuestion {
     subject: String,
     issuer: String,
     fingerprint: String,
-}
-
-impl CertificateQuestion {
-    /// The one line the card says about what was presented.
-    fn summary(&self) -> String {
-        let subject = if self.subject.trim().is_empty() {
-            self.host.clone()
-        } else {
-            self.subject.clone()
-        };
-        if self.issuer.trim().is_empty() {
-            subject
-        } else {
-            format!("{subject} - {}", self.issuer)
-        }
-    }
 }
 
 /// Where a desktop pane is in its own terms (R17).
@@ -279,6 +264,8 @@ pub struct DesktopPane {
     /// attempt records the moment it starts, and a link that comes up in under
     /// [`crate::app::CONNECT_STATE_FLOOR`] never draws the card at all.
     connecting_since: Option<std::time::Instant>,
+    /// Last elapsed second displayed while waiting for a real connection.
+    wait_seconds: Option<u64>,
     /// The step the session stopped on, kept so the reason can name it.
     failed_stage: Option<DesktopStage>,
     /// How the picture is scaled into the pane (R18).
@@ -294,7 +281,11 @@ pub struct DesktopPane {
     /// The last remote pixel a motion reported, so movement inside one pixel is not
     /// sent twice.
     last_sent: Option<(u16, u16)>,
+    /// Fractional wheel steps from a precision touchpad.
+    wheel_remainder: f32,
     certificate: Option<CertificateQuestion>,
+    certificate_reject_focus: FocusHandle,
+    certificate_trust_focus: FocusHandle,
     /// What the protocol layer said about why it ended, kept verbatim.
     layer_reason: Option<String>,
     /// What the last start was handed to sign in with, for the tests that prove the
@@ -370,6 +361,13 @@ pub struct DesktopPane {
 impl DesktopPane {
     /// A pane for a target that has not been started.
     pub fn new(target: DesktopTarget, locale: Locale, cx: &mut Context<Self>) -> Self {
+        cx.on_release(|pane: &mut Self, cx| {
+            pane.close_link(cx);
+            if let Some(image) = pane.image.take() {
+                cx.drop_image(image, None);
+            }
+        })
+        .detach();
         Self {
             availability: availability(target.protocol()),
             target,
@@ -380,6 +378,7 @@ impl DesktopPane {
             phase: DesktopPhase::NotStarted,
             stage: DesktopStage::NotStarted,
             connecting_since: None,
+            wait_seconds: None,
             failed_stage: None,
             zoom: DesktopZoom::Fit,
             pan: (0.0, 0.0),
@@ -387,7 +386,10 @@ impl DesktopPane {
             viewport: None,
             asked_size: FIRST_DESKTOP_SIZE,
             last_sent: None,
+            wheel_remainder: 0.0,
             certificate: None,
+            certificate_reject_focus: cx.focus_handle(),
+            certificate_trust_focus: cx.focus_handle(),
             layer_reason: None,
             #[cfg(test)]
             started_password: None,
@@ -719,7 +721,7 @@ impl DesktopPane {
         self.connecting_since = Some(std::time::Instant::now());
         self.failed_stage = None;
         self.surface.reset();
-        self.image = None;
+        self.wait_seconds = None;
         // A new session has said nothing yet and has not seen this clipboard.
         self.shared.clear();
         self.read_generation = None;
@@ -739,9 +741,10 @@ impl DesktopPane {
         let was_live = matches!(self.phase, DesktopPhase::Live);
         // The step it stopped on is part of the reason: "signing in" and "showing
         // the desktop" are different problems, and the card says which one it was.
-        if !matches!(self.stage, DesktopStage::NotStarted) {
+        if !was_live && !matches!(self.stage, DesktopStage::NotStarted) {
             self.failed_stage = Some(self.stage);
         }
+        self.certificate = None;
         self.phase = DesktopPhase::Ended(failure.session_failure(reason, &target, was_live));
         self.connecting_since = None;
         self.polling = false;
@@ -749,19 +752,26 @@ impl DesktopPane {
         // keep a modifier down for a connection that is gone.
         self.release_input();
         self.flush_input();
-        if let Some(mut link) = self.link.take() {
-            link.shutdown();
-        }
+        self.close_link(cx);
         cx.notify();
     }
 
+    fn close_link(&mut self, cx: &gpui::App) {
+        if let Some(mut link) = self.link.take() {
+            // Wake pending network I/O now. A DNS lookup or TCP connect may still
+            // have to finish before the backend can join its worker.
+            link.shutdown();
+            cx.background_executor()
+                .spawn(async move { drop(link) })
+                .detach();
+        }
+    }
+
     /// Stops the session and releases what it owns. Safe to call twice.
-    pub fn stop(&mut self) {
+    pub fn stop(&mut self, cx: &gpui::App) {
         self.release_input();
         self.flush_input();
-        if let Some(mut link) = self.link.take() {
-            link.shutdown();
-        }
+        self.close_link(cx);
         self.polling = false;
         if !matches!(self.phase, DesktopPhase::Ended(_)) {
             self.phase = DesktopPhase::Ended(SessionFailure::ConnectionLost);
@@ -877,7 +887,19 @@ impl DesktopPane {
         let events = link.drain();
         // Input is flushed before the batch is applied so a key pressed during the
         // last interval reaches the peer in the same order the user produced it.
+        let had_problem = self.send_problem.is_some();
         self.flush_input();
+        if self.phase == DesktopPhase::Connecting
+            && let Some(elapsed) = self.connecting_since.map(|since| since.elapsed())
+            && elapsed >= crate::app::CONNECT_STATE_FLOOR
+            && self.wait_seconds != Some(elapsed.as_secs())
+        {
+            self.wait_seconds = Some(elapsed.as_secs());
+            cx.notify();
+        }
+        if events.is_empty() && had_problem != self.send_problem.is_some() {
+            cx.notify();
+        }
         if events.is_empty() {
             return self.phase.accepts_input() || matches!(self.phase, DesktopPhase::NotStarted);
         }
@@ -954,6 +976,7 @@ impl DesktopPane {
                     self.fail(LinkFailure::CertificateRejected, "", cx);
                     return false;
                 }
+                self.release_input();
                 self.certificate = Some(question);
                 self.stage = DesktopStage::VerifyingCertificate;
                 cx.notify();
@@ -1170,10 +1193,12 @@ impl DesktopPane {
     }
 
     /// The picture for the current canvas, rebuilt once per batch.
-    fn picture(&mut self) -> Option<Arc<RenderImage>> {
+    fn picture(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<Arc<RenderImage>> {
         let (width, height) = self.surface.size();
         if self.surface.is_empty() {
-            self.image = None;
+            if let Some(old) = self.image.take() {
+                cx.drop_image(old, Some(window));
+            }
             return None;
         }
         let changed = self.surface.take_dirty();
@@ -1187,7 +1212,10 @@ impl DesktopPane {
         };
         let frame = image::Frame::new(buffer);
         let picture = Arc::new(RenderImage::new(vec![frame]));
-        self.image = Some(picture.clone());
+        // Each RenderImage has its own atlas key, even when the dimensions match.
+        if let Some(old) = self.image.replace(picture.clone()) {
+            cx.drop_image(old, Some(window));
+        }
         self.image_size = (width, height);
         Some(picture)
     }
@@ -1240,6 +1268,7 @@ impl DesktopPane {
             self.flush_input();
         }
         self.last_sent = None;
+        self.wheel_remainder = 0.0;
     }
 
     /// The remote pixel under a window position, through the fit the picture is
@@ -1249,6 +1278,9 @@ impl DesktopPane {
     /// measured from the last painted frame, so entering or leaving the full screen
     /// changes the numbers the pointer is mapped through and nothing else.
     fn remote_point(&self, position: gpui::Point<Pixels>) -> Option<(u16, u16)> {
+        if self.certificate.is_some() {
+            return None;
+        }
         to_remote_in(
             self.viewport?,
             self.surface.size(),
@@ -1289,11 +1321,21 @@ impl DesktopPane {
         let buttons = self.input.held_buttons();
         self.input.push_pointer(x, y, buttons);
         self.last_sent = Some((x, y));
-        self.flush_input();
-        cx.notify();
+        // Hover motion can replace the previous position until the next poll.
+        // A drag carries its path, and a click or key flushes pending motion first.
+        if buttons.any_button() {
+            let had_problem = self.send_problem.is_some();
+            self.flush_input();
+            if self.send_problem.is_some() != had_problem {
+                cx.notify();
+            }
+        }
     }
 
     fn on_mouse_up(&mut self, button: MouseButton, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.certificate.is_some() {
+            return;
+        }
         let Some(bit) = pointer_button(button) else {
             return;
         };
@@ -1317,6 +1359,7 @@ impl DesktopPane {
             // Shift for, so the plain wheel keeps going to the remote application
             // as it always did (R18).
             let scale = 40.0;
+            self.wheel_remainder = 0.0;
             self.pan_by(-dx * scale, -dy * scale, cx);
             return;
         }
@@ -1325,31 +1368,61 @@ impl DesktopPane {
         let Some((x, y)) = self.remote_point(event.position) else {
             return;
         };
-        let steps = dy.abs().max(dx.abs()).round().clamp(-10.0, 10.0) as i32;
-        let step = if dy.abs() >= dx.abs() {
-            if dy < 0.0 {
-                Buttons::WHEEL_UP
-            } else {
-                Buttons::WHEEL_DOWN
-            }
-        } else if dx < 0.0 {
+        let delta = if dy.abs() >= dx.abs() { dy } else { dx };
+        if matches!(event.touch_phase, gpui::TouchPhase::Started)
+            || self.wheel_remainder * delta < 0.0
+        {
+            self.wheel_remainder = 0.0;
+        }
+        let total = self.wheel_remainder + delta;
+        let steps = total.trunc().clamp(-10.0, 10.0) as i32;
+        self.wheel_remainder = if matches!(event.touch_phase, gpui::TouchPhase::Ended) {
+            0.0
+        } else {
+            total.fract()
+        };
+        if steps == 0 {
+            return;
+        }
+        let step = if steps < 0 {
             Buttons::WHEEL_UP
         } else {
             Buttons::WHEEL_DOWN
         };
-        for _ in 0..steps.abs() {
+        for _ in 0..steps.unsigned_abs() {
             self.input.push_wheel(x, y, step);
         }
-        if steps == 0 {
-            return;
-        }
-        self.input.push_pointer(x, y, self.input.held_buttons());
+        self.last_sent = Some((x, y));
         self.flush_input();
         cx.notify();
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+        if self.certificate.is_some() {
+            if keystroke.key == "tab"
+                && !keystroke.modifiers.control
+                && !keystroke.modifiers.alt
+                && !keystroke.modifiers.platform
+            {
+                let trust = self.certificate_reject_focus.is_focused(window)
+                    || (!self.certificate_trust_focus.is_focused(window)
+                        && keystroke.modifiers.shift);
+                window.focus(if trust {
+                    &self.certificate_trust_focus
+                } else {
+                    &self.certificate_reject_focus
+                });
+                cx.stop_propagation();
+            } else if matches!(keystroke.key.as_str(), "enter" | "space" | "escape")
+                && keystroke.modifiers == Modifiers::default()
+            {
+                cx.stop_propagation();
+            }
+            // The pending decision owns input. Local accelerators may still bubble.
+            return;
+        }
+
         // A session that ended sends no keys, so Tab moves on to the banner above the
         // pane and its commands are reached without the pointer, as from a terminal
         // (ADR-6). A live session keeps Tab: it is the remote side's key.
@@ -1449,7 +1522,16 @@ impl DesktopPane {
         }
     }
 
-    fn on_key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
+    fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.certificate.is_some() {
+            if event.keystroke.key == "escape" && event.keystroke.modifiers == Modifiers::default()
+            {
+                window.focus(&self.focus);
+                self.answer_certificate(false, cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
         let Some(codes) = key_codes(&event.keystroke.key) else {
             return;
         };
@@ -1478,7 +1560,16 @@ impl DesktopPane {
             DesktopPhase::Connecting => (
                 Tone::Neutral,
                 self.stage.headline(strings).to_owned(),
-                self.target.target(),
+                match self.wait_seconds {
+                    Some(seconds) => format!(
+                        "{}  ·  {} {}:{:02}",
+                        self.target.target(),
+                        strings.desktop_wait_time,
+                        seconds / 60,
+                        seconds % 60
+                    ),
+                    None => self.target.target(),
+                },
             ),
             DesktopPhase::Live => (
                 Tone::Positive,
@@ -1691,9 +1782,14 @@ impl DesktopPane {
             )
             .child(
                 components::compact_button(strings.desktop_zoom_out, Variant::Ghost, metrics)
+                    .when(self.zoom.zoomed_out() == self.zoom, |button| {
+                        button.opacity(0.45).cursor_default()
+                    })
                     .id(SharedString::from("desktop.zoom.out"))
                     .debug_selector(|| "desktop.zoom.out".to_owned())
-                    .on_click(cx.listener(|this, _event, _window, cx| this.zoom_out(cx))),
+                    .when(self.zoom.zoomed_out() != self.zoom, |button| {
+                        button.on_click(cx.listener(|this, _event, _window, cx| this.zoom_out(cx)))
+                    }),
             )
             // The readout is the switch between the two steps it names: pressing
             // "Fit" asks for 100% and pressing "100%" asks to fit the window again.
@@ -1704,13 +1800,23 @@ impl DesktopPane {
                     .justify_center()
                     .id(SharedString::from("desktop.zoom.fit"))
                     .debug_selector(|| "desktop.zoom.fit".to_owned())
+                    .tooltip(components::tooltip(if self.zoom.is_fit() {
+                        "100%"
+                    } else {
+                        strings.desktop_zoom_fit
+                    }))
                     .on_click(cx.listener(|this, _event, _window, cx| this.zoom_toggle(cx))),
             )
             .child(
                 components::compact_button(strings.desktop_zoom_in, Variant::Ghost, metrics)
+                    .when(self.zoom.zoomed_in() == self.zoom, |button| {
+                        button.opacity(0.45).cursor_default()
+                    })
                     .id(SharedString::from("desktop.zoom.in"))
                     .debug_selector(|| "desktop.zoom.in".to_owned())
-                    .on_click(cx.listener(|this, _event, _window, cx| this.zoom_in(cx))),
+                    .when(self.zoom.zoomed_in() != self.zoom, |button| {
+                        button.on_click(cx.listener(|this, _event, _window, cx| this.zoom_in(cx)))
+                    }),
             )
             .child(components::divider_vertical(metrics).mx(metrics.scale(spacing::HAIRLINE)))
             .child(
@@ -1729,6 +1835,7 @@ impl DesktopPane {
                 .text_size(metrics.label_size())
                 .id(SharedString::from("desktop.fullscreen"))
                 .debug_selector(|| "desktop.fullscreen".to_owned())
+                .tooltip(components::tooltip(format!("{fullscreen} (F11)")))
                 .on_click(cx.listener(|this, _event, window, cx| {
                     this.toggle_fullscreen(window, cx);
                 })),
@@ -1740,6 +1847,7 @@ impl DesktopPane {
                 components::icon_only_button(Icon::ChevronUp, metrics)
                     .id(SharedString::from("desktop.controls.collapse"))
                     .debug_selector(|| "desktop.controls.collapse".to_owned())
+                    .tooltip(components::tooltip(strings.desktop_hide_controls))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.set_controls_collapsed(true, cx);
                     })),
@@ -1778,6 +1886,9 @@ impl DesktopPane {
                 components::icon_only_button(Icon::ChevronDown, metrics)
                     .id(SharedString::from("desktop.controls.expand"))
                     .debug_selector(|| "desktop.controls.expand".to_owned())
+                    .tooltip(components::tooltip(
+                        self.locale.strings().desktop_show_controls,
+                    ))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.set_controls_collapsed(false, cx);
                     })),
@@ -1793,29 +1904,70 @@ impl DesktopPane {
         let Some(question) = &self.certificate else {
             return div();
         };
-        let fingerprint = question.fingerprint.clone();
-        // A question about the server's identity: the same status card the picture's
-        // place shows, in the warning tone, with the answers at its foot (ADR-7).
+        let label = |text| {
+            div()
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .child(text)
+        };
+        let mut details = div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .gap(metrics.scale(spacing::TIGHT));
+        for (field, value) in [
+            (strings.desktop_certificate_subject, &question.subject),
+            (strings.desktop_certificate_issuer, &question.issuer),
+        ] {
+            if !value.trim().is_empty() {
+                details = details.child(
+                    div()
+                        .child(label(field))
+                        .child(SharedString::from(value.clone())),
+                );
+            }
+        }
+        if !question.fingerprint.is_empty() {
+            let octets: Vec<_> = question.fingerprint.split(':').collect();
+            details = details.child(
+                div().child(label(strings.trust_fingerprint)).child(
+                    components::copy_on_click(
+                        div()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .font_family(crate::app::terminal::monospace_family())
+                            .debug_selector(|| "desktop.certificate.fingerprint".to_owned()),
+                        question.fingerprint.clone(),
+                    )
+                    .children(octets.chunks(16).map(|row| {
+                        div().child(
+                            row.chunks(4)
+                                .map(|group| group.join(":"))
+                                .collect::<Vec<_>>()
+                                .join("  "),
+                        )
+                    })),
+                ),
+            );
+        }
         components::status_card(
             Tone::Warning,
             icons::icon(Icon::Lock, metrics.icon_size(), Tone::Warning.text()).into_any_element(),
-            div().child(SharedString::from(question.summary())),
-            // The fingerprint is what the decision is made on, so it is drawn whole -
-            // wrapping, never cut to an ellipsis - in the monospace face, one click from
-            // the clipboard.
-            Some(
-                components::copy_on_click(
-                    div()
-                        .min_w_0()
-                        .font_family(crate::app::terminal::monospace_family())
-                        .debug_selector(|| "desktop.certificate.fingerprint".to_owned()),
-                    fingerprint.clone(),
-                )
-                .child(SharedString::from(fingerprint)),
-            ),
+            div().child(strings.desktop_certificate_title),
+            Some(div().child(SharedString::from(if question.host.is_empty() {
+                self.target.target()
+            } else {
+                question.host.clone()
+            }))),
             metrics,
         )
         .debug_selector(|| "desktop.certificate".to_owned())
+        .child(
+            details
+                .text_size(metrics.label_size())
+                .text_color(theme::swatch(palette::TEXT_PRIMARY)),
+        )
         .child(
             div()
                 .flex()
@@ -1825,12 +1977,20 @@ impl DesktopPane {
                 .child(
                     components::compact_button(
                         strings.desktop_certificate_reject,
-                        Variant::Danger,
+                        Variant::Secondary,
                         metrics,
                     )
                     .id(SharedString::from("desktop.certificate.reject"))
+                    .track_focus(&self.certificate_reject_focus)
+                    .focus(|style| {
+                        style
+                            .border_2()
+                            .border_color(theme::swatch(palette::FOCUS_RING))
+                    })
                     .debug_selector(|| "desktop.certificate.reject".to_owned())
-                    .on_click(cx.listener(|this, _event, _window, cx| {
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        cx.stop_propagation();
+                        window.focus(&this.focus);
                         this.answer_certificate(false, cx);
                     })),
                 )
@@ -1841,8 +2001,16 @@ impl DesktopPane {
                         metrics,
                     )
                     .id(SharedString::from("desktop.certificate.trust"))
+                    .track_focus(&self.certificate_trust_focus)
+                    .focus(|style| {
+                        style
+                            .border_2()
+                            .border_color(theme::swatch(palette::FOCUS_RING))
+                    })
                     .debug_selector(|| "desktop.certificate.trust".to_owned())
-                    .on_click(cx.listener(|this, _event, _window, cx| {
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        cx.stop_propagation();
+                        window.focus(&this.focus);
                         this.answer_certificate(true, cx);
                     })),
                 ),
@@ -1931,7 +2099,7 @@ impl Render for DesktopPane {
         {
             self.flush_input();
         }
-        let picture = self.picture();
+        let picture = self.picture(window, cx);
         // Whether the picture is what the body shows. The status card below stands in
         // for it while it is absent, and the warning strip belongs over the picture
         // only: drawing both would say the same thing twice before the first frame.
@@ -2002,8 +2170,8 @@ impl Render for DesktopPane {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key_down(event, window, cx);
             }))
-            .on_key_up(cx.listener(|this, event: &KeyUpEvent, _window, cx| {
-                this.on_key_up(event, cx);
+            .on_key_up(cx.listener(|this, event: &KeyUpEvent, window, cx| {
+                this.on_key_up(event, window, cx);
             }))
             .on_modifiers_changed(cx.listener(
                 |this, event: &ModifiersChangedEvent, _window, cx| {
@@ -2030,84 +2198,32 @@ impl Render for DesktopPane {
                 // At the Fit step that fit is GPUI's own Contain over the whole
                 // pane; at a zoom step the picture is drawn at the size the
                 // geometry says and moved by the pan, and the pane crops it.
-                let surface = match self.zoom {
-                    DesktopZoom::Fit => {
-                        // The fitted rectangle of the picture inside the surface,
-                        // measured on the last frame. It is given to the image
-                        // explicitly instead of letting the element lay itself out:
-                        // a replaced element here is as wide as the surface and takes
-                        // its height from its own aspect ratio, so a remote screen
-                        // taller than the surface (800x600 in a wide pane) makes a box
-                        // that runs past the bottom and is cut by the pane - the last
-                        // rows of the picture, the remote taskbar among them, never
-                        // reach the window. The explicit box is exactly the contain
-                        // fit, so the whole picture is inside the pane at every
-                        // aspect.
-                        let fitted = self
-                            .viewport
-                            .map(|viewport| content_rect(viewport, self.surface.size()).size);
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .relative()
-                            .debug_selector(|| "desktop.surface".to_owned())
-                            .child(match fitted {
-                                Some(fitted) => div()
-                                    .absolute()
-                                    .inset_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        div()
-                                            .w(fitted.width)
-                                            .h(fitted.height)
-                                            .debug_selector(|| "desktop.picture".to_owned())
-                                            .child(img(picture).size_full()),
-                                    )
-                                    .into_any_element(),
-                                // The first frame, before the surface has been
-                                // measured: the element's own contain fit stands in
-                                // for that one frame.
-                                None => img(picture)
-                                    .size_full()
-                                    .object_fit(gpui::ObjectFit::Contain)
-                                    .into_any_element(),
-                            })
-                    }
-                    DesktopZoom::Percent(percent) => {
-                        let (width, height) = self.surface.size();
-                        let factor = f32::from(percent) / 100.0;
-                        let (width, height) = (width as f32 * factor, height as f32 * factor);
-                        let (pan_x, pan_y) = self.pan;
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .relative()
-                            .overflow_hidden()
-                            .debug_selector(|| "desktop.surface".to_owned())
-                            .child(
-                                // Centred, then moved by the pan: the same two
-                                // numbers content_rect_in gives the pointer, so a
-                                // click lands on the pixel it is over.
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        div()
-                                            .ml(px(pan_x))
-                                            .mt(px(pan_y))
-                                            .w(px(width))
-                                            .h(px(height))
-                                            .debug_selector(|| "desktop.picture".to_owned())
-                                            .child(img(picture).size_full()),
-                                    ),
-                            )
-                    }
+                // Share the fitted and panned rectangle with pointer hit testing.
+                // Bounds use window coordinates; the image is placed in its pane.
+                let image = if let Some(viewport) = self.viewport {
+                    let rect = content_rect_in(viewport, self.surface.size(), self.zoom, self.pan);
+                    div()
+                        .absolute()
+                        .left(rect.origin.x - viewport.origin.x)
+                        .top(rect.origin.y - viewport.origin.y)
+                        .w(rect.size.width)
+                        .h(rect.size.height)
+                        .debug_selector(|| "desktop.picture".to_owned())
+                        .child(img(picture).size_full())
+                        .into_any_element()
+                } else {
+                    img(picture)
+                        .size_full()
+                        .object_fit(gpui::ObjectFit::Contain)
+                        .into_any_element()
                 };
+                let surface = div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .overflow_hidden()
+                    .debug_selector(|| "desktop.surface".to_owned())
+                    .child(image);
                 // The picture is the remote screen: over it the pointer the user
                 // sees should be the one the remote side draws, not a second local
                 // arrow beside it. The surface carries that choice; the bar and the
@@ -2122,7 +2238,7 @@ impl Render for DesktopPane {
                     && self
                         .connecting_since
                         .is_some_and(|since| since.elapsed() < crate::app::CONNECT_STATE_FLOOR);
-                body = body.child(if early {
+                body = body.child(if early || self.certificate.is_some() {
                     div().flex_1()
                 } else {
                     div()
@@ -2149,7 +2265,18 @@ impl Render for DesktopPane {
                     .items_center()
                     .justify_center()
                     .px(metrics.scale(spacing::LOOSE))
-                    .child(components::status_card_slot(card, metrics)),
+                    .child(
+                        div()
+                            .id("desktop.certificate.scroll")
+                            .min_h_0()
+                            .max_h_full()
+                            .w_full()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .child(components::status_card_slot(card, metrics)),
+                    ),
                 CursorStyle::Arrow,
             ));
         }
@@ -2174,7 +2301,7 @@ impl Render for DesktopPane {
         // nothing drawn over the picture - the warning strip, the certificate card -
         // sits between the pointer and a control. A folded bar is not drawn at all;
         // only its handle is, and only while the pointer is over the picture.
-        if !matches!(self.phase, DesktopPhase::NotStarted) {
+        if has_picture {
             if self.controls_collapsed {
                 if self.controls_shown() {
                     body = body.child(self.expand_handle(metrics, cx));

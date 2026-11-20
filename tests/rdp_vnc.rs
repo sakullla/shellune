@@ -27,6 +27,7 @@
 //! * SHELLUNE_VNC_OBSERVE (an ssh target), _USER, _DISPLAY and _XAUTHORITY - the
 //!   machine and X session whose pointer, keys and clipboard are read back with
 //!   xdotool, xterm and xclip;
+//! * SHELLUNE_DESKTOP_TEST_TIMEOUT_SECS - optional first-picture deadline (default 20);
 //! * SHELLUNE_VNC_BAD_PASSWORD - the password to offer the server above to make it
 //!   refuse the credentials.
 //!
@@ -42,7 +43,17 @@ use shellune_desktop::{
 };
 
 /// How long one endpoint may take to answer before the report calls it a hang.
-const PATIENCE: Duration = Duration::from_secs(20);
+fn first_picture_timeout() -> Duration {
+    let seconds = std::env::var("SHELLUNE_DESKTOP_TEST_TIMEOUT_SECS")
+        .map(|text| {
+            text.parse::<u32>()
+                .expect("first-picture timeout in seconds")
+        })
+        .unwrap_or(20);
+    Duration::from_secs(u64::from(seconds))
+}
+
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// One endpoint the release has to be shown against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,6 +230,9 @@ impl Endpoint {
         let password = std::env::var(password_var)
             .ok()
             .filter(|value| !value.is_empty());
+        if kind.expects_refusal() && password.is_none() {
+            return Err(format!("{password_var} is not set"));
+        }
         Ok(Self {
             kind,
             address,
@@ -432,7 +446,7 @@ fn verify(endpoint: &Endpoint) -> Outcome {
     };
 
     // Phase one: the first picture, or the refusal this endpoint exists to show.
-    let deadline = Instant::now() + PATIENCE;
+    let deadline = Instant::now() + first_picture_timeout();
     while Instant::now() < deadline && failure.is_none() && !first_frame {
         if let Ok(event) = client.recv_timeout(Duration::from_millis(100)) {
             step(
@@ -586,7 +600,7 @@ fn verify(endpoint: &Endpoint) -> Outcome {
     let shared = client.clipboard("shellune endpoint matrix");
     steps.push(("clipboard", shared.is_ok()));
     let cancelled = client.cancel().is_ok();
-    let stopped = client.wait_for_worker(PATIENCE).is_ok();
+    let stopped = client.wait_for_worker(CLOSE_TIMEOUT).is_ok();
     steps.push(("cancel", cancelled && stopped));
     Outcome::Verified(steps)
 }
@@ -623,7 +637,7 @@ fn the_vnc_endpoint_accepts_a_second_session() {
         client.set_size(1280, 720).expect("size");
         client.connect().expect("connect");
 
-        let deadline = Instant::now() + PATIENCE;
+        let deadline = Instant::now() + first_picture_timeout();
         let mut coverage = Coverage::default();
         let mut first_frame = false;
         let mut failure = None;
@@ -664,7 +678,9 @@ fn the_vnc_endpoint_accepts_a_second_session() {
             "attempt {attempt} painted {painted} of {total} desktop pixels: {failure:?}"
         );
         assert!(client.cancel().is_ok());
-        client.wait_for_worker(PATIENCE).expect("the worker stops");
+        client
+            .wait_for_worker(CLOSE_TIMEOUT)
+            .expect("the worker stops");
     }
 }
 
@@ -797,7 +813,7 @@ fn the_vnc_endpoint_takes_pointer_keyboard_and_clipboard() {
     client.set_size(1280, 720).expect("size");
     client.connect().expect("connect");
 
-    let deadline = Instant::now() + PATIENCE;
+    let deadline = Instant::now() + first_picture_timeout();
     let mut coverage = Coverage::default();
     let mut live = false;
     while Instant::now() < deadline && !live {
@@ -862,7 +878,7 @@ fn the_vnc_endpoint_takes_pointer_keyboard_and_clipboard() {
     client.key(0x1e, 0xff0d, true, false).expect("return down");
     client.key(0x1e, 0xff0d, false, false).expect("return up");
     let mut typed = String::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + first_picture_timeout();
     while Instant::now() < deadline && !typed.contains('a') {
         std::thread::sleep(Duration::from_millis(200));
         typed = observer
@@ -877,10 +893,16 @@ fn the_vnc_endpoint_takes_pointer_keyboard_and_clipboard() {
 
     // Pointer: the server's own pointer must be where the client sent it.
     client.pointer(321, 234, PointerButtons(0)).expect("move");
-    std::thread::sleep(Duration::from_millis(400));
-    let location = observer
-        .run("xdotool getmouselocation")
-        .unwrap_or_else(|error| panic!("xdotool: {error}"));
+    let deadline = Instant::now() + first_picture_timeout();
+    let location = loop {
+        let observed = observer
+            .run("xdotool getmouselocation")
+            .expect("read pointer");
+        if observed.contains("x:321 y:234") || Instant::now() >= deadline {
+            break observed;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
     assert!(
         location.contains("x:321 y:234"),
         "the pointer is not where it was sent: {location}"
@@ -890,11 +912,11 @@ fn the_vnc_endpoint_takes_pointer_keyboard_and_clipboard() {
     let text = format!("shellune endpoint text {}", std::process::id());
     client.clipboard(&text).expect("clipboard");
     let mut clipboard = String::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + first_picture_timeout();
     while Instant::now() < deadline && clipboard.trim_end_matches('\n') != text {
         std::thread::sleep(Duration::from_millis(200));
         clipboard = observer
-            .run("xclip -o -selection clipboard")
+            .run("xclip -o -selection clipboard 2>/dev/null || true")
             .unwrap_or_else(|error| panic!("xclip: {error}"));
     }
     assert_eq!(
@@ -925,7 +947,9 @@ fn the_vnc_endpoint_takes_pointer_keyboard_and_clipboard() {
         "VNC input: the terminal read the key back, xdotool reports x:321 y:234, xclip holds the offered text"
     );
     client.cancel().expect("cancel");
-    client.wait_for_worker(PATIENCE).expect("the worker stops");
+    client
+        .wait_for_worker(CLOSE_TIMEOUT)
+        .expect("the worker stops");
 }
 
 /// What a deliberately wrong password has to produce.

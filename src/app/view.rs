@@ -4699,8 +4699,20 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) {
         self.forget_reconnect_screen(tag.session);
-        cx.observe(&pane, |view, pane, cx| view.sync_desktop(pane, cx))
-            .detach();
+        // Frame and hover updates belong to the pane. Only these changes affect
+        // the enclosing tabs, session record or full-screen layout.
+        let shell_state = |pane: &desktop::DesktopPane| {
+            (pane.phase().clone(), pane.stage(), pane.is_fullscreen())
+        };
+        let mut previous = shell_state(pane.read(cx));
+        cx.observe(&pane, move |view, pane, cx| {
+            let current = shell_state(pane.read(cx));
+            if current != previous {
+                previous = current;
+                view.sync_desktop(pane, cx);
+            }
+        })
+        .detach();
         self.panes.push(OpenPane {
             tag,
             content: PaneContent::Desktop(pane.clone()),
@@ -5221,7 +5233,7 @@ impl ShelluneView {
                 // The surface is stopped before its handle is dropped, so the
                 // protocol worker is told and nothing keeps polling (R17).
                 let pane = pane.clone();
-                pane.update(cx, |pane, _cx| pane.stop());
+                pane.update(cx, |pane, cx| pane.stop(cx));
             }
         }
         // The pane has this moment left the tree, so a sentence kept inside it would
@@ -5446,7 +5458,7 @@ impl ShelluneView {
         let mut closed = None;
         for open in self.panes.iter().filter(|open| open.tag.session == id) {
             match &open.content {
-                PaneContent::Desktop(pane) => pane.update(cx, |pane, _cx| pane.stop()),
+                PaneContent::Desktop(pane) => pane.update(cx, |pane, cx| pane.stop(cx)),
                 // A serial pane keeps its tab after the device goes away, so its port is
                 // released here and not at the close (R17, R21): until it is, the writer
                 // thread and the queue of bytes waiting for the device outlive the

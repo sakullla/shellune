@@ -28190,6 +28190,45 @@ async fn the_zoom_control_scales_the_picture_and_the_pointer_follows_it(cx: &mut
     );
     cx.simulate_mouse_up(centre, MouseButton::Left, Modifiers::default());
 
+    // Pixel-sized touchpad deltas combine into one remote wheel step.
+    for _ in 0..4 {
+        cx.simulate_event(ScrollWheelEvent {
+            position: centre,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-10.0))),
+            ..Default::default()
+        });
+    }
+    let wheel_presses = log
+        .lock()
+        .unwrap()
+        .inputs
+        .iter()
+        .filter(|input| {
+            matches!(input,
+                DesktopInput::Pointer { buttons, .. } if buttons.contains(Buttons::WHEEL_UP)
+            )
+        })
+        .count();
+    assert_eq!(wheel_presses, 1);
+
+    // A panned picture must still put the reported pixel directly under the pointer.
+    cx.simulate_event(ScrollWheelEvent {
+        position: centre,
+        delta: ScrollDelta::Pixels(point(px(0.0), px(-80.0))),
+        modifiers: Modifiers {
+            shift: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    let panned = bounds_of(cx, "desktop.picture");
+    assert!((panned.origin.y - drawn.origin.y - px(80.0)).abs() < px(1.0));
+    cx.simulate_mouse_down(centre, MouseButton::Left, Modifiers::default());
+    let (x, y, _) = last_pointer(&log);
+    assert_eq!((x, y), (800, 410));
+    cx.simulate_mouse_up(centre, MouseButton::Left, Modifiers::default());
+
     // Smaller steps back to the fit, and the fit is the whole desktop again.
     let smaller = bounds_of(cx, "desktop.zoom.out").center();
     for _ in 0..crate::app::desktop::DesktopZoom::LADDER.len() {
@@ -28541,6 +28580,38 @@ async fn the_folded_handle_stays_drawn_and_pressable_with_the_pointer_on_it(
 
     click(cx, "desktop.controls.expand");
     assert!(!state(cx).0, "the handle under the pointer unfolds the bar");
+}
+
+#[gpui::test]
+async fn a_certificate_can_be_reviewed_with_the_keyboard(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, log) = ScriptedLink::new(vec![LinkEvent::Certificate {
+        request_id: 7,
+        host: "rdp.example.com".into(),
+        subject: "CN=rdp".into(),
+        issuer: String::new(),
+        fingerprint: "AA:BB".into(),
+        flags: 0,
+    }]);
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+    cx.update(|window, cx| {
+        window.focus(
+            view.read(cx)
+                .desktop_of(id)
+                .unwrap()
+                .read(cx)
+                .focus_handle(),
+        );
+    });
+    cx.simulate_keystrokes("a enter");
+    release_key(cx, "enter");
+    assert!(log.lock().unwrap().answers.is_empty());
+    assert_eq!(sent(&log), [], "input while reviewing the certificate");
+    cx.simulate_keystrokes("tab tab enter");
+    release_key(cx, "enter");
+    let log = log.lock().unwrap();
+    assert_eq!(log.answers, [(7, true)]);
+    assert_eq!(log.inputs, [], "input while confirming the certificate");
 }
 
 #[gpui::test]

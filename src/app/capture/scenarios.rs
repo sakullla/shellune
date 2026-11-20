@@ -910,7 +910,7 @@ fn show_desktop_certificate(
             host: "build-monitor.example.internal".to_owned(),
             subject: "CN=build-monitor.example.internal".to_owned(),
             issuer: "CN=Example Internal CA".to_owned(),
-            fingerprint: "3F:9A:61:0C:D2:7E:44:B8:19:A5:C3:70:5E:2D:88:F1:06:BC:4A:93".to_owned(),
+            fingerprint: "3F:9A:61:0C:D2:7E:44:B8:19:A5:C3:70:5E:2D:88:F1:06:BC:4A:93:72:D1:15:EA:90:32:7C:84:0B:A2:6F:38".to_owned(),
             flags: 0,
         },
     ];

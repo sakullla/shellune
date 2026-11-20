@@ -775,6 +775,7 @@ impl InputQueue {
 
     /// Queues one wheel step at a position, keeping the buttons that are held.
     pub fn push_wheel(&mut self, x: u16, y: u16, step: Buttons) {
+        self.position = (x, y);
         self.motion_tail = false;
         self.queued.push_back(DesktopInput::Pointer {
             x,
