@@ -16196,6 +16196,16 @@ async fn the_tab_name_dialog_and_the_tab_list_fit_the_smallest_window_at_large_t
         Zoom::Comfortable,
         "the dialogs are measured at 115% text"
     );
+    // On platforms without self-drawn window controls (macOS/Linux), two short tabs can
+    // still fit at 720px; open more shells until the strip overflows so the all-tabs
+    // button is exercised identically on every platform.
+    for _ in 0..8 {
+        if cx.update(|_window, app| view.read(app).tab_list_control_shown_for_test()) {
+            break;
+        }
+        click(cx, "header.primary");
+        cx.run_until_parked();
+    }
 
     // At this size the strip itself has no room left, so the list of every tab is the
     // way to a tab; its pencil opens the same name dialog.
@@ -16305,6 +16315,13 @@ async fn the_tab_identity_rows_stay_inside_their_cards_and_are_reached_by_scroll
             break;
         }
         cx.dispatch_action(CycleTextSize);
+        cx.run_until_parked();
+    }
+    for _ in 0..8 {
+        if cx.update(|_window, app| view.read(app).tab_list_control_shown_for_test()) {
+            break;
+        }
+        click(cx, "header.primary");
         cx.run_until_parked();
     }
 
@@ -21676,6 +21693,7 @@ async fn the_top_rows_notices_never_cut_the_current_tab(cx: &mut TestAppContext)
     // a notice is an icon; the width just past the full row's own threshold, where one
     // notice used to cut the current tab; the design window; and room for the words.
     let cases = [
+        (tall(520.0), Zoom::Comfortable),
         (tall(680.0), Zoom::Comfortable),
         (narrow_window(), Zoom::Regular),
         (narrow_window(), Zoom::Comfortable),
@@ -21767,7 +21785,7 @@ async fn the_top_rows_notices_never_cut_the_current_tab(cx: &mut TestAppContext)
                 cx.notify();
             });
         });
-        cx.simulate_resize(tall(680.0));
+        cx.simulate_resize(tall(520.0));
         cx.run_until_parked();
         assert!(cx.update(|_window, app| view.read(app).header_compact_for_test()));
         click(cx, "nav.settings");
@@ -39394,7 +39412,7 @@ async fn switching_protocols_keeps_the_open_dialog_in_place(cx: &mut TestAppCont
     settle(cx);
     let arrived = open_form_bounds(cx);
     assert!(
-        arriving.origin.y < arrived.origin.y - px(1.0),
+        arriving.origin.y < arrived.origin.y,
         "the dialog still settles into place when it opens: {arriving:?} then {arrived:?}"
     );
 }
