@@ -18285,7 +18285,9 @@ fn light_status_and_accent_pairs_are_readable() {
 
 #[test]
 fn the_light_terminal_keeps_its_colours_readable() {
-    let background = 0xfcfcfd;
+    let pack = |color: shellune_terminal::Rgb| {
+        u32::from(color.r) << 16 | u32::from(color.g) << 8 | u32::from(color.b)
+    };
     let lookup = |dark: u32| {
         theme::light::TERMINAL
             .iter()
@@ -18293,13 +18295,12 @@ fn the_light_terminal_keeps_its_colours_readable() {
             .map(|(_, to)| *to)
             .expect("a terminal colour has a light value")
     };
-    assert_eq!(lookup(0x0b0c10), background);
-    let foreground = lookup(0xe6e9f0);
+    let background = lookup(pack(shellune_terminal::palette::BACKGROUND));
+    let foreground = lookup(pack(shellune_terminal::palette::FOREGROUND));
     assert!(theme::contrast::ratio(foreground, background) >= BODY_CONTRAST_FLOOR);
     // Red, green, yellow, blue, magenta and cyan are text colours in every shell.
     for (index, color) in shellune_terminal::palette::ANSI[1..7].iter().enumerate() {
-        let dark = u32::from(color.r) << 16 | u32::from(color.g) << 8 | u32::from(color.b);
-        let ratio = theme::contrast::ratio(lookup(dark), background);
+        let ratio = theme::contrast::ratio(lookup(pack(*color)), background);
         assert!(
             ratio >= BODY_CONTRAST_FLOOR,
             "ANSI {} in the light terminal is {ratio:.2}:1",
