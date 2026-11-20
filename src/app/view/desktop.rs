@@ -12,11 +12,12 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    Bounds, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, RenderImage,
-    ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Window, div, img, px,
+    Bounds, Context, CursorStyle, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Window, div,
+    img, px,
 };
-use shellune_core::SessionFailure;
+use shellune_core::{ProtocolKind, SessionFailure};
 
 use crate::app::components::{self, Variant};
 use crate::app::copy::{Locale, Strings};
@@ -305,6 +306,17 @@ pub struct DesktopPane {
     /// colours are not ours, and the corner it sits in is where a remote window keeps
     /// its own controls.
     controls_hovered: bool,
+    /// Whether the pointer is over the bar or its handle, which is drawn above the
+    /// picture and occludes it.
+    ///
+    /// The bar has to block the pointer so a press on a control does not also
+    /// reach the remote screen, and an occluding layer is the one place the body
+    /// stops being hovered: the pointer moving onto the bar would take the bar
+    /// away in the same frame it arrived. Tracking the bar's own hover and
+    /// OR-ing it with the body's is what keeps it under the pointer while the
+    /// pointer is on it - including the folded handle, which is drawn only while
+    /// one of the two says the pointer is here.
+    bar_hovered: bool,
     /// Whether the bar over the picture is folded away on purpose.
     ///
     /// The fold is the pane's own memory: another frame, a redraw and a step of the
@@ -384,6 +396,7 @@ impl DesktopPane {
             // A shot of a session is a shot of its controls too, and the capture runs
             // with no pointer over the picture: there the bar starts shown.
             controls_hovered: cfg!(feature = "ui-capture"),
+            bar_hovered: false,
             controls_collapsed: false,
             #[cfg(test)]
             controls_frames: 0,
@@ -526,6 +539,10 @@ impl DesktopPane {
     pub fn set_controls_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
         if self.controls_collapsed != collapsed {
             self.controls_collapsed = collapsed;
+            // The bar's own hover was recorded while it was drawn; folding it away
+            // takes that element out of the tree, and a stale hover would keep the
+            // handle on screen after the pointer had left the picture.
+            self.bar_hovered = false;
             cx.notify();
         }
     }
@@ -774,6 +791,61 @@ impl DesktopPane {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_live(&self) -> bool {
         matches!(self.phase, DesktopPhase::Live)
+    }
+
+    /// The pointer a surface shows while the picture is what is under it.
+    ///
+    /// A VNC frame carries the server's own pointer: this client does not ask
+    /// for the Cursor pseudo-encoding, so the server draws the pointer into the
+    /// framebuffer and a second, local arrow over it would be two pointers on
+    /// one screen. While such a session is live the surface therefore asks for
+    /// [`CursorStyle::None`]; before and after it, and whenever the pane is not
+    /// a picture, it asks for the ordinary arrow so nothing else in the window
+    /// loses its pointer.
+    ///
+    /// RDP is the exception, and it is why this is not simply "hide while live":
+    /// its pointer travels in a pointer PDU of its own, which this build does
+    /// not decode yet, so the frames contain no pointer at all. Hiding the local
+    /// one there would leave the picture with no cursor, which is worse than a
+    /// pointer the server would also draw; the arrow stays until the pointer
+    /// update is drawn.
+    fn surface_cursor(&self) -> CursorStyle {
+        if matches!(self.phase, DesktopPhase::Live) && self.target.protocol() == ProtocolKind::Vnc {
+            CursorStyle::None
+        } else {
+            CursorStyle::Arrow
+        }
+    }
+
+    /// What the surface asks the window to show, for the tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn surface_cursor_for_test(&self) -> CursorStyle {
+        self.surface_cursor()
+    }
+
+    /// Whether the controls over the picture are drawn.
+    ///
+    /// The pointer may be over the picture itself or over the bar that sits on
+    /// it: the bar occludes the body's hitbox, so its own hover has to count, or
+    /// the pointer would hide the bar the moment it reached it.
+    fn controls_shown(&self) -> bool {
+        self.controls_hovered || self.bar_hovered
+    }
+
+    /// Whether the bar is drawn, for the tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn controls_shown_for_test(&self) -> bool {
+        self.controls_shown()
+    }
+
+    /// Records the pointer arriving on or leaving the bar itself.
+    fn set_bar_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        if self.bar_hovered != hovered {
+            self.bar_hovered = hovered;
+            cx.notify();
+        }
     }
 
     /// Applies whatever the link has waiting, for a test or a capture.
@@ -1538,7 +1610,7 @@ impl DesktopPane {
         // screen whose colours are not ours, so it carries the floating layer's
         // shadow to stay apart from it (R6). It stands at the picture's foot, so the
         // zoom controls at its head stay whole in a narrow window (ADR-7).
-        Some(
+        Some(cursor_over(
             components::banner(Tone::Warning, metrics)
                 .absolute()
                 .bottom_0()
@@ -1565,7 +1637,10 @@ impl DesktopPane {
                 ))
                 .child(lines)
                 .children(dismiss),
-        )
+            // The strip is a notice of this window's, laid over the picture: it
+            // keeps the arrow the picture hides.
+            CursorStyle::Arrow,
+        ))
     }
 
     /// The controls the pane owns: the whole window and the zoom steps (R18).
@@ -1573,7 +1648,7 @@ impl DesktopPane {
     /// A layer in the top right corner of the picture. Each control carries a
     /// selector of its own so the window-level tests can press the same button the
     /// user does instead of calling the method behind it.
-    fn controls(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
+    fn controls(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let strings = self.locale.strings();
         let zoom = match self.zoom.percent() {
             Some(percent) => format!("{percent}%"),
@@ -1591,13 +1666,20 @@ impl DesktopPane {
         // same corner, so a bar that is always there covers them. It is laid out either
         // way - a press on a step should not depend on a frame of hover first - and the
         // pane reveals it as soon as the pointer is anywhere over the picture.
-        components::floating_bar(metrics)
+        let mut bar = components::floating_bar(metrics)
             .absolute()
             .top_0()
             .right_0()
             .m(metrics.scale(spacing::TIGHT))
-            .when(!self.controls_hovered, |bar| bar.opacity(0.0))
+            .when(!self.controls_shown(), |bar| bar.opacity(0.0))
             .debug_selector(|| "desktop.controls".to_owned())
+            .id(SharedString::from("desktop.controls.bar"))
+            // The bar is above an occluding layer, so the body stops being hovered
+            // when the pointer lands on it: the bar's own hover is what keeps it
+            // drawn while a control is under the pointer.
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                this.set_bar_hovered(*hovered, cx);
+            }))
             // A press on a control belongs to the control: the picture underneath
             // is not clicked at the same time.
             .on_mouse_down(
@@ -1658,20 +1740,33 @@ impl DesktopPane {
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.set_controls_collapsed(true, cx);
                     })),
-            )
+            );
+        // The bar is this window's control, not part of the picture: it shows the
+        // ordinary arrow even while the picture underneath hides its pointer. The
+        // buttons keep their own pointing hand, which is set on them and painted
+        // after the bar.
+        bar.style().mouse_cursor = Some(CursorStyle::Arrow);
+        bar
     }
 
     /// The small handle that brings a folded bar back.
     ///
     /// It is in the bar's own corner and only while the pointer is over the picture:
     /// a screen nobody is pointing at keeps the whole corner.
-    fn expand_handle(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
-        components::floating_bar(metrics)
+    fn expand_handle(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let mut handle = components::floating_bar(metrics)
             .absolute()
             .top_0()
             .right_0()
             .m(metrics.scale(spacing::TIGHT))
             .debug_selector(|| "desktop.controls.handle".to_owned())
+            .id(SharedString::from("desktop.controls.handle.bar"))
+            // The folded handle is drawn only while the pointer is here, and it is
+            // the thing under the pointer: its own hover keeps it on screen long
+            // enough to be pressed.
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                this.set_bar_hovered(*hovered, cx);
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
@@ -1683,7 +1778,11 @@ impl DesktopPane {
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.set_controls_collapsed(false, cx);
                     })),
-            )
+            );
+        // The handle is over the picture too, and it is a control: like the bar it
+        // shows the arrow the picture hides.
+        handle.style().mouse_cursor = Some(CursorStyle::Arrow);
+        handle
     }
 
     fn certificate_card(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
@@ -1746,6 +1845,17 @@ impl DesktopPane {
                 ),
         )
     }
+}
+
+/// Shows `cursor` while the pointer is over `element`.
+///
+/// GPUI has no cursor builder on a `Div` in this version: the element reads
+/// [`gpui::Style::mouse_cursor`] at prepaint, so the field is set here and the
+/// element is handed back to the builder chain. A later-painted child that sets
+/// its own cursor (a button's pointing hand) wins over this one.
+fn cursor_over(mut element: gpui::Div, cursor: CursorStyle) -> gpui::Div {
+    element.style().mouse_cursor = Some(cursor);
+    element
 }
 
 /// The pointer bit a GPUI button maps to, or None for a button the protocol does
@@ -1918,16 +2028,50 @@ impl Render for DesktopPane {
                 // pane; at a zoom step the picture is drawn at the size the
                 // geometry says and moved by the pan, and the pane crops it.
                 let surface = match self.zoom {
-                    DesktopZoom::Fit => div()
-                        .flex_1()
-                        .min_h_0()
-                        .relative()
-                        .debug_selector(|| "desktop.surface".to_owned())
-                        .child(
-                            img(picture)
-                                .size_full()
-                                .object_fit(gpui::ObjectFit::Contain),
-                        ),
+                    DesktopZoom::Fit => {
+                        // The fitted rectangle of the picture inside the surface,
+                        // measured on the last frame. It is given to the image
+                        // explicitly instead of letting the element lay itself out:
+                        // a replaced element here is as wide as the surface and takes
+                        // its height from its own aspect ratio, so a remote screen
+                        // taller than the surface (800x600 in a wide pane) makes a box
+                        // that runs past the bottom and is cut by the pane - the last
+                        // rows of the picture, the remote taskbar among them, never
+                        // reach the window. The explicit box is exactly the contain
+                        // fit, so the whole picture is inside the pane at every
+                        // aspect.
+                        let fitted = self
+                            .viewport
+                            .map(|viewport| content_rect(viewport, self.surface.size()).size);
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .relative()
+                            .debug_selector(|| "desktop.surface".to_owned())
+                            .child(match fitted {
+                                Some(fitted) => div()
+                                    .absolute()
+                                    .inset_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .w(fitted.width)
+                                            .h(fitted.height)
+                                            .debug_selector(|| "desktop.picture".to_owned())
+                                            .child(img(picture).size_full()),
+                                    )
+                                    .into_any_element(),
+                                // The first frame, before the surface has been
+                                // measured: the element's own contain fit stands in
+                                // for that one frame.
+                                None => img(picture)
+                                    .size_full()
+                                    .object_fit(gpui::ObjectFit::Contain)
+                                    .into_any_element(),
+                            })
+                    }
                     DesktopZoom::Percent(percent) => {
                         let (width, height) = self.surface.size();
                         let factor = f32::from(percent) / 100.0;
@@ -1961,7 +2105,12 @@ impl Render for DesktopPane {
                             )
                     }
                 };
-                body = body.child(surface);
+                // The picture is the remote screen: over it the pointer the user
+                // sees should be the one the remote side draws, not a second local
+                // arrow beside it. The surface carries that choice; the bar and the
+                // notices drawn over it ask for the arrow back, because they are
+                // this window's controls and not the picture.
+                body = body.child(cursor_over(surface, self.surface_cursor()));
             }
             None => {
                 // A link that comes up in under the floor shows its picture instead of
@@ -1987,7 +2136,9 @@ impl Render for DesktopPane {
         }
         if self.certificate.is_some() {
             let card = self.certificate_card(metrics, cx);
-            body = body.child(
+            // The question is this window's, over a picture that may be hiding the
+            // pointer: it keeps the arrow so the card can be read and answered.
+            body = body.child(cursor_over(
                 div()
                     .absolute()
                     .inset_0()
@@ -1996,7 +2147,8 @@ impl Render for DesktopPane {
                     .justify_center()
                     .px(metrics.scale(spacing::LOOSE))
                     .child(components::status_card_slot(card, metrics)),
-            );
+                CursorStyle::Arrow,
+            ));
         }
         if self.surface.is_empty()
             && let DesktopPhase::Live = self.phase
@@ -2021,7 +2173,7 @@ impl Render for DesktopPane {
         // only its handle is, and only while the pointer is over the picture.
         if !matches!(self.phase, DesktopPhase::NotStarted) {
             if self.controls_collapsed {
-                if self.controls_hovered {
+                if self.controls_shown() {
                     body = body.child(self.expand_handle(metrics, cx));
                 }
             } else {
@@ -2045,6 +2197,9 @@ impl DesktopPane {
         if previous == Some(bounds) {
             return;
         }
+        // The fit is computed from this measurement, so the frame that learned it
+        // asks for the one that draws with it.
+        cx.notify();
         // The remote desktop is resized to the space it has, in the same fit the
         // picture is drawn with: the desktop keeps its aspect ratio, so the size is
         // what the drawn rectangle can hold.
@@ -2076,6 +2231,5 @@ impl DesktopPane {
         if link.resize(width, height).is_ok() {
             self.asked_size = (width, height);
         }
-        let _ = cx;
     }
 }

@@ -28133,9 +28133,15 @@ async fn the_zoom_control_scales_the_picture_and_the_pointer_follows_it(cx: &mut
     ]);
     let record = desktop_record("desk");
     let id = mount_scripted_desktop(&view, cx, &record, link);
+    // The fit step places the picture at the contain rectangle of the pane: a placed
+    // rectangle, but one that holds the whole picture and nothing outside the pane.
+    let fitted = bounds_of(cx, "desktop.picture");
+    let full = bounds_of(cx, "desktop.surface");
+    let expected = crate::app::desktop::content_rect(full, desktop);
     assert!(
-        cx.debug_bounds("desktop.picture").is_none(),
-        "the fit step draws the whole pane, not a placed rectangle"
+        (f32::from(fitted.size.width) - f32::from(expected.size.width)).abs() < 1.0
+            && (f32::from(fitted.size.height) - f32::from(expected.size.height)).abs() < 1.0,
+        "the fit step draws the whole picture at the contain rectangle: {fitted:?} was {expected:?}"
     );
 
     let larger = bounds_of(cx, "desktop.zoom.in").center();
@@ -28258,6 +28264,258 @@ async fn a_certificate_that_may_not_be_trusted_is_refused_at_once_and_releases_t
         Some(crate::app::view::DesktopStage::VerifyingCertificate),
         "the step it stopped on is the one it was on"
     );
+}
+
+/// A VNC picture carries the server's pointer, so ours steps aside while it is live.
+///
+/// The window cannot be asked what cursor the platform was handed: gpui keeps it in
+/// the test platform, which exposes no reader. What is asserted here is therefore
+/// the pane's own answer - the one render puts on the surface - at each step, and
+/// that the surface and the bar over it are drawn. Manual acceptance: connect to a
+/// VNC host and move the pointer over the picture (one pointer, the server's), over
+/// the bar (an arrow or a pointing hand, never nothing), and end the session (the
+/// local arrow is back).
+#[gpui::test]
+async fn a_live_vnc_picture_hides_the_local_pointer_until_the_session_ends(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, _log) = ScriptedLink::new(live_desktop_events());
+    let feed = link.feed();
+    let record = vnc_record_sharing("desk", true);
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+
+    let (live, cursor) = cx.update(|_window, app| {
+        let view = view.read(app);
+        let pane = view
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app);
+        (pane.is_live(), pane.surface_cursor_for_test())
+    });
+    assert!(live, "the frame put the session in its live step");
+    assert_eq!(
+        cursor,
+        gpui::CursorStyle::None,
+        "a live VNC picture shows the server's pointer, not a second local one"
+    );
+    let picture = cx
+        .debug_bounds("desktop.surface")
+        .expect("the picture the cursor is hidden over is drawn");
+    cx.simulate_mouse_move(
+        point(
+            picture.origin.x + picture.size.width / 2.0,
+            picture.origin.y + picture.size.height / 2.0,
+        ),
+        None,
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("desktop.controls").is_some(),
+        "the bar over the picture is drawn while the pointer is on the pane"
+    );
+
+    feed.feed(vec![LinkEvent::State {
+        state: LinkState::Closed,
+        failure: LinkFailure::None,
+        detail: 0,
+        reason: String::new(),
+    }]);
+    pump_desktop(&view, cx, id);
+
+    let (ended, cursor) = cx.update(|_window, app| {
+        let view = view.read(app);
+        let pane = view
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app);
+        (
+            matches!(pane.phase(), crate::app::view::DesktopPhase::Ended(_)),
+            pane.surface_cursor_for_test(),
+        )
+    });
+    assert!(ended, "the closed state ended the session");
+    assert_eq!(
+        cursor,
+        gpui::CursorStyle::Arrow,
+        "an ended session is not a picture and keeps the ordinary pointer"
+    );
+}
+
+/// An RDP picture has no pointer of its own yet, so ours stays.
+///
+/// The RDP backend sends the pointer in a PDU of its own, which this build does not
+/// decode: the frames arrive without a pointer in them. Hiding the local one while
+/// such a session is live would leave the picture with no cursor at all, so the
+/// arrow is kept until the pointer update is drawn. This is the other half of the
+/// policy the surface is given in render.
+#[gpui::test]
+async fn an_rdp_picture_keeps_the_local_pointer_because_its_frames_carry_none(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, _log) = ScriptedLink::new(live_desktop_events());
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+
+    let (live, cursor) = cx.update(|_window, app| {
+        let view = view.read(app);
+        let pane = view
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app);
+        (pane.is_live(), pane.surface_cursor_for_test())
+    });
+    assert!(live, "the frame put the session in its live step");
+    assert_eq!(
+        cursor,
+        gpui::CursorStyle::Arrow,
+        "RDP frames carry no pointer, so hiding the local one would leave none"
+    );
+}
+
+/// The whole remote screen is inside the pane at the Fit step, bottom row included.
+///
+/// A remote screen taller than the pane (800x600 in a 1120-wide pane) used to be laid
+/// out by the image element at the surface width and its own aspect ratio: the picture
+/// box became about 840 high in a 674-high pane, and the pane's clip cut the last rows
+/// - the remote taskbar among them - off. The picture is now given its contain
+/// rectangle explicitly, so its bottom is the pane's bottom and nothing of it lies
+/// outside the pane.
+#[gpui::test]
+async fn a_fit_picture_keeps_the_whole_remote_screen_inside_the_pane(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    let desktop = (800u32, 600u32);
+    let (link, _log) = ScriptedLink::new(vec![
+        LinkEvent::State {
+            state: LinkState::Connected,
+            failure: LinkFailure::None,
+            detail: 0,
+            reason: String::new(),
+        },
+        LinkEvent::Frame(solid(0, 0, 800, 600, desktop, [30, 40, 48, 255])),
+    ]);
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+    let _ = id;
+
+    let surface = bounds_of(cx, "desktop.surface");
+    let picture = bounds_of(cx, "desktop.picture");
+    let expected = crate::app::desktop::content_rect(surface, desktop);
+    assert!(
+        (f32::from(picture.size.width) - f32::from(expected.size.width)).abs() < 1.0
+            && (f32::from(picture.size.height) - f32::from(expected.size.height)).abs() < 1.0,
+        "the picture is drawn at the contain rectangle of the pane: {picture:?} was {expected:?}"
+    );
+    assert!(
+        picture.origin.y >= surface.origin.y
+            && picture.origin.y + picture.size.height
+                <= surface.origin.y + surface.size.height + px(0.5),
+        "no row of the picture lies below the pane: {picture:?} in {surface:?}"
+    );
+    // A 4:3 screen in this pane is fitted by its height, so the visible height is the
+    // pane height: 800x600 in a 674-high pane is drawn 674 high, the last row included.
+    assert!(
+        (f32::from(picture.size.height) - f32::from(surface.size.height)).abs() < 1.0,
+        "a 4:3 screen fills the pane's height at the Fit step: {picture:?} in {surface:?}"
+    );
+}
+
+/// The bar stays under the pointer once it is there, and its controls answer a press.
+///
+/// The bar blocks the pointer so a press on a control does not reach the remote screen,
+/// and an occluding layer is exactly where the body stops being hovered: moving onto
+/// the bar used to hide it in the same move. Its own hover now counts too.
+#[gpui::test]
+async fn the_bar_stays_drawn_and_pressable_with_the_pointer_on_it(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, _log) = ScriptedLink::new(live_desktop_events());
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+
+    let shown = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .desktop_of(id)
+                .expect("the desktop surface is mounted")
+                .read(app)
+                .controls_shown_for_test()
+        })
+    };
+    let body_hovered = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .desktop_of(id)
+                .expect("the desktop surface is mounted")
+                .read(app)
+                .controls_revealed_for_test()
+        })
+    };
+
+    hover(cx, "desktop.body");
+    assert!(shown(cx), "the pointer on the picture brings the bar out");
+
+    // Onto the bar itself: this is the move that used to fold it away.
+    hover(cx, "desktop.controls");
+    assert!(
+        !body_hovered(cx),
+        "the pointer really is on the occluding bar, not on the body"
+    );
+    assert!(shown(cx), "the bar's own hover keeps it drawn");
+    assert!(
+        cx.debug_bounds("desktop.controls").is_some(),
+        "the bar is still under the pointer"
+    );
+
+    let before = desktop_zoom(&view, cx, id);
+    click(cx, "desktop.zoom.fit");
+    assert_ne!(
+        desktop_zoom(&view, cx, id),
+        before,
+        "the control under the pointer answers the press"
+    );
+}
+
+/// A folded bar offers a handle, and the handle survives the pointer reaching it.
+#[gpui::test]
+async fn the_folded_handle_stays_drawn_and_pressable_with_the_pointer_on_it(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, _log) = ScriptedLink::new(live_desktop_events());
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+
+    let state = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| {
+            let pane = view
+                .read(app)
+                .desktop_of(id)
+                .expect("the desktop surface is mounted")
+                .read(app);
+            (
+                pane.controls_collapsed_for_test(),
+                pane.controls_shown_for_test(),
+            )
+        })
+    };
+
+    hover(cx, "desktop.body");
+    click(cx, "desktop.controls.collapse");
+    assert!(state(cx).0, "the bar is folded");
+    assert!(
+        cx.debug_bounds("desktop.controls.expand").is_some(),
+        "the handle is offered while the pointer is on the picture"
+    );
+
+    hover(cx, "desktop.controls.expand");
+    let (collapsed, shown) = state(cx);
+    assert!(shown, "the handle's own hover keeps it drawn");
+    assert!(
+        collapsed,
+        "the fold survives the pointer reaching the handle"
+    );
+
+    click(cx, "desktop.controls.expand");
+    assert!(!state(cx).0, "the handle under the pointer unfolds the bar");
 }
 
 #[gpui::test]
