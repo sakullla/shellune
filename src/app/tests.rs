@@ -29314,7 +29314,11 @@ async fn every_keystroke_reaches_a_desktop_once(cx: &mut TestAppContext) {
 }
 
 /// The pane's zoom step, read the way the controls draw it.
-fn desktop_zoom(view: &Entity<ShelluneView>, cx: &mut VisualTestContext, id: SessionId) -> crate::app::desktop::DesktopZoom {
+fn desktop_zoom(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+    id: SessionId,
+) -> crate::app::desktop::DesktopZoom {
     cx.update(|_window, app| {
         view.read(app)
             .desktop_of(id)
@@ -29369,9 +29373,7 @@ async fn the_controls_stay_clickable_over_a_notice_and_a_certificate(cx: &mut Te
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let mut events = live_desktop_events();
     events.push(LinkEvent::Notice(
-        crate::app::desktop::Notice::ClipboardTooLarge(
-            crate::app::desktop::ClipboardKind::Text,
-        ),
+        crate::app::desktop::Notice::ClipboardTooLarge(crate::app::desktop::ClipboardKind::Text),
     ));
     let (link, _log) = ScriptedLink::new(events);
     let feed = link.feed();

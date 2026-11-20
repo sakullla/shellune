@@ -370,7 +370,9 @@ impl DesktopPane {
             started_password: None,
             #[cfg(test)]
             starts: 0,
-            controls_hovered: false,
+            // A shot of a session is a shot of its controls too, and the capture runs
+            // with no pointer over the picture: there the bar starts shown.
+            controls_hovered: cfg!(feature = "ui-capture"),
             send_problem: None,
             polling: false,
             watching_focus: false,
