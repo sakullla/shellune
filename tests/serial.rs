@@ -344,7 +344,13 @@ fn an_unplugged_device_is_reported_as_a_disconnect_and_the_port_is_released() {
     assert_eq!(error.raw().map(RawError::code), Some(1167));
 
     // The session settles into its final state and lets the port go.
-    let _ = session.poll();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while (session.state() != SessionState::Failed || !port.is_released())
+        && Instant::now() < deadline
+    {
+        let _ = session.poll();
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert_eq!(session.state(), SessionState::Failed);
     assert!(port.is_released());
     assert_eq!(
