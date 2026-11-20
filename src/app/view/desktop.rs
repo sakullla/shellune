@@ -800,8 +800,8 @@ impl DesktopPane {
     ///
     /// * VNC: this client does not ask for the Cursor pseudo-encoding, so the
     ///   server renders its pointer into the framebuffer.
-    /// * RDP: xrdp paints its pointer into the bitmap updates instead of sending
-    ///   a pointer PDU, so the frame that arrives already has the pointer in it.
+    /// * RDP: this client advertises no pointer capability, so the server paints
+    ///   its pointer into the bitmap updates and the frame arrives with it.
     ///
     /// While a session is live the surface therefore asks for
     /// [`CursorStyle::None`]; before and after it, and whenever the pane is not a

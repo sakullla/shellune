@@ -1016,34 +1016,6 @@ pub fn failure_name(failure: Failure) -> String {
     .to_owned()
 }
 
-#[cfg(test)]
-mod clipboard_cut_tests {
-    use super::*;
-
-    #[test]
-    fn text_within_the_bound_is_left_whole() {
-        assert_eq!(cut_clipboard_text(b"", 4), 0);
-        assert_eq!(cut_clipboard_text(b"abcd", 4), 4);
-        assert_eq!(cut_clipboard_text("é".as_bytes(), 2), 2);
-    }
-
-    #[test]
-    fn the_cut_never_splits_a_character() {
-        assert_eq!(cut_clipboard_text(b"abcde", 4), 4);
-        // "aé": the bound falls inside the two-byte é, which is left out whole.
-        assert_eq!(cut_clipboard_text("aé".as_bytes(), 2), 1);
-        // Three- and four-byte characters.
-        assert_eq!(cut_clipboard_text("a中文".as_bytes(), 5), 4);
-        assert_eq!(cut_clipboard_text("a中文".as_bytes(), 6), 4);
-        assert_eq!(cut_clipboard_text("😀😀".as_bytes(), 7), 4);
-        assert_eq!(cut_clipboard_text("😀".as_bytes(), 3), 0);
-        let text = "x".repeat(MAX_CLIPBOARD_TEXT_BYTES - 1) + "€";
-        let len = cut_clipboard_text(text.as_bytes(), MAX_CLIPBOARD_TEXT_BYTES);
-        assert_eq!(len, MAX_CLIPBOARD_TEXT_BYTES - 1);
-        assert!(std::str::from_utf8(&text.as_bytes()[..len]).is_ok());
-    }
-}
-
 /// What an attempt would say about a folder offered as a drive.
 ///
 /// The check a mapped folder gets before the server sees it: absolute, inside the
@@ -1078,5 +1050,33 @@ fn folder_problem(path: &str) -> Option<DriveProblem> {
             Some(DriveProblem::NoAccess)
         }
         Err(_) => Some(DriveProblem::Missing),
+    }
+}
+
+#[cfg(test)]
+mod clipboard_cut_tests {
+    use super::*;
+
+    #[test]
+    fn text_within_the_bound_is_left_whole() {
+        assert_eq!(cut_clipboard_text(b"", 4), 0);
+        assert_eq!(cut_clipboard_text(b"abcd", 4), 4);
+        assert_eq!(cut_clipboard_text("é".as_bytes(), 2), 2);
+    }
+
+    #[test]
+    fn the_cut_never_splits_a_character() {
+        assert_eq!(cut_clipboard_text(b"abcde", 4), 4);
+        // "aé": the bound falls inside the two-byte é, which is left out whole.
+        assert_eq!(cut_clipboard_text("aé".as_bytes(), 2), 1);
+        // Three- and four-byte characters.
+        assert_eq!(cut_clipboard_text("a中文".as_bytes(), 5), 4);
+        assert_eq!(cut_clipboard_text("a中文".as_bytes(), 6), 4);
+        assert_eq!(cut_clipboard_text("😀😀".as_bytes(), 7), 4);
+        assert_eq!(cut_clipboard_text("😀".as_bytes(), 3), 0);
+        let text = "x".repeat(MAX_CLIPBOARD_TEXT_BYTES - 1) + "€";
+        let len = cut_clipboard_text(text.as_bytes(), MAX_CLIPBOARD_TEXT_BYTES);
+        assert_eq!(len, MAX_CLIPBOARD_TEXT_BYTES - 1);
+        assert!(std::str::from_utf8(&text.as_bytes()[..len]).is_ok());
     }
 }

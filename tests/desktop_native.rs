@@ -1202,8 +1202,10 @@ fn entry_names(data: &[u8]) -> Vec<String> {
         let end = start + length;
         assert!(end <= data.len(), "entry name runs past the page");
         let units: Vec<u16> = data[start..end]
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect();
         names.push(String::from_utf16_lossy(&units));
         if next == 0 {
@@ -1689,10 +1691,7 @@ fn a_refused_rdp_clipboard_is_reported_and_withdrawn() {
     );
 
     // The server offers a format list again: the clipboard is usable.
-    let mut list = Vec::new();
-    for format in [CF_UNICODETEXT] {
-        list.extend_from_slice(&format.to_le_bytes());
-    }
+    let list = CF_UNICODETEXT.to_le_bytes().to_vec();
     let (events, _) = probe::rdp_clipboard_receive(
         &[],
         &[

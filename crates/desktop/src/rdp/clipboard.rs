@@ -79,10 +79,10 @@ impl Clipboard {
         if !self.enabled || self.ready {
             return Ok(());
         }
-        if let Some(at) = self.announced {
-            if at.elapsed() < std::time::Duration::from_secs(2) {
-                return Ok(());
-            }
+        if let Some(at) = self.announced
+            && at.elapsed() < std::time::Duration::from_secs(2)
+        {
+            return Ok(());
         }
         self.announce(ch, out)
     }
@@ -407,7 +407,7 @@ fn to_utf16(text: &str) -> Vec<u8> {
 /// Reads up to the first NUL; an odd trailing byte is ignored.
 fn from_utf16(data: &[u8]) -> io::Result<String> {
     let mut units = Vec::with_capacity(data.len() / 2);
-    for pair in data.chunks_exact(2) {
+    for pair in data.as_chunks::<2>().0 {
         let unit = u16::from_le_bytes([pair[0], pair[1]]);
         if unit == 0 {
             break;

@@ -202,8 +202,8 @@ Remove this directory and the patch entry once `gpui` no longer pulls in `xattr`
 
 There is no `freerdp`, `winpr` or `libvncserver` here, and the build downloads
 nothing: the RDP client (`crates/desktop/src/rdp`) and the VNC client
-(`crates/desktop/src/vnc`) are part of that crate, and its `build.rs` compiles one
-small C file of diagnostic names. A release therefore needs no native prefix built
+(`crates/desktop/src/vnc`) are part of that crate. That crate compiles no C and has
+no build script. A release therefore needs no native prefix built
 before `cargo build --workspace --release`, links no protocol library, and carries
 no protocol library license text beside Shellune's `LICENSE`.
 

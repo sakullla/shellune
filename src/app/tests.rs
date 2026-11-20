@@ -29496,9 +29496,8 @@ async fn switching_protocols_does_not_carry_a_password_between_forms(cx: &mut Te
 
     // The SSH form is the host form, and it starts with nothing typed either.
     click(cx, "connection.protocol.ssh");
-    assert_eq!(
-        cx.update(|_window, app| view.read(app).hosts_state().protocol_draft().is_some()),
-        false,
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().protocol_draft().is_none()),
         "the SSH form is the host form"
     );
     let ssh_secret = cx.update(|_window, app| {

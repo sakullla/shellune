@@ -52,7 +52,12 @@ fn core(width: u16, height: u16, selected: Security) -> Vec<u8> {
     body.extend_from_slice(&0x409u32.to_le_bytes()); // US keyboard layout
     body.extend_from_slice(&1u32.to_le_bytes()); // Shellune build identifier
     let mut name = [0u8; 32];
-    for (slot, unit) in name.chunks_exact_mut(2).zip("Shellune".encode_utf16()) {
+    for (slot, unit) in name
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip("Shellune".encode_utf16())
+    {
         slot.copy_from_slice(&unit.to_le_bytes());
     }
     body.extend_from_slice(&name);

@@ -301,16 +301,16 @@ impl Drive {
                 ))
             }
             IRP_MJ_CLOSE => {
-                if let Some(open) = self.open.remove(&file) {
-                    if open.delete_on_close {
-                        let Open { handle, path, .. } = open;
-                        drop(handle);
-                        let _ = if path.is_dir() {
-                            fs::remove_dir_all(&path)
-                        } else {
-                            fs::remove_file(&path)
-                        };
-                    }
+                if let Some(open) = self.open.remove(&file)
+                    && open.delete_on_close
+                {
+                    let Open { handle, path, .. } = open;
+                    drop(handle);
+                    let _ = if path.is_dir() {
+                        fs::remove_dir_all(&path)
+                    } else {
+                        fs::remove_file(&path)
+                    };
                 }
                 Ok((STATUS_SUCCESS, Vec::new()))
             }
@@ -462,41 +462,6 @@ impl Drive {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn root() -> PathBuf {
-        let folder = std::env::temp_dir().join("shellune-rdpdr-resolve");
-        let _ = std::fs::create_dir_all(folder.join("sub"));
-        std::fs::write(folder.join("sub").join("file.txt"), b"x").unwrap();
-        folder.canonicalize().unwrap()
-    }
-
-    #[test]
-    fn a_device_path_stays_inside_the_mapped_folder() {
-        let root = root();
-        assert_eq!(
-            resolve(&root, "sub\\file.txt").unwrap(),
-            root.join("sub").join("file.txt")
-        );
-        // A leading separator is a path inside the device, not the host root.
-        assert_eq!(
-            resolve(&root, "\\sub\\file.txt").unwrap(),
-            root.join("sub").join("file.txt")
-        );
-    }
-
-    #[test]
-    fn escaping_the_folder_is_refused() {
-        let root = root();
-        assert_eq!(resolve(&root, "..\\outside.txt"), Err(STATUS_ACCESS_DENIED));
-        assert_eq!(resolve(&root, "sub\\..\\..\\x"), Err(STATUS_ACCESS_DENIED));
-        // A DOS drive prefix is not a name inside the folder.
-        assert_eq!(resolve(&root, "C:\\windows"), Err(STATUS_ACCESS_DENIED));
-    }
-}
-
 /// The MCS data inside one TPKT frame.
 fn mcs_payload(bytes: &[u8]) -> Option<&[u8]> {
     if bytes.len() < 11 || bytes[0] != 3 {
@@ -611,6 +576,7 @@ fn open_file(path: &Path, disposition: u32) -> io::Result<File> {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path),
         4 => OpenOptions::new().write(true).truncate(true).open(path),
         5 => OpenOptions::new()
@@ -707,7 +673,12 @@ fn push_entry(
     entry[64..68].copy_from_slice(&0u32.to_le_bytes()); // EaSize
     entry[68] = 0; // ShortNameLength
     entry[69] = 0; // Reserved
-    for (slot, unit) in entry[94..].chunks_exact_mut(2).zip(units.iter()) {
+    for (slot, unit) in entry[94..]
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(units.iter())
+    {
         slot.copy_from_slice(&unit.to_le_bytes());
     }
     Some(begin)
@@ -743,8 +714,7 @@ pub(crate) fn probe_drive_reply(folder: &str, result: u32) -> Vec<Event> {
     reply.extend_from_slice(&DEVICE_ID.to_le_bytes());
     reply.extend_from_slice(&result.to_le_bytes());
     let _ = drive.on_data(&channels, &mut out, &reply);
-    let events = events.lock().map(|slot| slot.clone()).unwrap_or_default();
-    events
+    events.lock().map(|slot| slot.clone()).unwrap_or_default()
 }
 
 fn folders(folder: &Path) -> Result<(), DriveProblem> {
@@ -839,7 +809,7 @@ fn status_of(error: &io::Error) -> u32 {
 
 fn utf16(bytes: &[u8]) -> io::Result<String> {
     let mut units = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let unit = u16::from_le_bytes([pair[0], pair[1]]);
         if unit == 0 {
             break;
@@ -847,4 +817,39 @@ fn utf16(bytes: &[u8]) -> io::Result<String> {
         units.push(unit);
     }
     String::from_utf16(&units).map_err(|_| invalid("RDPDR path is not valid UTF-16"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root() -> PathBuf {
+        let folder = std::env::temp_dir().join("shellune-rdpdr-resolve");
+        let _ = std::fs::create_dir_all(folder.join("sub"));
+        std::fs::write(folder.join("sub").join("file.txt"), b"x").unwrap();
+        folder.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn a_device_path_stays_inside_the_mapped_folder() {
+        let root = root();
+        assert_eq!(
+            resolve(&root, "sub\\file.txt").unwrap(),
+            root.join("sub").join("file.txt")
+        );
+        // A leading separator is a path inside the device, not the host root.
+        assert_eq!(
+            resolve(&root, "\\sub\\file.txt").unwrap(),
+            root.join("sub").join("file.txt")
+        );
+    }
+
+    #[test]
+    fn escaping_the_folder_is_refused() {
+        let root = root();
+        assert_eq!(resolve(&root, "..\\outside.txt"), Err(STATUS_ACCESS_DENIED));
+        assert_eq!(resolve(&root, "sub\\..\\..\\x"), Err(STATUS_ACCESS_DENIED));
+        // A DOS drive prefix is not a name inside the folder.
+        assert_eq!(resolve(&root, "C:\\windows"), Err(STATUS_ACCESS_DENIED));
+    }
 }

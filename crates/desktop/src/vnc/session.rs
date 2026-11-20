@@ -533,7 +533,7 @@ mod tests {
     #[test]
     fn a_raw_rectangle_is_copied_into_the_desktop_and_emitted() {
         let mut desktop = desktop();
-        let pixels = vec![7u8; 2 * 1 * 4];
+        let pixels = vec![7u8; 2 * 4];
         let event = desktop
             .apply(Rect::Raw {
                 x: 1,

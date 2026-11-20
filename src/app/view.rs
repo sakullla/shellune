@@ -7633,13 +7633,13 @@ impl ShelluneView {
         let typed = draft.typed_secret().map(shellune_core::SecretString::new);
         let id = record.id();
         if record.remembers_secret() {
-            if let Some(secret) = &typed {
-                if let Err(error) = self.secrets.save(id, secret) {
-                    let message = format!("{}: {error}", self.strings().host_secret_failed);
-                    self.hosts.set_message(message, true);
-                    cx.notify();
-                    return false;
-                }
+            if let Some(secret) = &typed
+                && let Err(error) = self.secrets.save(id, secret)
+            {
+                let message = format!("{}: {error}", self.strings().host_secret_failed);
+                self.hosts.set_message(message, true);
+                cx.notify();
+                return false;
             }
             // The store is the one place now: a copy here would outlive its use.
             self.desktop_secrets.remove(&id);

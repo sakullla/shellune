@@ -387,7 +387,7 @@ mod tests {
         };
         assert_eq!((*width, *height), (2, 1));
         assert_eq!(pixels, &[9, 8, 7, 6, 5, 4, 3, 2]);
-        assert!(matches!(incoming.take().expect("parsed"), None));
+        assert!(incoming.take().expect("parsed").is_none());
     }
 
     #[test]

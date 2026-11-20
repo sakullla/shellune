@@ -270,7 +270,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   （状态词“开 / 关” + 开关）是一个 ≥ 24px 的指针目标，按一下翻转并立即生效，选择器为
   `settings.notice.bell`、`settings.notice.finished`、`settings.keepalive`、`settings.sync.auto`、
   `settings.sync.secrets`、`settings.update.auto`（状态词为 `<选择器>.state`）。多选一仍用分段控件，数值用统一的输入框。
-- **弹窗**（`modal`）：新建 / 编辑主机（`hosts.editor`）、编辑桌面 / 串口连接（`connection.editor`）、连接到主机、
+- **弹窗**（`modal`）：新建 / 编辑主机及其桌面 / 串口连接（`hosts.editor`）、连接到主机、
   快速连接、导入 SSH 配置、端口转发、传输、备份、同步冲突、更新确认、删除主机确认（`hosts.confirm`）、关闭会话 /
   关闭应用前的询问（`session.close.question` / `app.close.question`）、快捷键录制（`keys.capture.dialog`）全部是同一个
   `components::modal`：头部是图标块 + 标题 + 关闭按钮（危险问题的图标块用 danger tint），主体滚动，底部

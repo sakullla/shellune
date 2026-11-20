@@ -179,7 +179,9 @@ impl Share {
         let mut orders = vec![0; 84];
         orders[20..32].copy_from_slice(&words(&[1, 20, 0, 1, 0, 2]));
         caps.add(3, &orders);
-        caps.add(8, &words(&[1, 20, 20])); // colour pointer cache and its size
+        // No pointer capability (CAPSTYPE_POINTER): this client does not decode
+        // pointer PDUs, so the server paints its pointer into the bitmap updates -
+        // which is exactly what the surface draws, with no local pointer over it.
         caps.add(9, &words(&[0, 0])); // share
         let mut input = words(&[1, 0]); // scan code input
         for v in [0x409u32, 4, 0, 12] {

@@ -258,37 +258,6 @@ impl Drop for Client {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_press_and_a_release_both_name_their_button() {
-        // Press: move with the button and the down bit.
-        assert_eq!(pointer_flags(0, SD_BUTTON_LEFT), 0x0800 | 0x1000 | 0x8000);
-        // Release: the same button bit without the down bit, so a server knows
-        // which button came up.
-        assert_eq!(pointer_flags(SD_BUTTON_LEFT, 0), 0x0800 | 0x1000);
-        assert_eq!(pointer_flags(SD_BUTTON_RIGHT, 0), 0x0800 | 0x2000);
-        assert_eq!(pointer_flags(SD_BUTTON_MIDDLE, 0), 0x0800 | 0x4000);
-        // A plain move carries no button at all.
-        assert_eq!(pointer_flags(0, 0), 0x0800);
-        // Holding a button while moving does not repeat the press.
-        assert_eq!(pointer_flags(SD_BUTTON_LEFT, SD_BUTTON_LEFT), 0x0800);
-    }
-
-    #[test]
-    fn a_wheel_step_is_one_event_and_its_release_is_not_one() {
-        assert_eq!(pointer_flags(0, SD_BUTTON_WHEEL_UP), 0x0200 | 0x0078);
-        assert_eq!(
-            pointer_flags(0, SD_BUTTON_WHEEL_DOWN),
-            0x0200 | 0x0100 | 0x0088
-        );
-        // The step bit clears again; that clearing is not a second wheel event.
-        assert_eq!(pointer_flags(SD_BUTTON_WHEEL_UP, 0), 0x0800);
-    }
-}
-
 /// Maps a change of the crate's button state to the protocol's pointer flags.
 ///
 /// The protocol names the button on both edges: a press carries PTR_FLAGS_DOWN
@@ -323,4 +292,35 @@ pub(super) fn pointer_flags(previous: u32, buttons: u32) -> u16 {
         }
     }
     flags
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_press_and_a_release_both_name_their_button() {
+        // Press: move with the button and the down bit.
+        assert_eq!(pointer_flags(0, SD_BUTTON_LEFT), 0x0800 | 0x1000 | 0x8000);
+        // Release: the same button bit without the down bit, so a server knows
+        // which button came up.
+        assert_eq!(pointer_flags(SD_BUTTON_LEFT, 0), 0x0800 | 0x1000);
+        assert_eq!(pointer_flags(SD_BUTTON_RIGHT, 0), 0x0800 | 0x2000);
+        assert_eq!(pointer_flags(SD_BUTTON_MIDDLE, 0), 0x0800 | 0x4000);
+        // A plain move carries no button at all.
+        assert_eq!(pointer_flags(0, 0), 0x0800);
+        // Holding a button while moving does not repeat the press.
+        assert_eq!(pointer_flags(SD_BUTTON_LEFT, SD_BUTTON_LEFT), 0x0800);
+    }
+
+    #[test]
+    fn a_wheel_step_is_one_event_and_its_release_is_not_one() {
+        assert_eq!(pointer_flags(0, SD_BUTTON_WHEEL_UP), 0x0200 | 0x0078);
+        assert_eq!(
+            pointer_flags(0, SD_BUTTON_WHEEL_DOWN),
+            0x0200 | 0x0100 | 0x0088
+        );
+        // The step bit clears again; that clearing is not a second wheel event.
+        assert_eq!(pointer_flags(SD_BUTTON_WHEEL_UP, 0), 0x0800);
+    }
 }

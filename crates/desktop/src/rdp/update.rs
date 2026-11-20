@@ -313,7 +313,7 @@ fn planar_rle(
             previous = Some(row);
         }
     }
-    for pixel in out.chunks_exact_mut(4) {
+    for pixel in out.as_chunks_mut::<4>().0 {
         pixel[3] = 0xff;
     }
     Ok((out, rle.at))
@@ -336,17 +336,17 @@ pub(super) fn decompress(bitmap: &Bitmap<'_>) -> io::Result<(Vec<u8>, usize)> {
     let width = usize::from(bitmap.bitmaps.0);
     let height = usize::from(bitmap.bitmaps.1);
     let mut failure = None;
-    if bitmap.bpp == 32 {
-        if let Some((start, marker)) = planar_marker(bitmap.data, width, height) {
-            let planes: &[usize] = if marker == 0x30 {
-                &[2, 1, 0]
-            } else {
-                &[3, 2, 1, 0]
-            };
-            match planar_rle(&bitmap.data[start..], width, height, planes) {
-                Ok((pixels, used)) => return Ok((pixels, start + used)),
-                Err(error) => failure = Some(error),
-            }
+    if bitmap.bpp == 32
+        && let Some((start, marker)) = planar_marker(bitmap.data, width, height)
+    {
+        let planes: &[usize] = if marker == 0x30 {
+            &[2, 1, 0]
+        } else {
+            &[3, 2, 1, 0]
+        };
+        match planar_rle(&bitmap.data[start..], width, height, planes) {
+            Ok((pixels, used)) => return Ok((pixels, start + used)),
+            Err(error) => failure = Some(error),
         }
     }
     match bitmap.bpp {
@@ -374,10 +374,13 @@ fn planar_marker(data: &[u8], width: usize, height: usize) -> Option<(usize, u8)
         usize::from(u16::from_le_bytes([scan[0], scan[1]])) == width * 4
             && usize::from(u16::from_le_bytes([raw[0], raw[1]])) == width * height * 4
     };
-    if data.len() > 8 && data[0] == 0 && data[1] == 0 && matches!(data[8], 0x10 | 0x30) {
-        if sizes_match(&data[2..4], &data[4..6]) {
-            return Some((8, data[8]));
-        }
+    if data.len() > 8
+        && data[0] == 0
+        && data[1] == 0
+        && matches!(data[8], 0x10 | 0x30)
+        && sizes_match(&data[2..4], &data[4..6])
+    {
+        return Some((8, data[8]));
     }
     if data.len() > 6 && matches!(data[6], 0x10 | 0x30) && sizes_match(&data[2..4], &data[4..6]) {
         return Some((6, data[6]));
@@ -472,12 +475,22 @@ fn unpack(bitmap: &Bitmap<'_>) -> io::Result<Vec<u8>> {
         match bitmap.bpp {
             32 => target.copy_from_slice(source),
             24 => {
-                for (pixel, bytes) in target.chunks_exact_mut(4).zip(source.chunks_exact(3)) {
+                for (pixel, bytes) in target
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(source.as_chunks::<3>().0)
+                {
                     pixel.copy_from_slice(&[bytes[0], bytes[1], bytes[2], 0xff]);
                 }
             }
             16 => {
-                for (pixel, bytes) in target.chunks_exact_mut(4).zip(source.chunks_exact(2)) {
+                for (pixel, bytes) in target
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(source.as_chunks::<2>().0)
+                {
                     let value = u16::from_le_bytes([bytes[0], bytes[1]]);
                     let red = ((value >> 10) & 0x1f) as u8;
                     let green = ((value >> 5) & 0x1f) as u8;
@@ -494,6 +507,17 @@ fn unpack(bitmap: &Bitmap<'_>) -> io::Result<Vec<u8>> {
         }
     }
     Ok(pixels)
+}
+
+/// A tightly packed copy of one rectangle, the shape `Event::Frame` carries.
+pub(super) fn region(frame: &[u8], stride: usize, bitmap: &Bitmap<'_>) -> Vec<u8> {
+    let row = usize::from(bitmap.width) * 4;
+    let mut pixels = Vec::with_capacity(row * usize::from(bitmap.height));
+    for line in 0..usize::from(bitmap.height) {
+        let start = usize::from(bitmap.y) * stride + line * stride + usize::from(bitmap.x) * 4;
+        pixels.extend_from_slice(&frame[start..start + row]);
+    }
+    pixels
 }
 
 #[cfg(test)]
@@ -519,7 +543,7 @@ mod tests {
         // Two rows of four black pixels: a fill order per row.
         let (pixels, used) = decompress(&bitmap(4, 2, 32, &[0x04, 0x04])).unwrap();
         assert_eq!(used, 2);
-        assert_eq!(pixels, vec![0, 0, 0, 0xff].repeat(8));
+        assert_eq!(pixels, [0, 0, 0, 0xff].repeat(8));
 
         // One row of four copied pixels, then the same again for the next row.
         let mut data = vec![0x84];
@@ -559,15 +583,4 @@ mod tests {
         // A depth this client never asks for is refused rather than misread.
         assert!(decompress(&bitmap(2, 2, 8, &[0x04])).is_err());
     }
-}
-
-/// A tightly packed copy of one rectangle, the shape `Event::Frame` carries.
-pub(super) fn region(frame: &[u8], stride: usize, bitmap: &Bitmap<'_>) -> Vec<u8> {
-    let row = usize::from(bitmap.width) * 4;
-    let mut pixels = Vec::with_capacity(row * usize::from(bitmap.height));
-    for line in 0..usize::from(bitmap.height) {
-        let start = usize::from(bitmap.y) * stride + line * stride + usize::from(bitmap.x) * 4;
-        pixels.extend_from_slice(&frame[start..start + row]);
-    }
-    pixels
 }

@@ -155,6 +155,15 @@ impl<'a> Packet<'a> {
     }
 }
 
+pub(super) fn per_length(target: &mut Vec<u8>, length: usize) -> io::Result<()> {
+    match length {
+        0..=127 => target.push(length as u8),
+        128..=0x7fff => target.extend_from_slice(&(0x8000 | length as u16).to_be_bytes()),
+        _ => return Err(invalid("MCS data exceeds PDU size")),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,13 +262,4 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains('5'));
     }
-}
-
-pub(super) fn per_length(target: &mut Vec<u8>, length: usize) -> io::Result<()> {
-    match length {
-        0..=127 => target.push(length as u8),
-        128..=0x7fff => target.extend_from_slice(&(0x8000 | length as u16).to_be_bytes()),
-        _ => return Err(invalid("MCS data exceeds PDU size")),
-    }
-    Ok(())
 }

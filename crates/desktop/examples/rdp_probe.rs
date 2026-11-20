@@ -164,10 +164,11 @@ fn main() {
                     }
                 }
                 frames += 1;
-                if let Some(at) = clicked {
-                    if at.elapsed() < Duration::from_secs(4) && frames > 1 {
-                        after_click += 1;
-                    }
+                if let Some(at) = clicked
+                    && at.elapsed() < Duration::from_secs(4)
+                    && frames > 1
+                {
+                    after_click += 1;
                 }
                 if frames == 1 {
                     println!("first frame {width}x{height}");
@@ -186,7 +187,7 @@ fn main() {
     if let (Some(path), true) = (dump, !desktop.is_empty()) {
         let (width, height) = desktop_size;
         let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
-        for pixel in desktop.chunks_exact(4) {
+        for pixel in desktop.as_chunks::<4>().0 {
             ppm.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
         }
         if std::fs::write(&path, ppm).is_ok() {
