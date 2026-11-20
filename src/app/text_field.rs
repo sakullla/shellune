@@ -541,6 +541,7 @@ impl TextField {
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         self.model.set_text(text);
         self.marked = None;
+        self.veil_when_empty();
         cx.notify();
     }
 
@@ -633,8 +634,24 @@ impl TextField {
         .detach();
     }
 
-    /// Whether the line is drawn as bullets.
+    /// The line as drawn - bullets while hidden - for the test that pressing the eye
+    /// changes what is on screen and not only a flag.
     #[cfg(test)]
+    #[must_use]
+    pub fn drawn_text_for_test(&self) -> String {
+        self.display_text()
+    }
+
+    /// Whether the text is shown while a masked field's eye is pressed, for the tests
+    /// that check the eye really changes what is drawn.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[must_use]
+    pub fn is_revealed(&self) -> bool {
+        self.revealed
+    }
+
+    /// Whether the line is drawn as bullets.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn is_masked(&self) -> bool {
         self.masked
@@ -737,7 +754,16 @@ impl TextField {
 
     fn edit(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut LineModel)) {
         change(&mut self.model);
+        self.veil_when_empty();
         cx.notify();
+    }
+
+    /// A field that no longer holds anything is hidden again: the eye is not drawn on
+    /// an empty field, and text typed after clearing must not reappear in the clear.
+    fn veil_when_empty(&mut self) {
+        if self.model.text().is_empty() {
+            self.revealed = false;
+        }
     }
 
     /// Copies the selection; a hidden password is never put on the clipboard.
@@ -1090,7 +1116,10 @@ impl Render for TextField {
         let focused = self.focus.is_focused(window);
         let accent = theme::swatch(palette::ACCENT);
         let strings = Locale::current().strings();
-        let reveal = self.masked && self.revealable;
+        // The eye is offered only when there is something to show: an empty field
+        // would toggle a flag nobody can see, and a saved password is never read back
+        // into the field, so its eye would be a promise the field cannot keep.
+        let reveal = self.masked && self.revealable && !self.model.text().is_empty();
         let revealed = self.revealed;
         let clear = self.clearable && !self.model.text().is_empty() && self.marked.is_none();
         let trailing = clear || reveal || self.browse.is_some();
@@ -1247,13 +1276,19 @@ impl Render for TextField {
                         } else {
                             strings.field_reveal
                         }))
-                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                            cx.stop_propagation();
-                        })
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.revealed = !this.revealed;
-                            cx.notify();
-                        }))
+                        // The toggle happens on the press itself, not on a click
+                        // synthesized from the release: a press whose release never
+                        // reaches the button (a tiny drag, or an ancestor taking it)
+                        // still has to show the password. Stopping the press here also
+                        // keeps the field under it from moving its caret.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                this.revealed = !this.revealed;
+                                cx.notify();
+                            }),
+                        )
                         .child(icons::icon(
                             if revealed { Icon::EyeOff } else { Icon::Eye },
                             metrics.small_icon_size(),

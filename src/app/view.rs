@@ -6513,6 +6513,32 @@ impl ShelluneView {
             .map(|fields| fields.secret.read(cx).is_masked())
     }
 
+    /// Whether the password field of the open connection form is showing its text,
+    /// for the test that presses its eye.
+    #[cfg(test)]
+    pub fn connection_secret_revealed_for_test(&self, cx: &gpui::App) -> Option<bool> {
+        self.protocol_fields
+            .as_ref()
+            .map(|fields| fields.secret.read(cx).is_revealed())
+    }
+
+    /// The line the password field of the open connection form draws, for the test
+    /// that presses its eye.
+    #[cfg(test)]
+    pub fn connection_secret_drawn_for_test(&self, cx: &gpui::App) -> Option<String> {
+        self.protocol_fields
+            .as_ref()
+            .map(|fields| fields.secret.read(cx).drawn_text_for_test())
+    }
+
+    /// Whether the secret field of the open SSH host form is showing its text.
+    #[cfg(test)]
+    pub fn host_secret_revealed_for_test(&self, cx: &gpui::App) -> Option<bool> {
+        self.host_fields
+            .as_ref()
+            .map(|fields| fields.secret.read(cx).is_revealed())
+    }
+
     /// What the credential store holds for a host, for tests.
     #[cfg(test)]
     pub fn saved_secret_for_test(&self, id: HostId) -> Option<String> {

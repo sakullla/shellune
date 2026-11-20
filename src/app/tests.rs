@@ -29506,6 +29506,81 @@ async fn the_controls_appear_only_while_the_pointer_is_over_the_pane(cx: &mut Te
 }
 
 #[gpui::test]
+async fn the_eye_shows_the_desktop_password_and_hides_it_again(cx: &mut TestAppContext) {
+    let dir = TempDir::new("desktop-secret-reveal");
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.simulate_resize(size(px(1400.0), px(1300.0)));
+    cx.run_until_parked();
+
+    click(cx, "hosts.new");
+    click(cx, "connection.protocol.rdp");
+    assert!(
+        cx.debug_bounds("field.reveal").is_none(),
+        "an empty password field offers nothing to show"
+    );
+    type_into(cx, "connection.field.secret", "rdp-pass");
+    assert!(
+        cx.debug_bounds("field.reveal").is_some(),
+        "typing the password offers the eye"
+    );
+    let revealed = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| view.read(app).connection_secret_revealed_for_test(app))
+    };
+    assert_eq!(revealed(cx), Some(false), "a password starts hidden");
+    let drawn = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| view.read(app).connection_secret_drawn_for_test(app))
+    };
+    assert_eq!(
+        drawn(cx),
+        Some("••••••••".to_owned()),
+        "the field draws one bullet per character, not the password"
+    );
+
+    // The eye is a press of its own: it changes what the field draws, not whether the
+    // field is a password. The pointer rests on it first, the way a person's does,
+    // which is also when the tooltip is up.
+    hover(cx, "field.reveal");
+    click(cx, "field.reveal");
+    assert_eq!(
+        revealed(cx),
+        Some(true),
+        "pressing the eye shows the password that was typed"
+    );
+    assert_eq!(
+        drawn(cx),
+        Some("rdp-pass".to_owned()),
+        "the line the field draws is the password itself"
+    );
+    click(cx, "field.reveal");
+    assert_eq!(revealed(cx), Some(false), "pressing it again hides it");
+    assert_eq!(
+        drawn(cx),
+        Some("••••••••".to_owned()),
+        "and the bullets are back"
+    );
+}
+
+#[gpui::test]
+async fn the_eye_shows_the_ssh_password_too(cx: &mut TestAppContext) {
+    let (view, cx, _dir) = dialog_view(cx, Vec::new());
+    click(cx, "hosts.new");
+    click(cx, "hosts.auth.remote.method.password");
+    type_into(cx, "hosts.field.secret", "ssh-pass");
+    let revealed = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| view.read(app).host_secret_revealed_for_test(app))
+    };
+    assert_eq!(revealed(cx), Some(false));
+    click(cx, "field.reveal");
+    assert_eq!(
+        revealed(cx),
+        Some(true),
+        "the same control works on the host form"
+    );
+    click(cx, "field.reveal");
+    assert_eq!(revealed(cx), Some(false));
+}
+
+#[gpui::test]
 async fn a_desktop_connection_starts_with_the_password_typed_in_its_form(cx: &mut TestAppContext) {
     let dir = TempDir::new("desktop-secret-connect");
     let (view, cx) = hosts_view(cx, dir.store());
