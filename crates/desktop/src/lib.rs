@@ -54,10 +54,17 @@ pub fn callback_panics() -> u64 {
     CALLBACK_PANICS.load(Ordering::Relaxed)
 }
 
-/// Sessions no longer hold a native handle, so a worker is always joined; this
-/// stays for the callers that used to watch for a leaked one.
+/// Incremented when a session's worker outlived the shutdown wait and was left to
+/// finish on its own. Its event sink stays alive with it, so nothing it delivers
+/// reaches freed memory; the count is a diagnostic, not a leak of the handle.
+static LEAKED_HANDLES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn count_leaked_handle() {
+    LEAKED_HANDLES.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn leaked_handles() -> u64 {
-    0
+    LEAKED_HANDLES.load(Ordering::Relaxed)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,7 +82,14 @@ pub struct VncSecurity(pub u32);
 impl VncSecurity {
     pub const NONE: VncSecurity = VncSecurity(ffi::SD_VNC_SECURITY_NONE);
     pub const VNC_AUTH: VncSecurity = VncSecurity(ffi::SD_VNC_SECURITY_VNC_AUTH);
+    /// Anonymous Diffie-Hellman TLS, RFB security type 18. This build has no
+    /// anonymous cipher suites, so a server that offers only this type is refused
+    /// with Failure::UnsupportedSecurity; the bit is kept so a host can record the
+    /// policy it asked for.
     pub const TLS: VncSecurity = VncSecurity(ffi::SD_VNC_SECURITY_TLS);
+    /// VeNCrypt (RFB security type 19). Its certificate forms (X509Vnc, X509None)
+    /// are the encrypted sessions this build completes; its anonymous TLS forms
+    /// are refused for the same reason as VncSecurity::TLS.
     pub const VENCRYPT: VncSecurity = VncSecurity(ffi::SD_VNC_SECURITY_VENCRYPT);
 
     /// What an unconfigured session asks for: the two types that need no
@@ -402,7 +416,8 @@ pub fn backend_info(protocol: Protocol) -> Result<String, Error> {
     Ok(match protocol {
         Protocol::Rdp => "shellune RDP client (native, no external library)".to_owned(),
         Protocol::Vnc => "shellune VNC client (native, no external library) \
-             security=none,vncauth,tls,vencrypt encodings=raw,copyrect clipboard=text"
+             security=none,vncauth,vencrypt-x509 anonymous-tls=refused encodings=raw,copyrect \
+             clipboard=text"
             .to_owned(),
     })
 }

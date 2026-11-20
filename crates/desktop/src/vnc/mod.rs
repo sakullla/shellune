@@ -25,6 +25,13 @@ use std::time::{Duration, Instant};
 /// A session dropped by the server is retried once before it is reported.
 const ATTEMPTS: u8 = 2;
 
+/// How long a drop waits for the worker before leaving it to finish on its own.
+///
+/// The worker can be parked in a name lookup or a multi-address connect that has
+/// no timeout of its own, and the drop runs on the thread that owns the handle
+/// (the UI thread). The wait is bounded so that thread is never held longer.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// What the host asked the session to configure before it connected.
 pub(super) struct Config {
     pub(super) host: String,
@@ -205,15 +212,24 @@ impl Client {
         }
     }
 
-    /// Waits for the worker to end, at most `millis`; the worker is never detached,
-    /// so a later call still reaps it.
+    /// Waits for the worker to end, at most `millis`; a worker that outlives the
+    /// wait is still reaped by a later call.
     pub(super) fn wait(&mut self, millis: u32) -> Result<(), Error> {
-        let deadline = Instant::now() + Duration::from_millis(u64::from(millis));
+        if self.join_worker(Duration::from_millis(u64::from(millis))) {
+            Ok(())
+        } else {
+            Err(Error::Timeout)
+        }
+    }
+
+    /// Joins the worker if it finishes within `timeout`.
+    fn join_worker(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
         loop {
             match self.worker.as_ref() {
                 Some(worker) if !worker.is_finished() => {
                     if Instant::now() >= deadline {
-                        return Err(Error::Timeout);
+                        return false;
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }
@@ -222,9 +238,9 @@ impl Client {
                         let _ = worker.join();
                     }
                     self.commands = None;
-                    return Ok(());
+                    return true;
                 }
-                None => return Ok(()),
+                None => return true,
             }
         }
     }
@@ -292,8 +308,11 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         self.control.stop();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        if !self.join_worker(SHUTDOWN_TIMEOUT) {
+            // The worker is parked in something that cannot be interrupted (a name
+            // lookup, a connect to an address that never answers). It is left to
+            // finish on its own; the sink it feeds stays alive through the emitter.
+            crate::count_leaked_handle();
         }
     }
 }

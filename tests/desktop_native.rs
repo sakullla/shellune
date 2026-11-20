@@ -876,9 +876,12 @@ fn the_vnc_engine_reports_itself_and_links_no_protocol_library() {
         !info.to_ascii_lowercase().contains("libvncclient"),
         "{info}"
     );
-    for security in ["none", "vncauth", "tls", "vencrypt"] {
+    for security in ["none", "vncauth", "vencrypt-x509"] {
         assert!(info.contains(security), "{security} is not claimed: {info}");
     }
+    // Anonymous TLS is not a capability this build has, and the report says so
+    // rather than claiming a type the handshake would refuse.
+    assert!(info.contains("anonymous-tls=refused"), "{info}");
 }
 
 #[test]

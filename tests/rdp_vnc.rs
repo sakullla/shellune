@@ -18,14 +18,22 @@
 //! * SHELLUNE_VNC_HOST / _PORT / _PASSWORD - a VNC server using None or VncAuth;
 //! * SHELLUNE_VNC_PASSWORD_HOST - a second VNC server (VncAuth) so the two-server
 //!   requirement is met;
-//! * SHELLUNE_VNC_TLS_HOST / _PORT / _PASSWORD - a server offering TLS or
-//!   VeNCrypt (a certificate is presented for the user to accept);
+//! * SHELLUNE_VNC_TLS_HOST / _PORT / _PASSWORD - a server offering certificate
+//!   TLS or VeNCrypt (a certificate is presented for the user to accept);
+//! * SHELLUNE_VNC_MIXED_HOST / _PORT / _PASSWORD - a server offering anonymous
+//!   TLS and certificate TLS together, so the certificate form has to be chosen;
+//! * SHELLUNE_VNC_ANON_HOST / _PORT - a server offering only anonymous TLS, which
+//!   this build has to refuse with UnsupportedSecurity;
+//! * SHELLUNE_VNC_OBSERVE (an ssh target), _USER, _DISPLAY and _XAUTHORITY - the
+//!   machine and X session whose pointer, keys and clipboard are read back with
+//!   xdotool, xterm and xclip;
 //! * SHELLUNE_VNC_BAD_PASSWORD - the password to offer the server above to make it
 //!   refuse the credentials.
 //!
 //! When a variable is missing the endpoint is listed with the reason its
 //! verification did not run. Nothing in this file is skipped silently.
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use shellune_desktop::{
@@ -49,21 +57,29 @@ enum Kind {
     Vnc,
     /// A second VNC server, so two independent implementations are covered.
     VncSecond,
-    /// A VNC server offering TLS or VeNCrypt.
+    /// A VNC server offering certificate TLS or VeNCrypt.
     VncTls,
+    /// A VNC server that offers anonymous TLS and certificate TLS together; the
+    /// certificate form must be chosen.
+    VncMixed,
+    /// A VNC server that offers only anonymous TLS, which this build must refuse
+    /// with a readable reason instead of failing inside a TLS handshake.
+    VncAnonymousTls,
     /// A VNC server that must refuse a deliberately wrong password.
     VncWrongPassword,
 }
 
 impl Kind {
     /// Every endpoint this matrix requires, in the order the report lists them.
-    const ALL: [Kind; 7] = [
+    const ALL: [Kind; 9] = [
         Kind::WindowsRdp,
         Kind::Xrdp,
         Kind::XrdpWrongPassword,
         Kind::Vnc,
         Kind::VncSecond,
         Kind::VncTls,
+        Kind::VncMixed,
+        Kind::VncAnonymousTls,
         Kind::VncWrongPassword,
     ];
 
@@ -76,6 +92,8 @@ impl Kind {
             Self::Vnc => "VNC (None or VncAuth)",
             Self::VncSecond => "VNC (second server)",
             Self::VncTls => "VNC over TLS or VeNCrypt",
+            Self::VncMixed => "VNC with anonymous and certificate TLS",
+            Self::VncAnonymousTls => "VNC with only anonymous TLS",
             Self::VncWrongPassword => "VNC with a refused password",
         }
     }
@@ -133,6 +151,18 @@ impl Kind {
                 "SHELLUNE_VNC_TLS_PORT",
                 None,
                 "SHELLUNE_VNC_TLS_PASSWORD",
+            ),
+            Self::VncMixed => (
+                "SHELLUNE_VNC_MIXED_HOST",
+                "SHELLUNE_VNC_MIXED_PORT",
+                None,
+                "SHELLUNE_VNC_MIXED_PASSWORD",
+            ),
+            Self::VncAnonymousTls => (
+                "SHELLUNE_VNC_ANON_HOST",
+                "SHELLUNE_VNC_ANON_PORT",
+                None,
+                "SHELLUNE_VNC_ANON_PASSWORD",
             ),
             Self::VncWrongPassword => (
                 "SHELLUNE_VNC_HOST",
@@ -201,7 +231,12 @@ impl Endpoint {
     /// What this endpoint may ask for.
     fn security(&self) -> VncSecurity {
         match self.kind {
-            Kind::VncTls => VncSecurity::TLS.with(VncSecurity::VENCRYPT),
+            // The encrypted endpoints answer through VeNCrypt; the standalone
+            // anonymous TLS type is part of what the policy asks for, and the
+            // anonymous endpoint exists to show it is refused.
+            Kind::VncTls | Kind::VncMixed | Kind::VncAnonymousTls => {
+                VncSecurity::TLS.with(VncSecurity::VENCRYPT)
+            }
             _ => VncSecurity::DEFAULT,
         }
     }
@@ -229,6 +264,69 @@ enum Outcome {
 /// counts as verified: a picture alone is not a working session, as a server that
 /// drops the connection after a few seconds would still deliver one.
 const SUSTAIN: Duration = Duration::from_secs(10);
+
+/// How much of the desktop the frames received so far have painted.
+///
+/// A first frame proves a working session only when the whole desktop is covered.
+/// The first update of a live server usually arrives as several dirty regions, and
+/// a 157x26 region is a picture of a corner, not of a desktop.
+#[derive(Default)]
+struct Coverage {
+    width: u32,
+    height: u32,
+    painted: Vec<bool>,
+    count: usize,
+}
+
+impl Coverage {
+    /// Marks one dirty region; true when that made the coverage complete.
+    fn add(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        desktop_width: u32,
+        desktop_height: u32,
+    ) -> bool {
+        if width <= 0 || height <= 0 || desktop_width == 0 || desktop_height == 0 {
+            return self.complete();
+        }
+        if self.width != desktop_width || self.height != desktop_height {
+            self.width = desktop_width;
+            self.height = desktop_height;
+            self.painted = vec![false; (desktop_width as usize) * (desktop_height as usize)];
+            self.count = 0;
+        }
+        let left = x.max(0) as u32;
+        let top = y.max(0) as u32;
+        let right = (x.max(0) as u32)
+            .saturating_add(width as u32)
+            .min(self.width);
+        let bottom = (y.max(0) as u32)
+            .saturating_add(height as u32)
+            .min(self.height);
+        for row in top..bottom {
+            let start = (row as usize) * (self.width as usize);
+            for column in left..right {
+                let index = start + column as usize;
+                if !self.painted[index] {
+                    self.painted[index] = true;
+                    self.count += 1;
+                }
+            }
+        }
+        self.complete()
+    }
+
+    fn complete(&self) -> bool {
+        !self.painted.is_empty() && self.count == self.painted.len()
+    }
+
+    fn painted(&self) -> (usize, usize) {
+        (self.count, self.painted.len())
+    }
+}
 
 /// Runs the matrix for one endpoint.
 fn verify(endpoint: &Endpoint) -> Outcome {
@@ -272,14 +370,20 @@ fn verify(endpoint: &Endpoint) -> Outcome {
     // a server that asks for nothing has no answer to prove.
     let mut certificate_answer_failed = false;
     let mut frames = 0usize;
+    let mut coverage = Coverage::default();
     let mut first_frame = false;
+    // Only the VNC endpoints are judged by full coverage. An RDP desktop paints
+    // through its own update stream, and the first frame is the same evidence it
+    // has always been there.
+    let covered = endpoint.kind.protocol() == Protocol::Vnc;
     let mut failure: Option<(Failure, String)> = None;
 
     // One step of the session, shared by both phases below: certificates are
-    // answered, frames counted, and a failure remembered.
+    // answered, frames counted and their regions marked, and a failure remembered.
     let step = |client: &DesktopClient,
                 event: Event,
                 frames: &mut usize,
+                coverage: &mut Coverage,
                 first_frame: &mut bool,
                 failure: &mut Option<(Failure, String)>,
                 certificate_asked: &mut bool,
@@ -295,10 +399,22 @@ fn verify(endpoint: &Endpoint) -> Outcome {
                     *certificate_answer_failed = true;
                 }
             }
-            Event::Frame { width, height, .. } => {
+            Event::Frame {
+                x,
+                y,
+                width,
+                height,
+                desktop_width,
+                desktop_height,
+                ..
+            } => {
                 if width > 0 && height > 0 {
                     *frames += 1;
-                    *first_frame = true;
+                    *first_frame = if covered {
+                        coverage.add(x, y, width, height, desktop_width, desktop_height)
+                    } else {
+                        true
+                    };
                 }
             }
             Event::State {
@@ -323,6 +439,7 @@ fn verify(endpoint: &Endpoint) -> Outcome {
                 &client,
                 event,
                 &mut frames,
+                &mut coverage,
                 &mut first_frame,
                 &mut failure,
                 &mut certificate_asked,
@@ -331,6 +448,24 @@ fn verify(endpoint: &Endpoint) -> Outcome {
         }
     }
     if let Some((reported, reason)) = failure.take() {
+        if endpoint.kind == Kind::VncAnonymousTls {
+            return match reported {
+                Failure::UnsupportedSecurity if reason.contains("anonymous TLS") => {
+                    Outcome::Verified(vec![("anonymous TLS refused", true)])
+                }
+                Failure::UnsupportedSecurity => Outcome::Unverified(format!(
+                    "the anonymous TLS endpoint was refused, but not for the anonymous TLS \
+                     reason: {reason}"
+                )),
+                // A TLS alert or a closed socket here means the client tried the
+                // handshake and failed inside it, which is exactly what must not
+                // happen any more.
+                other => Outcome::Failed(format!(
+                    "the anonymous TLS endpoint failed as {other:?} instead of being refused \
+                     up front ({reason})"
+                )),
+            };
+        }
         if endpoint.kind.expects_refusal() {
             return refusal_outcome(endpoint, reported, &reason);
         }
@@ -347,9 +482,20 @@ fn verify(endpoint: &Endpoint) -> Outcome {
             )),
         };
     }
+    if endpoint.kind == Kind::VncAnonymousTls {
+        return Outcome::Failed(
+            "the server accepted an anonymous TLS session this build is supposed to refuse"
+                .to_owned(),
+        );
+    }
     if !first_frame {
+        let (painted, total) = coverage.painted();
         steps.push(("first frame", false));
-        return Outcome::Failed("the session connected but drew no frame".to_owned());
+        return Outcome::Failed(if covered {
+            format!("the session connected but painted {painted} of {total} desktop pixels")
+        } else {
+            "the session connected but drew no frame".to_owned()
+        });
     }
     // A session that comes up with a password the server was supposed to refuse is
     // exactly the silent pass this matrix must never produce.
@@ -374,6 +520,7 @@ fn verify(endpoint: &Endpoint) -> Outcome {
                 &client,
                 event,
                 &mut frames,
+                &mut coverage,
                 &mut first_frame,
                 &mut failure,
                 &mut certificate_asked,
@@ -389,7 +536,14 @@ fn verify(endpoint: &Endpoint) -> Outcome {
         ));
     }
 
-    steps.push(("first frame", true));
+    steps.push((
+        if covered {
+            "desktop covered"
+        } else {
+            "first frame"
+        },
+        true,
+    ));
     // Sustained: the session survived the whole window above, and its worker is
     // still running at the end of it. Repaints are not part of this check, since a
     // desktop that does not change sends no updates.
@@ -431,6 +585,7 @@ fn verify(endpoint: &Endpoint) -> Outcome {
 /// the second attempt is a new, working session and not a cached picture.
 #[test]
 fn the_vnc_endpoint_accepts_a_second_session() {
+    let _sessions = vnc_sessions();
     let endpoint = match Endpoint::from_env(Kind::Vnc) {
         Ok(endpoint) => endpoint,
         Err(reason) => {
@@ -458,13 +613,26 @@ fn the_vnc_endpoint_accepts_a_second_session() {
         client.connect().expect("connect");
 
         let deadline = Instant::now() + PATIENCE;
+        let mut coverage = Coverage::default();
         let mut first_frame = false;
         let mut failure = None;
         while Instant::now() < deadline && !first_frame && failure.is_none() {
             match client.recv_timeout(Duration::from_millis(100)) {
-                Ok(Event::Frame { width, height, .. }) if width > 0 && height > 0 => {
-                    first_frame = true;
-                    println!("VNC reconnect attempt {attempt}: {width}x{height} frame");
+                Ok(Event::Frame {
+                    x,
+                    y,
+                    width,
+                    height,
+                    desktop_width,
+                    desktop_height,
+                    ..
+                }) if width > 0 && height > 0 => {
+                    if coverage.add(x, y, width, height, desktop_width, desktop_height) {
+                        first_frame = true;
+                        println!(
+                            "VNC reconnect attempt {attempt}: the whole {desktop_width}x{desktop_height} desktop was painted"
+                        );
+                    }
                 }
                 Ok(Event::Certificate { request_id, .. }) => {
                     client.answer_certificate(request_id, true).expect("answer");
@@ -479,20 +647,122 @@ fn the_vnc_endpoint_accepts_a_second_session() {
                 Err(_) => {}
             }
         }
-        assert!(first_frame, "attempt {attempt} drew no frame: {failure:?}");
+        let (painted, total) = coverage.painted();
+        assert!(
+            first_frame,
+            "attempt {attempt} painted {painted} of {total} desktop pixels: {failure:?}"
+        );
         assert!(client.cancel().is_ok());
         client.wait_for_worker(PATIENCE).expect("the worker stops");
     }
 }
 
-/// Drives the endpoint's pointer and keyboard, and offers text on its clipboard.
-/// The observable result is on the server's own screen: after this runs, the
-/// pointer is where it was sent and the right click has left its menu open. The
-/// test asserts the protocol steps were accepted while the session stayed live.
+/// The real VNC tests share one server. Two viewers on one session would fight
+/// over the clipboard and the pointer, so these tests take turns.
+static VNC_SESSIONS: Mutex<()> = Mutex::new(());
+
+fn vnc_sessions() -> std::sync::MutexGuard<'static, ()> {
+    VNC_SESSIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The machine the endpoint's desktop can be inspected on, reached over ssh.
+///
+/// Configured with `SHELLUNE_VNC_OBSERVE` (a user@host ssh target),
+/// `SHELLUNE_VNC_OBSERVE_DISPLAY` (default `:21`) and optionally
+/// `SHELLUNE_VNC_OBSERVE_XAUTHORITY`. The tools it runs are the ones that answer
+/// the question directly: `xdotool` for the pointer, `xev` for key events and
+/// `xclip` for the clipboard.
+struct Observer {
+    target: String,
+    /// The user whose X session is inspected. The ssh login may be another user
+    /// (root, for instance), and su is how the command reaches the session owner.
+    user: Option<String>,
+    display: String,
+    authority: Option<String>,
+}
+
+impl Observer {
+    fn from_env() -> Result<Observer, String> {
+        let target = std::env::var("SHELLUNE_VNC_OBSERVE")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "SHELLUNE_VNC_OBSERVE is not set".to_owned())?;
+        let display = std::env::var("SHELLUNE_VNC_OBSERVE_DISPLAY")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| ":21".to_owned());
+        let authority = std::env::var("SHELLUNE_VNC_OBSERVE_XAUTHORITY")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let user = std::env::var("SHELLUNE_VNC_OBSERVE_USER")
+            .ok()
+            .filter(|value| !value.is_empty());
+        Ok(Observer {
+            target,
+            user,
+            display,
+            authority,
+        })
+    }
+
+    fn run(&self, command: &str) -> Result<String, String> {
+        let mut inner = format!("DISPLAY={} ", self.display);
+        if let Some(authority) = &self.authority {
+            inner.push_str(&format!("XAUTHORITY={authority} "));
+        }
+        inner.push_str(command);
+        let shell = match &self.user {
+            Some(user) => format!("su - {user} -c {}", quote(&inner)),
+            None => inner,
+        };
+        let output = std::process::Command::new("ssh")
+            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
+            .arg(&self.target)
+            .arg(shell)
+            .output()
+            .map_err(|error| format!("ssh could not run: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "{command}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
+/// One shell word, quoted so a command with its own quotes survives su -c.
+fn quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for character in value.chars() {
+        if character == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(character);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+/// Drives the endpoint's pointer, keyboard and clipboard, and reads each one back
+/// on the server's own desktop: `xdotool` reports the pointer where it was sent,
+/// `xev` logs the key, and `xclip` returns the text the client offered. The
+/// assertions are on those observations, not on the calls having returned.
 #[test]
 fn the_vnc_endpoint_takes_pointer_keyboard_and_clipboard() {
+    let _sessions = vnc_sessions();
     let endpoint = match Endpoint::from_env(Kind::Vnc) {
         Ok(endpoint) => endpoint,
+        Err(reason) => {
+            println!("VNC input: not verified ({reason})");
+            return;
+        }
+    };
+    let observer = match Observer::from_env() {
+        Ok(observer) => observer,
         Err(reason) => {
             println!("VNC input: not verified ({reason})");
             return;
@@ -517,15 +787,20 @@ fn the_vnc_endpoint_takes_pointer_keyboard_and_clipboard() {
     client.connect().expect("connect");
 
     let deadline = Instant::now() + PATIENCE;
+    let mut coverage = Coverage::default();
     let mut live = false;
     while Instant::now() < deadline && !live {
         match client.recv_timeout(Duration::from_millis(100)) {
-            Ok(Event::Frame { .. })
-            | Ok(Event::State {
-                state: State::Connected,
+            Ok(Event::Frame {
+                x,
+                y,
+                width,
+                height,
+                desktop_width,
+                desktop_height,
                 ..
-            }) => {
-                live = true;
+            }) if width > 0 && height > 0 => {
+                live = coverage.add(x, y, width, height, desktop_width, desktop_height);
             }
             Ok(Event::Certificate { request_id, .. }) => {
                 client.answer_certificate(request_id, true).expect("answer");
@@ -538,26 +813,92 @@ fn the_vnc_endpoint_takes_pointer_keyboard_and_clipboard() {
             Ok(_) | Err(_) => {}
         }
     }
-    assert!(live, "the endpoint never became live");
+    assert!(live, "the endpoint never painted its desktop");
 
-    // The pointer, a right click (a menu opens on the desktop) and a key press.
-    client.pointer(400, 300, PointerButtons(0)).expect("move");
+    // Keyboard: a terminal whose command is cat writes what it reads to a file, so
+    // the key the client sent is read back as text. Any menu left open by an
+    // earlier run holds a keyboard grab, so it is dismissed first.
+    observer.run("xdotool key Escape").ok();
+    observer
+        .run("pkill -f '^xterm -geometry 40x5' || true; rm -f /tmp/shellune-key.txt")
+        .unwrap_or_else(|error| panic!("xterm cleanup: {error}"));
+    observer
+        .run(
+            "nohup xterm -geometry 40x5+100+100 -e sh -c 'cat > /tmp/shellune-key.txt' \
+             >/dev/null 2>&1 </dev/null &",
+        )
+        .unwrap_or_else(|error| panic!("xterm start: {error}"));
+    let mut window = String::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && window.is_empty() {
+        if let Ok(found) = observer.run("xdotool search --class xterm | head -1") {
+            window = found.trim().to_owned();
+        }
+        if window.is_empty() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    assert!(
+        !window.is_empty(),
+        "xterm opened no window to receive the key"
+    );
+    observer
+        .run(&format!("xdotool windowactivate --sync {window}"))
+        .unwrap_or_else(|error| panic!("xterm focus: {error}"));
+    // 'a' then Return: cat writes the line it read.
+    client.key(0x1e, 0x61, true, false).expect("key down");
+    client.key(0x1e, 0x61, false, false).expect("key up");
+    client.key(0x1e, 0xff0d, true, false).expect("return down");
+    client.key(0x1e, 0xff0d, false, false).expect("return up");
+    let mut typed = String::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !typed.contains('a') {
+        std::thread::sleep(Duration::from_millis(200));
+        typed = observer
+            .run("cat /tmp/shellune-key.txt")
+            .unwrap_or_default();
+    }
+    let _ = observer.run("pkill -f '^xterm -geometry 40x5' || true");
+    assert!(
+        typed.contains('a'),
+        "the terminal read {typed:?}, so the key press did not reach the desktop"
+    );
+
+    // Pointer: the server's own pointer must be where the client sent it.
+    client.pointer(321, 234, PointerButtons(0)).expect("move");
+    std::thread::sleep(Duration::from_millis(400));
+    let location = observer
+        .run("xdotool getmouselocation")
+        .unwrap_or_else(|error| panic!("xdotool: {error}"));
+    assert!(
+        location.contains("x:321 y:234"),
+        "the pointer is not where it was sent: {location}"
+    );
+
+    // Clipboard: the text the client offered is what the server's X server holds.
+    let text = format!("shellune endpoint text {}", std::process::id());
+    client.clipboard(&text).expect("clipboard");
+    let mut clipboard = String::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && clipboard.trim_end_matches('\n') != text {
+        std::thread::sleep(Duration::from_millis(200));
+        clipboard = observer
+            .run("xclip -o -selection clipboard")
+            .unwrap_or_else(|error| panic!("xclip: {error}"));
+    }
+    assert_eq!(
+        clipboard.trim_end_matches('\n'),
+        text,
+        "the server's clipboard does not hold the offered text"
+    );
+
+    // A right click on the desktop; the session must still be live afterwards.
     client
         .pointer(400, 300, PointerButtons::RIGHT)
         .expect("right press");
     client
         .pointer(400, 300, PointerButtons(0))
         .expect("release");
-    client.key(0x1e, 0x61, true, false).expect("key down");
-    client.key(0x1e, 0x61, false, false).expect("key up");
-    client
-        .clipboard("shellune endpoint text")
-        .expect("clipboard");
-    std::thread::sleep(Duration::from_millis(800));
-    println!(
-        "VNC input: pointer 400,300 and a right click were sent, plus one key and one clipboard text"
-    );
-    // The session must still be live after the input, not have failed on it.
     let after = client.recv_timeout(Duration::from_millis(500));
     assert!(
         !matches!(
@@ -568,6 +909,9 @@ fn the_vnc_endpoint_takes_pointer_keyboard_and_clipboard() {
             })
         ),
         "the session ended on the input: {after:?}"
+    );
+    println!(
+        "VNC input: the terminal read the key back, xdotool reports x:321 y:234, xclip holds the offered text"
     );
     client.cancel().expect("cancel");
     client.wait_for_worker(PATIENCE).expect("the worker stops");
@@ -603,6 +947,7 @@ fn refusal_outcome(endpoint: &Endpoint, reported: Failure, reason: &str) -> Outc
 /// The matrix, as one report.
 #[test]
 fn the_endpoint_matrix_reports_every_endpoint_it_could_not_verify() {
+    let _sessions = vnc_sessions();
     let mut verified = Vec::new();
     let mut unverified = Vec::new();
     for kind in Kind::ALL {

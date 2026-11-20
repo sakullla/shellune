@@ -97,8 +97,105 @@ pub(super) struct Opened {
 /// Security types as RFB numbers them.
 const NONE: u8 = 1;
 const VNC_AUTH: u8 = 2;
-const TLS: u8 = 18;
+/// Anonymous Diffie-Hellman TLS (TigerVNC's extension). This build has no
+/// anonymous cipher suites, so it is refused instead of attempted.
+const ANONYMOUS_TLS: u8 = 18;
 const VENCRYPT: u8 = 19;
+
+/// VeNCrypt sub-types, numbered as the specification numbers them.
+const VENCRYPT_PLAIN: u32 = 256;
+const VENCRYPT_TLS_NONE: u32 = 257;
+const VENCRYPT_TLS_VNC: u32 = 258;
+const VENCRYPT_TLS_PLAIN: u32 = 259;
+const VENCRYPT_X509_NONE: u32 = 260;
+const VENCRYPT_X509_VNC: u32 = 261;
+const VENCRYPT_X509_PLAIN: u32 = 262;
+const VENCRYPT_SASL_NONE: u32 = 263;
+const VENCRYPT_SASL_VNC: u32 = 264;
+/// LibVNCServer lists its plain security types inside VeNCrypt as well: 1 and 2
+/// mean no authentication and VNC authentication on the unwrapped connection.
+const VENCRYPT_COMPAT_NONE: u32 = 1;
+const VENCRYPT_COMPAT_VNC: u32 = 2;
+
+/// One VeNCrypt sub-type this client can complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SubType {
+    /// TLS with a certificate, no further credentials.
+    X509None,
+    /// TLS with a certificate, then VNC authentication.
+    X509Vnc,
+    /// LibVNCServer's no-authentication form, without TLS.
+    PlainNone,
+    /// LibVNCServer's VNC authentication form, without TLS.
+    PlainVnc,
+}
+
+impl SubType {
+    fn wire(self) -> u32 {
+        match self {
+            SubType::X509None => VENCRYPT_X509_NONE,
+            SubType::X509Vnc => VENCRYPT_X509_VNC,
+            SubType::PlainNone => VENCRYPT_COMPAT_NONE,
+            SubType::PlainVnc => VENCRYPT_COMPAT_VNC,
+        }
+    }
+
+    fn tls(self) -> bool {
+        matches!(self, SubType::X509None | SubType::X509Vnc)
+    }
+
+    fn needs_password(self) -> bool {
+        matches!(self, SubType::X509Vnc | SubType::PlainVnc)
+    }
+}
+
+/// Why no sub-type could be chosen.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Refusal {
+    /// Every sub-type the server offers is anonymous TLS.
+    Anonymous,
+    /// Something else this client cannot complete.
+    Unsupported,
+}
+
+/// The sentence a refusal is shown with.
+pub(super) const ANONYMOUS_TLS_REASON: &str =
+    "the server only offers anonymous TLS, which this build cannot provide";
+
+/// Picks the best sub-type this client can complete.
+///
+/// A certificate beats the unwrapped compatibility forms, and VNC
+/// authentication beats no credentials when a password is available. The
+/// anonymous TLS forms (257, 258) are never candidates: they need an anonymous
+/// Diffie-Hellman cipher suite, which this build does not have.
+pub(super) fn choose_subtype(subtypes: &[u32], has_password: bool) -> Result<SubType, Refusal> {
+    let order: &[SubType] = if has_password {
+        &[
+            SubType::X509Vnc,
+            SubType::X509None,
+            SubType::PlainVnc,
+            SubType::PlainNone,
+        ]
+    } else {
+        &[SubType::X509None, SubType::PlainNone]
+    };
+    for kind in order {
+        if subtypes.contains(&kind.wire()) {
+            return Ok(*kind);
+        }
+    }
+    let mut anonymous = true;
+    for kind in subtypes {
+        if !matches!(*kind, VENCRYPT_TLS_NONE | VENCRYPT_TLS_VNC) {
+            anonymous = false;
+        }
+    }
+    if anonymous && !subtypes.is_empty() {
+        Err(Refusal::Anonymous)
+    } else {
+        Err(Refusal::Unsupported)
+    }
+}
 
 /// Opens the connection and completes the handshake. A cancel at any step ends
 /// the attempt with `Failure::Cancelled`, which the caller reports as Closed.
@@ -117,13 +214,6 @@ pub(super) fn open(config: &Config, emit: &Emit, control: &Arc<Control>) -> Resu
         }
         VNC_AUTH => {
             authenticate(&mut transport, &config.password)?;
-            result(&mut transport, minor)?;
-        }
-        TLS => {
-            if read_u8(&mut transport)? == 0 {
-                return Err(Ended::new(Failure::Tls, "the server refused to start TLS"));
-            }
-            transport = secure(transport, config, emit, control)?;
             result(&mut transport, minor)?;
         }
         VENCRYPT => {
@@ -245,12 +335,7 @@ fn security_type(transport: &mut Transport, config: &Config, minor: u8) -> Resul
     if minor < 7 {
         let value = read_u32(transport)?;
         let chosen = u8::try_from(value).unwrap_or(0);
-        let allowed = match chosen {
-            NONE => config.security & 0x1 != 0,
-            VNC_AUTH => config.security & 0x2 != 0,
-            _ => false,
-        };
-        if !allowed {
+        if !type_allowed(chosen, config.security) {
             return Err(Ended::new(
                 Failure::UnsupportedSecurity,
                 format!("the server selected security type {value}, which this connection refuses"),
@@ -268,14 +353,11 @@ fn security_type(transport: &mut Transport, config: &Config, minor: u8) -> Resul
     }
     let mut types = vec![0u8; usize::from(count)];
     read_exact(transport, &mut types)?;
-    let allowed = |kind: u8| match kind {
-        NONE => config.security & 0x1 != 0,
-        VNC_AUTH => config.security & 0x2 != 0,
-        TLS => config.security & 0x4 != 0,
-        VENCRYPT => config.security & 0x8 != 0,
-        _ => false,
-    };
-    match types.iter().copied().find(|kind| allowed(*kind)) {
+    match types
+        .iter()
+        .copied()
+        .find(|kind| type_allowed(*kind, config.security))
+    {
         Some(chosen) => {
             send(transport, &[chosen])?;
             Ok(chosen)
@@ -284,18 +366,37 @@ fn security_type(transport: &mut Transport, config: &Config, minor: u8) -> Resul
             // 0 names no type: the connection cannot go on, and saying so is the
             // protocol's own answer.
             let _ = send(transport, &[0]);
+            let anonymous = types.iter().all(|kind| *kind == ANONYMOUS_TLS);
             Err(Ended::new(
                 Failure::UnsupportedSecurity,
-                format!(
-                    "the server offers only security types this client refuses ({})",
-                    types
-                        .iter()
-                        .map(u8::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ),
+                if anonymous {
+                    ANONYMOUS_TLS_REASON.to_owned()
+                } else {
+                    format!(
+                        "the server offers only security types this client refuses ({})",
+                        types
+                            .iter()
+                            .map(u8::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                },
             ))
         }
+    }
+}
+
+/// Whether the policy in `mask` allows this security type.
+///
+/// Anonymous TLS (18) is never allowed, even when the policy names it: this build
+/// has no anonymous cipher suites, and selecting it would only fail later inside
+/// the handshake.
+fn type_allowed(kind: u8, mask: u32) -> bool {
+    match kind {
+        NONE => mask & 0x1 != 0,
+        VNC_AUTH => mask & 0x2 != 0,
+        VENCRYPT => mask & 0x8 != 0,
+        _ => false,
     }
 }
 
@@ -421,55 +522,75 @@ fn vencrypt(
         .map(|chunk| u32::from_be_bytes(*chunk))
         .collect();
     super::trace(&format!("VeNCrypt sub-types {subtypes:?}"));
-    // Encrypted authentication with the VNC password is the strongest form this
-    // client can complete; TLS with no credentials is next. TigerVNC numbers its
-    // sub-types 256 and up while the VeNCrypt specification numbers them 2 and 3,
-    // so both forms of the two names are accepted.
-    // TLSVnc (3, or TigerVNC's 258) and X509Vnc (6, or 261) carry the VNC
-    // password inside TLS; their None forms carry no credentials. The anonymous
-    // TLS forms (TLSNone/TLSVnc as TigerVNC names the anon-DH family) cannot be
-    // completed by a client that requires a certificate.
-    let rank = |kind: u32| -> Option<u8> {
-        if !config.password.is_empty() && matches!(kind, 3 | 258 | 6 | 261) {
-            Some(0)
-        } else if matches!(kind, 2 | 257 | 5 | 260) {
-            Some(1)
-        } else {
-            None
+    let kind = match choose_subtype(&subtypes, !config.password.is_empty()) {
+        Ok(kind) => kind,
+        Err(Refusal::Anonymous) => {
+            return Err(Ended::new(
+                Failure::UnsupportedSecurity,
+                ANONYMOUS_TLS_REASON,
+            ));
+        }
+        Err(Refusal::Unsupported) => {
+            return Err(Ended::new(
+                Failure::UnsupportedSecurity,
+                format!(
+                    "the server offers VeNCrypt sub-types this client cannot complete ({})",
+                    describe_subtypes(&subtypes)
+                ),
+            ));
         }
     };
-    let chosen = subtypes
+    super::trace(&format!("VeNCrypt sub-type {kind:?}"));
+    send(&mut transport, &kind.wire().to_be_bytes())?;
+    if kind.tls() {
+        // TigerVNC marks the TLS upgrade with a 1 byte here; a server that starts
+        // the handshake directly sends a TLS record type instead, which is put
+        // back in front of the stream.
+        let marker = read_u8(&mut transport)?;
+        if marker != 1 {
+            transport.push_back(marker);
+        }
+        let mut inner = secure(transport, config, emit, control)?;
+        if kind.needs_password() {
+            authenticate(&mut inner, &config.password)?;
+        }
+        result(&mut inner, 8)?;
+        Ok(inner)
+    } else {
+        // LibVNCServer's unwrapped forms: the authentication and its result follow
+        // directly on the connection.
+        if kind.needs_password() {
+            authenticate(&mut transport, &config.password)?;
+        }
+        result(&mut transport, 8)?;
+        Ok(transport)
+    }
+}
+
+/// The protocol name of a VeNCrypt sub-type, for diagnostics.
+fn subtype_name(kind: u32) -> &'static str {
+    match kind {
+        VENCRYPT_PLAIN => "Plain",
+        VENCRYPT_TLS_NONE => "TLSNone",
+        VENCRYPT_TLS_VNC => "TLSVnc",
+        VENCRYPT_TLS_PLAIN => "TLSPlain",
+        VENCRYPT_X509_NONE => "X509None",
+        VENCRYPT_X509_VNC => "X509Vnc",
+        VENCRYPT_X509_PLAIN => "X509Plain",
+        VENCRYPT_SASL_NONE => "SASLNone",
+        VENCRYPT_SASL_VNC => "SASLVnc",
+        VENCRYPT_COMPAT_NONE => "None",
+        VENCRYPT_COMPAT_VNC => "VncAuth",
+        _ => "unknown",
+    }
+}
+
+fn describe_subtypes(subtypes: &[u32]) -> String {
+    subtypes
         .iter()
-        .copied()
-        .filter(|kind| rank(*kind).is_some())
-        .min_by_key(|kind| rank(*kind).unwrap_or(u8::MAX));
-    let Some(chosen) = chosen else {
-        return Err(Ended::new(
-            Failure::UnsupportedSecurity,
-            format!(
-                "the server offers VeNCrypt sub-types this client cannot complete ({})",
-                subtypes
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
-        ));
-    };
-    send(&mut transport, &chosen.to_be_bytes())?;
-    let vnc_auth = matches!(chosen, 3 | 258 | 6 | 261);
-    // TigerVNC marks the TLS upgrade with a 1 byte here; a server that starts the
-    // handshake directly sends a TLS record type instead, which is put back.
-    let marker = read_u8(&mut transport)?;
-    if marker != 1 {
-        transport.push_back(marker);
-    }
-    let mut inner = secure(transport, config, emit, control)?;
-    if vnc_auth {
-        authenticate(&mut inner, &config.password)?;
-    }
-    result(&mut inner, 8)?;
-    Ok(inner)
+        .map(|kind| format!("{kind}({})", subtype_name(*kind)))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn server_init(transport: &mut Transport) -> Result<(u16, u16), Ended> {
@@ -524,6 +645,55 @@ fn read_string(transport: &mut Transport) -> Result<String, Ended> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anonymous_vencrypt_sub_types_are_refused_with_a_readable_reason() {
+        assert_eq!(choose_subtype(&[258], true), Err(Refusal::Anonymous));
+        assert_eq!(choose_subtype(&[257], false), Err(Refusal::Anonymous));
+        assert_eq!(choose_subtype(&[257, 258], true), Err(Refusal::Anonymous));
+        assert!(ANONYMOUS_TLS_REASON.contains("anonymous TLS"));
+        assert!(ANONYMOUS_TLS_REASON.contains("cannot provide"));
+    }
+
+    #[test]
+    fn a_certificate_sub_type_wins_over_an_anonymous_one() {
+        assert_eq!(choose_subtype(&[258, 261], true), Ok(SubType::X509Vnc));
+        assert_eq!(choose_subtype(&[257, 260], false), Ok(SubType::X509None));
+        assert_eq!(choose_subtype(&[261, 260], true), Ok(SubType::X509Vnc));
+        // A VNC-authentication sub-type needs a password; without one the
+        // certificate form that carries no credentials is the only usable one.
+        assert_eq!(choose_subtype(&[261], false), Err(Refusal::Unsupported));
+    }
+
+    #[test]
+    fn libvnc_plain_forms_are_accepted_without_tls() {
+        assert_eq!(choose_subtype(&[1], false), Ok(SubType::PlainNone));
+        assert_eq!(choose_subtype(&[1, 2], true), Ok(SubType::PlainVnc));
+        assert_eq!(choose_subtype(&[1, 2], false), Ok(SubType::PlainNone));
+        assert_eq!(choose_subtype(&[2], false), Err(Refusal::Unsupported));
+        assert_eq!(choose_subtype(&[1, 260], true), Ok(SubType::X509None));
+    }
+
+    #[test]
+    fn the_old_numbering_is_not_read_as_a_password_type() {
+        // 3 and 6 are not VeNCrypt sub-types; treating them as TLSVnc/X509Vnc
+        // would select a number the server does not offer.
+        assert_eq!(choose_subtype(&[3, 6], true), Err(Refusal::Unsupported));
+        assert_eq!(
+            choose_subtype(&[256, 259, 262, 263, 264], true),
+            Err(Refusal::Unsupported)
+        );
+    }
+
+    #[test]
+    fn the_standalone_anonymous_tls_type_is_never_allowed() {
+        for mask in [0x4, 0x4 | 0x8, 0xC] {
+            assert!(!type_allowed(ANONYMOUS_TLS, mask), "mask {mask:#x}");
+        }
+        assert!(type_allowed(VENCRYPT, 0x8));
+        assert!(type_allowed(NONE, 0x1));
+        assert!(type_allowed(VNC_AUTH, 0x2));
+    }
 
     #[test]
     fn the_password_is_reversed_and_used_as_a_des_key() {
