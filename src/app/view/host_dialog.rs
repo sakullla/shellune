@@ -549,6 +549,14 @@ impl ShelluneView {
         }
     }
 
+    /// Saves the non-SSH connection and, when it was saved, connects to it at once.
+    fn save_and_connect_connection(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.save_connection(cx) else {
+            return;
+        };
+        self.connect_saved_connection(id, cx);
+    }
+
     /// One labelled field of the dialog.
     fn dialog_field(
         &self,
@@ -1718,11 +1726,22 @@ impl ShelluneView {
                 self.text_button(
                     SharedString::from("connection.save"),
                     strings.host_save,
-                    Variant::Primary,
+                    Variant::Secondary,
                     cx,
                     |view, cx| {
                         let _ = view.save_connection(cx);
                     },
+                )
+                .h(metrics.control_height()),
+            )
+            .child(
+                self.icon_text_button(
+                    SharedString::from("connection.save_connect"),
+                    Icon::Plug,
+                    strings.host_save_connect,
+                    Variant::Primary,
+                    cx,
+                    |view, cx| view.save_and_connect_connection(cx),
                 )
                 .h(metrics.control_height()),
             );

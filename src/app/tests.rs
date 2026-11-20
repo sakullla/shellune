@@ -39490,3 +39490,258 @@ fn addressed_text(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> St
             .expect("a protocol form is open")
     })
 }
+
+#[gpui::test]
+async fn non_ssh_dialog_save_and_connect_order_and_validation_failure(cx: &mut TestAppContext) {
+    let dir = TempDir::new("non-ssh-save-connect-validation");
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.simulate_resize(size(px(1400.0), px(1000.0)));
+    cx.run_until_parked();
+
+    click(cx, "hosts.new");
+    for protocol in [
+        "connection.protocol.rdp",
+        "connection.protocol.vnc",
+        "connection.protocol.serial",
+    ] {
+        click(cx, protocol);
+        redraw(cx);
+        let dialog = bounds_of(cx, "hosts.editor");
+        let cancel = bounds_of(cx, "connection.cancel");
+        let save = bounds_of(cx, "connection.save");
+        let save_connect = bounds_of(cx, "connection.save_connect");
+        for (name, bounds) in [
+            ("connection.cancel", cancel),
+            ("connection.save", save),
+            ("connection.save_connect", save_connect),
+        ] {
+            assert_inside_box(bounds, dialog, name);
+        }
+        assert!(
+            cancel.origin.x < save.origin.x && save.origin.x < save_connect.origin.x,
+            "{protocol} actions must be ordered cancel -> save -> save_connect: {cancel:?} {save:?} {save_connect:?}"
+        );
+    }
+
+    // Switch back to RDP, fill only the name (missing address), and press Save & Connect.
+    click(cx, "connection.protocol.rdp");
+    type_into(cx, "connection.field.name", "lab-rdp");
+    click(cx, "connection.save_connect");
+    redraw(cx);
+
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().protocol_draft().is_some()),
+        "validation failure must keep the non-SSH dialog open"
+    );
+    assert!(
+        cx.debug_bounds("connection.field.address.problem")
+            .is_some(),
+        "validation failure must show the inline field problem"
+    );
+    assert!(
+        cx.debug_bounds("connection.message").is_some(),
+        "validation failure must show the footer refusal banner"
+    );
+    assert_eq!(
+        typed_form_text(&view, cx).0,
+        "lab-rdp",
+        "validation failure must preserve already-typed form text"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).book().connections().is_empty()),
+        "validation failure must not save the connection"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).workspace().sessions().items().is_empty()),
+        "validation failure must not start any session"
+    );
+}
+
+#[gpui::test]
+async fn non_ssh_dialog_save_and_connect_starts_rdp_vnc_and_serial_sessions(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("non-ssh-save-connect-flow");
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.simulate_resize(size(px(1400.0), px(1000.0)));
+    cx.run_until_parked();
+
+    // 1. New RDP: Save & Connect saves and opens an RDP session.
+    click(cx, "hosts.new");
+    click(cx, "connection.protocol.rdp");
+    type_into(cx, "connection.field.address", "127.0.0.1");
+    clear_field(cx, "connection.field.port", 4);
+    type_into(cx, "connection.field.port", "1");
+    type_into(cx, "connection.field.name", "rdp-direct");
+    click(cx, "connection.save_connect");
+    cx.run_until_parked();
+
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().protocol_draft().is_none()),
+        "successful save & connect closes the RDP dialog"
+    );
+    let rdp_id = cx
+        .update(|_window, app| {
+            view.read(app)
+                .book()
+                .connections()
+                .iter()
+                .find(|record| record.name() == "rdp-direct")
+                .map(shellune_core::ConnectionRecord::id)
+        })
+        .expect("RDP connection saved");
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .sessions()
+                .items()
+                .iter()
+                .any(|session| {
+                    matches!(session.kind(), shellune_core::SessionKind::Rdp { host } if *host == rdp_id)
+                })
+        }),
+        "RDP save & connect must start an RDP session for the saved record"
+    );
+
+    // 2. Edit existing RDP: Save & Connect is present, updates record, and starts another session.
+    let sessions_before_edit =
+        cx.update(|_window, app| view.read(app).workspace().sessions().items().len());
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.edit_connection_for_test(rdp_id, cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("connection.save_connect").is_some(),
+        "edit dialog must also expose connection.save_connect"
+    );
+    type_into(cx, "connection.field.name", "-v2");
+    click(cx, "connection.save_connect");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .book()
+                .connection(rdp_id)
+                .map(|record| record.name().to_owned())
+        }),
+        Some("rdp-direct-v2".to_owned()),
+        "editing via save & connect must persist the updated record"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).workspace().sessions().items().len())
+            > sessions_before_edit,
+        "editing via save & connect must start a new session"
+    );
+
+    // 3. New VNC: Save & Connect saves and opens a VNC session.
+    click(cx, "nav.hosts");
+    click(cx, "hosts.new");
+    click(cx, "connection.protocol.vnc");
+    type_into(cx, "connection.field.address", "127.0.0.1");
+    clear_field(cx, "connection.field.port", 4);
+    type_into(cx, "connection.field.port", "1");
+    type_into(cx, "connection.field.name", "vnc-direct");
+    click(cx, "connection.save_connect");
+    cx.run_until_parked();
+
+    let vnc_id = cx
+        .update(|_window, app| {
+            view.read(app)
+                .book()
+                .connections()
+                .iter()
+                .find(|record| record.name() == "vnc-direct")
+                .map(shellune_core::ConnectionRecord::id)
+        })
+        .expect("VNC connection saved");
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .sessions()
+                .items()
+                .iter()
+                .any(|session| {
+                    matches!(session.kind(), shellune_core::SessionKind::Vnc { host } if *host == vnc_id)
+                })
+        }),
+        "VNC save & connect must start a VNC session for the saved record"
+    );
+
+    // 4. New Serial: Save & Connect saves and opens a Serial session.
+    click(cx, "nav.hosts");
+    click(cx, "hosts.new");
+    click(cx, "connection.protocol.serial");
+    type_into(
+        cx,
+        "connection.field.device",
+        "/dev/shellune-nonexistent-tty0",
+    );
+    type_into(cx, "connection.field.name", "serial-direct");
+    click(cx, "connection.save_connect");
+    cx.run_until_parked();
+
+    let serial_id = cx
+        .update(|_window, app| {
+            view.read(app)
+                .book()
+                .connections()
+                .iter()
+                .find(|record| record.name() == "serial-direct")
+                .map(shellune_core::ConnectionRecord::id)
+        })
+        .expect("Serial connection saved");
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .sessions()
+                .items()
+                .iter()
+                .any(|session| {
+                    matches!(session.kind(), shellune_core::SessionKind::Serial { host } if *host == serial_id)
+                })
+        }),
+        "Serial save & connect must start a Serial session for the saved record"
+    );
+}
+
+#[test]
+fn home_row_connect_buttons_are_secondary_while_new_host_is_primary() {
+    let source = include_str!("view/home.rs");
+    let new_pos = source
+        .find(".id(\"hosts.new\")")
+        .expect("hosts.new button in home.rs");
+    let new_window = &source[new_pos.saturating_sub(240)..new_pos];
+    assert!(
+        new_window.contains("Variant::Primary"),
+        "hosts.new must remain Variant::Primary"
+    );
+
+    let host_connect_pos = source
+        .find("format!(\"hosts.connect.{number}\")")
+        .expect("hosts.connect.{number} button in home.rs");
+    let host_connect_window = &source[host_connect_pos.saturating_sub(200)..host_connect_pos];
+    assert!(
+        host_connect_window.contains("Variant::Secondary"),
+        "hosts.connect.{{n}} must use Variant::Secondary"
+    );
+    assert!(
+        !host_connect_window.contains("Variant::Primary"),
+        "hosts.connect.{{n}} must not use Variant::Primary"
+    );
+
+    let conn_connect_pos = source
+        .find("\"hosts.connection.connect.{number}\"")
+        .expect("hosts.connection.connect.{number} button in home.rs");
+    let conn_connect_window = &source[conn_connect_pos.saturating_sub(220)..conn_connect_pos];
+    assert!(
+        conn_connect_window.contains("Variant::Secondary"),
+        "hosts.connection.connect.{{n}} must use Variant::Secondary"
+    );
+    assert!(
+        !conn_connect_window.contains("Variant::Primary"),
+        "hosts.connection.connect.{{n}} must not use Variant::Primary"
+    );
+}

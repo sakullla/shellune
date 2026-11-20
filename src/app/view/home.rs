@@ -2313,7 +2313,7 @@ fn host_row_element(
         )
         .child(
             div().pl(metrics.scale(spacing::HALF)).child(
-                components::compact_button(strings.remote_connect, Variant::Primary, metrics)
+                components::compact_button(strings.remote_connect, Variant::Secondary, metrics)
                     .id(SharedString::from(format!("hosts.connect.{number}")))
                     .debug_selector(move || format!("hosts.connect.{number}"))
                     .tooltip(components::tooltip(ux.hosts_connect_hint))
@@ -2449,7 +2449,7 @@ fn connection_row_element(
         )
         .child(
             div().pl(metrics.scale(spacing::HALF)).child(
-                components::compact_button(strings.remote_connect, Variant::Primary, metrics)
+                components::compact_button(strings.remote_connect, Variant::Secondary, metrics)
                     .id(SharedString::from(format!(
                         "hosts.connection.connect.{number}"
                     )))
