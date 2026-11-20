@@ -29149,6 +29149,16 @@ async fn the_desktop_form_asks_for_a_password_and_hides_it(cx: &mut TestAppConte
     );
     type_into(cx, "connection.field.secret", "rdp-pass");
     assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .hosts_state()
+                .protocol_draft()
+                .map(|draft| draft.text(ConnectionFormField::Secret).to_owned())
+        }),
+        Some("rdp-pass".to_owned()),
+        "every typed character lands once, in the draft the record is built from"
+    );
+    assert_eq!(
         cx.update(|_window, app| view.read(app).connection_secret_masked_for_test(app)),
         Some(true),
         "the password is not drawn as it is typed"
