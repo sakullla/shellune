@@ -605,12 +605,18 @@ impl ShelluneView {
             kinds.len(),
             "one control is drawn for each the session's menu may stand in for"
         );
+        let hidden = self.session_bar_hidden(id, cx).len();
+        let more_tooltip = if hidden > 0 {
+            format!("{} (+{hidden})", strings.session_more)
+        } else {
+            strings.session_more.to_owned()
+        };
         let mut pinned: Vec<AnyElement> = Vec::new();
         pinned.push(
             self.bar_icon(
                 "session.more",
                 Icon::More,
-                strings.session_more.to_owned(),
+                more_tooltip,
                 self.session_more.is_some(),
             )
             .size(metrics.hit_target())

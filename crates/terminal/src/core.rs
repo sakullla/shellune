@@ -568,6 +568,46 @@ impl TerminalCore {
         self.term.selection = Some(Selection::new(kind, point, side));
     }
 
+    /// Starts a mouse selection at a grid line and column.
+    ///
+    /// Out-of-range lines clamp to the oldest scrollback row or the live bottom.
+    pub fn begin_selection_at_line(
+        &mut self,
+        line: i32,
+        column: usize,
+        side: Side,
+        kind: SelectionType,
+    ) {
+        let history = self.history() as i64;
+        let top = -history;
+        let bottom = self.term.grid().screen_lines().saturating_sub(1) as i64;
+        let clamped = i32::try_from(i64::from(line).clamp(top, bottom)).unwrap_or(0);
+        let column = column.min(self.grid.cols.saturating_sub(1));
+        let point = Point::new(Line(clamped), Column(column));
+        self.term.selection = Some(Selection::new(kind, point, side));
+    }
+
+    /// Starts a mouse selection at an anchored grid line and column.
+    ///
+    /// If the anchored row has rotated out of scrollback or past the live bottom,
+    /// it clamps to the nearest row still in the grid.
+    pub fn begin_selection_at_anchor(
+        &mut self,
+        anchor: LineAnchor,
+        column: usize,
+        side: Side,
+        kind: SelectionType,
+    ) {
+        let line = self.line_of(anchor).unwrap_or_else(|| {
+            let history = self.history() as i64;
+            let top = -history;
+            let bottom = self.term.grid().screen_lines().saturating_sub(1) as i64;
+            let raw = anchor.stable - self.lines_dropped - history;
+            i32::try_from(raw.clamp(top, bottom)).unwrap_or(0)
+        });
+        self.begin_selection_at_line(line, column, side, kind);
+    }
+
     /// Starts a selection at the cursor's cell, on its left edge.
     ///
     /// It is what Shift+click extends when nothing is selected yet: the text
@@ -886,6 +926,14 @@ impl TerminalCore {
             stable: self.stable_line(line),
             column,
         }
+    }
+
+    /// Anchors a viewport row so it can be found again after streaming output
+    /// scrolls the grid.
+    #[must_use]
+    pub fn anchor_viewport_row(&self, row: usize) -> LineAnchor {
+        let point = self.grid_point(row, 0);
+        self.anchor_line(point.line.0, 0)
     }
 
     /// Top row of a viewport parked in history.
@@ -2789,5 +2837,38 @@ mod tests {
             selected.contains("row-0") && selected.contains("last-row"),
             "select_all spans from oldest scrollback row to live bottom: {selected:?}"
         );
+    }
+
+    #[test]
+    fn anchored_selection_survives_streaming_scroll_and_history_clamp() {
+        let mut terminal = TerminalCore::new(32, 4, 6);
+        for index in 0..4 {
+            terminal.feed(format!("row-{index:02}\r\n").as_bytes());
+        }
+        // Viewport row 1 currently holds "row-02".
+        let anchor = terminal.anchor_viewport_row(1);
+        let before = terminal.snapshot();
+        assert!(before.text().iter().any(|line| line.contains("row-02")));
+
+        // Stream 3 more lines so "row-02" scrolls up into scrollback.
+        for index in 4..7 {
+            terminal.feed(format!("row-{index:02}\r\n").as_bytes());
+        }
+        terminal.begin_selection_at_anchor(anchor, 0, Side::Left, SelectionType::Simple);
+        terminal.extend_selection(2, 5, Side::Right);
+        let selected = terminal.selection_text().expect("anchored selection text");
+        assert!(
+            selected.starts_with("row-02"),
+            "selection must stay anchored to row-02 after streaming scroll, got: {selected:?}"
+        );
+
+        // Stream enough lines to evict the anchor past scrollback and ensure clamping works.
+        for index in 7..30 {
+            terminal.feed(format!("row-{index:02}\r\n").as_bytes());
+        }
+        assert!(terminal.line_of(anchor).is_none());
+        terminal.begin_selection_at_anchor(anchor, 0, Side::Left, SelectionType::Simple);
+        terminal.extend_selection(0, 5, Side::Right);
+        assert!(terminal.has_selection());
     }
 }

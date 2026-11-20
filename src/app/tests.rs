@@ -39745,3 +39745,202 @@ fn home_row_connect_buttons_are_secondary_while_new_host_is_primary() {
         "hosts.connection.connect.{{n}} must not use Variant::Primary"
     );
 }
+
+#[gpui::test]
+async fn narrow_split_bar_marks_session_more_overflow_and_inactive_pane_closes_directly(
+    cx: &mut TestAppContext,
+) {
+    let Some((view, cx)) = split_local_shell(cx, SplitAxis::LeftRight) else {
+        return;
+    };
+    let id = cx
+        .update(|_window, app| view.read(app).active_session())
+        .expect("a shell is on screen");
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the active pane has a terminal");
+
+    // In a wide window, no controls are hidden and session.more shows no overflow dot.
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).bar_hidden_controls()),
+        0
+    );
+    assert!(
+        cx.debug_bounds("session.more.overflow").is_none(),
+        "no overflow indicator when all bar controls fit"
+    );
+
+    // Narrow the window so controls fold into session.more, and verify the visual indicator.
+    cx.simulate_resize(tiny_window());
+    largest_text_size(&view, cx);
+    cx.run_until_parked();
+    redraw(cx);
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| pane.read(app).bar_hidden_controls()) > 0,
+        "narrow split bar should fold trailing controls into session.more"
+    );
+    let overflow = bounds_of(cx, "session.more.overflow");
+    let more = bounds_of(cx, "session.more");
+    assert!(
+        wholly_inside(overflow, more),
+        "overflow dot {overflow:?} must sit inside session.more {more:?}"
+    );
+
+    // Restore width and verify the inactive pane offers its own direct close button.
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let (active_pane, idle_pane) = cx.update(|_window, app| {
+        let layout = view.read(app).workspace().layout();
+        let active = layout.active_pane().expect("active pane");
+        let idle = layout
+            .leaves()
+            .into_iter()
+            .map(|leaf| leaf.id())
+            .find(|pane_id| *pane_id != active)
+            .expect("idle pane");
+        (active, idle)
+    });
+    assert!(cx.debug_bounds("pane.active.mark").is_some());
+    assert!(cx.debug_bounds("pane.close").is_some());
+    let idle_close: &'static str = Box::leak(format!("pane.close.{idle_pane}").into_boxed_str());
+    let active_close: &'static str =
+        Box::leak(format!("pane.close.{active_pane}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(idle_close).is_some(),
+        "inactive pane {idle_pane} must offer direct close button {idle_close}"
+    );
+    assert!(
+        cx.debug_bounds(active_close).is_none(),
+        "active pane keeps the shared pane.close selector"
+    );
+
+    click(cx, idle_close);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_leaf_sessions_for_test())
+            .len(),
+        1,
+        "clicking inactive pane's close button closes it directly"
+    );
+}
+
+#[gpui::test]
+async fn split_pane_terminal_receives_escape_ctrl_c_and_ctrl_l(cx: &mut TestAppContext) {
+    let Some((view, cx)) = split_local_shell(cx, SplitAxis::LeftRight) else {
+        return;
+    };
+    let id = cx
+        .update(|_window, app| view.read(app).active_session())
+        .expect("a shell is on screen");
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the active pane has a terminal");
+
+    // Focus the active terminal pane and verify Esc, Ctrl+C, and Ctrl+L are not intercepted.
+    cx.update(|window, app| {
+        window.focus(pane.read(app).focus_handle());
+    });
+    cx.run_until_parked();
+    let before = cx.update(|_window, app| pane.read(app).sent().len());
+    cx.simulate_keystrokes("escape ctrl-c ctrl-l");
+    cx.run_until_parked();
+    let sent = cx.update(|_window, app| pane.read(app).sent()[before..].to_vec());
+    assert_eq!(
+        sent,
+        vec![0x1b, 0x03, 0x0c],
+        "split pane chrome must not intercept Esc, Ctrl+C, or Ctrl+L"
+    );
+}
+
+#[gpui::test]
+async fn desktop_controls_dock_top_center_keep_expand_handle_visible_and_block_passthrough(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let (link, log) = ScriptedLink::new(live_desktop_events());
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+
+    hover(cx, "desktop.body");
+    cx.run_until_parked();
+    let body = bounds_of(cx, "desktop.body");
+    let controls = bounds_of(cx, "desktop.controls");
+    let body_center_x = (body.left() + body.right()) / 2.0;
+    let controls_center_x = (controls.left() + controls.right()) / 2.0;
+    assert!(
+        (controls_center_x - body_center_x).abs() <= px(2.0),
+        "desktop.controls must be horizontally centered: controls={controls:?}, body={body:?}"
+    );
+    assert!(
+        controls.top() >= body.top() && controls.top() <= body.top() + px(32.0),
+        "desktop.controls must dock near the top edge: controls={controls:?}, body={body:?}"
+    );
+    assert!(
+        controls.right() < body.right() - px(40.0),
+        "desktop.controls must stay clear of the remote top-right corner: controls={controls:?}, body={body:?}"
+    );
+
+    // Clicking a bar button must not leak a left-button press to the remote picture.
+    let before_inputs = log.lock().expect("log lock").inputs.len();
+    click(cx, "desktop.zoom.in");
+    let leaked_press = log.lock().expect("log lock").inputs[before_inputs..]
+        .iter()
+        .any(|input| matches!(input, DesktopInput::Pointer { buttons, .. } if buttons.contains(Buttons::LEFT)));
+    assert!(
+        !leaked_press,
+        "clicking desktop.zoom.in must not pass through to the remote surface"
+    );
+
+    // Collapse the bar and move the pointer completely off the picture; the expand handle
+    // must remain stably visible at top-center and clickable without leaking to the surface.
+    click(cx, "desktop.controls.collapse");
+    cx.simulate_mouse_move(point(px(2.0), px(2.0)), None, Modifiers::default());
+    cx.run_until_parked();
+    redraw(cx);
+    cx.run_until_parked();
+    let handle = bounds_of(cx, "desktop.controls.handle");
+    let handle_center_x = (handle.left() + handle.right()) / 2.0;
+    assert!(
+        (handle_center_x - body_center_x).abs() <= px(2.0),
+        "desktop.controls.handle must be horizontally centered: handle={handle:?}, body={body:?}"
+    );
+    let before_expand = log.lock().expect("log lock").inputs.len();
+    click(cx, "desktop.controls.expand");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| {
+            view.read(app)
+                .desktop_of(id)
+                .expect("desktop mounted")
+                .read(app)
+                .controls_collapsed_for_test()
+        }),
+        "clicking the always-visible expand handle must unfold the bar"
+    );
+    let leaked_expand = log.lock().expect("log lock").inputs[before_expand..]
+        .iter()
+        .any(|input| matches!(input, DesktopInput::Pointer { buttons, .. } if buttons.contains(Buttons::LEFT)));
+    assert!(
+        !leaked_expand,
+        "clicking desktop.controls.expand must not pass through to the remote surface"
+    );
+
+    // Fullscreen entry and automatic exit guard when closing the session.
+    hover(cx, "desktop.body");
+    click(cx, "desktop.fullscreen");
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| {
+        view.read(app)
+            .desktop_of(id)
+            .expect("desktop mounted")
+            .read(app)
+            .is_fullscreen()
+    }));
+    cx.update(|_window, app| view.update(app, |view, cx| view.close_session(id, cx)));
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|window, _app| window.is_fullscreen()),
+        "closing a fullscreen desktop session must exit window fullscreen"
+    );
+}

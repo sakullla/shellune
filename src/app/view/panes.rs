@@ -981,7 +981,7 @@ impl ShelluneView {
                     .rounded(px(radius::MEDIUM))
                     .border_1()
                     .border_color(if active {
-                        theme::faded(theme::swatch(palette::ACCENT), 0.7)
+                        theme::swatch(palette::ACCENT)
                     } else {
                         theme::swatch(palette::BORDER)
                     })
@@ -1102,9 +1102,12 @@ impl ShelluneView {
             .gap(metrics.scale(spacing::HAIRLINE))
             .h(metrics.scale(PANE_HEAD_HEIGHT))
             .px(metrics.scale(spacing::TIGHT))
+            .border_b_1()
+            .border_color(theme::swatch(palette::BORDER))
             // The active pane is marked by its own fill and an accent bar, not only by
             // the weight of a word: the frame around it is the other half of the mark.
             .when(active, |row| row.bg(theme::swatch(palette::SURFACE)))
+            .when(!active, |row| row.bg(theme::swatch(palette::CANVAS)))
             .when(active, |row| {
                 row.child(
                     crate::app::components::accent_mark(true, metrics)
@@ -1140,28 +1143,47 @@ impl ShelluneView {
                     metrics,
                 ))
             })
+            .child(div().flex_1())
             .when(active, |row| {
-                row.child(div().flex_1())
-                    .child(self.pane_icon(
-                        pane,
-                        "zoom",
-                        Icon::Zoom,
-                        if zoomed {
-                            strings.pane_unzoom
-                        } else {
-                            strings.pane_zoom
-                        },
-                        cx,
-                        |this, _window, cx| this.toggle_active_zoom(cx),
-                    ))
-                    .child(self.pane_icon(
-                        pane,
-                        "close",
-                        Icon::Close,
-                        strings.pane_close,
-                        cx,
-                        move |this, _window, cx| this.close_one_pane(pane, cx),
-                    ))
+                row.child(self.pane_icon(
+                    pane,
+                    "zoom",
+                    Icon::Zoom,
+                    if zoomed {
+                        strings.pane_unzoom
+                    } else {
+                        strings.pane_zoom
+                    },
+                    cx,
+                    |this, _window, cx| this.toggle_active_zoom(cx),
+                ))
+                .child(self.pane_icon(
+                    pane,
+                    "close",
+                    Icon::Close,
+                    strings.pane_close,
+                    cx,
+                    move |this, _window, cx| this.close_one_pane(pane, cx),
+                ))
+            })
+            .when(!active, |row| {
+                row.child(
+                    crate::app::components::icon_only_button(Icon::Close, metrics)
+                        .flex_none()
+                        .w(metrics.hit_target())
+                        .h(metrics.hit_target())
+                        .id(SharedString::from(format!("pane.close.{pane}")))
+                        .debug_selector(move || format!("pane.close.{pane}"))
+                        .tooltip(crate::app::components::tooltip(strings.pane_close))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+                        )
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            cx.stop_propagation();
+                            this.close_one_pane(pane, cx);
+                        })),
+                )
             })
     }
 

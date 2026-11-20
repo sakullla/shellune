@@ -1739,10 +1739,11 @@ impl DesktopPane {
 
     /// The controls the pane owns: the whole window and the zoom steps (R18).
     ///
-    /// A layer in the top right corner of the picture. Each control carries a
-    /// selector of its own so the window-level tests can press the same button the
-    /// user does instead of calling the method behind it.
-    fn controls(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    /// Docked top-center over the picture so it stays clear of a remote window's
+    /// top-right close/maximize/minimize buttons and top-left menu bar. Each control
+    /// carries a selector of its own so the window-level tests can press the same
+    /// button the user does instead of calling the method behind it.
+    fn controls(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
         let strings = self.locale.strings();
         let zoom = match self.zoom.percent() {
             Some(percent) => format!("{percent}%"),
@@ -1756,15 +1757,10 @@ impl DesktopPane {
         // The shared floating bar with the toolbar's compact buttons: the controls float
         // over a picture that is not ours, like a menu floats over the page (R6).
         //
-        // The bar belongs to the pointer: a remote screen draws its own controls in the
-        // same corner, so a bar that is always there covers them. It is laid out either
-        // way - a press on a step should not depend on a frame of hover first - and the
-        // pane reveals it as soon as the pointer is anywhere over the picture.
+        // The bar is laid out either way - a press on a step should not depend on a
+        // frame of hover first - and the pane reveals it as soon as the pointer is
+        // anywhere over the picture.
         let mut bar = components::floating_bar(metrics)
-            .absolute()
-            .top_0()
-            .right_0()
-            .m(metrics.scale(spacing::TIGHT))
             .when(!self.controls_shown(), |bar| bar.opacity(0.0))
             .debug_selector(|| "desktop.controls".to_owned())
             .id(SharedString::from("desktop.controls.bar"))
@@ -1857,24 +1853,27 @@ impl DesktopPane {
         // buttons keep their own pointing hand, which is set on them and painted
         // after the bar.
         bar.style().mouse_cursor = Some(CursorStyle::Arrow);
-        bar
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .pt(metrics.scale(spacing::TIGHT))
+            .child(bar)
     }
 
     /// The small handle that brings a folded bar back.
     ///
-    /// It is in the bar's own corner and only while the pointer is over the picture:
-    /// a screen nobody is pointing at keeps the whole corner.
-    fn expand_handle(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    /// Docked top-center and kept softly visible while the picture is live so the
+    /// user never loses the way to unfold the bar, strengthening to full opacity on
+    /// hover.
+    fn expand_handle(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
         let mut handle = components::floating_bar(metrics)
-            .absolute()
-            .top_0()
-            .right_0()
-            .m(metrics.scale(spacing::TIGHT))
+            .when(!self.controls_shown(), |handle| handle.opacity(0.65))
             .debug_selector(|| "desktop.controls.handle".to_owned())
             .id(SharedString::from("desktop.controls.handle.bar"))
-            // The folded handle is drawn only while the pointer is here, and it is
-            // the thing under the pointer: its own hover keeps it on screen long
-            // enough to be pressed.
             .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                 this.set_bar_hovered(*hovered, cx);
             }))
@@ -1896,7 +1895,15 @@ impl DesktopPane {
         // The handle is over the picture too, and it is a control: like the bar it
         // shows the arrow the picture hides.
         handle.style().mouse_cursor = Some(CursorStyle::Arrow);
-        handle
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .pt(metrics.scale(spacing::TIGHT))
+            .child(handle)
     }
 
     fn certificate_card(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
@@ -2303,9 +2310,7 @@ impl Render for DesktopPane {
         // only its handle is, and only while the pointer is over the picture.
         if has_picture {
             if self.controls_collapsed {
-                if self.controls_shown() {
-                    body = body.child(self.expand_handle(metrics, cx));
-                }
+                body = body.child(self.expand_handle(metrics, cx));
             } else {
                 #[cfg(test)]
                 {

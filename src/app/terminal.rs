@@ -143,6 +143,8 @@ struct SelectionDrag {
     origin: gpui::Point<Pixels>,
     /// The cell the button went down on and the half of it the pointer was in.
     anchor: ((usize, usize), Side),
+    /// The grid line the button went down on, stable across streaming output.
+    anchor_line: Option<LineAnchor>,
     /// What the drag selects: characters, a block (Alt/Option), words or lines.
     kind: SelectionType,
     /// The selection has begun.
@@ -2901,6 +2903,7 @@ impl TerminalPane {
         let mut drag = SelectionDrag {
             origin: event.position,
             anchor: ((row, column), side),
+            anchor_line: Some(self.core.anchor_viewport_row(row)),
             kind,
             started: false,
             pointer: event.position,
@@ -3058,9 +3061,15 @@ impl TerminalPane {
             }
             drag.started = true;
             let ((anchor_row, anchor_column), anchor_side) = drag.anchor;
+            let anchor_line = drag.anchor_line;
             let kind = drag.kind;
-            self.core
-                .begin_selection(anchor_row, anchor_column, anchor_side, kind);
+            if let Some(anchor) = anchor_line {
+                self.core
+                    .begin_selection_at_anchor(anchor, anchor_column, anchor_side, kind);
+            } else {
+                self.core
+                    .begin_selection(anchor_row, anchor_column, anchor_side, kind);
+            }
         }
         self.core.extend_selection(row, column, side);
         cx.notify();
@@ -3429,9 +3438,8 @@ impl TerminalPane {
             && near(old.controls, room.controls)
             && near(old.pinned, room.pinned)
             && old.clipped == room.clipped
+            && old.hidden == room.hidden
         {
-            // What else was measured decides nothing in this pane's own draw; the
-            // window reads what is hidden when the session's menu opens.
             self.bar_room.set(room);
             return;
         }
@@ -3841,11 +3849,32 @@ impl TerminalPane {
                         .child(self.search_button(metrics, self.locale.strings(), cx)),
                 )
             })
-            .children(
+            .children({
+                let has_hidden = self.bar_room.get().hidden > 0;
                 slot_pinned
                     .into_iter()
-                    .map(|pinned| div().flex().flex_none().items_center().child(pinned)),
-            );
+                    .enumerate()
+                    .map(move |(index, pinned)| {
+                        div()
+                            .relative()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .child(pinned)
+                            .when(index == 0 && has_hidden, |slot| {
+                                slot.child(
+                                    div()
+                                        .absolute()
+                                        .top(metrics.scale(spacing::HALF))
+                                        .right(metrics.scale(spacing::HALF))
+                                        .size(metrics.scale(spacing::HAIRLINE))
+                                        .rounded_full()
+                                        .bg(theme::swatch(shell_palette::ACCENT))
+                                        .debug_selector(|| "session.more.overflow".to_owned()),
+                                )
+                            })
+                    })
+            });
 
         div()
             .on_children_prepainted(measure_bar)
@@ -5973,5 +6002,92 @@ mod flood_batch_tests {
         assert!(matches!(&events[0], SourceEvent::Data(bytes) if bytes == &[1, 2]));
         assert!(matches!(&events[1], SourceEvent::Exited(ExitReport::Clean)));
         assert!(matches!(&events[2], SourceEvent::Data(bytes) if bytes == &[3]));
+    }
+}
+
+#[cfg(test)]
+mod selection_drag_tests {
+    use super::*;
+
+    #[gpui::test]
+    async fn slow_drag_during_streaming_output_keeps_original_anchor_line(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (pane, cx) = cx.add_window_view(|_, cx| {
+            TerminalPane::without_process(
+                LocalShell::new("Test shell", "test-shell"),
+                EventTag::new(shellune_core::SessionId::new(), 0),
+                GridSize::new(80, 24),
+                shellune_terminal::DEFAULT_FONT_SIZE,
+                Locale::English,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // Fill the screen with numbered lines so row 5 holds a distinct marker.
+        let rows = cx.update(|_, app| pane.read(app).grid.rows);
+        assert!(rows >= 8, "test viewport should have at least 8 rows");
+        let target_row = 5usize;
+        cx.update(|_, app| {
+            pane.update(app, |pane, cx| {
+                for index in 0..rows {
+                    let line = if index + 1 < rows {
+                        format!("line-{index:02}-anchor-test\r\n")
+                    } else {
+                        format!("line-{index:02}-anchor-test")
+                    };
+                    pane.feed_for_test(line.as_bytes(), cx);
+                }
+            });
+        });
+        cx.run_until_parked();
+
+        let (down_pos, drag_pos) = cx.update(|_, app| {
+            let pane = pane.read(app);
+            let bounds = pane.viewport.expect("viewport measured");
+            let cell = pane.cell.sanitized();
+            let y = f32::from(bounds.origin.y) + (target_row as f32 + 0.5) * cell.height;
+            let x = f32::from(bounds.origin.x) + 0.25 * cell.width;
+            (
+                point(px(x), px(y)),
+                point(px(x + SELECTION_DRAG_THRESHOLD + cell.width * 6.0), px(y)),
+            )
+        });
+
+        // Mouse down records the anchor without starting the selection yet.
+        cx.simulate_mouse_down(down_pos, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.update(|_, app| pane.read(app).drag.is_some_and(|drag| !drag.started)),
+            "a single press waits for the drag threshold before starting selection"
+        );
+
+        // Streaming output arrives before the pointer crosses the threshold,
+        // scrolling the target line up by 4 rows.
+        cx.update(|_, app| {
+            pane.update(app, |pane, cx| {
+                for index in 0..4 {
+                    pane.feed_for_test(format!("\r\nstream-{index:02}-extra").as_bytes(), cx);
+                }
+            });
+        });
+        cx.run_until_parked();
+
+        // Move past the threshold and release.
+        cx.simulate_mouse_move(
+            drag_pos,
+            Some(MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(drag_pos, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        let selected = cx.update(|_, app| pane.read(app).core.selection_text());
+        let selected = selected.expect("selection should be established after drag");
+        assert!(
+            selected.starts_with(&format!("line-{target_row:02}")),
+            "selection start must stay anchored to line-{target_row:02} despite streaming scroll, got: {selected:?}"
+        );
     }
 }
