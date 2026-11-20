@@ -17,7 +17,7 @@ use gpui::{
     Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Window, div,
     img, px,
 };
-use shellune_core::{ProtocolKind, SessionFailure};
+use shellune_core::SessionFailure;
 
 use crate::app::components::{self, Variant};
 use crate::app::copy::{Locale, Strings};
@@ -793,24 +793,27 @@ impl DesktopPane {
         matches!(self.phase, DesktopPhase::Live)
     }
 
-    /// The pointer a surface shows while the picture is what is under it.
+    /// The pointer the window shows over the picture.
     ///
-    /// A VNC frame carries the server's own pointer: this client does not ask
-    /// for the Cursor pseudo-encoding, so the server draws the pointer into the
-    /// framebuffer and a second, local arrow over it would be two pointers on
-    /// one screen. While such a session is live the surface therefore asks for
-    /// [`CursorStyle::None`]; before and after it, and whenever the pane is not
-    /// a picture, it asks for the ordinary arrow so nothing else in the window
-    /// loses its pointer.
+    /// Both protocols this build speaks draw the remote pointer into the frame,
+    /// so a local arrow over the picture is a second pointer on one screen:
     ///
-    /// RDP is the exception, and it is why this is not simply "hide while live":
-    /// its pointer travels in a pointer PDU of its own, which this build does
-    /// not decode yet, so the frames contain no pointer at all. Hiding the local
-    /// one there would leave the picture with no cursor, which is worse than a
-    /// pointer the server would also draw; the arrow stays until the pointer
-    /// update is drawn.
+    /// * VNC: this client does not ask for the Cursor pseudo-encoding, so the
+    ///   server renders its pointer into the framebuffer.
+    /// * RDP: xrdp paints its pointer into the bitmap updates instead of sending
+    ///   a pointer PDU, so the frame that arrives already has the pointer in it.
+    ///
+    /// While a session is live the surface therefore asks for
+    /// [`CursorStyle::None`]; before and after it, and whenever the pane is not a
+    /// picture, it asks for the ordinary arrow so the rest of the window keeps
+    /// its pointer.
+    ///
+    /// If RDP pointer PDUs are ever decoded and the server stops painting the
+    /// pointer into the frame, this has to become a per-frame question - "does
+    /// this picture come with a pointer?" - instead of a per-phase one: hiding
+    /// the local pointer for a frame without one would leave no cursor at all.
     fn surface_cursor(&self) -> CursorStyle {
-        if matches!(self.phase, DesktopPhase::Live) && self.target.protocol() == ProtocolKind::Vnc {
+        if matches!(self.phase, DesktopPhase::Live) {
             CursorStyle::None
         } else {
             CursorStyle::Arrow

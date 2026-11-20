@@ -28343,19 +28343,17 @@ async fn a_live_vnc_picture_hides_the_local_pointer_until_the_session_ends(
     );
 }
 
-/// An RDP picture has no pointer of its own yet, so ours stays.
+/// An RDP picture carries the server's pointer in its frames, so ours goes away.
 ///
-/// The RDP backend sends the pointer in a PDU of its own, which this build does not
-/// decode: the frames arrive without a pointer in them. Hiding the local one while
-/// such a session is live would leave the picture with no cursor at all, so the
-/// arrow is kept until the pointer update is drawn. This is the other half of the
-/// policy the surface is given in render.
+/// This build does not decode RDP pointer PDUs, and xrdp paints its pointer into the
+/// bitmap it sends: a live RDP session used to draw the server's pointer and the local
+/// arrow on top of each other (the reported double pointer). The local pointer is
+/// hidden while the session is live, like a VNC picture, and comes back when it ends.
 #[gpui::test]
-async fn an_rdp_picture_keeps_the_local_pointer_because_its_frames_carry_none(
-    cx: &mut TestAppContext,
-) {
+async fn an_rdp_picture_hides_the_local_pointer_like_a_vnc_one(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let (link, _log) = ScriptedLink::new(live_desktop_events());
+    let feed = link.feed();
     let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
 
     let (live, cursor) = cx.update(|_window, app| {
@@ -28369,8 +28367,35 @@ async fn an_rdp_picture_keeps_the_local_pointer_because_its_frames_carry_none(
     assert!(live, "the frame put the session in its live step");
     assert_eq!(
         cursor,
+        gpui::CursorStyle::None,
+        "the server's pointer is in the frame, so the local one is not drawn over it"
+    );
+
+    // The pointer comes back when the picture is gone: an ended session is not a
+    // remote screen drawing its own pointer.
+    feed.feed(vec![LinkEvent::State {
+        state: LinkState::Closed,
+        failure: LinkFailure::None,
+        detail: 0,
+        reason: String::new(),
+    }]);
+    pump_desktop(&view, cx, id);
+    let (ended, cursor) = cx.update(|_window, app| {
+        let view = view.read(app);
+        let pane = view
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app);
+        (
+            matches!(pane.phase(), crate::app::view::DesktopPhase::Ended(_)),
+            pane.surface_cursor_for_test(),
+        )
+    });
+    assert!(ended, "the closed state ended the session");
+    assert_eq!(
+        cursor,
         gpui::CursorStyle::Arrow,
-        "RDP frames carry no pointer, so hiding the local one would leave none"
+        "an ended session is not a picture and gets the ordinary pointer back"
     );
 }
 
