@@ -89,8 +89,6 @@ fn next_frame(transport: &mut impl Read, frames: &mut Frames) -> io::Result<Inco
     }
 }
 
-/// A dropped session is retried once before it is reported as failed.
-const ATTEMPTS: u8 = 2;
 /// How long the server has to confirm or refuse the logon. A server that says
 /// nothing in this window is reported as unconfirmed rather than accepted.
 const LOGON_WAIT: Duration = Duration::from_secs(10);
@@ -181,66 +179,56 @@ enum Incoming {
     Fast,
 }
 
-/// Runs one attempt, retrying once if the server drops an established session.
+/// Runs one attempt and reports how it ended.
+///
+/// A session the server drops is reported as ended, with the reason the layer gave;
+/// the client does not dial again on its own. A silent second dial is a second logon
+/// to the server - on xrdp it reconnects to the same display and takes it over from
+/// the first client - and it hides the drop from the person who could decide to
+/// reconnect. Reconnecting is an explicit action of the session, which opens a new
+/// attempt (a new pane and a new link).
 pub(super) fn run(
     config: &Config,
     emit: &Emit,
     control: &Arc<Control>,
     commands: Receiver<Command>,
 ) {
-    for attempt in 1..=ATTEMPTS {
-        if control.cancelled() {
-            return;
-        }
-        match connect(config, emit, control, &commands) {
-            Ok(mut active) => {
-                // The pump publishes Connected, and only once the logon is settled:
-                // a refused set of credentials must never look like a desktop.
-                match active.pump(emit, control, &commands) {
-                    Ok(()) => {
+    if control.cancelled() {
+        return;
+    }
+    match connect(config, emit, control, &commands) {
+        Ok(mut active) => {
+            // The pump publishes Connected, and only once the logon is settled:
+            // a refused set of credentials must never look like a desktop.
+            match active.pump(emit, control, &commands) {
+                Ok(()) => publish(emit, control, &State::Closed, Failure::None, ""),
+                Err(ended) => {
+                    if control.cancelled() {
                         publish(emit, control, &State::Closed, Failure::None, "");
                         return;
                     }
-                    Err(ended) => {
-                        if control.cancelled() {
-                            publish(emit, control, &State::Closed, Failure::None, "");
-                            return;
-                        }
-                        if attempt < ATTEMPTS && ended.failure == Failure::RemoteClosed {
-                            publish(
-                                emit,
-                                control,
-                                &State::Connecting,
-                                Failure::None,
-                                "the session dropped; reconnecting",
-                            );
-                            continue;
-                        }
-                        publish(
-                            emit,
-                            control,
-                            &State::Failed(ended.failure),
-                            ended.failure,
-                            &ended.reason,
-                        );
-                        return;
-                    }
+                    publish(
+                        emit,
+                        control,
+                        &State::Failed(ended.failure),
+                        ended.failure,
+                        &ended.reason,
+                    );
                 }
             }
-            Err(ended) => {
-                if control.cancelled() {
-                    publish(emit, control, &State::Closed, Failure::None, "");
-                    return;
-                }
-                publish(
-                    emit,
-                    control,
-                    &State::Failed(ended.failure),
-                    ended.failure,
-                    &ended.reason,
-                );
+        }
+        Err(ended) => {
+            if control.cancelled() {
+                publish(emit, control, &State::Closed, Failure::None, "");
                 return;
             }
+            publish(
+                emit,
+                control,
+                &State::Failed(ended.failure),
+                ended.failure,
+                &ended.reason,
+            );
         }
     }
 }
@@ -330,6 +318,127 @@ mod tests {
             Incoming::Fast => panic!("the PDU was slow-path"),
         }
         peer.join().expect("peer thread");
+    }
+
+    /// The keyboard event one press or release puts on the wire: its flags and the
+    /// scancode, read back out of the Share Data PDU a server would receive.
+    fn keyboard_pdu(down: bool, scancode: u8, extended: bool) -> (u16, u16) {
+        let channels = Channels {
+            user: 1003,
+            global: 1007,
+            clipboard: None,
+            drive: None,
+        };
+        let share = Share::pending(800, 600);
+        let mut out = Vec::new();
+        share
+            .input(
+                &channels,
+                &mut out,
+                4, // INPUT_EVENT_SCANCODE
+                keyboard_flags(down, extended),
+                u16::from(scancode),
+                0,
+            )
+            .expect("the input PDU is written");
+
+        // TPKT, then MCS SendDataIndication: type, sending user, channel, flags,
+        // length, body.
+        let mut mcs = Packet(&out);
+        assert_eq!(mcs.u8().expect("TPKT version"), 3, "TPKT wraps the PDU");
+        mcs.u8().expect("TPKT flags");
+        let tpkt_len = usize::from(mcs.be16().expect("TPKT length"));
+        assert_eq!(tpkt_len, out.len(), "the TPKT says the whole PDU");
+        assert_eq!(
+            mcs.take(3).expect("X.224 data"),
+            [2, 0xf0, 0x80],
+            "X.224 wraps the MCS PDU"
+        );
+        assert_eq!(mcs.u8().expect("type"), 0x64, "MCS send-data");
+        mcs.take(2).expect("sending user");
+        mcs.be16().expect("channel");
+        assert_eq!(mcs.u8().expect("flags") & 0x30, 0x30, "one whole body");
+        let len = mcs.per_length().expect("length");
+        let body = mcs.take(len).expect("body");
+
+        // Share Control header, then the Share Data header, then the events.
+        let mut control = Packet(body);
+        control.le16().expect("total length");
+        assert_eq!(
+            control.le16().expect("pdu type") & 0x0f,
+            7,
+            "PDUTYPE_DATAPDU"
+        );
+        control.le16().expect("source");
+        let rest = control.take(control.0.len()).expect("share data");
+        let mut data = Packet(rest);
+        data.le32().expect("share id");
+        data.take(2).expect("padding and stream id");
+        let data_len = data.le16().expect("data length");
+        assert_eq!(data.u8().expect("data type"), 28, "PDUTYPE2_INPUT");
+        assert_eq!(data.u8().expect("compression"), 0, "no bulk compression");
+        data.take(2).expect("padding");
+        let events = data
+            .take(usize::from(data_len).saturating_sub(4))
+            .expect("input events");
+        let mut event = Packet(events);
+        assert_eq!(event.le16().expect("event count"), 1, "one event");
+        event.le16().expect("padding");
+        event.le32().expect("event time");
+        assert_eq!(
+            event.le16().expect("message type"),
+            4,
+            "INPUT_EVENT_SCANCODE"
+        );
+        (
+            event.le16().expect("keyboard flags"),
+            event.le16().expect("key code"),
+        )
+    }
+
+    #[test]
+    fn a_slow_path_key_release_is_flagged_as_a_release() {
+        // The slow path's bits, not the fast path's: a release marked 0x01 reads as
+        // a press, so every typed character arrived twice.
+        assert_eq!(keyboard_flags(true, false), 0, "a plain press has no flags");
+        assert_eq!(
+            keyboard_flags(false, false),
+            0x8000,
+            "a release is KBD_FLAGS_RELEASE"
+        );
+        assert_eq!(
+            keyboard_flags(true, true),
+            0x0100,
+            "an extended key is KBD_FLAGS_EXTENDED"
+        );
+        assert_eq!(
+            keyboard_flags(false, true),
+            0x8100,
+            "an extended release carries both"
+        );
+
+        // And in the PDU a server really receives.
+        let (down_flags, down_code) = keyboard_pdu(true, 0x1e, false);
+        let (up_flags, up_code) = keyboard_pdu(false, 0x1e, false);
+        assert_eq!(down_flags & 0x8000, 0, "the press is not a release");
+        assert_eq!(up_flags & 0x8000, 0x8000, "the release is a release");
+        assert_eq!(
+            down_flags ^ up_flags,
+            0x8000,
+            "the pair differs only by the release flag"
+        );
+        assert_eq!(
+            (down_code, up_code),
+            (0x1e, 0x1e),
+            "the same key goes down and up"
+        );
+        let (extended_flags, _) = keyboard_pdu(true, 0x48, true);
+        assert_eq!(
+            extended_flags & 0x0100,
+            0x0100,
+            "an up-arrow press carries the extended flag"
+        );
+        assert_eq!(extended_flags & 0x8000, 0, "and it is still a press");
     }
 
     #[test]
@@ -851,21 +960,11 @@ impl Active {
     /// Share Data PDU. Every server accepts it, which a fast-path PDU is not
     /// guaranteed to be.
     fn key(&mut self, scancode: u8, down: bool, extended: bool) -> io::Result<()> {
-        // Slow-path keyboard flags are the 0x0100/0x8000 family, not the fast
-        // path's 0x01/0x02: a release marked with the wrong bit arrives as a second
-        // press, which types every character twice.
-        let mut flags = 0u16;
-        if !down {
-            flags |= 0x8000; // KBDFLAGS_RELEASE
-        }
-        if extended {
-            flags |= 0x0100; // KBDFLAGS_EXTENDED
-        }
         self.share.input(
             &self.channels,
             &mut self.transport,
             4, // INPUT_EVENT_SCANCODE
-            flags,
+            keyboard_flags(down, extended),
             u16::from(scancode),
             0,
         )

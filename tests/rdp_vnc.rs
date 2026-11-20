@@ -529,6 +529,17 @@ fn verify(endpoint: &Endpoint) -> Outcome {
         }
     }
     if let Some((reported, reason)) = failure {
+        // The client does not dial again by itself any more, so a drop has to end
+        // the session here - and it has to say why, because that sentence is what the
+        // window shows instead of a second login on the server.
+        if reason.trim().is_empty() {
+            return Outcome::Failed(format!(
+                "the session reported {reported:?} after {} frames and {:.1}s, with no \
+                 reason to show",
+                frames,
+                SUSTAIN.as_secs_f32()
+            ));
+        }
         return Outcome::Failed(format!(
             "the session reported {reported:?} after {} frames and {:.1}s ({reason})",
             frames,

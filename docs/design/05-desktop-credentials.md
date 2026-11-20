@@ -69,10 +69,14 @@ VNC 只用 password（VncAuth）。密码不进入 `DesktopTarget`、不写日�
 
 - 应用侧一次「连接」只有一次启动（上面两个用例），列表按钮、双击行、重连都走
   `start_desktop_session`；失败后不自动重启，另一次尝试由用户发起。
-- **协议层**（`crates/desktop/src/rdp/session.rs` 的 `ATTEMPTS`）在一个已建立的会话被服务器
-  关闭（`RemoteClosed`）时会**自行重连一次**。对 xrdp 来说这表现为同一次 `DesktopPane` 产生
-  两条登录记录（第二条是 reconnected 到同一 display，没有 create session），而应用只显示一个会话。
-  这是客户端内部行为，应用无从得知；日志里的两次登录应优先按这条解释核对。
+- **协议层不自己重连**（`crates/desktop/src/rdp/session.rs` 的 `run`）：会话被服务器关闭
+  （`RemoteClosed`）时直接以 `State::Failed` 结束，并带上协议层的原因；静默重连会让服务端把同一
+  用户记成第二条登录（xrdp 会接管同一 display 并踢掉第一个连接），也把“会话断了”藏起来。
+  重新连接是用户的动作：标签菜单、快捷键或列表行的连接会为同一标签开一个新的尝试（新 pane、新 link），
+  由 `a_dropped_desktop_reconnects_only_when_the_user_asks` 钉住。
+- 键盘输入走慢路径 `TS_KEYBOARD_EVENT`，抬起标志是 `0x8000`（`KBD_FLAGS_RELEASE`）、扩展键是
+  `0x0100`。用快速路径的 `0x01/0x02` 会让服务器把每次抬起当成第二次按下，于是“每个字符输入两次”；
+  由 `a_slow_path_key_release_is_flagged_as_a_release` 直接解析 input PDU 的 keyboardFlags 钉住。
 - 剪贴板要求服务器侧有 chansrv（xrdp 的 `/usr/lib/xrdp`）。chansrv 起不来的端点上 cliprdr 通道
   不会被授予，`NativeLink::open` 仍然按记录把 `set_clipboard(true)` 传下去，
   但本地内容无处可送，粘贴时窗格只会给出「发送失败」；这不是应用关掉了共享。

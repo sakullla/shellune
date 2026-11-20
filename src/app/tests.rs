@@ -29256,6 +29256,11 @@ async fn one_press_on_a_saved_desktop_opens_one_attempt(cx: &mut TestAppContext)
     });
     assert_eq!(attempts, 1, "one press starts one attempt, not two");
     assert_eq!(sessions, 1, "one press opens one session");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).desktop_pane_count_for_test()),
+        1,
+        "one connection paints one picture: a second surface would show the desktop twice"
+    );
 
     // The pane itself was asked to start once, and it dialled once.
     let session = cx
@@ -29415,6 +29420,62 @@ async fn the_controls_stay_clickable_over_a_notice_and_a_certificate(cx: &mut Te
         crate::app::desktop::DesktopZoom::Percent(150),
         "the zoom button works with the certificate question up"
     );
+}
+
+#[gpui::test]
+async fn a_dropped_desktop_reconnects_only_when_the_user_asks(cx: &mut TestAppContext) {
+    // The record is in the book: the reconnect opens the saved connection again, and
+    // a record that is only mounted on a scripted link has nothing to open.
+    let dir = TempDir::new("desktop-drop-reconnect");
+    let record = desktop_record("desk");
+    seed_connections(&dir.store(), vec![record.clone()]);
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    let (link, _log) = ScriptedLink::new(live_desktop_events());
+    let feed = link.feed();
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+
+    // The server closes the session. The client reports it and stops: it does not
+    // dial again on its own, which on xrdp would log the same user in twice and take
+    // the display over from the first connection.
+    feed.feed(vec![LinkEvent::State {
+        state: LinkState::Failed(LinkFailure::RemoteClosed),
+        failure: LinkFailure::RemoteClosed,
+        detail: 0,
+        reason: "the server closed the connection".to_owned(),
+    }]);
+    pump_desktop(&view, cx, id);
+    assert!(
+        matches!(
+            session_state(cx, &view, id),
+            Some(SessionState::Disconnected(_))
+        ),
+        "the drop ends the session: {:?}",
+        session_state(cx, &view, id)
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).desktop_start_count_for_test()),
+        0,
+        "nothing dials again by itself"
+    );
+
+    // The reconnect the user asks for is a new attempt, in the same tab.
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.reconnect_session(id, cx));
+    });
+    cx.run_until_parked();
+    let (attempts, tabs) = cx.update(|_window, app| {
+        (
+            view.read(app).desktop_start_count_for_test(),
+            view.read(app).open_tabs(),
+        )
+    });
+    assert_eq!(
+        attempts,
+        1,
+        "the explicit reconnect starts one new attempt (state {:?})",
+        session_state(cx, &view, id)
+    );
+    assert_eq!(tabs, vec![id], "and it stays in the session's own tab");
 }
 
 #[gpui::test]

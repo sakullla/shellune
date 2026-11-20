@@ -6494,6 +6494,16 @@ impl ShelluneView {
         self.desktop_starts
     }
 
+    /// How many desktop surfaces the window is holding, for the test that one
+    /// connection paints one picture and not two.
+    #[cfg(test)]
+    pub fn desktop_pane_count_for_test(&self) -> usize {
+        self.panes
+            .iter()
+            .filter(|open| open.content.desktop().is_some())
+            .count()
+    }
+
     /// Whether the password field of the open connection form is masked, for the
     /// tests that check a desktop password is not shown as it is typed.
     #[cfg(test)]
