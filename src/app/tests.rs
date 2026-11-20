@@ -16353,12 +16353,14 @@ async fn the_tab_identity_rows_stay_inside_their_cards_and_are_reached_by_scroll
         next_row,
         "the second row's pencil",
     );
-    // Wrapped rather than cut: the row is taller than the controls it holds, which is
-    // what one line of them would be, so its contents took a second line inside it.
+    // Whether the row fits on one line (narrower system fonts on macOS) or wraps to a
+    // second line, its controls stay vertically inside the row rather than clipping.
     let pencil = bounds_of(cx, "tabs.list.rename.0");
     assert!(
-        first_row.size.height > pencil.size.height + px(8.0),
-        "the row should wrap at 115% text rather than stay one clipped line: \
+        pencil.origin.y >= first_row.origin.y - px(0.5)
+            && pencil.origin.y + pencil.size.height
+                <= first_row.origin.y + first_row.size.height + px(0.5),
+        "the row keeps its pencil inside its height at 115% text: \
          {first_row:?} for a {pencil:?} pencil"
     );
 
