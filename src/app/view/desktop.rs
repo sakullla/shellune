@@ -300,6 +300,11 @@ pub struct DesktopPane {
     /// password reaches the link. `None` until a start; `Some(None)` is "no password".
     #[cfg(test)]
     started_password: Option<Option<String>>,
+    /// How many times this pane was asked to start, for the tests that prove one
+    /// connection is one attempt. A guard keeps a second start from dialling, and
+    /// the count says whether one was even asked for.
+    #[cfg(test)]
+    starts: usize,
     /// Why the last send failed, when it did, shown once beside the surface.
     send_problem: Option<String>,
     polling: bool,
@@ -358,6 +363,8 @@ impl DesktopPane {
             layer_reason: None,
             #[cfg(test)]
             started_password: None,
+            #[cfg(test)]
+            starts: 0,
             send_problem: None,
             polling: false,
             watching_focus: false,
@@ -546,6 +553,13 @@ impl DesktopPane {
             .filter(|reason| !reason.trim().is_empty())
     }
 
+    /// How many starts this pane was asked for, for the tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn starts(&self) -> usize {
+        self.starts
+    }
+
     /// What the last [`Self::start`] was handed to sign in with, for the tests.
     #[cfg(test)]
     #[must_use]
@@ -564,6 +578,7 @@ impl DesktopPane {
         // started the way the window starts one, and says what it was handed.
         #[cfg(test)]
         {
+            self.starts += 1;
             self.started_password = Some(password.map(str::to_owned));
         }
         if self.link.is_some() {

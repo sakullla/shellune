@@ -29238,6 +29238,82 @@ async fn switching_protocols_does_not_carry_a_password_between_forms(cx: &mut Te
 }
 
 #[gpui::test]
+async fn one_press_on_a_saved_desktop_opens_one_attempt(cx: &mut TestAppContext) {
+    let dir = TempDir::new("desktop-one-attempt");
+    let record = desktop_record("office");
+    seed_connections(&dir.store(), vec![record.clone()]);
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    click(cx, "hosts.connection.connect.0");
+    cx.run_until_parked();
+
+    let (attempts, sessions) = cx.update(|_window, app| {
+        let view = view.read(app);
+        (
+            view.desktop_start_count_for_test(),
+            view.open_sessions().len(),
+        )
+    });
+    assert_eq!(attempts, 1, "one press starts one attempt, not two");
+    assert_eq!(sessions, 1, "one press opens one session");
+
+    // The pane itself was asked to start once, and it dialled once.
+    let session = cx
+        .update(|_window, app| view.read(app).open_sessions().first().copied())
+        .expect("the session exists");
+    let starts = cx.update(|_window, app| {
+        view.read(app)
+            .desktop_of(session)
+            .map(|pane| pane.read(app).starts())
+    });
+    assert_eq!(starts, Some(1), "the surface is started once");
+
+    // The attempt fails at once - nothing listens on the record's address - and a
+    // session that ended is not quietly started again: another attempt is the user's
+    // decision, made from the tab or the list.
+    pump_desktop(&view, cx, session);
+    pump_desktop(&view, cx, session);
+    let after = cx.update(|_window, app| {
+        (
+            view.read(app).desktop_start_count_for_test(),
+            view.read(app).open_sessions().len(),
+        )
+    });
+    assert_eq!(
+        after,
+        (1, 1),
+        "one press stays one attempt, however the attempt ends"
+    );
+}
+
+#[gpui::test]
+async fn every_keystroke_reaches_a_desktop_once(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, log) = ScriptedLink::new(live_desktop_events());
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+    focus_desktop_drawn(&view, cx, id);
+
+    let before = sent(&log).len();
+    cx.simulate_keystrokes("a");
+    release_key(cx, "a");
+    let a = crate::app::desktop::key_codes("a").expect("a is a key");
+    assert_eq!(
+        sent(&log)[before..],
+        [
+            DesktopInput::Key {
+                codes: a,
+                down: true
+            },
+            DesktopInput::Key {
+                codes: a,
+                down: false
+            },
+        ],
+        "one press and one release, so a character cannot arrive twice"
+    );
+}
+
+#[gpui::test]
 async fn a_desktop_connection_starts_with_the_password_typed_in_its_form(cx: &mut TestAppContext) {
     let dir = TempDir::new("desktop-secret-connect");
     let (view, cx) = hosts_view(cx, dir.store());

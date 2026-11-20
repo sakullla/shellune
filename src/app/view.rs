@@ -559,6 +559,10 @@ pub struct ShelluneView {
     /// dials, and the connection is started after the form closes: this is where the
     /// typed value waits for that one start, and a start takes it away.
     desktop_secrets: std::collections::HashMap<HostId, shellune_core::SecretString>,
+    /// How many desktop attempts the window started, for the tests that prove one
+    /// press opens one connection.
+    #[cfg(test)]
+    desktop_starts: usize,
     /// The SSH configuration import panel and what the last read of a file showed.
     import: ImportPanel,
     /// The configuration path field, present only while that panel is open.
@@ -2879,6 +2883,8 @@ impl ShelluneView {
             host_connection_fields: None,
             protocol_fields: None,
             desktop_secrets: std::collections::HashMap::new(),
+            #[cfg(test)]
+            desktop_starts: 0,
             theme_choice: theme::ThemeChoice::default(),
             terminal_scheme: theme::TerminalScheme::default(),
             connection_choice: None,
@@ -4876,6 +4882,10 @@ impl ShelluneView {
             .session(session)
             .map_or(EventTag::new(session, 0), shellune_core::Session::tag);
         let locale = self.workspace.locale();
+        #[cfg(test)]
+        {
+            self.desktop_starts += 1;
+        }
         let pane = cx.new(|cx| desktop::DesktopPane::new(target, locale, cx));
         pane.update(cx, |pane, cx| pane.start(password.as_deref(), cx));
         self.attach_desktop(tag, pane, cx);
@@ -6475,6 +6485,13 @@ impl ShelluneView {
         if let Some(id) = self.reconnect_candidate() {
             self.reconnect_session(id, cx);
         }
+    }
+
+    /// How many desktop attempts the window has started, for the tests that prove
+    /// one press is one connection.
+    #[cfg(test)]
+    pub fn desktop_start_count_for_test(&self) -> usize {
+        self.desktop_starts
     }
 
     /// Whether the password field of the open connection form is masked, for the

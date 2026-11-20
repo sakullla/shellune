@@ -59,3 +59,20 @@ VNC 只用 password（VncAuth）。密码不进入 `DesktopTarget`、不写日�
   启动从凭据库取；取消勾选 → 凭据库删掉、记录不再宣称保留。
 - `a_saved_desktop_password_is_never_shown_back_and_a_blank_field_keeps_it`：编辑时框为空，留空保存沿用旧值。
 - `switching_protocols_does_not_carry_a_password_between_forms`：SSH → RDP → VNC → SSH 之间互不串用。
+- `the_desktop_form_asks_for_a_password_and_hides_it` 同时断言草稿里的文本正好是输入的那串，
+  每个字符只落一次。
+- `one_press_on_a_saved_desktop_opens_one_attempt`：一次「连接」只启动一次
+  （`ShelluneView::desktop_starts`、`DesktopPane::starts`），尝试失败后也不会悄悄再启动。
+- `every_keystroke_reaches_a_desktop_once`：一个按键只产生一次按下与一次抬起，输入不会成对下发。
+
+## 5. 与「登录了两次 / 会话断开」有关的事实
+
+- 应用侧一次「连接」只有一次启动（上面两个用例），列表按钮、双击行、重连都走
+  `start_desktop_session`；失败后不自动重启，另一次尝试由用户发起。
+- **协议层**（`crates/desktop/src/rdp/session.rs` 的 `ATTEMPTS`）在一个已建立的会话被服务器
+  关闭（`RemoteClosed`）时会**自行重连一次**。对 xrdp 来说这表现为同一次 `DesktopPane` 产生
+  两条登录记录（第二条是 reconnected 到同一 display，没有 create session），而应用只显示一个会话。
+  这是客户端内部行为，应用无从得知；日志里的两次登录应优先按这条解释核对。
+- 剪贴板要求服务器侧有 chansrv（xrdp 的 `/usr/lib/xrdp`）。chansrv 起不来的端点上 cliprdr 通道
+  不会被授予，`NativeLink::open` 仍然按记录把 `set_clipboard(true)` 传下去，
+  但本地内容无处可送，粘贴时窗格只会给出「发送失败」；这不是应用关掉了共享。
