@@ -12,112 +12,113 @@
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
-/// Default text colour, matching the shell's primary text token.
+/// Default text colour, a soft off-white tuned for low glare on [`BACKGROUND`].
 pub const FOREGROUND: Rgb = Rgb {
-    r: 0xe6,
-    g: 0xe9,
-    b: 0xf0,
+    r: 0xd8,
+    g: 0xdc,
+    b: 0xe4,
 };
 
-/// Default terminal background, matching the shell canvas token.
+/// Default terminal background, a low-glare soft charcoal matching the dark shell.
 pub const BACKGROUND: Rgb = Rgb {
-    r: 0x0b,
-    g: 0x0c,
-    b: 0x10,
+    r: 0x18,
+    g: 0x1a,
+    b: 0x1f,
 };
 
-/// Default cursor colour, matching the accent token.
+/// Default cursor colour, a soft periwinkle matching the dark accent family.
 pub const CURSOR: Rgb = Rgb {
-    r: 0x8b,
-    g: 0x9f,
-    b: 0xfd,
+    r: 0x8e,
+    g: 0xa0,
+    b: 0xe6,
 };
 
 /// The sixteen ANSI colours.
 ///
-/// They are chosen for a dark canvas and checked for contrast in the tests: every
-/// colour a program can use as text stays readable on `BACKGROUND`, and the bright
-/// variants are visibly lighter rather than merely different.
+/// They are chosen for a low-glare dark charcoal canvas with restrained saturation
+/// and checked for contrast in the tests: every colour a program can use as text
+/// stays readable on `BACKGROUND`, and the bright variants are visibly lighter
+/// rather than neon.
 pub const ANSI: [Rgb; 16] = [
     Rgb {
-        r: 0x2b,
-        g: 0x31,
-        b: 0x3d,
+        r: 0x2a,
+        g: 0x2e,
+        b: 0x37,
     },
     Rgb {
-        r: 0xff,
-        g: 0x8d,
-        b: 0x99,
+        r: 0xd9,
+        g: 0x87,
+        b: 0x8c,
     },
     Rgb {
-        r: 0x64,
-        g: 0xd8,
-        b: 0xa8,
-    },
-    Rgb {
-        r: 0xf3,
-        g: 0xc6,
-        b: 0x6c,
-    },
-    Rgb {
-        r: 0x9d,
-        g: 0xb4,
-        b: 0xff,
-    },
-    Rgb {
-        r: 0xd7,
-        g: 0xa0,
-        b: 0xff,
-    },
-    Rgb {
-        r: 0x7f,
-        g: 0xd8,
-        b: 0xe8,
-    },
-    Rgb {
-        r: 0xb5,
+        r: 0x79,
         g: 0xbd,
-        b: 0xcc,
+        b: 0x96,
     },
     Rgb {
-        r: 0x82,
-        g: 0x8b,
-        b: 0x9c,
+        r: 0xd4,
+        g: 0xb2,
+        b: 0x6a,
     },
     Rgb {
-        r: 0xff,
-        g: 0xb3,
-        b: 0xbc,
+        r: 0x8a,
+        g: 0xa8,
+        b: 0xe6,
     },
     Rgb {
-        r: 0x8d,
-        g: 0xe6,
-        b: 0xc0,
+        r: 0xba,
+        g: 0x96,
+        b: 0xdb,
     },
     Rgb {
-        r: 0xf8,
-        g: 0xd8,
-        b: 0x94,
+        r: 0x72,
+        g: 0xbc,
+        b: 0xc7,
     },
     Rgb {
-        r: 0xbc,
-        g: 0xcb,
-        b: 0xff,
+        r: 0xb3,
+        g: 0xb9,
+        b: 0xc4,
+    },
+    Rgb {
+        r: 0x8c,
+        g: 0x93,
+        b: 0xa0,
+    },
+    Rgb {
+        r: 0xe6,
+        g: 0xa5,
+        b: 0xa9,
+    },
+    Rgb {
+        r: 0x98,
+        g: 0xcf,
+        b: 0xaf,
     },
     Rgb {
         r: 0xe3,
-        g: 0xc4,
-        b: 0xff,
+        g: 0xc7,
+        b: 0x8a,
     },
     Rgb {
         r: 0xa8,
-        g: 0xe9,
-        b: 0xf4,
+        g: 0xbf,
+        b: 0xf0,
     },
     Rgb {
-        r: 0xee,
-        g: 0xf1,
-        b: 0xf7,
+        r: 0xce,
+        g: 0xb2,
+        b: 0xe8,
+    },
+    Rgb {
+        r: 0x93,
+        g: 0xcf,
+        b: 0xd8,
+    },
+    Rgb {
+        r: 0xdc,
+        g: 0xe0,
+        b: 0xe8,
     },
 ];
 

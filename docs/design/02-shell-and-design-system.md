@@ -894,17 +894,17 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 强调色，accent 不偏紫（蓝 > 绿 ≥ 红，蓝绿差 ≥ 0x40，由测试校验）。唯一的渐变 `brand_gradient`（accent → brand end）
 只画在品牌徽记上。表面、边框与文字在两种主题下都保持中性（各通道差值 ≤ 14，由测试校验）。
 
-**表面**：
+**表面**（2026-11-20 护眼低眩光修订：深色采用柔和炭灰阶，浅色采用温和暖纸白，消除漆黑/纯白高眩光反差）：
 
 | 令牌 | 深色 | 浅色 | 放什么 |
 | --- | --- | --- | --- |
-| `CANVAS` | `#0f0f11` | `#fafafa` | 窗口底：内容区、终端外围 |
-| `SURFACE` | `#151518` | `#f4f4f5` | 面板层：侧栏、输入框、行、卡片 |
-| `CHROME` | `#151518` | `#f4f4f5` | 标题栏、标签条、状态栏（与 `SURFACE` 同值，同属面板层） |
-| `RAISED` | `#1c1c20` | `#ffffff` | 浮层：菜单、弹出层、命令面板、tooltip、toast（`components::popover_surface`） |
-| `OVERLAY` | `#202024` | `#ffffff` | 对话框（最前层，压在 scrim 上） |
+| `CANVAS` | `#18191d` | `#f4f2ed` | 窗口底：内容区、终端外围 |
+| `SURFACE` | `#1e2025` | `#eceae4` | 面板层：侧栏、输入框、行、卡片 |
+| `CHROME` | `#1e2025` | `#eceae4` | 标题栏、标签条、状态栏（与 `SURFACE` 同值，同属面板层） |
+| `RAISED` | `#24262c` | `#faf9f5` | 浮层：菜单、弹出层、命令面板、tooltip、toast（`components::popover_surface`） |
+| `OVERLAY` | `#282a30` | `#faf9f5` | 对话框（最前层，压在 scrim 上） |
 
-深色下 canvas < 面板 < 浮层 < 对话框逐级变亮（测试校验）；浅色下面板比底色灰一档，浮在上面的一律为白
+深色下 canvas < 面板 < 浮层 < 对话框逐级变亮（测试校验）；浅色下面板比暖纸底色灰一档，浮在上面的一律为温和暖白
 （测试校验浮层亮于 canvas 与面板）。
 
 **交互填充是半透明遮罩**（ADR-1 的“白 5% / 黑 4%”本意）：`SURFACE_HOVER` / `SURFACE_SELECTED` / `SURFACE_PRESSED`
@@ -913,59 +913,57 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 地方（终端输入法组字框）用 `theme::swatch_over(veil, layer)` 取叠好的不透明色。对比度测试一律先用 `Token::over`
 把遮罩叠到具体的层上再量（`contrast::both` 遇到遮罩直接报错）。发丝线仍是叠在面板上的不透明值。
 测试 `the_interaction_fills_and_hairlines_are_the_documented_blends` 校验比例，`every_interaction_fill_stands_off_every_layer_it_is_drawn_on`
-校验每种遮罩在五个层上、以及选中行上的 tag 与其底都至少差 1.08:1（迁移前深色 hover 叠在对话框上只有 1.01:1）：
+校验每种遮罩在五个层上、以及选中行上的 tag 与其底都至少差 1.08:1：
 
 | 令牌 | 深色 | 浅色 |
 | --- | --- | --- |
-| `SURFACE_HOVER` | 白 5%（叠面板 ≈ `#212124`，叠对话框 ≈ `#2b2b2f`） | 黑 4% |
+| `SURFACE_HOVER` | 白 5%（叠面板 ≈ `#292b30`，叠对话框 ≈ `#33353a`） | 黑 4% |
 | `SURFACE_SELECTED` | 白 8% | 黑 6% |
 | `SURFACE_PRESSED` | 白 10% | 黑 8% |
-| `BORDER` | 白 7% 叠面板 → `#252528` | 黑 8% 叠面板 → `#e0e0e1` |
-| `BORDER_STRONG` | 白 12% 叠面板 → `#313134` | 黑 14% 叠面板 → `#d2d2d3` |
+| `BORDER` | 白 7% 叠面板 → `#2e3034` | 黑 8% 叠面板 → `#d9d7d2` |
+| `BORDER_STRONG` | 白 12% 叠面板 → `#393b3f` | 黑 14% 叠面板 → `#cbc9c4` |
 
 **文字、强调色与状态色**：
 
 | 令牌 | 深色 | 浅色 | 用途 |
 | --- | --- | --- | --- |
-| `TEXT_PRIMARY` / `TEXT_SECONDARY` / `TEXT_MUTED` | `#ededef` / `#b0b0b8` / `#9e9ea6` | `#18181b` / `#52525b` / `#63636b` | 标题 / 正文 / 提示与计数 |
-| `ACCENT` / `ACCENT_HOVER` / `ACCENT_PRESSED` | `#9396f4` / `#a0a3f6` / `#8689f3` | `#5252d2` / `#4747c4` / `#3f3fb5` | 主操作：静止 / 悬停 / 按下 |
-| `ON_ACCENT` | `#0f0f11` | `#ffffff` | 实心 accent 上的文字 |
-| `ACCENT_TINT` / `ACCENT_ON_TINT` | `#272737`（accent 14% 叠面板）/ `#c5c7fa` | `#eeeefa`（accent 10% 叠白）/ `#3e3eb8` | 徽标、空状态图标块、当前项底色 |
-| `POSITIVE` / `WARNING` / `DANGER` / `INFO` | `#5bc490` / `#d9ae5f` / `#ee8a8a` / `#78aeeb` | `#166c42` / `#825400` / `#b12f36` / `#2563ae` | 低饱和状态色（同时是其 tint 上的文字色） |
-| `*_TINT`（positive / warning / danger / info） | `#1f2e29` / `#302a22` / `#332528` / `#232a36`（各 14% 叠面板） | `#e8f0ec` / `#f2eee6` / `#f7eaeb` / `#e9eff7`（各 10% 叠白） | 状态 chip、横幅、toast 图标底 |
-| `PLANNED` | `#9e9ea9` | `#5e5e6a` | 已关闭 / 本版本不提供 |
-| `FOCUS_RING` | `#a0a3f6` | `#4747c4` | 键盘焦点环（2px 边） |
-| `DISABLED_SURFACE` / `DISABLED_TEXT` | `#18181b` / `#7c7c84` | `#f0f0f1` / `#7f7f88` | 不可用控件（保持 3:1） |
-| `LOADING_TRACK` / `LOADING_FILL` | `#28282a` / `#9396f4` | `#e5e5e6` / `#5252d2` | 进度条的槽与已完成部分 |
-| `SEGMENT_TRACK` / `SEGMENT_THUMB` | `#0c0c0e` / `#232327` | `#eaeaeb` / `#ffffff` | 分段控件凹槽 / 选中滑块 |
-| `TRACK_OFF` / `TRACK_OFF_HOVER` | `#52525b` / `#5e5e68` | `#8a8a93` / `#7c7c85` | 开关关闭时的轨道 |
-| `TRACK_ON` / `TRACK_ON_HOVER` | `#6d71e6` / `#7377ea` | `#5252d2` / `#4747c4` | 开关打开时的轨道（accent 色相，深色下压暗以托住浅色圆钮） |
-| `KNOB` | `#f4f4f5` | `#ffffff` | 开关圆钮 |
-| `DANGER_SOLID` / `ON_DANGER` | `#c42b1c` / `#ffffff` | 同 | 实心危险填充（Windows 关闭按钮悬停） |
-| `SCRIM` | `#000000` | `#18181b` | 对话框遮罩，按 `SCRIM_ALPHA`（0.62）叠加 |
+| `TEXT_PRIMARY` / `TEXT_SECONDARY` / `TEXT_MUTED` | `#dce0e7` / `#b8bcc6` / `#a7aab4` | `#24262b` / `#4f5158` / `#595b63` | 标题 / 正文 / 提示与计数 |
+| `ACCENT` / `ACCENT_HOVER` / `ACCENT_PRESSED` | `#9fa3f5` / `#acb0f7` / `#9296f1` | `#464cb8` / `#3d43ab` / `#353b9e` | 主操作：静止 / 悬停 / 按下 |
+| `ON_ACCENT` | `#18191d` | `#faf9f5` | 实心 accent 上的文字 |
+| `ACCENT_TINT` / `ACCENT_ON_TINT` | `#303242`（accent 14% 叠面板）/ `#cad0fa` | `#e8e8ef`（accent 10% 叠暖白）/ `#393fa8` | 徽标、空状态图标块、当前项底色 |
+| `POSITIVE` / `WARNING` / `DANGER` / `INFO` | `#73c99b` / `#dcb56b` / `#ef9494` / `#84b6ee` | `#1b663f` / `#7a4f04` / `#a82f37` / `#265ca1` | 低饱和状态色（同时是其 tint 上的文字色） |
+| `*_TINT`（positive / warning / danger / info） | `#2a3836` / `#39352f` / `#3b3035` / `#2c3541`（各 14% 叠面板） | `#e4eae3` / `#ede8dd` / `#f2e5e2` / `#e5e9ed`（各 10% 叠暖白） | 状态 chip、横幅、toast 图标底 |
+| `PLANNED` | `#a9acb4` | `#555661` | 已关闭 / 本版本不提供 |
+| `FOCUS_RING` | `#acb0f7` | `#3d43ab` | 键盘焦点环（2px 边） |
+| `DISABLED_SURFACE` / `DISABLED_TEXT` | `#212329` / `#878a94` | `#e8e6e0` / `#74757c` | 不可用控件（保持 3:1） |
+| `LOADING_TRACK` / `LOADING_FILL` | `#303239` / `#9fa3f5` | `#dedcd6` / `#464cb8` | 进度条的槽与已完成部分 |
+| `SEGMENT_TRACK` / `SEGMENT_THUMB` | `#141519` / `#2c2f36` | `#e2e0da` / `#faf9f5` | 分段控件凹槽 / 选中滑块 |
+| `TRACK_OFF` / `TRACK_OFF_HOVER` | `#565963` / `#626570` | `#82817c` / `#74736e` | 开关关闭时的轨道 |
+| `TRACK_ON` / `TRACK_ON_HOVER` | `#7479e0` / `#7c81e6` | `#464cb8` / `#3d43ab` | 开关打开时的轨道（accent 色相，深色下压暗以托住浅色圆钮） |
+| `KNOB` | `#f0f1f4` | `#faf9f5` | 开关圆钮 |
+| `DANGER_SOLID` / `ON_DANGER` | `#c42b1c` / `#f7f7f8` | `#b82e24` / `#faf9f5` | 实心危险填充（Windows 关闭按钮悬停） |
+| `SCRIM` | `#000000` | `#202124` | 对话框遮罩，按 `SCRIM_ALPHA`（0.62）叠加 |
 | `SHADOW` | `#000000` | `#000000` | 层级阴影的墨色 |
-| `BRAND_END` | `#a78bfa` | `#7c5cd6` | 唯一渐变的第二色标 |
-| `SELECTION` | `#373859`（accent 32% 叠终端底色） | `#d7d7f4`（accent 22% 叠终端底色） | 终端选区背景，按**终端**配色解析（取代 `terminal.rs` 里的两个硬编码值） |
+| `SELECTION` | `#434663`（accent 32% 叠深色终端底 `#181a1f`） | `#cfcfe3`（accent 22% 叠浅色终端底 `#f6f4ef`） | 终端选区背景，按**终端**配色解析 |
 | `AVATARS` | 8 组 | 8 组 | 主机头像（靛、钢、青、鼠尾草、苔、沙、陶、石楠，各 18%/12% 叠底），低饱和，不与状态色同源 |
 | `TAB_ACCENTS` | 6 色 | 6 色 | 标签辨识色（不与状态色同源） |
 
-**与 ADR-1 表的偏差（为守住对比度下限）**：ADR 给的 `TEXT_MUTED`（深 `#71717a` / 浅 `#a1a1aa`）在面板上只有
-2.8:1 / 1.9:1，`ACCENT`（深 `#7c7ff2` / 浅 `#5b5bd6`）在按下底色上不到 4.5:1，深色 `ON_ACCENT` 用白只有 3.4:1。
-这里保留 ADR 的色相与层次，把这几个值调到最近的合格值：muted 浅 `#63636b`、accent 浅 `#5252d2`，深色 `ON_ACCENT`
-用 canvas 墨色 `#0f0f11`（浅色仍是白）。交互填充改为遮罩后，深色的 muted、accent、planned 还要在对话框层上的
-选中 / 按下底（白 8% / 10% 叠 `#202024`）上守住 4.5:1，因此再提亮一档：muted `#9e9ea6`、accent `#9396f4`（hover
-`#a0a3f6`、按下 `#8689f3`，焦点环随 hover）、planned `#9e9ea9`；为保持 secondary 与 muted 的层次（约 1.24:1），
-深色 `TEXT_SECONDARY` 由 ADR 的 `#a1a1aa` 提到 `#b0b0b8`；禁用文字 `#7c7c84` 以在各层的选中底上守住 3:1。
-其余表面、hover/selected/border 比例、`TEXT_PRIMARY` 与 ADR 一致（pressed 取 10%/8%，ADR 未列）。
+**与早期初版的偏差（护眼低眩光与对比度守卫）**：2026-11-20 起深色表面整体由近纯黑（`#0f0f11`–`#202024`）抬升至柔和炭灰
+（`#18191d`–`#282a30`），浅色表面由近纯白（`#fafafa`/`#ffffff`）调为温和暖纸白（`#f4f2ed`/`#eceae4`/`#faf9f5`），
+正文与状态色同步降眩光并在全部 20 种表面（5 层 + 3 种交互遮罩 × 5 层）上严格保持 ≥ 4.5:1 对比度；深色 `ON_ACCENT`
+取 `CANVAS` 炭灰 `#18191d`，浅色取暖白 `#faf9f5`。中性色保持通道差 ≤ 14，强调色保持长春花蓝色相（`b > g >= r` 且 `b - g >= 0x40`）。
 
 **对比度（测试断言）**：正文三色、accent、四个状态色与 planned 在五个层（canvas、chrome、surface、raised、
 overlay）以及 hover/selected/pressed 叠在每个层上的 15 种底上深浅两套都 ≥ 4.5:1；焦点环 ≥ 3:1；每个状态色在自己的 tint 上、
 `ON_ACCENT` 在三种 accent 上、`ON_DANGER` 在 `DANGER_SOLID` 上、头像字在头像底上 ≥ 4.5:1；禁用文字与进度条
 取图形下限 3:1；开关圆钮在四种轨道上、打开的轨道在各表面上深浅两套都 ≥ 3:1。
 
-终端默认前景、背景、光标与 16 个 ANSI 色另有浅色映射（`theme::light::TERMINAL`，按终端深色值索引）；
-程序输出的颜色不被界面主题改写。终端配色可单独选择（`theme::TerminalScheme`）。绘制时有最低对比度保护：
-低于 3:1（dim 2:1）时把文字推向黑或白。
+**终端深浅色板（`crates/terminal/src/palette.rs`、`theme::light::TERMINAL`）**：
+深色终端采用柔和炭灰底 `#181a1f`、柔和浅灰白前景 `#d8dce4` 与柔和长春花蓝光标 `#8ea0e6`，16 个 ANSI 槽位降饱和去荧光，
+满足 `ANSI[0]` 对比度 `< 4.5`、`ANSI[1..16]` ≥ 4.5:1、亮色严格亮于常规色、dim 严格暗于常规色。
+浅色终端采用温和暖纸白底 `#f6f4ef`、柔和石墨灰前景 `#282c34` 与深长春花蓝光标 `#4858b8`，`theme::light::TERMINAL`
+完整映射全部 19 个默认与 ANSI 槽位并由测试守卫全部达到 ≥ 4.5:1 对比度。程序通过 OSC 或真彩色主动输出的颜色不被改写；
+终端配色可单独选择（`theme::TerminalScheme`）。绘制时有最低对比度保护：低于 3:1（dim 2:1）时把文字推向黑或白。
 
 ### 2.2 层级（Elevation）
 

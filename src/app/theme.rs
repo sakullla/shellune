@@ -151,24 +151,25 @@ impl std::fmt::LowerHex for Token {
     }
 }
 
-/// The dark palette: neutral graphite with one periwinkle accent (token v2).
+/// The dark palette: low-glare soft charcoal with one restrained periwinkle accent.
 ///
-/// The surfaces are a short neutral grey ramp - canvas, panel, raised, dialog. The
-/// interaction fills are white veils (hover 5%, selected 8%, pressed 10%) that lie over
-/// whichever layer they are drawn on; the hairlines are white over the panel (border
-/// 7%, strong border 12%), written here as the opaque colour that blend gives. A dark
-/// palette tells its layers apart by lightness and edge; the shadows are faint.
+/// The surfaces are a calm charcoal grey ramp - canvas, panel, raised, dialog - lifted
+/// off pitch black to reduce halation during long sessions. The interaction fills are
+/// white veils (hover 5%, selected 8%, pressed 10%) that lie over whichever layer they
+/// are drawn on; the hairlines are white over the panel (border 7%, strong border 12%),
+/// written here as the opaque colour that blend gives. A dark palette tells its layers
+/// apart by lightness and edge; the shadows are faint.
 pub mod dark {
     /// The window's floor: behind the content area and around the terminal.
-    pub const CANVAS: u32 = 0x0f0f11;
+    pub const CANVAS: u32 = 0x18191d;
     /// The title bar, the tab strip, the sidebar and the status bar: the panel layer.
-    pub const CHROME: u32 = 0x151518;
+    pub const CHROME: u32 = 0x1e2025;
     /// Panels, inputs, rows and cards.
-    pub const SURFACE: u32 = 0x151518;
+    pub const SURFACE: u32 = 0x1e2025;
     /// Things that float over content: menus, popovers, tooltips and toasts.
-    pub const RAISED: u32 = 0x1c1c20;
+    pub const RAISED: u32 = 0x24262c;
     /// Dialogs, the front-most layer.
-    pub const OVERLAY: u32 = 0x202024;
+    pub const OVERLAY: u32 = 0x282a30;
     /// White at 5%, over whatever layer it is on.
     pub const SURFACE_HOVER: (u32, u8) = (0xffffff, 5);
     /// White at 8%.
@@ -176,153 +177,153 @@ pub mod dark {
     /// White at 10%.
     pub const SURFACE_PRESSED: (u32, u8) = (0xffffff, 10);
     /// White 7% over the panel.
-    pub const BORDER: u32 = 0x252528;
+    pub const BORDER: u32 = 0x2e3034;
     /// White 12% over the panel.
-    pub const BORDER_STRONG: u32 = 0x313134;
-    pub const SEGMENT_TRACK: u32 = 0x0c0c0e;
-    pub const SEGMENT_THUMB: u32 = 0x232327;
-    pub const TEXT_PRIMARY: u32 = 0xededef;
-    pub const TEXT_SECONDARY: u32 = 0xb0b0b8;
-    pub const TEXT_MUTED: u32 = 0x9e9ea6;
-    pub const ACCENT: u32 = 0x9396f4;
-    pub const ACCENT_HOVER: u32 = 0xa0a3f6;
-    pub const ACCENT_PRESSED: u32 = 0x8689f3;
-    pub const ON_ACCENT: u32 = 0x0f0f11;
+    pub const BORDER_STRONG: u32 = 0x393b3f;
+    pub const SEGMENT_TRACK: u32 = 0x141519;
+    pub const SEGMENT_THUMB: u32 = 0x2c2f36;
+    pub const TEXT_PRIMARY: u32 = 0xdce0e7;
+    pub const TEXT_SECONDARY: u32 = 0xb8bcc6;
+    pub const TEXT_MUTED: u32 = 0xa7aab4;
+    pub const ACCENT: u32 = 0x9fa3f5;
+    pub const ACCENT_HOVER: u32 = 0xacb0f7;
+    pub const ACCENT_PRESSED: u32 = 0x9296f1;
+    pub const ON_ACCENT: u32 = 0x18191d;
     /// The accent 14% over the panel.
-    pub const ACCENT_TINT: u32 = 0x272737;
-    pub const ACCENT_ON_TINT: u32 = 0xc5c7fa;
-    pub const POSITIVE: u32 = 0x5bc490;
-    pub const WARNING: u32 = 0xd9ae5f;
-    pub const DANGER: u32 = 0xee8a8a;
-    pub const INFO: u32 = 0x78aeeb;
-    pub const PLANNED: u32 = 0x9e9ea9;
+    pub const ACCENT_TINT: u32 = 0x303242;
+    pub const ACCENT_ON_TINT: u32 = 0xcad0fa;
+    pub const POSITIVE: u32 = 0x73c99b;
+    pub const WARNING: u32 = 0xdcb56b;
+    pub const DANGER: u32 = 0xef9494;
+    pub const INFO: u32 = 0x84b6ee;
+    pub const PLANNED: u32 = 0xa9acb4;
     /// Each status colour 14% over the panel.
-    pub const POSITIVE_TINT: u32 = 0x1f2e29;
-    pub const WARNING_TINT: u32 = 0x302a22;
-    pub const DANGER_TINT: u32 = 0x332528;
-    pub const INFO_TINT: u32 = 0x232a36;
+    pub const POSITIVE_TINT: u32 = 0x2a3836;
+    pub const WARNING_TINT: u32 = 0x39352f;
+    pub const DANGER_TINT: u32 = 0x3b3035;
+    pub const INFO_TINT: u32 = 0x2c3541;
     pub const DANGER_SOLID: u32 = 0xc42b1c;
-    pub const ON_DANGER: u32 = 0xffffff;
-    pub const TRACK_OFF: u32 = 0x52525b;
-    pub const TRACK_OFF_HOVER: u32 = 0x5e5e68;
-    pub const TRACK_ON: u32 = 0x6d71e6;
-    pub const TRACK_ON_HOVER: u32 = 0x7377ea;
-    pub const KNOB: u32 = 0xf4f4f5;
-    pub const FOCUS_RING: u32 = 0xa0a3f6;
-    pub const DISABLED_SURFACE: u32 = 0x18181b;
-    pub const DISABLED_TEXT: u32 = 0x7c7c84;
-    pub const LOADING_TRACK: u32 = 0x28282a;
-    pub const LOADING_FILL: u32 = 0x9396f4;
+    pub const ON_DANGER: u32 = 0xf7f7f8;
+    pub const TRACK_OFF: u32 = 0x565963;
+    pub const TRACK_OFF_HOVER: u32 = 0x626570;
+    pub const TRACK_ON: u32 = 0x7479e0;
+    pub const TRACK_ON_HOVER: u32 = 0x7c81e6;
+    pub const KNOB: u32 = 0xf0f1f4;
+    pub const FOCUS_RING: u32 = 0xacb0f7;
+    pub const DISABLED_SURFACE: u32 = 0x212329;
+    pub const DISABLED_TEXT: u32 = 0x878a94;
+    pub const LOADING_TRACK: u32 = 0x303239;
+    pub const LOADING_FILL: u32 = 0x9fa3f5;
     pub const SCRIM: u32 = 0x000000;
     pub const SHADOW: u32 = 0x000000;
     /// The terminal's selection: the accent 32% over the terminal's background.
-    pub const SELECTION: u32 = 0x373859;
+    pub const SELECTION: u32 = 0x434663;
     /// Eight low-chroma avatar pairs (tint, initials): indigo, steel, teal, sage, moss,
     /// sand, clay and heather, each hue 18% over the panel.
     pub const AVATARS: [(u32, u32); 8] = [
-        (0x282836, 0xb5b6e3),
-        (0x282f36, 0xb5d0e3),
-        (0x283435, 0xb5e3df),
-        (0x28342f, 0xb5e3c8),
-        (0x2d342a, 0xc8e3b5),
-        (0x34302a, 0xe3d4b5),
-        (0x342b2a, 0xe3c1b5),
-        (0x342830, 0xe3b5cc),
+        (0x2f3145, 0xc0c2eb),
+        (0x2c3642, 0xbcd6ec),
+        (0x2b393c, 0xb9e0dd),
+        (0x2c3836, 0xbae0ca),
+        (0x323832, 0xcde0b9),
+        (0x3a3732, 0xe6d6b8),
+        (0x3a3132, 0xe6c3b8),
+        (0x392e38, 0xe6bad0),
     ];
     pub const TAB_ACCENTS: [u32; 6] = [0x9cbcd8, 0xb9aecb, 0x8fc6cf, 0xaec79a, 0xd3bc9c, 0xd4a8ae];
 }
 
-/// The light palette: neutral paper with the same accent, a step deeper.
+/// The light palette: warm paper with soft graphite text and the same accent, deeper.
 ///
-/// The floor is near-white, the panels one step greyer and anything that floats is
-/// white; the interaction fills are black veils (hover 4%, selected 6%, pressed 8%)
-/// over whichever layer they are on, and the hairlines are black over the panel
-/// (border 8%, strong border 14%).
+/// The floor is warm paper white, the panels one step deeper warm grey and anything
+/// that floats is gentle ivory; the interaction fills are black veils (hover 4%,
+/// selected 6%, pressed 8%) over whichever layer they are on, and the hairlines are
+/// black over the panel (border 8%, strong border 14%).
 pub mod light {
-    pub const CANVAS: u32 = 0xfafafa;
-    pub const CHROME: u32 = 0xf4f4f5;
-    pub const SURFACE: u32 = 0xf4f4f5;
-    pub const RAISED: u32 = 0xffffff;
-    pub const OVERLAY: u32 = 0xffffff;
+    pub const CANVAS: u32 = 0xf4f2ed;
+    pub const CHROME: u32 = 0xeceae4;
+    pub const SURFACE: u32 = 0xeceae4;
+    pub const RAISED: u32 = 0xfaf9f5;
+    pub const OVERLAY: u32 = 0xfaf9f5;
     pub const SURFACE_HOVER: (u32, u8) = (0x000000, 4);
     pub const SURFACE_SELECTED: (u32, u8) = (0x000000, 6);
     pub const SURFACE_PRESSED: (u32, u8) = (0x000000, 8);
-    pub const BORDER: u32 = 0xe0e0e1;
-    pub const BORDER_STRONG: u32 = 0xd2d2d3;
-    pub const SEGMENT_TRACK: u32 = 0xeaeaeb;
-    pub const SEGMENT_THUMB: u32 = 0xffffff;
-    pub const TEXT_PRIMARY: u32 = 0x18181b;
-    pub const TEXT_SECONDARY: u32 = 0x52525b;
-    pub const TEXT_MUTED: u32 = 0x63636b;
-    pub const ACCENT: u32 = 0x5252d2;
-    pub const ACCENT_HOVER: u32 = 0x4747c4;
-    pub const ACCENT_PRESSED: u32 = 0x3f3fb5;
-    pub const ON_ACCENT: u32 = 0xffffff;
-    /// The accent 10% over white.
-    pub const ACCENT_TINT: u32 = 0xeeeefa;
-    pub const ACCENT_ON_TINT: u32 = 0x3e3eb8;
-    pub const POSITIVE: u32 = 0x166c42;
-    pub const WARNING: u32 = 0x825400;
-    pub const DANGER: u32 = 0xb12f36;
-    pub const INFO: u32 = 0x2563ae;
-    pub const PLANNED: u32 = 0x5e5e6a;
-    /// Each status colour 10% over white.
-    pub const POSITIVE_TINT: u32 = 0xe8f0ec;
-    pub const WARNING_TINT: u32 = 0xf2eee6;
-    pub const DANGER_TINT: u32 = 0xf7eaeb;
-    pub const INFO_TINT: u32 = 0xe9eff7;
-    pub const DANGER_SOLID: u32 = 0xc42b1c;
-    pub const ON_DANGER: u32 = 0xffffff;
-    pub const TRACK_OFF: u32 = 0x8a8a93;
-    pub const TRACK_OFF_HOVER: u32 = 0x7c7c85;
-    pub const TRACK_ON: u32 = 0x5252d2;
-    pub const TRACK_ON_HOVER: u32 = 0x4747c4;
-    pub const KNOB: u32 = 0xffffff;
-    pub const FOCUS_RING: u32 = 0x4747c4;
-    pub const DISABLED_SURFACE: u32 = 0xf0f0f1;
-    pub const DISABLED_TEXT: u32 = 0x7f7f88;
-    pub const LOADING_TRACK: u32 = 0xe5e5e6;
-    pub const LOADING_FILL: u32 = 0x5252d2;
-    pub const SCRIM: u32 = 0x18181b;
+    pub const BORDER: u32 = 0xd9d7d2;
+    pub const BORDER_STRONG: u32 = 0xcbc9c4;
+    pub const SEGMENT_TRACK: u32 = 0xe2e0da;
+    pub const SEGMENT_THUMB: u32 = 0xfaf9f5;
+    pub const TEXT_PRIMARY: u32 = 0x24262b;
+    pub const TEXT_SECONDARY: u32 = 0x4f5158;
+    pub const TEXT_MUTED: u32 = 0x595b63;
+    pub const ACCENT: u32 = 0x464cb8;
+    pub const ACCENT_HOVER: u32 = 0x3d43ab;
+    pub const ACCENT_PRESSED: u32 = 0x353b9e;
+    pub const ON_ACCENT: u32 = 0xfaf9f5;
+    /// The accent 10% over raised warm white.
+    pub const ACCENT_TINT: u32 = 0xe8e8ef;
+    pub const ACCENT_ON_TINT: u32 = 0x393fa8;
+    pub const POSITIVE: u32 = 0x1b663f;
+    pub const WARNING: u32 = 0x7a4f04;
+    pub const DANGER: u32 = 0xa82f37;
+    pub const INFO: u32 = 0x265ca1;
+    pub const PLANNED: u32 = 0x555661;
+    /// Each status colour 10% over raised warm white.
+    pub const POSITIVE_TINT: u32 = 0xe4eae3;
+    pub const WARNING_TINT: u32 = 0xede8dd;
+    pub const DANGER_TINT: u32 = 0xf2e5e2;
+    pub const INFO_TINT: u32 = 0xe5e9ed;
+    pub const DANGER_SOLID: u32 = 0xb82e24;
+    pub const ON_DANGER: u32 = 0xfaf9f5;
+    pub const TRACK_OFF: u32 = 0x82817c;
+    pub const TRACK_OFF_HOVER: u32 = 0x74736e;
+    pub const TRACK_ON: u32 = 0x464cb8;
+    pub const TRACK_ON_HOVER: u32 = 0x3d43ab;
+    pub const KNOB: u32 = 0xfaf9f5;
+    pub const FOCUS_RING: u32 = 0x3d43ab;
+    pub const DISABLED_SURFACE: u32 = 0xe8e6e0;
+    pub const DISABLED_TEXT: u32 = 0x74757c;
+    pub const LOADING_TRACK: u32 = 0xdedcd6;
+    pub const LOADING_FILL: u32 = 0x464cb8;
+    pub const SCRIM: u32 = 0x202124;
     pub const SHADOW: u32 = 0x000000;
-    /// The terminal's selection: the accent 22% over the terminal's background.
-    pub const SELECTION: u32 = 0xd7d7f4;
+    /// The terminal's selection: the accent 22% over the light terminal's background.
+    pub const SELECTION: u32 = 0xcfcfe3;
     pub const AVATARS: [(u32, u32); 8] = [
-        (0xe5e6ee, 0x2a2b6f),
-        (0xe5eaee, 0x2a526f),
-        (0xe5eeed, 0x2a6f69),
-        (0xe5eee9, 0x2a6f47),
-        (0xe9eee5, 0x476f2a),
-        (0xeeebe5, 0x6f582a),
-        (0xeee7e5, 0x6f3b2a),
-        (0xeee5ea, 0x6f2a4d),
+        (0xe4e5ec, 0x2c306e),
+        (0xe3e8ec, 0x2a4f6b),
+        (0xe2eceb, 0x266963),
+        (0xe3ece6, 0x286944),
+        (0xe8ece3, 0x456928),
+        (0xede9e2, 0x6b5326),
+        (0xede5e2, 0x6b3928),
+        (0xede3e8, 0x6b284a),
     ];
     pub const TAB_ACCENTS: [u32; 6] = [0x2f5f86, 0x5d4a80, 0x1a6b74, 0x51662f, 0x8a5a20, 0x8b4450];
 
-    /// The terminal's default colours and its 16 ANSI colours, light.
+    /// The terminal's default colours and its 16 ANSI colours, warm-paper light.
     ///
     /// Keyed by the dark values of `shellune_terminal::palette`; a colour a program
     /// set itself (256-colour or true colour) is drawn as it asked.
     pub const TERMINAL: &[(u32, u32)] = &[
-        (0xe6e9f0, 0x1f2329), // foreground
-        (0x0b0c10, 0xfcfcfd), // background
-        (0x8b9ffd, 0x3f52c8), // cursor
-        (0x2b313d, 0x3a3e48), // black
-        (0xff8d99, 0xc8334a), // red
-        (0x64d8a8, 0x2a7a3f), // green
-        (0xf3c66c, 0x8a5c00), // yellow
-        (0x9db4ff, 0x3157c9), // blue
-        (0xd7a0ff, 0x8c35a8), // magenta
-        (0x7fd8e8, 0x0b7286), // cyan
-        (0xb5bdcc, 0x80879a), // white
-        (0x828b9c, 0x646b7b), // bright black
-        (0xffb3bc, 0xb52a3f), // bright red
-        (0x8de6c0, 0x246c37), // bright green
-        (0xf8d894, 0x7a5100), // bright yellow
-        (0xbccbff, 0x2a4cb6), // bright blue
-        (0xe3c4ff, 0x7b2b95), // bright magenta
-        (0xa8e9f4, 0x0a6474), // bright cyan
-        (0xeef1f7, 0x4a4f5c), // bright white
+        (0xd8dce4, 0x282c34), // foreground
+        (0x181a1f, 0xf6f4ef), // background
+        (0x8ea0e6, 0x4858b8), // cursor
+        (0x2a2e37, 0x363a42), // black
+        (0xd9878c, 0xb53c48), // red
+        (0x79bd96, 0x2b7344), // green
+        (0xd4b26a, 0x855a08), // yellow
+        (0x8aa8e6, 0x375ab5), // blue
+        (0xba96db, 0x813d9c), // magenta
+        (0x72bcc7, 0x196e7d), // cyan
+        (0xb3b9c4, 0x5d626e), // white
+        (0x8c93a0, 0x525763), // bright black
+        (0xe6a5a9, 0xa1313d), // bright red
+        (0x98cfaf, 0x226338), // bright green
+        (0xe3c78a, 0x734d05), // bright yellow
+        (0xa8bff0, 0x2d4da1), // bright blue
+        (0xceb2e8, 0x70318a), // bright magenta
+        (0x93cfd8, 0x125d6b), // bright cyan
+        (0xdce0e8, 0x3c404a), // bright white
     ];
 }
 
@@ -2242,13 +2243,15 @@ mod tests {
             );
         }
         // The terminal's selection is the accent over the terminal's own background.
+        let dark_terminal_bg = rgb_u32(shellune_terminal::palette::BACKGROUND);
+        let light_terminal_bg = light_terminal_color(dark_terminal_bg);
         assert_eq!(
             palette::SELECTION.dark(),
-            over(dark::ACCENT, 0.32, 0x0b0c10)
+            over(dark::ACCENT, 0.32, dark_terminal_bg)
         );
         assert_eq!(
             palette::SELECTION.light(),
-            over(light::ACCENT, 0.22, 0xfcfcfd)
+            over(light::ACCENT, 0.22, light_terminal_bg)
         );
     }
 
@@ -2606,17 +2609,58 @@ mod tests {
         assert_eq!(count, marks.len(), "two tones are drawn with one mark");
     }
 
+    fn rgb_u32(color: shellune_terminal::Rgb) -> u32 {
+        (u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b)
+    }
+
+    fn light_terminal_color(dark: u32) -> u32 {
+        TERMINAL
+            .iter()
+            .find(|(from, _)| *from == dark)
+            .map(|(_, to)| *to)
+            .unwrap_or_else(|| panic!("missing light terminal mapping for {dark:06x}"))
+    }
+
     #[test]
     fn the_light_terminal_keeps_the_accent_cursor() {
-        let cursor = TERMINAL
-            .iter()
-            .find(|(from, _)| *from == 0x8b9ffd)
-            .map(|(_, to)| *to)
-            .expect("the cursor has a light value");
+        let cursor = light_terminal_color(rgb_u32(shellune_terminal::palette::CURSOR));
         let [_, r, g, b] = cursor.to_be_bytes();
         assert!(
             g > r && b > r,
             "the light cursor {cursor:06x} is not the accent"
         );
+    }
+
+    #[test]
+    fn the_light_terminal_maps_every_slot_with_readable_contrast() {
+        let dark_bg = rgb_u32(shellune_terminal::palette::BACKGROUND);
+        let dark_fg = rgb_u32(shellune_terminal::palette::FOREGROUND);
+        let dark_cursor = rgb_u32(shellune_terminal::palette::CURSOR);
+        assert_eq!(
+            TERMINAL.len(),
+            19,
+            "light::TERMINAL must map foreground, background, cursor and 16 ANSI slots"
+        );
+        let light_bg = light_terminal_color(dark_bg);
+        let light_fg = light_terminal_color(dark_fg);
+        let light_cursor = light_terminal_color(dark_cursor);
+        assert!(
+            contrast::ratio(light_fg, light_bg) >= BODY,
+            "light terminal foreground is {:.2}:1 on background",
+            contrast::ratio(light_fg, light_bg)
+        );
+        assert!(
+            contrast::ratio(light_cursor, light_bg) >= BODY,
+            "light terminal cursor is {:.2}:1 on background",
+            contrast::ratio(light_cursor, light_bg)
+        );
+        for (index, color) in shellune_terminal::palette::ANSI.iter().enumerate() {
+            let light_ansi = light_terminal_color(rgb_u32(*color));
+            let ratio = contrast::ratio(light_ansi, light_bg);
+            assert!(
+                ratio >= BODY,
+                "light terminal ANSI[{index}] ({light_ansi:06x}) is {ratio:.2}:1 on background ({light_bg:06x})"
+            );
+        }
     }
 }
