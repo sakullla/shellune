@@ -609,9 +609,9 @@ impl Huffman {
     }
 }
 
-/// Enough of RFC 1950/1951 to read what LibVNCClient's deflate writes: stored,
-/// fixed and dynamic blocks, ending at a final block or at the end of a stream that
-/// was only sync-flushed.
+/// Enough of RFC 1950/1951 to read the deflate stream an extended-clipboard text
+/// arrives in: stored, fixed and dynamic blocks, ending at a final block or at the
+/// end of a stream that was only sync-flushed.
 fn zlib_inflate(data: &[u8]) -> Option<Vec<u8>> {
     const LBASE: [u16; 29] = [
         3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
@@ -763,12 +763,16 @@ fn when_connected(
 // ------------------------------------------------------------------------ tests
 
 #[test]
-fn the_event_struct_is_the_one_the_header_declares() {
-    assert_eq!(shellune_desktop::SD_ABI_VERSION, 2);
-    // Same numbers as the layout assertions in shim/sd_shim.c.
+fn the_diagnostics_names_are_the_ones_a_session_reports() {
+    // The names the pane shows for a state, a failure and a status code. They used
+    // to come from a C table; nothing but this test pins them now.
+    assert_eq!(shellune_desktop::status_name(0), "ok");
+    assert_eq!(shellune_desktop::status_name(5), "internal");
+    assert_eq!(shellune_desktop::status_name(99), "unknown");
+    assert_eq!(shellune_desktop::state_name(State::Connected), "connected");
     assert_eq!(
-        shellune_desktop::abi_layout(),
-        [136, 32, 48, 112, 120, 132, 16]
+        shellune_desktop::failure_name(Failure::Authentication),
+        "authentication"
     );
 }
 
@@ -831,7 +835,7 @@ fn a_vnc_session_dropped_before_its_first_frame_is_reconnected_once() {
         height: 2,
         pixel: [3, 4, 5, 0],
     });
-    let mut client = connect_vnc(&peer, false);
+    let client = connect_vnc(&peer, false);
     let events = pump(&client, PATIENCE, |event| {
         matches!(event, Event::Frame { .. })
     });
@@ -967,7 +971,7 @@ fn a_cancelled_rdp_connect_stops_without_reporting_a_session() {
     while !peer.accepted.load(Ordering::SeqCst) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
-    // FreeRDP is now waiting for an X.224 response that never comes.
+    // The client is now waiting for an X.224 response that never comes.
     thread::sleep(Duration::from_millis(200));
     client.cancel().expect("cancel");
     let started = Instant::now();
@@ -1089,7 +1093,7 @@ fn clipboard_pushes_answer_by_switch_then_state_and_check_the_group() {
     }
 }
 
-// ----------------------------------------------- RDP drive (patched FreeRDP)
+// -------------------------------------------- RDP drive (rdpdr channel)
 
 const IRP_MJ_CREATE: u32 = 0x00;
 const IRP_MJ_SET_INFORMATION: u32 = 0x06;
@@ -1174,7 +1178,7 @@ fn query(body: &[u8]) -> DriveRequest<'_> {
     }
 }
 
-/// The statuses the patched drive channel answers `requests` with.
+/// The statuses the drive channel answers `requests` with.
 fn drive(base: &str, requests: &[DriveRequest<'_>]) -> Vec<u32> {
     probe::rdp_drive_requests(base, requests).expect("the RDP backend is built")
 }
@@ -1724,13 +1728,13 @@ fn an_oversized_local_rdp_copy_is_cut_and_reported() {
     assert!(quiet.is_empty(), "{quiet:?}");
 }
 
-/// A mapped folder with a junction in it that points outside. Through FreeRDP's own
-/// drive channel, patched (packaging/native/patches/freerdp-drive-confinement.patch):
+/// A mapped folder with a junction in it that points outside. Through the drive
+/// channel this crate serves (crates/desktop/src/rdp/drive.rs):
 /// the server can use the folder, and nothing that resolves through the junction -
 /// opening, creating, deleting, listing, or moving something into it - reaches the
 /// place it points at (R5).
 #[test]
-fn the_patched_drive_channel_keeps_the_server_inside_the_mapped_folder() {
+fn the_drive_channel_keeps_the_server_inside_the_mapped_folder() {
     if !backends_built() {
         return;
     }
@@ -1774,7 +1778,7 @@ fn the_patched_drive_channel_keeps_the_server_inside_the_mapped_folder() {
     } else {
         assert_ne!(open("\\OUT\\SECRET.TXT"), STATUS_SUCCESS);
     }
-    // FreeRDP's own ".." refusal still holds, and a device name never opens.
+    // The ".." refusal still holds, and a device name never opens.
     for path in [
         "\\inside\\..\\out\\secret.txt",
         "\\..\\outside\\secret.txt",
@@ -1806,8 +1810,8 @@ fn the_patched_drive_channel_keeps_the_server_inside_the_mapped_folder() {
     );
     assert!(base.join("inside").join("new.txt").exists());
 
-    // Delete on close: a refused open deletes nothing (FreeRDP used to delete the
-    // named path even when the open failed); inside, the file goes when it closes.
+    // Delete on close: a refused open deletes nothing; inside, the file goes when
+    // it closes.
     assert_eq!(
         open_status(
             &base_text,
@@ -1904,13 +1908,15 @@ fn clipboard_text_encodings_round_trip() {
         probe::cf_unicode_to_utf8(&utf16("héllo\r\n世界😀")).as_deref(),
         Some("héllo\r\n世界😀".as_bytes())
     );
-    // Up to the first NUL; an odd trailing byte and a lone surrogate do no harm.
+    // Up to the first NUL, and an odd trailing byte is ignored.
     let mut raw = utf16("ab");
     raw.extend_from_slice(&utf16("ignored"));
     assert_eq!(probe::cf_unicode_to_utf8(&raw).as_deref(), Some(&b"ab"[..]));
+    // A lone surrogate is not valid UTF-16: the text is refused instead of being
+    // delivered with a replacement character the server never sent.
     assert_eq!(
-        probe::cf_unicode_to_utf8(&[0x00, 0xD8, 0x41, 0x00, 0x42]).as_deref(),
-        Some("\u{FFFD}A".as_bytes())
+        probe::cf_unicode_to_utf8(&[0x00, 0xD8, 0x41, 0x00, 0x42]),
+        None
     );
 
     assert_eq!(

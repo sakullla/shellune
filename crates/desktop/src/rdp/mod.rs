@@ -12,10 +12,15 @@ mod share;
 mod update;
 mod wire;
 
-pub(crate) use clipboard::{probe_offer, probe_offer_events, probe_receive};
+pub(crate) use clipboard::{
+    cf_unicode_text, probe_offer, probe_offer_events, probe_receive, text_from_cf_unicode,
+};
 pub(crate) use drive::{ProbeRequest, probe_drive_reply, probe_replies, probe_requests};
 
-use crate::{ClipboardEntry, Failure, State, ffi};
+use crate::{
+    ClipboardEntry, Failure, SD_BUTTON_LEFT, SD_BUTTON_MIDDLE, SD_BUTTON_RIGHT,
+    SD_BUTTON_WHEEL_DOWN, SD_BUTTON_WHEEL_LEFT, SD_BUTTON_WHEEL_RIGHT, SD_BUTTON_WHEEL_UP, State,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
@@ -260,33 +265,27 @@ mod tests {
     #[test]
     fn a_press_and_a_release_both_name_their_button() {
         // Press: move with the button and the down bit.
-        assert_eq!(
-            pointer_flags(0, ffi::SD_BUTTON_LEFT),
-            0x0800 | 0x1000 | 0x8000
-        );
+        assert_eq!(pointer_flags(0, SD_BUTTON_LEFT), 0x0800 | 0x1000 | 0x8000);
         // Release: the same button bit without the down bit, so a server knows
         // which button came up.
-        assert_eq!(pointer_flags(ffi::SD_BUTTON_LEFT, 0), 0x0800 | 0x1000);
-        assert_eq!(pointer_flags(ffi::SD_BUTTON_RIGHT, 0), 0x0800 | 0x2000);
-        assert_eq!(pointer_flags(ffi::SD_BUTTON_MIDDLE, 0), 0x0800 | 0x4000);
+        assert_eq!(pointer_flags(SD_BUTTON_LEFT, 0), 0x0800 | 0x1000);
+        assert_eq!(pointer_flags(SD_BUTTON_RIGHT, 0), 0x0800 | 0x2000);
+        assert_eq!(pointer_flags(SD_BUTTON_MIDDLE, 0), 0x0800 | 0x4000);
         // A plain move carries no button at all.
         assert_eq!(pointer_flags(0, 0), 0x0800);
         // Holding a button while moving does not repeat the press.
-        assert_eq!(
-            pointer_flags(ffi::SD_BUTTON_LEFT, ffi::SD_BUTTON_LEFT),
-            0x0800
-        );
+        assert_eq!(pointer_flags(SD_BUTTON_LEFT, SD_BUTTON_LEFT), 0x0800);
     }
 
     #[test]
     fn a_wheel_step_is_one_event_and_its_release_is_not_one() {
-        assert_eq!(pointer_flags(0, ffi::SD_BUTTON_WHEEL_UP), 0x0200 | 0x0078);
+        assert_eq!(pointer_flags(0, SD_BUTTON_WHEEL_UP), 0x0200 | 0x0078);
         assert_eq!(
-            pointer_flags(0, ffi::SD_BUTTON_WHEEL_DOWN),
+            pointer_flags(0, SD_BUTTON_WHEEL_DOWN),
             0x0200 | 0x0100 | 0x0088
         );
         // The step bit clears again; that clearing is not a second wheel event.
-        assert_eq!(pointer_flags(ffi::SD_BUTTON_WHEEL_UP, 0), 0x0800);
+        assert_eq!(pointer_flags(SD_BUTTON_WHEEL_UP, 0), 0x0800);
     }
 }
 
@@ -298,23 +297,23 @@ mod tests {
 pub(super) fn pointer_flags(previous: u32, buttons: u32) -> u16 {
     const DOWN: u16 = 0x8000;
     const MOVE: u16 = 0x0800;
-    if buttons & ffi::SD_BUTTON_WHEEL_UP != 0 && previous & ffi::SD_BUTTON_WHEEL_UP == 0 {
+    if buttons & SD_BUTTON_WHEEL_UP != 0 && previous & SD_BUTTON_WHEEL_UP == 0 {
         return 0x0200 | 0x0078;
     }
-    if buttons & ffi::SD_BUTTON_WHEEL_DOWN != 0 && previous & ffi::SD_BUTTON_WHEEL_DOWN == 0 {
+    if buttons & SD_BUTTON_WHEEL_DOWN != 0 && previous & SD_BUTTON_WHEEL_DOWN == 0 {
         return 0x0200 | 0x0100 | 0x0088;
     }
-    if buttons & ffi::SD_BUTTON_WHEEL_LEFT != 0 && previous & ffi::SD_BUTTON_WHEEL_LEFT == 0 {
+    if buttons & SD_BUTTON_WHEEL_LEFT != 0 && previous & SD_BUTTON_WHEEL_LEFT == 0 {
         return 0x0400 | 0x0078;
     }
-    if buttons & ffi::SD_BUTTON_WHEEL_RIGHT != 0 && previous & ffi::SD_BUTTON_WHEEL_RIGHT == 0 {
+    if buttons & SD_BUTTON_WHEEL_RIGHT != 0 && previous & SD_BUTTON_WHEEL_RIGHT == 0 {
         return 0x0400 | 0x0088;
     }
     let mut flags = MOVE;
     for (mask, flag) in [
-        (ffi::SD_BUTTON_LEFT, 0x1000u16),
-        (ffi::SD_BUTTON_RIGHT, 0x2000),
-        (ffi::SD_BUTTON_MIDDLE, 0x4000),
+        (SD_BUTTON_LEFT, 0x1000u16),
+        (SD_BUTTON_RIGHT, 0x2000),
+        (SD_BUTTON_MIDDLE, 0x4000),
     ] {
         if buttons & mask != previous & mask {
             flags |= flag;

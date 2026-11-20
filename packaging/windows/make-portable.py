@@ -11,8 +11,6 @@ The result is a directory plus a zip:
         shellune.exe
         LICENSE
         README.txt
-        third-party/     license texts of the libraries the RDP/VNC backends link
-                         (only in a build with the native backends)
 
 The archive is unsigned: no code-signing certificate exists for this project, so
 the readme says so instead of implying a signature.
@@ -26,8 +24,6 @@ import sys
 import zipfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(REPO, "packaging"))
-import third_party  # noqa: E402
 NAME = "Shellune"
 TAGLINE_ZH = "连接远程，也专注本地。"
 TAGLINE_EN = "A modern terminal for local shells, SSH, and SFTP."
@@ -61,8 +57,8 @@ start over instead of resuming.
 
 License
 -------
-GNU General Public License v3.0 only. See LICENSE. The libraries the remote
-desktop sessions link, with their licenses, are listed in third-party\\README.txt.
+GNU General Public License v3.0 only. See LICENSE. The RDP and VNC sessions are
+part of this binary and link no third-party protocol library.
 """
 
 
@@ -71,8 +67,6 @@ def main():
     parser.add_argument("--binary", required=True, help="path to the built shellune.exe")
     parser.add_argument("--version", default=None, help="version string, defaults to Cargo.toml")
     parser.add_argument("--out", default=os.path.join(REPO, "dist"), help="output directory")
-    parser.add_argument("--require-native", action="store_true",
-                        help="fail unless the native RDP/VNC prefix and its licenses exist")
     args = parser.parse_args()
 
     binary = os.path.abspath(args.binary)
@@ -90,7 +84,6 @@ def main():
 
     shutil.copy2(binary, os.path.join(bundle, "shellune.exe"))
     shutil.copy2(os.path.join(REPO, "LICENSE"), os.path.join(bundle, "LICENSE"))
-    third_party.copy_licenses(os.path.join(bundle, third_party.FOLDER), args.require_native)
     with open(os.path.join(bundle, "README.txt"), "w", encoding="utf-8", newline="\r\n") as f:
         f.write(README.format(
             name=NAME,

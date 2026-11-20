@@ -699,10 +699,10 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 `full_screen_gives_the_window_back_when_another_page_is_chosen` 与 `..._when_the_desktop_tab_is_split` 各证一条路径。
 
 **剪贴板（远程桌面剪贴板与文件互通 R1—R4、R6）。** 剪贴板按连接开关（`RdpConfig::clipboard` / `VncConfig::clipboard`，
-默认开；RDP 与 VNC 表单里都是勾选框 `connection.field.clipboard`），`DesktopTarget` 带着它交给 `NativeLink::open` → `set_clipboard`；关闭时 shim 不收不发，窗格也不读本机剪贴板、
+默认开；RDP 与 VNC 表单里都是勾选框 `connection.field.clipboard`），`DesktopTarget` 带着它交给 `NativeLink::open` → `set_clipboard`；关闭时客户端不收不发，窗格也不读本机剪贴板、
 不写远端内容。两个方向的格式规则都在 `src/app/desktop_clipboard.rs`，是纯函数，不需要窗口或服务器就能测：
 
-- **本机 → 远端**（`local_offer`）：文本原样交给 `push_clipboard`。**截断语义**：超过 1 MiB 的文本由 shim 在界内最后一个
+- **本机 → 远端**（`local_offer`）：文本原样交给 `push_clipboard`。**截断语义**：超过 1 MiB 的文本由客户端在界内最后一个
   完整 UTF-8 字符处截断，截断后的文本照常发送，并在会话接收这组内容时回一条 `ClipboardTooLarge(Text)` 通知，不返回错误——
   这改变了 ADR-1 “本机超限返回参数错误”的约定（T2 落地时改为截断）。图片仍按原约定：超过 32 MiB 的图片条目让
   `push_clipboard` 返回 `Argument`，所以窗格在交出去之前先按 32 MiB 过滤。第一张图片同时给 PNG 与 DIB 两种形式（本机是 PNG
@@ -714,13 +714,13 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   远端的 DIB 可能是 `CF_DIB`（`BITMAPINFOHEADER`），也可能是带 `BITMAPV5HEADER` 的 `CF_DIBV5`（`BI_BITFIELDS`，掩码在
   头里，含 alpha）。`BITMAPV5HEADER` 之后是否再重复三个颜色掩码各家写法不一（Windows 自己合成的重复，浏览器等多数程序
   不重复），而 `image` crate 总是跳过 12 字节；`dib_to_png` 按包长判断——像素数据总在包尾——没有这 12 字节时先补上，
-  两种写法都按原样解出（`a_remote_dibv5_pastes_as_the_same_picture_with_its_transparency`）。远端文本超过 1 MiB 时 shim 同样
+  两种写法都按原样解出（`a_remote_dibv5_pastes_as_the_same_picture_with_its_transparency`）。远端文本超过 1 MiB 时客户端同样
   截断后照常送达并提示“已截断”；远端图片超过 32 MiB 时从这一组里被跳过，其余格式照常送达并提示“没有传输”。RDP 远端
   文本保留 Windows 的 CRLF 换行，原样写入本机。
 - **什么时候推送**：窗格拿到键盘（`cx.on_focus_in`）、窗口重新激活且画面仍有焦点（`observe_window_activation`；GPUI
   的焦点事件在窗口失活时也视为失焦，所以重新激活同样触发 focus-in，两条路径由去重合并成一次）、以及按下粘贴快捷键。
   这样远端程序无论用 Ctrl+V 还是右键“粘贴”都拿到本机最新内容。只在会话 **Live**（画面已出现）且有链路时读剪贴板：
-  连接中、等证书回答时 shim 的 `sd_client_clipboard_set_cut` 回 `SD_ERR_STATE`，排进队列的推送只会在连接卡片上变成一句
+  连接中、等证书回答时 `push_clipboard` 回 `Error::State`，排进队列的推送只会在连接卡片上变成一句
   “发送失败”，用户却什么也没做（`focusing_a_session_still_connecting_raises_no_send_warning`）。因此会话变成 Live 时若画面
   持有键盘且窗口是活动窗口，由下一帧绘制补推一次（`offer_when_live`，每个会话一次；新会话 `attach` 时重置）——首次连接
   时在连接过程中就点了画面、以及重连时窗格一直持有键盘，都没有新的 focus-in 事件，靠的是这一次
@@ -746,23 +746,20 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 **文件夹映射（R5、R6）。** RDP 表单的“映射本机文件夹”是带浏览按钮（`Browse::Directory`）的输入框，留空即关闭；
 选择器 `connection.field.drive_folder`，下方一行说明远端看到什么；VNC 表单没有这一项。
 它只存在本机记录与 `platforms.<os>` 覆盖层（T1），`DesktopTarget::drive_folder` 交给 `set_drive("Shellune", …)`，
-远端“此电脑”里看到名为 Shellune 的磁盘。shim 在每次连接开始时检查文件夹（`sd_rdp_drive.c`：必须是盘符或 UNC 的完整路径、
-存在、是文件夹、能列出内容、长度在 MAX_PATH 以内），通过后经 FreeRDP 自己的 drive 通道提供。
+远端“此电脑”里看到名为 Shellune 的磁盘。自研 RDP 客户端在每次连接开始时检查文件夹
+（`crates/desktop/src/rdp/drive.rs`：必须是盘符或 UNC 的完整路径、存在、是文件夹、能列出内容、长度在 MAX_PATH 以内），
+通过后由同一个客户端在 rdpdr 通道上提供。
 
-**越界拦截机制。** 让服务器只能待在这个文件夹里的唯一一道防线是 FreeRDP 补丁
-`packaging/native/patches/freerdp-drive-confinement.patch`（改 `channels/drive/client/drive_file.c`）。上游只拒绝路径文本里的
-`..`，而 `CreateFileW` / `FindFirstFileW` 会跟随符号链接、junction 与挂载点，文件夹里的一个链接就能把它指向的东西交给服务器。
-补丁让打开与创建、关闭时删除、首次目录列举和改名目标在执行前先解析：以不请求数据访问的方式打开路径中已存在的最深一段，
-用 `GetFinalPathNameByHandleW` 取最终路径（其它系统用 `realpath`），它必须落在基准文件夹最终路径之内；设备名（CON、NUL、
-COM1 等）不算文件夹里的文件。不满足的一律 `ERROR_ACCESS_DENIED`，服务器看到的是 `STATUS_ACCESS_DENIED`。Windows 上打开
-之后还按句柄再校验一次，检查与打开之间换进来的链接也会被拦下。补丁顺带修了两处：被拒绝或失败的创建不再在关闭时删掉它
-所指的路径；在任何调用设置错误码之前就被拒绝的路径（如含 `..`）回“拒绝访问”，而不是线程里残留的错误码（常为
-`STATUS_SUCCESS`）。窗格与表单不参与拦截，只负责把文件夹交出去、把结果说出来。
+**越界拦截机制。** 让服务器只能待在这个文件夹里的唯一一道防线是 `rdp/drive.rs` 的路径解析（`resolve`）：它拒绝 `..`、
+绝对路径和 DOS 设备名（CON、NUL、COM1 等），把剩下的相对路径拼到文件夹上后再 `canonicalize`——Windows 上这一步经
+`GetFinalPathNameByHandleW` 解析符号链接、junction 与挂载点，文件夹里的一个链接不能把它指向的东西交给服务器——结果必须
+仍在文件夹的最终路径之内；尚不存在的名字（新建）改为解析父目录并同样校验。不满足的一律回 `STATUS_ACCESS_DENIED`。
+解析与打开之间仍有一个窗口，这一点没有在真实服务器上验证过。窗格与表单不参与拦截，只负责把文件夹交出去、把结果说出来。
 
-**会话通知与原因码。** shim 的 `Notice` 经 `LinkEvent::Notice` 到窗格，由 `DesktopNotice` 归类成下面几种，每种在每个会话
+**会话通知与原因码。** 客户端的 `Notice` 经 `LinkEvent::Notice` 到窗格，由 `DesktopNotice` 归类成下面几种，每种在每个会话
 里**只显示一次**（新会话 `attach` 时清空），各行有自己的选择器：
 
-| shim 通知（`SD_NOTICE_*`） | Rust `Notice` | 选择器 `desktop.notice.*` | 文案（英文 / 中文） |
+| 会话通知（`Notice`） | Rust `Notice` | 选择器 `desktop.notice.*` | 文案（英文 / 中文） |
 |---|---|---|---|
 | `CLIPBOARD_REFUSED` = 1 | `ClipboardRefused` | `clipboard_refused` | This server does not allow the clipboard, so copy and paste stay on each side. / 该服务器不允许剪贴板，复制粘贴不会在本机与远端之间同步。 |
 | `CLIPBOARD_READY` = 5 | `ClipboardReady` | —（不显示） | 撤下上面那条：服务器登录完成后剪贴板才就绪，先前的“不允许”不再成立 |
@@ -778,17 +775,19 @@ COM1 等）不算文件夹里的文件。不满足的一律 `ERROR_ACCESS_DENIED
 无法建立磁盘 / the drive could not be set up；其它值 `Other` 原因未知 / the reason is unknown。`DriveRefused` 是与之分开的一种
 通知：detail 非 0 是服务器以该 NTSTATUS 拒绝了这个设备（`DriveRefusal::Declined`），0 是宽限期内服务器始终没有打开设备重定向
 （`DriveRefusal::NotOpened`）；两者文案相同，会话都照常继续。同一种通知按种类去重：文件夹不可用的几种原因只说第一条
-（shim 每次连接也只报一次磁盘问题）；文本截断与图片未传说的是两件不同的事，各算一种。`Unknown` 不显示。
+（每次连接也只报一次磁盘问题）；文本截断与图片未传说的是两件不同的事，各算一种。`Unknown` 不显示。
 
 有画面时通知与发送失败的句子同在 `desktop.notice` 提示条里，带一个“知道了”按钮（`desktop.notice.dismiss`）收起；没有画面时
 同样的句子写在状态卡片里（经 `components::capped_text` 居中限宽换行）。
 
+**构建与分发。** 两个协议、诊断用的名称表与剪贴板转换都在 `crates/desktop` 的 Rust 代码里，构建不需要原生库、补丁或构建期下载：三个平台都是 `cargo build --workspace --release` 之后直接打包，包内只有可执行文件与 `LICENSE`，不再有 `third-party/` 许可证目录。`ring`（SSH 与 TLS 的加密后端）是唯一自带 C 构建步骤的依赖。
+
 **已知限制（需实机确认）。** 本机没有 RDP / VNC 服务器：cliprdr 与 rdpdr 的真实往返、服务器在 `fDisableCdm` 等策略下的回应、
-剪贴板通道与输入通道之间的先后，都只由脚本链路和 shim 探针覆盖，真实 RDP / VNC 服务器的往返未在本机验证。服务器打开了
-设备重定向却始终不回这个磁盘的 Device Reply 时客户端收不到信号，不会提示。越界拦截在 Windows 上靠打开后的句柄复核关住
-检查与打开之间的竞态；其它系统只在打开前用 `realpath` 校验，留有这一窗口。平台限制：Wayland 下本机写不出图片（远端复制的
-图片只有文本部分落到本机）；X11 不支持 INCR，超过约 16 MiB 的图片无法提供给本机其它程序；libvncclient 收到超过 1 MiB 的
-服务器剪贴板文本会直接断开会话。关闭了剪贴板的主机在 0.4.8 及以前的版本上会让整份主机文件 / 同步文件被拒收，需提示其它
+剪贴板通道与输入通道之间的先后，都只由脚本链路和引擎探针覆盖，真实 RDP / VNC 服务器的往返未在本机验证。服务器打开了
+设备重定向却始终不回这个磁盘的 Device Reply 时客户端收不到信号，不会提示。越界拦截在解析与打开之间留有一个
+竞态窗口，未在真实服务器上验证过。平台限制：Wayland 下本机写不出图片（远端复制的
+图片只有文本部分落到本机）；X11 不支持 INCR，超过约 16 MiB 的图片无法提供给本机其它程序；自研 VNC 客户端收到超过 1 MiB 的
+服务器剪贴板文本时按上限截断并报 `ClipboardTooLarge`，会话继续。关闭了剪贴板的主机在 0.4.8 及以前的版本上会让整份主机文件 / 同步文件被拒收，需提示其它
 设备升级。
 
 **证据边界。** 捕获场景 `desktop-rdp`、`desktop-vnc-failed`、`desktop-send-problem`、`desktop-notices` 与 `serial-session` 用的是
@@ -2246,5 +2245,5 @@ T9 关闭了各任务审查留下的这些事项（每项有测试）：横幅�
 - 终端选择：阈值之前锚点按视口坐标记录，流式输出期间缓慢越过阈值时锚点可能落到新内容上；`pressed_button ≠ Left` 的松开分支与
   向下自动滚动没有专门测试。
 - 主机 / 连接表单：`ConnectionFormField::is_basic` 与对话框各自的分组判断重复，靠 `*_tab_follows_the_drawn_order` 测试兜底。
-- 发布：macOS 上 shim 目标版本未设 `MACOSX_DEPLOYMENT_TARGET`（链接警告）；POSIX 上 VNC 套接字未设 close-on-exec。
+- 发布：POSIX 上 VNC 套接字未设 close-on-exec。
 - 串口集成测试 `an_unplugged_device_is_reported_as_a_disconnect_and_the_port_is_released` 在 macOS CI 上偶发失败（见 7.5），属于既有的时序问题。

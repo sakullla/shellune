@@ -27,6 +27,16 @@ path = "src/bin/shellune-flood.rs"
 # not for users, so it is never in a release artifact.
 required-features = ["test-support"]
 
+# tests/desktop_native.rs is the `native` test of shellune-desktop: that crate declares
+# the same file as its own test target, which is where it belongs, since it drives only
+# that crate's API. Cargo would otherwise also register it here as an integration test
+# of this package and run every case a second time; `test = false` keeps the single
+# registration without moving the file.
+[[test]]
+name = "desktop_native"
+path = "tests/desktop_native.rs"
+test = false
+
 [dependencies]
 gpui = "=0.2.2"
 shellune-core = { path = "crates/core" }
@@ -37,10 +47,9 @@ shellune-sync = { path = "crates/sync" }
 shellune-terminal = { path = "crates/terminal" }
 # Self-update: the release manifest, signed downloads and the install routes.
 shellune-update = { path = "crates/update" }
-# The RDP/VNC sessions a desktop pane shows (R18-R20, R23). The same crate is what
-# the native tests drive directly, so it is a normal dependency as well as a test
-# one: a build without the native sources still compiles, and the pane reports the
-# reason instead of offering a connection that cannot open.
+# The RDP/VNC sessions a desktop pane shows (R18-R20, R23). Both clients are part
+# of that crate and link no protocol library; the same crate is what the native
+# tests drive directly.
 shellune-desktop = { path = "crates/desktop" }
 # The serial ports a serial terminal holds open (R17, R21). The tests drive the same
 # session over an in-memory port; that half is behind the crate's test-support

@@ -130,40 +130,18 @@ python tool/generate_app_icons.py --force
 python tool/generate_app_icons.py --reuse-source --force
 ```
 
-## Native desktop backends (RDP, VNC)
+## Remote desktop sessions (RDP, VNC)
 
-The binary links the RDP and VNC protocol libraries statically on all three
-platforms (Windows x86_64, macOS arm64, Linux x86_64), so the packages ship the
-executable alone: there is no `freerdp.dll`, `libfreerdp3.so` or `libvncclient.dylib`
-to place next to it, and a library installed on the user's machine is never used.
-Build them before the release binary:
+The RDP and VNC clients are part of the `shellune-desktop` crate: they are compiled
+into the executable, link no protocol library and load no plugin at run time, so a
+package contains the binary and nothing else (no `freerdp.dll`, no
+`libvncclient.so`, no library from the user's machine).
 
-    python packaging/native/build_native.py --perl <perl with standard modules>   # Windows
-    python3 packaging/native/build_native.py                                       # macOS, Linux
-    cargo build --workspace --release
+That leaves no third-party license text to place beside Shellune's own `LICENSE`:
+the only code from other projects in the binary is the Rust dependency tree and
+the C that `ring` compiles for itself, which is covered by the ordinary
+dependency licenses. The packaging scripts therefore copy one file, `LICENSE`, and
+have no `--require-native` switch or `third-party` folder any more.
 
-`target/native/dist/shellune-native.txt` records the pinned versions, the options
-that were used and the platform the archives were built for. A build without it
-still compiles and starts, but `crates/desktop` reports both protocols as
-unavailable - the packaging step must not describe RDP or VNC support for a binary
-built that way. The release workflow builds the libraries on every platform before
-`cargo build`, and a failed native build fails the release.
-
-The vendored sources and their licenses are described in `vendor/README.md`; a
-distributable that includes the binary carries the same obligations as before
-(GPL-3.0-only for Shellune, Apache-2.0 for FreeRDP and OpenSSL, GPL-2.0-or-later
-for LibVNCServer, the zlib license for zlib). `build_native.py` copies the four
-license texts into `target/native/dist/licenses/`, and every package carries them
-next to Shellune's own `LICENSE`, in a `third-party` folder:
-
-| package | where |
-| --- | --- |
-| portable zip | `third-party/` beside `shellune.exe` |
-| installer (NSIS, `/DTHIRD_PARTY=<dist>\licenses`) | `<install dir>\third-party\` |
-| `Shellune.app` | `Contents/Resources/third-party/` |
-| deb | `/usr/share/doc/shellune/third-party/` |
-
-The packaging scripts find the prefix the way `crates/desktop/build.rs` does
-(`SHELLUNE_DESKTOP_NATIVE`, else `target/native/dist`). With `--require-native`, as
-the release workflow runs them, a missing prefix or an incomplete licenses folder
-stops the package; without it a stub build is packaged without the folder.
+`vendor/README.md` describes the two patched crates the build uses (`gpui`,
+`xattr`); neither is a protocol library.

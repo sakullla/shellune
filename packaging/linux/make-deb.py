@@ -21,8 +21,6 @@ import sys
 import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(REPO, "packaging"))
-import third_party  # noqa: E402
 
 HOMEPAGE = "https://github.com/sakullla/shellune"
 DEFAULT_MAINTAINER = "sakullla <sakullla@users.noreply.github.com>"
@@ -70,8 +68,6 @@ def main():
     parser.add_argument("--arch", default="amd64")
     parser.add_argument("--maintainer", default=DEFAULT_MAINTAINER)
     parser.add_argument("--out", default=os.path.join(REPO, "dist"))
-    parser.add_argument("--require-native", action="store_true",
-                        help="fail unless the native RDP/VNC prefix and its licenses exist")
     args = parser.parse_args()
 
     binary = os.path.abspath(args.binary)
@@ -100,9 +96,6 @@ def main():
                  os.path.join(share, "icons", "hicolor", "1024x1024", "apps", "shellune.png"))
     shutil.copy2(os.path.join(REPO, "LICENSE"),
                  os.path.join(share, "doc", "shellune", "copyright"))
-    # The libraries the RDP/VNC backends link, with their licenses.
-    third_party.copy_licenses(os.path.join(share, "doc", "shellune", third_party.FOLDER),
-                              args.require_native)
 
     depends = shlib_depends(target)
     control = (

@@ -6,11 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-# Both protocols are implemented in Rust (src/rdp, src/vnc) and link no protocol
-# library. build.rs compiles only the small C surface the ABI test pins: the
-# version, the diagnostic names and the text conversions a probe calls.
-links = "shellune_desktop_shim"
-build = "build.rs"
+# Both protocols are implemented in Rust (src/rdp, src/vnc). The crate builds no C,
+# links no protocol library and has no build script: the diagnostics names are
+# ordinary functions in src/lib.rs.
 
 [dependencies]
 # TLS is the generic transport the RDP client establishes before its own MCS and
@@ -40,9 +38,6 @@ des = "0.9.0"
 # The extended clipboard carries its text in a zlib stream. flate2's default
 # backend is miniz_oxide, so no C compression library joins the build.
 flate2 = "1.1.10"
-
-[build-dependencies]
-cc = "1.2.25"
 
 [[test]]
 name = "native"

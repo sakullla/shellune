@@ -19,32 +19,48 @@
 //! claims a capability the binary does not have.
 
 mod control;
-mod ffi;
 mod mailbox;
 mod rdp;
 mod tls;
 mod vnc;
 
 use mailbox::Mailbox;
-use std::ffi::CStr;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub use ffi::SD_ABI_VERSION;
-
 /// Largest frame this crate accepts, in bytes.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 /// Largest clipboard text, in UTF-8 bytes, either direction.
-pub const MAX_CLIPBOARD_TEXT_BYTES: usize = ffi::SD_MAX_CLIPBOARD_BYTES;
+pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
 /// Largest clipboard image entry, either direction.
-pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = ffi::SD_MAX_CLIPBOARD_IMAGE_BYTES;
+pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+/// One entry per kind at most, so a group never holds more than this.
+pub const MAX_CLIPBOARD_ENTRIES: usize = 3;
 
 /// The drive name a mapped local folder gets on the RDP server.
 pub const DRIVE_NAME: &str = "Shellune";
+
+// Pointer button bits, protocol independent: the UI names a button and each engine
+// maps it to its own form.
+pub(crate) const SD_BUTTON_LEFT: u32 = 0x01;
+pub(crate) const SD_BUTTON_MIDDLE: u32 = 0x02;
+pub(crate) const SD_BUTTON_RIGHT: u32 = 0x04;
+pub(crate) const SD_BUTTON_WHEEL_UP: u32 = 0x08;
+pub(crate) const SD_BUTTON_WHEEL_DOWN: u32 = 0x10;
+pub(crate) const SD_BUTTON_WHEEL_LEFT: u32 = 0x20;
+pub(crate) const SD_BUTTON_WHEEL_RIGHT: u32 = 0x40;
+
+// VNC security types a session may negotiate. A bit outside the mask is refused
+// before it is attempted, so a server offering only an unsupported type fails
+// instead of silently downgrading.
+const SD_VNC_SECURITY_NONE: u32 = 0x1;
+const SD_VNC_SECURITY_VNC_AUTH: u32 = 0x2;
+const SD_VNC_SECURITY_TLS: u32 = 0x4;
+const SD_VNC_SECURITY_VENCRYPT: u32 = 0x8;
 
 /// Incremented whenever a consumer callback panics. A failing callback is a bug in
 /// the consumer, but it is contained here instead of ending the worker.
@@ -80,17 +96,17 @@ pub enum Protocol {
 pub struct VncSecurity(pub u32);
 
 impl VncSecurity {
-    pub const NONE: VncSecurity = VncSecurity(ffi::SD_VNC_SECURITY_NONE);
-    pub const VNC_AUTH: VncSecurity = VncSecurity(ffi::SD_VNC_SECURITY_VNC_AUTH);
+    pub const NONE: VncSecurity = VncSecurity(SD_VNC_SECURITY_NONE);
+    pub const VNC_AUTH: VncSecurity = VncSecurity(SD_VNC_SECURITY_VNC_AUTH);
     /// Anonymous Diffie-Hellman TLS, RFB security type 18. This build has no
     /// anonymous cipher suites, so a server that offers only this type is refused
     /// with Failure::UnsupportedSecurity; the bit is kept so a host can record the
     /// policy it asked for.
-    pub const TLS: VncSecurity = VncSecurity(ffi::SD_VNC_SECURITY_TLS);
+    pub const TLS: VncSecurity = VncSecurity(SD_VNC_SECURITY_TLS);
     /// VeNCrypt (RFB security type 19). Its certificate forms (X509Vnc, X509None)
     /// are the encrypted sessions this build completes; its anonymous TLS forms
     /// are refused for the same reason as VncSecurity::TLS.
-    pub const VENCRYPT: VncSecurity = VncSecurity(ffi::SD_VNC_SECURITY_VENCRYPT);
+    pub const VENCRYPT: VncSecurity = VncSecurity(SD_VNC_SECURITY_VENCRYPT);
 
     /// What an unconfigured session asks for: the two types that need no
     /// certificate. A UI must show this as unencrypted.
@@ -111,13 +127,13 @@ impl VncSecurity {
 pub struct PointerButtons(pub u32);
 
 impl PointerButtons {
-    pub const LEFT: PointerButtons = PointerButtons(ffi::SD_BUTTON_LEFT);
-    pub const MIDDLE: PointerButtons = PointerButtons(ffi::SD_BUTTON_MIDDLE);
-    pub const RIGHT: PointerButtons = PointerButtons(ffi::SD_BUTTON_RIGHT);
-    pub const WHEEL_UP: PointerButtons = PointerButtons(ffi::SD_BUTTON_WHEEL_UP);
-    pub const WHEEL_DOWN: PointerButtons = PointerButtons(ffi::SD_BUTTON_WHEEL_DOWN);
-    pub const WHEEL_LEFT: PointerButtons = PointerButtons(ffi::SD_BUTTON_WHEEL_LEFT);
-    pub const WHEEL_RIGHT: PointerButtons = PointerButtons(ffi::SD_BUTTON_WHEEL_RIGHT);
+    pub const LEFT: PointerButtons = PointerButtons(SD_BUTTON_LEFT);
+    pub const MIDDLE: PointerButtons = PointerButtons(SD_BUTTON_MIDDLE);
+    pub const RIGHT: PointerButtons = PointerButtons(SD_BUTTON_RIGHT);
+    pub const WHEEL_UP: PointerButtons = PointerButtons(SD_BUTTON_WHEEL_UP);
+    pub const WHEEL_DOWN: PointerButtons = PointerButtons(SD_BUTTON_WHEEL_DOWN);
+    pub const WHEEL_LEFT: PointerButtons = PointerButtons(SD_BUTTON_WHEEL_LEFT);
+    pub const WHEEL_RIGHT: PointerButtons = PointerButtons(SD_BUTTON_WHEEL_RIGHT);
 
     pub fn contains(self, other: PointerButtons) -> bool {
         self.0 & other.0 == other.0
@@ -147,26 +163,6 @@ pub enum Failure {
     Limit,
     Internal,
     Unknown(i32),
-}
-
-impl Failure {
-    fn raw(self) -> i32 {
-        match self {
-            Failure::None => 0,
-            Failure::Connect => 1,
-            Failure::Tls => 2,
-            Failure::Authentication => 3,
-            Failure::CertificateRejected => 4,
-            Failure::UnsupportedSecurity => 5,
-            Failure::ProtocolFailure => 6,
-            Failure::Io => 7,
-            Failure::Cancelled => 8,
-            Failure::RemoteClosed => 9,
-            Failure::Limit => 10,
-            Failure::Internal => 11,
-            Failure::Unknown(raw) => raw,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -387,7 +383,8 @@ pub enum Error {
     Timeout,
     Aborted,
     Internal,
-    /// The native diagnostics table and this crate disagree about the ABI.
+    /// A diagnostics table from another build. The names are part of this crate, so
+    /// it cannot disagree with itself; the variant stays because callers match it.
     Abi(u32),
 }
 
@@ -395,15 +392,14 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Argument => write!(f, "invalid argument"),
-            Error::Unavailable(reason) => write!(f, "native desktop backend unavailable: {reason}"),
+            Error::Unavailable(reason) => write!(f, "unavailable: {reason}"),
             Error::State => write!(f, "not valid in the current state"),
             Error::Timeout => write!(f, "the session worker did not stop in time"),
             Error::Aborted => write!(f, "aborted"),
             Error::Internal => write!(f, "internal failure"),
-            Error::Abi(version) => write!(
-                f,
-                "native diagnostics ABI {version} does not match {SD_ABI_VERSION}"
-            ),
+            Error::Abi(version) => {
+                write!(f, "diagnostics table version {version} is not this build")
+            }
         }
     }
 }
@@ -420,15 +416,6 @@ pub fn backend_info(protocol: Protocol) -> Result<String, Error> {
              clipboard=text"
             .to_owned(),
     })
-}
-
-fn check_abi() -> Result<(), Error> {
-    let version = unsafe { ffi::sd_abi_version() };
-    if version == SD_ABI_VERSION {
-        Ok(())
-    } else {
-        Err(Error::Abi(version))
-    }
 }
 
 /// Where an event goes. A mailbox is the normal shape; a closure lets a caller
@@ -775,7 +762,7 @@ impl DesktopClient {
     /// offers every entry, VNC only the text. A connection with sharing off answers
     /// [`Error::Unavailable`].
     pub fn push_clipboard(&self, entries: &[ClipboardEntry]) -> Result<(), Error> {
-        if entries.len() > ffi::SD_MAX_CLIPBOARD_ENTRIES {
+        if entries.len() > MAX_CLIPBOARD_ENTRIES {
             return Err(Error::Argument);
         }
         // A bad group is refused by both backends before anything is queued.
@@ -867,28 +854,21 @@ impl DesktopClient {
     }
 }
 
-/// The native diagnostics table's name for a status code.
+/// The name the session reports for a status code.
+///
+/// The codes are the ones an attempt answers with: 0 ok, 1 argument, 2 unavailable,
+/// 3 state, 4 aborted, 5 internal.
 pub fn status_name(code: i32) -> String {
-    let _ = check_abi();
-    unsafe { CStr::from_ptr(ffi::sd_status_name(code)) }
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// The numbers the C header promises, so the test can prove the table agrees.
-/// Returns (size of sd_event, offset of text, offset of host, offset of pixels,
-/// offset of entries, offset of notice, size of sd_clipboard_entry).
-#[doc(hidden)]
-pub fn abi_layout() -> [usize; 7] {
-    [
-        std::mem::size_of::<ffi::sd_event>(),
-        std::mem::offset_of!(ffi::sd_event, text),
-        std::mem::offset_of!(ffi::sd_event, host),
-        std::mem::offset_of!(ffi::sd_event, pixels),
-        std::mem::offset_of!(ffi::sd_event, entries),
-        std::mem::offset_of!(ffi::sd_event, notice),
-        std::mem::size_of::<ffi::sd_clipboard_entry>(),
-    ]
+    match code {
+        0 => "ok",
+        1 => "argument",
+        2 => "unavailable",
+        3 => "state",
+        4 => "aborted",
+        5 => "internal",
+        _ => "unknown",
+    }
+    .to_owned()
 }
 
 /// Runs single pieces of the engines without a session or a server: the text
@@ -897,7 +877,7 @@ pub fn abi_layout() -> [usize; 7] {
 /// copies, so a test proves the shipped behaviour on a machine with no server.
 #[doc(hidden)]
 pub mod probe {
-    use super::{Event, ffi};
+    use super::Event;
 
     /// The formats one local copy offers on the cliprdr channel, and the bytes each
     /// carries, through the session's own conversion.
@@ -920,44 +900,16 @@ pub mod probe {
         super::rdp::probe_receive(offered, messages)
     }
 
-    fn convert(conversion: i32, input: &[u8]) -> Option<Vec<u8>> {
-        let mut needed = 0usize;
-        let code = unsafe {
-            ffi::sd_probe_text(
-                conversion,
-                input.as_ptr(),
-                input.len(),
-                std::ptr::null_mut(),
-                0,
-                &mut needed,
-            )
-        };
-        if code != ffi::SD_OK {
-            return None;
-        }
-        let mut out = vec![0u8; needed];
-        let mut written = 0usize;
-        let code = unsafe {
-            ffi::sd_probe_text(
-                conversion,
-                input.as_ptr(),
-                input.len(),
-                out.as_mut_ptr(),
-                out.len(),
-                &mut written,
-            )
-        };
-        (code == ffi::SD_OK && written == needed).then_some(out)
-    }
-
     /// UTF-8 as RDP's CF_UNICODETEXT: UTF-16LE, CRLF line ends, NUL terminated.
+    /// This is the conversion an RDP session sends with.
     pub fn utf8_to_cf_unicode(text: &str) -> Vec<u8> {
-        convert(ffi::SD_PROBE_UTF8_TO_CF_UNICODE, text.as_bytes()).unwrap_or_default()
+        super::rdp::cf_unicode_text(text)
     }
 
-    /// CF_UNICODETEXT bytes back to UTF-8, up to the first NUL.
+    /// CF_UNICODETEXT bytes back to UTF-8, up to the first NUL; `None` when the
+    /// text is not valid UTF-16. This is the conversion a session receives with.
     pub fn cf_unicode_to_utf8(bytes: &[u8]) -> Option<Vec<u8>> {
-        convert(ffi::SD_PROBE_CF_UNICODE_TO_UTF8, bytes)
+        super::rdp::text_from_cf_unicode(bytes)
     }
 
     /// UTF-8 as RFB Latin-1, or `None` when a character does not fit. This is the
@@ -1031,26 +983,37 @@ pub mod probe {
     }
 }
 
-/// The native diagnostics table's name for a session state.
+/// The name a session reports for its state.
 pub fn state_name(state: State) -> String {
-    let raw = match state {
-        State::Idle => ffi::SD_STATE_IDLE,
-        State::Connecting => ffi::SD_STATE_CONNECTING,
-        State::Connected => ffi::SD_STATE_CONNECTED,
-        State::Closing => ffi::SD_STATE_CLOSING,
-        State::Closed => ffi::SD_STATE_CLOSED,
-        State::Failed(_) => ffi::SD_STATE_FAILED,
-    };
-    unsafe { CStr::from_ptr(ffi::sd_state_name(raw as i32)) }
-        .to_string_lossy()
-        .into_owned()
+    match state {
+        State::Idle => "idle",
+        State::Connecting => "connecting",
+        State::Connected => "connected",
+        State::Closing => "closing",
+        State::Closed => "closed",
+        State::Failed(_) => "failed",
+    }
+    .to_owned()
 }
 
-/// The native diagnostics table's name for a failure kind.
+/// The name a session reports for a failure.
 pub fn failure_name(failure: Failure) -> String {
-    unsafe { CStr::from_ptr(ffi::sd_failure_name(failure.raw())) }
-        .to_string_lossy()
-        .into_owned()
+    match failure {
+        Failure::None => "none",
+        Failure::Connect => "connect",
+        Failure::Tls => "tls",
+        Failure::Authentication => "authentication",
+        Failure::CertificateRejected => "certificate-rejected",
+        Failure::UnsupportedSecurity => "unsupported-security",
+        Failure::ProtocolFailure => "protocol",
+        Failure::Io => "io",
+        Failure::Cancelled => "cancelled",
+        Failure::RemoteClosed => "remote-closed",
+        Failure::Limit => "limit",
+        Failure::Internal => "internal",
+        Failure::Unknown(_) => "unknown",
+    }
+    .to_owned()
 }
 
 #[cfg(test)]

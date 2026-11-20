@@ -386,6 +386,16 @@ fn preferred(data: &[u8]) -> io::Result<Option<u16>> {
         .find(|wanted| seen.contains(wanted)))
 }
 
+/// CF_UNICODETEXT bytes for `text`: the conversion a session offers with.
+pub(crate) fn cf_unicode_text(text: &str) -> Vec<u8> {
+    to_utf16(text)
+}
+
+/// The UTF-8 text of CF_UNICODETEXT `bytes`; `None` when they are not valid UTF-16.
+pub(crate) fn text_from_cf_unicode(bytes: &[u8]) -> Option<Vec<u8>> {
+    from_utf16(bytes).ok().map(String::into_bytes)
+}
+
 /// UTF-16LE, CRLF line ends and a terminating NUL, as CF_UNICODETEXT defines it.
 fn to_utf16(text: &str) -> Vec<u8> {
     let normalised = text.replace("\r\n", "\n").replace('\n', "\r\n");

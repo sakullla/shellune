@@ -1,14 +1,9 @@
 # Formatting, static analysis and the test suite on the three target platforms.
 #
-# Every job builds the native RDP/VNC libraries first (packaging/native/build_native.py)
-# so the desktop crate links FreeRDP and LibVNCClient instead of its stub, and the
-# native tests run against them: SHELLUNE_REQUIRE_NATIVE=1 turns a missing backend
-# into a failure instead of a row of skips. A failed native build fails the job.
-#
-# The native build is cached per platform, keyed by the build script (pins and
-# options) and the FreeRDP patches. It lives outside target/ - rust-cache cleans
-# target/ to what cargo needs - in a sibling of the checkout, so the absolute paths
-# in its manifest are the same on every run that restores it.
+# No native library is built before cargo runs: the RDP and VNC clients are part of
+# the shellune-desktop crate and link no third-party protocol library, so a checkout
+# and the Rust toolchain are the whole build. ring, the SSH and TLS crypto backend,
+# is the only dependency with a C build step of its own.
 #
 # Pushing a branch under ci/ runs this workflow without touching main.
 name: ci
@@ -39,13 +34,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install the Linux graphics headers and the native build tools
+      - name: Install the Linux graphics headers and a test display
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libvulkan-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev \
-            libxcb1-dev pkg-config cmake ninja-build
+            libxcb1-dev pkg-config
           # The X11 forwarding tests need a display server to forward to and a client
           # that opens a window; the tests themselves skip when neither is available
           # and say so, so a missing package is reported as a gap and not as a pass.
@@ -54,60 +49,6 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-
-      - name: Locate the native build
-        shell: bash
-        run: |
-          work=$(python -c "import os, pathlib; print(pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve().parent / 'shellune-native')")
-          echo "SHELLUNE_NATIVE_WORK=$work" >> "$GITHUB_ENV"
-          echo "SHELLUNE_DESKTOP_NATIVE=$work/dist" >> "$GITHUB_ENV"
-
-      - name: Restore the native build
-        id: native-cache
-        uses: actions/cache/restore@v6
-        with:
-          path: ${{ env.SHELLUNE_NATIVE_WORK }}
-          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('packaging/native/build_native.py', 'packaging/native/patches/*.patch') }}
-
-      - name: Build the native desktop libraries (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (-not $vs) { Write-Error "no Visual Studio with the C++ x64 tools"; exit 1 }
-          Write-Output "Visual Studio: $vs"
-          $perl = "C:\Strawberry\perl\bin\perl.exe"
-          if (-not (Test-Path $perl)) {
-            choco install strawberryperl -y --no-progress
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
-            choco install ninja -y --no-progress
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-          python packaging/native/build_native.py --work $env:SHELLUNE_NATIVE_WORK --build-tools $vs --perl $perl --prune
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Build the native desktop libraries (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          command -v ninja >/dev/null || brew install ninja
-          command -v cmake >/dev/null || brew install cmake
-          python packaging/native/build_native.py --work "$SHELLUNE_NATIVE_WORK" --prune
-
-      - name: Build the native desktop libraries (Linux)
-        if: runner.os == 'Linux'
-        run: python packaging/native/build_native.py --work "$SHELLUNE_NATIVE_WORK" --prune
-
-      # Saved right after the build, not at the end of the job: a later failing step
-      # must not throw away a good native build.
-      - name: Save the native build
-        if: steps.native-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: ${{ env.SHELLUNE_NATIVE_WORK }}
-          key: ${{ steps.native-cache.outputs.cache-primary-key }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -123,5 +64,7 @@ jobs:
 
       - name: Test
         env:
+          # A protocol whose engine the build does not carry must fail the job rather
+          # than pass as a row of skips.
           SHELLUNE_REQUIRE_NATIVE: "1"
         run: cargo test --workspace --all-features -- --include-ignored
