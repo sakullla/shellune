@@ -6,11 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-# The VNC shim is compiled and linked by build.rs; the library it calls is built
-# from the pinned sources in vendor/ by packaging/native/build_native.py. Without
-# it build.rs compiles the stub and every VNC call reports "unavailable" instead of
-# pretending to connect. RDP is implemented in Rust (src/rdp) and needs no native
-# library.
+# Both protocols are implemented in Rust (src/rdp, src/vnc) and link no protocol
+# library. build.rs compiles only the small C surface the ABI test pins: the
+# version, the diagnostic names and the text conversions a probe calls.
 links = "shellune_desktop_shim"
 build = "build.rs"
 
@@ -36,6 +34,12 @@ sspi = { version = "0.23.1", default-features = false }
 x509-parser = "0.18.1"
 # Passwords and derived session keys are wiped when the attempt ends.
 zeroize = { workspace = true }
+# VNC authentication encrypts the server's challenge with the password as a DES
+# key; the crate is the one the CredSSP stack already brings in.
+des = "0.9.0"
+# The extended clipboard carries its text in a zlib stream. flate2's default
+# backend is miniz_oxide, so no C compression library joins the build.
+flate2 = "1.1.10"
 
 [build-dependencies]
 cc = "1.2.25"

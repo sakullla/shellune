@@ -6522,6 +6522,8 @@ name = "shellune-desktop"
 version = "0.4.9"
 dependencies = [
  "cc",
+ "des",
+ "flate2",
  "hmac 0.12.1",
  "md-5 0.10.6",
  "rustls",

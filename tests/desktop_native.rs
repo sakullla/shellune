@@ -1,18 +1,17 @@
 //! The native desktop boundary (R18-R20, R23).
 //!
-//! Everything here runs the real shim against the real code: LibVNCClient for
-//! VNC, and this crate's own RDP client for desktop remoting. No server is started
-//! here, so the peer is a scripted TCP server that speaks exactly the bytes the
-//! test needs and nothing more. That is enough to prove the parts this file owns -
-//! the ABI, cancellation, close ordering, the failure classification, the drive
-//! channel and a first frame with input - and it is *not* evidence that any
-//! particular real server works. The endpoint matrix in tests/rdp_vnc.rs is that
-//! evidence, and it runs when its `SHELLUNE_*` endpoint variables are set.
+//! Everything here runs the real engines: this crate's own RDP client (src/rdp)
+//! and VNC client (src/vnc). No server is started here, so the peer is a scripted
+//! TCP server that speaks exactly the bytes the test needs and nothing more. That is
+//! enough to prove the parts this file owns - cancellation, close ordering, the
+//! failure classification, the drive channel, a first frame with input, both
+//! clipboard forms and reconnection - and it is *not* evidence that any particular
+//! real server works. The endpoint matrix in tests/rdp_vnc.rs is that evidence, and
+//! it runs when its `SHELLUNE_*` endpoint variables are set.
 //!
-//! When the native libraries were not built, every test here reports SKIP and says
-//! which command produces them. Nothing is faked into a pass. With
-//! `SHELLUNE_REQUIRE_NATIVE=1` (set by CI, which builds them first) a missing backend
-//! fails instead, so a broken native build cannot pass as a row of skips.
+//! A protocol whose engine this build does not carry reports SKIP instead of a pass;
+//! with `SHELLUNE_REQUIRE_NATIVE=1` a missing engine fails instead, so a broken build
+//! cannot pass as a row of skips.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -43,9 +42,7 @@ fn backends_built() -> bool {
                          says it must be"
                     );
                 }
-                eprintln!(
-                    "SKIP: {protocol:?} is not built here ({reason}); run                      packaging/native/build_native.py"
-                );
+                eprintln!("SKIP: {protocol:?} is not built here ({reason})");
                 built = false;
             }
             Err(error) => panic!("backend info failed: {error}"),
@@ -173,6 +170,14 @@ enum Script {
         clipboard: Option<Cut>,
         extended: bool,
     },
+    /// Serve one handshake, then close the connection as soon as the client asks
+    /// for its first frame; the next accept serves that frame. This is the shape a
+    /// dropped session has from the client's side.
+    DropsFirstSession {
+        width: u16,
+        height: u16,
+        pixel: [u8; 4],
+    },
 }
 
 struct Scripted {
@@ -196,8 +201,10 @@ impl Scripted {
         let log = Arc::clone(&messages);
         let saw = Arc::clone(&accepted);
         let thread = thread::spawn(move || {
+            // The first connection of DropsFirstSession is the one that is dropped.
+            let mut dropped = false;
             // Like a real server, accept as many connections as the client opens: a
-            // refused handshake may be followed by the shim's security-type probe.
+            // reconnecting client dials again.
             while let Ok((stream, _)) = listener.accept() {
                 saw.store(true, Ordering::SeqCst);
                 thread::sleep(delay);
@@ -240,8 +247,29 @@ impl Scripted {
                             clipboard,
                             extended,
                         };
-                        serve_session(stream, peer, Arc::clone(&log));
+                        serve_session(stream, peer, Arc::clone(&log), false);
                         return;
+                    }
+                    Script::DropsFirstSession {
+                        width,
+                        height,
+                        pixel,
+                    } => {
+                        let peer = Peer {
+                            width,
+                            height,
+                            pixel,
+                            clipboard: None,
+                            extended: false,
+                        };
+                        if dropped {
+                            // The second connection is served normally, and the test
+                            // ends when the client closes it.
+                            serve_session(stream, peer, Arc::clone(&log), false);
+                            return;
+                        }
+                        dropped = true;
+                        serve_session(stream, peer, Arc::clone(&log), true);
                     }
                 }
             }
@@ -377,7 +405,12 @@ fn extended_message(flags: u32, body: &[u8]) -> Vec<u8> {
     message
 }
 
-fn serve_session(mut stream: TcpStream, peer: Peer, log: Arc<Mutex<Vec<ClientMessage>>>) {
+fn serve_session(
+    mut stream: TcpStream,
+    peer: Peer,
+    log: Arc<Mutex<Vec<ClientMessage>>>,
+    drop_at_first_request: bool,
+) {
     let Peer {
         width,
         height,
@@ -467,6 +500,11 @@ fn serve_session(mut stream: TcpStream, peer: Peer, log: Arc<Mutex<Vec<ClientMes
                     return;
                 }
             }
+        }
+        if served_frame && drop_at_first_request {
+            // Close the way a server whose session ends does: the client sees EOF
+            // and has to dial again.
+            return;
         }
         if served_frame {
             let mut update = vec![0u8, 0];
@@ -780,6 +818,69 @@ fn a_vnc_banner_delayed_three_seconds_still_connects() {
     assert!(start.elapsed() < Duration::from_secs(2));
 }
 
+/// A session the server drops before its first frame is dialled once more, and
+/// the second attempt draws. The client reports the drop as Connecting with the
+/// reason that says what happened, so a pane can show it rather than a hang.
+#[test]
+fn a_vnc_session_dropped_before_its_first_frame_is_reconnected_once() {
+    if !backends_built() {
+        return;
+    }
+    let peer = Scripted::start(Script::DropsFirstSession {
+        width: 2,
+        height: 2,
+        pixel: [3, 4, 5, 0],
+    });
+    let mut client = connect_vnc(&peer, false);
+    let events = pump(&client, PATIENCE, |event| {
+        matches!(event, Event::Frame { .. })
+    });
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            Event::State {
+                state: State::Connecting,
+                reason,
+                ..
+            } if reason.contains("reconnecting")
+        )),
+        "the drop is reported before the second attempt: {events:?}"
+    );
+    assert_eq!(
+        states(&events)
+            .iter()
+            .filter(|state| **state == State::Connected)
+            .count(),
+        2,
+        "both attempts reached a live session: {events:?}"
+    );
+    let frame = events
+        .iter()
+        .find_map(|event| match event {
+            Event::Frame { pixels, .. } => Some(pixels.clone()),
+            _ => None,
+        })
+        .expect("the second session drew");
+    assert_eq!(frame.len(), 2 * 2 * 4);
+    drop(client);
+    assert_eq!(leaked_handles(), 0);
+}
+
+/// The VNC engine is this crate, not a linked library: the reported build says so,
+/// which is what the pane shows and what the endpoint matrix trusts.
+#[test]
+fn the_vnc_engine_reports_itself_and_links_no_protocol_library() {
+    let info = backend_info(Protocol::Vnc).expect("a VNC engine");
+    assert!(info.contains("shellune VNC client"), "{info}");
+    assert!(
+        !info.to_ascii_lowercase().contains("libvncclient"),
+        "{info}"
+    );
+    for security in ["none", "vncauth", "tls", "vencrypt"] {
+        assert!(info.contains(security), "{security} is not claimed: {info}");
+    }
+}
+
 #[test]
 fn a_closed_vnc_port_is_a_connect_failure_never_a_connection() {
     if !backends_built() {
@@ -909,9 +1010,9 @@ fn an_unsupported_vnc_security_type_fails_instead_of_downgrading() {
     );
 }
 
-/// The ABI accepts exactly one VNC pixel depth. The shim pins a 32bpp pixel format
-/// and always hands out four-byte pixels, so a three-byte request must be refused
-/// rather than accepted and then silently produce no frames.
+/// The ABI accepts exactly one VNC pixel depth. The engine pins a 32bpp pixel
+/// format and always hands out four-byte pixels, so a three-byte request must be
+/// refused rather than accepted and then silently produce no frames.
 #[test]
 fn the_vnc_pixel_depth_is_fixed_at_four_bytes() {
     if !backends_built() {

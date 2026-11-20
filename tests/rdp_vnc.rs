@@ -19,7 +19,7 @@
 //! * SHELLUNE_VNC_PASSWORD_HOST - a second VNC server (VncAuth) so the two-server
 //!   requirement is met;
 //! * SHELLUNE_VNC_TLS_HOST / _PORT / _PASSWORD - a server offering TLS or
-//!   VeNCrypt;
+//!   VeNCrypt (a certificate is presented for the user to accept);
 //! * SHELLUNE_VNC_BAD_PASSWORD - the password to offer the server above to make it
 //!   refuse the credentials.
 //!
@@ -424,6 +424,153 @@ fn verify(endpoint: &Endpoint) -> Outcome {
     let stopped = client.wait_for_worker(PATIENCE).is_ok();
     steps.push(("cancel", cancelled && stopped));
     Outcome::Verified(steps)
+}
+
+/// A real VNC endpoint serves a second session after the first one is closed, so
+/// the application can reconnect. The matrix runs each endpoint once; this proves
+/// the second attempt is a new, working session and not a cached picture.
+#[test]
+fn the_vnc_endpoint_accepts_a_second_session() {
+    let endpoint = match Endpoint::from_env(Kind::Vnc) {
+        Ok(endpoint) => endpoint,
+        Err(reason) => {
+            println!("VNC reconnect: not verified ({reason})");
+            return;
+        }
+    };
+    if let Err(Error::Unavailable(reason)) = backend_info(Protocol::Vnc) {
+        println!("VNC reconnect: not verified (this build has no VNC backend: {reason})");
+        return;
+    }
+    for attempt in 1..=2 {
+        let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
+        client
+            .set_server(&endpoint.address, endpoint.port)
+            .expect("server");
+        client
+            .set_credentials(None, endpoint.password.as_deref(), None)
+            .expect("credentials");
+        client
+            .set_vnc_security(endpoint.security())
+            .expect("security");
+        client.set_vnc_colour_depth(4).expect("depth");
+        client.set_size(1280, 720).expect("size");
+        client.connect().expect("connect");
+
+        let deadline = Instant::now() + PATIENCE;
+        let mut first_frame = false;
+        let mut failure = None;
+        while Instant::now() < deadline && !first_frame && failure.is_none() {
+            match client.recv_timeout(Duration::from_millis(100)) {
+                Ok(Event::Frame { width, height, .. }) if width > 0 && height > 0 => {
+                    first_frame = true;
+                    println!("VNC reconnect attempt {attempt}: {width}x{height} frame");
+                }
+                Ok(Event::Certificate { request_id, .. }) => {
+                    client.answer_certificate(request_id, true).expect("answer");
+                }
+                Ok(Event::State {
+                    state: State::Failed(_) | State::Closed,
+                    failure: reported,
+                    reason,
+                    ..
+                }) => failure = Some((reported, reason)),
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        assert!(first_frame, "attempt {attempt} drew no frame: {failure:?}");
+        assert!(client.cancel().is_ok());
+        client.wait_for_worker(PATIENCE).expect("the worker stops");
+    }
+}
+
+/// Drives the endpoint's pointer and keyboard, and offers text on its clipboard.
+/// The observable result is on the server's own screen: after this runs, the
+/// pointer is where it was sent and the right click has left its menu open. The
+/// test asserts the protocol steps were accepted while the session stayed live.
+#[test]
+fn the_vnc_endpoint_takes_pointer_keyboard_and_clipboard() {
+    let endpoint = match Endpoint::from_env(Kind::Vnc) {
+        Ok(endpoint) => endpoint,
+        Err(reason) => {
+            println!("VNC input: not verified ({reason})");
+            return;
+        }
+    };
+    if let Err(Error::Unavailable(reason)) = backend_info(Protocol::Vnc) {
+        println!("VNC input: not verified (this build has no VNC backend: {reason})");
+        return;
+    }
+    let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
+    client
+        .set_server(&endpoint.address, endpoint.port)
+        .expect("server");
+    client
+        .set_credentials(None, endpoint.password.as_deref(), None)
+        .expect("credentials");
+    client
+        .set_vnc_security(endpoint.security())
+        .expect("security");
+    client.set_vnc_colour_depth(4).expect("depth");
+    client.set_size(1280, 720).expect("size");
+    client.connect().expect("connect");
+
+    let deadline = Instant::now() + PATIENCE;
+    let mut live = false;
+    while Instant::now() < deadline && !live {
+        match client.recv_timeout(Duration::from_millis(100)) {
+            Ok(Event::Frame { .. })
+            | Ok(Event::State {
+                state: State::Connected,
+                ..
+            }) => {
+                live = true;
+            }
+            Ok(Event::Certificate { request_id, .. }) => {
+                client.answer_certificate(request_id, true).expect("answer");
+            }
+            Ok(Event::State {
+                state: State::Failed(failure),
+                reason,
+                ..
+            }) => panic!("the session failed: {failure:?} {reason}"),
+            Ok(_) | Err(_) => {}
+        }
+    }
+    assert!(live, "the endpoint never became live");
+
+    // The pointer, a right click (a menu opens on the desktop) and a key press.
+    client.pointer(400, 300, PointerButtons(0)).expect("move");
+    client
+        .pointer(400, 300, PointerButtons::RIGHT)
+        .expect("right press");
+    client
+        .pointer(400, 300, PointerButtons(0))
+        .expect("release");
+    client.key(0x1e, 0x61, true, false).expect("key down");
+    client.key(0x1e, 0x61, false, false).expect("key up");
+    client
+        .clipboard("shellune endpoint text")
+        .expect("clipboard");
+    std::thread::sleep(Duration::from_millis(800));
+    println!(
+        "VNC input: pointer 400,300 and a right click were sent, plus one key and one clipboard text"
+    );
+    // The session must still be live after the input, not have failed on it.
+    let after = client.recv_timeout(Duration::from_millis(500));
+    assert!(
+        !matches!(
+            after,
+            Ok(Event::State {
+                state: State::Failed(_) | State::Closed,
+                ..
+            })
+        ),
+        "the session ended on the input: {after:?}"
+    );
+    client.cancel().expect("cancel");
+    client.wait_for_worker(PATIENCE).expect("the worker stops");
 }
 
 /// What a deliberately wrong password has to produce.
