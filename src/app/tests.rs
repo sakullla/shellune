@@ -29479,6 +29479,135 @@ async fn a_dropped_desktop_reconnects_only_when_the_user_asks(cx: &mut TestAppCo
 }
 
 #[gpui::test]
+async fn a_folded_bar_stays_folded_until_the_handle_is_pressed(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, _log) = ScriptedLink::new(live_desktop_events());
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+    let collapsed = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .desktop_of(id)
+                .expect("the desktop surface is mounted")
+                .read(app)
+                .controls_collapsed_for_test()
+        })
+    };
+    let drawn = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .desktop_of(id)
+                .expect("the desktop surface is mounted")
+                .read(app)
+                .controls_frames_for_test()
+        })
+    };
+    let revealed = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .desktop_of(id)
+                .expect("the desktop surface is mounted")
+                .read(app)
+                .controls_revealed_for_test()
+        })
+    };
+
+    hover(cx, "desktop.body");
+    cx.run_until_parked();
+    assert!(revealed(cx), "the bar follows the pointer");
+    assert!(
+        cx.debug_bounds("desktop.controls").is_some(),
+        "the bar is over the picture while the pointer is on it"
+    );
+
+    click(cx, "desktop.controls.collapse");
+    cx.run_until_parked();
+    assert!(collapsed(cx), "the fold is the pane's own state");
+
+    // The test window keeps the debug bounds of an element that is gone, so absence
+    // is read two ways: no frame draws the bar any more, and a press where the
+    // readout was does nothing.
+    let frames = drawn(cx);
+    for _ in 0..3 {
+        redraw(cx);
+        cx.run_until_parked();
+    }
+    assert_eq!(drawn(cx), frames, "no frame after the fold drew the bar");
+    let fitted = desktop_zoom(&view, cx, id);
+    click(cx, "desktop.zoom.fit");
+    assert_eq!(
+        desktop_zoom(&view, cx, id),
+        fitted,
+        "a folded bar does not answer a press where its readout was"
+    );
+
+    // The pointer is still over the picture, so the handle is what is offered.
+    assert!(
+        cx.debug_bounds("desktop.controls.expand").is_some(),
+        "the handle is in the bar's corner"
+    );
+
+    // Leaving the picture hides the handle; coming back shows it again, and the fold
+    // survives either way.
+    cx.simulate_mouse_move(point(px(2.0), px(2.0)), None, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        !revealed(cx),
+        "away from the picture nothing is drawn over it"
+    );
+    hover(cx, "desktop.body");
+    cx.run_until_parked();
+    assert!(revealed(cx), "the pointer brings the handle back");
+    assert!(collapsed(cx), "and the bar stays folded");
+    assert_eq!(drawn(cx), frames, "still no frame drew the bar");
+
+    // The handle is the way back, and the bar keeps its behaviour.
+    click(cx, "desktop.controls.expand");
+    cx.run_until_parked();
+    assert!(!collapsed(cx), "pressing the handle unfolds the bar");
+    assert!(
+        cx.debug_bounds("desktop.controls").is_some(),
+        "the bar is drawn again"
+    );
+    click(cx, "desktop.zoom.fit");
+    assert_eq!(
+        desktop_zoom(&view, cx, id),
+        crate::app::desktop::DesktopZoom::Percent(100),
+        "the readout works again once the bar is back"
+    );
+}
+
+#[gpui::test]
+async fn the_zoom_readout_works_after_folding_and_unfolding(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, _log) = ScriptedLink::new(live_desktop_events());
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+
+    click(cx, "desktop.controls.collapse");
+    cx.run_until_parked();
+    let folded = desktop_zoom(&view, cx, id);
+    click(cx, "desktop.zoom.fit");
+    assert_eq!(
+        desktop_zoom(&view, cx, id),
+        folded,
+        "the readout is not there while the bar is folded, so the press changes nothing"
+    );
+
+    hover(cx, "desktop.body");
+    click(cx, "desktop.controls.expand");
+    cx.run_until_parked();
+    click(cx, "desktop.zoom.fit");
+    assert_eq!(
+        desktop_zoom(&view, cx, id),
+        crate::app::desktop::DesktopZoom::Percent(100),
+        "the readout still switches once the bar is back"
+    );
+    click(cx, "desktop.zoom.fit");
+    assert_eq!(
+        desktop_zoom(&view, cx, id),
+        crate::app::desktop::DesktopZoom::Fit
+    );
+}
+#[gpui::test]
 async fn the_controls_appear_only_while_the_pointer_is_over_the_pane(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let (link, _log) = ScriptedLink::new(live_desktop_events());

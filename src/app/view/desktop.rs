@@ -305,6 +305,17 @@ pub struct DesktopPane {
     /// colours are not ours, and the corner it sits in is where a remote window keeps
     /// its own controls.
     controls_hovered: bool,
+    /// Whether the bar over the picture is folded away on purpose.
+    ///
+    /// The fold is the pane's own memory: another frame, a redraw and a step of the
+    /// session keep it, and it is never written down - a new attempt starts with the
+    /// bar shown, because the fold was a decision about this screen.
+    controls_collapsed: bool,
+    /// How many frames drew the bar over the picture, for the test that a folded bar
+    /// is not drawn at all. The test window keeps the debug bounds of elements that
+    /// are gone, so a frame count is the only honest way to say "not drawn".
+    #[cfg(test)]
+    controls_frames: u32,
     /// How many times this pane was asked to start, for the tests that prove one
     /// connection is one attempt. A guard keeps a second start from dialling, and
     /// the count says whether one was even asked for.
@@ -373,6 +384,9 @@ impl DesktopPane {
             // A shot of a session is a shot of its controls too, and the capture runs
             // with no pointer over the picture: there the bar starts shown.
             controls_hovered: cfg!(feature = "ui-capture"),
+            controls_collapsed: false,
+            #[cfg(test)]
+            controls_frames: 0,
             send_problem: None,
             polling: false,
             watching_focus: false,
@@ -502,6 +516,32 @@ impl DesktopPane {
             self.pan = (0.0, 0.0);
             cx.notify();
         }
+    }
+
+    /// Folds the controls over the picture away, or brings them back.
+    ///
+    /// Folded, the bar is not drawn at all - not even while the pointer is over the
+    /// picture - and only a small handle in the same corner brings it back. The state
+    /// belongs to the pane and is never written down.
+    pub fn set_controls_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
+        if self.controls_collapsed != collapsed {
+            self.controls_collapsed = collapsed;
+            cx.notify();
+        }
+    }
+
+    /// How many frames drew the bar over the picture, for the tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn controls_frames_for_test(&self) -> u32 {
+        self.controls_frames
+    }
+
+    /// Whether the bar over the picture is folded away, for the tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn controls_collapsed_for_test(&self) -> bool {
+        self.controls_collapsed
     }
 
     /// Fit and 100% are the two steps the readout names, so pressing it moves
@@ -1608,6 +1648,42 @@ impl DesktopPane {
                     this.toggle_fullscreen(window, cx);
                 })),
             )
+            // Folding the bar away is the pane's own control, so a remote screen is
+            // left alone once the person has said they do not want the bar over it.
+            .child(components::divider_vertical(metrics).mx(metrics.scale(spacing::HAIRLINE)))
+            .child(
+                components::icon_only_button(Icon::ChevronUp, metrics)
+                    .id(SharedString::from("desktop.controls.collapse"))
+                    .debug_selector(|| "desktop.controls.collapse".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.set_controls_collapsed(true, cx);
+                    })),
+            )
+    }
+
+    /// The small handle that brings a folded bar back.
+    ///
+    /// It is in the bar's own corner and only while the pointer is over the picture:
+    /// a screen nobody is pointing at keeps the whole corner.
+    fn expand_handle(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
+        components::floating_bar(metrics)
+            .absolute()
+            .top_0()
+            .right_0()
+            .m(metrics.scale(spacing::TIGHT))
+            .debug_selector(|| "desktop.controls.handle".to_owned())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+            )
+            .child(
+                components::icon_only_button(Icon::ChevronDown, metrics)
+                    .id(SharedString::from("desktop.controls.expand"))
+                    .debug_selector(|| "desktop.controls.expand".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.set_controls_collapsed(false, cx);
+                    })),
+            )
     }
 
     fn certificate_card(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
@@ -1941,9 +2017,20 @@ impl Render for DesktopPane {
         // The controls belong to the pane, not to the session: they are drawn over
         // the picture whenever there is a link to control (R18). They go on last so
         // nothing drawn over the picture - the warning strip, the certificate card -
-        // sits between the pointer and a control.
+        // sits between the pointer and a control. A folded bar is not drawn at all;
+        // only its handle is, and only while the pointer is over the picture.
         if !matches!(self.phase, DesktopPhase::NotStarted) {
-            body = body.child(self.controls(metrics, cx));
+            if self.controls_collapsed {
+                if self.controls_hovered {
+                    body = body.child(self.expand_handle(metrics, cx));
+                }
+            } else {
+                #[cfg(test)]
+                {
+                    self.controls_frames += 1;
+                }
+                body = body.child(self.controls(metrics, cx));
+            }
         }
         body
     }
