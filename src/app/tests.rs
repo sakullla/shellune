@@ -29313,6 +29313,135 @@ async fn every_keystroke_reaches_a_desktop_once(cx: &mut TestAppContext) {
     );
 }
 
+/// The pane's zoom step, read the way the controls draw it.
+fn desktop_zoom(view: &Entity<ShelluneView>, cx: &mut VisualTestContext, id: SessionId) -> crate::app::desktop::DesktopZoom {
+    cx.update(|_window, app| {
+        view.read(app)
+            .desktop_of(id)
+            .expect("the desktop surface is mounted")
+            .read(app)
+            .zoom()
+    })
+}
+
+#[gpui::test]
+async fn the_zoom_readout_switches_between_fit_and_one_hundred(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, _log) = ScriptedLink::new(live_desktop_events());
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+    assert_eq!(
+        desktop_zoom(&view, cx, id),
+        crate::app::desktop::DesktopZoom::Fit,
+        "a session starts by fitting the window"
+    );
+
+    click(cx, "desktop.zoom.fit");
+    assert_eq!(
+        desktop_zoom(&view, cx, id),
+        crate::app::desktop::DesktopZoom::Percent(100),
+        "pressing the readout asks for the actual size"
+    );
+    click(cx, "desktop.zoom.fit");
+    assert_eq!(
+        desktop_zoom(&view, cx, id),
+        crate::app::desktop::DesktopZoom::Fit,
+        "pressing it again fits the window"
+    );
+
+    // The steps on either side keep their own ladder; the readout is not a third
+    // way of stepping through it.
+    click(cx, "desktop.zoom.in");
+    assert_eq!(
+        desktop_zoom(&view, cx, id),
+        crate::app::desktop::DesktopZoom::Percent(200),
+        "the + button still jumps to the largest step from Fit"
+    );
+    click(cx, "desktop.zoom.fit");
+    assert_eq!(
+        desktop_zoom(&view, cx, id),
+        crate::app::desktop::DesktopZoom::Fit,
+        "from a zoomed picture the readout fits the window again"
+    );
+}
+
+#[gpui::test]
+async fn the_controls_stay_clickable_over_a_notice_and_a_certificate(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let mut events = live_desktop_events();
+    events.push(LinkEvent::Notice(
+        crate::app::desktop::Notice::ClipboardTooLarge(
+            crate::app::desktop::ClipboardKind::Text,
+        ),
+    ));
+    let (link, _log) = ScriptedLink::new(events);
+    let feed = link.feed();
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+    assert!(
+        cx.debug_bounds("desktop.notice").is_some(),
+        "the warning strip is over the picture"
+    );
+
+    // A press on a control still reaches it with the strip on screen: the strip is
+    // at the picture's foot and the bar is drawn after it.
+    click(cx, "desktop.zoom.in");
+    assert_eq!(
+        desktop_zoom(&view, cx, id),
+        crate::app::desktop::DesktopZoom::Percent(200),
+        "the zoom button works with the warning strip up"
+    );
+
+    // And with the certificate card, which is centred over the picture: the bar is
+    // drawn last, so it is above the layer the card sits on.
+    feed.feed(vec![LinkEvent::Certificate {
+        request_id: 3,
+        host: "rdp.example.com".to_owned(),
+        subject: "CN=rdp".to_owned(),
+        issuer: "CN=ca".to_owned(),
+        fingerprint: "AA:BB".to_owned(),
+        flags: 0,
+    }]);
+    pump_desktop(&view, cx, id);
+    redraw(cx);
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("desktop.certificate").is_some(),
+        "the question is on screen"
+    );
+    click(cx, "desktop.zoom.out");
+    assert_eq!(
+        desktop_zoom(&view, cx, id),
+        crate::app::desktop::DesktopZoom::Percent(150),
+        "the zoom button works with the certificate question up"
+    );
+}
+
+#[gpui::test]
+async fn the_controls_appear_only_while_the_pointer_is_over_the_pane(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, _log) = ScriptedLink::new(live_desktop_events());
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+    let revealed = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .desktop_of(id)
+                .expect("the desktop surface is mounted")
+                .read(app)
+                .controls_revealed_for_test()
+        })
+    };
+    assert!(
+        !revealed(cx),
+        "the bar stays out of the way until the pointer comes to the picture"
+    );
+
+    hover(cx, "desktop.body");
+    cx.run_until_parked();
+    assert!(
+        revealed(cx),
+        "moving over the pane brings the controls back"
+    );
+}
+
 #[gpui::test]
 async fn a_desktop_connection_starts_with_the_password_typed_in_its_form(cx: &mut TestAppContext) {
     let dir = TempDir::new("desktop-secret-connect");

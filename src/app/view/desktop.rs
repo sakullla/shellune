@@ -300,6 +300,11 @@ pub struct DesktopPane {
     /// password reaches the link. `None` until a start; `Some(None)` is "no password".
     #[cfg(test)]
     started_password: Option<Option<String>>,
+    /// Whether the pointer is over the pane, which is when the controls over the
+    /// picture are drawn. A bar that is always there covers a remote screen whose
+    /// colours are not ours, and the corner it sits in is where a remote window keeps
+    /// its own controls.
+    controls_hovered: bool,
     /// How many times this pane was asked to start, for the tests that prove one
     /// connection is one attempt. A guard keeps a second start from dialling, and
     /// the count says whether one was even asked for.
@@ -365,6 +370,7 @@ impl DesktopPane {
             started_password: None,
             #[cfg(test)]
             starts: 0,
+            controls_hovered: false,
             send_problem: None,
             polling: false,
             watching_focus: false,
@@ -496,6 +502,24 @@ impl DesktopPane {
         }
     }
 
+    /// Fit and 100% are the two steps the readout names, so pressing it moves
+    /// between them and the +/- buttons keep their own ladder.
+    ///
+    /// A zoom out of the way (50% or 75%) goes back to Fit rather than to 100%: the
+    /// readout says what the picture is now, and the next press is the other end.
+    pub fn zoom_toggle(&mut self, cx: &mut Context<Self>) {
+        let next = if self.zoom.is_fit() {
+            DesktopZoom::Percent(100)
+        } else {
+            DesktopZoom::Fit
+        };
+        if next != self.zoom {
+            self.zoom = next;
+            self.pan = (0.0, 0.0);
+            cx.notify();
+        }
+    }
+
     /// Back to the whole desktop in the space it has.
     pub fn zoom_fit(&mut self, cx: &mut Context<Self>) {
         if !self.zoom.is_fit() || self.pan != (0.0, 0.0) {
@@ -551,6 +575,14 @@ impl DesktopPane {
         self.layer_reason
             .as_deref()
             .filter(|reason| !reason.trim().is_empty())
+    }
+
+    /// Whether the controls over the picture are drawn, for the tests that check they
+    /// stay out of the way until the pointer is over the pane.
+    #[cfg(test)]
+    #[must_use]
+    pub fn controls_revealed_for_test(&self) -> bool {
+        self.controls_hovered
     }
 
     /// How many starts this pane was asked for, for the tests.
@@ -1512,11 +1544,17 @@ impl DesktopPane {
         };
         // The shared floating bar with the toolbar's compact buttons: the controls float
         // over a picture that is not ours, like a menu floats over the page (R6).
+        //
+        // The bar belongs to the pointer: a remote screen draws its own controls in the
+        // same corner, so a bar that is always there covers them. It is laid out either
+        // way - a press on a step should not depend on a frame of hover first - and the
+        // pane reveals it as soon as the pointer is anywhere over the picture.
         components::floating_bar(metrics)
             .absolute()
             .top_0()
             .right_0()
             .m(metrics.scale(spacing::TIGHT))
+            .when(!self.controls_hovered, |bar| bar.opacity(0.0))
             .debug_selector(|| "desktop.controls".to_owned())
             // A press on a control belongs to the control: the picture underneath
             // is not clicked at the same time.
@@ -1530,17 +1568,16 @@ impl DesktopPane {
                     .debug_selector(|| "desktop.zoom.out".to_owned())
                     .on_click(cx.listener(|this, _event, _window, cx| this.zoom_out(cx))),
             )
+            // The readout is the switch between the two steps it names: pressing
+            // "Fit" asks for 100% and pressing "100%" asks to fit the window again.
             .child(
-                div()
+                components::compact_button(zoom, Variant::Ghost, metrics)
                     .flex_none()
                     .min_w(metrics.scale(ZOOM_LABEL_WIDTH))
-                    .px(metrics.scale(spacing::HAIRLINE))
-                    .text_center()
-                    .text_size(metrics.caption_size())
-                    .font_weight(metrics.medium_weight())
-                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .debug_selector(|| "desktop.zoom.label".to_owned())
-                    .child(SharedString::from(zoom)),
+                    .justify_center()
+                    .id(SharedString::from("desktop.zoom.fit"))
+                    .debug_selector(|| "desktop.zoom.fit".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| this.zoom_toggle(cx))),
             )
             .child(
                 components::compact_button(strings.desktop_zoom_in, Variant::Ghost, metrics)
@@ -1781,7 +1818,19 @@ impl Render for DesktopPane {
                 |this, event: &ModifiersChangedEvent, _window, cx| {
                     this.on_modifiers_changed(event, cx);
                 },
-            ));
+            ))
+            // The identity is what lets the pointer's arrival be observed: the bar
+            // over the picture follows it, so it is out of the way of a remote screen
+            // nobody is pointing at.
+            .id(SharedString::from("desktop.body"))
+            // The bar over the picture follows the pointer: over the pane it is drawn,
+            // away from it the remote screen is left alone.
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                if this.controls_hovered != *hovered {
+                    this.controls_hovered = *hovered;
+                    cx.notify();
+                }
+            }));
 
         match picture {
             Some(picture) => {
@@ -1855,11 +1904,6 @@ impl Render for DesktopPane {
                 });
             }
         }
-        // The controls belong to the pane, not to the session: they are drawn over
-        // the picture whenever there is a link to control (R18).
-        if !matches!(self.phase, DesktopPhase::NotStarted) {
-            body = body.child(self.controls(metrics, cx));
-        }
         if has_picture && let Some(notice) = self.notice_strip(metrics, cx) {
             body = body.child(notice);
         }
@@ -1891,6 +1935,13 @@ impl Render for DesktopPane {
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .child(SharedString::from(self.target.target())),
             );
+        }
+        // The controls belong to the pane, not to the session: they are drawn over
+        // the picture whenever there is a link to control (R18). They go on last so
+        // nothing drawn over the picture - the warning strip, the certificate card -
+        // sits between the pointer and a control.
+        if !matches!(self.phase, DesktopPhase::NotStarted) {
+            body = body.child(self.controls(metrics, cx));
         }
         body
     }
