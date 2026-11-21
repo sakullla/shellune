@@ -1291,6 +1291,24 @@ impl TransferQueue {
         self.transfers.retain(|transfer| transfer.id() != id);
         self.transfers.len() != before
     }
+
+    /// Removes every finished task (completed, failed or cancelled) across all sessions,
+    /// leaving queued, running and overwrite-prompt tasks untouched.
+    pub fn clear_finished(&mut self) -> usize {
+        let before = self.transfers.len();
+        self.transfers
+            .retain(|transfer| !transfer.state().is_finished());
+        before - self.transfers.len()
+    }
+
+    /// Removes every finished task belonging to one session, leaving active tasks and
+    /// other sessions untouched.
+    pub fn clear_finished_for_session(&mut self, session: SessionId) -> usize {
+        let before = self.transfers.len();
+        self.transfers
+            .retain(|transfer| transfer.session() != session || !transfer.state().is_finished());
+        before - self.transfers.len()
+    }
 }
 
 #[cfg(test)]

@@ -206,7 +206,7 @@ fn feedback(metrics: Metrics) -> Div {
     section("Feedback", metrics)
         .child(banner(
             Tone::Danger,
-            Icon::Plug,
+            Icon::AlertCircle,
             "Connection lost · keepalive timed out",
             "Reconnect",
         ))
@@ -218,7 +218,7 @@ fn feedback(metrics: Metrics) -> Div {
         ))
         .child(banner(
             Tone::Info,
-            Icon::Globe,
+            Icon::Info,
             "A new version is ready",
             "Details",
         ))
@@ -273,7 +273,7 @@ fn lists(metrics: Metrics) -> Div {
                         .into_any_element(),
                 ),
                 actions: Some(
-                    components::compact_button("Connect", Variant::Primary, metrics)
+                    components::compact_button("Connect", Variant::Secondary, metrics)
                         .into_any_element(),
                 ),
                 reveal_actions: true,

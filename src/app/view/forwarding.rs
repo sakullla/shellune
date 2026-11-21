@@ -885,11 +885,23 @@ impl ShelluneView {
             let active = row.phase.is_active();
             let listening = matches!(row.phase, ForwardPhase::Listening { .. });
             let fault = faults.iter().find_map(|fault| match fault {
-                ForwardFault::MissingHost { rule, message, .. } if *rule == id => {
-                    Some(message.clone())
-                }
+                ForwardFault::MissingHost { rule, host, .. } if *rule == id => Some(copy::fill(
+                    ux.fwd_missing_host,
+                    &[("rule", &id.to_string()), ("host", &host.to_string())],
+                )),
                 _ => None,
             });
+            let icon_tone = if fault.is_some() {
+                Tone::Danger
+            } else {
+                match row.phase {
+                    ForwardPhase::Listening { .. } => Tone::Positive,
+                    ForwardPhase::Starting { .. } => Tone::Warning,
+                    ForwardPhase::Failed { .. } => Tone::Danger,
+                    ForwardPhase::Saved => Tone::Accent,
+                    ForwardPhase::Stopped => Tone::Neutral,
+                }
+            };
             // Which side each endpoint is on is part of what a tunnel is: a local
             // forward listens here and reaches through the server, a remote one is the
             // other way round. Naming the sides makes the same "8080 -> 5432" text mean
@@ -916,7 +928,7 @@ impl ShelluneView {
                     .debug_selector(move || format!("forwards.row.{index}"))
                     .child(components::leading_icon(
                         Icon::Forward,
-                        if active { Tone::Positive } else { Tone::Accent },
+                        icon_tone,
                         metrics,
                     ))
                     .child(
@@ -957,7 +969,7 @@ impl ShelluneView {
                                         .font_family(crate::app::terminal::monospace_family())
                                         .text_size(metrics.label_size())
                                         .text_color(theme::swatch(palette::TEXT_SECONDARY)),
-                                    mapping.clone(),
+                                    listen.clone(),
                                 )
                                 .child(SharedString::from(mapping)),
                             )
@@ -1077,12 +1089,16 @@ impl ShelluneView {
     #[cfg(test)]
     pub fn forward_fault_for_test(&self, index: usize) -> Option<String> {
         let id = self.forwards.rows().into_iter().nth(index)?.rule.id();
+        let ux = copy::ux();
         self.forwards
             .book()
             .faults(|host| self.book.host(host).is_some())
             .into_iter()
             .find_map(|fault| match fault {
-                ForwardFault::MissingHost { rule, message, .. } if rule == id => Some(message),
+                ForwardFault::MissingHost { rule, host, .. } if rule == id => Some(copy::fill(
+                    ux.fwd_missing_host,
+                    &[("rule", &id.to_string()), ("host", &host.to_string())],
+                )),
                 _ => None,
             })
     }

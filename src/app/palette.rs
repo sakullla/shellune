@@ -117,8 +117,10 @@ pub fn rank(entries: &[Entry], query: &str) -> Vec<Entry> {
     if words.is_empty() {
         let mut all = entries.to_vec();
         all.sort_by_key(|entry| entry.group);
-        all.truncate(MAX_RESULTS);
-        return all;
+        if all.len() <= MAX_RESULTS {
+            return all;
+        }
+        return balanced_unfiltered(&all);
     }
     let mut scored: Vec<(u32, &Entry)> = entries
         .iter()
@@ -130,6 +132,67 @@ pub fn rank(entries: &[Entry], query: &str) -> Vec<Entry> {
         .take(MAX_RESULTS)
         .map(|(_, entry)| entry.clone())
         .collect()
+}
+
+/// Balances an unfiltered palette when saved records exceed [`MAX_RESULTS`], keeping
+/// navigation and window actions reachable instead of truncating everything after Hosts.
+fn balanced_unfiltered(sorted: &[Entry]) -> Vec<Entry> {
+    const RECENT_CAP: usize = 8;
+    const SNIPPETS_CAP: usize = 10;
+    let fixed_count = sorted
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.group,
+                Group::Sessions | Group::Shells | Group::Navigate | Group::Actions
+            )
+        })
+        .count();
+    let recent_total = sorted
+        .iter()
+        .filter(|entry| entry.group == Group::Recent)
+        .count();
+    let snippets_total = sorted
+        .iter()
+        .filter(|entry| entry.group == Group::Snippets)
+        .count();
+    let recent_cap = recent_total.min(RECENT_CAP);
+    let snippets_cap = snippets_total.min(SNIPPETS_CAP);
+    let hosts_cap = MAX_RESULTS
+        .saturating_sub(fixed_count + recent_cap + snippets_cap)
+        .max(4);
+
+    let mut out = Vec::with_capacity(MAX_RESULTS);
+    let mut recent_kept = 0;
+    let mut hosts_kept = 0;
+    let mut snippets_kept = 0;
+    for entry in sorted {
+        let keep = match entry.group {
+            Group::Recent => {
+                let ok = recent_kept < recent_cap;
+                recent_kept += usize::from(ok);
+                ok
+            }
+            Group::Hosts => {
+                let ok = hosts_kept < hosts_cap;
+                hosts_kept += usize::from(ok);
+                ok
+            }
+            Group::Snippets => {
+                let ok = snippets_kept < snippets_cap;
+                snippets_kept += usize::from(ok);
+                ok
+            }
+            Group::Sessions | Group::Shells | Group::Navigate | Group::Actions => true,
+        };
+        if keep {
+            out.push(entry.clone());
+            if out.len() == MAX_RESULTS {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// How well an entry matches every word, or `None` when one word is missing.

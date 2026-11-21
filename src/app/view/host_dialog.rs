@@ -119,10 +119,15 @@ impl ShelluneView {
         }
     }
 
-    /// Closes the jump picker and gives the keyboard back to the dialog.
+    /// Closes the jump picker and gives the keyboard back to the dialog's route field.
     pub(super) fn close_jump_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.jump_picker.take().is_some() {
-            window.focus(&self.root_focus);
+            if let Some(fields) = self.host_fields.as_ref() {
+                let handle = fields.proxy.read(cx).focus_handle().clone();
+                window.focus(&handle);
+            } else {
+                window.focus(&self.root_focus);
+            }
             cx.notify();
         }
     }
@@ -535,7 +540,18 @@ impl ShelluneView {
                         .child(picker.search.clone()),
                 )
                 .children(none)
-                .when(!candidates.is_empty(), |card| card.child(list)),
+                .when(!candidates.is_empty(), |card| {
+                    card.child(list).child(
+                        div()
+                            .px(metrics.scale(spacing::TIGHT))
+                            .py(metrics.scale(spacing::HAIRLINE))
+                            .border_t_1()
+                            .border_color(theme::swatch(palette::BORDER))
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(ux.host_jump_keys),
+                    )
+                }),
         )
     }
 
@@ -574,7 +590,7 @@ impl ShelluneView {
         } else {
             components::FORM_FIELD_MIN_WIDTH
         };
-        components::form_cell(grow, floor, metrics)
+        let mut cell = components::form_cell(grow, floor, metrics)
             .child(
                 components::form_label(label, metrics)
                     .debug_selector(move || format!("{}.label", field.debug_selector())),
@@ -586,7 +602,30 @@ impl ShelluneView {
                     .min_w_0()
                     .debug_selector(move || field.debug_selector().to_owned())
                     .child(fields.get(field).clone()),
-            )
+            );
+        let problem = self
+            .hosts
+            .message()
+            .filter(|message| message.failed())
+            .and_then(|_| self.hosts.draft())
+            .and_then(|draft| {
+                let saved = draft.editing().and_then(|id| self.book.host(id));
+                draft.first_problem(saved)
+            })
+            .and_then(|(which, reason)| match which {
+                Ok(problem_field) if problem_field == field => Some(reason),
+                _ => None,
+            });
+        if let Some(reason) = problem {
+            cell = cell.child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::DANGER))
+                    .debug_selector(move || format!("{}.problem", field.debug_selector()))
+                    .child(SharedString::from(reason)),
+            );
+        }
+        cell
     }
 
     /// The fields the chosen sign-in method asks for.
@@ -647,8 +686,22 @@ impl ShelluneView {
 
         if auth.needs_key_path() {
             let has_passphrase = auth.needs_passphrase();
+            let identity_path = draft.text(HostField::IdentityFile).trim();
+            let missing_key = !identity_path.is_empty() && self.key_presence.missing(identity_path);
             column = column
                 .child(self.dialog_field(fields, HostField::IdentityFile, None, 1.0))
+                .when(missing_key, |col| {
+                    let backup = copy::backup_for(self.workspace.locale());
+                    let tip = copy::fill(backup.host_key_missing_tip, &[("path", identity_path)]);
+                    col.child(
+                        div()
+                            .mt(metrics.scale(-(spacing::HAIRLINE)))
+                            .text_size(metrics.caption_size())
+                            .text_color(Tone::Warning.text())
+                            .debug_selector(|| "hosts.identity.missing".to_owned())
+                            .child(SharedString::from(tip)),
+                    )
+                })
                 .child(
                     div()
                         .mt(metrics.scale(-(spacing::HAIRLINE)))
@@ -1011,6 +1064,73 @@ impl ShelluneView {
         column
     }
 
+    /// Quick-pick pills for existing saved groups, so assigning a host to an existing
+    /// group takes one click rather than typing the exact path.
+    fn group_suggestions_row(
+        &self,
+        current: &str,
+        prefix: &'static str,
+        for_ssh: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let paths = crate::app::hosts::drawn_paths(&self.book, &self.groups);
+        if paths.is_empty() {
+            return None;
+        }
+        let metrics = self.metrics();
+        let current_trimmed = current.trim();
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(metrics.scale(spacing::HALF))
+            .debug_selector(move || format!("{prefix}.group.suggestions"));
+        for (index, path) in paths.into_iter().take(8).enumerate() {
+            let text = path.to_canonical();
+            let chosen = current_trimmed == text;
+            let pick_text = text.clone();
+            let id = format!("{prefix}.group.pick.{index}");
+            let selector = id.clone();
+            row = row.child(
+                components::chip(
+                    text,
+                    if chosen { Tone::Accent } else { Tone::Neutral },
+                    metrics,
+                )
+                .id(SharedString::from(id))
+                .debug_selector(move || selector.clone())
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    let next = if chosen {
+                        String::new()
+                    } else {
+                        pick_text.clone()
+                    };
+                    if for_ssh {
+                        if let Some(draft) = this.hosts.draft_mut() {
+                            draft.set_text(HostField::Group, next.clone());
+                        }
+                        if let Some(fields) = this.host_fields.as_ref() {
+                            let group_field = fields.group.clone();
+                            group_field.update(cx, |f, cx| f.set_text(next, cx));
+                        }
+                    } else {
+                        if let Some(draft) = this.hosts.protocol_draft_mut() {
+                            draft.set_text(ConnectionFormField::Group, next.clone());
+                        }
+                        if let Some(fields) = this.protocol_fields.as_ref()
+                            && let Some(group_field) = fields.get(ConnectionFormField::Group).cloned()
+                        {
+                            group_field.update(cx, |f, cx| f.set_text(next, cx));
+                        }
+                    }
+                    cx.notify();
+                })),
+            );
+        }
+        Some(row)
+    }
+
     /// The dialog over a dimmed window, while a host is being created or edited.
     ///
     /// # Keepalive
@@ -1053,7 +1173,16 @@ impl ShelluneView {
             .flex_col()
             .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::BASE));
+            .py(metrics.scale(spacing::BASE))
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                if event.keystroke.key == "enter"
+                    && event.keystroke.modifiers.number_of_modifiers() == 1
+                    && event.keystroke.modifiers.secondary()
+                {
+                    cx.stop_propagation();
+                    this.save_and_connect(cx);
+                }
+            }));
         // A new record may be of another protocol. The chooser is here so the form the
         // user sees is always the one the chosen protocol really has (R2, R18); a saved
         // host keeps the protocol it was saved with, so editing never shows it.
@@ -1085,6 +1214,12 @@ impl ShelluneView {
                             Some(ux.host_group_optional),
                             0.5,
                         ),
+                    ))
+                    .children(self.group_suggestions_row(
+                        draft.text(HostField::Group),
+                        "hosts",
+                        true,
+                        cx,
                     )),
             )
             .child(
@@ -1165,6 +1300,13 @@ impl ShelluneView {
 
         // The refusal takes a line of its own above the actions; the actions stay on
         // the right, the one that connects last and filled.
+        let save_connect_shortcut = if crate::app::Platform::current()
+            == crate::app::Platform::MacOs
+        {
+            "⌘↵"
+        } else {
+            "Ctrl+Enter"
+        };
         let footer = components::modal_footer(metrics)
             .children(refusal.map(|refusal| refusal.w_full()))
             .child(
@@ -1187,7 +1329,11 @@ impl ShelluneView {
                         let _ = view.save_host(cx);
                     },
                 )
-                .h(metrics.control_height()),
+                .h(metrics.control_height())
+                .tooltip(components::tooltip(SharedString::from(format!(
+                    "{} (Enter)",
+                    strings.host_save
+                )))),
             )
             .child(
                 self.icon_text_button(
@@ -1198,7 +1344,11 @@ impl ShelluneView {
                     cx,
                     |view, cx| view.save_and_connect(cx),
                 )
-                .h(metrics.control_height()),
+                .h(metrics.control_height())
+                .tooltip(components::tooltip(SharedString::from(format!(
+                    "{} ({save_connect_shortcut})",
+                    strings.host_save_connect
+                )))),
             );
 
         Some(self.modal_with(
@@ -1328,7 +1478,16 @@ impl ShelluneView {
             .flex_col()
             .gap(metrics.scale(spacing::BASE))
             .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::BASE));
+            .py(metrics.scale(spacing::BASE))
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                if event.keystroke.key == "enter"
+                    && event.keystroke.modifiers.number_of_modifiers() == 1
+                    && event.keystroke.modifiers.secondary()
+                {
+                    cx.stop_propagation();
+                    this.save_and_connect_connection(cx);
+                }
+            }));
 
         if !editing {
             body = body.child(self.protocol_chooser(draft.protocol(), cx));
@@ -1664,10 +1823,17 @@ impl ShelluneView {
                     options = options.child(self.protocol_field(ConnectionFormField::DataBits));
                 }
                 ConnectionFormField::Name => {
-                    basic = basic.child(line(
-                        self.protocol_field(ConnectionFormField::Name),
-                        self.protocol_field(ConnectionFormField::Group),
-                    ));
+                    basic = basic
+                        .child(line(
+                            self.protocol_field(ConnectionFormField::Name),
+                            self.protocol_field(ConnectionFormField::Group),
+                        ))
+                        .children(self.group_suggestions_row(
+                            draft.text(ConnectionFormField::Group),
+                            "connection",
+                            false,
+                            cx,
+                        ));
                 }
                 ConnectionFormField::Group => {}
             }
@@ -1710,6 +1876,13 @@ impl ShelluneView {
             |this, cx| this.close_connection_editor(cx),
         );
 
+        let save_connect_shortcut = if crate::app::Platform::current()
+            == crate::app::Platform::MacOs
+        {
+            "⌘↵"
+        } else {
+            "Ctrl+Enter"
+        };
         let footer = components::modal_footer(metrics)
             .children(refusal.map(|refusal| refusal.w_full()))
             .child(
@@ -1732,7 +1905,11 @@ impl ShelluneView {
                         let _ = view.save_connection(cx);
                     },
                 )
-                .h(metrics.control_height()),
+                .h(metrics.control_height())
+                .tooltip(components::tooltip(SharedString::from(format!(
+                    "{} (Enter)",
+                    strings.host_save
+                )))),
             )
             .child(
                 self.icon_text_button(
@@ -1743,7 +1920,11 @@ impl ShelluneView {
                     cx,
                     |view, cx| view.save_and_connect_connection(cx),
                 )
-                .h(metrics.control_height()),
+                .h(metrics.control_height())
+                .tooltip(components::tooltip(SharedString::from(format!(
+                    "{} ({save_connect_shortcut})",
+                    strings.host_save_connect
+                )))),
             );
 
         Some(self.modal_with(

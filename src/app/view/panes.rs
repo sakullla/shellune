@@ -292,8 +292,9 @@ impl ShelluneView {
         }
     }
 
-    pub(super) fn toggle_active_zoom(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn toggle_active_zoom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.layout_mut().toggle_zoom() {
+            self.present_active_pane(window, cx);
             cx.notify();
         }
     }
@@ -748,9 +749,28 @@ impl ShelluneView {
         let metrics = self.metrics();
         let fraction = f32::from(ratio) / 10_000.0;
         let across = matches!(axis, SplitAxis::LeftRight);
-        let mut row = div().flex().flex_1().min_w_0().min_h_0();
+        let view = cx.entity().downgrade();
+        let measure = gpui::canvas(
+            move |bounds, _window, app| {
+                let span = if across {
+                    f32::from(bounds.size.width)
+                } else {
+                    f32::from(bounds.size.height)
+                };
+                if span > 1.0 {
+                    let _ = view.update(app, |this, _cx| {
+                        this.split_spans.borrow_mut().insert(id, span);
+                    });
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0();
+        let mut row = div().relative().flex().flex_1().min_w_0().min_h_0();
         row = if across { row } else { row.flex_col() };
-        row.child(self.sized_child(self.layout_node(first, true, cx), fraction, across))
+        row.child(measure)
+            .child(self.sized_child(self.layout_node(first, true, cx), fraction, across))
             .child(self.split_divider(id, axis, cx, metrics))
             .child(self.sized_child(self.layout_node(second, true, cx), 1.0 - fraction, across))
     }
@@ -820,11 +840,22 @@ impl ShelluneView {
             .when(!across, |bar| bar.border_t_1().border_b_1())
             .child(self.resize_button(id, shrink, strings.pane_resize_less, "less", cx))
             .child(self.resize_button(id, grow, strings.pane_resize_more, "more", cx))
+            .tooltip(crate::app::components::tooltip(
+                crate::app::copy::ux().pane_divider_reset_hint,
+            ))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
                     cx.stop_propagation();
-                    this.begin_split_drag(id, axis, event.position, cx);
+                    if event.click_count >= 2 {
+                        this.split_drag = None;
+                        if this.workspace.layout_mut().set_split_ratio(id, 5000) {
+                            this.checkpoint_layout();
+                            cx.notify();
+                        }
+                    } else {
+                        this.begin_split_drag(id, axis, event.position, cx);
+                    }
                 }),
             )
     }
@@ -874,7 +905,7 @@ impl ShelluneView {
             Direction::Right | Direction::Down => ratio.saturating_add(500),
             Direction::Left | Direction::Up => ratio.saturating_sub(500),
         };
-        let next = next.clamp(1, 9999);
+        let next = next.clamp(1000, 9000);
         if self.workspace.layout_mut().set_split_ratio(split, next) {
             self.checkpoint_layout();
             cx.notify();
@@ -894,11 +925,19 @@ impl ShelluneView {
             .active_tab()
             .and_then(|tab| split_ratio(tab.root(), split))
             .unwrap_or(5000);
+        let span = self
+            .split_spans
+            .borrow()
+            .get(&split)
+            .copied()
+            .unwrap_or(500.0)
+            .max(120.0);
         self.split_drag = Some(SplitDrag {
             split,
             axis,
             origin,
             origin_ratio: ratio,
+            span,
         });
         cx.notify();
     }
@@ -944,7 +983,8 @@ impl ShelluneView {
             SplitAxis::LeftRight => f32::from(position.x) - f32::from(drag.origin.x),
             SplitAxis::TopBottom => f32::from(position.y) - f32::from(drag.origin.y),
         };
-        let next = (i32::from(drag.origin_ratio) + (delta * 20.0) as i32).clamp(1, 9999) as u16;
+        let ratio_delta = ((delta / drag.span.max(120.0)) * 10_000.0).round() as i32;
+        let next = (i32::from(drag.origin_ratio) + ratio_delta).clamp(1000, 9000) as u16;
         if self
             .workspace
             .layout_mut()
@@ -990,7 +1030,19 @@ impl ShelluneView {
                 frame.debug_selector(|| "pane.active".to_owned())
             })
             .when(!active, |frame| {
-                frame.debug_selector(|| "pane.idle".to_owned())
+                frame
+                    .debug_selector(|| "pane.idle".to_owned())
+                    .capture_any_mouse_down(cx.listener(
+                        move |this, event: &MouseDownEvent, _window, cx| {
+                            if matches!(event.button, MouseButton::Middle | MouseButton::Right)
+                                && this.workspace.layout_mut().focus_pane(pane)
+                            {
+                                this.active = this.workspace.layout().active_session();
+                                this.checkpoint_layout();
+                                cx.notify();
+                            }
+                        },
+                    ))
             })
             .on_mouse_down(
                 MouseButton::Left,
@@ -1135,33 +1187,59 @@ impl ShelluneView {
                     })),
             )
             // The word, not only the accent: which pane holds the keys is never said by
-            // colour alone (R8).
+            // colour alone (R8). When zoomed, the chip also states that other panes are
+            // hidden behind this one.
             .when(active, |row| {
+                let chip_label: SharedString = if zoomed {
+                    SharedString::from(format!(
+                        "{} · {}",
+                        strings.pane_active,
+                        crate::app::copy::ux().pane_zoomed
+                    ))
+                } else {
+                    SharedString::from(strings.pane_active)
+                };
                 row.child(crate::app::components::chip_within(
-                    strings.pane_active,
+                    chip_label,
                     Tone::Accent,
                     metrics,
                 ))
             })
             .child(div().flex_1())
             .when(active, |row| {
-                row.child(self.pane_icon(
-                    pane,
-                    "zoom",
-                    Icon::Zoom,
-                    if zoomed {
-                        strings.pane_unzoom
-                    } else {
-                        strings.pane_zoom
-                    },
-                    cx,
-                    |this, _window, cx| this.toggle_active_zoom(cx),
-                ))
-                .child(self.pane_icon(
+                let zoom_base = if zoomed {
+                    strings.pane_unzoom
+                } else {
+                    strings.pane_zoom
+                };
+                let zoom_tip = match self.keymap.label("pane.zoom") {
+                    Some(shortcut) => format!("{zoom_base} ({shortcut})"),
+                    None => zoom_base.to_owned(),
+                };
+                let zoom_btn = crate::app::components::toggle_icon_button(
+                    if zoomed { Icon::Restore } else { Icon::Zoom },
+                    zoomed,
+                    metrics,
+                )
+                .flex_none()
+                .w(metrics.hit_target())
+                .h(metrics.hit_target())
+                .id(SharedString::from(format!("pane.zoom.{pane}")))
+                .debug_selector(|| "pane.zoom".to_owned())
+                .tooltip(crate::app::components::tooltip(SharedString::from(zoom_tip)))
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    cx.stop_propagation();
+                    this.toggle_active_zoom(window, cx);
+                }));
+                let close_tip = match self.keymap.label("tab.close") {
+                    Some(shortcut) => format!("{} ({shortcut})", strings.pane_close),
+                    None => strings.pane_close.to_owned(),
+                };
+                row.child(zoom_btn).child(self.pane_icon(
                     pane,
                     "close",
                     Icon::Close,
-                    strings.pane_close,
+                    close_tip,
                     cx,
                     move |this, _window, cx| this.close_one_pane(pane, cx),
                 ))
@@ -1220,12 +1298,20 @@ impl ShelluneView {
         };
         let strings = self.strings();
         let control = self.metrics().hit_target();
+        let right_tip = match self.keymap.label("pane.split-right") {
+            Some(shortcut) => format!("{} ({shortcut})", strings.pane_split_right),
+            None => strings.pane_split_right.to_owned(),
+        };
+        let down_tip = match self.keymap.label("pane.split-down") {
+            Some(shortcut) => format!("{} ({shortcut})", strings.pane_split_down),
+            None => strings.pane_split_down.to_owned(),
+        };
         vec![
             self.pane_icon(
                 pane,
                 "split.right",
                 Icon::SplitRight,
-                strings.pane_split_right,
+                right_tip,
                 cx,
                 |this, window, cx| this.split_active(SplitAxis::LeftRight, window, cx),
             )
@@ -1235,7 +1321,7 @@ impl ShelluneView {
                 pane,
                 "split.down",
                 Icon::SplitDown,
-                strings.pane_split_down,
+                down_tip,
                 cx,
                 |this, window, cx| this.split_active(SplitAxis::TopBottom, window, cx),
             )
@@ -1249,7 +1335,7 @@ impl ShelluneView {
         pane: PaneId,
         name: &'static str,
         icon: Icon,
-        label: &'static str,
+        label: impl Into<SharedString> + 'static,
         cx: &mut Context<Self>,
         click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> gpui::Stateful<gpui::Div> {
@@ -1420,9 +1506,21 @@ impl ShelluneView {
         .flex_shrink()
         .min_w(self.tab_min_width())
         .tooltip(crate::app::components::tooltip(tooltip))
-        .on_click(cx.listener(move |this, _event, window, cx| {
+        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
             this.select_tab(index, window, cx);
-        }));
+            if event.click_count() == 2
+                && let Some(tab) = this.workspace.layout().tabs().get(index).map(|t| t.id())
+            {
+                this.open_tab_rename(tab, window, cx);
+            }
+        }))
+        .on_mouse_down(
+            MouseButton::Middle,
+            cx.listener(move |this, _event, _window, cx| {
+                cx.stop_propagation();
+                this.close_pending_tab(index, cx);
+            }),
+        );
         let body = super::tab_body(metrics)
             .child(crate::app::components::pulsing_status_dot(
                 Tone::Neutral,

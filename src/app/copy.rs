@@ -1715,7 +1715,7 @@ pub static ENGLISH: Strings = Strings {
     terminal_paste_lines: "lines",
     terminal_paste_runs: "Runs once you confirm",
     terminal_paste_run_confirm: "Run this command",
-    terminal_paste_safe: "Esc or Cancel writes nothing and keeps the keyboard in the terminal.",
+    terminal_paste_safe: "Esc or Do not paste writes nothing and keeps the keyboard in the terminal.",
     terminal_no_blocks: "This shell has not reported command blocks. The grid is unchanged.",
     terminal_blocks_failed: "Shell integration failed. The classic grid was kept.",
     terminal_filter_all: "All commands",
@@ -2271,7 +2271,7 @@ pub static CHINESE: Strings = Strings {
     terminal_paste_lines: "行",
     terminal_paste_runs: "确认后执行",
     terminal_paste_run_confirm: "执行这条命令",
-    terminal_paste_safe: "按 Esc 或「取消」不会写入任何内容，键盘回到终端。",
+    terminal_paste_safe: "按 Esc 或「不粘贴」不会写入任何内容，键盘回到终端。",
     terminal_no_blocks: "这个 Shell 没有报告命令块。网格保持原样。",
     terminal_blocks_failed: "Shell 集成已失效。经典网格已保留。",
     terminal_filter_all: "全部命令",
@@ -3252,8 +3252,68 @@ pub struct UxStrings {
     pub banner_copy_diagnostic: &'static str,
     /// Palette detail suffix when a host connects through jump hosts: `{count}`
     pub palette_host_jumps: &'static str,
+    /// Palette detail suffix when a host connects through a single jump host
+    pub palette_host_jumps_one: &'static str,
     /// Palette detail suffix when a host uses a ProxyCommand
     pub palette_host_proxy_command: &'static str,
+    /// Empty group state body when no search is active
+    pub hosts_group_empty_body: &'static str,
+    /// Action in selection bar to delete all selected hosts
+    pub hosts_delete_selected: &'static str,
+    /// Confirmation dialog title when deleting multiple selected hosts
+    pub hosts_delete_selected_title: &'static str,
+    /// Confirmation dialog body when deleting multiple selected hosts
+    pub hosts_delete_selected_body: &'static str,
+    /// Toast after deleting multiple selected hosts
+    pub hosts_deleted_many: &'static str,
+    /// Keyboard legend inside jump host picker
+    pub host_jump_keys: &'static str,
+    /// Badge shown in split-pane header while a pane fills its tab
+    pub pane_zoomed: &'static str,
+    /// Tooltip on split divider drag band
+    pub pane_divider_reset_hint: &'static str,
+    /// Tooltip hint on remote desktop zoom bar explaining Shift+scroll panning
+    pub desktop_pan_hint: &'static str,
+    /// Tooltip on toast dismiss button
+    pub toast_dismiss: &'static str,
+    /// File browser toolbar button to jump directly to a path
+    pub files_go_to_path: &'static str,
+    /// Inline form heading for Go to folder
+    pub files_go_to_title: &'static str,
+    /// Confirm button for Go to folder
+    pub files_go_to_action: &'static str,
+    /// Action to clear completed and cancelled transfers
+    pub transfers_clear_finished: &'static str,
+    /// Error shown when the tunnel's host was deleted
+    pub fwd_missing_host: &'static str,
+    /// Button in batch run / history output header to copy stdout/stderr
+    pub batch_output_copy: &'static str,
+    /// Toast after batch output was copied
+    pub batch_output_copied: &'static str,
+    /// Refusal tooltip when another batch run is already active
+    pub batch_run_in_progress_refusal: &'static str,
+    /// Batch host filter: all hosts
+    pub batch_filter_all: &'static str,
+    /// Batch host filter: failed hosts
+    pub batch_filter_failed: &'static str,
+    /// Batch host filter: waiting for user answer
+    pub batch_filter_waiting: &'static str,
+    /// Batch host filter: running / connecting
+    pub batch_filter_running: &'static str,
+    /// Batch host filter: succeeded
+    pub batch_filter_done: &'static str,
+    /// Placeholder for shortcut command search box
+    pub snippet_search_placeholder: &'static str,
+    /// Empty state when shortcut command search matches nothing
+    pub snippet_search_empty: &'static str,
+    /// Keyboard hint in shortcut command dialog footer
+    pub snippet_keys_hint: &'static str,
+    /// Placeholder for Quick Connect address field
+    pub quick_address_placeholder: &'static str,
+    /// Reset button for modified settings
+    pub settings_reset_default: &'static str,
+    /// Unsaved edits notice on WebDAV sync card
+    pub sync_unsaved_changes: &'static str,
 }
 
 impl UxStrings {
@@ -3365,6 +3425,20 @@ impl UxStrings {
             self.fwd_empty_body,
             self.fwd_no_hosts,
             self.fwd_cancel,
+            self.fwd_stop_title,
+            self.fwd_stop_action,
+            self.fwd_stop_body,
+            self.fwd_delete_title,
+            self.fwd_delete_action,
+            self.fwd_delete_body,
+            self.fwd_delete_running,
+            self.fwd_delete_saved,
+            self.fwd_here,
+            self.fwd_there,
+            self.fwd_failure_in_use,
+            self.fwd_failure_denied,
+            self.fwd_failure_server,
+            self.fwd_failure_target,
             self.fwd_more,
             self.files_name,
             self.files_size,
@@ -3675,7 +3749,37 @@ impl UxStrings {
             self.banner_diagnostic,
             self.banner_copy_diagnostic,
             self.palette_host_jumps,
+            self.palette_host_jumps_one,
             self.palette_host_proxy_command,
+            self.hosts_group_empty_body,
+            self.hosts_delete_selected,
+            self.hosts_delete_selected_title,
+            self.hosts_delete_selected_body,
+            self.hosts_deleted_many,
+            self.host_jump_keys,
+            self.pane_zoomed,
+            self.pane_divider_reset_hint,
+            self.desktop_pan_hint,
+            self.toast_dismiss,
+            self.files_go_to_path,
+            self.files_go_to_title,
+            self.files_go_to_action,
+            self.transfers_clear_finished,
+            self.fwd_missing_host,
+            self.batch_output_copy,
+            self.batch_output_copied,
+            self.batch_run_in_progress_refusal,
+            self.batch_filter_all,
+            self.batch_filter_failed,
+            self.batch_filter_waiting,
+            self.batch_filter_running,
+            self.batch_filter_done,
+            self.snippet_search_placeholder,
+            self.snippet_search_empty,
+            self.snippet_keys_hint,
+            self.quick_address_placeholder,
+            self.settings_reset_default,
+            self.sync_unsaved_changes,
         ]
     }
 }
@@ -3950,7 +4054,7 @@ included",
     hosts_scope_current: "Current results",
     hosts_scope_all: "All hosts",
     hosts_selection_count: "{count} selected",
-    hosts_select_scope: "Select",
+    hosts_select_scope: "Select all",
     hosts_select_none: "Clear",
     hosts_select_start: "Select",
     hosts_filter_clear: "Clear filters",
@@ -4111,8 +4215,38 @@ included",
     banner_dismiss: "Dismiss (Esc)",
     banner_diagnostic: "Diagnostics",
     banner_copy_diagnostic: "Copy diagnostics",
-    palette_host_jumps: "{count} jump",
+    palette_host_jumps: "{count} jumps",
+    palette_host_jumps_one: "1 jump",
     palette_host_proxy_command: "ProxyCommand",
+    hosts_group_empty_body: "This group has no saved connections yet.",
+    hosts_delete_selected: "Delete selected",
+    hosts_delete_selected_title: "Delete {count} selected hosts?",
+    hosts_delete_selected_body: "These saved hosts will be removed from this computer. Active sessions stay open.",
+    hosts_deleted_many: "Deleted {count} hosts",
+    host_jump_keys: "↑↓ select · Enter add · Esc close",
+    pane_zoomed: "Zoomed",
+    pane_divider_reset_hint: "Drag to resize · Double-click to equalize",
+    desktop_pan_hint: "Shift+scroll to pan",
+    toast_dismiss: "Dismiss notification",
+    files_go_to_path: "Go to folder\u{2026}",
+    files_go_to_title: "Go to folder",
+    files_go_to_action: "Open folder",
+    transfers_clear_finished: "Clear finished",
+    fwd_missing_host: "rule {rule}: host {host} is not saved, so this rule was not started",
+    batch_output_copy: "Copy output",
+    batch_output_copied: "Output copied",
+    batch_run_in_progress_refusal: "A batch run is already active in this window; wait for it to finish or return to it.",
+    batch_filter_all: "All",
+    batch_filter_failed: "Failed",
+    batch_filter_waiting: "Needs answer",
+    batch_filter_running: "Running",
+    batch_filter_done: "Succeeded",
+    snippet_search_placeholder: "Filter shortcut commands\u{2026}",
+    snippet_search_empty: "No matching shortcut commands.",
+    snippet_keys_hint: "↑↓ select · Enter fill in · {run_key} run · Esc close",
+    quick_address_placeholder: "example.com or 192.0.2.10",
+    settings_reset_default: "Reset",
+    sync_unsaved_changes: "Unsaved changes — click Save before syncing",
 };
 
 /// Simplified Chinese.
@@ -4544,7 +4678,37 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     banner_diagnostic: "诊断信息",
     banner_copy_diagnostic: "复制诊断",
     palette_host_jumps: "{count} 个跳板",
+    palette_host_jumps_one: "1 个跳板",
     palette_host_proxy_command: "代理命令",
+    hosts_group_empty_body: "这个分组下还没有保存的连接。",
+    hosts_delete_selected: "删除所选",
+    hosts_delete_selected_title: "删除所选的 {count} 台主机？",
+    hosts_delete_selected_body: "这些已保存的主机将从本机移除；当前已打开的会话保持运行。",
+    hosts_deleted_many: "已删除 {count} 台主机",
+    host_jump_keys: "↑↓ 选择 · Enter 添加 · Esc 关闭",
+    pane_zoomed: "已放大",
+    pane_divider_reset_hint: "拖动调整比例 · 双击平分窗格",
+    desktop_pan_hint: "按住 Shift 滚动可平移画面",
+    toast_dismiss: "关闭通知",
+    files_go_to_path: "前往路径\u{2026}",
+    files_go_to_title: "前往文件夹",
+    files_go_to_action: "打开文件夹",
+    transfers_clear_finished: "清理已完成",
+    fwd_missing_host: "规则 {rule}：主机 {host} 未保存，因此该规则未启动",
+    batch_output_copy: "复制输出",
+    batch_output_copied: "输出已复制",
+    batch_run_in_progress_refusal: "当前窗口已有正在运行的批量任务；请等待结束或返回查看。",
+    batch_filter_all: "全部",
+    batch_filter_failed: "失败",
+    batch_filter_waiting: "待确认",
+    batch_filter_running: "运行中",
+    batch_filter_done: "已完成",
+    snippet_search_placeholder: "搜索快捷命令\u{2026}",
+    snippet_search_empty: "没有匹配的快捷命令。",
+    snippet_keys_hint: "↑↓ 选择 · Enter 填入 · {run_key} 执行 · Esc 关闭",
+    quick_address_placeholder: "example.com 或 192.0.2.10",
+    settings_reset_default: "重置",
+    sync_unsaved_changes: "有未保存的修改——请先点击保存再同步",
 };
 
 /// The redesigned-shell strings of the current language.

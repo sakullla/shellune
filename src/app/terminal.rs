@@ -87,6 +87,12 @@ const SCROLL_THUMB_INSET: f32 = 2.0;
 /// The width of the scroll position thumb.
 const SCROLL_THUMB_WIDTH: f32 = 4.0;
 
+/// The width of the scroll position thumb when pointed at.
+const SCROLL_THUMB_HOVER_WIDTH: f32 = 6.0;
+
+/// Hit-target width of the interactive scrollbar track along the right edge.
+const SCROLL_TRACK_WIDTH: f32 = 12.0;
+
 /// A selection a capture asked for: from the first character of one text to the last
 /// character of another, as the grid shows them.
 #[cfg(feature = "ui-capture")]
@@ -652,6 +658,8 @@ pub struct TerminalPane {
     /// A timer is scrolling the view while a drag holds the pointer past the top
     /// or bottom edge of the grid.
     autoscrolling: bool,
+    /// Whether the pointer is dragging the scrollback scrollbar track.
+    scrollbar_drag: bool,
     /// The button a program is being told is held, while it asked for the mouse.
     mouse_held: Option<TerminalMouseButton>,
     /// The cell the last motion report named, so moving inside one cell does not
@@ -883,6 +891,7 @@ impl TerminalPane {
             focus: cx.focus_handle(),
             drag: None,
             autoscrolling: false,
+            scrollbar_drag: false,
             mouse_held: None,
             last_report_cell: None,
             menu: None,
@@ -959,6 +968,7 @@ impl TerminalPane {
             focus: cx.focus_handle(),
             drag: None,
             autoscrolling: false,
+            scrollbar_drag: false,
             mouse_held: None,
             last_report_cell: None,
             menu: None,
@@ -1034,6 +1044,7 @@ impl TerminalPane {
             focus: cx.focus_handle(),
             drag: None,
             autoscrolling: false,
+            scrollbar_drag: false,
             mouse_held: None,
             last_report_cell: None,
             menu: None,
@@ -1192,6 +1203,7 @@ impl TerminalPane {
             focus: cx.focus_handle(),
             drag: None,
             autoscrolling: false,
+            scrollbar_drag: false,
             mouse_held: None,
             last_report_cell: None,
             menu: None,
@@ -1388,6 +1400,7 @@ impl TerminalPane {
             focus: cx.focus_handle(),
             drag: None,
             autoscrolling: false,
+            scrollbar_drag: false,
             mouse_held: None,
             last_report_cell: None,
             menu: None,
@@ -2284,7 +2297,7 @@ impl TerminalPane {
 
     /// Offers `text` to this pane. A risky paste waits; a plain line is written.
     pub fn stage_paste(&mut self, text: &str, cx: &mut Context<Self>) {
-        if text.is_empty() {
+        if text.is_empty() || !self.state.accepts_input() {
             return;
         }
         if paste_needs_confirmation(text) {
@@ -3022,6 +3035,15 @@ impl TerminalPane {
     /// pane listens at the window instead (see [`TerminalPane::viewport`]) and
     /// does nothing unless a drag is held here.
     fn drag_moved(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.scrollbar_drag {
+            if event.pressed_button != Some(MouseButton::Left) {
+                self.scrollbar_drag = false;
+                cx.notify();
+            } else {
+                self.scrub_scrollbar(event.position.y, cx);
+            }
+            return;
+        }
         if self.drag.is_none() {
             return;
         }
@@ -3037,9 +3059,30 @@ impl TerminalPane {
 
     /// The left button came up anywhere in the window while a drag is held.
     fn drag_released(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.scrollbar_drag {
+            self.scrollbar_drag = false;
+            cx.notify();
+            return;
+        }
         if self.drag.is_some() {
             self.finish_drag(event.position, cx);
         }
+    }
+
+    fn scrub_scrollbar(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        let history = self.core.history();
+        let Some(bounds) = self.viewport else {
+            return;
+        };
+        let height = f32::from(bounds.size.height);
+        if history == 0 || height <= 1.0 {
+            return;
+        }
+        let ratio = ((f32::from(y - bounds.origin.y)) / height).clamp(0.0, 1.0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let target = ((1.0 - ratio) * history as f32).round() as usize;
+        self.scroll_to_offset(target.min(history));
+        cx.notify();
     }
 
     /// Moves the end of the drag's selection to a window position, beginning the
@@ -3243,33 +3286,56 @@ impl TerminalPane {
         let strings = self.locale.strings();
         let viewport = window.viewport_size();
         let can_copy = self.core.has_selection();
-        let can_paste = cx
-            .read_from_clipboard()
-            .and_then(|item| item.text())
-            .is_some_and(|text| !text.is_empty());
+        let can_paste = if self.search_focused && self.search_open {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .is_some_and(|text| !text.is_empty())
+        } else if !self.state.accepts_input() {
+            false
+        } else {
+            cx.read_from_clipboard().is_some_and(|item| {
+                if item.text().is_some_and(|text| !text.is_empty()) {
+                    return true;
+                }
+                !matches!(self.origin, PaneOrigin::Serial { .. })
+                    && item
+                        .into_entries()
+                        .any(|entry| matches!(entry, gpui::ClipboardEntry::Image(_)))
+            })
+        };
         // The hint names the binding in force, like the tooltips do: a rebound key, or
         // an unbinding that handed the combination back to the program, is described as
         // it really is (R5).
         // The entries are the shared menu entry, so this menu is the same object as the
         // tab's and the file view's (R6).
-        let item =
-            |label: &'static str, shortcut: &Option<String>, enabled: bool, id: &'static str| {
-                components::menu_entry(label, id, None, enabled, false, metrics).when_some(
-                    shortcut.clone(),
-                    |item, shortcut| {
-                        item.child(
-                            components::menu_shortcut(SharedString::from(shortcut), metrics)
-                                .debug_selector(move || format!("{id}.shortcut")),
-                        )
-                    },
-                )
-            };
+        let item = |label: &'static str,
+                    icon: Icon,
+                    shortcut: &Option<String>,
+                    enabled: bool,
+                    id: &'static str| {
+            components::menu_entry(label, id, Some(icon), enabled, false, metrics).when_some(
+                shortcut.clone(),
+                |item, shortcut| {
+                    item.child(
+                        components::menu_shortcut(SharedString::from(shortcut), metrics)
+                            .debug_selector(move || format!("{id}.shortcut")),
+                    )
+                },
+            )
+        };
         let ux = crate::app::copy::ux_for(self.locale);
         let scrolled_back = !self.alternate_screen() && self.core.display_offset() > 0;
         let menu = components::menu_card("terminal.menu", metrics)
+            .id("terminal.menu.scroll")
+            .max_h(
+                (viewport.height - metrics.scale(spacing::LOOSE))
+                    .max(metrics.scale(components::MENU_MIN_WIDTH)),
+            )
+            .overflow_y_scroll()
             .child(
                 item(
                     strings.field_copy,
+                    Icon::Copy,
                     &self.shortcuts.copy,
                     can_copy,
                     "terminal.menu.copy",
@@ -3285,6 +3351,7 @@ impl TerminalPane {
             .child(
                 item(
                     strings.field_paste,
+                    Icon::Import,
                     &self.shortcuts.paste,
                     can_paste,
                     "terminal.menu.paste",
@@ -3300,6 +3367,7 @@ impl TerminalPane {
             .child(
                 item(
                     ux.terminal_select_all,
+                    Icon::Layers,
                     &None,
                     true,
                     "terminal.menu.select_all",
@@ -3314,6 +3382,7 @@ impl TerminalPane {
             .child(
                 item(
                     strings.terminal_search,
+                    Icon::Search,
                     &self.shortcuts.search,
                     true,
                     "terminal.menu.search",
@@ -3327,6 +3396,7 @@ impl TerminalPane {
                 menu.child(
                     item(
                         ux.terminal_jump_bottom_short,
+                        Icon::ChevronDown,
                         &None,
                         true,
                         "terminal.menu.jump_bottom",
@@ -3465,11 +3535,13 @@ impl TerminalPane {
         let strings = self.locale.strings();
         let live = self.state.accepts_input();
         let muted = theme::swatch(shell_palette::TEXT_MUTED);
-        let echo = if serial.echo() {
+        let echo_on = serial.echo();
+        let echo = if echo_on {
             strings.serial_echo_on
         } else {
             strings.serial_echo_off
         };
+        let device_summary = format!("{} \u{00B7} {}", serial.device(), serial.settings());
         let row = div()
             .flex()
             .flex_wrap()
@@ -3477,18 +3549,20 @@ impl TerminalPane {
             .gap(metrics.scale(spacing::TIGHT))
             .pl(metrics.scale(spacing::BASE - 2.0))
             .pr(metrics.scale(spacing::HAIRLINE))
+            .py(px(spacing::HALF))
             .text_size(metrics.caption_size())
             .text_color(muted)
             .child(
                 div()
-                    .flex_none()
+                    .id("serial.device.label")
+                    .min_w_0()
+                    .truncate()
                     .font_family(monospace_family())
+                    .tooltip(components::tooltip(SharedString::from(
+                        device_summary.clone(),
+                    )))
                     .debug_selector(|| "serial.device".to_owned())
-                    .child(SharedString::from(format!(
-                        "{} \u{00B7} {}",
-                        serial.device(),
-                        serial.settings()
-                    ))),
+                    .child(SharedString::from(device_summary)),
             )
             .child(components::divider_vertical(metrics))
             // The two send habits and the refresh are the toolbar's own quiet buttons,
@@ -3496,7 +3570,11 @@ impl TerminalPane {
             .child(
                 components::compact_button(
                     format!("{} {echo}", strings.serial_echo),
-                    components::Variant::Ghost,
+                    if echo_on {
+                        components::Variant::Secondary
+                    } else {
+                        components::Variant::Ghost
+                    },
                     metrics,
                 )
                 .h(metrics.hit_target())
@@ -3522,9 +3600,11 @@ impl TerminalPane {
                 .px(metrics.scale(spacing::TIGHT))
                 .id("serial.newline")
                 .debug_selector(|| "serial.newline".to_owned())
-                .tooltip(components::tooltip(SharedString::from(
+                .tooltip(components::tooltip(SharedString::from(format!(
+                    "{}: {} (LF / CRLF / CR)",
                     strings.serial_newline,
-                )))
+                    serial.format().label()
+                ))))
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     let Some(current) = this.serial.as_ref().map(SerialPane::format) else {
                         return;
@@ -4152,7 +4232,13 @@ impl TerminalPane {
         let metrics = theme::metrics();
         let viewport = window.viewport_size();
         let menu = components::menu_card("terminal.more.menu", metrics)
+            .id("terminal.more.menu.scroll")
             .max_w(viewport.width - metrics.scale(spacing::TIGHT) * 2.0)
+            .max_h(
+                (viewport.height - metrics.scale(spacing::LOOSE))
+                    .max(metrics.scale(components::MENU_MIN_WIDTH)),
+            )
+            .overflow_y_scroll()
             .children(self.tool_entries(metrics, MenuCloser::Own, cx));
         Some(
             gpui::deferred(
@@ -4225,36 +4311,56 @@ impl TerminalPane {
             .filter(|cursor| focused && cursor.shape == CursorShape::Block)
             .map(|cursor| cursor.column);
         let x = |column: usize| px(column as f32 * width);
+        let search_marks = self.row_search_matches(index, &row.cells);
 
         // Backgrounds: one rectangle per stretch of cells with the same colour.
         let mut column = 0;
-        let mut stretch: Option<(usize, usize, gpui::Rgba)> = None;
+        let mut stretch: Option<(usize, usize, gpui::Rgba, Option<bool>)> = None;
         let mut backgrounds = Vec::new();
-        for rendered in &row.cells {
+        for (cell_index, rendered) in row.cells.iter().enumerate() {
             let span = rendered.width.max(1);
-            let background = cell_background(rendered, canvas_color);
+            let search_hit = if rendered.selected {
+                None
+            } else {
+                search_marks.get(cell_index).copied().flatten()
+            };
+            let background = match search_hit {
+                Some(true) => Some(theme::swatch(shell_palette::ACCENT)),
+                Some(false) => Some(Tone::Warning.chip_background()),
+                None => cell_background(rendered, canvas_color),
+            };
             match (&mut stretch, background) {
-                (Some((_, end, color)), Some(next)) if *color == next && *end == column => {
+                (Some((_, end, color, prev_hit)), Some(next))
+                    if *color == next && *prev_hit == search_hit && *end == column =>
+                {
                     *end = column + span;
                 }
                 (_, next) => {
                     backgrounds.extend(stretch.take());
-                    stretch = next.map(|color| (column, column + span, color));
+                    stretch = next.map(|color| (column, column + span, color, search_hit));
                 }
             }
             column += span;
         }
         backgrounds.extend(stretch);
-        for (start, end, color) in backgrounds {
-            element = element.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left(x(start))
-                    .w(x(end - start))
-                    .h(px(height))
-                    .bg(color),
-            );
+        for (start, end, color, search_hit) in backgrounds {
+            let bg = div()
+                .absolute()
+                .top_0()
+                .left(x(start))
+                .w(x(end - start))
+                .h(px(height))
+                .bg(color)
+                .when(search_hit == Some(false), |box_div| {
+                    box_div
+                        .border_b_1()
+                        .border_color(Tone::Warning.text())
+                        .debug_selector(|| "terminal.search.match".to_owned())
+                })
+                .when(search_hit == Some(true), |box_div| {
+                    box_div.debug_selector(|| "terminal.search.match.current".to_owned())
+                });
+            element = element.child(bg);
         }
 
         if let Some(cursor) = cursor {
@@ -4291,11 +4397,22 @@ impl TerminalPane {
         let mut run: Option<TextRun> = None;
         let mut shapes: Option<ShapeRun> = None;
         let mut pieces: Vec<gpui::Div> = Vec::new();
-        for rendered in &row.cells {
+        for (cell_index, rendered) in row.cells.iter().enumerate() {
             let span = rendered.width.max(1);
-            let background = cell_background(rendered, canvas_color).unwrap_or(canvas_color);
+            let search_hit = if rendered.selected {
+                None
+            } else {
+                search_marks.get(cell_index).copied().flatten()
+            };
+            let background = match search_hit {
+                Some(true) => theme::swatch(shell_palette::ACCENT),
+                Some(false) => Tone::Warning.chip_background(),
+                None => cell_background(rendered, canvas_color).unwrap_or(canvas_color),
+            };
             let ink = if solid_cursor == Some(column) {
                 canvas_color
+            } else if search_hit == Some(true) {
+                theme::swatch(shell_palette::ON_ACCENT)
             } else {
                 ink(
                     color_of(rendered.foreground),
@@ -4372,6 +4489,45 @@ impl TerminalPane {
         flush_text(&mut run, &mut pieces, cell, self.font_size, index);
         flush_shapes(&mut shapes, &mut pieces, cell, stroke, index);
         element.children(pieces)
+    }
+
+    /// Maps active search hits on `row_index` to per-cell highlight states (`Some(true)`
+    /// for the current match, `Some(false)` for other matches on screen).
+    fn row_search_matches(&self, row_index: usize, cells: &[RenderedCell]) -> Vec<Option<bool>> {
+        if !self.search_open || self.search_hits.is_empty() || self.alternate_screen() {
+            return Vec::new();
+        }
+        let grid_line = i32::try_from(row_index).unwrap_or(0)
+            - i32::try_from(self.core.display_offset()).unwrap_or(0);
+        let mut marks = vec![None; cells.len()];
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(cells.len());
+        let mut byte_pos = 0;
+        for cell in cells {
+            let len = if cell.text.is_empty() {
+                1
+            } else {
+                cell.text.len()
+            };
+            ranges.push((byte_pos, byte_pos + len));
+            byte_pos += len;
+        }
+        for (hit_index, hit) in self.search_hits.iter().enumerate() {
+            if hit.line != grid_line || hit.length == 0 {
+                continue;
+            }
+            let hit_start = hit.column;
+            let hit_end = hit.column.saturating_add(hit.length);
+            let is_current = hit_index == self.search_at;
+            for (cell_index, &(start, end)) in ranges.iter().enumerate() {
+                if start < hit_end && end > hit_start {
+                    marks[cell_index] = match marks[cell_index] {
+                        Some(true) => Some(true),
+                        _ => Some(is_current),
+                    };
+                }
+            }
+        }
+        marks
     }
 
     fn history_completion(&self) -> Option<&str> {
@@ -4518,9 +4674,18 @@ impl TerminalPane {
     ) -> gpui::Stateful<gpui::Div> {
         let strings = self.locale.strings();
         let blocks = self.listed_blocks();
+        let dodge_bottom = self.search_open
+            && !self.core.shows_command_blocks()
+            && self.search_hits.get(self.search_at).is_some_and(|hit| {
+                let vrow = hit.line + i32::try_from(self.core.display_offset()).unwrap_or(0);
+                vrow >= i32::try_from(self.grid.rows.saturating_sub(3)).unwrap_or(0)
+            });
         let mut panel = div()
             .absolute()
-            .bottom(bar_height)
+            .when(dodge_bottom, |panel| panel.top(px(0.0)).border_b_1())
+            .when(!dodge_bottom, |panel| {
+                panel.bottom(bar_height).border_t_1()
+            })
             .left(px(0.0))
             .right(px(0.0))
             // The bar grows with the text; the panel stops at a height that still
@@ -4537,7 +4702,6 @@ impl TerminalPane {
             .p(metrics.scale(spacing::TIGHT))
             .gap(metrics.scale(spacing::HAIRLINE))
             .bg(theme::swatch(shell_palette::CHROME))
-            .border_t_1()
             .border_color(theme::swatch(shell_palette::BORDER))
             .debug_selector(|| "terminal.blocks".to_owned())
             .on_mouse_down(
@@ -4640,8 +4804,19 @@ impl TerminalPane {
             // keys go in words as well (R4).
             .child(
                 div()
+                    .id("terminal.search.field")
                     .flex()
                     .items_center()
+                    .cursor_text()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.search_focused = true;
+                            window.focus(&this.focus);
+                            cx.notify();
+                        }),
+                    )
                     .when(empty_query, |field| {
                         field.flex_none().min_w(query_field_floor)
                     })
@@ -4920,14 +5095,14 @@ impl TerminalPane {
             )
     }
 
-    /// A subtle proportional scrollbar thumb when scrolled up in history.
-    fn scrollback_thumb(&self) -> Option<gpui::Div> {
+    /// An interactive proportional scrollbar along the right edge when history exists.
+    fn scrollback_thumb(&self, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
         if self.alternate_screen() {
             return None;
         }
         let offset = self.core.display_offset();
         let history = self.core.history();
-        if offset == 0 || history == 0 {
+        if history == 0 || (offset == 0 && !self.scrollbar_drag) {
             return None;
         }
         let rows = self.grid.rows.max(1);
@@ -4935,16 +5110,45 @@ impl TerminalPane {
         let fraction = (rows as f32 / total as f32).clamp(0.08, 1.0);
         let progress = 1.0 - (offset as f32 / history as f32).clamp(0.0, 1.0);
         let top_pct = progress * (1.0 - fraction);
+        let resting_ink = theme::faded(theme::swatch(shell_palette::TEXT_MUTED), 0.45);
+        let active_ink = theme::faded(theme::swatch(shell_palette::TEXT_SECONDARY), 0.78);
+        let dragging = self.scrollbar_drag;
         Some(
             div()
+                .id("terminal.scrollbar.track")
+                .group("terminal-scrollbar")
                 .absolute()
-                .right(px(SCROLL_THUMB_INSET))
-                .top(gpui::relative(top_pct))
-                .h(gpui::relative(fraction))
-                .w(px(SCROLL_THUMB_WIDTH))
-                .rounded_full()
-                .bg(theme::faded(theme::swatch(shell_palette::TEXT_MUTED), 0.45))
-                .debug_selector(|| "terminal.scrollbar.thumb".to_owned()),
+                .top_0()
+                .bottom_0()
+                .right(px(0.0))
+                .w(px(SCROLL_TRACK_WIDTH))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                        this.scrollbar_drag = true;
+                        this.scrub_scrollbar(event.position.y, cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .right(px(SCROLL_THUMB_INSET))
+                        .top(gpui::relative(top_pct))
+                        .h(gpui::relative(fraction))
+                        .w(px(if dragging {
+                            SCROLL_THUMB_HOVER_WIDTH
+                        } else {
+                            SCROLL_THUMB_WIDTH
+                        }))
+                        .rounded_full()
+                        .bg(if dragging { active_ink } else { resting_ink })
+                        .group_hover("terminal-scrollbar", move |style| {
+                            style.w(px(SCROLL_THUMB_HOVER_WIDTH)).bg(active_ink)
+                        })
+                        .debug_selector(|| "terminal.scrollbar.thumb".to_owned()),
+                ),
         )
     }
 
@@ -5674,7 +5878,7 @@ impl Render for TerminalPane {
                     .py(metrics.scale(spacing::TIGHT))
                     .bg(color_of(palette::BACKGROUND))
                     .child(self.viewport(window, cx))
-                    .children(self.scrollback_thumb())
+                    .children(self.scrollback_thumb(cx))
                     .children(self.scroll_bottom_pill(tools, show_blocks, cx)),
             )
             // A serial line states itself above the bar: its device, its settings and

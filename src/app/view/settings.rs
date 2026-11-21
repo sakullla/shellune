@@ -1272,33 +1272,58 @@ impl ShelluneView {
             ConnectionField::ConnectTimeout,
             ux.settings_connect_timeout_hint,
         );
-        self.settings_card(
-            "policy",
-            vec![
-                keepalive_row,
-                interval_row,
-                misses_row,
-                timeout_row,
+        let mut rows = vec![
+            keepalive_row,
+            interval_row,
+            misses_row,
+            timeout_row,
+            div()
+                .w_full()
+                .min_w_0()
+                .px(metrics.scale(spacing::BASE))
+                .py(metrics.scale(spacing::TIGHT))
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                .debug_selector(|| "settings.policy.window".to_owned())
+                .child(SharedString::from(window)),
+            div()
+                .w_full()
+                .min_w_0()
+                .px(metrics.scale(spacing::BASE))
+                .py(metrics.scale(spacing::TIGHT))
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .debug_selector(|| "settings.policy.note".to_owned())
+                .child(ux.connection_defaults_note),
+        ];
+        if self
+            .connection_choice
+            .is_some_and(|choice| choice != shellune_core::ConnectionDefaults::default())
+        {
+            rows.push(
                 div()
+                    .flex()
                     .w_full()
                     .min_w_0()
+                    .items_center()
+                    .justify_end()
                     .px(metrics.scale(spacing::BASE))
                     .py(metrics.scale(spacing::TIGHT))
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .debug_selector(|| "settings.policy.window".to_owned())
-                    .child(SharedString::from(window)),
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .px(metrics.scale(spacing::BASE))
-                    .py(metrics.scale(spacing::TIGHT))
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .debug_selector(|| "settings.policy.note".to_owned())
-                    .child(ux.connection_defaults_note),
-            ],
-        )
+                    .child(
+                        components::compact_button(
+                            ux.settings_reset_default,
+                            components::Variant::Secondary,
+                            metrics,
+                        )
+                        .id("settings.policy.reset")
+                        .debug_selector(|| "settings.policy.reset".to_owned())
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.reset_connection_defaults(cx);
+                        })),
+                    ),
+            );
+        }
+        self.settings_card("policy", rows)
     }
 
     /// One number of the connection page: its field, and the reason a value was refused.
@@ -1802,11 +1827,18 @@ impl ShelluneView {
                     )),
             )
             .child(
-                components::compact_button(
+                components::button_with_state(
                     ux.keys_reset_all,
                     components::Variant::Secondary,
+                    if count > 0 {
+                        components::ControlState::Resting
+                    } else {
+                        components::ControlState::Disabled
+                    },
                     metrics,
                 )
+                .px(metrics.scale(spacing::SNUG))
+                .text_size(metrics.caption_size())
                 .min_w(components::compact_label_reserved_width(
                     ux.keys_reset_all,
                     metrics,
@@ -1818,9 +1850,11 @@ impl ShelluneView {
                 .min_h(metrics.compact_control_height())
                 .id("settings.keys.reset_all")
                 .debug_selector(|| "settings.keys.reset_all".to_owned())
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.keys_reset_all(cx);
-                })),
+                .when(count > 0, |button| {
+                    button.on_click(cx.listener(|this, _event, _window, cx| {
+                        this.keys_reset_all(cx);
+                    }))
+                }),
             )
     }
 }

@@ -20,7 +20,7 @@ use shellune_core::{BatchTarget, FailurePolicy, HostId, HostState, RunState, Ste
 
 use super::ShelluneView;
 use super::shell::{ModalContent, NoticeForm};
-use crate::app::batch::{BatchRunPage, MAX_PREVIEW_ROWS};
+use crate::app::batch::{BatchHostFilter, BatchRunPage, MAX_PREVIEW_ROWS};
 use crate::app::components::{self, Variant};
 use crate::app::copy::{self, UxStrings};
 use crate::app::hosts::SelectionScope;
@@ -593,11 +593,47 @@ impl ShelluneView {
                     _ => false,
                 }
             }
+            BatchCenterView::ActiveRun => match event.keystroke.key.as_str() {
+                "down" if !event.keystroke.modifiers.modified() => {
+                    let moved = self.batch.step_run_host(1, MAX_RUN_ROWS);
+                    if moved {
+                        cx.notify();
+                    }
+                    moved
+                }
+                "up" if !event.keystroke.modifiers.modified() => {
+                    let moved = self.batch.step_run_host(-1, MAX_RUN_ROWS);
+                    if moved {
+                        cx.notify();
+                    }
+                    moved
+                }
+                _ => false,
+            },
             BatchCenterView::History => {
-                // The detail of one run is read, not chosen from: its way back is the
-                // button and Escape.
                 if self.batch.stored_open().is_some() {
-                    return false;
+                    if event.keystroke.modifiers.modified() {
+                        return false;
+                    }
+                    return match event.keystroke.key.as_str() {
+                        "down" => {
+                            if let Some(host) = self.batch.next_stored_host(1, MAX_HISTORY_HOSTS) {
+                                self.select_stored_host(host, cx);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        "up" => {
+                            if let Some(host) = self.batch.next_stored_host(-1, MAX_HISTORY_HOSTS) {
+                                self.select_stored_host(host, cx);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
                 }
                 let visible = self.batch.history_visible();
                 // The same rule as the library: the mark stays on a row that was drawn,
@@ -1581,7 +1617,7 @@ impl ShelluneView {
     }
 
     /// The output and the step times of the chosen host of a stored run.
-    fn batch_history_output(&self, run: &shellune_core::BatchRun, _cx: &mut Context<Self>) -> Div {
+    fn batch_history_output(&self, run: &shellune_core::BatchRun, cx: &mut Context<Self>) -> Div {
         let ux = copy::ux();
         let metrics = self.metrics();
         let Some(host) = self.batch.stored_host() else {
@@ -1593,6 +1629,17 @@ impl ShelluneView {
                 .child(ux.batch_history_no_host);
         };
         let detail = self.batch.stored_detail_open();
+        let copy_text = detail
+            .map(|detail| {
+                detail
+                    .output
+                    .lines()
+                    .iter()
+                    .map(|line| redact_batch_text(&line.text))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|text| !text.is_empty());
         let mut output = div()
             .id("batch.history.output")
             .flex()
@@ -1603,6 +1650,7 @@ impl ShelluneView {
             .p(metrics.scale(spacing::TIGHT))
             .rounded(px(radius::MEDIUM))
             .bg(theme::swatch(palette::SEGMENT_TRACK))
+            .font_family(crate::app::terminal::monospace_family())
             .debug_selector(|| "batch.history.output".to_owned());
         match detail.map(|detail| detail.output.lines()) {
             Some(lines) if !lines.is_empty() => {
@@ -1742,11 +1790,34 @@ impl ShelluneView {
                 );
             }
         }
+        let mut heading = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::TIGHT))
+            .child(components::section_label(ux.batch_run_output, metrics));
+        if let Some(copy_text) = copy_text {
+            heading = heading.child(
+                self.icon_text_button(
+                    SharedString::from("batch.history.output.copy"),
+                    Icon::Copy,
+                    ux.batch_output_copy,
+                    Variant::Ghost,
+                    cx,
+                    move |this, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_text.clone()));
+                        this.toast(Tone::Positive, copy::ux().batch_output_copied, None, cx);
+                    },
+                )
+                .h(metrics.compact_control_height()),
+            );
+        }
         div()
             .flex()
             .flex_col()
             .gap(metrics.scale(spacing::TIGHT))
-            .child(components::section_label(ux.batch_run_output, metrics))
+            .child(heading)
             .child(output)
             .child(timeline)
     }
@@ -1826,7 +1897,7 @@ impl ShelluneView {
                             this.close_batch(cx);
                         })),
                 )
-                .child(if let Some(refusal) = self.batch.second_run_refusal() {
+                .child(if self.batch.second_run_refusal().is_some() {
                     // A second run would replace the page of the one already going,
                     // so the button is drawn unable to answer instead of answering
                     // with a refusal after the click (R13).
@@ -1838,7 +1909,9 @@ impl ShelluneView {
                     )
                     .id("batch.preview.confirm")
                     .debug_selector(|| "batch.preview.confirm".to_owned())
-                    .tooltip(components::tooltip(SharedString::from(refusal.to_string())))
+                    .tooltip(components::tooltip(SharedString::from(
+                        ux.batch_run_in_progress_refusal,
+                    )))
                 } else {
                     components::button(ux.batch_confirm, Variant::Primary, metrics)
                         .id("batch.preview.confirm")
@@ -2016,6 +2089,7 @@ impl ShelluneView {
                             .id(SharedString::from(format!("batch.step.up.{index}")))
                             .debug_selector(move || format!("batch.step.up.{index}"))
                             .tooltip(components::tooltip(SharedString::from(ux.batch_step_up)))
+                            .when(index == 0, |button| button.opacity(0.38))
                             .when(index > 0, |button| {
                                 button.cursor_pointer().on_click(cx.listener(
                                     move |this, _event, _window, cx| {
@@ -2030,6 +2104,7 @@ impl ShelluneView {
                             .id(SharedString::from(format!("batch.step.down.{index}")))
                             .debug_selector(move || format!("batch.step.down.{index}"))
                             .tooltip(components::tooltip(SharedString::from(ux.batch_step_down)))
+                            .when(index + 1 >= count, |button| button.opacity(0.38))
                             .when(index + 1 < count, |button| {
                                 button.cursor_pointer().on_click(cx.listener(
                                     move |this, _event, _window, cx| {
@@ -2040,13 +2115,27 @@ impl ShelluneView {
                             }),
                     )
                     .child(
-                        components::compact_button(ux.batch_step_remove, Variant::Ghost, metrics)
-                            .id(SharedString::from(format!("batch.step.remove.{index}")))
-                            .debug_selector(move || format!("batch.step.remove.{index}"))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                        components::button_with_state(
+                            ux.batch_step_remove,
+                            Variant::Ghost,
+                            if count > 1 {
+                                components::ControlState::Resting
+                            } else {
+                                components::ControlState::Disabled
+                            },
+                            metrics,
+                        )
+                        .h(metrics.compact_control_height())
+                        .px(metrics.scale(spacing::SNUG))
+                        .text_size(metrics.caption_size())
+                        .id(SharedString::from(format!("batch.step.remove.{index}")))
+                        .debug_selector(move || format!("batch.step.remove.{index}"))
+                        .when(count > 1, |button| {
+                            button.on_click(cx.listener(move |this, _event, _window, cx| {
                                 let _ = this.batch.remove_step(index);
                                 cx.notify();
-                            })),
+                            }))
+                        }),
                     ),
             );
         }
@@ -2213,7 +2302,7 @@ impl ShelluneView {
                 .items_start()
                 .gap(metrics.scale(spacing::SNUG))
                 .child(self.batch_run_hosts(page, cx))
-                .child(self.batch_run_side(page)),
+                .child(self.batch_run_side(page, cx)),
         );
         let footer = components::modal_footer_noted(
             div()
@@ -2411,21 +2500,59 @@ impl ShelluneView {
     }
 
     /// One row per host, with its steps, its exit results and its reason.
-    fn batch_run_hosts(&self, page: &BatchRunPage, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn batch_run_hosts(&self, page: &BatchRunPage, cx: &mut Context<Self>) -> Div {
         let ux = copy::ux();
         let metrics = self.metrics();
         let selected = page.selected();
+        let active_filter = self.batch.run_host_filter();
+        let mut filter_bar = None;
+        if page.total_hosts() > 1 {
+            let pill = |selector: &'static str,
+                        label: &'static str,
+                        choice: Option<BatchHostFilter>,
+                        cx: &mut Context<Self>| {
+                components::segment(label, active_filter == choice, metrics)
+                    .id(selector)
+                    .debug_selector(move || selector.to_owned())
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.batch.set_run_host_filter(choice);
+                        cx.notify();
+                    }))
+            };
+            let mut pills = components::segmented(metrics)
+                .debug_selector(|| "batch.run.filters".to_owned())
+                .child(pill("batch.run.filter.all", ux.batch_filter_all, None, cx));
+            for filter in BatchHostFilter::ALL {
+                let (sel, label) = match filter {
+                    BatchHostFilter::Failed => ("batch.run.filter.failed", ux.batch_filter_failed),
+                    BatchHostFilter::Waiting => {
+                        ("batch.run.filter.waiting", ux.batch_filter_waiting)
+                    }
+                    BatchHostFilter::Running => {
+                        ("batch.run.filter.running", ux.batch_filter_running)
+                    }
+                    BatchHostFilter::Done => ("batch.run.filter.done", ux.batch_filter_done),
+                };
+                pills = pills.child(pill(sel, label, Some(filter), cx));
+            }
+            filter_bar = Some(pills);
+        }
+        let matching_hosts: Vec<_> = page
+            .run()
+            .hosts()
+            .iter()
+            .filter(|host| active_filter.is_none_or(|f| f.matches(host.state())))
+            .collect();
         let mut list = div()
             .id("batch.run.hosts")
             .flex()
             .flex_col()
-            .flex_1()
-            .min_w(metrics.scale(RUN_HOSTS_MIN_WIDTH))
+            .w_full()
             .max_h(metrics.scale(RUN_HOSTS_MAX_HEIGHT))
             .overflow_y_scroll()
             .gap(metrics.scale(spacing::HAIRLINE))
             .debug_selector(|| "batch.run.hosts".to_owned());
-        for (index, host) in page.run().hosts().iter().take(MAX_RUN_ROWS).enumerate() {
+        for (index, host) in matching_hosts.iter().take(MAX_RUN_ROWS).enumerate() {
             let id = host.target().host_id();
             let is_selected = selected == Some(id);
             let tone = host_state_tone(host.state());
@@ -2575,7 +2702,7 @@ impl ShelluneView {
             }
             list = list.child(row);
         }
-        let hidden = page.run().hosts().len().saturating_sub(MAX_RUN_ROWS);
+        let hidden = matching_hosts.len().saturating_sub(MAX_RUN_ROWS);
         if hidden > 0 {
             list = list.child(
                 div()
@@ -2589,13 +2716,54 @@ impl ShelluneView {
                     )),
             );
         }
-        list
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(metrics.scale(RUN_HOSTS_MIN_WIDTH))
+            .gap(metrics.scale(spacing::TIGHT))
+            .children(filter_bar)
+            .child(list)
     }
 
     /// The output of one host and the times of its steps.
-    fn batch_run_side(&self, page: &BatchRunPage) -> Div {
+    fn batch_run_side(&self, page: &BatchRunPage, cx: &mut Context<Self>) -> Div {
         let ux = copy::ux();
         let metrics = self.metrics();
+        let copy_text = page
+            .selected()
+            .and_then(|host| page.output(host))
+            .map(|log| {
+                log.lines()
+                    .iter()
+                    .map(|line| redact_batch_text(&line.text))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|text| !text.is_empty());
+        let mut heading = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::TIGHT))
+            .child(components::section_label(ux.batch_run_output, metrics));
+        if let Some(copy_text) = copy_text {
+            heading = heading.child(
+                self.icon_text_button(
+                    SharedString::from("batch.run.output.copy"),
+                    Icon::Copy,
+                    ux.batch_output_copy,
+                    Variant::Ghost,
+                    cx,
+                    move |this, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_text.clone()));
+                        this.toast(Tone::Positive, copy::ux().batch_output_copied, None, cx);
+                    },
+                )
+                .h(metrics.compact_control_height()),
+            );
+        }
         let mut column = div()
             .flex()
             .flex_col()
@@ -2603,7 +2771,7 @@ impl ShelluneView {
             .min_w(metrics.scale(RUN_SIDE_MIN_WIDTH))
             .gap(metrics.scale(spacing::TIGHT))
             .debug_selector(|| "batch.run.side".to_owned())
-            .child(components::section_label(ux.batch_run_output, metrics));
+            .child(heading);
         let Some(host) = page.selected() else {
             return column;
         };
@@ -2617,6 +2785,7 @@ impl ShelluneView {
             .p(metrics.scale(spacing::TIGHT))
             .rounded(px(radius::MEDIUM))
             .bg(theme::swatch(palette::SEGMENT_TRACK))
+            .font_family(crate::app::terminal::monospace_family())
             .debug_selector(|| "batch.run.output".to_owned());
         match page.output(host) {
             Some(log) if !log.lines().is_empty() => {

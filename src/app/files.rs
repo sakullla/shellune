@@ -1908,6 +1908,17 @@ pub enum FilesDialog {
         /// Why the last attempt could not start, when it could not.
         problem: Option<PathProblem>,
     },
+    /// Jump directly to a typed folder path on one column.
+    GoTo {
+        /// The session whose column is jumping.
+        session: SessionId,
+        /// Which source the path belongs to.
+        source: FileSource,
+        /// The path the user typed.
+        text: String,
+        /// Why the path could not be used, when it was empty.
+        problem: Option<PathProblem>,
+    },
 }
 
 impl FilesDialog {
@@ -1919,7 +1930,8 @@ impl FilesDialog {
             | Self::Rename { session, .. }
             | Self::Delete { session, .. }
             | Self::Upload { session, .. }
-            | Self::Download { session, .. } => *session,
+            | Self::Download { session, .. }
+            | Self::GoTo { session, .. } => *session,
         }
     }
 
@@ -1931,7 +1943,8 @@ impl FilesDialog {
             | Self::Rename { source, .. }
             | Self::Delete { source, .. }
             | Self::Upload { source, .. }
-            | Self::Download { source, .. } => *source,
+            | Self::Download { source, .. }
+            | Self::GoTo { source, .. } => *source,
         }
     }
 
@@ -1943,7 +1956,8 @@ impl FilesDialog {
             Self::NewDirectory { text, .. }
             | Self::Rename { text, .. }
             | Self::Upload { text, .. }
-            | Self::Download { text, .. } => Some(text),
+            | Self::Download { text, .. }
+            | Self::GoTo { text, .. } => Some(text),
             Self::Delete { .. } => None,
         }
     }
@@ -1955,7 +1969,9 @@ impl FilesDialog {
                 *text = typed;
                 *problem = None;
             }
-            Self::Upload { text, problem, .. } | Self::Download { text, problem, .. } => {
+            Self::Upload { text, problem, .. }
+            | Self::Download { text, problem, .. }
+            | Self::GoTo { text, problem, .. } => {
                 *text = typed;
                 *problem = None;
             }
@@ -1982,7 +1998,10 @@ impl FilesDialog {
                 *remote = typed;
                 *problem = None;
             }
-            Self::NewDirectory { .. } | Self::Rename { .. } | Self::Delete { .. } => {}
+            Self::NewDirectory { .. }
+            | Self::Rename { .. }
+            | Self::Delete { .. }
+            | Self::GoTo { .. } => {}
         }
     }
 
@@ -1992,7 +2011,10 @@ impl FilesDialog {
         match self {
             Self::Upload { directory, .. } => Some(directory),
             Self::Download { remote, .. } => Some(remote),
-            Self::NewDirectory { .. } | Self::Rename { .. } | Self::Delete { .. } => None,
+            Self::NewDirectory { .. }
+            | Self::Rename { .. }
+            | Self::Delete { .. }
+            | Self::GoTo { .. } => None,
         }
     }
 
@@ -2001,7 +2023,10 @@ impl FilesDialog {
     pub fn protocol(&self) -> Option<TransferProtocol> {
         match self {
             Self::Upload { protocol, .. } | Self::Download { protocol, .. } => Some(*protocol),
-            Self::NewDirectory { .. } | Self::Rename { .. } | Self::Delete { .. } => None,
+            Self::NewDirectory { .. }
+            | Self::Rename { .. }
+            | Self::Delete { .. }
+            | Self::GoTo { .. } => None,
         }
     }
 
@@ -2031,7 +2056,10 @@ impl FilesDialog {
                 }
                 *problem = None;
             }
-            Self::NewDirectory { .. } | Self::Rename { .. } | Self::Delete { .. } => {}
+            Self::NewDirectory { .. }
+            | Self::Rename { .. }
+            | Self::Delete { .. }
+            | Self::GoTo { .. } => {}
         }
     }
 
@@ -2040,7 +2068,10 @@ impl FilesDialog {
     pub fn recursive(&self) -> bool {
         match self {
             Self::Upload { recursive, .. } | Self::Download { recursive, .. } => *recursive,
-            Self::NewDirectory { .. } | Self::Rename { .. } | Self::Delete { .. } => false,
+            Self::NewDirectory { .. }
+            | Self::Rename { .. }
+            | Self::Delete { .. }
+            | Self::GoTo { .. } => false,
         }
     }
 
@@ -2062,7 +2093,10 @@ impl FilesDialog {
                 *current = recursive && protocol.copies_directories();
                 *problem = None;
             }
-            Self::NewDirectory { .. } | Self::Rename { .. } | Self::Delete { .. } => {}
+            Self::NewDirectory { .. }
+            | Self::Rename { .. }
+            | Self::Delete { .. }
+            | Self::GoTo { .. } => {}
         }
     }
 
@@ -2074,14 +2108,16 @@ impl FilesDialog {
             | Self::Delete { problem, .. } => {
                 *problem = Some(failure);
             }
-            Self::Upload { .. } | Self::Download { .. } => {}
+            Self::Upload { .. } | Self::Download { .. } | Self::GoTo { .. } => {}
         }
     }
 
     /// States why a transfer could not start, keeping what the user typed.
     pub fn fail_path(&mut self, failure: PathProblem) {
         match self {
-            Self::Upload { problem, .. } | Self::Download { problem, .. } => {
+            Self::Upload { problem, .. }
+            | Self::Download { problem, .. }
+            | Self::GoTo { problem, .. } => {
                 *problem = Some(failure);
             }
             Self::NewDirectory { .. } | Self::Rename { .. } | Self::Delete { .. } => {}
@@ -2095,7 +2131,7 @@ impl FilesDialog {
             Self::NewDirectory { problem, .. }
             | Self::Rename { problem, .. }
             | Self::Delete { problem, .. } => problem.as_ref(),
-            Self::Upload { .. } | Self::Download { .. } => None,
+            Self::Upload { .. } | Self::Download { .. } | Self::GoTo { .. } => None,
         }
     }
 
@@ -2103,7 +2139,9 @@ impl FilesDialog {
     #[must_use]
     pub fn path_problem(&self) -> Option<&PathProblem> {
         match self {
-            Self::Upload { problem, .. } | Self::Download { problem, .. } => problem.as_ref(),
+            Self::Upload { problem, .. }
+            | Self::Download { problem, .. }
+            | Self::GoTo { problem, .. } => problem.as_ref(),
             Self::NewDirectory { .. } | Self::Rename { .. } | Self::Delete { .. } => None,
         }
     }

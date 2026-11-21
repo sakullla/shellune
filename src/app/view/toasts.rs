@@ -22,6 +22,8 @@ use crate::app::theme::{self, Tone, palette, spacing};
 
 /// How long a success stays.
 const SHORT: Duration = Duration::from_secs(4);
+/// How long a warning stays.
+const MEDIUM: Duration = Duration::from_secs(6);
 /// How long a problem stays.
 const LONG: Duration = Duration::from_secs(9);
 /// How many toasts show at once; an older one makes way for a newer.
@@ -110,7 +112,11 @@ impl ShelluneView {
         if self.toasts.len() > MOST {
             self.toasts.remove(0);
         }
-        let stay = if tone == Tone::Danger { LONG } else { SHORT };
+        let stay = match tone {
+            Tone::Danger => LONG,
+            Tone::Warning => MEDIUM,
+            _ => SHORT,
+        };
         self.expire_toast(id, stay, cx);
         cx.notify();
         id
@@ -175,6 +181,11 @@ impl ShelluneView {
             let title = div()
                 .debug_selector(move || format!("toast.{index}.title"))
                 .child(SharedString::from(toast.title.clone()));
+            let full_detail = toast
+                .detail
+                .as_deref()
+                .filter(|detail| detail.chars().count() > 48 || detail.contains('\n'))
+                .map(|detail| SharedString::from(detail.to_owned()));
             let card = components::toast(
                 tone,
                 tone_icon(tone),
@@ -185,6 +196,9 @@ impl ShelluneView {
             .id(("toast", id as usize))
             .debug_selector(move || format!("toast.{index}"))
             .occlude()
+            .when_some(full_detail, |card, detail| {
+                card.tooltip(components::tooltip(detail))
+            })
             .on_hover(cx.listener(|view, hovered: &bool, _window, cx| {
                 view.toasts_hovered = *hovered;
                 cx.notify();
@@ -195,6 +209,7 @@ impl ShelluneView {
                     .size(metrics.hit_target())
                     .id(("toast.close", id as usize))
                     .debug_selector(move || format!("toast.close.{index}"))
+                    .tooltip(components::tooltip(crate::app::copy::ux().toast_dismiss))
                     .on_click(cx.listener(move |view, _event, _window, cx| {
                         view.dismiss_toast(id, cx);
                     })),

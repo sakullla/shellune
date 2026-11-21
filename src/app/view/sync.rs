@@ -1512,6 +1512,34 @@ impl ShelluneView {
                 &self.sync.passphrase,
             ));
         }
+        let unsaved = {
+            let draft = self.sync_draft(cx);
+            let typed_password = !self.sync.password.read(cx).text().is_empty();
+            let typed_passphrase = !self.sync.passphrase.read(cx).text().trim().is_empty();
+            match &self.sync.config {
+                Some(saved) => {
+                    draft.url != saved.url
+                        || draft.username != saved.username
+                        || draft.remote_dir != saved.remote_dir
+                        || draft.sync_secrets != saved.sync_secrets
+                        || typed_password
+                        || typed_passphrase
+                }
+                None => {
+                    !draft.url.is_empty()
+                        || !draft.username.is_empty()
+                        || typed_password
+                        || typed_passphrase
+                }
+            }
+        };
+        if unsaved {
+            rows.push(self.sync_line(
+                copy::ux().sync_unsaved_changes,
+                Some(Tone::Warning),
+                "settings.sync.unsaved",
+            ));
+        }
         let testing = self.sync.test == TestStatus::Running;
         let mut actions = div()
             .flex()

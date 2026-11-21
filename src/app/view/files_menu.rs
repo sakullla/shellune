@@ -76,7 +76,7 @@ impl ShelluneView {
         cx.notify();
     }
 
-    fn close_files_menu(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_files_menu(&mut self, cx: &mut Context<Self>) {
         if self.files_menu.take().is_some() {
             cx.notify();
         }

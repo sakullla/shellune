@@ -94,11 +94,13 @@ impl ShelluneView {
             Platform::Windows => area.window_control_area(WindowControlArea::Drag),
             // macOS drags the top of a window natively; the double click is forwarded so
             // it does what the user chose in the system settings.
-            Platform::MacOs => area.on_click(|event, window, _cx| {
-                if event.click_count() == 2 {
-                    window.titlebar_double_click();
-                }
-            }),
+            Platform::MacOs => area
+                .window_control_area(gpui::WindowControlArea::Drag)
+                .on_click(|event, window, _cx| {
+                    if event.click_count() == 2 {
+                        window.titlebar_double_click();
+                    }
+                }),
             Platform::Linux => area,
         }
     }

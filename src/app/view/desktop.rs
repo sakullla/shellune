@@ -44,8 +44,8 @@ pub const FIRST_DESKTOP_SIZE: (u32, u32) = (1280, 720);
 const NOTICE_WIDTH: f32 = 420.0;
 
 /// The room the zoom step's words take between the two zoom buttons, before text
-/// scale: "100%" and "Fit" in either language, so the buttons do not move.
-const ZOOM_LABEL_WIDTH: f32 = 44.0;
+/// scale: "100%" and "Fit" / "适应窗口" in either language, so the buttons do not move.
+const ZOOM_LABEL_WIDTH: f32 = 72.0;
 
 /// Whether a certificate question is still waiting for an answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1151,7 +1151,8 @@ impl DesktopPane {
 
     /// Puts the notices away. Each still counts as shown for this session.
     pub fn dismiss_notices(&mut self, cx: &mut Context<Self>) {
-        if !self.notices.is_empty() {
+        if self.send_problem.is_some() || !self.notices.is_empty() {
+            self.send_problem = None;
             self.notices.clear();
             cx.notify();
         }
@@ -1484,7 +1485,11 @@ impl DesktopPane {
                     &self.certificate_reject_focus
                 });
                 cx.stop_propagation();
-            } else if matches!(keystroke.key.as_str(), "enter" | "space" | "escape")
+            } else if keystroke.key == "escape" && keystroke.modifiers == Modifiers::default() {
+                window.focus(&self.focus);
+                self.answer_certificate(false, cx);
+                cx.stop_propagation();
+            } else if matches!(keystroke.key.as_str(), "enter" | "space")
                 && keystroke.modifiers == Modifiers::default()
             {
                 cx.stop_propagation();
@@ -1780,7 +1785,7 @@ impl DesktopPane {
             let selector = kind.selector();
             lines = lines.child(line(text).debug_selector(move || selector.to_owned()));
         }
-        let dismiss = (!self.notices.is_empty()).then(|| {
+        let dismiss = (self.send_problem.is_some() || !self.notices.is_empty()).then(|| {
             components::compact_button(
                 self.locale.strings().desktop_notice_dismiss,
                 Variant::Ghost,
@@ -1874,6 +1879,10 @@ impl DesktopPane {
                     })
                     .id(SharedString::from("desktop.zoom.out"))
                     .debug_selector(|| "desktop.zoom.out".to_owned())
+                    .tooltip(components::tooltip(format!(
+                        "{} (Alt+-)",
+                        strings.desktop_zoom_out
+                    )))
                     .when(self.zoom.zoomed_out() != self.zoom, |button| {
                         button.on_click(cx.listener(|this, _event, _window, cx| this.zoom_out(cx)))
                     }),
@@ -1888,9 +1897,13 @@ impl DesktopPane {
                     .id(SharedString::from("desktop.zoom.fit"))
                     .debug_selector(|| "desktop.zoom.fit".to_owned())
                     .tooltip(components::tooltip(if self.zoom.is_fit() {
-                        "100%"
+                        "100%".to_owned()
                     } else {
-                        strings.desktop_zoom_fit
+                        format!(
+                            "{} (Alt+0) · {}",
+                            strings.desktop_zoom_fit,
+                            crate::app::copy::ux_for(self.locale).desktop_pan_hint
+                        )
                     }))
                     .on_click(cx.listener(|this, _event, _window, cx| this.zoom_toggle(cx))),
             )
@@ -1901,6 +1914,10 @@ impl DesktopPane {
                     })
                     .id(SharedString::from("desktop.zoom.in"))
                     .debug_selector(|| "desktop.zoom.in".to_owned())
+                    .tooltip(components::tooltip(format!(
+                        "{} (Alt+=)",
+                        strings.desktop_zoom_in
+                    )))
                     .when(self.zoom.zoomed_in() != self.zoom, |button| {
                         button.on_click(cx.listener(|this, _event, _window, cx| this.zoom_in(cx)))
                     }),
@@ -2140,7 +2157,7 @@ fn pointer_button(button: MouseButton) -> Option<Buttons> {
 
 impl Render for DesktopPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let metrics = Metrics::default();
+        let metrics = theme::metrics();
         self.update_pointer_image(window, cx);
         if !self.watching_focus {
             // A picture that lost the keyboard may be showing a modifier the remote

@@ -468,29 +468,35 @@ impl ShelluneView {
                     .child(toggle),
             );
 
+        let ring = theme::swatch(palette::FOCUS_RING);
         let places = [
             (
+                0usize,
                 HomeSection::All,
                 Icon::Server,
                 strings.hosts_view_all,
                 list.total(),
             ),
             (
+                1usize,
                 HomeSection::Favorites,
                 Icon::Star,
                 ux.home_favorites_section,
                 self.book.favorite_hosts().len(),
             ),
             (
+                2usize,
                 HomeSection::Recent,
                 Icon::Clock,
                 strings.hosts_view_recent,
                 self.book.recent_hosts().len(),
             ),
         ];
-        for (place, icon, label, count) in places {
+        for (slot, place, icon, label, count) in places {
             let chosen = section == place;
             let selector = place.debug_selector();
+            let focus = self.sidebar_place_focus[slot].clone();
+            let focus_click = focus.clone();
             let item = if folded {
                 components::sidebar_icon_item(icon, chosen, metrics)
             } else {
@@ -499,8 +505,13 @@ impl ShelluneView {
             bar = bar.child(
                 item.id(selector)
                     .debug_selector(move || selector.to_owned())
+                    .track_focus(&focus)
+                    .border_1()
+                    .border_color(theme::clear())
+                    .focus(move |style| style.border_color(ring))
                     .when(folded, |item| item.tooltip(components::tooltip(label)))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        window.focus(&focus_click);
                         this.show_home_section(place.clone(), cx);
                     })),
             );
@@ -548,6 +559,8 @@ impl ShelluneView {
                 metrics,
             )
         };
+        let local_focus = self.sidebar_place_focus[3].clone();
+        let local_focus_click = local_focus.clone();
         bar.child(div().flex_1().min_h_0()).child(
             div()
                 .relative()
@@ -559,6 +572,10 @@ impl ShelluneView {
                     local
                         .id("home.local")
                         .debug_selector(|| "home.local".to_owned())
+                        .track_focus(&local_focus)
+                        .border_1()
+                        .border_color(theme::clear())
+                        .focus(move |style| style.border_color(ring))
                         .when(!local_open, |item| {
                             item.tooltip(components::tooltip(if folded {
                                 ux.home_local_button
@@ -566,7 +583,8 @@ impl ShelluneView {
                                 ux.home_local_hint
                             }))
                         })
-                        .on_click(cx.listener(|this, _event, _window, cx| {
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            window.focus(&local_focus_click);
                             this.home_menu = None;
                             this.toggle_home_local_menu(cx);
                         })),
@@ -725,35 +743,64 @@ impl ShelluneView {
     }
 
     /// Shift+Tab from the search or the list: the keys go to the sidebar, on the group
-    /// shown or else the first one. Returns whether there was a group to go to.
+    /// shown or else the first one (when groups are drawn), or the active sidebar place.
     pub(super) fn focus_sidebar_groups(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let drawn = self.drawn_group_paths();
+        let drawn = if self.home_sidebar_folded() {
+            Vec::new()
+        } else {
+            self.drawn_group_paths()
+        };
         let target = match self.hosts.section() {
             HomeSection::Group(shown) if drawn.contains(&shown) => Some(shown),
             _ => drawn.first().cloned(),
         };
-        let Some(target) = target else {
-            return false;
+        if let Some(target) = target {
+            self.focus_group_row(&target, window, cx);
+            return true;
+        }
+        let place_slot = match self.hosts.section() {
+            HomeSection::All | HomeSection::Group(_) => 0,
+            HomeSection::Favorites => 1,
+            HomeSection::Recent => 2,
         };
-        self.focus_group_row(&target, window, cx);
+        window.focus(&self.sidebar_place_focus[place_slot].clone());
+        cx.notify();
         true
     }
 
-    /// The keys of a sidebar group row that holds the keyboard (ADR-3): F2 renames it,
-    /// Delete asks to delete it, ↑↓ walk the groups, Enter shows it, Tab goes back to
-    /// the search and Escape to the list. Returns whether the key was the row's.
+    /// The keys of the sidebar's places and group rows while one holds the keyboard (ADR-3):
+    /// ↑↓ walk All, Favorites, Recent, Groups and Local terminal; Left/Right collapse and
+    /// expand a group branch; F2 renames a group; Delete asks to delete a group; Enter/Space
+    /// activates the focused entry; Tab goes back to the search and Escape to the list.
     pub(super) fn home_group_key(
         &mut self,
         event: &gpui::KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(path) = self.focused_group(window) else {
-            return false;
+        #[derive(Clone, PartialEq, Eq)]
+        enum SidebarStop {
+            Place(usize, HomeSection),
+            Group(GroupPath),
+            Local,
+        }
+
+        let focused_place = self
+            .sidebar_place_focus
+            .iter()
+            .position(|handle| handle.is_focused(window));
+        let focused_group = self.focused_group(window);
+        let current = match (focused_place, focused_group) {
+            (Some(0), _) => SidebarStop::Place(0, HomeSection::All),
+            (Some(1), _) => SidebarStop::Place(1, HomeSection::Favorites),
+            (Some(2), _) => SidebarStop::Place(2, HomeSection::Recent),
+            (Some(3), _) => SidebarStop::Local,
+            (_, Some(path)) => SidebarStop::Group(path),
+            _ => return false,
         };
         if self.workspace.destination() != Destination::Hosts || self.hosts_keys_blocked() {
             return false;
@@ -767,32 +814,92 @@ impl ShelluneView {
         if modifiers.number_of_modifiers() != 0 {
             return false;
         }
-        match key {
-            "f2" => {
-                self.open_group_dialog(GroupAction::Rename(path), window, cx);
+
+        let mut stops = vec![
+            SidebarStop::Place(0, HomeSection::All),
+            SidebarStop::Place(1, HomeSection::Favorites),
+            SidebarStop::Place(2, HomeSection::Recent),
+        ];
+        let drawn = if self.home_sidebar_folded() {
+            Vec::new()
+        } else {
+            self.drawn_group_paths()
+        };
+        for path in &drawn {
+            stops.push(SidebarStop::Group(path.clone()));
+        }
+        stops.push(SidebarStop::Local);
+
+        match (&current, key) {
+            (SidebarStop::Group(path), "f2") => {
+                self.open_group_dialog(GroupAction::Rename(path.clone()), window, cx);
                 true
             }
-            "delete" | "backspace" => {
-                self.open_group_dialog(GroupAction::Delete(path), window, cx);
+            (SidebarStop::Group(path), "delete" | "backspace") => {
+                self.open_group_dialog(GroupAction::Delete(path.clone()), window, cx);
                 true
             }
-            "enter" | "space" => {
-                self.show_home_section(HomeSection::Group(path), cx);
-                true
-            }
-            "up" | "down" => {
-                let drawn = self.drawn_group_paths();
-                if let Some(here) = drawn.iter().position(|shown| *shown == path) {
-                    let next = if key == "up" {
-                        here.saturating_sub(1)
-                    } else {
-                        (here + 1).min(drawn.len() - 1)
-                    };
-                    self.focus_group_row(&drawn[next], window, cx);
+            (SidebarStop::Group(path), "left") => {
+                let all_paths = crate::app::hosts::drawn_paths(&self.book, &self.groups);
+                let has_children = all_paths
+                    .iter()
+                    .any(|candidate| candidate.parent().as_ref() == Some(path));
+                if has_children && self.hosts.is_expanded(path) {
+                    self.hosts.set_expanded(path, false);
+                    cx.notify();
+                } else if let Some(parent) = path.parent() {
+                    self.focus_group_row(&parent, window, cx);
                 }
                 true
             }
-            "escape" => {
+            (SidebarStop::Group(path), "right") => {
+                let all_paths = crate::app::hosts::drawn_paths(&self.book, &self.groups);
+                let has_children = all_paths
+                    .iter()
+                    .any(|candidate| candidate.parent().as_ref() == Some(path));
+                if has_children && !self.hosts.is_expanded(path) {
+                    self.hosts.set_expanded(path, true);
+                    cx.notify();
+                }
+                true
+            }
+            (SidebarStop::Group(path), "enter" | "space") => {
+                self.show_home_section(HomeSection::Group(path.clone()), cx);
+                true
+            }
+            (SidebarStop::Place(_, section), "enter" | "space") => {
+                self.show_home_section(section.clone(), cx);
+                true
+            }
+            (SidebarStop::Local, "enter" | "space") => {
+                self.home_menu = None;
+                self.toggle_home_local_menu(cx);
+                true
+            }
+            (_, "up" | "down") => {
+                if let Some(here) = stops.iter().position(|stop| *stop == current) {
+                    let next = if key == "up" {
+                        here.saturating_sub(1)
+                    } else {
+                        (here + 1).min(stops.len() - 1)
+                    };
+                    match &stops[next] {
+                        SidebarStop::Place(slot, _) => {
+                            window.focus(&self.sidebar_place_focus[*slot].clone());
+                            cx.notify();
+                        }
+                        SidebarStop::Group(path) => {
+                            self.focus_group_row(path, window, cx);
+                        }
+                        SidebarStop::Local => {
+                            window.focus(&self.sidebar_place_focus[3].clone());
+                            cx.notify();
+                        }
+                    }
+                }
+                true
+            }
+            (_, "escape") => {
                 let handle = self.destination_focus(Destination::Hosts).clone();
                 window.focus(&handle);
                 cx.notify();
@@ -959,8 +1066,10 @@ impl ShelluneView {
         // drop it: a filter that hides hosts without naming itself is how a list looks
         // empty for no reason (R4).
         let status = self.hosts.filter().status();
+        let sort_applies = self.hosts.section() != HomeSection::Recent;
         let sort = self.hosts.sort();
-        if status != HostStatusFilter::Any || sort != HostSort::Saved {
+        let sort_active = sort_applies && sort != HostSort::Saved;
+        if status != HostStatusFilter::Any || sort_active {
             let mut chips = div()
                 .flex()
                 .flex_none()
@@ -970,18 +1079,33 @@ impl ShelluneView {
                 .debug_selector(|| "hosts.filters".to_owned());
             if status != HostStatusFilter::Any {
                 chips = chips.child(
-                    components::chip(status.label(ux), Tone::Accent, metrics)
-                        .debug_selector(|| "hosts.filter.status".to_owned()),
+                    components::chip(format!("{} ×", status.label(ux)), Tone::Accent, metrics)
+                        .id("hosts.filter.status")
+                        .debug_selector(|| "hosts.filter.status".to_owned())
+                        .cursor_pointer()
+                        .tooltip(components::tooltip(ux.hosts_filter_clear))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.hosts.set_status_filter(HostStatusFilter::Any);
+                            this.hosts_cursor = None;
+                            cx.notify();
+                        })),
                 );
             }
-            if sort != HostSort::Saved {
+            if sort_active {
                 chips = chips.child(
                     components::chip(
-                        format!("{} · {}", ux.home_sort_label, sort.label(ux)),
+                        format!("{} · {} ×", ux.home_sort_label, sort.label(ux)),
                         Tone::Neutral,
                         metrics,
                     )
-                    .debug_selector(|| "hosts.filter.sort".to_owned()),
+                    .id("hosts.filter.sort")
+                    .debug_selector(|| "hosts.filter.sort".to_owned())
+                    .cursor_pointer()
+                    .tooltip(components::tooltip(ux.hosts_filter_clear))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.hosts.set_sort(HostSort::Saved);
+                        cx.notify();
+                    })),
                 );
             }
             body = body.child(
@@ -1072,7 +1196,8 @@ impl ShelluneView {
             ));
 
         let narrowing = self.hosts.filter().status() != HostStatusFilter::Any
-            || self.hosts.sort() != HostSort::Saved;
+            || (self.hosts.section() != HomeSection::Recent
+                && self.hosts.sort() != HostSort::Saved);
         let filter_open = self.home_menu == Some(HomeMenu::Filter);
         let filter_anchor = self.home_filter_anchor.clone();
         let filter = div()
@@ -1135,7 +1260,15 @@ impl ShelluneView {
                     .gap(metrics.scale(spacing::HALF))
                     .child(filter)
                     .child(more)
-                    .child(
+                    .child({
+                        let shortcut = if crate::app::Platform::current()
+                            == crate::app::Platform::MacOs
+                        {
+                            "⌘N"
+                        } else {
+                            "Ctrl+N"
+                        };
+                        let new_tip = format!("{} ({shortcut})", strings.primary_hosts);
                         components::icon_label_button(
                             Icon::Plus,
                             strings.primary_hosts,
@@ -1145,13 +1278,14 @@ impl ShelluneView {
                         .h(metrics.compact_control_height())
                         .id("hosts.new")
                         .debug_selector(|| "hosts.new".to_owned())
+                        .tooltip(components::tooltip(SharedString::from(new_tip)))
                         .on_click(cx.listener(
                             |this, _event, _window, cx| {
                                 this.home_menu = None;
                                 this.open_create_host(cx);
                             },
-                        )),
-                    ),
+                        ))
+                    }),
             )
     }
 
@@ -1194,28 +1328,30 @@ impl ShelluneView {
                         )),
                     );
                 }
-                card = card
-                    .child(components::menu_divider(metrics))
-                    .child(components::menu_section(ux.home_sort_label, metrics));
-                for sort in HostSort::ALL {
-                    let chosen = self.hosts.sort() == sort;
-                    card = card.child(
-                        components::menu_entry(
-                            sort.label(ux),
-                            sort.debug_selector(),
-                            None,
-                            true,
-                            false,
-                            metrics,
-                        )
-                        .children(chosen.then(|| menu_check(metrics)))
-                        .on_click(cx.listener(
-                            move |this, _event, _window, cx| {
-                                this.hosts.set_sort(sort);
-                                this.close_home_menu(cx);
-                            },
-                        )),
-                    );
+                if self.hosts.section() != HomeSection::Recent {
+                    card = card
+                        .child(components::menu_divider(metrics))
+                        .child(components::menu_section(ux.home_sort_label, metrics));
+                    for sort in HostSort::ALL {
+                        let chosen = self.hosts.sort() == sort;
+                        card = card.child(
+                            components::menu_entry(
+                                sort.label(ux),
+                                sort.debug_selector(),
+                                None,
+                                true,
+                                false,
+                                metrics,
+                            )
+                            .children(chosen.then(|| menu_check(metrics)))
+                            .on_click(cx.listener(
+                                move |this, _event, _window, cx| {
+                                    this.hosts.set_sort(sort);
+                                    this.close_home_menu(cx);
+                                },
+                            )),
+                        );
+                    }
                 }
                 (card, below(self.home_filter_anchor.get()))
             }
@@ -1468,6 +1604,14 @@ impl ShelluneView {
                         this.open_batch_preview(cx);
                     })),
             )
+            .child(
+                components::compact_button(ux.hosts_delete_selected, Variant::Danger, metrics)
+                    .id("hosts.select.delete")
+                    .debug_selector(|| "hosts.select.delete".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.ask_batch_delete_hosts(cx);
+                    })),
+            )
     }
 
     /// The list, or what an empty one says.
@@ -1604,7 +1748,40 @@ impl ShelluneView {
                     }))
                     .into_any_element(),
             ),
-            HomeSection::Group(_) | HomeSection::All => note(
+            HomeSection::Group(_) => note(
+                "hosts.group.empty",
+                Icon::Folder,
+                SharedString::from(ux.hosts_group_empty_body),
+                None,
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .justify_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        components::icon_label_button(
+                            Icon::Plus,
+                            strings.primary_hosts,
+                            Variant::Primary,
+                            metrics,
+                        )
+                        .h(metrics.compact_control_height())
+                        .id("hosts.group.new_host")
+                        .debug_selector(|| "hosts.group.new_host".to_owned())
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.open_create_host(cx);
+                        })),
+                    )
+                    .child(
+                        all.id("hosts.group.all")
+                            .debug_selector(|| "hosts.group.all".to_owned())
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.show_home_section(HomeSection::All, cx);
+                            })),
+                    )
+                    .into_any_element(),
+            ),
+            HomeSection::All => note(
                 "hosts.group.empty",
                 Icon::Folder,
                 SharedString::from(strings.hosts_no_match),
@@ -2264,9 +2441,10 @@ fn host_row_element(
         div()
             .id(SharedString::from(format!("hosts.key-missing.{number}")))
             .debug_selector(move || format!("hosts.key-missing.{number}"))
-            .flex_none()
+            .min_w_0()
+            .flex_shrink()
             .tooltip(components::tooltip(tip))
-            .child(components::chip(label, Tone::Warning, metrics))
+            .child(components::chip_within(label, Tone::Warning, metrics))
             .into_any_element()
     });
     let last = host

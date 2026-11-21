@@ -470,6 +470,10 @@ pub struct TextField {
     /// draws: the home page's search sits in [`crate::app::components::search_field`],
     /// which owns the edge, the focus ring and the magnifier.
     bare: bool,
+    /// Whether Escape empties the field when it holds text (for search/filter boxes).
+    clear_on_escape: bool,
+    /// Whether the last submission rejected this field's value.
+    invalid: bool,
     /// Whether the left button is down after a press in the field: dragging selects.
     selecting: bool,
     /// How far the line is scrolled left so the caret stays in view.
@@ -526,6 +530,8 @@ impl TextField {
             browse: None,
             leading: None,
             bare: false,
+            clear_on_escape: false,
+            invalid: false,
             selecting: false,
             scroll: px(0.0),
             menu: None,
@@ -566,6 +572,24 @@ impl TextField {
     pub fn set_clearable(&mut self, clearable: bool, cx: &mut Context<Self>) {
         if self.clearable != clearable {
             self.clearable = clearable;
+            self.clear_on_escape = clearable;
+            cx.notify();
+        }
+    }
+
+    /// Whether pressing Escape clears the field when it holds text.
+    #[allow(dead_code)]
+    pub fn set_clear_on_escape(&mut self, clear_on_escape: bool, cx: &mut Context<Self>) {
+        if self.clear_on_escape != clear_on_escape {
+            self.clear_on_escape = clear_on_escape;
+            cx.notify();
+        }
+    }
+
+    /// Marks whether this field's current value was rejected by validation.
+    pub fn set_invalid(&mut self, invalid: bool, cx: &mut Context<Self>) {
+        if self.invalid != invalid {
+            self.invalid = invalid;
             cx.notify();
         }
     }
@@ -754,6 +778,7 @@ impl TextField {
 
     fn edit(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut LineModel)) {
         change(&mut self.model);
+        self.invalid = false;
         self.veil_when_empty();
         cx.notify();
     }
@@ -834,13 +859,16 @@ impl TextField {
                     return;
                 }
             }
-            // Escape first drops a selection; on a bare caret it empties the field, the
-            // quick way to start a search or a path again.
+            // Escape first drops a selection; in a search/filter box it clears non-empty
+            // text; otherwise it bubbles so the enclosing dialog, menu or page can answer.
             "escape" if !self.model.selection().is_empty() => {
                 let caret = self.model.caret();
                 self.edit(cx, |model| model.move_to(caret));
             }
-            "escape" => self.edit(cx, |model| model.set_text("")),
+            "escape" if self.clear_on_escape && !self.model.text().is_empty() => {
+                self.edit(cx, |model| model.set_text(""));
+            }
+            "escape" => return,
             "backspace" => self.edit(cx, |model| model.backspace(by_word)),
             "delete" if shift && !mac => self.cut(cx),
             "delete" => self.edit(cx, |model| model.delete(by_word)),
@@ -1124,6 +1152,8 @@ impl Render for TextField {
         let clear = self.clearable && !self.model.text().is_empty() && self.marked.is_none();
         let trailing = clear || reveal || self.browse.is_some();
         let bare = self.bare;
+        let invalid = self.invalid;
+        let danger = theme::swatch(palette::DANGER);
         let inset = spacing::SNUG - spacing::HALF;
 
         div()
@@ -1136,17 +1166,20 @@ impl Render for TextField {
             .min_w_0()
             .when(bare, |field| field.h_full())
             .when(!bare, |field| {
-                field
+                let field = field
                     .h(metrics.control_height())
                     .pl(metrics.scale(inset))
                     .rounded(px(radius::MEDIUM))
-                    .bg(theme::swatch(palette::CANVAS))
-                    .border_1()
-                    .border_color(if focused {
+                    .bg(theme::swatch(palette::CANVAS));
+                if invalid {
+                    field.border_2().border_color(danger)
+                } else {
+                    field.border_1().border_color(if focused {
                         accent
                     } else {
                         theme::swatch(palette::BORDER_STRONG)
                     })
+                }
             })
             .pr(metrics.scale(if trailing || bare {
                 spacing::HAIRLINE
@@ -1156,14 +1189,15 @@ impl Render for TextField {
             // A soft ring outside the border marks the field that has the keyboard,
             // so it reads at a glance without the border alone carrying it.
             .when(focused && !bare, |field| {
+                let halo = if invalid { danger } else { accent };
                 field.shadow(vec![BoxShadow {
-                    color: theme::faded(accent, 0.22).into(),
+                    color: theme::faded(halo, 0.22).into(),
                     offset: point(px(0.0), px(0.0)),
                     blur_radius: px(0.0),
                     spread_radius: px(FOCUS_HALO),
                 }])
             })
-            .when(!focused && !bare, |field| {
+            .when(!focused && !invalid && !bare, |field| {
                 let hover = theme::swatch(palette::TEXT_MUTED);
                 field.hover(move |style| style.border_color(hover))
             })

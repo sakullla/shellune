@@ -557,6 +557,11 @@ impl SessionLayout {
         for tab in &mut self.tabs {
             if contains(&tab.root, pane) {
                 tab.active = Some(pane);
+                if matches!(tab.root, Node::Leaf(_)) {
+                    tab.zoomed = None;
+                } else if tab.zoomed.is_some() {
+                    tab.zoomed = Some(pane);
+                }
                 self.active = Some(tab.id);
                 return true;
             }
@@ -656,6 +661,10 @@ impl SessionLayout {
         let Some(tab) = self.tab_mut(tab_id) else {
             return false;
         };
+        if matches!(tab.root, Node::Leaf(_)) {
+            tab.zoomed = None;
+            return false;
+        }
         if tab.zoomed == Some(pane) {
             tab.zoomed = None;
         } else {
@@ -701,7 +710,9 @@ impl SessionLayout {
         if tab.active.is_some_and(|id| !contains(&tab.root, id)) {
             tab.active = first_pane(&tab.root);
         }
-        if tab.zoomed.is_some_and(|id| !contains(&tab.root, id)) {
+        if matches!(tab.root, Node::Leaf(_))
+            || tab.zoomed.is_some_and(|id| !contains(&tab.root, id))
+        {
             tab.zoomed = None;
         }
         true
@@ -730,7 +741,9 @@ impl SessionLayout {
         if tab.active.is_some_and(|pane| !contains(&tab.root, pane)) {
             tab.active = first_pane(&tab.root);
         }
-        if tab.zoomed.is_some_and(|pane| !contains(&tab.root, pane)) {
+        if matches!(tab.root, Node::Leaf(_))
+            || tab.zoomed.is_some_and(|pane| !contains(&tab.root, pane))
+        {
             tab.zoomed = None;
         }
         true

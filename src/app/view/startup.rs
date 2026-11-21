@@ -244,6 +244,8 @@ pub(super) struct StartupRun {
     frame_drawn: bool,
     /// The brand has had its entrance.
     entrance_over: bool,
+    /// Whether the keyboard focus on a stopped start is on "Open data folder" rather than "Continue".
+    focus_open_folder: bool,
     /// Where the bar's fill is going and where it set off from.
     bar: BarMotion,
 }
@@ -1027,15 +1029,34 @@ impl ShelluneView {
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
             .key_context("Shellune")
             .track_focus(&self.root_focus)
-            // A stopped start goes on with Enter, and scrolls its details with arrow/page keys.
+            // A stopped start goes on with Enter, steps between its two actions with Tab / Left / Right, and scrolls its details with arrow/page keys.
             .when(stopped, |el| {
                 el.on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                    if event.keystroke.modifiers.modified() {
+                    let modifiers = &event.keystroke.modifiers;
+                    if modifiers.control || modifiers.alt || modifiers.platform {
+                        return;
+                    }
+                    if event.keystroke.key == "tab" {
+                        this.startup_run.focus_open_folder = !this.startup_run.focus_open_folder;
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if modifiers.modified() {
                         return;
                     }
                     match event.keystroke.key.as_str() {
-                        "enter" => {
-                            this.continue_startup(cx);
+                        "left" | "right" => {
+                            this.startup_run.focus_open_folder = !this.startup_run.focus_open_folder;
+                            cx.notify();
+                            cx.stop_propagation();
+                        }
+                        "enter" | "space" => {
+                            if this.startup_run.focus_open_folder {
+                                this.open_data_folder(cx);
+                            } else {
+                                this.continue_startup(cx);
+                            }
                             cx.stop_propagation();
                         }
                         "up" | "down" | "pageup" | "pagedown" | "home" | "end" => {
@@ -1247,6 +1268,10 @@ impl ShelluneView {
                         components::button(strings.continue_start, Variant::Primary, metrics)
                             .id("startup.continue")
                             .debug_selector(|| "startup.continue".to_owned())
+                            .when(!self.pointer_input && !self.startup_run.focus_open_folder, |b| {
+                                b.border_2()
+                                    .border_color(theme::swatch(palette::FOCUS_RING))
+                            })
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.continue_startup(cx);
                             })),
@@ -1260,6 +1285,10 @@ impl ShelluneView {
                         )
                         .id("startup.open_folder")
                         .debug_selector(|| "startup.open_folder".to_owned())
+                        .when(!self.pointer_input && self.startup_run.focus_open_folder, |b| {
+                            b.border_2()
+                                .border_color(theme::swatch(palette::FOCUS_RING))
+                        })
                         .on_click(cx.listener(
                             |this, _event, _window, cx| {
                                 this.open_data_folder(cx);

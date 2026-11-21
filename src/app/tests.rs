@@ -40385,3 +40385,88 @@ async fn short_narrow_single_column_file_view_preserves_list_room(cx: &mut TestA
          list={list:?}, min_row={min_row:?}"
     );
 }
+
+#[gpui::test]
+async fn sftp_goto_folder_and_clear_finished_transfers_work_cleanly(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (files, transfers) = open_transfers(cx, &view, id);
+    let request = match files.requests().last().expect("list request sent") {
+        shellune_core::BrowseRequest::Home { request }
+        | shellune_core::BrowseRequest::List { request, .. } => *request,
+        other => panic!("expected home/list request, got {other:?}"),
+    };
+    files.reply(
+        request,
+        "/home/ops",
+        &[("notes.txt", shellune_core::FileKind::File)],
+    );
+    pump_files(cx, &view);
+
+    // Jump directly to a path via toolbar button `files.goto`.
+    assert!(cx.debug_bounds("files.goto").is_some());
+    assert!(cx.debug_bounds("files.path.copy").is_some());
+    click(cx, "files.goto");
+    assert!(cx.debug_bounds("files.question").is_some());
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("/var/log/nginx");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    match files.requests().last().expect("goto list request sent") {
+        shellune_core::BrowseRequest::List { path, .. } => {
+            assert_eq!(path, "/var/log/nginx");
+        }
+        other => panic!("expected List request for /var/log/nginx, got {other:?}"),
+    }
+
+    // Complete a transfer, then verify `transfers.clear_finished` removes finished rows.
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/report.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let task = transfers.starts()[0].transfer;
+    transfers.push(shellune_core::TransferEvent::started(task));
+    transfers.push(shellune_core::TransferEvent {
+        transfer: task,
+        update: shellune_core::TransferUpdate::Completed { bytes: 128 },
+    });
+    pump_files(cx, &view);
+    assert!(cx.debug_bounds("transfers.row.0").is_some());
+    assert!(cx.debug_bounds("transfers.clear_finished").is_some());
+
+    click(cx, "transfers.clear_finished");
+    assert!(
+        !cx.update(|_window, app| view.read(app).transfers_strip_shown(id)),
+        "clearing finished transfers empties the session's transfer strip"
+    );
+}
+
+#[gpui::test]
+async fn command_palette_keeps_navigation_and_actions_visible_with_many_hosts(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("palette-40");
+    let store = dir.store();
+    seed_many(&store, 40);
+    let (view, cx) = hosts_view(cx, store);
+    go(cx, crate::app::actions::OpenPalette);
+    assert!(cx.update(|_window, app| view.read(app).palette_open()));
+    let titles = cx.update(|_window, app| view.read(app).palette_titles());
+    assert!(
+        titles.iter().any(|t| t == ENGLISH.palette_theme),
+        "unfiltered palette preserves Actions entries alongside 40 hosts: {titles:?}"
+    );
+    assert!(
+        titles
+            .iter()
+            .any(|t| t == copy::ux_for(Locale::English).settings_title),
+        "unfiltered palette preserves Navigate entries alongside 40 hosts: {titles:?}"
+    );
+}

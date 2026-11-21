@@ -111,6 +111,38 @@ pub enum BatchPage {
     Run,
 }
 
+/// Host state filter on the active batch run page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchHostFilter {
+    /// Failed or interrupted hosts.
+    Failed,
+    /// Hosts waiting on a host-key or ProxyCommand answer.
+    Waiting,
+    /// Hosts currently queued, connecting or running.
+    Running,
+    /// Hosts that finished every step successfully.
+    Done,
+}
+
+impl BatchHostFilter {
+    /// Every narrowed filter pill offered beside "All".
+    pub const ALL: [Self; 4] = [Self::Failed, Self::Waiting, Self::Running, Self::Done];
+
+    /// Whether a host in `state` passes this filter.
+    #[must_use]
+    pub fn matches(self, state: HostState) -> bool {
+        match self {
+            Self::Failed => matches!(state, HostState::Failed | HostState::Interrupted),
+            Self::Waiting => state == HostState::WaitingForUser,
+            Self::Running => matches!(
+                state,
+                HostState::Queued | HostState::Connecting | HostState::Running
+            ),
+            Self::Done => state == HostState::Succeeded,
+        }
+    }
+}
+
 /// Which surface of the task centre is on screen.
 ///
 /// The four surfaces are separate because they hold separate things, and the split is
@@ -817,6 +849,8 @@ pub struct BatchCenter {
     library_selected: usize,
     /// Which row of the run list the keyboard is on.
     history_selected: usize,
+    /// Optional host state filter on the active run page.
+    run_host_filter: Option<BatchHostFilter>,
 }
 
 /// The name this panel had when it was one page.
@@ -853,6 +887,7 @@ impl BatchCenter {
             library_confirm: None,
             library_selected: 0,
             history_selected: 0,
+            run_host_filter: None,
         }
     }
 
@@ -1244,6 +1279,7 @@ impl BatchCenter {
         );
         self.problem = None;
         self.view = BatchCenterView::ActiveRun;
+        self.run_host_filter = None;
         self.steps.clear();
         self.concurrency = None;
         self.name = None;
@@ -1346,6 +1382,77 @@ impl BatchCenter {
         if let Some(page) = self.active.as_mut() {
             page.selected = Some(host);
         }
+    }
+
+    /// Current host filter on the active run page.
+    #[must_use]
+    pub fn run_host_filter(&self) -> Option<BatchHostFilter> {
+        self.run_host_filter
+    }
+
+    /// Sets the host state filter on the active run page and keeps selection on a visible host.
+    pub fn set_run_host_filter(&mut self, filter: Option<BatchHostFilter>) {
+        self.run_host_filter = filter;
+        if let Some(page) = self.active.as_mut() {
+            let visible: Vec<HostId> = page
+                .run
+                .hosts()
+                .iter()
+                .filter(|host| filter.is_none_or(|f| f.matches(host.state())))
+                .map(|host| host.target().host_id())
+                .collect();
+            if let Some(first) = visible.first().copied()
+                && page.selected.is_none_or(|sel| !visible.contains(&sel))
+            {
+                page.selected = Some(first);
+            }
+        }
+    }
+
+    /// Steps the selected host in the active run up or down across visible hosts.
+    pub fn step_run_host(&mut self, delta: isize, limit: usize) -> bool {
+        let filter = self.run_host_filter;
+        let Some(page) = self.active.as_mut() else {
+            return false;
+        };
+        let ids: Vec<HostId> = page
+            .run
+            .hosts()
+            .iter()
+            .filter(|host| filter.is_none_or(|f| f.matches(host.state())))
+            .take(limit)
+            .map(|host| host.target().host_id())
+            .collect();
+        if ids.is_empty() {
+            return false;
+        }
+        let at = page
+            .selected
+            .and_then(|sel| ids.iter().position(|id| *id == sel))
+            .unwrap_or(0);
+        let next = crate::app::palette::step(at, delta, ids.len());
+        page.selected = Some(ids[next]);
+        true
+    }
+
+    /// Steps the selected host in an open stored run up or down.
+    pub fn next_stored_host(&self, delta: isize, limit: usize) -> Option<HostId> {
+        let run = self.stored_summary()?;
+        let ids: Vec<HostId> = run
+            .hosts()
+            .iter()
+            .take(limit)
+            .map(|host| host.target().host_id())
+            .collect();
+        if ids.is_empty() {
+            return None;
+        }
+        let at = self
+            .history_host
+            .and_then(|sel| ids.iter().position(|id| *id == sel))
+            .unwrap_or(0);
+        let next = crate::app::palette::step(at, delta, ids.len());
+        Some(ids[next])
     }
 
     /// Records why an action was refused, for the page to show.

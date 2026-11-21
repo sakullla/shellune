@@ -238,6 +238,41 @@ impl TransferViews {
         !self.queue.transfers().is_empty()
     }
 
+    /// Whether any task in the queue has reached a finished state.
+    #[must_use]
+    pub fn has_finished(&self) -> bool {
+        self.queue
+            .transfers()
+            .iter()
+            .any(|task| task.state().is_finished())
+    }
+
+    /// Whether any task of one session has reached a finished state.
+    #[must_use]
+    pub fn has_finished_for_session(&self, session: SessionId) -> bool {
+        self.queue
+            .for_session(session)
+            .any(|task| task.state().is_finished())
+    }
+
+    /// Removes every finished task across all sessions and drops their stale pace samples.
+    pub fn clear_finished(&mut self) -> usize {
+        let removed = self.queue.clear_finished();
+        if removed > 0 {
+            self.paces.retain(|id, _| self.queue.contains(*id));
+        }
+        removed
+    }
+
+    /// Removes every finished task of one session and drops their stale pace samples.
+    pub fn clear_finished_for_session(&mut self, session: SessionId) -> usize {
+        let removed = self.queue.clear_finished_for_session(session);
+        if removed > 0 {
+            self.paces.retain(|id, _| self.queue.contains(*id));
+        }
+        removed
+    }
+
     /// Starts an upload of one local file into a remote directory over SFTP.
     ///
     /// The remote name is the local file's own name, exactly as it is: a file called

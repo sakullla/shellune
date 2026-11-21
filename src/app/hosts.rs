@@ -1067,6 +1067,54 @@ impl HostDraft {
         self.secret.clear();
     }
 
+    /// Identifies the first field whose current text would be refused on save, in form order.
+    #[must_use]
+    pub fn first_problem(
+        &self,
+        existing: Option<&HostConfig>,
+    ) -> Option<(Result<HostField, ConnectionField>, String)> {
+        let address_trimmed = self.address.trim();
+        if address_trimmed.is_empty() || address_trimmed.chars().any(char::is_whitespace) {
+            let mut probe = existing.cloned().unwrap_or_else(|| {
+                HostConfig::new("probe", "probe", 22, "probe").expect("valid probe")
+            });
+            if let Err(err) = probe.set_address(self.address.clone()) {
+                return Some((Ok(HostField::Address), err.to_string()));
+            }
+        }
+        if let Err(reason) = parse_port(&self.port) {
+            return Some((Ok(HostField::Port), reason));
+        }
+        let user_trimmed = self.user.trim();
+        if user_trimmed.is_empty() || user_trimmed.chars().any(char::is_whitespace) {
+            let mut probe = existing.cloned().unwrap_or_else(|| {
+                HostConfig::new("probe", "probe", 22, "probe").expect("valid probe")
+            });
+            if let Err(err) = probe.set_user(self.user.clone()) {
+                return Some((Ok(HostField::User), err.to_string()));
+            }
+        }
+        let effective = self.effective_name();
+        if effective.trim().is_empty() {
+            let mut probe = existing.cloned().unwrap_or_else(|| {
+                HostConfig::new("probe", "probe", 22, "probe").expect("valid probe")
+            });
+            if let Err(err) = probe.set_name(effective) {
+                return Some((Ok(HostField::Name), err.to_string()));
+            }
+        }
+        let group_trimmed = self.group.trim();
+        if !group_trimmed.is_empty()
+            && let Err(err) = GroupPath::parse(group_trimmed)
+        {
+            return Some((Ok(HostField::Group), err.to_string()));
+        }
+        if let Err((field, problem)) = self.connection.resolve() {
+            return Some((Err(field), connection_refusal(field, &problem)));
+        }
+        None
+    }
+
     /// The validated change this form describes.
     ///
     /// # Errors
@@ -1298,6 +1346,7 @@ pub struct HostsPanel {
     /// already had, and the other protocols have their own fields.
     protocol_draft: Option<ProtocolDraft>,
     pending_delete: Option<HostId>,
+    pending_batch_delete: bool,
     message: Option<HostsMessage>,
     /// The group and status the list is narrowed to, beside the search phrase.
     filter: HostFilter,
@@ -1334,6 +1383,7 @@ impl HostsPanel {
         if self.view != view {
             self.view = view;
             self.pending_delete = None;
+            self.pending_batch_delete = false;
         }
     }
 
@@ -1420,6 +1470,7 @@ impl HostsPanel {
         self.draft = Some(HostDraft::create());
         self.protocol_draft = None;
         self.pending_delete = None;
+        self.pending_batch_delete = false;
         self.clear_message();
     }
 
@@ -1428,6 +1479,7 @@ impl HostsPanel {
         self.draft = Some(HostDraft::edit(host));
         self.protocol_draft = None;
         self.pending_delete = None;
+        self.pending_batch_delete = false;
         self.clear_message();
     }
 
@@ -1481,7 +1533,7 @@ impl HostsPanel {
         self.clear_message();
     }
 
-    /// Switches the open form to another protocol, keeping the name and group typed.
+    /// Switches the open form to another protocol, keeping the name, group, address and user typed.
     ///
     /// A protocol decides which fields exist, so changing it builds the form for the
     /// new one instead of hiding fields the old one had.
@@ -1496,11 +1548,23 @@ impl HostsPanel {
             (None, Some(draft)) => draft.text(ConnectionFormField::Group).to_owned(),
             (None, None) => String::new(),
         };
+        let address = match (&self.draft, &self.protocol_draft) {
+            (Some(draft), _) => draft.text(HostField::Address).to_owned(),
+            (None, Some(draft)) => draft.text(ConnectionFormField::Address).to_owned(),
+            (None, None) => String::new(),
+        };
+        let user = match (&self.draft, &self.protocol_draft) {
+            (Some(draft), _) => draft.text(HostField::User).to_owned(),
+            (None, Some(draft)) => draft.text(ConnectionFormField::User).to_owned(),
+            (None, None) => String::new(),
+        };
         match protocol {
             ProtocolKind::Ssh => {
                 let mut draft = HostDraft::create();
                 draft.set_text(HostField::Name, name);
                 draft.set_text(HostField::Group, group);
+                draft.set_text(HostField::Address, address);
+                draft.set_text(HostField::User, user);
                 self.draft = Some(draft);
                 self.protocol_draft = None;
             }
@@ -1508,6 +1572,8 @@ impl HostsPanel {
                 let mut draft = ProtocolDraft::create(other);
                 draft.set_text(ConnectionFormField::Name, name);
                 draft.set_text(ConnectionFormField::Group, group);
+                draft.set_text(ConnectionFormField::Address, address);
+                draft.set_text(ConnectionFormField::User, user);
                 self.protocol_draft = Some(draft);
                 self.draft = None;
             }
@@ -1546,6 +1612,37 @@ impl HostsPanel {
     /// Takes the confirmed deletion target.
     pub fn take_delete(&mut self) -> Option<HostId> {
         self.pending_delete.take()
+    }
+
+    /// Whether the selection's batch-deletion confirmation dialog is open.
+    #[must_use]
+    pub fn is_asking_batch_delete(&self) -> bool {
+        self.pending_batch_delete && !self.selected.is_empty()
+    }
+
+    /// Asks the deletion question for all selected hosts.
+    pub fn ask_batch_delete(&mut self) {
+        if !self.selected.is_empty() {
+            self.pending_batch_delete = true;
+            self.pending_delete = None;
+            self.draft = None;
+            self.protocol_draft = None;
+        }
+    }
+
+    /// Drops the batch-deletion question without touching any records.
+    pub fn cancel_batch_delete(&mut self) {
+        self.pending_batch_delete = false;
+    }
+
+    /// Takes the confirmed batch-deletion targets and clears the selection.
+    pub fn take_batch_delete(&mut self) -> Vec<HostId> {
+        if !std::mem::take(&mut self.pending_batch_delete) {
+            return Vec::new();
+        }
+        let ids = self.selected.ids();
+        self.selected.clear();
+        ids
     }
 
     /// The last message, if any.
@@ -1783,6 +1880,32 @@ impl HostsPanel {
         };
         for id in &connections {
             rows.push(HostListRow::Connection(ConnectionRow { id: *id }));
+        }
+        if self.view == HostView::All && self.sort != HostSort::Saved {
+            let row_id = |row: &HostListRow| match row {
+                HostListRow::Host(host) => Some(host.id),
+                HostListRow::Connection(conn) => Some(conn.id),
+                HostListRow::Group(_) => None,
+            };
+            match self.sort {
+                HostSort::Saved => {}
+                HostSort::Name => {
+                    rows.sort_by_cached_key(|row| {
+                        row_id(row)
+                            .and_then(|id| book.connection(id).map(|rec| rec.name().to_lowercase()))
+                            .unwrap_or_default()
+                    });
+                }
+                HostSort::LastConnected => {
+                    rows.sort_by_key(|row| {
+                        std::cmp::Reverse(
+                            row_id(row)
+                                .and_then(|id| book.recent_of(id))
+                                .map_or(0, |recent| recent.last_connected_unix()),
+                        )
+                    });
+                }
+            }
         }
         let saved_connections = book.connections().len();
         HostList {

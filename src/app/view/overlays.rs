@@ -115,11 +115,15 @@ fn kind_badge_parts(
 fn host_palette_detail(host: &HostConfig, locale: crate::app::copy::Locale) -> String {
     let ux = copy::ux_for(locale);
     let mut detail = host.target();
-    if !host.jumps().is_empty() {
+    let jumps = host.jumps().len();
+    if jumps == 1 {
+        detail.push_str(" · ");
+        detail.push_str(ux.palette_host_jumps_one);
+    } else if jumps > 1 {
         detail.push_str(" · ");
         detail.push_str(&copy::fill(
             ux.palette_host_jumps,
-            &[("count", &host.jumps().len().to_string())],
+            &[("count", &jumps.to_string())],
         ));
     }
     if host.proxy_command().is_some() {
@@ -356,6 +360,20 @@ impl ShelluneView {
                 detail: host_palette_detail(host, locale),
                 shortcut: None,
                 icon: Icon::Plug,
+                current: false,
+            });
+        }
+        for record in self.book.connections() {
+            entries.push(Entry {
+                command: Command::Connect(record.id()),
+                group: Group::Hosts,
+                title: record.name().to_owned(),
+                detail: format!("{} · {}", record.protocol().label(), record.target()),
+                shortcut: None,
+                icon: match record.protocol() {
+                    shellune_core::ProtocolKind::Serial => Icon::Terminal,
+                    _ => Icon::Monitor,
+                },
                 current: false,
             });
         }
@@ -685,6 +703,8 @@ impl ShelluneView {
                         self.select(Destination::LocalShells, window, cx);
                     }
                     self.open_remote(&host, cx);
+                } else if self.book.contains_connection(host) {
+                    self.connect_saved_connection(host, cx);
                 }
             }
             Command::ToggleFavorite(id) => self.toggle_favorite(id, cx),
@@ -1112,8 +1132,8 @@ impl ShelluneView {
         let viewport = window.viewport_size();
         // The shared menu entry and card: a host's menu is the same object as a tab's
         // or a file's (R6).
-        let item = |label: &'static str, selector: &'static str, danger: bool| {
-            components::menu_entry(label, selector, None, true, danger, metrics)
+        let item = |label: &'static str, selector: &'static str, icon: Icon, danger: bool| {
+            components::menu_entry(label, selector, Some(icon), true, danger, metrics)
         };
         let divider = || components::menu_divider(metrics);
         let max_height =
@@ -1124,21 +1144,25 @@ impl ShelluneView {
             .max_h(max_height)
             .overflow_y_scroll()
             .child(
-                item(strings.remote_connect, "host.menu.connect", false).on_click(cx.listener(
-                    move |this, _event, window, cx| {
+                item(strings.remote_connect, "host.menu.connect", Icon::Plug, false).on_click(
+                    cx.listener(move |this, _event, window, cx| {
                         this.close_host_menu(window, cx);
                         this.connect_saved_connection(id, cx);
-                    },
-                )),
+                    }),
+                ),
             );
         if is_ssh {
             menu = menu.child(
-                item(strings.forward_open, "host.menu.forwards", false).on_click(cx.listener(
-                    move |this, _event, window, cx| {
-                        this.close_host_menu(window, cx);
-                        this.open_saved_forwards(id, cx);
-                    },
-                )),
+                item(
+                    strings.forward_open,
+                    "host.menu.forwards",
+                    Icon::Forward,
+                    false,
+                )
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.close_host_menu(window, cx);
+                    this.open_saved_forwards(id, cx);
+                })),
             );
         }
         let delete_label = if is_ssh {
@@ -1146,50 +1170,55 @@ impl ShelluneView {
         } else {
             strings.connection_delete
         };
-        let favorite_label = if self.book.is_favorite(id) {
-            ux.favorite_remove
+        let is_favorite = self.book.is_favorite(id);
+        let (favorite_label, favorite_icon) = if is_favorite {
+            (ux.favorite_remove, Icon::StarFilled)
         } else {
-            ux.favorite_add
+            (ux.favorite_add, Icon::Star)
         };
         menu = menu
             .child(
-                item(favorite_label, "host.menu.favorite", false).on_click(cx.listener(
-                    move |this, _event, window, cx| {
-                        this.close_host_menu(window, cx);
-                        this.toggle_favorite(id, cx);
-                    },
-                )),
-            )
-            .child(divider())
-            .child(
-                item(ux.host_copy_target, "host.menu.copy_target", false).on_click(cx.listener(
-                    move |this, _event, window, cx| {
-                        let copied = target.clone();
-                        this.close_host_menu(window, cx);
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copied));
-                        window.dispatch_action(Box::new(crate::app::actions::ShowCopied), cx);
-                    },
-                )),
-            )
-            .child(
-                item(strings.host_edit, "host.menu.edit", false).on_click(cx.listener(
-                    move |this, _event, window, cx| {
-                        this.close_host_menu(window, cx);
-                        this.edit_saved_connection(id, cx);
-                    },
-                )),
-            )
-            .child(
-                item(strings.connection_duplicate, "host.menu.duplicate", false).on_click(
+                item(favorite_label, "host.menu.favorite", favorite_icon, false).on_click(
                     cx.listener(move |this, _event, window, cx| {
                         this.close_host_menu(window, cx);
-                        this.duplicate_saved_connection(id, cx);
+                        this.toggle_favorite(id, cx);
                     }),
                 ),
             )
             .child(divider())
             .child(
-                item(delete_label, "host.menu.delete", true).on_click(cx.listener(
+                item(ux.host_copy_target, "host.menu.copy_target", Icon::Copy, false).on_click(
+                    cx.listener(move |this, _event, window, cx| {
+                        let copied = target.clone();
+                        this.close_host_menu(window, cx);
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copied));
+                        window.dispatch_action(Box::new(crate::app::actions::ShowCopied), cx);
+                    }),
+                ),
+            )
+            .child(
+                item(strings.host_edit, "host.menu.edit", Icon::Pencil, false).on_click(
+                    cx.listener(move |this, _event, window, cx| {
+                        this.close_host_menu(window, cx);
+                        this.edit_saved_connection(id, cx);
+                    }),
+                ),
+            )
+            .child(
+                item(
+                    strings.connection_duplicate,
+                    "host.menu.duplicate",
+                    Icon::Copy,
+                    false,
+                )
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.close_host_menu(window, cx);
+                    this.duplicate_saved_connection(id, cx);
+                })),
+            )
+            .child(divider())
+            .child(
+                item(delete_label, "host.menu.delete", Icon::Trash, true).on_click(cx.listener(
                     move |this, _event, window, cx| {
                         this.close_host_menu(window, cx);
                         this.ask_delete_host(id, cx);
@@ -1274,10 +1303,11 @@ impl ShelluneView {
                     self.open_remote(&host, cx);
                 }
             }
-            // Duplicating a tab copies what it is about to start. This build cannot
-            // start a desktop or serial session yet, so it copies nothing rather than
-            // opening a tab that could never connect.
-            SessionKind::Rdp { .. } | SessionKind::Vnc { .. } | SessionKind::Serial { .. } => {}
+            SessionKind::Rdp { host } | SessionKind::Vnc { host } | SessionKind::Serial { host } => {
+                if self.book.connection(host).is_some() {
+                    self.connect_saved_connection(host, cx);
+                }
+            }
         }
     }
 
@@ -1903,6 +1933,7 @@ impl ShelluneView {
             })
             .unwrap_or(0);
         self.tab_list_open = true;
+        self.tab_list_reveal.set(true);
         window.focus(&self.tab_list_focus);
         cx.notify();
     }
@@ -1917,11 +1948,13 @@ impl ShelluneView {
         match event.keystroke.key.as_str() {
             "down" => {
                 self.tab_list_selected = palette::step(self.tab_list_selected, 1, count);
+                self.tab_list_reveal.set(true);
                 cx.notify();
                 cx.stop_propagation();
             }
             "up" => {
                 self.tab_list_selected = palette::step(self.tab_list_selected, -1, count);
+                self.tab_list_reveal.set(true);
                 cx.notify();
                 cx.stop_propagation();
             }
@@ -2077,12 +2110,45 @@ impl ShelluneView {
             let marks = attention_rows(unread, strings, metrics, index);
             let hover = theme::swatch(colors::SURFACE_HOVER);
             let rename = tab_id;
+            let reveal_row = on_keyboard.then(|| {
+                let reveal = self.tab_list_reveal.clone();
+                let scroll = self.tab_list_scroll.clone();
+                let shell = cx.entity_id();
+                let margin = metrics.scale(spacing::TIGHT);
+                gpui::canvas(
+                    move |bounds, _window, cx| {
+                        if !reveal.replace(false) {
+                            return;
+                        }
+                        let view = scroll.bounds();
+                        if view.size.height <= px(0.0) {
+                            return;
+                        }
+                        let mut offset = scroll.offset();
+                        let below = bounds.bottom() + margin - view.bottom();
+                        let above = view.top() - (bounds.top() - margin);
+                        if below > px(0.0) {
+                            offset.y -= below;
+                            scroll.set_offset(offset);
+                            cx.defer(move |cx| cx.notify(shell));
+                        } else if above > px(0.0) {
+                            offset.y = (offset.y + above).min(px(0.0));
+                            scroll.set_offset(offset);
+                            cx.defer(move |cx| cx.notify(shell));
+                        }
+                    },
+                    |_bounds, (), _window, _cx| {},
+                )
+                .absolute()
+                .inset_0()
+            });
             let row = div()
                 .id(SharedString::from(selector.clone()))
                 .debug_selector({
                     let selector = selector.clone();
                     move || selector.clone()
                 })
+                .relative()
                 .flex()
                 .items_center()
                 .flex_wrap()
@@ -2102,6 +2168,7 @@ impl ShelluneView {
                     row.bg(theme::swatch(colors::SURFACE_SELECTED))
                 })
                 .hover(move |style| style.bg(hover))
+                .children(reveal_row)
                 // The pointer and the arrow keys move the same highlight, so the row a
                 // click would choose is the row Enter would open.
                 .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
@@ -2245,7 +2312,7 @@ impl ShelluneView {
             .child(hint("\u{2191}\u{2193}", strings.palette_key_move))
             .child(hint("\u{21b5}", strings.palette_key_run))
             .child(hint("Esc", strings.palette_key_close));
-        Some(self.modal(
+        Some(self.modal_with(
             window,
             "tabs.list.dialog",
             680.0,
@@ -2254,6 +2321,10 @@ impl ShelluneView {
                 subtitle,
                 body,
                 footer: Some(footer),
+            },
+            super::shell::ModalBehaviour {
+                scroll: Some(self.tab_list_scroll.clone()),
+                dismiss: None,
             },
         ))
     }

@@ -270,6 +270,8 @@ pub struct SnippetsPanel {
     editor: Option<SnippetEditor>,
     pending_delete: Option<SnippetId>,
     selected: usize,
+    search: Option<Entity<TextField>>,
+    query: String,
 }
 
 impl SnippetsPanel {
@@ -280,7 +282,49 @@ impl SnippetsPanel {
             editor: None,
             pending_delete: None,
             selected: 0,
+            search: None,
+            query: String::new(),
         }
+    }
+
+    /// The search field that narrows the snippet list, while initialized.
+    #[must_use]
+    pub fn search_field(&self) -> Option<&Entity<TextField>> {
+        self.search.as_ref()
+    }
+
+    /// Installs the search field for the manager dialog.
+    pub fn set_search_field(&mut self, field: Entity<TextField>) {
+        self.search = Some(field);
+    }
+
+    /// Replaces the search phrase, returning whether it changed.
+    pub fn set_query(&mut self, query: impl Into<String>) -> bool {
+        let query = query.into();
+        if self.query == query {
+            return false;
+        }
+        self.query = query;
+        self.selected = 0;
+        true
+    }
+
+    /// Indices into `snippets` that match the current search phrase.
+    #[must_use]
+    pub fn filtered_indices(&self, snippets: &[Snippet]) -> Vec<usize> {
+        let needle = self.query.trim().to_lowercase();
+        if needle.is_empty() {
+            return (0..snippets.len()).collect();
+        }
+        snippets
+            .iter()
+            .enumerate()
+            .filter(|(_, snippet)| {
+                snippet.name().to_lowercase().contains(&needle)
+                    || snippet.body().to_lowercase().contains(&needle)
+            })
+            .map(|(index, _)| index)
+            .collect()
     }
 
     /// The row the keyboard is on.

@@ -1784,7 +1784,7 @@ pub fn copy_on_click(base: Div, text: impl Into<String>) -> Div {
     let text: String = text.into();
     let hover = theme::swatch(palette::TEXT_PRIMARY);
     base.cursor_pointer()
-        .hover(move |style| style.text_color(hover))
+        .hover(move |style| style.text_color(hover).underline())
         .on_mouse_down(gpui::MouseButton::Left, move |_event, window, cx| {
             cx.stop_propagation();
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));

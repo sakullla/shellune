@@ -590,11 +590,16 @@ impl ShelluneView {
                 ));
             }
             Some(SessionStep::Close) => {
-                let button =
+                let button = if narrow {
+                    components::icon_only_button(Icon::Close, metrics)
+                        .size(metrics.hit_target())
+                } else {
                     components::compact_button(strings.session_close, Variant::Secondary, metrics)
-                        .flex_none()
-                        .id("terminal.failure.next")
-                        .debug_selector(|| "terminal.failure.next".to_owned());
+                }
+                .flex_none()
+                .id("terminal.failure.next")
+                .debug_selector(|| "terminal.failure.next".to_owned())
+                .tooltip(components::tooltip(strings.session_close));
                 row = row.child(self.banner_control(
                     id,
                     BannerStop::Next,
@@ -739,10 +744,16 @@ impl ShelluneView {
             .map(|session| self.target_of(session))
             .unwrap_or_default();
         let sentence = copy::fill(ux.banner_reconnecting, &[("target", &target)]);
-        let cancel = components::compact_button(ux.banner_cancel, Variant::Secondary, metrics)
-            .flex_none()
-            .id("terminal.reconnecting.cancel")
-            .debug_selector(|| "terminal.reconnecting.cancel".to_owned());
+        let narrow = self.banner_is_narrow(id, cx);
+        let cancel = if narrow {
+            components::icon_only_button(Icon::Stop, metrics).size(metrics.hit_target())
+        } else {
+            components::compact_button(ux.banner_cancel, Variant::Secondary, metrics)
+        }
+        .flex_none()
+        .id("terminal.reconnecting.cancel")
+        .debug_selector(|| "terminal.reconnecting.cancel".to_owned())
+        .tooltip(components::tooltip(ux.banner_cancel));
         let row = Self::banner_line(
             components::inline_banner_frame(Tone::Warning, Icon::Refresh, metrics),
             metrics,

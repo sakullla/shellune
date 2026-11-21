@@ -1025,28 +1025,34 @@ impl ShelluneView {
                     })),
             )
             .when(!compact, |control| {
-                control.child(
-                    components::icon_only_button(Icon::ChevronDown, metrics)
-                        // Its own width, but never narrower than a pointer target (R4).
-                        .w(metrics.hit_target())
-                        .h(size)
-                        .rounded_r(px(radius::MEDIUM))
-                        .rounded_l(px(0.0))
-                        .when(open, |button| {
-                            button.bg(theme::swatch(palette::SURFACE_SELECTED))
-                        })
-                        .id("shell.menu")
-                        .debug_selector(|| "shell.menu".to_owned())
-                        .when(!open, |button| {
-                            button.tooltip(components::tooltip(ux.new_tab_menu))
-                        })
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            // The header's menu, wherever the home page's one was.
-                            this.shell_menu_open = !(this.shell_menu_open && !this.shell_menu_home);
-                            this.shell_menu_home = false;
-                            cx.notify();
-                        })),
-                )
+                control
+                    .child(components::divider_vertical(metrics))
+                    .child(
+                        components::icon_only_button(Icon::ChevronDown, metrics)
+                            // Its own width, but never narrower than a pointer target (R4).
+                            .w(metrics.hit_target())
+                            .h(size)
+                            .rounded_r(px(radius::MEDIUM))
+                            .rounded_l(px(0.0))
+                            .when(open, |button| {
+                                button.bg(theme::swatch(palette::SURFACE_SELECTED))
+                            })
+                            .id("shell.menu")
+                            .debug_selector(|| "shell.menu".to_owned())
+                            .when(!open, |button| {
+                                button.tooltip(components::tooltip(ux.new_tab_menu))
+                            })
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.tab_menu = None;
+                                this.session_more = None;
+                                this.session_menu = None;
+                                this.host_menu = None;
+                                // The header's menu, wherever the home page's one was.
+                                this.shell_menu_open = !(this.shell_menu_open && !this.shell_menu_home);
+                                this.shell_menu_home = false;
+                                cx.notify();
+                            })),
+                    )
             });
         // Records where the control is drawn, for the menu that hangs from it.
         let anchor = self.shell_menu_anchor.clone();
@@ -2032,6 +2038,17 @@ impl ShelluneView {
                     .pb(metrics.scale(spacing::LOOSE))
                     .child(list)
                     .into_any_element();
+                let footer = self.transfers.has_finished().then(|| {
+                    components::modal_footer(metrics)
+                        .justify_end()
+                        .child(self.text_button(
+                            SharedString::from("transfers.center.clear_finished"),
+                            ux.transfers_clear_finished,
+                            Variant::Secondary,
+                            cx,
+                            |this, cx| this.clear_finished_transfers(None, cx),
+                        ))
+                });
                 Some(self.modal(
                     window,
                     "transfers.dialog",
@@ -2040,7 +2057,7 @@ impl ShelluneView {
                         header,
                         subtitle,
                         body,
-                        footer: None,
+                        footer,
                     },
                 ))
             }
@@ -2114,6 +2131,26 @@ impl ShelluneView {
     pub(crate) fn open_snippets(&mut self, new: bool, cx: &mut Context<Self>) {
         self.open_tool(Tool::Snippets, cx);
         self.snippet_panel.keep();
+        if self.snippet_panel.search_field().is_none() {
+            let placeholder = copy::ux_for(self.workspace.locale()).snippet_search_placeholder;
+            let field = cx.new(|cx| {
+                let mut field = TextField::new(placeholder, cx);
+                field.set_leading_icon(Icon::Search, cx);
+                field.set_clearable(true, cx);
+                field
+            });
+            cx.observe(&field, |view, field, cx| {
+                let text = field.read(cx).text().to_owned();
+                if view.snippet_panel.set_query(text) {
+                    cx.notify();
+                }
+            })
+            .detach();
+            self.snippet_panel.set_search_field(field);
+        } else if let Some(field) = self.snippet_panel.search_field().cloned() {
+            field.update(cx, |field, cx| field.set_text("", cx));
+            self.snippet_panel.set_query("");
+        }
         if new {
             self.open_snippet_editor(None, cx);
         } else {
@@ -2386,7 +2423,10 @@ impl ShelluneView {
         if self.snippet_panel.is_editing() {
             return;
         }
-        let len = self.snippets.snippets().len();
+        let filtered = self.snippet_panel.filtered_indices(self.snippets.snippets());
+        let len = filtered.len();
+        let secondary = event.keystroke.modifiers.number_of_modifiers() == 1
+            && event.keystroke.modifiers.secondary();
         match key {
             "down" => {
                 cx.stop_propagation();
@@ -2400,9 +2440,11 @@ impl ShelluneView {
             }
             "enter" if self.snippet_panel.pending_delete().is_none() => {
                 cx.stop_propagation();
-                if let Some(snippet) = self.snippets.snippets().get(self.snippet_panel.selected()) {
+                if let Some(&real_index) = filtered.get(self.snippet_panel.selected())
+                    && let Some(snippet) = self.snippets.snippets().get(real_index)
+                {
                     let id = snippet.id();
-                    self.use_snippet(id, false, cx);
+                    self.use_snippet(id, secondary, cx);
                 }
             }
             _ => {}
@@ -2493,15 +2535,48 @@ impl ShelluneView {
                     .debug_selector(|| "snippets.empty".to_owned()),
                 );
             }
+            let filtered = self.snippet_panel.filtered_indices(self.snippets.snippets());
+            if count > 0
+                && let Some(search) = self.snippet_panel.search_field().cloned()
+            {
+                body = body.child(
+                    div()
+                        .flex()
+                        .w_full()
+                        .min_w_0()
+                        .debug_selector(|| "snippets.search".to_owned())
+                        .child(search),
+                );
+            }
             let mut list = div()
                 .flex()
                 .flex_col()
                 .gap(metrics.scale(spacing::HAIRLINE))
                 .debug_selector(|| "snippets.list".to_owned());
-            for index in 0..count {
-                list = list.child(self.snippet_row(index, cx));
+            if count > 0 && filtered.is_empty() {
+                list = list.child(
+                    div()
+                        .py(metrics.scale(spacing::SNUG))
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .debug_selector(|| "snippets.search.empty".to_owned())
+                        .child(ux.snippet_search_empty),
+                );
+            } else {
+                for (pos, &index) in filtered.iter().enumerate() {
+                    list = list.child(self.snippet_row(pos, index, filtered.len(), cx));
+                }
             }
             body = body.child(list);
+            if count > 0 {
+                body = body.child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .debug_selector(|| "snippets.keys.hint".to_owned())
+                        .child(ux.snippet_keys_hint),
+                );
+            }
             if let Some(question) = self.snippet_delete_question(cx) {
                 body = body.child(question);
             }
@@ -2517,18 +2592,26 @@ impl ShelluneView {
                 .child(ux.snippet_storage_note),
         );
 
-        let new_button = self
-            .text_button(
-                SharedString::from("snippets.new"),
-                ux.snippet_new,
-                Variant::Primary,
-                cx,
-                |this, cx| {
-                    this.snippet_panel.keep();
-                    this.open_snippet_editor(None, cx);
-                },
-            )
-            .when(!self.snippets.can_write(), |button| button.opacity(0.5));
+        let writable = self.snippets.can_write();
+        let new_button = components::button_with_state(
+            ux.snippet_new,
+            Variant::Primary,
+            if writable {
+                components::ControlState::Resting
+            } else {
+                components::ControlState::Disabled
+            },
+            metrics,
+        )
+        .h(metrics.compact_control_height())
+        .id("snippets.new")
+        .debug_selector(|| "snippets.new".to_owned())
+        .when(writable, |button| {
+            button.on_click(cx.listener(|this, _event, _window, cx| {
+                this.snippet_panel.keep();
+                this.open_snippet_editor(None, cx);
+            }))
+        });
         let close_footer = close.clone();
         let footer = components::modal_footer(metrics)
             .justify_between()
@@ -2555,7 +2638,13 @@ impl ShelluneView {
     }
 
     /// One saved command: what it is, what it runs and what can be done with it.
-    fn snippet_row(&self, index: usize, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn snippet_row(
+        &self,
+        pos: usize,
+        index: usize,
+        visible_len: usize,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let metrics = self.metrics();
         let ux = copy::ux();
         let Some(snippet) = self.snippets.snippets().get(index) else {
@@ -2563,7 +2652,7 @@ impl ShelluneView {
         };
         let id = snippet.id();
         let lines = snippet.line_count();
-        let selected = self.snippet_panel.selected() == index;
+        let selected = self.snippet_panel.selected() == pos;
         let hover = theme::swatch(palette::SURFACE_HOVER);
         // The name and the body are one line each, ellipsized when the row is narrow: a
         // column that is allowed to wrap instead is squeezed to a few pixels by the four
@@ -2627,8 +2716,7 @@ impl ShelluneView {
             })
             .hover(move |style| style.bg(hover))
             .on_click(cx.listener(move |this, _event, _window, cx| {
-                let len = this.snippets.snippets().len();
-                this.snippet_panel.select(index, len);
+                this.snippet_panel.select(pos, visible_len);
                 cx.notify();
             }))
             .child(detail)
@@ -2674,8 +2762,7 @@ impl ShelluneView {
                         cx,
                         move |this, cx| {
                             this.snippet_panel.ask_delete(id);
-                            let len = this.snippets.snippets().len();
-                            this.snippet_panel.select(index, len);
+                            this.snippet_panel.select(pos, visible_len);
                             cx.notify();
                         },
                     )),
@@ -2784,15 +2871,24 @@ impl ShelluneView {
         // A library whose file could not be read offers no save: the change would have
         // nowhere honest to go, and the banner above says which file to repair.
         let writable = self.snippets.can_write();
-        let save = self
-            .text_button(
-                SharedString::from("snippet.editor.save"),
-                ux.snippet_save,
-                Variant::Primary,
-                cx,
-                |this, cx| this.save_snippet_editor(cx),
-            )
-            .when(!writable, |button| button.opacity(0.5));
+        let save = components::button_with_state(
+            ux.snippet_save,
+            Variant::Primary,
+            if writable {
+                components::ControlState::Resting
+            } else {
+                components::ControlState::Disabled
+            },
+            metrics,
+        )
+        .h(metrics.compact_control_height())
+        .id("snippet.editor.save")
+        .debug_selector(|| "snippet.editor.save".to_owned())
+        .when(writable, |button| {
+            button.on_click(cx.listener(|this, _event, _window, cx| {
+                this.save_snippet_editor(cx);
+            }))
+        });
         let cancel = self.text_button(
             SharedString::from("snippet.editor.cancel"),
             ux.fwd_cancel,

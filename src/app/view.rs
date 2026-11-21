@@ -322,6 +322,7 @@ struct SplitDrag {
     axis: SplitAxis,
     origin: gpui::Point<gpui::Pixels>,
     origin_ratio: u16,
+    span: f32,
 }
 
 /// One connection attempt.
@@ -604,6 +605,8 @@ pub struct ShelluneView {
     /// A group is renamed with F2 and deleted with Delete while its row holds the keys
     /// (ADR-3), so every row needs a focus of its own that survives redraws.
     group_focus: RefCell<HashMap<GroupPath, FocusHandle>>,
+    /// Keyboard stops for the Home sidebar's fixed places: All, Favorites, Recent, Local.
+    sidebar_place_focus: [FocusHandle; 4],
     /// The host or connection row whose right-click menu is open, and where the pointer opened it.
     host_menu: Option<(HostId, gpui::Point<gpui::Pixels>)>,
     /// The connection form on screen. Other attempts keep theirs on [`Attempt::panel`].
@@ -888,6 +891,8 @@ pub struct ShelluneView {
     /// The keyboard target of that list, so it answers Up, Down, Enter and Escape
     /// while it is open instead of passing them to the terminal behind it (R17).
     tab_list_focus: FocusHandle,
+    tab_list_scroll: gpui::ScrollHandle,
+    tab_list_reveal: std::rc::Rc<std::cell::Cell<bool>>,
     /// The keyboard target of the paste dialog, so the answer is given with the keys
     /// and nothing behind the dialog receives them (R17).
     paste_focus: FocusHandle,
@@ -922,6 +927,8 @@ pub struct ShelluneView {
     layout_error: Option<String>,
     /// The split whose divider is being dragged.
     split_drag: Option<SplitDrag>,
+    /// Measured pixel span of each split node along its axis, for 1:1 divider dragging.
+    split_spans: RefCell<HashMap<u64, f32>>,
     /// Whether the sessions page shows the selected terminal rather than the list.
     ///
     /// Selecting a tab shows its terminal; going to the page from the sidebar or its
@@ -2654,7 +2661,12 @@ impl ShelluneView {
             field.set_revealable(true, cx);
             field
         });
-        let quick_address = cx.new(|cx| TextField::new(strings.host_field_address, cx));
+        let quick_address = cx.new(|cx| {
+            TextField::new(
+                copy::ux_for(workspace.locale()).quick_address_placeholder,
+                cx,
+            )
+        });
         let quick_port = cx.new(|cx| {
             let mut field = TextField::new(strings.host_field_port, cx);
             field.set_text("22", cx);
@@ -2740,6 +2752,12 @@ impl ShelluneView {
             hosts_rows_drawn: std::rc::Rc::new(std::cell::Cell::new(0)),
             hosts_cursor: None,
             group_focus: RefCell::new(HashMap::new()),
+            sidebar_place_focus: [
+                cx.focus_handle().tab_stop(true),
+                cx.focus_handle().tab_stop(true),
+                cx.focus_handle().tab_stop(true),
+                cx.focus_handle().tab_stop(true),
+            ],
             host_menu: None,
             remote: None,
             chain: None,
@@ -2873,6 +2891,8 @@ impl ShelluneView {
             tab_list_open: false,
             tab_list_selected: 0,
             tab_list_focus: cx.focus_handle(),
+            tab_list_scroll: gpui::ScrollHandle::new(),
+            tab_list_reveal: std::rc::Rc::new(std::cell::Cell::new(false)),
             paste_focus: cx.focus_handle(),
             paste_watch: None,
             paste_scroll: gpui::ScrollHandle::new(),
@@ -2918,6 +2938,7 @@ impl ShelluneView {
             layout_persist: false,
             layout_error: None,
             split_drag: None,
+            split_spans: RefCell::new(HashMap::new()),
             session_terminal: false,
             desktop_fullscreen: None,
             startup: startup::Startup::Ready,
@@ -3667,6 +3688,7 @@ impl ShelluneView {
             || self.protocol_fields.is_some()
             || self.hosts.group_editor().is_some()
             || self.hosts.pending_delete().is_some()
+            || self.hosts.is_asking_batch_delete()
             || self.import.is_open()
             || self.quick_open
             || self.host_menu.is_some()
@@ -3719,6 +3741,25 @@ impl ShelluneView {
                 } else {
                     // With no row chosen, the "connect to …" row is the one Enter means.
                     self.home_direct_row_shown() && self.connect_home_direct(false, window, cx)
+                }
+            }
+            // Space toggles selection on an SSH host row; F2 edits the record under cursor.
+            "space" if page_focused => {
+                if let Some(id) = self.active_hosts_cursor()
+                    && self.book.host(id).is_some()
+                {
+                    self.toggle_host_selection(id, cx);
+                    true
+                } else {
+                    false
+                }
+            }
+            "f2" if page_focused => {
+                if let Some(id) = self.active_hosts_cursor() {
+                    self.edit_saved_connection(id, cx);
+                    true
+                } else {
+                    false
                 }
             }
             // Delete asks first: the question is the same one the row's bin opens.
@@ -4524,6 +4565,12 @@ impl ShelluneView {
             "enter" => {
                 self.confirm_paste_prompt(cx);
             }
+            "up" | "down" | "pageup" | "pagedown" | "home" | "end"
+                if !keystroke.modifiers.modified() =>
+            {
+                scroll_by_key(&self.paste_scroll, keystroke.key.as_str());
+                cx.notify();
+            }
             _ => {}
         }
         self.paste_key_spent = true;
@@ -4588,7 +4635,10 @@ impl ShelluneView {
             (&self.remote_fields.password, strings.auth_password),
             (&self.remote_fields.key_path, strings.auth_key),
             (&self.remote_fields.passphrase, strings.auth_key_passphrase),
-            (&self.quick_address, strings.host_field_address),
+            (
+                &self.quick_address,
+                copy::ux_for(self.workspace.locale()).quick_address_placeholder,
+            ),
             (&self.quick_port, strings.host_field_port),
             (&self.quick_user, strings.host_field_user),
             (&self.quick_password, strings.auth_password),
@@ -4611,6 +4661,10 @@ impl ShelluneView {
             if let Some(field) = field {
                 field.update(cx, |field, cx| field.set_placeholder(label, cx));
             }
+        }
+        if let Some(search) = self.snippet_panel.search_field() {
+            let label = copy::ux_for(self.workspace.locale()).snippet_search_placeholder;
+            search.update(cx, |field, cx| field.set_placeholder(label, cx));
         }
         self.relabel_jump_picker(cx);
         self.relabel_sync_fields(cx);
@@ -6733,7 +6787,7 @@ impl ShelluneView {
                         true
                     } else {
                         if let Some(id) = view.first_searched_host() {
-                            view.connect_saved_host(id, cx);
+                            view.connect_saved_connection(id, cx);
                         }
                         false
                     }
@@ -6763,10 +6817,8 @@ impl ShelluneView {
             .list(&self.book, &self.groups, &|id| self.host_is_open(id));
         list.rows().iter().find_map(|row| match row {
             crate::app::hosts::HostListRow::Host(host) => Some(host.id),
-            // Only a host can be opened by pressing Enter; a desktop or serial row is
-            // edited, not started.
-            crate::app::hosts::HostListRow::Group(_)
-            | crate::app::hosts::HostListRow::Connection(_) => None,
+            crate::app::hosts::HostListRow::Connection(conn) => Some(conn.id),
+            crate::app::hosts::HostListRow::Group(_) => None,
         })
     }
 
@@ -6840,6 +6892,7 @@ impl ShelluneView {
         match self.write_hosts_file(&next) {
             Ok(()) => {
                 self.book = next;
+                self.key_presence.forget();
                 self.note_data_changed(cx);
                 let ux = copy::ux();
                 let said = if favorite {
@@ -6986,6 +7039,13 @@ impl ShelluneView {
         }
     }
 
+    /// Restores the connection keepalive and timeout settings back to built-in defaults.
+    pub(super) fn reset_connection_defaults(&mut self, cx: &mut Context<Self>) {
+        self.connection_choice = None;
+        self.sync_connection_draft(cx);
+        cx.notify();
+    }
+
     /// Reads one number of the connection page, keeping the reason it was refused.
     ///
     /// A number that is not usable is not written: the file keeps the last value the user
@@ -7065,6 +7125,16 @@ impl ShelluneView {
         };
         for field in ConnectionField::ALL {
             let entity = fields.get(field).clone();
+            let view = cx.entity().downgrade();
+            entity.update(cx, |text_field, _cx| {
+                text_field.on_submit(move |_text, _window, app| {
+                    view.update(app, |view, cx| {
+                        let _ = view.save_host(cx);
+                        false
+                    })
+                    .unwrap_or(false)
+                });
+            });
             cx.observe(&entity, move |view, text_field, cx| {
                 let text = text_field.read(cx).text().to_owned();
                 view.set_host_connection_value(field, text, cx);
@@ -7114,9 +7184,16 @@ impl ShelluneView {
             .recheck_layout_hosts(|id| self.book.contains_connection(id));
     }
 
-    /// Opens an empty form for a new host.
+    /// Opens an empty form for a new host, pre-filling the current group when one is active.
     fn open_create_host(&mut self, cx: &mut Context<Self>) {
+        let initial_group = match self.hosts.section() {
+            crate::app::hosts::HomeSection::Group(path) => Some(path.to_canonical()),
+            _ => None,
+        };
         self.hosts.open_create();
+        if let (Some(group), Some(draft)) = (initial_group, self.hosts.draft_mut()) {
+            draft.set_text(HostField::Group, group);
+        }
         self.open_host_fields(cx);
     }
 
@@ -7543,7 +7620,20 @@ impl ShelluneView {
             Err(problem) => {
                 // The reason names the field it came from, so the form can show it there
                 // and the banner says which field to change.
-                let label = problem.field().label(self.strings());
+                let bad_field = problem.field();
+                if let Some(fields) = self.protocol_fields.as_ref() {
+                    for candidate in draft.fields() {
+                        if let Some(entity) = fields.get(*candidate).cloned() {
+                            let is_bad = *candidate == bad_field;
+                            if is_bad {
+                                self.field_focus_pending =
+                                    Some(entity.read(cx).focus_handle().clone());
+                            }
+                            entity.update(cx, |f, cx| f.set_invalid(is_bad, cx));
+                        }
+                    }
+                }
+                let label = bad_field.label(self.strings());
                 self.hosts.set_message(format!("{label}: {problem}"), true);
                 cx.notify();
                 return None;
@@ -7581,6 +7671,32 @@ impl ShelluneView {
             Err(reason) => {
                 // The form stays open with what the user typed, and the reason names
                 // the field the domain refused.
+                let located = draft.first_problem(saved.as_ref()).map(|(which, _)| which);
+                if let Some(fields) = self.host_fields.as_ref() {
+                    for candidate in HostField::ALL {
+                        let entity = fields.get(candidate).clone();
+                        let is_bad = located == Some(Ok(candidate));
+                        if is_bad {
+                            self.field_focus_pending =
+                                Some(entity.read(cx).focus_handle().clone());
+                        }
+                        entity.update(cx, |f, cx| f.set_invalid(is_bad, cx));
+                    }
+                }
+                if let Some(Err(conn_field)) = located {
+                    self.host_advanced = true;
+                    if let Some(conn_fields) = self.host_connection_fields.as_ref() {
+                        for candidate in ConnectionField::ALL {
+                            let entity = conn_fields.get(candidate).clone();
+                            let is_bad = candidate == conn_field;
+                            if is_bad {
+                                self.field_focus_pending =
+                                    Some(entity.read(cx).focus_handle().clone());
+                            }
+                            entity.update(cx, |f, cx| f.set_invalid(is_bad, cx));
+                        }
+                    }
+                }
                 self.hosts.set_message(reason, true);
                 cx.notify();
                 return None;
@@ -7690,6 +7806,7 @@ impl ShelluneView {
         match self.write_hosts_file(&next) {
             Ok(()) => {
                 self.book = next;
+                self.key_presence.forget();
                 self.note_data_changed(cx);
                 self.hosts.close_editor();
                 self.host_fields = None;
@@ -8647,6 +8764,7 @@ impl ShelluneView {
         match self.write_hosts_file(&next) {
             Ok(()) => {
                 self.book = next;
+                self.key_presence.forget();
                 self.note_data_changed(cx);
                 let items = self.book.hosts().to_vec();
                 self.workspace.replace_hosts(SectionStatus::Ready, items);
@@ -10212,6 +10330,7 @@ impl ShelluneView {
         match self.write_hosts_file(&next) {
             Ok(()) => {
                 self.book = next;
+                self.key_presence.forget();
                 self.note_data_changed(cx);
                 cx.notify();
                 true
@@ -10628,25 +10747,41 @@ impl ShelluneView {
         }
         if let Some(reason) = &self.quick_error {
             card = card.child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(Tone::Danger.text())
+                components::banner(Tone::Danger, metrics)
                     .debug_selector(|| "quick.error".to_owned())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     .child(SharedString::from(reason.clone())),
             );
         }
         card.child(
-            div().flex().justify_end().child(
-                self.icon_text_button(
-                    SharedString::from("quick.connect"),
-                    Icon::Plug,
-                    strings.remote_connect,
-                    Variant::Primary,
+            div()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap(metrics.scale(spacing::TIGHT))
+                .child(self.text_button(
+                    SharedString::from("quick.cancel"),
+                    strings.host_cancel,
+                    Variant::Ghost,
                     cx,
-                    |view, cx| view.start_quick_connect(cx),
-                )
-                .debug_selector(|| "quick.connect".to_owned()),
-            ),
+                    |view, cx| {
+                        view.quick_open = false;
+                        view.quick_error = None;
+                        view.restore_focus_pending = true;
+                        cx.notify();
+                    },
+                ))
+                .child(
+                    self.icon_text_button(
+                        SharedString::from("quick.connect"),
+                        Icon::Plug,
+                        strings.remote_connect,
+                        Variant::Primary,
+                        cx,
+                        |view, cx| view.start_quick_connect(cx),
+                    )
+                    .debug_selector(|| "quick.connect".to_owned()),
+                ),
         )
     }
 
@@ -10891,13 +11026,16 @@ impl ShelluneView {
                         div()
                             .flex()
                             .items_center()
+                            .w_full()
+                            .justify_end()
+                            .flex_wrap()
                             .gap(metrics.scale(spacing::TIGHT))
                             .child(self.text_button(
-                                SharedString::from("remote.x11.answer.trusted"),
-                                strings.x11_trusted_confirm,
-                                Variant::Danger,
+                                SharedString::from("remote.x11.answer.cancel"),
+                                strings.x11_trusted_cancel,
+                                Variant::Ghost,
                                 cx,
-                                |view, cx| view.answer_x11(X11Answer::Trusted, cx),
+                                |view, cx| view.answer_x11(X11Answer::Cancel, cx),
                             ))
                             .child(self.text_button(
                                 SharedString::from("remote.x11.answer.restricted"),
@@ -10907,11 +11045,11 @@ impl ShelluneView {
                                 |view, cx| view.answer_x11(X11Answer::Restricted, cx),
                             ))
                             .child(self.text_button(
-                                SharedString::from("remote.x11.answer.cancel"),
-                                strings.x11_trusted_cancel,
-                                Variant::Ghost,
+                                SharedString::from("remote.x11.answer.trusted"),
+                                strings.x11_trusted_confirm,
+                                Variant::Danger,
                                 cx,
-                                |view, cx| view.answer_x11(X11Answer::Cancel, cx),
+                                |view, cx| view.answer_x11(X11Answer::Trusted, cx),
                             )),
                     ),
             );
@@ -11156,10 +11294,9 @@ impl ShelluneView {
 
         if let Some(reason) = panel.form_error() {
             form = form.child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(Tone::Danger.text())
+                components::banner(Tone::Danger, metrics)
                     .debug_selector(|| "remote.form.error".to_owned())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     .child(SharedString::from(reason.to_owned())),
             );
         }
@@ -11787,6 +11924,165 @@ impl ShelluneView {
         ))
     }
 
+    pub(super) fn ask_batch_delete_hosts(&mut self, cx: &mut Context<Self>) {
+        self.host_fields = None;
+        self.protocol_fields = None;
+        self.jump_picker = None;
+        self.hosts.ask_batch_delete();
+        cx.notify();
+    }
+
+    fn cancel_batch_delete_hosts(&mut self, cx: &mut Context<Self>) {
+        self.hosts.cancel_batch_delete();
+        cx.notify();
+    }
+
+    fn confirm_batch_delete_hosts(&mut self, cx: &mut Context<Self>) {
+        let ids = self.hosts.take_batch_delete();
+        if ids.is_empty() {
+            return;
+        }
+        let mut next = self.book.clone();
+        let mut remembered = Vec::new();
+        for id in &ids {
+            if next.host(*id).is_some() {
+                match next.remove(*id) {
+                    Ok(removed) => {
+                        if removed.remembers_secret() {
+                            remembered.push(*id);
+                        }
+                    }
+                    Err(error) => {
+                        self.hosts.set_message(error.to_string(), true);
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        }
+        for id in &ids {
+            self.desktop_secrets.remove(id);
+        }
+        for id in remembered {
+            let _ = self.secrets.forget(id);
+        }
+        let count_str = ids.len().to_string();
+        let message = copy::fill(copy::ux().hosts_deleted_many, &[("count", &count_str)]);
+        self.commit_hosts(next, &message, cx);
+    }
+
+    pub(super) fn host_batch_delete_overlay(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        if self.workspace.destination() != Destination::Hosts
+            || !self.hosts.is_asking_batch_delete()
+        {
+            return None;
+        }
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let ux = copy::ux();
+        let selected_ids = self.hosts.selected().ids();
+        let count_str = selected_ids.len().to_string();
+        let question = copy::fill(ux.hosts_delete_selected_title, &[("count", &count_str)]);
+        let (header, subtitle) = self.modal_header_lead(
+            Some(components::modal_icon(
+                Icon::Trash,
+                Some(Tone::Danger),
+                metrics,
+            )),
+            question,
+            None,
+            None,
+            "hosts.batch_confirm.close",
+            cx,
+            |this, cx| this.cancel_batch_delete_hosts(cx),
+        );
+        const BATCH_DELETE_LIST_MAX_HEIGHT: f32 = 160.0;
+        let mut names_list = Self::close_question_list("hosts.batch_confirm.list", metrics)
+            .id("hosts.batch_confirm.list")
+            .max_h(metrics.scale(BATCH_DELETE_LIST_MAX_HEIGHT))
+            .overflow_y_scroll();
+        for id in selected_ids.iter().take(24) {
+            if let Some(host) = self.book.host(*id) {
+                names_list = names_list.child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .truncate()
+                        .child(SharedString::from(format!(
+                            "{} ({})",
+                            host.name(),
+                            host.target()
+                        ))),
+                );
+            }
+        }
+        if selected_ids.len() > 24 {
+            names_list = names_list.child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(SharedString::from(format!(
+                        "+{}",
+                        selected_ids.len() - 24
+                    ))),
+            );
+        }
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::TIGHT))
+            .px(metrics.scale(spacing::LOOSE))
+            .pt(metrics.scale(spacing::TIGHT))
+            .pb(metrics.scale(spacing::BASE))
+            .child(names_list)
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .child(ux.hosts_delete_selected_body),
+            )
+            .into_any_element();
+        let footer = components::modal_footer(metrics)
+            .child(
+                self.text_button(
+                    SharedString::from("hosts.batch_confirm.cancel"),
+                    strings.host_cancel,
+                    Variant::Ghost,
+                    cx,
+                    |view, cx| view.cancel_batch_delete_hosts(cx),
+                )
+                .h(metrics.control_height()),
+            )
+            .child(
+                self.text_button(
+                    SharedString::from("hosts.batch_confirm.delete"),
+                    ux.hosts_delete_selected,
+                    Variant::Danger,
+                    cx,
+                    |view, cx| view.confirm_batch_delete_hosts(cx),
+                )
+                .h(metrics.control_height()),
+            );
+        Some(self.modal(
+            window,
+            "hosts.batch_confirm",
+            460.0,
+            shell::ModalContent {
+                header,
+                subtitle,
+                body,
+                footer: Some(footer),
+            },
+        ))
+    }
+
     /// A small command button that runs one action.
     ///
     /// The variant carries the weight of the action, not its colour: a form's
@@ -12061,7 +12357,8 @@ impl ShelluneView {
                 .closing
                 .is_some_and(|id| self.close_needs_confirmation(id))
             || (self.workspace.destination() == Destination::Hosts
-                && self.hosts.pending_delete().is_some())
+                && (self.hosts.pending_delete().is_some()
+                    || self.hosts.is_asking_batch_delete()))
     }
 
     /// Keeps every shortcut but Escape from running while a question is up.
@@ -12247,6 +12544,57 @@ impl ShelluneView {
             self.cancel_delete_host(cx);
             return true;
         }
+        if self.workspace.destination() == Destination::Hosts
+            && self.hosts.is_asking_batch_delete()
+        {
+            self.cancel_batch_delete_hosts(cx);
+            return true;
+        }
+        if self.quick_open {
+            self.quick_open = false;
+            self.quick_error = None;
+            self.restore_focus_pending = true;
+            cx.notify();
+            return true;
+        }
+        if self.showing_connection_form
+            && self.remote.is_some()
+            && !self.connection_inline()
+            && !self.connection_behind_screen()
+        {
+            if self.form_session.is_some() {
+                self.hide_connection(cx);
+            } else {
+                self.close_remote(cx);
+            }
+            return true;
+        }
+        if self.import.is_open() {
+            self.close_import(cx);
+            return true;
+        }
+        if self.pending_exposure.is_some() {
+            self.pending_exposure = None;
+            cx.notify();
+            return true;
+        }
+        if self.forward_confirm.is_some() {
+            self.forward_confirm = None;
+            cx.notify();
+            return true;
+        }
+        if self.forwards.editor().is_some()
+            && (self.tool == Some(shell::Tool::Forwards)
+                || self.workspace.destination() == Destination::Forwards)
+        {
+            self.forwards.close_editor();
+            cx.notify();
+            return true;
+        }
+        if self.files_menu.is_some() {
+            self.close_files_menu(cx);
+            return true;
+        }
         if self.host_menu.is_some() {
             self.close_host_menu(window, cx);
             return true;
@@ -12269,8 +12617,11 @@ impl ShelluneView {
             cx.notify();
             return true;
         }
-        if self.tool == Some(shell::Tool::Snippets) {
+        if self.tool.is_some() {
             self.tool = None;
+            self.forwards.close_editor();
+            self.pending_exposure = None;
+            self.forward_confirm = None;
             self.restore_focus_pending = true;
             cx.notify();
             return true;
@@ -12304,9 +12655,33 @@ impl ShelluneView {
         // The file view itself is a place the keyboard can leave. It takes the
         // terminal's place while it is open, so without this a person who never
         // touches the pointer would be left in it (R4).
+        // A focused non-empty filter inside the file view clears its own phrase first
+        // before Escape closes the whole file view.
         if let Some(id) = self.active.filter(|id| self.files.is_open(*id)) {
+            for source in [FileSource::Remote, FileSource::Local] {
+                if let Some(field) = self.files_filter_fields.get(&(id, source)).cloned()
+                    && field.read(cx).focus_handle().is_focused(window)
+                    && !field.read(cx).text().is_empty()
+                {
+                    field.update(cx, |f, cx| f.set_text("", cx));
+                    self.files.set_filter(id, source, "");
+                    cx.notify();
+                    return true;
+                }
+            }
             self.toggle_files(id, cx);
             self.reclaim_focus(window, cx);
+            return true;
+        }
+        if self.workspace.destination() == Destination::Hosts
+            && self.hosts_search.read(cx).focus_handle().is_focused(window)
+            && !self.hosts.search().is_empty()
+        {
+            self.hosts_search
+                .update(cx, |field, cx| field.set_text("", cx));
+            self.hosts.set_search(String::new());
+            self.hosts_cursor = None;
+            cx.notify();
             return true;
         }
         // The banner over an ended or reconnecting terminal is the last thing Escape
@@ -12381,7 +12756,13 @@ impl ShelluneView {
         let divider = || components::menu_divider(metrics);
 
         let mut menu = components::menu_card("shell.picker", metrics)
+            .id("shell.picker.scroll")
             .w(metrics.scale(SHELL_PICKER_WIDTH))
+            .max_h(
+                (viewport.height - metrics.header_height() - metrics.scale(spacing::LOOSE))
+                    .max(metrics.scale(components::MENU_MIN_WIDTH)),
+            )
+            .overflow_y_scroll()
             .child(section(ux.home_local_section));
 
         if self.workspace.shells().is_empty() {
@@ -12992,14 +13373,27 @@ impl ShelluneView {
                 })
                 .unwrap_or_else(|| strings.files_other_side.to_owned());
             let full = label.clone();
+            let hover = theme::swatch(palette::SURFACE_HOVER);
             div().flex().flex_1().justify_end().min_w_0().child(
                 div()
                     .id("files.other")
                     .truncate()
+                    .px(metrics.scale(spacing::HAIRLINE))
+                    .py(px(components::HAIRLINE_WIDTH))
+                    .rounded(px(radius::SMALL))
+                    .cursor_pointer()
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .hover(move |style| {
+                        style
+                            .bg(hover)
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    })
                     .debug_selector(|| "files.other".to_owned())
                     .tooltip(components::tooltip(SharedString::from(full)))
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        view.files_show(id, hidden, cx);
+                    }))
                     .child(SharedString::from(label)),
             )
         });
@@ -13067,7 +13461,7 @@ impl ShelluneView {
                 .border_b_1()
                 .border_color(theme::swatch(palette::BORDER))
                 .debug_selector(|| "files.transfers".to_owned())
-                .child(self.transfers_heading(id))
+                .child(self.transfers_heading(id, cx))
                 .child(
                     div()
                         .id("files.transfers.scroll")
@@ -13635,6 +14029,29 @@ impl ShelluneView {
     // Changes to a remote directory (R11)
     // -----------------------------------------------------------------------
 
+    /// Asks for a folder path to jump directly to on one column.
+    fn files_ask_goto(&mut self, id: SessionId, source: FileSource, cx: &mut Context<Self>) {
+        let Some(browser) = self.files.browser_in(id, source) else {
+            return;
+        };
+        let initial = browser
+            .path()
+            .map(|path| display_path(source, path))
+            .unwrap_or_default();
+        let placeholder = copy::ux().files_go_to_path;
+        let field = cx.new(|cx| TextField::with_text(placeholder, &initial, cx));
+        self.open_files_dialog(
+            FilesDialog::GoTo {
+                session: id,
+                source,
+                text: initial,
+                problem: None,
+            },
+            field,
+            cx,
+        );
+    }
+
     /// Asks for the name of a new directory, without sending anything yet.
     fn files_new(&mut self, id: SessionId, source: FileSource, cx: &mut Context<Self>) {
         if self.files.browser_in(id, source).is_none() {
@@ -13900,6 +14317,33 @@ impl ShelluneView {
                 let _ = self.start_download(*session, remote, text, cx);
                 return;
             }
+            FilesDialog::GoTo {
+                session,
+                source,
+                text,
+                ..
+            } => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    if let Some(dialog) = self.files_dialog.as_mut() {
+                        dialog.fail_path(crate::app::transfers::PathProblem::Empty);
+                    }
+                    cx.notify();
+                    return;
+                }
+                let target = match source {
+                    FileSource::Local => {
+                        crate::app::files::local_os_to_protocol(std::path::Path::new(trimmed))
+                    }
+                    FileSource::Remote => trimmed.to_owned(),
+                };
+                self.files_dialog = None;
+                self.clear_files_fields();
+                self.files_go(*session, *source, &target, cx);
+                self.watch_files(cx);
+                self.restore_files_focus(*source, cx);
+                return;
+            }
             FilesDialog::NewDirectory { .. }
             | FilesDialog::Rename { .. }
             | FilesDialog::Delete { .. } => {}
@@ -13943,7 +14387,9 @@ impl ShelluneView {
                     .delete_many(*session, *source, &names)
                     .map(|_| ())
             }
-            FilesDialog::Upload { .. } | FilesDialog::Download { .. } => Ok(()),
+            FilesDialog::Upload { .. }
+            | FilesDialog::Download { .. }
+            | FilesDialog::GoTo { .. } => Ok(()),
         };
         match sent {
             Ok(()) => {
@@ -14199,12 +14645,50 @@ impl ShelluneView {
             .is_some_and(|(at, stop)| at == source && stop == FilesStop::Body);
         if on_the_listing
             && (modifiers.control || modifiers.platform)
-            && key == "a"
             && !modifiers.alt
         {
-            self.files.mark_all(id, source, true);
-            cx.notify();
-            return true;
+            match key {
+                "a" if !modifiers.shift => {
+                    self.files.mark_all(id, source, true);
+                    cx.notify();
+                    return true;
+                }
+                "g" if !modifiers.shift => {
+                    self.files_ask_goto(id, source, cx);
+                    return true;
+                }
+                "n" if modifiers.shift => {
+                    self.files_new(id, source, cx);
+                    return true;
+                }
+                "c" if !modifiers.shift => {
+                    if !self.files.marked(id, source).is_empty() {
+                        self.files_copy_marked(id, source, cx);
+                        return true;
+                    }
+                    if let Some(name) = self.files.selected(id, source).map(str::to_owned)
+                        && let Some(dir) = self
+                            .files
+                            .browser_in(id, source)
+                            .and_then(|browser| browser.current_directory())
+                    {
+                        let path = shellune_core::join_path(dir, &name);
+                        let copied = match source {
+                            FileSource::Local => files_menu::native_local_path(&path),
+                            FileSource::Remote => path,
+                        };
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copied.clone()));
+                        self.toast(
+                            Tone::Positive,
+                            copy::ux().toast_path_copied,
+                            Some(copied),
+                            cx,
+                        );
+                        return true;
+                    }
+                }
+                _ => {}
+            }
         }
         if on_the_listing
             && modifiers.shift
@@ -14900,6 +15384,13 @@ impl ShelluneView {
             }
         };
         self.files.select(id, source, Some(names[next].clone()));
+        let has_parent = self
+            .files
+            .browser_in(id, source)
+            .and_then(|browser| browser.path())
+            .is_some_and(|path| path != "/");
+        self.files_list_scroll(source)
+            .scroll_to_item(1 + usize::from(has_parent) + next);
         cx.notify();
     }
 
@@ -15184,14 +15675,23 @@ impl ShelluneView {
         if remote {
             tools = tools.child(self.files_follow_button(id, cx));
         }
-        tools = tools.child(self.row_icon_button(
-            files_element_id(source, "new"),
-            Icon::FolderPlus,
-            strings.files_new,
-            false,
-            cx,
-            move |view, cx| view.files_new(id, source, cx),
-        ));
+        tools = tools
+            .child(self.row_icon_button(
+                files_element_id(source, "goto"),
+                Icon::FolderOpen,
+                ux.files_go_to_path,
+                false,
+                cx,
+                move |view, cx| view.files_ask_goto(id, source, cx),
+            ))
+            .child(self.row_icon_button(
+                files_element_id(source, "new"),
+                Icon::FolderPlus,
+                strings.files_new,
+                false,
+                cx,
+                move |view, cx| view.files_new(id, source, cx),
+            ));
         if remote {
             tools = tools.child(
                 self.icon_text_button(
@@ -15345,6 +15845,25 @@ impl ShelluneView {
                             .child(SharedString::from(label)),
                     ),
             );
+        }
+        if path.is_some() {
+            let copy_path_text = shown_path.clone();
+            crumb_row = crumb_row.child(self.row_icon_button(
+                files_element_id(source, "path.copy"),
+                Icon::Copy,
+                ux.files_copy_path,
+                false,
+                cx,
+                move |view, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_path_text.clone()));
+                    view.toast(
+                        Tone::Positive,
+                        copy::ux().toast_path_copied,
+                        Some(copy_path_text.clone()),
+                        cx,
+                    );
+                },
+            ));
         }
 
         let body: gpui::AnyElement = match &state {
@@ -15620,48 +16139,102 @@ impl ShelluneView {
         panel.child(content)
     }
 
+    /// Clears finished transfers across all sessions or for one session, updating the
+    /// workspace's transfer section state.
+    pub(super) fn clear_finished_transfers(
+        &mut self,
+        session: Option<SessionId>,
+        cx: &mut Context<Self>,
+    ) {
+        match session {
+            Some(id) => {
+                self.transfers.clear_finished_for_session(id);
+                if self.transfer_problem.as_ref().is_some_and(|(s, _)| *s == id) {
+                    self.transfer_problem = None;
+                }
+                if self
+                    .transfer_skipped_folders
+                    .as_ref()
+                    .is_some_and(|(s, _)| *s == id)
+                {
+                    self.transfer_skipped_folders = None;
+                }
+            }
+            None => {
+                self.transfers.clear_finished();
+                self.transfer_problem = None;
+                self.transfer_skipped_folders = None;
+            }
+        }
+        self.sync_transfer_section();
+        cx.notify();
+    }
+
     /// Title and count for the transfer strip. They sit above the scroller so its
     /// clip cannot cut the first line of glyphs (R4).
-    fn transfers_heading(&self, id: SessionId) -> Div {
+    fn transfers_heading(&self, id: SessionId, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
+        let ux = copy::ux();
         let active = self
             .transfers
             .for_session(id)
             .filter(|task| task.is_active())
             .count();
+        let clearable = self.transfers.has_finished_for_session(id)
+            || self.transfer_problem.as_ref().is_some_and(|(s, _)| *s == id)
+            || self
+                .transfer_skipped_folders
+                .as_ref()
+                .is_some_and(|(s, _)| *s == id);
         // The strip's own toolbar line: what it is and how many tasks still run.
         div()
             .flex()
             .flex_none()
             .items_center()
+            .justify_between()
             .flex_wrap()
             .gap(metrics.scale(spacing::NARROW))
             .debug_selector(|| "transfers.heading".to_owned())
-            .child(icons::icon(
-                Icon::Transfer,
-                metrics.small_icon_size(),
-                theme::swatch(palette::TEXT_MUTED),
-            ))
             .child(
                 div()
-                    .text_size(metrics.caption_size())
-                    .font_weight(metrics.medium_weight())
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .child(SharedString::from(strings.transfers_heading)),
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::NARROW))
+                    .child(icons::icon(
+                        Icon::Transfer,
+                        metrics.small_icon_size(),
+                        theme::swatch(palette::TEXT_MUTED),
+                    ))
+                    .child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .font_weight(metrics.medium_weight())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(strings.transfers_heading)),
+                    )
+                    .child(
+                        components::badge(
+                            active,
+                            if active > 0 {
+                                Tone::Accent
+                            } else {
+                                Tone::Neutral
+                            },
+                            metrics,
+                        )
+                        .debug_selector(|| "transfers.count".to_owned()),
+                    ),
             )
-            .child(
-                components::badge(
-                    active,
-                    if active > 0 {
-                        Tone::Accent
-                    } else {
-                        Tone::Neutral
-                    },
-                    metrics,
-                )
-                .debug_selector(|| "transfers.count".to_owned()),
-            )
+            .when(clearable, |row| {
+                row.child(self.text_button(
+                    SharedString::from("transfers.clear_finished"),
+                    ux.transfers_clear_finished,
+                    Variant::Ghost,
+                    cx,
+                    move |view, cx| view.clear_finished_transfers(Some(id), cx),
+                ))
+            })
     }
 
     /// The transfers of one session: their state, their progress and the actions left (R10).
@@ -16235,12 +16808,14 @@ impl ShelluneView {
         // control the keyboard just reached into its slice (R4).
         let mut rows: Vec<(Vec<FilesStop>, Div)> = Vec::new();
 
+        let ux = copy::ux();
         let (heading, icon) = match dialog {
             FilesDialog::NewDirectory { .. } => (strings.files_new, Icon::FolderPlus),
             FilesDialog::Rename { .. } => (strings.files_rename, Icon::Pencil),
             FilesDialog::Delete { .. } => (strings.files_delete, Icon::Trash),
             FilesDialog::Upload { .. } => (strings.transfers_upload, Icon::Upload),
             FilesDialog::Download { .. } => (strings.transfers_download, Icon::Download),
+            FilesDialog::GoTo { .. } => (ux.files_go_to_title, Icon::FolderOpen),
         };
         // The question stays in its column, where the keyboard already is, and is headed
         // the way a dialog is: the action's icon in its tone and the plain words (R6).
@@ -16254,7 +16829,8 @@ impl ShelluneView {
             FilesDialog::NewDirectory { .. }
             | FilesDialog::Rename { .. }
             | FilesDialog::Upload { .. }
-            | FilesDialog::Download { .. } => {
+            | FilesDialog::Download { .. }
+            | FilesDialog::GoTo { .. } => {
                 // Each question names the object it would act on: a new folder goes into
                 // the directory on screen, a rename keeps the entry's full path, an upload
                 // names the directory its file would land in, and a download names the
@@ -16414,6 +16990,7 @@ impl ShelluneView {
                     FilesDialog::Rename { .. } => strings.files_rename_confirm,
                     FilesDialog::Upload { .. } => strings.transfers_upload_confirm,
                     FilesDialog::Download { .. } => strings.transfers_download_confirm,
+                    FilesDialog::GoTo { .. } => ux.files_go_to_action,
                     _ => strings.files_create,
                 };
                 rows.push((
@@ -17147,8 +17724,26 @@ impl ShelluneView {
         if openable {
             let open_name = name.to_owned();
             entry_row = entry_row.cursor_pointer().on_click(cx.listener(
-                move |view, _event, _window, cx| {
-                    view.files_enter(id, source, &open_name, cx);
+                move |view, event: &gpui::ClickEvent, _window, cx| {
+                    let modifiers = event.modifiers();
+                    if modifiers.shift {
+                        cx.stop_propagation();
+                        let anchor = view
+                            .files
+                            .selected(id, source)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| open_name.clone());
+                        view.files.mark_range(id, source, &anchor, &open_name);
+                        view.files.select(id, source, Some(open_name.clone()));
+                        cx.notify();
+                    } else if modifiers.control || modifiers.platform {
+                        cx.stop_propagation();
+                        view.files.toggle_mark(id, source, &open_name);
+                        view.files.select(id, source, Some(open_name.clone()));
+                        cx.notify();
+                    } else {
+                        view.files_enter(id, source, &open_name, cx);
+                    }
                 },
             ));
         } else if let Some(directory) = self
@@ -18041,8 +18636,13 @@ impl ShelluneView {
         .flex_shrink()
         .min_w(self.tab_min_width() + mark_room)
         .tooltip(components::tooltip(tooltip))
-        .on_click(cx.listener(move |this, _event, window, cx| {
+        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
             this.activate_in(id, window, cx);
+            if event.click_count() == 2
+                && let Some(tab) = this.workspace.tab_of_session(id)
+            {
+                this.open_tab_rename(tab, window, cx);
+            }
         }))
         // A middle click closes a tab and a right click offers the other tab
         // actions, as in a browser or any other tabbed terminal.
@@ -18125,10 +18725,10 @@ impl ShelluneView {
             this.request_close_tab_anchor(id, cx);
         }));
         if compact {
-            let fill = if selected {
-                palette::RAISED
+            let backing = if selected {
+                theme::swatch(palette::RAISED)
             } else {
-                palette::SURFACE_HOVER
+                theme::swatch_over(palette::SURFACE_HOVER, palette::CHROME)
             };
             tab.child(body).child(
                 div()
@@ -18138,7 +18738,7 @@ impl ShelluneView {
                     .right(metrics.scale(spacing::HALF))
                     .flex()
                     .items_center()
-                    .child(close.bg(theme::swatch(fill))),
+                    .child(div().rounded(px(radius::SMALL)).bg(backing).child(close)),
             )
         } else {
             tab.child(body).child(close)
@@ -18765,6 +19365,30 @@ impl ShelluneView {
                             .text_color(theme::swatch(palette::TEXT_SECONDARY))
                             .child(SharedString::from(summary)),
                     )
+                    .children(match transfer.state() {
+                        shellune_core::TransferState::Running { total: Some(_), .. } => {
+                            let permille =
+                                transfer.state().permille().unwrap_or(0).min(1000) as f32;
+                            Some(
+                                div()
+                                    .flex()
+                                    .flex_none()
+                                    .w_full()
+                                    .min_w_0()
+                                    .debug_selector(move || {
+                                        format!("transfers.center.progress.{index}")
+                                    })
+                                    .child(components::progress_bar(
+                                        SharedString::from(format!(
+                                            "transfers.center.progress.bar.{index}"
+                                        )),
+                                        components::Progress::Determinate(permille / 1000.0),
+                                        metrics,
+                                    )),
+                            )
+                        }
+                        _ => None,
+                    })
                     .child(actions),
             )
             .child(components::chip(
@@ -18909,17 +19533,24 @@ impl Render for ShelluneView {
             window.focus(&handle);
         }
         if std::mem::take(&mut self.focus_host_dialog) {
-            // The address is the first thing either form asks for, and it has to be the
-            // one of the form that is open: focusing the SSH field while another
-            // protocol's form is up leaves the keyboard in a field nobody can see (R7).
+            // The first field of whichever form is open gets the keyboard: address for SSH,
+            // RDP and VNC, and device for Serial (R7).
             let handle = if self.hosts.draft().is_some() {
                 self.host_fields
                     .as_ref()
                     .map(|fields| fields.address.read(cx).focus_handle().clone())
             } else {
-                self.protocol_fields
-                    .as_ref()
-                    .map(|fields| fields.address.read(cx).focus_handle().clone())
+                let is_serial = self
+                    .hosts
+                    .protocol_draft()
+                    .is_some_and(|draft| draft.protocol() == ProtocolKind::Serial);
+                self.protocol_fields.as_ref().map(|fields| {
+                    if is_serial {
+                        fields.device.read(cx).focus_handle().clone()
+                    } else {
+                        fields.address.read(cx).focus_handle().clone()
+                    }
+                })
             };
             if let Some(handle) = handle {
                 self.remember_focus(window, cx);
@@ -19057,6 +19688,12 @@ impl Render for ShelluneView {
                         }
                         "enter" => {
                             this.confirm_paste_prompt(cx);
+                        }
+                        "up" | "down" | "pageup" | "pagedown" | "home" | "end"
+                            if !event.keystroke.modifiers.modified() =>
+                        {
+                            scroll_by_key(&this.paste_scroll, event.keystroke.key.as_str());
+                            cx.notify();
                         }
                         _ => {}
                     }
@@ -19201,8 +19838,8 @@ impl Render for ShelluneView {
             .on_action(cx.listener(|this, _: &SplitPaneDown, window, cx| {
                 this.split_active(SplitAxis::TopBottom, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &ZoomPane, _window, cx| {
-                this.toggle_active_zoom(cx);
+            .on_action(cx.listener(|this, _: &ZoomPane, window, cx| {
+                this.toggle_active_zoom(window, cx);
             }))
             .on_action(cx.listener(|this, _: &FocusPaneLeft, window, cx| {
                 this.focus_direction(crate::app::layout::Direction::Left, window, cx);
@@ -19290,6 +19927,7 @@ impl Render for ShelluneView {
             connection_dialog,
             self.group_dialog_overlay(window, cx),
             self.host_delete_overlay(window, cx),
+            self.host_batch_delete_overlay(window, cx),
             self.backup_overlay(window, cx),
             self.sync_overlay(window, cx),
             self.update_overlay(window, cx),
@@ -19712,7 +20350,7 @@ fn tab_accent_mark(accent: TabAccent, metrics: Metrics, selector: String) -> Div
 /// five Latin characters at roughly 0.6 em each and "结束" two full-width ones, both
 /// under the three em reserved here.
 fn attention_mark_room(unread: UnreadNotices, metrics: Metrics) -> gpui::Pixels {
-    let word = metrics.caption_size() * 3.0 + metrics.scale(spacing::TIGHT - 1.0);
+    let word = metrics.caption_size() * 3.0 + metrics.scale(spacing::TIGHT + spacing::TIGHT - 1.0);
     let mut room = px(0.0);
     if unread.bell {
         room += word;
@@ -19749,6 +20387,9 @@ fn tab_attention_marks(
         marks.push(
             div()
                 .flex_none()
+                .px(metrics.scale(spacing::HAIRLINE))
+                .rounded(px(radius::SMALL))
+                .bg(Tone::Accent.chip_background())
                 .text_size(metrics.caption_size())
                 .font_weight(FontWeight::MEDIUM)
                 // The accent says "new", never which kind: the word already does, and a
