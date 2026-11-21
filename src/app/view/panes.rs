@@ -549,9 +549,26 @@ impl ShelluneView {
     }
 
     /// Lightweight, discoverable corner affordance to leave focus mode without blocking
-    /// authentication, certificate, failure banners or the top-centre desktop reveal zone (R1).
+    /// authentication, certificate, failure banners or remote window controls (R1, R2).
+    ///
+    /// Live RDP/VNC surfaces omit a permanently resident floating pill so remote window
+    /// chrome and hit targets are never occluded; focus mode is toggled via `view.focus`
+    /// (`Alt+Shift+F` / `Opt+Shift+F`). Non-desktop and non-picture views anchor the
+    /// exit control at the bottom-right with `.occlude()` and mouse-down propagation
+    /// stopped so clicks never bleed through to the underlying pane.
     fn focus_mode_exit_pill(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         if !self.focus_mode || self.desktop_fullscreen.is_some() {
+            return None;
+        }
+        let session_id = if self.workspace.layout().active_tab().is_some() {
+            self.workspace.layout().active_session()
+        } else {
+            self.active
+        };
+        let live_desktop = session_id
+            .and_then(|id| self.desktop_for(id))
+            .is_some_and(|pane| !pane.read(cx).surface().is_empty());
+        if live_desktop {
             return None;
         }
         let metrics = self.metrics();
@@ -563,8 +580,12 @@ impl ShelluneView {
         Some(
             div()
                 .absolute()
-                .top(metrics.scale(spacing::TIGHT))
+                .bottom(metrics.scale(spacing::TIGHT))
                 .right(metrics.scale(spacing::TIGHT))
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
                 .flex()
                 .items_center()
                 .rounded(px(radius::MEDIUM))
@@ -578,6 +599,7 @@ impl ShelluneView {
                         .debug_selector(|| "focus.mode.exit".to_owned())
                         .tooltip(crate::app::components::tooltip(SharedString::from(tooltip)))
                         .on_click(cx.listener(|this, _event, window, cx| {
+                            cx.stop_propagation();
                             this.toggle_focus_mode(window, cx);
                         })),
                 ),

@@ -26,9 +26,11 @@ use crate::app::actions::{
     NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination, PreviousTab,
     ReconnectSession, ResizePaneDown, ResizePaneLeft, ResizePaneRight, ResizePaneUp, SelectTab1,
     SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9,
-    SplitPaneDown, SplitPaneRight, TerminalCopy, TerminalPaste, TerminalSearch, ToggleFocusMode,
-    ToggleLanguage, ToggleSidebar, ZoomPane,
+    SplitPaneDown, SplitPaneRight, TerminalCopy, TerminalPaste, TerminalSearch, ToggleLanguage,
+    ToggleSidebar, ZoomPane,
 };
+
+gpui::actions!(shellune, [ToggleFocusMode]);
 use crate::app::copy::Locale;
 use crate::app::nav::{Destination, Platform};
 use shellune_storage::{KeymapEntry, KeymapPreferences};

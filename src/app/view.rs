@@ -44,9 +44,10 @@ use crate::app::actions::{
     MovePaneUp, MoveTabLeft, MoveTabRight, NewLocalShell, NextDestination, NextTab, OpenPalette,
     PreviousDestination, PreviousTab, ReconnectSession, ResizePaneDown, ResizePaneLeft,
     ResizePaneRight, ResizePaneUp, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5,
-    SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitPaneDown, SplitPaneRight, ToggleFocusMode,
-    ToggleLanguage, ToggleSidebar, ZoomPane,
+    SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitPaneDown, SplitPaneRight, ToggleLanguage,
+    ToggleSidebar, ZoomPane,
 };
+use crate::app::keymap::ToggleFocusMode;
 use crate::app::components::{ControlState, Variant};
 use crate::app::copy::{self, Locale, Strings};
 #[cfg(any(test, feature = "ui-capture"))]
