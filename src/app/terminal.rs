@@ -687,6 +687,8 @@ pub struct TerminalPane {
     /// then it closes the bar and gives the terminal back (R1, R4).
     search_focused: bool,
     search_query: String,
+    /// Byte offset of the editing caret inside [`Self::search_query`].
+    search_cursor: usize,
     /// Why the query could not be compiled, in the expression engine's words.
     ///
     /// An unusable expression is its own answer: it is never drawn as "no matches".
@@ -900,6 +902,7 @@ impl TerminalPane {
             bar_has_slot: std::cell::Cell::new(false),
             search_focused: false,
             search_query: String::new(),
+            search_cursor: 0,
             search_error: None,
             input_busy: false,
             output_search_at: None,
@@ -977,6 +980,7 @@ impl TerminalPane {
             bar_has_slot: std::cell::Cell::new(false),
             search_focused: false,
             search_query: String::new(),
+            search_cursor: 0,
             search_error: None,
             input_busy: false,
             output_search_at: None,
@@ -1053,6 +1057,7 @@ impl TerminalPane {
             bar_has_slot: std::cell::Cell::new(false),
             search_focused: false,
             search_query: String::new(),
+            search_cursor: 0,
             search_error: None,
             input_busy: false,
             output_search_at: None,
@@ -1213,6 +1218,7 @@ impl TerminalPane {
             bar_has_slot: std::cell::Cell::new(false),
             search_focused: false,
             search_query: String::new(),
+            search_cursor: 0,
             search_error: None,
             input_busy: false,
             output_search_at: None,
@@ -1410,6 +1416,7 @@ impl TerminalPane {
             bar_has_slot: std::cell::Cell::new(false),
             search_focused: false,
             search_query: String::new(),
+            search_cursor: 0,
             search_error: None,
             input_busy: false,
             output_search_at: None,
@@ -2017,18 +2024,15 @@ impl TerminalPane {
             return;
         }
 
-        // While the find bar holds the keyboard, the keys that edit and leave it are
-        // the bar's: Escape closes it and hands the terminal back, Enter steps to the
-        // next match and Shift+Enter to the previous one, Alt+C turns the case switch
-        // over and Alt+R the expression switch, so a complete search — including its
-        // two switches — can be run without a pointer (R1, R4). None of these reaches
-        // the shell. They are the bar's only while it holds the keyboard: the terminal
-        // keeps Alt+C and Alt+R whenever the keys are its own.
-        if self.search_focused && self.search_open && !self.alternate_screen() {
-            // Alt alone, without Ctrl or ⌘, is a bar key rather than a program
-            // combination. Shift is left to the program so the pairs other programs
-            // read stay intact.
+        // While the find bar holds the keyboard, every editing, navigation and control
+        // key belongs to the query rather than the shell (R3): Escape closes the bar and
+        // hands the terminal back, Enter/Shift+Enter step through hits, Alt+C/Alt+R toggle
+        // switches, arrow/Home/End/Backspace/Delete/Ctrl editing keys edit the query in
+        // place, and no unhandled control or navigation key may fall through to
+        // `encode_key -> write_input` or pull a parked viewport back to the bottom.
+        if self.search_captures_keyboard() {
             let bar_alt = modifiers.alt && !modifiers.control && !modifiers.platform;
+            let ctrl_only = modifiers.control && !modifiers.alt && !modifiers.platform;
             match keystroke.key.as_str() {
                 "escape" if plain => {
                     self.close_search(window, cx);
@@ -2045,10 +2049,84 @@ impl TerminalPane {
                     return;
                 }
                 "backspace" if plain => {
-                    self.search_query.pop();
-                    self.refresh_search(true);
+                    self.delete_search_backward(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "backspace" | "w" if ctrl_only && !modifiers.shift => {
+                    self.delete_search_word_backward(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "delete" if plain => {
+                    self.delete_search_forward(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "left" if plain => {
+                    self.clamp_search_cursor();
+                    self.search_cursor = self.prev_search_boundary(self.search_cursor);
                     cx.stop_propagation();
                     cx.notify();
+                    return;
+                }
+                "left" if ctrl_only => {
+                    self.clamp_search_cursor();
+                    self.search_cursor = self.prev_search_word_boundary(self.search_cursor);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "right" if plain => {
+                    self.clamp_search_cursor();
+                    self.search_cursor = self.next_search_boundary(self.search_cursor);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "home" if plain => {
+                    self.search_cursor = 0;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "end" if plain => {
+                    self.search_cursor = self.search_query.len();
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "a" if ctrl_only && !modifiers.shift => {
+                    self.search_cursor = 0;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "e" if ctrl_only && !modifiers.shift => {
+                    self.search_cursor = self.search_query.len();
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "u" if ctrl_only && !modifiers.shift => {
+                    self.clamp_search_cursor();
+                    if self.search_cursor > 0 {
+                        self.search_query.drain(..self.search_cursor);
+                        self.search_cursor = 0;
+                        self.refresh_search(true);
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                "k" if ctrl_only && !modifiers.shift => {
+                    self.clamp_search_cursor();
+                    if self.search_cursor < self.search_query.len() {
+                        self.search_query.truncate(self.search_cursor);
+                        self.refresh_search(true);
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
                     return;
                 }
                 "c" if bar_alt && !modifiers.shift => {
@@ -2061,7 +2139,25 @@ impl TerminalPane {
                     cx.stop_propagation();
                     return;
                 }
-                _ => {}
+                "g" if ctrl_only && modifiers.shift => {
+                    self.next_search_hit(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {
+                    if modifiers.platform {
+                        return;
+                    }
+                    // Consume any control, alt, navigation or function key so it can
+                    // never fall through to the shell. Plain printable characters stay
+                    // un-stopped so GPUI's input handler commits them into the query.
+                    let encoded = Key::from_name(&keystroke.key)
+                        .is_some_and(|key| encode_key(key, modifiers, self.core.mode()).is_some());
+                    if modifiers.control || modifiers.alt || encoded {
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
             }
         }
 
@@ -2205,14 +2301,19 @@ impl TerminalPane {
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
-        if let Some(text) = item.text().filter(|text| !text.is_empty()) {
-            if self.search_focused && self.search_open && !self.alternate_screen() {
+        if self.search_captures_keyboard() {
+            if let Some(text) = item.text().filter(|text| !text.is_empty()) {
                 // Line breaks have no meaning in a query: a pasted block becomes one
                 // line, exactly as a single-line field would take it.
                 let query = text.lines().collect::<Vec<_>>().join(" ");
                 self.append_search_query(&query, cx);
-                return;
             }
+            // Image-only or empty clipboards are ignored while the find bar owns the
+            // keyboard so neither Ctrl+V (0x16) nor a remote image upload leaks to the
+            // shell behind the bar (R3).
+            return;
+        }
+        if let Some(text) = item.text().filter(|text| !text.is_empty()) {
             self.stage_paste(&text, cx);
             return;
         }
@@ -2487,9 +2588,92 @@ impl TerminalPane {
         }
     }
 
+    fn search_captures_keyboard(&self) -> bool {
+        self.search_focused && self.search_open && !self.alternate_screen()
+    }
+
+    fn clamp_search_cursor(&mut self) {
+        let mut cursor = self.search_cursor.min(self.search_query.len());
+        while cursor > 0 && !self.search_query.is_char_boundary(cursor) {
+            cursor -= 1;
+        }
+        self.search_cursor = cursor;
+    }
+
+    fn prev_search_boundary(&self, cursor: usize) -> usize {
+        self.search_query[..cursor]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(index, _)| index)
+    }
+
+    fn next_search_boundary(&self, cursor: usize) -> usize {
+        self.search_query[cursor..]
+            .chars()
+            .next()
+            .map_or(cursor, |ch| cursor + ch.len_utf8())
+    }
+
+    fn prev_search_word_boundary(&self, cursor: usize) -> usize {
+        let mut pos = cursor;
+        while pos > 0 {
+            let prev = self.prev_search_boundary(pos);
+            let ch = self.search_query[prev..pos].chars().next().unwrap_or(' ');
+            if !ch.is_whitespace() {
+                break;
+            }
+            pos = prev;
+        }
+        while pos > 0 {
+            let prev = self.prev_search_boundary(pos);
+            let ch = self.search_query[prev..pos].chars().next().unwrap_or(' ');
+            if ch.is_whitespace() {
+                break;
+            }
+            pos = prev;
+        }
+        pos
+    }
+
+    fn delete_search_backward(&mut self, cx: &mut Context<Self>) {
+        self.clamp_search_cursor();
+        if self.search_cursor == 0 {
+            return;
+        }
+        let prev = self.prev_search_boundary(self.search_cursor);
+        self.search_query.drain(prev..self.search_cursor);
+        self.search_cursor = prev;
+        self.refresh_search(true);
+        cx.notify();
+    }
+
+    fn delete_search_word_backward(&mut self, cx: &mut Context<Self>) {
+        self.clamp_search_cursor();
+        if self.search_cursor == 0 {
+            return;
+        }
+        let prev = self.prev_search_word_boundary(self.search_cursor);
+        self.search_query.drain(prev..self.search_cursor);
+        self.search_cursor = prev;
+        self.refresh_search(true);
+        cx.notify();
+    }
+
+    fn delete_search_forward(&mut self, cx: &mut Context<Self>) {
+        self.clamp_search_cursor();
+        if self.search_cursor >= self.search_query.len() {
+            return;
+        }
+        let next = self.next_search_boundary(self.search_cursor);
+        self.search_query.drain(self.search_cursor..next);
+        self.refresh_search(true);
+        cx.notify();
+    }
+
     fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_open = true;
         self.search_focused = true;
+        self.search_cursor = self.search_query.len();
         // The top row, taken before anything scrolls, so closing puts the reader
         // back on the line they were reading rather than at the bottom of a live
         // shell. The anchor, not the display offset: new output while this row is
@@ -2505,6 +2689,8 @@ impl TerminalPane {
         self.search_open = false;
         self.search_focused = false;
         self.search_query.clear();
+        self.search_cursor = 0;
+        self.marked = None;
         self.search_hits.clear();
         self.search_at = 0;
         self.search_mark = None;
@@ -2621,7 +2807,9 @@ impl TerminalPane {
         if text.is_empty() {
             return;
         }
-        self.search_query.push_str(text);
+        self.clamp_search_cursor();
+        self.search_query.insert_str(self.search_cursor, text);
+        self.search_cursor += text.len();
         self.refresh_search(true);
         cx.notify();
     }
@@ -3276,7 +3464,8 @@ impl TerminalPane {
         let strings = self.locale.strings();
         let viewport = window.viewport_size();
         let can_copy = self.core.has_selection();
-        let can_paste = if self.search_focused && self.search_open {
+        let can_search = !self.alternate_screen();
+        let can_paste = if self.search_captures_keyboard() {
             cx.read_from_clipboard()
                 .and_then(|item| item.text())
                 .is_some_and(|text| !text.is_empty())
@@ -3374,13 +3563,15 @@ impl TerminalPane {
                     strings.terminal_search,
                     Icon::Search,
                     &self.shortcuts.search,
-                    true,
+                    can_search,
                     "terminal.menu.search",
                 )
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    this.menu = None;
-                    this.toggle_search(window, cx);
-                })),
+                .when(can_search, |item| {
+                    item.on_click(cx.listener(|this, _event, window, cx| {
+                        this.menu = None;
+                        this.toggle_search(window, cx);
+                    }))
+                }),
             )
             .when(scrolled_back, |menu| {
                 menu.child(
@@ -4535,6 +4726,9 @@ impl TerminalPane {
     }
 
     fn composition_overlay(&self, snapshot: &Snapshot) -> Option<gpui::Div> {
+        if self.search_captures_keyboard() {
+            return None;
+        }
         let marked = self.marked.as_ref()?;
         let cell = self.cell.sanitized();
         let cursor = snapshot.cursor?;
@@ -4719,12 +4913,19 @@ impl TerminalPane {
     /// line instead of running past the pane (R4).
     fn search_bar(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
         let strings = self.locale.strings();
-        let empty_query = self.search_query.is_empty();
-        let query = if empty_query {
-            strings.terminal_search.to_owned()
+        let focused = self.search_focused;
+        let inline_marked = if self.search_captures_keyboard() {
+            self.marked.as_deref().filter(|text| !text.is_empty())
         } else {
-            self.search_query.clone()
+            None
         };
+        let empty_query = self.search_query.is_empty() && inline_marked.is_none();
+        let mut cursor = self.search_cursor.min(self.search_query.len());
+        while cursor > 0 && !self.search_query.is_char_boundary(cursor) {
+            cursor -= 1;
+        }
+        let before = &self.search_query[..cursor];
+        let after = &self.search_query[cursor..];
         // The count, the empty result and the invalid-expression reason are whole
         // sentences. The reason for `a{2,1}` is wider than one pane of a sideways
         // split (354 px at the minimum window). A note that cannot shrink is drawn
@@ -4762,7 +4963,6 @@ impl TerminalPane {
             ),
         };
 
-        let focused = self.search_focused;
         let accent = theme::swatch(shell_palette::ACCENT);
         // The placeholder is a sentence. A field that shrinks to a few letters and
         // then truncates cuts it through a word ("Search this te"), and the pane
@@ -4777,6 +4977,61 @@ impl TerminalPane {
         let query_field_floor = query_text_floor
             + metrics.scale(spacing::HAIRLINE) * 2.0
             + px(components::HAIRLINE_WIDTH * 2.0);
+        let query_content = if empty_query {
+            div()
+                .flex_1()
+                .min_w(query_text_floor)
+                .whitespace_normal()
+                .debug_selector(|| "terminal.search.query".to_owned())
+                .font_family(monospace_family())
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(shell_palette::TEXT_MUTED))
+                .child(SharedString::from(strings.terminal_search.to_owned()))
+        } else {
+            div()
+                .flex()
+                .items_center()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .debug_selector(|| "terminal.search.query".to_owned())
+                .font_family(monospace_family())
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
+                .when(!before.is_empty(), |row| {
+                    row.child(SharedString::from(before.to_owned()))
+                })
+                .when_some(inline_marked, |row, marked| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .px(px(spacing::HALF))
+                            .bg(theme::swatch_over(
+                                shell_palette::SURFACE_SELECTED,
+                                shell_palette::SURFACE,
+                            ))
+                            .border_b_1()
+                            .border_color(accent)
+                            .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
+                            .debug_selector(|| "terminal.search.composition".to_owned())
+                            .child(SharedString::from(marked.to_owned())),
+                    )
+                })
+                .when(focused, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .w(px(CARET_WIDTH))
+                            .h(metrics.caption_size())
+                            .bg(accent)
+                            .debug_selector(|| "terminal.search.caret".to_owned()),
+                    )
+                })
+                .when(!after.is_empty(), |row| {
+                    row.child(SharedString::from(after.to_owned()))
+                })
+        };
         let mut bar = div()
             .flex()
             .flex_wrap()
@@ -4800,6 +5055,9 @@ impl TerminalPane {
                         MouseButton::Left,
                         cx.listener(|this, _event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
+                            if !this.search_focused {
+                                this.search_cursor = this.search_query.len();
+                            }
                             this.search_focused = true;
                             window.focus(&this.focus);
                             cx.notify();
@@ -4809,10 +5067,11 @@ impl TerminalPane {
                         field.flex_none().min_w(query_field_floor)
                     })
                     .when(!empty_query, |field| {
-                        field.flex_1().min_w(px(SEARCH_QUERY_MIN_WIDTH))
+                        field.flex_1().min_w(metrics.scale(SEARCH_QUERY_MIN_WIDTH))
                     })
                     .max_w_full()
                     .rounded(px(radius::SMALL))
+                    .bg(theme::swatch(shell_palette::SURFACE))
                     .border_1()
                     .border_color(if focused {
                         accent
@@ -4835,26 +5094,7 @@ impl TerminalPane {
                             "terminal.search.keyboard.terminal".to_owned()
                         }
                     })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(if empty_query {
-                                query_text_floor
-                            } else {
-                                px(0.0)
-                            })
-                            .when(empty_query, |text| text.whitespace_normal())
-                            .when(!empty_query, |text| text.truncate())
-                            .debug_selector(|| "terminal.search.query".to_owned())
-                            .font_family(monospace_family())
-                            .text_size(metrics.caption_size())
-                            .text_color(if empty_query {
-                                theme::swatch(shell_palette::TEXT_MUTED)
-                            } else {
-                                theme::swatch(shell_palette::TEXT_PRIMARY)
-                            })
-                            .child(SharedString::from(query)),
-                    ),
+                    .child(query_content),
             );
         // Which keys do what, or — once the terminal has the keyboard again — the one
         // thing the reader needs to know before typing: their keys go to the shell.
@@ -4954,10 +5194,10 @@ impl TerminalPane {
 
     /// One switch of the find bar.
     ///
-    /// The box in the label says which state it is in, so the state is readable as
-    /// text; the filled variant only repeats it instead of carrying the answer alone
-    /// (R3). The identifier is also the debug selector, so a test clicks the same
-    /// control a person does.
+    /// Drawn as a capsule toggle with a check icon when active and a hollow mark when
+    /// off, so state is readable both by shape and by tokenised accent tint rather than
+    /// raw `[x]`/`[ ]` brackets (R3, R13). The identifier is also the debug selector, so
+    /// a test clicks the same control a person does.
     fn search_switch(
         label: &'static str,
         on: bool,
@@ -4966,21 +5206,68 @@ impl TerminalPane {
         toggle: fn(&mut Self, &mut Context<Self>),
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let box_mark = if on { "[x]" } else { "[ ]" };
-        components::compact_button(
-            format!("{box_mark} {label}"),
-            if on {
-                components::Variant::Secondary
-            } else {
-                components::Variant::Ghost
-            },
-            metrics,
-        )
-        .h(metrics.hit_target())
-        .id(id)
-        .debug_selector(move || id.to_owned())
-        .tooltip(components::tooltip(SharedString::from(label)))
-        .on_click(cx.listener(move |this, _event, _window, cx| toggle(this, cx)))
+        let on_bg = theme::swatch(shell_palette::ACCENT_TINT);
+        let on_hover = theme::swatch_over(shell_palette::SURFACE_HOVER, shell_palette::ACCENT_TINT);
+        let on_border = theme::swatch(shell_palette::ACCENT);
+        let on_text = theme::swatch(shell_palette::ACCENT_ON_TINT);
+        let off_bg = theme::swatch(shell_palette::SURFACE);
+        let off_hover = theme::swatch_over(shell_palette::SURFACE_HOVER, shell_palette::SURFACE);
+        let off_border = theme::swatch(shell_palette::BORDER_STRONG);
+        let off_text = theme::swatch(shell_palette::TEXT_SECONDARY);
+        let off_hover_text = theme::swatch(shell_palette::TEXT_PRIMARY);
+        let off_mark = theme::swatch(shell_palette::TEXT_MUTED);
+        let indicator = if on {
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .debug_selector(move || format!("{id}.on"))
+                .child(crate::app::icons::icon(
+                    Icon::Check,
+                    metrics.small_icon_size(),
+                    on_text,
+                ))
+        } else {
+            div()
+                .flex_none()
+                .w(metrics.scale(spacing::TIGHT))
+                .h(metrics.scale(spacing::TIGHT))
+                .rounded_full()
+                .border_1()
+                .border_color(off_mark)
+                .debug_selector(move || format!("{id}.off"))
+        };
+        div()
+            .id(id)
+            .debug_selector(move || id.to_owned())
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .h(metrics.hit_target())
+            .px(metrics.scale(spacing::NARROW))
+            .rounded_full()
+            .border_1()
+            .text_size(metrics.caption_size())
+            .cursor_pointer()
+            .when(on, |pill| {
+                pill.bg(on_bg)
+                    .border_color(on_border)
+                    .text_color(on_text)
+                    .font_weight(FontWeight::MEDIUM)
+                    .hover(move |style| style.bg(on_hover))
+            })
+            .when(!on, |pill| {
+                pill.bg(off_bg)
+                    .border_color(off_border)
+                    .text_color(off_text)
+                    .hover(move |style| style.bg(off_hover).text_color(off_hover_text))
+            })
+            .child(indicator)
+            .child(SharedString::from(label))
+            .tooltip(components::tooltip(SharedString::from(label)))
+            .on_click(cx.listener(move |this, _event, _window, cx| toggle(this, cx)))
     }
 
     /// The block list's own row: how the list is filtered, and the switch that
@@ -5878,7 +6165,7 @@ impl Render for TerminalPane {
             })
             .child(self.bar(metrics, cx))
             .when(show_blocks, |column| {
-                column.child(self.block_overlay(tools, bar_height, cx))
+                column.child(self.block_overlay(metrics, bar_height, cx))
             })
             .children(self.context_menu(window, cx))
             .children(self.more_menu(window, cx));
@@ -6014,7 +6301,7 @@ impl EntityInputHandler for TerminalPane {
         // A commit replaces any composition with its final text, so the pending
         // marker is dropped before the text is sent.
         self.marked = None;
-        if self.search_focused && self.search_open && !self.alternate_screen() {
+        if self.search_captures_keyboard() {
             self.append_search_query(text, cx);
             return;
         }
@@ -6040,7 +6327,7 @@ impl EntityInputHandler for TerminalPane {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !new_text.is_empty() && !self.search_focused && self.state.accepts_input() {
+        if !new_text.is_empty() && !self.search_captures_keyboard() && self.state.accepts_input() {
             self.reveal_input(cx);
         }
         // Composition is shown next to the caret but nothing is sent until the
@@ -6280,6 +6567,378 @@ mod selection_drag_tests {
         assert!(
             selected.starts_with(&format!("line-{target_row:02}")),
             "selection start must stay anchored to line-{target_row:02} despite streaming scroll, got: {selected:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod search_isolation_tests {
+    use super::*;
+
+    fn test_pane(
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::Entity<TerminalPane>, &mut gpui::VisualTestContext) {
+        let (pane, cx) = cx.add_window_view(|_, cx| {
+            TerminalPane::without_process(
+                LocalShell::new("Test shell", "test-shell"),
+                EventTag::new(shellune_core::SessionId::new(), 0),
+                GridSize::new(80, 24),
+                shellune_terminal::DEFAULT_FONT_SIZE,
+                Locale::English,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            window.focus(pane.read(app).focus_handle());
+        });
+        cx.run_until_parked();
+        (pane, cx)
+    }
+
+    fn feed_scrollback(pane: &gpui::Entity<TerminalPane>, cx: &mut gpui::VisualTestContext) {
+        cx.update(|_, app| {
+            pane.update(app, |pane, cx| {
+                let mut text = String::new();
+                for index in 0..80 {
+                    text.push_str(&format!("history-line-{index:03}\r\n"));
+                }
+                pane.feed_for_test(text.as_bytes(), cx);
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn search_focused_handles_edit_and_navigation_keys_without_shell_leak(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (pane, cx) = test_pane(cx);
+        feed_scrollback(&pane, cx);
+
+        // Park viewport in scrollback history.
+        cx.update(|_, app| {
+            pane.update(app, |pane, cx| {
+                pane.core.scroll(10);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        let parked = cx.update(|_, app| pane.read(app).display_offset());
+        assert!(parked > 0, "viewport must start parked in scrollback");
+
+        // Open search and type a query.
+        cx.update(|window, app| {
+            pane.update(app, |pane, cx| pane.open_search(window, cx));
+        });
+        cx.run_until_parked();
+        cx.simulate_input("abcd");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).search_state().query),
+            "abcd"
+        );
+
+        // Navigation and editing inside query: Left, Left, insert 'X', Delete, Home, Delete, End, Backspace.
+        cx.simulate_keystrokes("left left");
+        cx.simulate_input("X");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).search_state().query),
+            "abXcd"
+        );
+
+        cx.simulate_keystrokes("delete");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).search_state().query),
+            "abXd"
+        );
+
+        cx.simulate_keystrokes("home delete");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).search_state().query),
+            "bXd"
+        );
+
+        cx.simulate_keystrokes("end backspace");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).search_state().query),
+            "bX"
+        );
+
+        // Ctrl editing combinations and Tab/Up/Down/Ctrl+C/Ctrl+L must never leak to shell.
+        cx.simulate_input(" foo bar");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-backspace");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).search_state().query),
+            "bX foo "
+        );
+
+        cx.simulate_keystrokes("ctrl-a right ctrl-k");
+        cx.run_until_parked();
+        assert_eq!(cx.update(|_, app| pane.read(app).search_state().query), "b");
+
+        cx.simulate_keystrokes("ctrl-e ctrl-u");
+        cx.run_until_parked();
+        assert_eq!(cx.update(|_, app| pane.read(app).search_state().query), "");
+
+        cx.simulate_keystrokes("tab up down pageup pagedown ctrl-c ctrl-l");
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).sent().to_vec()),
+            Vec::<u8>::new(),
+            "no key pressed while search holds focus may leak to the shell"
+        );
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).display_offset()),
+            parked,
+            "search keys must not pull a parked viewport back to the bottom"
+        );
+    }
+
+    #[gpui::test]
+    async fn search_focused_blocks_image_clipboard_paste_for_local_and_remote(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (pane, cx) = test_pane(cx);
+        let image_requests = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let image_requests_sub = image_requests.clone();
+        cx.update(|_, app| {
+            app.subscribe(&pane, move |_, event: &PaneRequest, _| {
+                if matches!(event, PaneRequest::PasteImage(_)) {
+                    image_requests_sub.set(image_requests_sub.get() + 1);
+                }
+            })
+            .detach();
+        });
+
+        let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![0x89, b'P', b'N', b'G']);
+        cx.write_to_clipboard(ClipboardItem::new_image(&image));
+        cx.update(|window, app| {
+            pane.update(app, |pane, cx| pane.open_search(window, cx));
+        });
+        cx.run_until_parked();
+
+        // Local origin: must NOT send 0x16.
+        cx.dispatch_action(TerminalPaste);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).sent().to_vec()),
+            Vec::<u8>::new(),
+            "image paste while search is focused must not send 0x16 to local shell"
+        );
+
+        // Remote origin: must NOT emit PaneRequest::PasteImage.
+        cx.update(|_, app| {
+            pane.update(app, |pane, _| {
+                pane.origin = PaneOrigin::Remote {
+                    target: "host@example".to_owned(),
+                };
+            });
+        });
+        cx.dispatch_action(TerminalPaste);
+        cx.run_until_parked();
+        assert_eq!(
+            image_requests.get(),
+            0,
+            "image paste while search is focused must not emit PasteImage for remote pane"
+        );
+    }
+
+    #[gpui::test]
+    async fn search_bar_shows_inline_ime_composition_instead_of_grid_overlay(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (pane, cx) = test_pane(cx);
+        feed_scrollback(&pane, cx);
+        cx.update(|window, app| {
+            pane.update(app, |pane, cx| {
+                pane.core.scroll(8);
+                pane.open_search(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let parked = cx.update(|_, app| pane.read(app).display_offset());
+
+        cx.update(|window, app| {
+            use gpui::EntityInputHandler;
+            pane.update(app, |pane, cx| {
+                pane.replace_and_mark_text_in_range(None, "nihao", None, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("terminal.search.composition").is_some(),
+            "IME pre-edit text must render inline inside the search bar"
+        );
+        assert!(
+            cx.debug_bounds("terminal.composition").is_none(),
+            "IME pre-edit text must not draw on the terminal grid cursor while search is focused"
+        );
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).display_offset()),
+            parked,
+            "IME composition in search must not pull parked scrollback to the bottom"
+        );
+
+        cx.update(|window, app| {
+            use gpui::EntityInputHandler;
+            pane.update(app, |pane, cx| {
+                pane.replace_text_in_range(None, "你好", window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).search_state().query),
+            "你好"
+        );
+        assert!(cx.debug_bounds("terminal.search.composition").is_none());
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).sent().to_vec()),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[gpui::test]
+    async fn alternate_screen_disables_context_menu_search_and_gates_paste(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (pane, cx) = test_pane(cx);
+        cx.write_to_clipboard(ClipboardItem::new_string("echo hi".to_owned()));
+
+        // Enter alternate screen and open right-click menu.
+        cx.update(|_, app| {
+            pane.update(app, |pane, cx| {
+                pane.feed_for_test(b"\x1b[?1049h\x1b[Halt", cx);
+                pane.menu = Some(point(px(40.0), px(40.0)));
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+
+        let search_center = cx
+            .debug_bounds("terminal.menu.search")
+            .expect("search item rendered in menu")
+            .center();
+        cx.simulate_click(search_center, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|_, app| pane.read(app).search_state().open),
+            "clicking disabled search item in alternate screen must not open search"
+        );
+
+        // If search was parked while entering alternate screen and the session has ended,
+        // paste must be disabled instead of routing through the search branch.
+        cx.update(|_, app| {
+            pane.update(app, |pane, cx| {
+                pane.search_open = true;
+                pane.search_focused = true;
+                pane.state = PaneState::Exited {
+                    report: ExitReport::Clean,
+                };
+                pane.menu = Some(point(px(40.0), px(40.0)));
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+
+        let paste_center = cx
+            .debug_bounds("terminal.menu.paste")
+            .expect("paste item rendered in menu")
+            .center();
+        cx.simulate_click(paste_center, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).search_state().query),
+            "",
+            "disabled paste in alternate screen must not mutate parked search query"
+        );
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).sent().to_vec()),
+            Vec::<u8>::new(),
+            "disabled paste in exited alternate screen must not write to shell"
+        );
+    }
+
+    #[gpui::test]
+    async fn search_switches_use_capsule_indicators_and_scale_with_theme_metrics(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (pane, cx) = test_pane(cx);
+        cx.update(|window, app| {
+            theme::set_zoom(theme::Zoom::Regular);
+            pane.update(app, |pane, cx| pane.open_search(window, cx));
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("terminal.search.case.off").is_some());
+        assert!(cx.debug_bounds("terminal.search.regex.off").is_some());
+        let regular_height = cx
+            .debug_bounds("terminal.search.case")
+            .expect("case switch bounds")
+            .size
+            .height;
+
+        cx.simulate_keystrokes("alt-c alt-r");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("terminal.search.case.on").is_some());
+        assert!(cx.debug_bounds("terminal.search.regex.on").is_some());
+
+        cx.update(|_, app| {
+            theme::set_zoom(theme::Zoom::Comfortable);
+            pane.update(app, |_, cx| cx.notify());
+        });
+        cx.run_until_parked();
+        let comfortable_height = cx
+            .debug_bounds("terminal.search.case")
+            .expect("case switch bounds at 115%")
+            .size
+            .height;
+        assert!(
+            comfortable_height > regular_height,
+            "search bar controls must scale with theme::metrics(): {regular_height:?} vs {comfortable_height:?}"
+        );
+        theme::set_zoom(theme::Zoom::Regular);
+    }
+
+    #[gpui::test]
+    async fn scroll_bottom_pill_returns_to_live_output_without_writing_to_shell(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (pane, cx) = test_pane(cx);
+        feed_scrollback(&pane, cx);
+        cx.update(|_, app| {
+            pane.update(app, |pane, cx| {
+                pane.core.scroll(12);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(cx.update(|_, app| pane.read(app).display_offset()) > 0);
+        let pill = cx
+            .debug_bounds("terminal.scroll_bottom")
+            .expect("scroll_bottom_pill visible when scrolled back");
+        cx.simulate_click(pill.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).display_offset()),
+            0,
+            "clicking scroll_bottom_pill must return to live bottom"
+        );
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).sent().to_vec()),
+            Vec::<u8>::new(),
+            "returning to live output must not write any bytes to the shell"
         );
     }
 }
