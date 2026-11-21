@@ -2558,6 +2558,7 @@ fn key_bindings_cover_every_destination_plus_the_shell_controls() {
             + crate::app::TAB_JUMP_COUNT
             + 2
             + 1
+            + 1
             + 4
             + 4
             + 4
@@ -2566,7 +2567,7 @@ fn key_bindings_cover_every_destination_plus_the_shell_controls() {
             + 3,
         "three pages and the settings comma, next and previous, zoom, new shell, language \
          and dismiss; the palette, close tab, reconnect, next and previous tab; one jump per \
-         tab digit; split right and split down, zoom pane, focus, resize and move in \
+         tab digit; split right and split down, zoom pane, focus mode, focus, resize and move in \
          four directions, move tab left and right; the keyboard's upload and download; \
          and the three terminal actions (search, copy, paste)"
     );
@@ -10698,15 +10699,20 @@ async fn a_reconnect_that_can_never_work_offers_close_instead(cx: &mut TestAppCo
         "a refused reconnect keeps its reason, got {state:?}"
     );
 
-    // What the user sees: the reason, and close as the step - not a reconnect button that
-    // would only refuse again.
+    // What the user sees: the reason, and close as the single next step in the banner
+    // (without duplicating the close chip in the bottom session bar) - not a reconnect
+    // button that would only refuse again.
     assert!(
         cx.debug_bounds("terminal.failure").is_some(),
         "the reason the session cannot come back is stated"
     );
     assert!(
-        cx.debug_bounds("session.close").is_some(),
-        "closing the finished session is offered"
+        cx.debug_bounds("terminal.failure.next").is_some(),
+        "closing the finished session is offered once in the failure banner"
+    );
+    assert!(
+        cx.debug_bounds("session.close").is_none(),
+        "the session bar does not duplicate the failure banner's close action"
     );
     // The button's absence is checked through the rule that draws it: the test window
     // never forgets a selector once a frame drew it (GPUI clears every per-frame buffer
@@ -27500,12 +27506,14 @@ async fn a_desktop_that_was_refused_states_one_reason_and_forgets_its_disclosure
     cx: &mut TestAppContext,
 ) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
-    let (link, _log) = ScriptedLink::new(vec![LinkEvent::State {
+    let mut events = live_desktop_events();
+    events.push(LinkEvent::State {
         state: LinkState::Failed(LinkFailure::Authentication),
         failure: LinkFailure::Authentication,
         detail: 0,
         reason: "the server rejected the logon".to_owned(),
-    }]);
+    });
+    let (link, _log) = ScriptedLink::new(events);
     let record = desktop_record("desk");
     let id = mount_scripted_desktop(&view, cx, &record, link);
 
@@ -27563,12 +27571,12 @@ async fn a_desktop_that_was_refused_states_one_reason_and_forgets_its_disclosure
     );
 }
 
-/// A remote desktop that ended says so once in the banner above its place and once in
-/// its own status card under it, the way a terminal does (ADR-6, ADR-7): the window no
-/// longer stacks a second failure card over the desktop's card, and closing the banner
-/// leaves the card, not the old one.
+/// A remote desktop that ended before any frame uses its own status card alone (no duplicate
+/// banner on top); once a picture has been shown, an ended session preserves that last picture
+/// and states the reason once in the banner above it (R5 / ADR-5).
 #[gpui::test]
 async fn an_ended_desktop_states_itself_in_the_banner_above_its_own_card(cx: &mut TestAppContext) {
+    // Without a first frame: only desktop.status is shown, no duplicate terminal.failure banner.
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
     let (link, _log) = ScriptedLink::new(vec![LinkEvent::State {
@@ -27578,20 +27586,40 @@ async fn an_ended_desktop_states_itself_in_the_banner_above_its_own_card(cx: &mu
         reason: "the server rejected the logon".to_owned(),
     }]);
     let record = desktop_record("desk");
+    let no_frame_id = mount_scripted_desktop(&view, cx, &record, link);
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("desktop.status").is_some(),
+        "a desktop that failed before its first frame renders its status card"
+    );
+    assert!(
+        cx.debug_bounds("terminal.failure").is_none(),
+        "a desktop without a first frame must not stack a duplicate banner above desktop.status"
+    );
+    cx.update(|_window, app| view.update(app, |view, cx| view.close_session(no_frame_id, cx)));
+    cx.run_until_parked();
+
+    // After a live frame: last picture stays visible and a single banner states the reason.
+    let mut events = live_desktop_events();
+    events.push(LinkEvent::State {
+        state: LinkState::Failed(LinkFailure::Authentication),
+        failure: LinkFailure::Authentication,
+        detail: 0,
+        reason: "the server rejected the logon".to_owned(),
+    });
+    let (link, _log) = ScriptedLink::new(events);
     let id = mount_scripted_desktop(&view, cx, &record, link);
     redraw(cx);
 
     let metrics = Metrics::default();
     let banner = bounds_of(cx, "terminal.failure");
-    let card = bounds_of(cx, "desktop.status");
     assert!(
         banner.size.height <= metrics.large_control_height() + px(1.0),
         "the failure is one banner line, not a card: {banner:?}"
     );
     assert!(
-        card.top() >= banner.bottom() - px(0.5),
-        "the desktop's own card stands under the banner, not under a second card: \
-         banner {banner:?}, card {card:?}"
+        cx.debug_bounds("desktop.picture").is_some(),
+        "the last picture remains visible under the banner"
     );
     assert!(
         cx.debug_bounds("terminal.failure.next").is_some(),
@@ -27604,22 +27632,15 @@ async fn an_ended_desktop_states_itself_in_the_banner_above_its_own_card(cx: &mu
         !cx.update(|_window, app| view.read(app).banner_shown_for_test(id, app)),
         "the banner closed"
     );
-    // A selector that is no longer drawn keeps its last bounds, so the old card would
-    // show here as a `terminal.failure` taller than one banner line.
-    let after = bounds_of(cx, "terminal.failure");
     assert!(
-        after.size.height <= metrics.large_control_height() + px(1.0),
-        "a closed banner does not come back as the old failure card: {after:?}"
-    );
-    assert!(
-        bounds_of(cx, "desktop.status").size.height > px(0.0),
-        "the desktop's card still says the session ended"
+        cx.debug_bounds("desktop.picture").is_some(),
+        "dismissing the banner leaves the last picture visible"
     );
 }
 
-/// The banner above an ended desktop is reached from the keyboard the way a terminal's
-/// is: the banner does not take the keyboard, Tab from the desktop reaches its first
-/// control, Tab past the last one goes back to the desktop, and Enter presses the step
+/// The banner above an ended desktop (after a picture was shown) is reached from the keyboard
+/// the way a terminal's is: the banner does not take the keyboard, Tab from the desktop reaches
+/// its first control, Tab past the last one goes back to the desktop, and Enter presses the step
 /// (ADR-6, ADR-7). A live desktop keeps Tab for the remote side.
 #[gpui::test]
 async fn tab_reaches_the_banner_above_an_ended_desktop_and_enter_reconnects(
@@ -27627,12 +27648,14 @@ async fn tab_reaches_the_banner_above_an_ended_desktop_and_enter_reconnects(
 ) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
-    let (link, _log) = ScriptedLink::new(vec![LinkEvent::State {
+    let mut events = live_desktop_events();
+    events.push(LinkEvent::State {
         state: LinkState::Failed(LinkFailure::Connect),
         failure: LinkFailure::Connect,
         detail: 0,
         reason: "the address could not be reached".to_owned(),
-    }]);
+    });
+    let (link, _log) = ScriptedLink::new(events);
     let record = desktop_record("desk");
     let id = mount_scripted_desktop(&view, cx, &record, link);
     redraw(cx);
@@ -27696,12 +27719,14 @@ async fn tab_reaches_the_banner_above_an_ended_desktop_and_enter_reconnects(
 async fn escape_closes_the_banner_above_an_ended_desktop(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
-    let (link, _log) = ScriptedLink::new(vec![LinkEvent::State {
+    let mut events = live_desktop_events();
+    events.push(LinkEvent::State {
         state: LinkState::Failed(LinkFailure::Connect),
         failure: LinkFailure::Connect,
         detail: 0,
         reason: "the address could not be reached".to_owned(),
-    }]);
+    });
+    let (link, _log) = ScriptedLink::new(events);
     let record = desktop_record("desk");
     let id = mount_scripted_desktop(&view, cx, &record, link);
     redraw(cx);
@@ -28800,22 +28825,21 @@ async fn the_folded_handle_stays_drawn_and_pressable_with_the_pointer_on_it(
 
     hover(cx, "desktop.body");
     click(cx, "desktop.controls.collapse");
+    cx.run_until_parked();
     assert!(state(cx).0, "the bar is folded");
     assert!(
-        cx.debug_bounds("desktop.controls.expand").is_some(),
-        "the handle is offered while the pointer is on the picture"
+        !state(cx).1,
+        "a collapsed bar leaves no residual hit area over the picture"
     );
 
-    hover(cx, "desktop.controls.expand");
+    // Moving the pointer to the top-center reveal zone restores the bar without a residual handle.
+    let body = bounds_of(cx, "desktop.body");
+    let reveal_point = point((body.left() + body.right()) / 2.0, body.top() + px(4.0));
+    cx.simulate_mouse_move(reveal_point, None, Modifiers::default());
+    cx.run_until_parked();
     let (collapsed, shown) = state(cx);
-    assert!(shown, "the handle's own hover keeps it drawn");
-    assert!(
-        collapsed,
-        "the fold survives the pointer reaching the handle"
-    );
-
-    click(cx, "desktop.controls.expand");
-    assert!(!state(cx).0, "the handle under the pointer unfolds the bar");
+    assert!(shown, "the top-center reveal zone brings the bar back");
+    assert!(!collapsed, "revealing the bar clears the collapsed state");
 }
 
 #[gpui::test]
@@ -28849,12 +28873,8 @@ async fn a_desktop_authentication_challenge_opens_a_masked_password_form(cx: &mu
     assert!(cx.debug_bounds("desktop.signin.password").is_some());
     assert!(cx.debug_bounds("desktop.signin.user").is_some());
     assert!(cx.update(|_, app| {
-        view.read(app)
-            .desktop_of(id)
-            .unwrap()
-            .read(app)
-            .phase()
-            .accepts_input()
+        let phase = view.read(app).desktop_of(id).unwrap().read(app).phase();
+        phase.wants_poll() && !phase.accepts_input()
     }));
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
@@ -30060,8 +30080,8 @@ async fn the_controls_stay_clickable_over_a_notice_and_a_certificate(cx: &mut Te
         "the zoom button works with the warning strip up"
     );
 
-    // And with the certificate card, which is centred over the picture: the bar is
-    // drawn last, so it is above the layer the card sits on.
+    // With a certificate card up, the certificate question takes priority above the toolbar
+    // so it is never obscured or blocked by non-essential controls (R2).
     feed.feed(vec![LinkEvent::Certificate {
         request_id: 3,
         host: "rdp.example.com".to_owned(),
@@ -30075,13 +30095,25 @@ async fn the_controls_stay_clickable_over_a_notice_and_a_certificate(cx: &mut Te
     cx.run_until_parked();
     assert!(
         cx.debug_bounds("desktop.certificate").is_some(),
-        "the question is on screen"
+        "the certificate question is immediately visible above the toolbar"
     );
-    click(cx, "desktop.zoom.out");
-    assert_eq!(
-        desktop_zoom(&view, cx, id),
-        crate::app::desktop::DesktopZoom::Percent(150),
-        "the zoom button works with the certificate question up"
+    assert!(
+        cx.debug_bounds("desktop.certificate.reject").is_some(),
+        "the certificate decision remains reachable without unfolding the toolbar"
+    );
+    click(cx, "desktop.certificate.reject");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .desktop_of(id)
+                .expect("desktop mounted")
+                .read(app)
+                .phase()
+                .failure()
+                .is_some()
+        }),
+        "refusing the certificate card acts directly on the certificate"
     );
 }
 
@@ -30203,14 +30235,13 @@ async fn a_folded_bar_stays_folded_until_the_handle_is_pressed(cx: &mut TestAppC
         "a folded bar does not answer a press where its readout was"
     );
 
-    // The pointer is still over the picture, so the handle is what is offered.
+    // No residual expand handle exists while collapsed (R2: zero residual hit area).
     assert!(
-        cx.debug_bounds("desktop.controls.expand").is_some(),
-        "the handle is in the bar's corner"
+        cx.debug_bounds("desktop.controls.expand").is_none(),
+        "no residual expand handle is drawn when collapsed"
     );
 
-    // Leaving the picture hides the handle; coming back shows it again, and the fold
-    // survives either way.
+    // Moving away and back over the middle of the picture keeps the bar folded.
     cx.simulate_mouse_move(point(px(2.0), px(2.0)), None, Modifiers::default());
     cx.run_until_parked();
     assert!(
@@ -30219,14 +30250,21 @@ async fn a_folded_bar_stays_folded_until_the_handle_is_pressed(cx: &mut TestAppC
     );
     hover(cx, "desktop.body");
     cx.run_until_parked();
-    assert!(revealed(cx), "the pointer brings the handle back");
-    assert!(collapsed(cx), "and the bar stays folded");
+    assert!(
+        collapsed(cx),
+        "moving to the middle of the picture keeps the bar folded"
+    );
     assert_eq!(drawn(cx), frames, "still no frame drew the bar");
 
-    // The handle is the way back, and the bar keeps its behaviour.
-    click(cx, "desktop.controls.expand");
+    // Moving the pointer into the top-center reveal zone unfolds the bar cleanly.
+    let body = bounds_of(cx, "desktop.body");
+    let reveal_point = point((body.left() + body.right()) / 2.0, body.top() + px(4.0));
+    cx.simulate_mouse_move(reveal_point, None, Modifiers::default());
     cx.run_until_parked();
-    assert!(!collapsed(cx), "pressing the handle unfolds the bar");
+    assert!(
+        !collapsed(cx),
+        "entering the top-center reveal zone unfolds the bar"
+    );
     assert!(
         cx.debug_bounds("desktop.controls").is_some(),
         "the bar is drawn again"
@@ -30255,8 +30293,9 @@ async fn the_zoom_readout_works_after_folding_and_unfolding(cx: &mut TestAppCont
         "the readout is not there while the bar is folded, so the press changes nothing"
     );
 
-    hover(cx, "desktop.body");
-    click(cx, "desktop.controls.expand");
+    let body = bounds_of(cx, "desktop.body");
+    let reveal_point = point((body.left() + body.right()) / 2.0, body.top() + px(4.0));
+    cx.simulate_mouse_move(reveal_point, None, Modifiers::default());
     cx.run_until_parked();
     click(cx, "desktop.zoom.fit");
     assert_eq!(
@@ -40134,21 +40173,24 @@ async fn desktop_controls_dock_top_center_keep_expand_handle_visible_and_block_p
         "clicking desktop.zoom.in must not pass through to the remote surface"
     );
 
-    // Collapse the bar and move the pointer completely off the picture; the expand handle
-    // must remain stably visible at top-center and clickable without leaking to the surface.
+    // Collapse the bar and move the pointer off the picture: no residual handle exists,
+    // and moving into the top-center reveal zone restores the bar without sending any
+    // pointer press to the remote surface (R2).
     click(cx, "desktop.controls.collapse");
     cx.simulate_mouse_move(point(px(2.0), px(2.0)), None, Modifiers::default());
     cx.run_until_parked();
     redraw(cx);
     cx.run_until_parked();
-    let handle = bounds_of(cx, "desktop.controls.handle");
-    let handle_center_x = (handle.left() + handle.right()) / 2.0;
     assert!(
-        (handle_center_x - body_center_x).abs() <= px(2.0),
-        "desktop.controls.handle must be horizontally centered: handle={handle:?}, body={body:?}"
+        cx.debug_bounds("desktop.controls.handle").is_none(),
+        "no residual handle is drawn after collapsing desktop.controls"
     );
     let before_expand = log.lock().expect("log lock").inputs.len();
-    click(cx, "desktop.controls.expand");
+    cx.simulate_mouse_move(
+        point(body_center_x, body.top() + px(4.0)),
+        None,
+        Modifiers::default(),
+    );
     cx.run_until_parked();
     assert!(
         !cx.update(|_window, app| {
@@ -40158,14 +40200,14 @@ async fn desktop_controls_dock_top_center_keep_expand_handle_visible_and_block_p
                 .read(app)
                 .controls_collapsed_for_test()
         }),
-        "clicking the always-visible expand handle must unfold the bar"
+        "moving to the top-center reveal zone must unfold the bar"
     );
     let leaked_expand = log.lock().expect("log lock").inputs[before_expand..]
         .iter()
         .any(|input| matches!(input, DesktopInput::Pointer { buttons, .. } if buttons.contains(Buttons::LEFT)));
     assert!(
         !leaked_expand,
-        "clicking desktop.controls.expand must not pass through to the remote surface"
+        "revealing desktop.controls must not send a click to the remote surface"
     );
 
     // Fullscreen entry and automatic exit guard when closing the session.
@@ -40550,5 +40592,927 @@ async fn command_palette_keeps_navigation_and_actions_visible_with_many_hosts(
             .iter()
             .any(|t| t == copy::ux_for(Locale::English).settings_title),
         "unfiltered palette preserves Navigate entries alongside 40 hosts: {titles:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Terminal, RDP/VNC, Home Groups & Multi-Protocol Experience Matrix (R1–R6, R9–R13)
+// ---------------------------------------------------------------------------
+
+fn wide_representative_window() -> Size<Pixels> {
+    size(px(1680.0), px(940.0))
+}
+
+#[gpui::test]
+async fn r6_r13_representative_windows_matrix_keeps_primary_controls_inside_bounds(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("r6-r13-matrix");
+    let store = dir.store();
+    let mut book = HostBook::new();
+    let mut ssh = HostConfig::new("prod-web", "10.0.1.10", 22, "ops").expect("valid ssh");
+    ssh.set_group_path(Some(GroupPath::parse("prod/web").expect("valid path")));
+    book.insert(ssh).expect("insert ssh");
+    book.insert_connection(desktop_record("prod-rdp"))
+        .expect("insert rdp");
+    book.insert_connection(vnc_record_sharing("prod-vnc", false))
+        .expect("insert vnc");
+    book.insert_connection(serial_record("prod-serial", "COM3"))
+        .expect("insert serial");
+    store.save(&book).expect("save book");
+
+    let (view, cx) = hosts_view(cx, store);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+
+    // Cover representative window sizes (1120×720 and 1680×940), 100%/115% text sizes,
+    // English/Chinese, Light/Dark themes, and Full/Reduced motion.
+    let configs = [
+        (
+            design_window(),
+            Zoom::Regular,
+            Locale::English,
+            theme::ThemeChoice::Dark,
+            Motion::Full,
+        ),
+        (
+            design_window(),
+            Zoom::Comfortable,
+            Locale::Chinese,
+            theme::ThemeChoice::Light,
+            Motion::Reduced,
+        ),
+        (
+            wide_representative_window(),
+            Zoom::Regular,
+            Locale::Chinese,
+            theme::ThemeChoice::Dark,
+            Motion::Reduced,
+        ),
+        (
+            wide_representative_window(),
+            Zoom::Comfortable,
+            Locale::English,
+            theme::ThemeChoice::Light,
+            Motion::Full,
+        ),
+    ];
+
+    for (window_size, zoom, locale, choice, motion) in configs {
+        cx.simulate_resize(window_size);
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| {
+                view.workspace_mut_for_test().set_zoom(zoom);
+                view.workspace_mut_for_test().set_locale(locale);
+                while view.theme_choice() != choice {
+                    view.cycle_theme(cx);
+                }
+                cx.notify();
+            });
+        });
+        motion_to(&view, cx, motion);
+        cx.run_until_parked();
+        redraw(cx);
+        cx.run_until_parked();
+
+        assert_eq!(
+            theme::motion_allowed(),
+            motion == Motion::Full,
+            "theme::motion_allowed must track Motion::{motion:?}"
+        );
+
+        let viewport = cx.update(|window, _app| window.viewport_size());
+        assert_eq!(viewport, window_size);
+        for selector in TOP_BAR {
+            assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+        }
+        for selector in [
+            "hosts.search",
+            "hosts.groups.search",
+            "hosts.new",
+            "home.local",
+            "content",
+        ] {
+            assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+        }
+    }
+
+    // Restore motion to default for subsequent tests.
+    motion_to(&view, cx, Motion::Full);
+}
+
+#[gpui::test]
+async fn r1_focus_mode_covers_local_ssh_rdp_vnc_preserves_layout_focus_and_esc_layers(
+    cx: &mut TestAppContext,
+) {
+    use crate::app::keymap::ToggleFocusMode;
+
+    // 1. Split local terminal: entering and exiting focus mode preserves split layout & focus.
+    let Some((view, cx)) = split_local_shell(cx, SplitAxis::LeftRight) else {
+        return;
+    };
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let local_id = cx
+        .update(|_window, app| view.read(app).active_session())
+        .expect("active local session");
+    let local_pane = cx
+        .update(|_window, app| view.read(app).pane_of(local_id).cloned())
+        .expect("local terminal pane");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_leaf_sessions_for_test().len()),
+        2
+    );
+
+    cx.update(|window, app| window.focus(local_pane.read(app).focus_handle()));
+    cx.run_until_parked();
+    cx.dispatch_action(ToggleFocusMode);
+    cx.run_until_parked();
+    redraw(cx);
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).focus_mode()),
+        "local terminal enters focus mode"
+    );
+    assert!(
+        cx.debug_bounds("focus.mode.exit").is_some(),
+        "terminal focus mode offers an accessible exit control"
+    );
+    assert!(
+        cx.update(|window, app| local_pane.read(app).focus_handle().is_focused(window)),
+        "entering focus mode keeps keyboard focus on the active terminal"
+    );
+    // Input still reaches the terminal in focus mode.
+    let before = cx.update(|_window, app| local_pane.read(app).sent().len());
+    cx.simulate_keystrokes("x");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| local_pane.read(app).sent()[before..].to_vec()),
+        b"x",
+        "terminal still receives input in focus mode"
+    );
+
+    // Open command palette inside focus mode, press Escape: only palette closes, no 0x1b leaks.
+    let before_esc = cx.update(|_window, app| local_pane.read(app).sent().len());
+    go(cx, crate::app::actions::OpenPalette);
+    assert!(cx.update(|_window, app| view.read(app).palette_open()));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).palette_open()),
+        "Escape closes the topmost palette overlay"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).focus_mode()),
+        "closing palette does not exit focus mode"
+    );
+    assert_eq!(
+        cx.update(|_window, app| local_pane.read(app).sent()[before_esc..].to_vec()),
+        Vec::<u8>::new(),
+        "Escape on palette must not leak 0x1b to the terminal behind it"
+    );
+
+    // Exit focus mode: split layout and focus remain intact.
+    cx.dispatch_action(ToggleFocusMode);
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).focus_mode()));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_leaf_sessions_for_test().len()),
+        2,
+        "exiting focus mode preserves the split layout"
+    );
+
+    // 2. SSH terminal: focus mode enters, and navigating to Hosts/Settings auto-exits.
+    let (ssh_view, ssh_cx) = remote_view(cx);
+    ssh_cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    let ssh_id = live_remote(ssh_cx, &ssh_view);
+    show_remote_terminal(ssh_cx, &ssh_view, ssh_id);
+    ssh_cx.simulate_resize(wide_representative_window());
+    ssh_cx.run_until_parked();
+    focus_root(&ssh_view, ssh_cx);
+    ssh_cx.dispatch_action(ToggleFocusMode);
+    ssh_cx.run_until_parked();
+    assert!(
+        ssh_cx.update(|_window, app| ssh_view.read(app).focus_mode()),
+        "SSH session enters focus mode"
+    );
+    go(ssh_cx, GoToHosts);
+    assert!(
+        !ssh_cx.update(|_window, app| ssh_view.read(app).focus_mode()),
+        "returning to Hosts automatically exits focus mode"
+    );
+
+    // 3. RDP & VNC desktops: focus mode enters, preserves desktop focus, keeps certificate
+    //    overlay visible, and exits cleanly back to the desktop surface.
+    for record in [
+        desktop_record("rdp-focus"),
+        vnc_record_sharing("vnc-focus", false),
+    ] {
+        let (dview, dcx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+        dcx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+        dcx.simulate_resize(design_window());
+        let (link, _log) = ScriptedLink::new(live_desktop_events());
+        let feed = link.feed();
+        let id = mount_scripted_desktop(&dview, dcx, &record, link);
+        let pane = dcx
+            .update(|_window, app| dview.read(app).desktop_of(id).cloned())
+            .expect("desktop mounted");
+        dcx.update(|window, app| window.focus(pane.read(app).focus_handle()));
+        dcx.run_until_parked();
+
+        dcx.dispatch_action(ToggleFocusMode);
+        dcx.run_until_parked();
+        redraw(dcx);
+        dcx.run_until_parked();
+        assert!(
+            dcx.update(|_window, app| dview.read(app).focus_mode()),
+            "desktop session enters focus mode"
+        );
+        assert!(
+            dcx.update(|window, app| pane.read(app).focus_handle().is_focused(window)),
+            "desktop keeps keyboard focus in focus mode"
+        );
+
+        // Certificate question stays visible during focus mode.
+        feed.feed(vec![LinkEvent::Certificate {
+            request_id: 7,
+            host: "desk.example.com".to_owned(),
+            subject: "CN=desk".to_owned(),
+            issuer: "CN=ca".to_owned(),
+            fingerprint: "11:22".to_owned(),
+            flags: 0,
+        }]);
+        pump_desktop(&dview, dcx, id);
+        redraw(dcx);
+        dcx.run_until_parked();
+        assert!(
+            dcx.debug_bounds("desktop.certificate").is_some(),
+            "certificate overlay remains visible in desktop focus mode"
+        );
+
+        dcx.dispatch_action(ToggleFocusMode);
+        dcx.run_until_parked();
+        assert!(!dcx.update(|_window, app| dview.read(app).focus_mode()));
+    }
+}
+
+#[gpui::test]
+async fn r2_desktop_toolbar_auto_hide_zero_hit_area_recovery_and_certificate_priority(
+    cx: &mut TestAppContext,
+) {
+    for record in [
+        desktop_record("r2-rdp"),
+        vnc_record_sharing("r2-vnc", false),
+    ] {
+        let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+        cx.simulate_resize(design_window());
+        cx.run_until_parked();
+        let (link, log) = ScriptedLink::new(live_desktop_events());
+        let feed = link.feed();
+        let id = mount_scripted_desktop(&view, cx, &record, link);
+        let pane = cx
+            .update(|_window, app| view.read(app).desktop_of(id).cloned())
+            .expect("desktop mounted");
+
+        hover(cx, "desktop.body");
+        cx.run_until_parked();
+        let controls = bounds_of(cx, "desktop.controls");
+        let body = bounds_of(cx, "desktop.body");
+
+        // Trigger auto-hide: toolbar disappears completely with zero residual hit area.
+        cx.update(|_window, app| {
+            pane.update(app, |pane, cx| pane.trigger_controls_auto_hide_for_test(cx));
+        });
+        cx.run_until_parked();
+        redraw(cx);
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|_window, app| pane.read(app).controls_shown_for_test()),
+            "auto-hide hides the desktop toolbar"
+        );
+
+        // Clicking where the toolbar used to sit passes directly to the remote surface.
+        let before_click = log.lock().expect("log lock").inputs.len();
+        cx.simulate_click(controls.center(), Modifiers::default());
+        cx.run_until_parked();
+        let passed_through = log.lock().expect("log lock").inputs[before_click..]
+            .iter()
+            .any(|input| matches!(input, DesktopInput::Pointer { buttons, .. } if buttons.contains(Buttons::LEFT)));
+        assert!(
+            passed_through,
+            "clicking the hidden toolbar's former region must pass through to the remote surface"
+        );
+
+        // Pointer approach to top-center reveal zone restores toolbar without sending a click.
+        let before_hover = log.lock().expect("log lock").inputs.len();
+        let reveal_point = point((body.left() + body.right()) / 2.0, body.top() + px(4.0));
+        cx.simulate_mouse_move(reveal_point, None, Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.update(|_window, app| pane.read(app).controls_shown_for_test()),
+            "pointer approach to top-center reveals the toolbar"
+        );
+        let hover_sent_click = log.lock().expect("log lock").inputs[before_hover..]
+            .iter()
+            .any(|input| matches!(input, DesktopInput::Pointer { buttons, .. } if buttons.contains(Buttons::LEFT)));
+        assert!(
+            !hover_sent_click,
+            "revealing via pointer must not send a click to the remote surface"
+        );
+
+        // Keyboard shortcut Alt+Shift+T toggles toolbar off and back on without sending remote keys.
+        cx.update(|window, app| window.focus(pane.read(app).focus_handle()));
+        cx.run_until_parked();
+        let before_keys = log.lock().expect("log lock").inputs.len();
+        cx.simulate_keystrokes("alt-shift-t");
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|_window, app| pane.read(app).controls_shown_for_test()),
+            "Alt+Shift+T hides the toolbar"
+        );
+        cx.simulate_keystrokes("alt-shift-t");
+        cx.run_until_parked();
+        assert!(
+            cx.update(|_window, app| pane.read(app).controls_shown_for_test()),
+            "Alt+Shift+T restores the toolbar"
+        );
+        let leaked_key = log.lock().expect("log lock").inputs[before_keys..]
+            .iter()
+            .any(|input| matches!(input, DesktopInput::Key { .. }));
+        assert!(!leaked_key, "Alt+Shift+T must not send remote keystrokes");
+
+        // Hide toolbar again and emit a certificate challenge: certificate card appears immediately.
+        cx.simulate_keystrokes("alt-shift-t");
+        cx.run_until_parked();
+        assert!(!cx.update(|_window, app| pane.read(app).controls_shown_for_test()));
+        feed.feed(vec![LinkEvent::Certificate {
+            request_id: 9,
+            host: "r2.example.com".to_owned(),
+            subject: "CN=r2".to_owned(),
+            issuer: "CN=ca".to_owned(),
+            fingerprint: "AA:CC".to_owned(),
+            flags: 0,
+        }]);
+        pump_desktop(&view, cx, id);
+        redraw(cx);
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("desktop.certificate").is_some(),
+            "certificate prompt appears immediately even while toolbar is hidden"
+        );
+    }
+}
+
+#[gpui::test]
+async fn r3_r13_terminal_search_isolation_split_independence_and_switch_controls(
+    cx: &mut TestAppContext,
+) {
+    let Some((view, cx)) = split_local_shell(cx, SplitAxis::LeftRight) else {
+        return;
+    };
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(design_window());
+    largest_text_size(&view, cx);
+    cx.run_until_parked();
+
+    let (active_id, other_id) = cx.update(|_window, app| {
+        let view = view.read(app);
+        let active = view.active_session().expect("active session");
+        let other = view
+            .active_leaf_sessions_for_test()
+            .into_iter()
+            .flatten()
+            .find(|id| *id != active)
+            .expect("second split session");
+        (active, other)
+    });
+    let active_pane = cx
+        .update(|_window, app| view.read(app).pane_of(active_id).cloned())
+        .expect("active pane");
+    let other_pane = cx
+        .update(|_window, app| view.read(app).pane_of(other_id).cloned())
+        .expect("other pane");
+
+    // Populate scrollback history in the active pane and scroll up to review history.
+    cx.update(|_window, app| {
+        active_pane.update(app, |pane, cx| {
+            let mut text = String::new();
+            for i in 0..80 {
+                text.push_str(&format!("history-line-{i:03} needle\r\n"));
+            }
+            pane.feed_for_test(text.as_bytes(), cx);
+        });
+    });
+    cx.run_until_parked();
+    let other_before = cx.update(|_window, app| other_pane.read(app).sent().len());
+
+    // Open search on active pane.
+    click(cx, "terminal.search");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("terminal.search.query").is_some(),
+        "search bar query box is rendered"
+    );
+
+    // Verify search switches (case & regex) render as visual state controls (.off -> .on)
+    // and fit inside the window at 115% text size in a split pane.
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    assert!(cx.debug_bounds("terminal.search.case.off").is_some());
+    assert!(cx.debug_bounds("terminal.search.regex.off").is_some());
+    click(cx, "terminal.search.case");
+    cx.run_until_parked();
+    assert_fits_inside(
+        bounds_of(cx, "terminal.search.case.on"),
+        viewport,
+        "case switch active state",
+    );
+    click(cx, "terminal.search.regex");
+    cx.run_until_parked();
+    assert_fits_inside(
+        bounds_of(cx, "terminal.search.regex.on"),
+        viewport,
+        "regex switch active state",
+    );
+
+    // Focus search input and verify navigation/editing keys + empty/image paste do NOT leak to Shell.
+    let sent_before = cx.update(|_window, app| active_pane.read(app).sent().len());
+    cx.simulate_keystrokes("n e e d l e left right home end backspace delete tab enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| active_pane.read(app).sent()[sent_before..].to_vec()),
+        Vec::<u8>::new(),
+        "search editing and navigation keys must never leak to the shell"
+    );
+    assert_eq!(
+        cx.update(|_window, app| other_pane.read(app).sent().len()),
+        other_before,
+        "searching in one split pane must not affect the sibling pane"
+    );
+
+    // Closing search with Escape returns keyboard focus to the terminal.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|window, app| active_pane.read(app).focus_handle().is_focused(window)),
+        "closing search returns focus to the active terminal"
+    );
+    let sent_after_close = cx.update(|_window, app| active_pane.read(app).sent().len());
+    cx.simulate_keystrokes("z");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| active_pane.read(app).sent()[sent_after_close..].to_vec()),
+        b"z",
+        "keys reach the terminal again once search is closed"
+    );
+}
+
+#[gpui::test]
+async fn r4_desktop_zoom_pan_resize_fullscreen_and_pointer_mapping(cx: &mut TestAppContext) {
+    use crate::app::desktop::{DesktopZoom, content_rect_in};
+
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let (link, log) = ScriptedLink::new(live_desktop_events());
+    let feed = link.feed();
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("r4-desk"), link);
+    let pane = cx
+        .update(|_window, app| view.read(app).desktop_of(id).cloned())
+        .expect("desktop mounted");
+
+    // 1. Fit mode: resize 1120×720 -> 1680×940 keeps Fit and accurate pointer mapping.
+    assert_eq!(desktop_zoom(&view, cx, id), DesktopZoom::Fit);
+    cx.simulate_resize(wide_representative_window());
+    cx.run_until_parked();
+    redraw(cx);
+    cx.run_until_parked();
+    assert_eq!(
+        desktop_zoom(&view, cx, id),
+        DesktopZoom::Fit,
+        "Fit mode stays Fit after window resize"
+    );
+
+    let body = bounds_of(cx, "desktop.body");
+    let rect = content_rect_in(body, (640, 400), DesktopZoom::Fit, (0.0, 0.0));
+    let before = log.lock().expect("log lock").inputs.len();
+    cx.simulate_click(rect.center(), Modifiers::default());
+    cx.run_until_parked();
+    let mapped = log.lock().expect("log lock").inputs[before..]
+        .iter()
+        .find_map(|input| match input {
+            DesktopInput::Pointer { x, y, buttons } if buttons.contains(Buttons::LEFT) => {
+                Some((*x, *y))
+            }
+            _ => None,
+        })
+        .expect("remote pointer click recorded in Fit mode");
+    assert!(
+        (i32::from(mapped.0) - 320).abs() <= 2 && (i32::from(mapped.1) - 200).abs() <= 2,
+        "Fit mode center click maps to (320, 200): got {mapped:?}"
+    );
+
+    // 2. Fixed zoom + resize: zoom level stays fixed and pan stays clamped in-place.
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.zoom_in(cx);
+        });
+    });
+    cx.run_until_parked();
+    let fixed_zoom = desktop_zoom(&view, cx, id);
+    assert!(
+        !fixed_zoom.is_fit(),
+        "zoom_in switches to a fixed percentage zoom: {fixed_zoom:?}"
+    );
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    redraw(cx);
+    cx.run_until_parked();
+    assert_eq!(
+        desktop_zoom(&view, cx, id),
+        fixed_zoom,
+        "resizing in fixed zoom mode preserves the chosen zoom percentage"
+    );
+
+    // 3. Fullscreen toggle preserves fixed zoom and session ownership.
+    hover(cx, "desktop.body");
+    click(cx, "desktop.fullscreen");
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| pane.read(app).is_fullscreen()));
+    assert_eq!(desktop_zoom(&view, cx, id), fixed_zoom);
+    hover(cx, "desktop.body");
+    click(cx, "desktop.fullscreen");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| pane.read(app).is_fullscreen()));
+    assert_eq!(desktop_zoom(&view, cx, id), fixed_zoom);
+
+    // 4. Disconnected session rejects pointer inputs.
+    feed.feed(vec![LinkEvent::State {
+        state: LinkState::Failed(LinkFailure::RemoteClosed),
+        failure: LinkFailure::RemoteClosed,
+        detail: 0,
+        reason: "closed".to_owned(),
+    }]);
+    pump_desktop(&view, cx, id);
+    let before_closed = log.lock().expect("log lock").inputs.len();
+    let body_center = bounds_of(cx, "desktop.body").center();
+    cx.simulate_click(body_center, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        log.lock().expect("log lock").inputs.len(),
+        before_closed,
+        "clicks on a disconnected desktop must not enqueue remote pointer inputs"
+    );
+}
+
+#[gpui::test]
+async fn r5_single_feedback_reconnect_keeps_frame_blocks_input_and_sanitizes_secrets(
+    cx: &mut TestAppContext,
+) {
+    // 1. Diagnostic sanitization covers password=, pwd=, passwd=, token=.
+    let raw = "auth failed password=SuperSecret99 pwd=AnotherPass passwd=ThirdPass token=Tok123";
+    let clean = sanitize_diagnostic(raw);
+    for secret in ["SuperSecret99", "AnotherPass", "ThirdPass", "Tok123"] {
+        assert!(
+            !clean.contains(secret),
+            "sanitize_diagnostic must strip {secret}: {clean}"
+        );
+    }
+
+    // 2. Live desktop fails: last picture remains visible, single banner shown, no plaintext secret.
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    let (link, log) = ScriptedLink::new(live_desktop_events());
+    let feed = link.feed();
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("r5-desk"), link);
+    let pane = cx
+        .update(|_window, app| view.read(app).desktop_of(id).cloned())
+        .expect("desktop mounted");
+
+    // Notice dismissal returns keyboard focus to the desktop surface.
+    feed.feed(vec![LinkEvent::Notice(
+        crate::app::desktop::Notice::ClipboardTooLarge(crate::app::desktop::ClipboardKind::Text),
+    )]);
+    pump_desktop(&view, cx, id);
+    redraw(cx);
+    assert!(cx.debug_bounds("desktop.notice").is_some());
+    cx.update(|window, app| {
+        pane.update(app, |pane, cx| pane.dismiss_notices(window, cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|window, app| pane.read(app).focus_handle().is_focused(window)),
+        "dismissing desktop notices returns keyboard focus to the desktop pane"
+    );
+
+    // Emit failure with secret in reason.
+    feed.feed(vec![LinkEvent::State {
+        state: LinkState::Failed(LinkFailure::Authentication),
+        failure: LinkFailure::Authentication,
+        detail: 0,
+        reason: raw.to_owned(),
+    }]);
+    pump_desktop(&view, cx, id);
+    redraw(cx);
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("desktop.picture").is_some(),
+        "last desktop picture stays visible after disconnect"
+    );
+    assert!(
+        cx.debug_bounds("terminal.failure").is_some(),
+        "single failure banner states the reason over the last picture"
+    );
+    let diagnostic = cx.update(|_window, app| {
+        view.read(app)
+            .workspace()
+            .status(id)
+            .and_then(|s| s.diagnostic().map(str::to_owned))
+            .unwrap_or_default()
+    });
+    for secret in ["SuperSecret99", "AnotherPass", "ThirdPass", "Tok123"] {
+        assert!(
+            !diagnostic.contains(secret),
+            "workspace diagnostic must not expose {secret}: {diagnostic}"
+        );
+    }
+
+    // Manual reconnect via pane.start(): last frame stays visible, input is blocked.
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.start(None, cx);
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| {
+            let phase = pane.read(app).phase();
+            phase.wants_poll() && !phase.accepts_input()
+        }),
+        "reconnecting desktop polls events while blocking remote input"
+    );
+    assert!(
+        cx.debug_bounds("desktop.picture").is_some(),
+        "manual reconnect preserves the last picture until the first new frame arrives"
+    );
+    let old_inputs = log.lock().expect("log lock").inputs.len();
+    cx.update(|window, app| window.focus(pane.read(app).focus_handle()));
+    cx.simulate_keystrokes("a b c");
+    let body_center = bounds_of(cx, "desktop.body").center();
+    cx.simulate_click(body_center, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        log.lock().expect("log lock").inputs.len(),
+        old_inputs,
+        "inputs during reconnect must not enter the old link"
+    );
+}
+
+#[gpui::test]
+async fn r9_r10_hundreds_of_groups_search_bounded_rendering_scroll_and_focus_migration(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("r9-r10-groups");
+    let store = dir.store();
+    let mut book = HostBook::new();
+    let mut groups = GroupBook::new();
+
+    for i in 0..240 {
+        let path = GroupPath::parse(&format!("org-{:03}/team-{:02}", i / 10, i % 10))
+            .expect("valid group path");
+        groups.insert(&path).expect("insert group");
+        let mut host = HostConfig::new(
+            format!("srv-{i:03}"),
+            format!("10.1.{}.{i}", i / 200),
+            22,
+            "ops",
+        )
+        .expect("valid host");
+        host.set_group_path(Some(path));
+        book.insert(host).expect("insert host");
+    }
+    // Duplicate leaf names under distinct ancestors + a group whose host name doesn't match.
+    for path_str in [
+        "prod/region-a/db",
+        "staging/region-b/db",
+        "alpha/special-match",
+    ] {
+        let path = GroupPath::parse(path_str).expect("valid special path");
+        groups.insert(&path).expect("insert special group");
+        let mut host = HostConfig::new("unrelated-box", "10.2.0.10", 22, "ops").expect("host");
+        host.set_group_path(Some(path));
+        book.insert(host).expect("insert special host");
+    }
+    store.save(&book).expect("save hosts");
+    shellune_storage::GroupStore::at(dir.path())
+        .save(&groups)
+        .expect("save groups");
+
+    let (view, cx) = hosts_view(cx, store);
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    redraw(cx);
+    cx.run_until_parked();
+
+    // R10: Bounded rendered rows & O(1) focus nodes regardless of 240+ groups.
+    let drawn = cx.update(|_window, app| view.read(app).group_rows_drawn());
+    let focus_nodes = cx.update(|_window, app| view.read(app).group_focus_node_count_for_test());
+    assert!(
+        drawn > 0 && drawn < 80,
+        "virtualized group list must draw a bounded window of rows, not all 240+: drawn={drawn}"
+    );
+    assert!(
+        focus_nodes <= 2,
+        "group list must use O(1) container focus instead of per-row FocusHandles: {focus_nodes}"
+    );
+
+    // R9: Independent group locator matches group name without requiring host name match.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.search_groups("special-match", cx));
+    });
+    cx.run_until_parked();
+    let matched_paths = cx.update(|_window, app| {
+        let view = view.read(app);
+        view.hosts_state()
+            .sidebar_group_rows(view.book(), view.groups(), &|_| false)
+            .into_iter()
+            .map(|row| row.path.to_canonical())
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        matched_paths.iter().any(|p| p == "alpha/special-match"),
+        "group locator finds group by name even when host name does not match: {matched_paths:?}"
+    );
+
+    // R9: Duplicate leaves both appear with full ancestor context.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.search_groups("db", cx));
+    });
+    cx.run_until_parked();
+    let dup_paths = cx.update(|_window, app| {
+        let view = view.read(app);
+        view.hosts_state()
+            .sidebar_group_rows(view.book(), view.groups(), &|_| false)
+            .into_iter()
+            .map(|row| row.path.to_canonical())
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        dup_paths.iter().any(|p| p == "prod/region-a/db")
+            && dup_paths.iter().any(|p| p == "staging/region-b/db"),
+        "duplicate leaf groups both appear with distinct paths: {dup_paths:?}"
+    );
+
+    // R9: No-match state offers clear button and preserves host search / filter.
+    type_into(cx, "hosts.search", "srv-001");
+    click(cx, "hosts.filter");
+    cx.run_until_parked();
+    click(
+        cx,
+        crate::app::hosts::HostProtocolFilter::Ssh.debug_selector(),
+    );
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.search_groups("no-such-group-xyz", cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("hosts.groups.nomatch").is_some());
+    click(cx, "hosts.groups.nomatch.clear");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().group_query().to_owned()),
+        ""
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().search().to_owned()),
+        "srv-001",
+        "clearing group query must not clear host search"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().filter().protocol()),
+        crate::app::hosts::HostProtocolFilter::Ssh,
+        "clearing group query must not clear protocol filter"
+    );
+}
+
+#[gpui::test]
+async fn r11_r12_protocol_filter_connected_status_and_multi_protocol_form_group_picker(
+    cx: &mut TestAppContext,
+) {
+    use crate::app::hosts::{HostProtocolFilter, HostStatusFilter};
+
+    let dir = TempDir::new("r11-r12-protocols");
+    let store = dir.store();
+    let mut book = HostBook::new();
+    let mut groups = GroupBook::new();
+    for i in 0..40 {
+        let path = GroupPath::parse(&format!("env-{i:02}/app")).expect("valid group");
+        groups.insert(&path).expect("insert group");
+    }
+    let target_group = GroupPath::parse("ops/emea/core-db").expect("valid target group");
+    groups.insert(&target_group).expect("insert target group");
+
+    let ssh = HostConfig::new("ssh-box", "10.0.0.10", 22, "ops").expect("ssh");
+    book.insert(ssh).expect("insert ssh");
+    let rdp = desktop_record("rdp-box");
+    book.insert_connection(rdp.clone()).expect("insert rdp");
+    book.insert_connection(vnc_record_sharing("vnc-box", false))
+        .expect("insert vnc");
+    book.insert_connection(serial_record("serial-box", "COM4"))
+        .expect("insert serial");
+    store.save(&book).expect("save book");
+    shellune_storage::GroupStore::at(dir.path())
+        .save(&groups)
+        .expect("save groups");
+
+    let (view, cx) = hosts_view(cx, store);
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    // R11: Protocol filtering via UI menu and chip clearing.
+    click(cx, "hosts.filter");
+    cx.run_until_parked();
+    click(cx, HostProtocolFilter::Rdp.debug_selector());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().filter().protocol()),
+        HostProtocolFilter::Rdp
+    );
+    assert!(
+        cx.debug_bounds("hosts.filter.protocol").is_some(),
+        "active protocol filter renders a clearable chip"
+    );
+    click(cx, "hosts.filter.clear");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().filter().protocol()),
+        HostProtocolFilter::All
+    );
+
+    // R11: Active RDP session counts as Connected under HostStatusFilter::Connected.
+    let (link, _log) = ScriptedLink::new(live_desktop_events());
+    let _rdp_session = mount_scripted_desktop(&view, cx, &rdp, link);
+    go(cx, GoToHosts);
+    click(cx, "hosts.filter");
+    cx.run_until_parked();
+    click(cx, "hosts.status.connected");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().filter().status()),
+        HostStatusFilter::Connected
+    );
+    assert!(
+        cx.debug_bounds("hosts.connection.0").is_some(),
+        "active RDP session must appear under Connected status filter"
+    );
+
+    // R12: Close filter menu if open, open New Host dialog, switch across SSH/RDP/VNC/Serial,
+    // verify dialog fits, and verify searchable group picker finds 'ops/emea/core-db'
+    // beyond the old 8-item cap.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    click(cx, "hosts.new");
+    cx.run_until_parked();
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    for protocol_selector in [
+        "connection.protocol.rdp",
+        "connection.protocol.vnc",
+        "connection.protocol.serial",
+        "connection.protocol.ssh",
+    ] {
+        click(cx, protocol_selector);
+        cx.run_until_parked();
+        assert_fits_inside(
+            bounds_of(cx, protocol_selector),
+            viewport,
+            protocol_selector,
+        );
+    }
+
+    // Type 'core-db' in SSH group field: picker filters 41 groups down to 'ops/emea/core-db'.
+    type_into(cx, "hosts.field.group", "core-db");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("hosts.group.suggestions").is_some(),
+        "group picker renders filtered suggestions"
+    );
+    assert!(
+        cx.debug_bounds("hosts.group.pick.0").is_some(),
+        "group picker surfaces ops/emea/core-db beyond the first 8 groups"
+    );
+    click(cx, "hosts.group.pick.0");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .hosts_state()
+                .draft()
+                .map(|d| d.text(crate::app::hosts::HostField::Group).to_owned())
+        }),
+        Some("ops/emea/core-db".to_owned()),
+        "clicking a filtered group suggestion fills the group field"
     );
 }
