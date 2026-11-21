@@ -1742,6 +1742,7 @@ impl HostsPanel {
     }
 
     /// Drops every narrowing filter, keeping the search phrase as it is.
+    #[cfg(test)]
     pub fn clear_filters(&mut self) {
         self.filter = HostFilter::default();
     }
@@ -5855,7 +5856,8 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_group_query_keeps_ancestors_disambiguates_duplicate_leaves_and_ignores_host_search() {
+    fn sidebar_group_query_keeps_ancestors_disambiguates_duplicate_leaves_and_ignores_host_search()
+    {
         let mut book = HostBook::new();
         let mut groups = GroupBook::new();
         let prod_web = GroupPath::parse("Prod/Web").expect("valid path");
@@ -5893,7 +5895,10 @@ mod tests {
         assert!(rows.iter().all(|r| r.expanded), "matched paths auto-expand");
         let prod_web_row = rows.iter().find(|r| r.path == prod_web).unwrap();
         let staging_web_row = rows.iter().find(|r| r.path == staging_web).unwrap();
-        assert!(prod_web_row.show_full_path, "duplicate leaf shows full path");
+        assert!(
+            prod_web_row.show_full_path,
+            "duplicate leaf shows full path"
+        );
         assert!(
             staging_web_row.show_full_path,
             "duplicate leaf shows full path"
@@ -5916,9 +5921,7 @@ mod tests {
         let rdp_id = rdp.id();
         book.insert_connection(rdp).expect("rdp");
 
-        let vnc = ConnectionRecord::Vnc(
-            VncConfig::new("vnc-box", "10.0.0.3").expect("valid vnc"),
-        );
+        let vnc = ConnectionRecord::Vnc(VncConfig::new("vnc-box", "10.0.0.3").expect("valid vnc"));
         let vnc_id = vnc.id();
         book.insert_connection(vnc).expect("vnc");
 
@@ -5964,10 +5967,15 @@ mod tests {
             groups.insert(&path).expect("insert");
         }
         let all = filtered_group_paths(&book, &groups, "");
-        assert!(all.len() > 250, "all saved paths returned without 8-item cap");
+        assert!(
+            all.len() > 250,
+            "all saved paths returned without 8-item cap"
+        );
         let narrowed = filtered_group_paths(&book, &groups, "service24");
         assert!(
-            narrowed.iter().any(|p| p.to_canonical().contains("Service249")),
+            narrowed
+                .iter()
+                .any(|p| p.to_canonical().contains("Service249")),
             "deeply ordered group is reachable by real-time filter"
         );
     }

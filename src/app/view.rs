@@ -47,7 +47,6 @@ use crate::app::actions::{
     SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitPaneDown, SplitPaneRight, ToggleLanguage,
     ToggleSidebar, ZoomPane,
 };
-use crate::app::keymap::ToggleFocusMode;
 use crate::app::components::{ControlState, Variant};
 use crate::app::copy::{self, Locale, Strings};
 #[cfg(any(test, feature = "ui-capture"))]
@@ -64,6 +63,7 @@ use crate::app::hosts::{
     ProtocolDraft, group_path_from_text, import_message, unimported_hosts,
 };
 use crate::app::icons::{self, Icon};
+use crate::app::keymap::ToggleFocusMode;
 use crate::app::keymap::{self, Keymap, Problem};
 use crate::app::nav::{Destination, Platform};
 use crate::app::remote::{
@@ -4599,10 +4599,9 @@ impl ShelluneView {
     ) -> Option<gpui::FocusHandle> {
         if let Some(pane) = self.pane_for(id) {
             Some(pane.read(cx).focus_handle().clone())
-        } else if let Some(pane) = self.desktop_for(id) {
-            Some(pane.read(cx).focus_handle().clone())
         } else {
-            None
+            self.desktop_for(id)
+                .map(|pane| pane.read(cx).focus_handle().clone())
         }
     }
 
@@ -7788,7 +7787,8 @@ impl ShelluneView {
                 let label = bad_field.label(self.strings());
                 self.hosts.set_message(format!("{label}: {problem}"), true);
                 if bad_field.is_basic() {
-                    self.host_body_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+                    self.host_body_scroll
+                        .set_offset(gpui::point(px(0.0), px(0.0)));
                 }
                 cx.notify();
                 return None;
@@ -7853,15 +7853,14 @@ impl ShelluneView {
                 }
                 if matches!(
                     located,
-                    Some(Ok(
-                        HostField::Name
-                            | HostField::Address
-                            | HostField::Port
-                            | HostField::User
-                            | HostField::Group
-                    ))
+                    Some(Ok(HostField::Name
+                        | HostField::Address
+                        | HostField::Port
+                        | HostField::User
+                        | HostField::Group))
                 ) {
-                    self.host_body_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+                    self.host_body_scroll
+                        .set_offset(gpui::point(px(0.0), px(0.0)));
                 }
                 self.hosts.set_message(reason, true);
                 cx.notify();
@@ -19653,10 +19652,9 @@ impl Render for ShelluneView {
             && self.active == Some(id)
             && self.shows_terminal(self.workspace.destination())
             && let Some(handle) = self.work_focus_for(id, cx)
+            && !handle.is_focused(window)
         {
-            if !handle.is_focused(window) {
-                window.focus(&handle);
-            }
+            window.focus(&handle);
         }
         if std::mem::take(&mut self.restore_focus_pending) {
             self.restore_overlay_focus(window, cx);

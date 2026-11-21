@@ -1121,7 +1121,9 @@ impl ShelluneView {
 
         let hover = theme::swatch(palette::SURFACE_HOVER);
         let mut list = div()
-            .id(SharedString::from(format!("{prefix}.group.suggestions.scroll")))
+            .id(SharedString::from(format!(
+                "{prefix}.group.suggestions.scroll"
+            )))
             .flex()
             .flex_col()
             .gap(px(components::HAIRLINE_WIDTH))
@@ -1272,7 +1274,8 @@ impl ShelluneView {
                 true
             }
             "up" => {
-                self.group_picker_highlight = self.group_picker_highlight.saturating_sub(1).min(last);
+                self.group_picker_highlight =
+                    self.group_picker_highlight.saturating_sub(1).min(last);
                 self.group_picker_scroll
                     .scroll_to_item(self.group_picker_highlight);
                 cx.notify();

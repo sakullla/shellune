@@ -575,43 +575,43 @@ impl ShelluneView {
         let local_focus_click = local_focus.clone();
         bar.when(folded, |bar| bar.child(div().flex_1().min_h_0()))
             .child(
-            div()
-                .relative()
-                .flex()
-                .flex_none()
-                .w_full()
-                .when(folded, |slot| slot.justify_center())
-                .child(
-                    local
-                        .id("home.local")
-                        .debug_selector(|| "home.local".to_owned())
-                        .track_focus(&local_focus)
-                        .border_1()
-                        .border_color(theme::clear())
-                        .focus(move |style| style.border_color(ring))
-                        .when(!local_open, |item| {
-                            item.tooltip(components::tooltip(if folded {
-                                ux.home_local_button
-                            } else {
-                                ux.home_local_hint
-                            }))
-                        })
-                        .on_click(cx.listener(move |this, _event, window, cx| {
-                            window.focus(&local_focus_click);
-                            this.home_menu = None;
-                            this.toggle_home_local_menu(cx);
-                        })),
-                )
-                // Records where the entry is drawn, for the menu that opens beside it.
-                .child(
-                    gpui::canvas(
-                        move |bounds, _window, _cx| anchor.set(bounds),
-                        |_, _, _, _| {},
+                div()
+                    .relative()
+                    .flex()
+                    .flex_none()
+                    .w_full()
+                    .when(folded, |slot| slot.justify_center())
+                    .child(
+                        local
+                            .id("home.local")
+                            .debug_selector(|| "home.local".to_owned())
+                            .track_focus(&local_focus)
+                            .border_1()
+                            .border_color(theme::clear())
+                            .focus(move |style| style.border_color(ring))
+                            .when(!local_open, |item| {
+                                item.tooltip(components::tooltip(if folded {
+                                    ux.home_local_button
+                                } else {
+                                    ux.home_local_hint
+                                }))
+                            })
+                            .on_click(cx.listener(move |this, _event, window, cx| {
+                                window.focus(&local_focus_click);
+                                this.home_menu = None;
+                                this.toggle_home_local_menu(cx);
+                            })),
                     )
-                    .absolute()
-                    .inset_0(),
-                ),
-        )
+                    // Records where the entry is drawn, for the menu that opens beside it.
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _window, _cx| anchor.set(bounds),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    ),
+            )
     }
 
     /// The groups of the sidebar: heading with "+", independent group locator, and a
@@ -692,9 +692,11 @@ impl ShelluneView {
                             )
                             .id("hosts.groups.nomatch.clear")
                             .debug_selector(|| "hosts.groups.nomatch.clear".to_owned())
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.clear_group_query(window, cx);
-                            })),
+                            .on_click(cx.listener(
+                                |this, _event, window, cx| {
+                                    this.clear_group_query(window, cx);
+                                },
+                            )),
                         ),
                 );
             } else if !host_narrowing {
@@ -724,8 +726,7 @@ impl ShelluneView {
                 let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
                 for index in range {
                     let row = &rows_rc[index];
-                    let is_focused =
-                        list_focused && focused_path.as_ref() == Some(&row.path);
+                    let is_focused = list_focused && focused_path.as_ref() == Some(&row.path);
                     items.push(
                         group_tree_row_element(
                             row,
@@ -1230,10 +1231,7 @@ impl ShelluneView {
         let sort_applies = self.hosts.section() != HomeSection::Recent;
         let sort = self.hosts.sort();
         let sort_active = sort_applies && sort != HostSort::Saved;
-        if status != HostStatusFilter::Any
-            || protocol != HostProtocolFilter::All
-            || sort_active
-        {
+        if status != HostStatusFilter::Any || protocol != HostProtocolFilter::All || sort_active {
             let mut chips = div()
                 .flex()
                 .flex_none()

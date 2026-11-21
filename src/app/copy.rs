@@ -430,6 +430,7 @@ pub struct Strings {
     /// Elapsed time beside the target while a connection is pending.
     pub desktop_wait_time: &'static str,
     pub desktop_hide_controls: &'static str,
+    #[allow(dead_code)]
     pub desktop_show_controls: &'static str,
     /// Control that makes the desktop fill the whole window.
     pub desktop_fullscreen_enter: &'static str,
