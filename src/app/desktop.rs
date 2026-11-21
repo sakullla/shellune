@@ -291,6 +291,8 @@ pub enum LinkEvent {
     },
     /// A dirty region of the desktop.
     Frame(Region),
+    /// The remote cursor can now be positioned locally.
+    Pointer(shellune_desktop::PointerShape),
     /// The server asks whether its certificate is trusted.
     Certificate {
         /// Must be echoed with the answer.
@@ -1415,6 +1417,7 @@ fn native_event(event: shellune_desktop::Event) -> Option<LinkEvent> {
             detail,
             reason,
         },
+        shellune_desktop::Event::Pointer(shape) => LinkEvent::Pointer(shape),
         shellune_desktop::Event::Frame {
             x,
             y,

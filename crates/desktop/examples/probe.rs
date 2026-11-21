@@ -23,10 +23,12 @@ fn main() {
     client.connect().expect("start");
     let mut connected = false;
     let mut frames = 0;
+    let mut shapes = 0;
     let reject_certificate = std::env::var_os("SHELLUNE_PROBE_REJECT_CERTIFICATE").is_some();
     let mut asked_certificate = false;
     let settle = Duration::from_secs(args.get(5).map_or(0, |s| s.parse().expect("settle")));
-    let mut input_sent = None;
+    let mut input_sent: Option<Instant> = None;
+    let click = std::env::var_os("SHELLUNE_PROBE_CLICK").is_some();
     let mut ended = false;
     while start.elapsed() < timeout {
         match client.recv_timeout(Duration::from_millis(100)) {
@@ -53,13 +55,47 @@ fn main() {
                     .answer_certificate(request_id, !reject_certificate)
                     .expect("test certificate");
             }
+            Ok(Event::Pointer(shape)) => {
+                shapes += 1;
+                if shapes <= 8 {
+                    let description = match shape {
+                        shellune_desktop::PointerShape::Bitmap {
+                            width,
+                            height,
+                            hotspot,
+                            ..
+                        } => format!("{width}x{height} hotspot={hotspot:?}"),
+                        shellune_desktop::PointerShape::Default => "system default".into(),
+                        shellune_desktop::PointerShape::Hidden => "hidden".into(),
+                    };
+                    println!(
+                        "{:.3}s independent pointer {description}",
+                        start.elapsed().as_secs_f64()
+                    );
+                }
+            }
             Ok(Event::Frame {
+                x,
+                y,
                 width,
                 height,
+                stride,
                 pixels,
                 ..
             }) => {
                 frames += 1;
+                if click
+                    && let Some(sent) = input_sent
+                    && (x..x + width).contains(&30)
+                    && (y..y + height).contains(&30)
+                {
+                    let offset = (30 - y) as usize * stride as usize + (30 - x) as usize * 4;
+                    println!(
+                        "{:.3}s after input pixel (30,30) BGR={:?}",
+                        sent.elapsed().as_secs_f64(),
+                        &pixels[offset..offset + 3]
+                    );
+                }
                 if frames == 1 {
                     println!(
                         "{:.3}s first frame {width}x{height}, {} bytes",
@@ -74,6 +110,16 @@ fn main() {
             client.key(0x1e, 0x61, true, false).expect("key down");
             client.key(0x1e, 0x61, false, false).expect("key up");
             client.pointer(30, 30, PointerButtons(0)).expect("pointer");
+            println!(
+                "{:.3}s queued pointer (30,30)",
+                start.elapsed().as_secs_f64()
+            );
+            if click {
+                client
+                    .pointer(30, 30, PointerButtons(1))
+                    .expect("left down");
+                client.pointer(30, 30, PointerButtons(0)).expect("left up");
+            }
             input_sent = Some(Instant::now());
         }
         if input_sent.is_some_and(|sent| sent.elapsed() >= settle) {
@@ -86,7 +132,7 @@ fn main() {
         .wait_for_worker(Duration::from_secs(5))
         .expect("worker stops");
     println!(
-        "close={}ms, connected={connected}, frames={frames}",
+        "close={}ms, connected={connected}, frames={frames}, pointer updates={shapes}",
         closing.elapsed().as_millis()
     );
     if reject_certificate {

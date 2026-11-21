@@ -6,6 +6,7 @@
 mod clipboard;
 mod drive;
 mod mcs;
+mod pointer;
 mod security;
 mod session;
 mod share;
@@ -17,13 +18,13 @@ pub(crate) use clipboard::{
 };
 pub(crate) use drive::{ProbeRequest, probe_drive_reply, probe_replies, probe_requests};
 
+use crate::input::{self, Sender};
 use crate::{
     ClipboardEntry, Failure, SD_BUTTON_LEFT, SD_BUTTON_MIDDLE, SD_BUTTON_RIGHT,
     SD_BUTTON_WHEEL_DOWN, SD_BUTTON_WHEEL_LEFT, SD_BUTTON_WHEEL_RIGHT, SD_BUTTON_WHEEL_UP, State,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -141,7 +142,7 @@ impl Client {
         if self.config.host.is_empty() {
             return Err(crate::Error::Argument);
         }
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = input::channel();
         let emit = Arc::clone(&self.emit);
         let control = Arc::clone(&self.control);
         let config = Config {
@@ -204,10 +205,14 @@ impl Client {
     }
 
     fn command(&self, command: Command) -> Result<(), crate::Error> {
-        match &self.commands {
-            Some(sender) => sender.send(command).map_err(|_| crate::Error::State),
-            None => Err(crate::Error::State),
-        }
+        let buttons = match &command {
+            Command::Pointer { buttons, .. } => Some(*buttons),
+            _ => None,
+        };
+        self.commands
+            .as_ref()
+            .ok_or(crate::Error::State)?
+            .send(command, buttons)
     }
 
     pub(super) fn key(

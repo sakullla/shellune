@@ -206,18 +206,15 @@ pub(super) fn open(config: &Config, emit: &Emit, control: &Arc<Control>) -> Resu
     super::trace(&format!("protocol version answered as 3.{minor}"));
     let chosen = security_type(&mut transport, config, minor)?;
     super::trace(&format!("security type {chosen}"));
-    match chosen {
-        NONE => {
-            if minor >= 8 {
-                result(&mut transport, minor)?;
-            }
-        }
+    let result_version = match chosen {
+        NONE => (minor >= 8).then_some(minor),
         VNC_AUTH => {
             authenticate(&mut transport, &config.password)?;
-            result(&mut transport, minor)?;
+            Some(minor)
         }
         VENCRYPT => {
             transport = vencrypt(transport, config, emit, control)?;
+            Some(8)
         }
         other => {
             return Err(Ended::new(
@@ -227,12 +224,17 @@ pub(super) fn open(config: &Config, emit: &Emit, control: &Arc<Control>) -> Resu
                 ),
             ));
         }
-    }
+    };
     if control.cancelled() {
         return Err(Ended::new(Failure::Cancelled, "cancelled"));
     }
-    // ClientInit: every viewer may attach to the same session.
+    // The shared-session flag is fixed. Queue it behind the authentication
+    // exchange on the negotiated transport to save one RTT. SecurityResult
+    // must still succeed before interpreting ServerInit or starting a session.
     send(&mut transport, &[1])?;
+    if let Some(version) = result_version {
+        result(&mut transport, version)?;
+    }
     let (width, height) = server_init(&mut transport)?;
     super::trace(&format!("desktop {width}x{height}"));
     let bytes = u64::from(width) * u64::from(height) * 4;
@@ -554,7 +556,6 @@ fn vencrypt(
         if kind.needs_password() {
             authenticate(&mut inner, &config.password)?;
         }
-        result(&mut inner, 8)?;
         Ok(inner)
     } else {
         // LibVNCServer's unwrapped forms: the authentication and its result follow
@@ -562,7 +563,6 @@ fn vencrypt(
         if kind.needs_password() {
             authenticate(&mut transport, &config.password)?;
         }
-        result(&mut transport, 8)?;
         Ok(transport)
     }
 }

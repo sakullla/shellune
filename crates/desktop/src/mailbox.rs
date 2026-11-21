@@ -83,6 +83,11 @@ impl Mailbox {
                         .events
                         .retain(|e| !matches!(e, Some(Event::Clipboard { .. })));
                 }
+                if matches!(event, Event::Pointer(_)) {
+                    pending
+                        .events
+                        .retain(|e| !matches!(e, Some(Event::Pointer(_))));
+                }
                 if matches!(event, Event::Certificate { .. }) {
                     pending
                         .events

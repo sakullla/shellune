@@ -34,7 +34,13 @@ pub(crate) enum Rect {
 /// What the server sent.
 pub(crate) enum Message {
     Rectangle(Rect),
+    Pointer(crate::PointerShape),
     UpdateEnd,
+    EndContinuous,
+    Fence {
+        flags: u32,
+        payload: Vec<u8>,
+    },
     Bell,
     /// Classic cut text: ISO 8859-1 bytes.
     CutText(Vec<u8>),
@@ -51,6 +57,7 @@ const COPY_RECT: i32 = 1;
 const HEXTILE: i32 = 5;
 const DESKTOP_SIZE: i32 = -223;
 const LAST_RECT: i32 = -224;
+pub(super) const RICH_CURSOR: i32 = -239;
 
 /// Hextile sub-encoding bits.
 const HEXTILE_RAW: u8 = 1;
@@ -324,6 +331,45 @@ impl Incoming {
                             source_y,
                         })
                     }
+                    RICH_CURSOR => {
+                        // RFC 6143 7.8.1: pixel data followed by a one-bit mask,
+                        // padded to a byte boundary on each row.
+                        let w = usize::from(width);
+                        let h = usize::from(height);
+                        let shape = if w == 0 || h == 0 {
+                            crate::PointerShape::Hidden
+                        } else {
+                            if w > 512 || h > 512 || x >= width || y >= height {
+                                return Err(format!(
+                                    "invalid cursor {width}x{height} at hotspot {x},{y}"
+                                ));
+                            }
+                            let mask_stride = w.div_ceil(8);
+                            let (Some(raw), Some(mask)) =
+                                (cursor.take(w * h * 4), cursor.take(mask_stride * h))
+                            else {
+                                return Ok(None);
+                            };
+                            let mut pixels = raw.to_vec();
+                            for (i, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                                let col = i % w;
+                                if mask[i / w * mask_stride + col / 8] & (0x80 >> (col % 8)) != 0 {
+                                    pixel[3] = 255;
+                                } else {
+                                    pixel.fill(0);
+                                }
+                            }
+                            crate::PointerShape::Bitmap {
+                                width,
+                                height,
+                                hotspot: (x, y),
+                                pixels: pixels.into(),
+                            }
+                        };
+                        self.remaining = Some(remaining - 1);
+                        self.offset += cursor.at;
+                        return Ok(Some(Message::Pointer(shape)));
+                    }
                     DESKTOP_SIZE => Some(Rect::Resize { width, height }),
                     LAST_RECT => {
                         self.remaining = None;
@@ -360,6 +406,8 @@ impl Incoming {
                 1 => colour_map(&mut cursor)?,
                 2 => Parsed::Complete(Message::Bell, 1),
                 3 => cut_text(&mut cursor)?,
+                150 => Parsed::Complete(Message::EndContinuous, 1),
+                248 => fence(&mut cursor)?,
                 other => {
                     return Err(format!(
                         "the server sent RFB message type {other}, which this client does not read"
@@ -411,6 +459,26 @@ fn colour_map(cursor: &mut Cursor<'_>) -> Result<Parsed, String> {
     Ok(Parsed::Complete(Message::Ignored, cursor.at))
 }
 
+fn fence(cursor: &mut Cursor<'_>) -> Result<Parsed, String> {
+    let (Some(_), Some(flags), Some(length)) = (cursor.take(3), cursor.i32(), cursor.take(1))
+    else {
+        return Ok(Parsed::Incomplete);
+    };
+    if length[0] > 64 {
+        return Err("a fence payload exceeds 64 bytes".into());
+    }
+    let Some(payload) = cursor.take(usize::from(length[0])) else {
+        return Ok(Parsed::Incomplete);
+    };
+    Ok(Parsed::Complete(
+        Message::Fence {
+            flags: flags as u32,
+            payload: payload.to_vec(),
+        },
+        cursor.at,
+    ))
+}
+
 fn cut_text(cursor: &mut Cursor<'_>) -> Result<Parsed, String> {
     if cursor.take(3).is_none() {
         return Ok(Parsed::Incomplete);
@@ -440,6 +508,58 @@ fn cut_text(cursor: &mut Cursor<'_>) -> Result<Parsed, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuous_update_negotiation_survives_fragmented_fences() {
+        let message = [248, 0, 0, 0, 0x80, 0, 0, 1, 2, 0xaa, 0xbb, 150];
+        let mut incoming = Incoming::default();
+        for byte in &message[..10] {
+            incoming.push(&[*byte]);
+            assert!(incoming.take().unwrap().is_none());
+        }
+        incoming.push(&message[10..]);
+        assert!(
+            matches!(incoming.take().unwrap(), Some(Message::Fence { flags: 0x80000001, payload }) if payload == [0xaa,0xbb])
+        );
+        assert!(matches!(
+            incoming.take().unwrap(),
+            Some(Message::EndContinuous)
+        ));
+        incoming.push(&[248, 0, 0, 0, 0, 0, 0, 0, 65]);
+        assert!(incoming.take().is_err());
+    }
+
+    #[test]
+    fn rich_pointer_waits_for_its_row_padded_mask() {
+        let mut data = vec![0, 0, 0, 1, 0, 8, 0, 1, 0, 9, 0, 2];
+        data.extend_from_slice(&RICH_CURSOR.to_be_bytes());
+        data.extend_from_slice(&[3; 9 * 2 * 4]);
+        data.extend_from_slice(&[0, 0x80, 0x80, 0]);
+        let mut incoming = Incoming::default();
+        for byte in &data[..data.len() - 1] {
+            incoming.push(&[*byte]);
+            assert!(incoming.take().unwrap().is_none());
+        }
+        incoming.push(&[0]);
+        let Some(Message::Pointer(crate::PointerShape::Bitmap {
+            hotspot, pixels, ..
+        })) = incoming.take().unwrap()
+        else {
+            panic!("expected a pointer");
+        };
+        assert_eq!(hotspot, (8, 1));
+        for (i, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(
+                pixel,
+                if matches!(i, 8 | 9) {
+                    &[3, 3, 3, 255]
+                } else {
+                    &[0; 4]
+                }
+            );
+        }
+        assert!(matches!(incoming.take().unwrap(), Some(Message::UpdateEnd)));
+    }
 
     #[test]
     fn a_message_split_across_reads_is_joined_again() {

@@ -441,7 +441,7 @@ fn verify(endpoint: &Endpoint) -> Outcome {
                 State::Failed(_) | State::Closed => *failure = Some((reported, reason)),
                 _ => {}
             },
-            Event::Clipboard { .. } | Event::Notice { .. } => {}
+            Event::Pointer(_) | Event::Clipboard { .. } | Event::Notice { .. } => {}
         }
     };
 

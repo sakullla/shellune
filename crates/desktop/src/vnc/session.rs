@@ -8,15 +8,15 @@ use super::handshake::{self, Opened, Transport};
 use super::wire::{Incoming, Message, Rect};
 use super::{Command, Config, Ended};
 use crate::control::{Control, Emit, publish};
+use crate::input::Receiver;
 use crate::{ClipboardKind, Event, Failure, MAX_FRAME_BYTES, Notice, State};
 use std::io::{self, Read, Write};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
 /// One read wait once the desktop is up: the loop returns to its cancellation
 /// check after each, and a partial message stays buffered.
-const POLL: Duration = Duration::from_millis(200);
+const POLL: Duration = Duration::from_millis(32);
 /// The decoder retains an incomplete tile or pixel band across reads.
 const CHUNK: usize = 32 * 1024;
 
@@ -230,6 +230,9 @@ struct Session {
     clipboard: bool,
     /// Whether the server speaks the extended clipboard and can carry text.
     extended: bool,
+    /// None until the server acknowledges the extension, then the subscribed area.
+    continuous: Option<(u16, u16)>,
+    continuous_announced: bool,
     /// The Latin-1 notice is said once per session.
     latin1_reported: bool,
     stats: Stats,
@@ -244,6 +247,8 @@ impl Session {
             emit: Arc::clone(emit),
             clipboard: config.clipboard,
             extended: false,
+            continuous: None,
+            continuous_announced: false,
             latin1_reported: false,
             stats: Stats::default(),
         }
@@ -317,7 +322,8 @@ impl Session {
         // first: it carries a screen of text and UI in a fraction of raw's bytes,
         // and TigerVNC and libvncserver both speak it. Raw stays in the list so a
         // server that supports nothing else still has a way to answer.
-        let mut encodings: Vec<i32> = vec![5, 0, 1, -223, -224];
+        let mut encodings: Vec<i32> =
+            vec![5, 0, 1, -223, -224, super::wire::RICH_CURSOR, -312, -313];
         if self.clipboard {
             encodings.push(EXTENDED_CLIPBOARD);
         }
@@ -331,8 +337,11 @@ impl Session {
     }
 
     fn request(&mut self, incremental: bool) -> Result<(), Ended> {
-        // Type, incremental, then the region: x, y, width, height.
-        let mut message = vec![3u8, u8::from(incremental)];
+        self.request_region(3, incremental)
+    }
+
+    fn request_region(&mut self, kind: u8, enabled: bool) -> Result<(), Ended> {
+        let mut message = vec![kind, u8::from(enabled)];
         message.extend_from_slice(&[0, 0, 0, 0]);
         message.extend_from_slice(&self.desktop.width.to_be_bytes());
         message.extend_from_slice(&self.desktop.height.to_be_bytes());
@@ -341,15 +350,15 @@ impl Session {
 
     /// Applies every queued input or clipboard command before the next read.
     fn drain(&mut self, commands: &Receiver<Command>) -> Result<(), Ended> {
-        loop {
-            match commands.try_recv() {
-                Ok(Command::Key { keysym, down }) => self.key(keysym, down)?,
-                Ok(Command::Pointer { x, y, buttons }) => self.pointer(x, y, buttons)?,
-                Ok(Command::Clipboard(entries)) => self.offer(&entries)?,
-                Err(TryRecvError::Empty) => return Ok(()),
-                Err(TryRecvError::Disconnected) => return Ok(()),
+        for _ in 0..64 {
+            match commands.pop() {
+                Some(Command::Key { keysym, down }) => self.key(keysym, down)?,
+                Some(Command::Pointer { x, y, buttons }) => self.pointer(x, y, buttons)?,
+                Some(Command::Clipboard(entries)) => self.offer(&entries)?,
+                None => break,
             }
         }
+        Ok(())
     }
 
     /// Publishes available pixel bands and requests the next update at the end.
@@ -376,7 +385,39 @@ impl Session {
                         (self.emit)(event);
                     }
                 }
-                Message::UpdateEnd => self.request(true)?,
+                Message::Pointer(shape) => (self.emit)(Event::Pointer(shape)),
+                Message::UpdateEnd => {
+                    let size = (self.desktop.width, self.desktop.height);
+                    match self.continuous {
+                        None => self.request(true)?,
+                        Some(region) if region != size => {
+                            self.request_region(150, true)?;
+                            self.continuous = Some(size);
+                            self.request(false)?;
+                        }
+                        _ => {}
+                    }
+                }
+                Message::EndContinuous if !self.continuous_announced => {
+                    self.continuous_announced = true;
+                    self.request_region(150, true)?;
+                    self.continuous = Some((self.desktop.width, self.desktop.height));
+                }
+                Message::EndContinuous => {
+                    self.continuous = None;
+                    self.request(true)?;
+                }
+                Message::Fence { flags, payload } => {
+                    if flags & 0x8000_0000 != 0 {
+                        // The single decoder processes messages in wire order,
+                        // so BlockBefore and BlockAfter are already satisfied.
+                        let mut reply = vec![248, 0, 0, 0];
+                        reply.extend_from_slice(&(flags & 3).to_be_bytes());
+                        reply.push(payload.len() as u8);
+                        reply.extend_from_slice(&payload);
+                        self.send(&reply)?;
+                    }
+                }
                 Message::CutText(bytes) => {
                     super::trace(&format!("classic cut text of {} bytes", bytes.len()));
                     if self.clipboard {

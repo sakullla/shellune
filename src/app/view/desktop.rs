@@ -18,6 +18,7 @@ use gpui::{
     img, px,
 };
 use shellune_core::SessionFailure;
+use shellune_desktop::PointerShape;
 
 use crate::app::components::{self, Variant};
 use crate::app::copy::{Locale, Strings};
@@ -253,6 +254,9 @@ pub struct DesktopPane {
     focus: FocusHandle,
     link: Option<Box<dyn DesktopLink>>,
     surface: DesktopSurface,
+    pointer_shape: Option<PointerShape>,
+    pointer_image: Option<Arc<RenderImage>>,
+    pointer_dirty: bool,
     input: InputQueue,
     phase: DesktopPhase,
     /// The step of the connection the status card names (R19).
@@ -363,6 +367,9 @@ impl DesktopPane {
     pub fn new(target: DesktopTarget, locale: Locale, cx: &mut Context<Self>) -> Self {
         cx.on_release(|pane: &mut Self, cx| {
             pane.close_link(cx);
+            if let Some(image) = pane.pointer_image.take() {
+                cx.drop_image(image, None);
+            }
             if let Some(image) = pane.image.take() {
                 cx.drop_image(image, None);
             }
@@ -374,6 +381,9 @@ impl DesktopPane {
             focus: cx.focus_handle(),
             link: None,
             surface: DesktopSurface::new(),
+            pointer_shape: None,
+            pointer_image: None,
+            pointer_dirty: false,
             input: InputQueue::new(),
             phase: DesktopPhase::NotStarted,
             stage: DesktopStage::NotStarted,
@@ -721,6 +731,7 @@ impl DesktopPane {
         self.connecting_since = Some(std::time::Instant::now());
         self.failed_stage = None;
         self.surface.reset();
+        self.set_pointer(None);
         self.wait_seconds = None;
         // A new session has said nothing yet and has not seen this clipboard.
         self.shared.clear();
@@ -745,6 +756,7 @@ impl DesktopPane {
             self.failed_stage = Some(self.stage);
         }
         self.certificate = None;
+        self.set_pointer(None);
         self.phase = DesktopPhase::Ended(failure.session_failure(reason, &target, was_live));
         self.connecting_since = None;
         self.polling = false;
@@ -796,34 +808,39 @@ impl DesktopPane {
         .detach();
     }
 
-    /// Whether the surface is showing a live picture, for a test or a capture.
-    #[cfg(any(test, feature = "ui-capture"))]
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Whether the surface is showing a live picture.
     pub fn is_live(&self) -> bool {
         matches!(self.phase, DesktopPhase::Live)
     }
 
-    /// The pointer the window shows over the picture.
-    ///
-    /// Both protocols this build speaks draw the remote pointer into the frame,
-    /// so a local arrow over the picture is a second pointer on one screen:
-    ///
-    /// * VNC: this client does not ask for the Cursor pseudo-encoding, so the
-    ///   server renders its pointer into the framebuffer.
-    /// * RDP: this client advertises no pointer capability, so the server paints
-    ///   its pointer into the bitmap updates and the frame arrives with it.
-    ///
-    /// While a session is live the surface therefore asks for
-    /// [`CursorStyle::None`]; before and after it, and whenever the pane is not a
-    /// picture, it asks for the ordinary arrow so the rest of the window keeps
-    /// its pointer.
-    ///
-    /// If RDP pointer PDUs are ever decoded and the server stops painting the
-    /// pointer into the frame, this has to become a per-frame question - "does
-    /// this picture come with a pointer?" - instead of a per-phase one: hiding
-    /// the local pointer for a frame without one would leave no cursor at all.
+    fn set_pointer(&mut self, shape: Option<PointerShape>) {
+        self.pointer_shape = shape;
+        self.pointer_dirty = true;
+    }
+
+    fn update_pointer_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.pointer_dirty) {
+            return;
+        }
+        if let Some(old) = self.pointer_image.take() {
+            cx.drop_image(old, Some(window));
+        }
+        if let Some(PointerShape::Bitmap {
+            width,
+            height,
+            pixels,
+            ..
+        }) = &self.pointer_shape
+            && let Some(buffer) =
+                image::ImageBuffer::from_raw((*width).into(), (*height).into(), pixels.to_vec())
+        {
+            self.pointer_image = Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])));
+        }
+    }
+
+    /// A peer that has not sent a shape may already be painting its cursor.
     fn surface_cursor(&self) -> CursorStyle {
-        if matches!(self.phase, DesktopPhase::Live) {
+        if self.is_live() && !matches!(self.pointer_shape, Some(PointerShape::Default)) {
             CursorStyle::None
         } else {
             CursorStyle::Arrow
@@ -913,6 +930,10 @@ impl DesktopPane {
 
     fn apply(&mut self, event: LinkEvent, cx: &mut Context<Self>) -> bool {
         match event {
+            LinkEvent::Pointer(shape) => {
+                self.set_pointer(Some(shape));
+                true
+            }
             LinkEvent::Frame(region) => {
                 if !self.surface.apply(&region) {
                     // A region that does not fit its own desktop is refused rather
@@ -1115,6 +1136,7 @@ impl DesktopPane {
     ) -> bool {
         match state {
             LinkState::Idle | LinkState::Connecting => {
+                self.set_pointer(None);
                 if !matches!(self.phase, DesktopPhase::Live) {
                     self.phase = DesktopPhase::Connecting;
                 }
@@ -1312,24 +1334,20 @@ impl DesktopPane {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        // The overlay follows movement at display speed, including movement
+        // inside one magnified desktop pixel. The cached desktop is reused.
+        if self.pointer_image.is_some() {
+            cx.notify();
+        }
         let Some((x, y)) = self.remote_point(event.position) else {
             return;
         };
-        if self.last_sent == Some((x, y)) {
-            return;
+        if self.last_sent != Some((x, y)) {
+            self.input.push_pointer(x, y, self.input.held_buttons());
+            self.last_sent = Some((x, y));
         }
-        let buttons = self.input.held_buttons();
-        self.input.push_pointer(x, y, buttons);
-        self.last_sent = Some((x, y));
-        // Hover motion can replace the previous position until the next poll.
-        // A drag carries its path, and a click or key flushes pending motion first.
-        if buttons.any_button() {
-            let had_problem = self.send_problem.is_some();
-            self.flush_input();
-            if self.send_problem.is_some() != had_problem {
-                cx.notify();
-            }
-        }
+        // Sample motion once per input tick. Press, release and key handlers
+        // flush the last position first, preserving their order during drags.
     }
 
     fn on_mouse_up(&mut self, button: MouseButton, event: &MouseUpEvent, cx: &mut Context<Self>) {
@@ -2050,6 +2068,7 @@ fn pointer_button(button: MouseButton) -> Option<Buttons> {
 impl Render for DesktopPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let metrics = Metrics::default();
+        self.update_pointer_image(window, cx);
         if !self.watching_focus {
             // A picture that lost the keyboard may be showing a modifier the remote
             // side still thinks is held; letting go of everything is the only
@@ -2209,15 +2228,41 @@ impl Render for DesktopPane {
                 // Bounds use window coordinates; the image is placed in its pane.
                 let image = if let Some(viewport) = self.viewport {
                     let rect = content_rect_in(viewport, self.surface.size(), self.zoom, self.pan);
-                    div()
+                    let mut picture_layer = div()
                         .absolute()
+                        .overflow_hidden()
                         .left(rect.origin.x - viewport.origin.x)
                         .top(rect.origin.y - viewport.origin.y)
                         .w(rect.size.width)
                         .h(rect.size.height)
                         .debug_selector(|| "desktop.picture".to_owned())
-                        .child(img(picture).size_full())
-                        .into_any_element()
+                        .child(img(picture).size_full());
+                    let position = window.mouse_position();
+                    if self.is_live()
+                        && self.controls_hovered
+                        && !self.bar_hovered
+                        && self.certificate.is_none()
+                        && rect.contains(&position)
+                        && let Some(PointerShape::Bitmap {
+                            width,
+                            height,
+                            hotspot,
+                            ..
+                        }) = &self.pointer_shape
+                        && let Some(cursor) = &self.pointer_image
+                    {
+                        let scale = rect.size.width / self.surface.size().0 as f32;
+                        picture_layer = picture_layer.child(
+                            img(cursor.clone())
+                                .absolute()
+                                .debug_selector(|| "desktop.pointer".to_owned())
+                                .left(position.x - rect.origin.x - scale * f32::from(hotspot.0))
+                                .top(position.y - rect.origin.y - scale * f32::from(hotspot.1))
+                                .w(scale * f32::from(*width))
+                                .h(scale * f32::from(*height)),
+                        );
+                    }
+                    cursor_over(picture_layer, self.surface_cursor()).into_any_element()
                 } else {
                     img(picture)
                         .size_full()
@@ -2231,12 +2276,7 @@ impl Render for DesktopPane {
                     .overflow_hidden()
                     .debug_selector(|| "desktop.surface".to_owned())
                     .child(image);
-                // The picture is the remote screen: over it the pointer the user
-                // sees should be the one the remote side draws, not a second local
-                // arrow beside it. The surface carries that choice; the bar and the
-                // notices drawn over it ask for the arrow back, because they are
-                // this window's controls and not the picture.
-                body = body.child(cursor_over(surface, self.surface_cursor()));
+                body = body.child(surface);
             }
             None => {
                 // A link that comes up in under the floor shows its picture instead of

@@ -12,13 +12,13 @@ mod wire;
 pub(crate) use clipboard::{latin1_to_utf8, utf8_to_latin1};
 
 use crate::control::{Control, Emit, publish};
+use crate::input::{self, Sender};
 use crate::{
     ClipboardEntry, ClipboardKind, Error, Event, Failure, MAX_CLIPBOARD_TEXT_BYTES, Notice, State,
     cut_clipboard_text,
 };
 use std::io;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -187,7 +187,7 @@ impl Client {
         if self.config.host.is_empty() {
             return Err(Error::Argument);
         }
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = input::channel();
         let emit = Arc::clone(&self.emit);
         let control = Arc::clone(&self.control);
         let config = self.config.snapshot();
@@ -246,10 +246,14 @@ impl Client {
     }
 
     fn command(&self, command: Command) -> Result<(), Error> {
-        match &self.commands {
-            Some(sender) => sender.send(command).map_err(|_| Error::State),
-            None => Err(Error::State),
-        }
+        let buttons = match &command {
+            Command::Pointer { buttons, .. } => Some(*buttons),
+            _ => None,
+        };
+        self.commands
+            .as_ref()
+            .ok_or(crate::Error::State)?
+            .send(command, buttons)
     }
 
     pub(super) fn key(&self, keysym: u32, down: bool) -> Result<(), Error> {

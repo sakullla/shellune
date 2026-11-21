@@ -28326,15 +28326,8 @@ async fn a_certificate_that_may_not_be_trusted_is_refused_at_once_and_releases_t
     );
 }
 
-/// A VNC picture carries the server's pointer, so ours steps aside while it is live.
-///
-/// The window cannot be asked what cursor the platform was handed: gpui keeps it in
-/// the test platform, which exposes no reader. What is asserted here is therefore
-/// the pane's own answer - the one render puts on the surface - at each step, and
-/// that the surface and the bar over it are drawn. Manual acceptance: connect to a
-/// VNC host and move the pointer over the picture (one pointer, the server's), over
-/// the bar (an arrow or a pointing hand, never nothing), and end the session (the
-/// local arrow is back).
+/// A peer that paints the cursor into its frames keeps that cursor until it
+/// explicitly supplies a shape.
 #[gpui::test]
 async fn a_live_vnc_picture_hides_the_local_pointer_until_the_session_ends(
     cx: &mut TestAppContext,
@@ -28403,12 +28396,47 @@ async fn a_live_vnc_picture_hides_the_local_pointer_until_the_session_ends(
     );
 }
 
-/// An RDP picture carries the server's pointer in its frames, so ours goes away.
-///
-/// This build does not decode RDP pointer PDUs, and xrdp paints its pointer into the
-/// bitmap it sends: a live RDP session used to draw the server's pointer and the local
-/// arrow on top of each other (the reported double pointer). The local pointer is
-/// hidden while the session is live, like a VNC picture, and comes back when it ends.
+/// Local motion must remain visible while the link sends no new frames.
+#[gpui::test]
+async fn desktop_pointer_follows_local_motion_without_another_frame(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, _) = ScriptedLink::new(vec![
+        LinkEvent::Frame(solid(0, 0, 1, 1, (800, 600), [3, 3, 3, 255])),
+        LinkEvent::Pointer(shellune_desktop::PointerShape::Bitmap {
+            width: 4,
+            height: 4,
+            hotspot: (1, 2),
+            pixels: vec![255; 64].into(),
+        }),
+    ]);
+    let feed = link.feed();
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+    let picture = bounds_of(cx, "desktop.picture");
+    let scale = f32::from(picture.size.width) / 800.0;
+    for offset in [0.0, 40.0, -27.0] {
+        let point = picture.center() + point(px(offset), px(offset));
+        cx.simulate_mouse_move(point, None, Modifiers::default());
+        cx.run_until_parked();
+        let cursor = bounds_of(cx, "desktop.pointer");
+        assert!((f32::from(cursor.origin.x - point.x) + scale).abs() < 1.1);
+        assert!((f32::from(cursor.origin.y - point.y) + 2.0 * scale).abs() < 1.1);
+    }
+    feed.feed(vec![LinkEvent::Pointer(
+        shellune_desktop::PointerShape::Default,
+    )]);
+    pump_desktop(&view, cx, id);
+    assert_eq!(
+        cx.update(|_, app| view
+            .read(app)
+            .desktop_of(id)
+            .unwrap()
+            .read(app)
+            .surface_cursor_for_test()),
+        gpui::CursorStyle::Arrow
+    );
+}
+
+/// RDP peers that do not supply pointer updates retain the embedded cursor.
 #[gpui::test]
 async fn an_rdp_picture_hides_the_local_pointer_like_a_vnc_one(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));

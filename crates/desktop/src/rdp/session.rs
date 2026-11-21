@@ -11,11 +11,11 @@ use super::share::{self, Share};
 use super::update;
 use super::wire::{self, Packet};
 use super::{Command, Config, Control, Emit, publish};
+use crate::input::Receiver;
 use crate::{Event, Failure, MAX_FRAME_BYTES, State};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
 /// How long the handshake may take before the attempt is abandoned.
@@ -72,21 +72,28 @@ impl Frames {
 /// call continues the same PDU instead of parsing from its middle.
 fn next_frame(transport: &mut impl Read, frames: &mut Frames) -> io::Result<Incoming> {
     loop {
-        if let Some(incoming) = frames.take()? {
-            return Ok(incoming);
-        }
-        let mut chunk = [0u8; 16 * 1024];
-        match transport.read(&mut chunk) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "the server closed the connection",
-                ));
-            }
-            Ok(read) => frames.push(&chunk[..read]),
-            Err(error) => return Err(error),
+        if let Some(frame) = read_chunk(transport, frames)? {
+            return Ok(frame);
         }
     }
+}
+
+/// Give the input queue a turn after each socket read. A low-bandwidth peer
+/// may stream one PDU for seconds without a single read timing out.
+fn read_chunk(transport: &mut impl Read, frames: &mut Frames) -> io::Result<Option<Incoming>> {
+    if let Some(frame) = frames.take()? {
+        return Ok(Some(frame));
+    }
+    let mut chunk = [0u8; 16 * 1024];
+    let read = transport.read(&mut chunk)?;
+    if read == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the server closed the connection",
+        ));
+    }
+    frames.push(&chunk[..read]);
+    frames.take()
 }
 
 /// How long the server has to confirm or refuse the logon. A server that says
@@ -94,7 +101,7 @@ fn next_frame(transport: &mut impl Read, frames: &mut Frames) -> io::Result<Inco
 const LOGON_WAIT: Duration = Duration::from_secs(10);
 /// One read wait once the desktop is up: the loop returns to its cancellation and
 /// deadline checks after each, and a partial record stays buffered.
-const POLL: Duration = Duration::from_millis(200);
+const POLL: Duration = Duration::from_millis(32);
 
 /// Ends one attempt with the business failure it maps to.
 struct Ended {
@@ -484,6 +491,7 @@ struct Active {
     drive: Drive,
     /// The button state the host last reported, so each edge carries its button.
     buttons: u32,
+    pointers: super::pointer::Pointers,
 }
 
 fn connect(
@@ -591,6 +599,7 @@ fn connect(
         clipboard: Clipboard::new(config.clipboard, Arc::clone(emit)),
         drive: Drive::new(config.drive.clone(), Arc::clone(emit)),
         buttons: 0,
+        pointers: Default::default(),
         logon: None,
         frames: Frames::default(),
         connected: false,
@@ -735,12 +744,13 @@ impl Active {
                 return Err(Ended::new(Failure::Cancelled, "cancelled"));
             }
             self.announce_logon(emit, control)?;
-            self.drain(emit, commands)?;
+            self.drain(commands)?;
             self.clipboard
                 .poll(&self.channels, &mut self.transport)
                 .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-            match self.read() {
-                Ok(Incoming::Slow(body)) => {
+            match read_chunk(&mut self.transport, &mut self.frames) {
+                Ok(None) => continue,
+                Ok(Some(Incoming::Slow(body))) => {
                     self.slow(&body, emit)?;
                     if let Some(Logon::Refused(code)) = self.logon {
                         return Err(Ended::new(
@@ -749,7 +759,7 @@ impl Active {
                         ));
                     }
                 }
-                Ok(Incoming::Fast) => {
+                Ok(Some(Incoming::Fast)) => {
                     return Err(Ended::new(
                         Failure::ProtocolFailure,
                         "the server sent fast-path output the client did not offer",
@@ -766,33 +776,30 @@ impl Active {
     }
 
     /// Applies every queued input or clipboard command before the next read.
-    fn drain(&mut self, emit: &Emit, commands: &Receiver<Command>) -> Result<(), Ended> {
-        loop {
-            match commands.try_recv() {
-                Ok(Command::Key {
+    fn drain(&mut self, commands: &Receiver<Command>) -> Result<(), Ended> {
+        for _ in 0..64 {
+            match commands.pop() {
+                Some(Command::Key {
                     scancode,
                     down,
                     extended,
                 }) => self
                     .key(scancode, down, extended)
                     .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?,
-                Ok(Command::Pointer { buttons, x, y }) => {
+                Some(Command::Pointer { buttons, x, y }) => {
                     let flags = super::pointer_flags(self.buttons, buttons);
                     self.buttons = buttons;
                     self.pointer(flags, x, y)
                         .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
                 }
-                Ok(Command::Clipboard(entries)) => self
+                Some(Command::Clipboard(entries)) => self
                     .clipboard
                     .offer(&self.channels, &mut self.transport, &entries)
                     .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?,
-                Err(TryRecvError::Empty) => return Ok(()),
-                Err(TryRecvError::Disconnected) => {
-                    let _ = emit;
-                    return Ok(());
-                }
+                None => break,
             }
         }
+        Ok(())
     }
 
     /// Reads bytes until a whole PDU is buffered. A timeout part-way through keeps
@@ -893,6 +900,13 @@ impl Active {
                 }
                 if kind == 2 {
                     self.bitmap_update(payload, emit)?;
+                } else if kind == 27
+                    && let Some(shape) = self
+                        .pointers
+                        .update(payload)
+                        .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?
+                {
+                    emit(Event::Pointer(shape));
                 }
             }
             2 => {

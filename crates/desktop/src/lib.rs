@@ -19,6 +19,7 @@
 //! claims a capability the binary does not have.
 
 mod control;
+mod input;
 mod mailbox;
 mod rdp;
 mod tls;
@@ -331,6 +332,20 @@ pub enum DriveProblem {
     Other(i32),
 }
 
+/// A server-supplied cursor follows the local mouse independently of desktop updates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PointerShape {
+    Hidden,
+    Default,
+    Bitmap {
+        width: u16,
+        height: u16,
+        hotspot: (u16, u16),
+        /// Top-down BGRA, including the transparency mask.
+        pixels: std::sync::Arc<[u8]>,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// The session's main state changed. `reason` is the engine's own text: it is
@@ -341,6 +356,7 @@ pub enum Event {
         detail: i32,
         reason: String,
     },
+    Pointer(PointerShape),
     /// A dirty region of the desktop, already copied out of the engine's buffer.
     Frame {
         x: i32,
@@ -365,9 +381,13 @@ pub enum Event {
     /// The peer copied something: every format of that one copy that could be
     /// fetched, each kind at most once. Text bytes that were not UTF-8 are replaced,
     /// so the text may differ from what the peer sent.
-    Clipboard { entries: Vec<ClipboardEntry> },
+    Clipboard {
+        entries: Vec<ClipboardEntry>,
+    },
     /// Worth telling the user; the session state is unchanged.
-    Notice { notice: Notice },
+    Notice {
+        notice: Notice,
+    },
 }
 
 #[derive(Debug)]

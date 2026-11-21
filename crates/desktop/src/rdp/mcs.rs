@@ -234,11 +234,20 @@ pub(super) fn connect(
     let user = offset
         .checked_add(BASE_USER_ID)
         .ok_or_else(|| invalid("invalid MCS user"))?;
-    for id in [user, global].iter().chain(&ids) {
+    // MS-RDPBCGR 1.3.1.1: all channel IDs are known after Attach User.
+    // Send the joins in one TLS write, then verify every confirmation before logon.
+    let base_channels = [user, global];
+    let channels = base_channels.iter().chain(&ids);
+    let mut batch = Vec::new();
+    for id in channels.clone() {
         let mut join = vec![0x38];
         join.extend_from_slice(&offset.to_be_bytes());
         join.extend_from_slice(&id.to_be_bytes());
-        write_data(io, &join)?;
+        write_data(&mut batch, &join)?;
+    }
+    io.write_all(&batch)?;
+    io.flush()?;
+    for id in channels {
         let response = read_data(io)?;
         let mut joined = Packet(&response);
         joined.expect(&[0x3e, 0])?;
