@@ -396,10 +396,17 @@ pub fn sanitize_diagnostic(reason: &str) -> String {
     let mut rest = without_user.as_str();
     loop {
         let lowered = rest.to_ascii_lowercase();
-        let found = ["password=", "passphrase=", "secret=", "token="]
-            .iter()
-            .filter_map(|needle| lowered.find(needle).map(|at| (at, needle.len())))
-            .min_by_key(|(at, _)| *at);
+        let found = [
+            "password=",
+            "passwd=",
+            "pwd=",
+            "passphrase=",
+            "secret=",
+            "token=",
+        ]
+        .iter()
+        .filter_map(|needle| lowered.find(needle).map(|at| (at, needle.len())))
+        .min_by_key(|(at, _)| *at);
         let Some((at, len)) = found else {
             break;
         };
@@ -1388,5 +1395,34 @@ impl Workspace {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_diagnostic;
+
+    #[test]
+    fn sanitize_diagnostic_redacts_common_password_and_url_forms() {
+        assert_eq!(
+            sanitize_diagnostic("auth failed (pwd=s3cr3t, retries=2)"),
+            "auth failed (pwd=<hidden>, retries=2)"
+        );
+        assert_eq!(
+            sanitize_diagnostic("auth failed (PASSWD=hunter2; host=desk)"),
+            "auth failed (PASSWD=<hidden>; host=desk)"
+        );
+        assert_eq!(
+            sanitize_diagnostic("rdp://alice:topsecret@10.0.0.8:3389?token=abc123&pwd=xyz"),
+            "rdp://10.0.0.8:3389?token=<hidden>&pwd=<hidden>"
+        );
+        assert_eq!(
+            sanitize_diagnostic("passphrase=my-phrase secret=shh password=pw"),
+            "passphrase=<hidden> secret=<hidden> password=<hidden>"
+        );
+        assert_eq!(
+            sanitize_diagnostic("connection reset by peer"),
+            "connection reset by peer"
+        );
     }
 }

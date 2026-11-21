@@ -26,7 +26,8 @@ use crate::app::desktop::{
     ALT_LEFT, Availability, Buttons, CONTROL_LEFT, ClipboardEntry, ClipboardKind,
     DESKTOP_POLL_INTERVAL, DesktopLink, DesktopSurface, DesktopTarget, DesktopZoom, DriveProblem,
     InputQueue, KeyCodes, LinkEvent, LinkFailure, LinkState, NativeLink, Notice, SHIFT_LEFT,
-    availability, clamp_pan, content_rect_in, encryption_note, key_codes, to_remote_in,
+    availability, clamp_pan, content_rect_in, encryption_note, in_controls_reveal_zone, key_codes,
+    to_remote_in,
 };
 use crate::app::desktop_clipboard;
 use crate::app::icons::{self, Icon};
@@ -72,6 +73,10 @@ const NOTICE_WIDTH: f32 = 420.0;
 /// scale: "100%" and "Fit" / "适应窗口" in either language, so the buttons do not move.
 const ZOOM_LABEL_WIDTH: f32 = 72.0;
 
+/// How long the floating desktop toolbar stays visible without being hovered
+/// before automatically leaving the element tree (R2).
+const CONTROLS_AUTO_HIDE_DELAY: std::time::Duration = std::time::Duration::from_millis(2500);
+
 /// Whether a certificate question is still waiting for an answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CertificateQuestion {
@@ -112,10 +117,16 @@ pub enum DesktopPhase {
 }
 
 impl DesktopPhase {
-    /// Whether the pane still sends what the user does to the remote side.
+    /// Whether the pane still needs to poll the link for frames and state changes.
+    #[must_use]
+    pub fn wants_poll(&self) -> bool {
+        matches!(self, Self::Connecting | Self::Live)
+    }
+
+    /// Whether the pane sends user input to the remote side (only while live).
     #[must_use]
     pub fn accepts_input(&self) -> bool {
-        matches!(self, Self::Live) || matches!(self, Self::Connecting)
+        matches!(self, Self::Live)
     }
 
     /// The failure the pane states, when it ended.
@@ -336,12 +347,20 @@ pub struct DesktopPane {
     /// pointer is on it - including the folded handle, which is drawn only while
     /// one of the two says the pointer is here.
     bar_hovered: bool,
+    /// Whether the floating toolbar is currently visible over the picture.
+    ///
+    /// Revealed briefly when the first frame arrives, on top-center pointer
+    /// approach, or via Alt+Shift+T, and automatically removed from the element
+    /// tree after [CONTROLS_AUTO_HIDE_DELAY] when not hovered (R2).
+    controls_visible: bool,
     /// Whether the bar over the picture is folded away on purpose.
     ///
     /// The fold is the pane's own memory: another frame, a redraw and a step of the
     /// session keep it, and it is never written down - a new attempt starts with the
     /// bar shown, because the fold was a decision about this screen.
     controls_collapsed: bool,
+    /// Monotonic debounce token for the toolbar auto-hide timer (R2).
+    controls_idle_token: u64,
     /// How many frames drew the bar over the picture, for the test that a folded bar
     /// is not drawn at all. The test window keeps the debug bounds of elements that
     /// are gone, so a frame count is the only honest way to say "not drawn".
@@ -454,7 +473,9 @@ impl DesktopPane {
             // with no pointer over the picture: there the bar starts shown.
             controls_hovered: cfg!(feature = "ui-capture"),
             bar_hovered: false,
+            controls_visible: cfg!(feature = "ui-capture"),
             controls_collapsed: false,
+            controls_idle_token: 0,
             #[cfg(test)]
             controls_frames: 0,
             send_problem: None,
@@ -590,20 +611,78 @@ impl DesktopPane {
         }
     }
 
-    /// Folds the controls over the picture away, or brings them back.
+    /// Folds the controls over the picture away, or brings them back (R2).
     ///
-    /// Folded, the bar is not drawn at all - not even while the pointer is over the
-    /// picture - and only a small handle in the same corner brings it back. The state
-    /// belongs to the pane and is never written down.
+    /// When collapsed or auto-hidden, the bar is completely removed from the
+    /// element tree so it leaves zero hitboxes over the remote desktop. The
+    /// user can bring it back by moving the pointer into the top-center reveal
+    /// band or pressing Alt+Shift+T.
     pub fn set_controls_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
-        if self.controls_collapsed != collapsed {
-            self.controls_collapsed = collapsed;
-            // The bar's own hover was recorded while it was drawn; folding it away
-            // takes that element out of the tree, and a stale hover would keep the
-            // handle on screen after the pointer had left the picture.
+        if collapsed {
+            let changed = !self.controls_collapsed || self.controls_visible || self.bar_hovered;
+            self.controls_collapsed = true;
+            self.controls_visible = false;
             self.bar_hovered = false;
+            self.controls_idle_token = self.controls_idle_token.wrapping_add(1);
+            if changed {
+                cx.notify();
+            }
+        } else {
+            self.reveal_controls(cx);
+        }
+    }
+
+    /// Reveals the floating toolbar and schedules its automatic dismissal when
+    /// the pointer is not hovering over it (R2).
+    pub fn reveal_controls(&mut self, cx: &mut Context<Self>) {
+        let changed = self.controls_collapsed || !self.controls_visible;
+        self.controls_collapsed = false;
+        self.controls_visible = true;
+        self.schedule_controls_auto_hide(cx);
+        if changed {
             cx.notify();
         }
+    }
+
+    /// Toggles the floating toolbar without sending any input to the remote desktop (R2).
+    pub fn toggle_controls(&mut self, cx: &mut Context<Self>) {
+        if self.controls_shown() {
+            self.set_controls_collapsed(true, cx);
+        } else {
+            self.reveal_controls(cx);
+        }
+    }
+
+    fn schedule_controls_auto_hide(&mut self, cx: &mut Context<Self>) {
+        if cfg!(feature = "ui-capture") {
+            return;
+        }
+        self.controls_idle_token = self.controls_idle_token.wrapping_add(1);
+        let token = self.controls_idle_token;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(CONTROLS_AUTO_HIDE_DELAY)
+                .await;
+            let _ = this.update(cx, |pane, cx| {
+                pane.auto_hide_controls_if_idle(token, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn auto_hide_controls_if_idle(&mut self, token: u64, cx: &mut Context<Self>) {
+        if self.controls_idle_token != token || self.bar_hovered || !self.controls_visible {
+            return;
+        }
+        self.controls_visible = false;
+        cx.notify();
+    }
+
+    /// Forces the pending toolbar auto-hide timer to fire immediately, for tests.
+    #[cfg(test)]
+    pub fn trigger_controls_auto_hide_for_test(&mut self, cx: &mut Context<Self>) {
+        let token = self.controls_idle_token;
+        self.auto_hide_controls_if_idle(token, cx);
     }
 
     /// How many frames drew the bar over the picture, for the tests.
@@ -645,6 +724,26 @@ impl DesktopPane {
             self.pan = (0.0, 0.0);
             cx.notify();
         }
+    }
+
+    /// Clamps `self.pan` in place against the current viewport and zoomed picture size (R4).
+    fn clamp_current_pan(&mut self) {
+        let Some(viewport) = self.viewport else {
+            return;
+        };
+        let Some(percent) = self.zoom.percent() else {
+            return;
+        };
+        let (width, height) = self.surface.size();
+        if width == 0 || height == 0 {
+            return;
+        }
+        let factor = f32::from(percent) / 100.0;
+        self.pan = clamp_pan(
+            viewport,
+            (width as f32 * factor, height as f32 * factor),
+            self.pan,
+        );
     }
 
     /// Moves a zoomed picture by one scroll step, keeping it over the pane.
@@ -738,6 +837,9 @@ impl DesktopPane {
             self.phase = DesktopPhase::Connecting;
             self.stage = DesktopStage::Connecting;
             self.connection_wait = Some(crate::app::ConnectionWait::new());
+            self.input = InputQueue::new();
+            self.last_sent = None;
+            self.wheel_remainder = [0.0; 2];
             self.provided_password = password.is_some_and(|p| !p.is_empty());
             self.pending_dial = Some(password.map(shellune_core::SecretString::new));
             if self.viewport.is_some() {
@@ -827,7 +929,15 @@ impl DesktopPane {
         self.connection_wait
             .get_or_insert_with(crate::app::ConnectionWait::new);
         self.failed_stage = None;
-        self.surface.reset();
+        // Preserve any previously drawn surface/images across a manual reconnect so
+        // the last picture stays visible until the new session delivers its first
+        // frame and atomically replaces it (R5).
+        self.input = InputQueue::new();
+        self.last_sent = None;
+        self.wheel_remainder = [0.0; 2];
+        self.send_problem = None;
+        self.controls_collapsed = false;
+        self.bar_hovered = false;
         self.set_pointer(None);
         self.wait_seconds = None;
         // A new session has said nothing yet and has not seen this clipboard.
@@ -854,18 +964,22 @@ impl DesktopPane {
         }
         self.certificate = None;
         self.set_pointer(None);
+        // Release any held keys/buttons while the link is still live, then drop any
+        // unsent queued input so nothing stale can leak into a later reconnect (R5).
+        if was_live {
+            self.release_input();
+        }
         self.phase = DesktopPhase::Ended(failure.session_failure(
             reason,
             self.target.protocol(),
             &target,
             was_live,
         ));
+        self.input = InputQueue::new();
+        self.last_sent = None;
+        self.wheel_remainder = [0.0; 2];
         self.connection_wait = None;
         self.polling = false;
-        // Nothing is held after a session ended: the remote side would otherwise
-        // keep a modifier down for a connection that is gone.
-        self.release_input();
-        self.flush_input();
         self.close_link(cx);
         cx.notify();
     }
@@ -981,13 +1095,9 @@ impl DesktopPane {
         self.presented_cursor
     }
 
-    /// Whether the controls over the picture are drawn.
-    ///
-    /// The pointer may be over the picture itself or over the bar that sits on
-    /// it: the bar occludes the body's hitbox, so its own hover has to count, or
-    /// the pointer would hide the bar the moment it reached it.
+    /// Whether the controls over the picture are currently mounted in the element tree (R2).
     fn controls_shown(&self) -> bool {
-        self.controls_hovered || self.bar_hovered
+        !self.controls_collapsed && (self.controls_visible || self.bar_hovered)
     }
 
     /// Whether the bar is drawn, for the tests.
@@ -998,9 +1108,17 @@ impl DesktopPane {
     }
 
     /// Records the pointer arriving on or leaving the bar itself.
+    ///
+    /// Hovering the bar pauses its auto-hide countdown; leaving it starts a fresh
+    /// countdown so the bar gets out of the way once the user resumes remote work.
     fn set_bar_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
         if self.bar_hovered != hovered {
             self.bar_hovered = hovered;
+            if hovered {
+                self.controls_idle_token = self.controls_idle_token.wrapping_add(1);
+            } else if self.controls_visible && !self.controls_collapsed {
+                self.schedule_controls_auto_hide(cx);
+            }
             cx.notify();
         }
     }
@@ -1055,7 +1173,7 @@ impl DesktopPane {
             cx.notify();
         }
         if events.is_empty() {
-            return self.phase.accepts_input() || matches!(self.phase, DesktopPhase::NotStarted);
+            return self.phase.wants_poll() || matches!(self.phase, DesktopPhase::NotStarted);
         }
         let mut keep = true;
         let mut redraw = had_problem != self.send_problem.is_some();
@@ -1080,6 +1198,7 @@ impl DesktopPane {
                 true
             }
             LinkEvent::Frame(region) => {
+                let previous_size = self.surface.size();
                 if self.reconnecting() {
                     let mut next = DesktopSurface::new();
                     if !next.apply(&region) {
@@ -1090,6 +1209,9 @@ impl DesktopPane {
                     // A region that does not fit its own desktop is refused rather
                     // than written past the canvas; the session keeps running.
                     return true;
+                }
+                if self.surface.size() != previous_size && !self.zoom.is_fit() {
+                    self.clamp_current_pan();
                 }
                 if let Some((_, content @ false)) = &mut self.picture_trace {
                     *content = region
@@ -1105,6 +1227,9 @@ impl DesktopPane {
                     self.phase = DesktopPhase::Live;
                     self.stage = DesktopStage::Establishing;
                     self.connection_wait = None;
+                    if !self.controls_collapsed {
+                        self.reveal_controls(cx);
+                    }
                 }
                 true
             }
@@ -1280,13 +1405,15 @@ impl DesktopPane {
         self.notices.iter().map(|(kind, _)| *kind).collect()
     }
 
-    /// Puts the notices away. Each still counts as shown for this session.
-    pub fn dismiss_notices(&mut self, cx: &mut Context<Self>) {
+    /// Puts the notices away and returns keyboard focus to the desktop surface (R5).
+    /// Each still counts as shown for this session.
+    pub fn dismiss_notices(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.send_problem.is_some() || !self.notices.is_empty() {
             self.send_problem = None;
             self.notices.clear();
             cx.notify();
         }
+        window.focus(&self.focus);
     }
 
     fn apply_state(
@@ -1342,8 +1469,8 @@ impl DesktopPane {
                         && self.provided_password
                         && !self.is_live())
                 {
-                    let rejected =
-                        (failure == LinkFailure::Authentication).then(|| reason.to_owned());
+                    let rejected = (failure == LinkFailure::Authentication)
+                        .then(|| crate::app::workspace::sanitize_diagnostic(reason));
                     self.close_link(cx);
                     self.polling = false;
                     self.certificate = None;
@@ -1495,8 +1622,13 @@ impl DesktopPane {
 
     // ---------------------------------------------------------------- input
 
+    /// Whether the pane may enqueue and forward remote input (R5).
+    fn can_send_input(&self) -> bool {
+        self.phase.accepts_input() && self.certificate.is_none() && self.sign_in.is_none()
+    }
+
     fn flush_input(&mut self) {
-        if self.reconnecting() {
+        if !self.can_send_input() {
             return;
         }
         let Some(link) = self.link.as_ref() else {
@@ -1558,7 +1690,7 @@ impl DesktopPane {
     /// measured from the last painted frame, so entering or leaving the full screen
     /// changes the numbers the pointer is mapped through and nothing else.
     fn remote_point(&self, position: gpui::Point<Pixels>) -> Option<(u16, u16)> {
-        if self.certificate.is_some() || !self.is_live() {
+        if !self.can_send_input() {
             return None;
         }
         to_remote_in(
@@ -1592,6 +1724,19 @@ impl DesktopPane {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        // Reveal a hidden/collapsed toolbar when the pointer approaches the
+        // top-center edge without holding a mouse button (R2). Evaluated purely
+        // from coordinates so the hidden state leaves zero hitboxes.
+        if !self.images.is_empty()
+            && !self.controls_shown()
+            && !self.input.held_buttons().any_button()
+            && self.certificate.is_none()
+            && self.sign_in.is_none()
+            && let Some(viewport) = self.viewport
+            && in_controls_reveal_zone(viewport, event.position)
+        {
+            self.reveal_controls(cx);
+        }
         // The overlay follows movement at display speed, including movement
         // inside one magnified desktop pixel. The cached desktop is reused.
         #[cfg(target_os = "macos")]
@@ -1616,7 +1761,7 @@ impl DesktopPane {
     }
 
     fn on_mouse_up(&mut self, button: MouseButton, event: &MouseUpEvent, cx: &mut Context<Self>) {
-        if self.certificate.is_some() || !self.is_live() {
+        if !self.can_send_input() {
             return;
         }
         let Some(bit) = pointer_button(button) else {
@@ -1733,18 +1878,23 @@ impl DesktopPane {
             cx.stop_propagation();
             return;
         }
-        // The pane hands every key to the remote side, so the two controls that
+        // The pane hands every key to the remote side, so the local controls that
         // belong to the pane itself are taken here, before the key table can turn
-        // them into remote keys: F11 for the whole window (R18) and Alt with the
-        // zoom keys (R18). Shift is the way past them - Shift+F11 is the remote
-        // application's own F11, which is what makes the local control a
-        // convenience rather than a lost key.
+        // them into remote keys: F11 for the whole window (R18), Alt with the
+        // zoom keys (R18), and Alt+Shift+T to toggle the floating toolbar without
+        // sending any side-effect key to the remote desktop (R2). Shift is the way
+        // past F11 - Shift+F11 is the remote application's own F11.
         if !keystroke.modifiers.control && !keystroke.modifiers.platform {
             match keystroke.key.as_str() {
                 "f11" if !keystroke.modifiers.alt && !keystroke.modifiers.shift => {
                     self.toggle_fullscreen(window, cx);
                     cx.stop_propagation();
                     cx.notify();
+                    return;
+                }
+                "t" | "T" if keystroke.modifiers.alt && keystroke.modifiers.shift => {
+                    self.toggle_controls(cx);
+                    cx.stop_propagation();
                     return;
                 }
                 "+" | "=" if keystroke.modifiers.alt => {
@@ -1765,7 +1915,7 @@ impl DesktopPane {
                 _ => {}
             }
         }
-        if self.reconnecting() {
+        if !self.can_send_input() {
             return;
         }
         if keystroke.modifiers.platform && !cfg!(target_os = "macos") {
@@ -1807,6 +1957,9 @@ impl DesktopPane {
     /// remote side reads alone - Alt opens a menu bar - is not what pressing it for
     /// a shortcut of this window meant. It goes down with the next key instead.
     fn on_modifiers_changed(&mut self, event: &ModifiersChangedEvent, cx: &mut Context<Self>) {
+        if !self.can_send_input() {
+            return;
+        }
         let mut released = false;
         for (modifier, down) in remote_modifiers(&event.modifiers) {
             if !down {
@@ -1829,7 +1982,7 @@ impl DesktopPane {
             }
             return;
         }
-        if self.reconnecting() {
+        if !self.can_send_input() {
             return;
         }
         let Some(codes) = key_codes(&event.keystroke.key) else {
@@ -1894,7 +2047,10 @@ impl DesktopPane {
             DesktopPhase::Ended(failure) => (
                 Tone::Danger,
                 strings.desktop_ended.to_owned(),
-                match (self.failed_stage, self.layer_reason()) {
+                crate::app::workspace::sanitize_diagnostic(&match (
+                    self.failed_stage,
+                    self.layer_reason(),
+                ) {
                     // The step it stopped on, the fact the record states and the
                     // layer's own sentence, in that order.
                     (Some(stage), Some(reason)) => {
@@ -1903,7 +2059,7 @@ impl DesktopPane {
                     (Some(stage), None) => format!("{} - {failure}", stage.headline(strings)),
                     (None, Some(reason)) => format!("{failure} - {reason}"),
                     (None, None) => failure.to_string(),
-                },
+                }),
             ),
         };
         // The status card a terminal's place shows (ADR-7): the place the picture will
@@ -2013,7 +2169,7 @@ impl DesktopPane {
             .flex_none()
             .id(SharedString::from("desktop.notice.dismiss"))
             .debug_selector(|| "desktop.notice.dismiss".to_owned())
-            .on_click(cx.listener(|this, _event, _window, cx| this.dismiss_notices(cx)))
+            .on_click(cx.listener(|this, _event, window, cx| this.dismiss_notices(window, cx)))
         });
         // The warning banner, lifted onto the picture: it floats over a remote
         // screen whose colours are not ours, so it carries the floating layer's
@@ -2071,12 +2227,9 @@ impl DesktopPane {
         };
         // The shared floating bar with the toolbar's compact buttons: the controls float
         // over a picture that is not ours, like a menu floats over the page (R6).
-        //
-        // The bar is laid out either way - a press on a step should not depend on a
-        // frame of hover first - and the pane reveals it as soon as the pointer is
-        // anywhere over the picture.
+        // Mounted only while `controls_shown()` is true so hidden/collapsed states leave
+        // zero hitboxes over the remote desktop (R2).
         let mut bar = components::floating_bar(metrics)
-            .when(!self.controls_shown(), |bar| bar.opacity(0.0))
             .debug_selector(|| "desktop.controls".to_owned())
             .id(SharedString::from("desktop.controls.bar"))
             // The bar is above an occluding layer, so the body stops being hovered
@@ -2170,7 +2323,10 @@ impl DesktopPane {
                 components::icon_only_button(Icon::ChevronUp, metrics)
                     .id(SharedString::from("desktop.controls.collapse"))
                     .debug_selector(|| "desktop.controls.collapse".to_owned())
-                    .tooltip(components::tooltip(strings.desktop_hide_controls))
+                    .tooltip(components::tooltip(format!(
+                        "{} (Alt+Shift+T)",
+                        strings.desktop_hide_controls
+                    )))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.set_controls_collapsed(true, cx);
                     })),
@@ -2189,48 +2345,6 @@ impl DesktopPane {
             .justify_center()
             .pt(metrics.scale(spacing::TIGHT))
             .child(bar)
-    }
-
-    /// The small handle that brings a folded bar back.
-    ///
-    /// Docked top-center and kept softly visible while the picture is live so the
-    /// user never loses the way to unfold the bar, strengthening to full opacity on
-    /// hover.
-    fn expand_handle(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
-        let mut handle = components::floating_bar(metrics)
-            .when(!self.controls_shown(), |handle| handle.opacity(0.65))
-            .debug_selector(|| "desktop.controls.handle".to_owned())
-            .id(SharedString::from("desktop.controls.handle.bar"))
-            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
-                this.set_bar_hovered(*hovered, cx);
-            }))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
-            )
-            .child(
-                components::icon_only_button(Icon::ChevronDown, metrics)
-                    .id(SharedString::from("desktop.controls.expand"))
-                    .debug_selector(|| "desktop.controls.expand".to_owned())
-                    .tooltip(components::tooltip(
-                        self.locale.strings().desktop_show_controls,
-                    ))
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.set_controls_collapsed(false, cx);
-                    })),
-            );
-        // The handle is over the picture too, and it is a control: like the bar it
-        // shows the arrow the picture hides.
-        handle.style().mouse_cursor = Some(CursorStyle::Arrow);
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .flex()
-            .justify_center()
-            .pt(metrics.scale(spacing::TIGHT))
-            .child(handle)
     }
 
     fn submit_credentials(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2324,11 +2438,13 @@ impl DesktopPane {
         )
         .debug_selector(|| "desktop.signin.card".to_owned())
         .gap(metrics.scale(spacing::BASE))
-        .children(fields.rejection.clone().map(|reason| {
+        .children(fields.rejection.as_deref().map(|reason| {
+            let sanitized = crate::app::workspace::sanitize_diagnostic(reason);
             div()
+                .debug_selector(|| "desktop.signin.rejection".to_owned())
                 .text_size(metrics.caption_size())
                 .text_color(Tone::Danger.text())
-                .child(reason)
+                .child(sanitized)
         }))
         .children(
             user.clone()
@@ -2967,6 +3083,20 @@ impl Render for DesktopPane {
             // The first child supplies the viewport used to dial at the negotiated size.
             body = body.child(div().flex_1());
         }
+        // The floating controls belong to the pane, not the remote session (R2, R18).
+        // When hidden or manually collapsed they are omitted from the element tree
+        // completely so zero hitboxes remain over the remote picture, and they are
+        // placed beneath status/certificate cards so blocking prompts always stay on top.
+        if has_picture && self.controls_shown() && self.certificate.is_none() {
+            #[cfg(test)]
+            {
+                self.controls_frames += 1;
+            }
+            body = body.child(self.controls(metrics, cx));
+        }
+        if has_picture && let Some(notice) = self.notice_strip(metrics, cx) {
+            body = body.child(notice);
+        }
         if show_status && (!has_picture || self.reconnecting()) {
             body = body.child(
                 div()
@@ -2981,9 +3111,6 @@ impl Render for DesktopPane {
                         theme::Enter::Rise,
                     )),
             );
-        }
-        if has_picture && let Some(notice) = self.notice_strip(metrics, cx) {
-            body = body.child(notice);
         }
         if self.certificate.is_some() {
             let card = self.certificate_card(metrics, cx);
@@ -3028,32 +3155,19 @@ impl Render for DesktopPane {
                     .child(SharedString::from(self.target.target())),
             );
         }
-        // The controls belong to the pane, not to the session: they are drawn over
-        // the picture whenever there is a link to control (R18). They go on last so
-        // nothing drawn over the picture - the warning strip, the certificate card -
-        // sits between the pointer and a control. A folded bar is not drawn at all;
-        // only its handle is, and only while the pointer is over the picture.
-        if has_picture {
-            if self.controls_collapsed {
-                body = body.child(self.expand_handle(metrics, cx));
-            } else {
-                #[cfg(test)]
-                {
-                    self.controls_frames += 1;
-                }
-                body = body.child(self.controls(metrics, cx));
-            }
-        }
         body
     }
 }
 
 impl DesktopPane {
-    /// Keeps the space the picture is drawn in, and renegotiates the remote size
-    /// when it changed.
+    /// Keeps the space the picture is drawn in, clamps any zoomed pan in place
+    /// (R4), and renegotiates the remote size when it changed.
     fn set_viewport(&mut self, bounds: Bounds<Pixels>, scale: f32, cx: &mut Context<Self>) {
         if self.viewport != Some(bounds) {
             self.viewport = Some(bounds);
+            if !self.zoom.is_fit() {
+                self.clamp_current_pan();
+            }
             cx.notify();
         }
         let Some(size) = framebuffer_size(bounds.size, scale) else {
@@ -3143,5 +3257,359 @@ mod tile_tests {
                 (f32::from(bounds.bottom()) * scale).round() as i32
             );
         }
+    }
+
+    fn test_target() -> DesktopTarget {
+        let config =
+            shellune_core::RdpConfig::new("desk", "rdp.example.com", Some("alice")).unwrap();
+        DesktopTarget::of_record(&shellune_core::ConnectionRecord::Rdp(config)).unwrap()
+    }
+
+    fn test_trust_store() -> shellune_storage::TrustStore {
+        let path = std::env::temp_dir().join(format!(
+            "shellune-desktop-pane-test-{}.toml",
+            std::process::id()
+        ));
+        shellune_storage::TrustStore::at(path)
+    }
+
+    fn live_frame_events(bgra: [u8; 4], size: (u32, u32)) -> Vec<LinkEvent> {
+        vec![
+            LinkEvent::State {
+                state: LinkState::Connected,
+                failure: LinkFailure::None,
+                detail: 0,
+                reason: String::new(),
+            },
+            LinkEvent::Frame(crate::app::desktop::scripted::solid(
+                0,
+                0,
+                size.0 as i32,
+                size.1 as i32,
+                size,
+                bgra,
+            )),
+        ]
+    }
+
+    #[test]
+    fn desktop_phase_splits_wants_poll_and_accepts_input() {
+        assert!(!DesktopPhase::NotStarted.wants_poll());
+        assert!(!DesktopPhase::NotStarted.accepts_input());
+        assert!(DesktopPhase::Connecting.wants_poll());
+        assert!(!DesktopPhase::Connecting.accepts_input());
+        assert!(DesktopPhase::Live.wants_poll());
+        assert!(DesktopPhase::Live.accepts_input());
+        let ended = DesktopPhase::Ended(SessionFailure::ConnectionLost);
+        assert!(!ended.wants_poll());
+        assert!(!ended.accepts_input());
+    }
+
+    #[gpui::test]
+    async fn set_viewport_clamps_pan_in_place_and_preserves_zoom(cx: &mut gpui::TestAppContext) {
+        let (link, _log) = crate::app::desktop::scripted::ScriptedLink::new(live_frame_events(
+            [10, 20, 30, 255],
+            (1600, 900),
+        ));
+        let (pane, cx) = cx.add_window_view(|_window, cx| {
+            DesktopPane::with_link(
+                test_target(),
+                Box::new(link),
+                Locale::default(),
+                test_trust_store(),
+                cx,
+            )
+        });
+        cx.update(|_window, app| {
+            pane.update(app, |pane, cx| {
+                assert!(pane.pump_once(cx));
+                pane.zoom_toggle(cx);
+                assert_eq!(pane.zoom(), DesktopZoom::Percent(100));
+                pane.set_viewport(
+                    Bounds::new(
+                        gpui::point(px(0.0), px(0.0)),
+                        gpui::size(px(800.0), px(600.0)),
+                    ),
+                    1.0,
+                    cx,
+                );
+                pane.pan_by(500.0, 500.0, cx);
+                assert_eq!(pane.pan(), (400.0, 150.0));
+
+                // Growing viewport clamps pan in place so the next opposite pan has zero lag.
+                pane.set_viewport(
+                    Bounds::new(
+                        gpui::point(px(0.0), px(0.0)),
+                        gpui::size(px(1400.0), px(800.0)),
+                    ),
+                    1.0,
+                    cx,
+                );
+                assert_eq!(pane.zoom(), DesktopZoom::Percent(100));
+                assert_eq!(pane.pan(), (100.0, 50.0));
+                pane.pan_by(-40.0, 0.0, cx);
+                assert_eq!(pane.pan(), (60.0, 50.0));
+
+                // Fit zoom stays Fit across viewport changes.
+                pane.zoom_fit(cx);
+                pane.set_viewport(
+                    Bounds::new(
+                        gpui::point(px(0.0), px(0.0)),
+                        gpui::size(px(1000.0), px(700.0)),
+                    ),
+                    1.0,
+                    cx,
+                );
+                assert_eq!(pane.zoom(), DesktopZoom::Fit);
+                assert_eq!(pane.pan(), (0.0, 0.0));
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn toolbar_auto_hides_leaves_zero_hitbox_and_recovers_without_side_effects(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Match the window aspect ratio so the top-center toolbar area sits
+        // directly over remote desktop pixels rather than a letterbox margin.
+        let (link, log) = crate::app::desktop::scripted::ScriptedLink::new(live_frame_events(
+            [40, 50, 60, 255],
+            (1120, 720),
+        ));
+        let (pane, cx) = cx.add_window_view(|_window, cx| {
+            DesktopPane::with_link(
+                test_target(),
+                Box::new(link),
+                Locale::default(),
+                test_trust_store(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(1120.0), px(720.0)));
+        cx.update(|_window, app| {
+            pane.update(app, |pane, cx| {
+                assert!(pane.pump_once(cx));
+            });
+        });
+        cx.run_until_parked();
+
+        // First frame reveals the toolbar.
+        assert!(cx.update(|_window, app| pane.read(app).controls_shown_for_test()));
+        let top_center = cx.update(|_window, app| {
+            let vp = pane.read(app).viewport.expect("viewport measured");
+            gpui::point(vp.left() + vp.size.width / 2.0, vp.top() + px(8.0))
+        });
+
+        // Auto-hide removes the toolbar completely from the element tree.
+        cx.update(|_window, app| {
+            pane.update(app, |pane, cx| pane.trigger_controls_auto_hide_for_test(cx));
+        });
+        cx.run_until_parked();
+        let frames_hidden = cx.update(|_window, app| {
+            assert!(!pane.read(app).controls_shown_for_test());
+            pane.read(app).controls_frames_for_test()
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_window, app| pane.read(app).controls_frames_for_test()),
+            frames_hidden,
+            "hidden toolbar must not be rendered in subsequent frames"
+        );
+
+        // Clicking the former top-center toolbar area reaches the remote desktop directly.
+        let before_click = log.lock().unwrap().inputs.len();
+        cx.simulate_mouse_down(top_center, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(top_center, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            log.lock().unwrap().inputs[before_click..]
+                .iter()
+                .any(|input| matches!(
+                    input,
+                    crate::app::desktop::DesktopInput::Pointer { buttons, .. }
+                        if buttons.contains(Buttons::LEFT)
+                )),
+            "clicking top-center while toolbar is hidden must pass through to remote desktop"
+        );
+
+        // Moving pointer into top-center hotzone reveals the toolbar without sending clicks/keys.
+        let before_reveal = log.lock().unwrap().inputs.len();
+        cx.simulate_mouse_move(top_center, None, Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.update(|_window, app| pane.read(app).controls_shown_for_test()));
+        assert!(
+            !log.lock().unwrap().inputs[before_reveal..]
+                .iter()
+                .any(|input| {
+                    matches!(input, crate::app::desktop::DesktopInput::Key { .. })
+                        || matches!(
+                            input,
+                            crate::app::desktop::DesktopInput::Pointer { buttons, .. }
+                                if buttons.any_button()
+                        )
+                }),
+            "top-center reveal must not emit spurious clicks or keys"
+        );
+
+        // Alt+Shift+T toggles toolbar off and back on with zero remote key side effects.
+        let before_shortcut = log.lock().unwrap().inputs.len();
+        cx.simulate_keystrokes("alt-shift-t");
+        cx.run_until_parked();
+        assert!(cx.update(|_window, app| {
+            !pane.read(app).controls_shown_for_test()
+                && pane.read(app).controls_collapsed_for_test()
+        }));
+        cx.simulate_keystrokes("alt-shift-t");
+        cx.run_until_parked();
+        assert!(cx.update(|_window, app| {
+            pane.read(app).controls_shown_for_test()
+                && !pane.read(app).controls_collapsed_for_test()
+        }));
+        assert!(
+            !log.lock().unwrap().inputs[before_shortcut..]
+                .iter()
+                .any(|input| matches!(input, crate::app::desktop::DesktopInput::Key { .. })),
+            "Alt+Shift+T must not forward any key to the remote desktop"
+        );
+    }
+
+    #[gpui::test]
+    async fn non_live_blocks_input_and_manual_reconnect_preserves_last_frame(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (first_link, first_log) = crate::app::desktop::scripted::ScriptedLink::new(Vec::new());
+        let feed = first_link.feed();
+        let (pane, cx) = cx.add_window_view(|_window, cx| {
+            DesktopPane::with_link(
+                test_target(),
+                Box::new(first_link),
+                Locale::default(),
+                test_trust_store(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(800.0), px(600.0)));
+        cx.run_until_parked();
+
+        // While Connecting, keyboard input is strictly blocked and never enqueued.
+        cx.update(|window, app| window.focus(pane.read(app).focus_handle()));
+        cx.simulate_keystrokes("a");
+        cx.run_until_parked();
+        assert!(cx.update(|_window, app| pane.read(app).input.is_empty()));
+        assert!(first_log.lock().unwrap().inputs.is_empty());
+
+        // First frame transitions to Live.
+        feed.feed(live_frame_events([11, 22, 33, 255], (640, 480)));
+        cx.update(|_window, app| pane.update(app, |pane, cx| assert!(pane.pump_once(cx))));
+        cx.run_until_parked();
+        assert!(cx.update(|_window, app| pane.read(app).is_live()));
+        assert_eq!(
+            cx.update(|_window, app| pane.read(app).surface().pixels()[0..4].to_vec()),
+            vec![11, 22, 33, 255]
+        );
+
+        // Failing clears any residual input queue while keeping the last frame visible.
+        cx.update(|_window, app| {
+            pane.update(app, |pane, cx| {
+                pane.input.push_key(key_codes("a").unwrap(), true);
+                pane.fail(LinkFailure::Io, "socket lost pwd=secret123", cx);
+                assert!(pane.input.is_empty());
+                assert!(!pane.surface().is_empty());
+            });
+        });
+
+        // Manual reconnect via attach() preserves the last frame and blocks input until first frame.
+        let (second_link, second_log) =
+            crate::app::desktop::scripted::ScriptedLink::new(Vec::new());
+        let second_feed = second_link.feed();
+        cx.update(|_window, app| {
+            pane.update(app, |pane, cx| {
+                pane.input.push_key(key_codes("b").unwrap(), true);
+                pane.attach(Box::new(second_link), cx);
+                assert!(pane.reconnecting());
+                assert!(pane.input.is_empty());
+                assert!(!pane.surface().is_empty());
+            });
+        });
+        cx.simulate_keystrokes("c");
+        cx.run_until_parked();
+        assert!(cx.update(|_window, app| pane.read(app).input.is_empty()));
+        assert!(second_log.lock().unwrap().inputs.is_empty());
+
+        // First frame of the reconnected session atomically replaces the old picture.
+        second_feed.feed(live_frame_events([77, 88, 99, 255], (640, 480)));
+        cx.update(|_window, app| pane.update(app, |pane, cx| assert!(pane.pump_once(cx))));
+        cx.run_until_parked();
+        assert!(cx.update(|_window, app| pane.read(app).is_live()));
+        assert_eq!(
+            cx.update(|_window, app| pane.read(app).surface().pixels()[0..4].to_vec()),
+            vec![77, 88, 99, 255]
+        );
+    }
+
+    #[gpui::test]
+    async fn dismiss_notices_returns_focus_and_rejections_are_sanitized(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (link, _log) = crate::app::desktop::scripted::ScriptedLink::new(live_frame_events(
+            [1, 2, 3, 255],
+            (640, 480),
+        ));
+        let (pane, cx) = cx.add_window_view(|_window, cx| {
+            DesktopPane::with_link(
+                test_target(),
+                Box::new(link),
+                Locale::default(),
+                test_trust_store(),
+                cx,
+            )
+        });
+        cx.update(|window, app| {
+            let other_focus = app.focus_handle();
+            window.focus(&other_focus);
+            pane.update(app, |pane, cx| {
+                pane.show_send_problem("temporary send error", cx);
+                assert!(pane.send_problem().is_some());
+                pane.dismiss_notices(window, cx);
+                assert!(pane.send_problem().is_none());
+                assert!(pane.focus_handle().is_focused(window));
+            });
+        });
+
+        // Sign-in rejection reason is sanitized before storage and render.
+        let (auth_link, _log) =
+            crate::app::desktop::scripted::ScriptedLink::new(vec![LinkEvent::State {
+                state: LinkState::Failed(LinkFailure::Authentication),
+                failure: LinkFailure::Authentication,
+                detail: 0,
+                reason: "rejected rdp://alice:s3cr3t@host:3389 pwd=p1 passwd=p2".to_owned(),
+            }]);
+        let (auth_pane, cx) = cx.add_window_view(|_window, cx| {
+            let mut pane = DesktopPane::with_link(
+                test_target(),
+                Box::new(auth_link),
+                Locale::default(),
+                test_trust_store(),
+                cx,
+            );
+            pane.provided_password = true;
+            pane
+        });
+        cx.update(|_window, app| {
+            auth_pane.update(app, |pane, cx| {
+                let _ = pane.pump_once(cx);
+                let rejection = pane
+                    .sign_in
+                    .as_ref()
+                    .and_then(|s| s.rejection.as_deref())
+                    .expect("sign-in form opened with rejection");
+                assert!(!rejection.contains("s3cr3t"), "{rejection}");
+                assert!(!rejection.contains("p1"), "{rejection}");
+                assert!(!rejection.contains("p2"), "{rejection}");
+                assert!(rejection.contains("pwd=<hidden>"), "{rejection}");
+                assert!(rejection.contains("passwd=<hidden>"), "{rejection}");
+            });
+        });
     }
 }

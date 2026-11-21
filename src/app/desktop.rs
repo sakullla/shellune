@@ -498,6 +498,7 @@ impl DesktopSurface {
     }
 
     /// Drops the picture, for a session that is starting again.
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.width = 0;
         self.height = 0;
@@ -1300,6 +1301,33 @@ pub fn to_remote(
     position: gpui::Point<Pixels>,
 ) -> Option<(u16, u16)> {
     to_remote_in(viewport, desktop, DesktopZoom::Fit, (0.0, 0.0), position)
+}
+
+/// Logical vertical band along the top edge of the viewport that reveals the
+/// hidden desktop toolbar when the pointer approaches the top-center (R2).
+pub const CONTROLS_REVEAL_TOP_BAND: f32 = 12.0;
+
+/// Maximum half-width of the top-center reveal hotzone, in logical pixels (R2).
+pub const CONTROLS_REVEAL_CENTER_HALF_WIDTH: f32 = 180.0;
+
+/// Whether a window position lies inside the top-center reveal hotzone of the
+/// desktop viewport (R2).
+///
+/// Evaluated purely from `on_mouse_move` coordinates so a hidden toolbar leaves
+/// zero hitboxes in the element tree and clicks pass straight through to the
+/// remote desktop.
+#[must_use]
+pub fn in_controls_reveal_zone(viewport: Bounds<Pixels>, position: gpui::Point<Pixels>) -> bool {
+    if viewport.size.width <= px(0.0) || viewport.size.height <= px(0.0) {
+        return false;
+    }
+    let top_offset = f32::from(position.y - viewport.top());
+    if !(0.0..=CONTROLS_REVEAL_TOP_BAND).contains(&top_offset) {
+        return false;
+    }
+    let center_x = f32::from(viewport.left() + viewport.size.width / 2.0);
+    let half_width = (f32::from(viewport.size.width) * 0.25).min(CONTROLS_REVEAL_CENTER_HALF_WIDTH);
+    (f32::from(position.x) - center_x).abs() <= half_width
 }
 
 /// One protocol implementation, behind the seam the surface talks to.
@@ -2357,5 +2385,32 @@ mod tests {
         }
         let ssh = availability(ProtocolKind::Ssh);
         assert!(!ssh.is_built());
+    }
+
+    #[test]
+    fn controls_reveal_zone_targets_only_top_center_band() {
+        let bounds = Bounds {
+            origin: point(px(100.0), px(40.0)),
+            size: size(px(1120.0), px(674.0)),
+        };
+        // Top-center inside the 12px band triggers reveal.
+        assert!(in_controls_reveal_zone(bounds, point(px(660.0), px(44.0))));
+        assert!(in_controls_reveal_zone(bounds, point(px(480.0), px(52.0))));
+        assert!(in_controls_reveal_zone(bounds, point(px(840.0), px(40.0))));
+        // Below the top band does not trigger.
+        assert!(!in_controls_reveal_zone(bounds, point(px(660.0), px(53.0))));
+        // Top-left and top-right corners (remote menu / window buttons) do not trigger.
+        assert!(!in_controls_reveal_zone(bounds, point(px(120.0), px(44.0))));
+        assert!(!in_controls_reveal_zone(
+            bounds,
+            point(px(1200.0), px(44.0))
+        ));
+        // Above the viewport does not trigger.
+        assert!(!in_controls_reveal_zone(bounds, point(px(660.0), px(35.0))));
+        // Empty viewport never triggers.
+        assert!(!in_controls_reveal_zone(
+            viewport(0.0, 0.0),
+            point(px(0.0), px(0.0))
+        ));
     }
 }
