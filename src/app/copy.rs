@@ -3323,6 +3323,10 @@ pub struct UxStrings {
     pub host_jump_keys: &'static str,
     /// Badge shown in split-pane header while a pane fills its tab
     pub pane_zoomed: &'static str,
+    /// Tooltip / label to enter cross-session focus mode
+    pub focus_mode_enter: &'static str,
+    /// Tooltip / label to leave cross-session focus mode
+    pub focus_mode_exit: &'static str,
     /// Tooltip on split divider drag band
     pub pane_divider_reset_hint: &'static str,
     /// Tooltip hint on remote desktop zoom bar explaining Shift+scroll panning
@@ -3833,6 +3837,8 @@ impl UxStrings {
             self.hosts_deleted_many,
             self.host_jump_keys,
             self.pane_zoomed,
+            self.focus_mode_enter,
+            self.focus_mode_exit,
             self.pane_divider_reset_hint,
             self.desktop_pan_hint,
             self.toast_dismiss,
@@ -4322,6 +4328,8 @@ included",
     hosts_deleted_many: "Deleted {count} hosts",
     host_jump_keys: "↑↓ select · Enter add · Esc close",
     pane_zoomed: "Zoomed",
+    focus_mode_enter: "Focus mode",
+    focus_mode_exit: "Exit focus mode",
     pane_divider_reset_hint: "Drag to resize · Double-click to equalize",
     desktop_pan_hint: "Shift+scroll to pan",
     toast_dismiss: "Dismiss notification",
@@ -4806,6 +4814,8 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     hosts_deleted_many: "已删除 {count} 台主机",
     host_jump_keys: "↑↓ 选择 · Enter 添加 · Esc 关闭",
     pane_zoomed: "已放大",
+    focus_mode_enter: "专注视图",
+    focus_mode_exit: "退出专注视图",
     pane_divider_reset_hint: "拖动调整比例 · 双击平分窗格",
     desktop_pan_hint: "按住 Shift 滚动可平移画面",
     toast_dismiss: "关闭通知",

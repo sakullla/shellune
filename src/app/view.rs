@@ -44,8 +44,8 @@ use crate::app::actions::{
     MovePaneUp, MoveTabLeft, MoveTabRight, NewLocalShell, NextDestination, NextTab, OpenPalette,
     PreviousDestination, PreviousTab, ReconnectSession, ResizePaneDown, ResizePaneLeft,
     ResizePaneRight, ResizePaneUp, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5,
-    SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitPaneDown, SplitPaneRight, ToggleLanguage,
-    ToggleSidebar, ZoomPane,
+    SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitPaneDown, SplitPaneRight, ToggleFocusMode,
+    ToggleLanguage, ToggleSidebar, ZoomPane,
 };
 use crate::app::components::{ControlState, Variant};
 use crate::app::copy::{self, Locale, Strings};
@@ -937,6 +937,12 @@ pub struct ShelluneView {
     /// desktop that fills the screen is what full screen means, and the pane's own
     /// controls are what leave it again.
     desktop_fullscreen: Option<SessionId>,
+    /// Cross-session distraction-free focus mode (ADR-1, R1).
+    ///
+    /// Hides window chrome (top bar, split pane headers, non-essential bars) across
+    /// local terminal, SSH, RDP and VNC sessions while keeping authentication,
+    /// certificate, failure/reconnect banners and close confirmations visible.
+    focus_mode: bool,
     /// Where the window is in its start: the brand and the progress of the stages,
     /// then the page (R3).
     startup: startup::Startup,
@@ -2953,6 +2959,7 @@ impl ShelluneView {
             split_spans: RefCell::new(HashMap::new()),
             session_terminal: false,
             desktop_fullscreen: None,
+            focus_mode: false,
             startup: startup::Startup::Ready,
             startup_run: startup::StartupRun::default(),
             startup_scroll: gpui::ScrollHandle::new(),
@@ -4332,6 +4339,48 @@ impl ShelluneView {
         self.desktop_fullscreen
     }
 
+    /// Whether cross-session focus mode is currently active (R1).
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn focus_mode(&self) -> bool {
+        self.focus_mode
+    }
+
+    /// Whether the window is currently showing a session workspace that can enter focus mode.
+    pub(super) fn can_focus_mode(&self) -> bool {
+        self.shows_terminal(self.workspace.destination())
+            && (self.active.is_some() || self.workspace.layout().active_session().is_some())
+    }
+
+    /// Toggles cross-session focus mode across local terminal, SSH, RDP and VNC sessions (R1).
+    ///
+    /// Entering hides chrome while keeping the active session and its keyboard focus intact.
+    /// Leaving restores the pre-entry single or split layout and returns focus to the active
+    /// terminal or desktop surface without recreating or reconnecting anything.
+    pub(super) fn toggle_focus_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus_mode {
+            self.focus_mode = false;
+            self.reclaim_focus(window, cx);
+            return;
+        }
+        if !self.can_focus_mode() {
+            return;
+        }
+        self.focus_mode = true;
+        self.shell_menu_open = false;
+        self.session_more = None;
+        self.tab_menu = None;
+        self.reclaim_focus(window, cx);
+    }
+
+    /// Automatically leaves focus mode if the user navigates away from a session page
+    /// or no session remains on screen, so the user is never stranded without chrome.
+    fn settle_focus_mode(&mut self) {
+        if self.focus_mode && !self.can_focus_mode() {
+            self.focus_mode = false;
+        }
+    }
+
     /// The desktop surface of one session, for the tests that drive its frames and for
     /// the capture that has to hand it the frames a scripted link holds.
     #[cfg(any(test, feature = "ui-capture"))]
@@ -4541,6 +4590,27 @@ impl ShelluneView {
             .and_then(|open| open.content.desktop())
     }
 
+    /// Keyboard focus handle of one session's work surface, whether terminal or desktop (ADR-1).
+    pub(super) fn work_focus_for(
+        &self,
+        id: SessionId,
+        cx: &gpui::App,
+    ) -> Option<gpui::FocusHandle> {
+        if let Some(pane) = self.pane_for(id) {
+            Some(pane.read(cx).focus_handle().clone())
+        } else if let Some(pane) = self.desktop_for(id) {
+            Some(pane.read(cx).focus_handle().clone())
+        } else {
+            None
+        }
+    }
+
+    /// Keyboard focus handle of the currently active work surface, covering both
+    /// `TerminalPane` and `DesktopPane` (ADR-1, R1).
+    pub(super) fn active_work_focus(&self, cx: &gpui::App) -> Option<gpui::FocusHandle> {
+        self.active.and_then(|id| self.work_focus_for(id, cx))
+    }
+
     /// The terminal whose paste or saved command is waiting for an answer (R17).
     ///
     /// The pane keeps the text and the name of the session it would be written into;
@@ -4672,11 +4742,7 @@ impl ShelluneView {
     fn focus_pane(&mut self, id: SessionId, cx: &mut Context<Self>) {
         // A terminal and a desktop surface both take the keyboard; which one it is
         // only decides whose handle is asked.
-        let handle = if let Some(pane) = self.pane_for(id) {
-            pane.read(cx).focus_handle().clone()
-        } else if let Some(pane) = self.desktop_for(id) {
-            pane.read(cx).focus_handle().clone()
-        } else {
+        let Some(handle) = self.work_focus_for(id, cx) else {
             return;
         };
         self.pane_focus_pending = Some(id);
@@ -4738,14 +4804,13 @@ impl ShelluneView {
         self.relabel_sync_fields(cx);
     }
 
-    /// Puts the keyboard on what the page shows: the terminal on screen, or the page.
+    /// Puts the keyboard on what the page shows: the active terminal or desktop surface, or the page.
     /// Without this a control that disappeared would take every shortcut with it.
     fn reclaim_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let destination = self.workspace.destination();
         if self.shows_terminal(destination)
-            && let Some(pane) = self.active_pane()
+            && let Some(handle) = self.active_work_focus(cx)
         {
-            let handle = pane.read(cx).focus_handle().clone();
             window.focus(&handle);
         } else {
             let handle = self.destination_focus(destination).clone();
@@ -6780,6 +6845,10 @@ impl ShelluneView {
         self.shell_menu_open = false;
         if destination == Destination::LocalShells {
             self.showing_connection_form = false;
+        } else if self.focus_mode {
+            // Leaving the session workspace always exits focus mode so Hosts/Settings
+            // never open without navigation chrome (ADR-1, R1).
+            self.focus_mode = false;
         }
         self.workspace.select(destination);
         self.workspace.set_context(match destination {
@@ -6789,11 +6858,10 @@ impl ShelluneView {
             _ => shellune_core::PanelSection::None,
         });
         if self.shows_terminal(destination)
-            && let Some(pane) = self.active_pane()
+            && let Some(handle) = self.active_work_focus(cx)
         {
-            let handle = pane.read(cx).focus_handle().clone();
             window.focus(&handle);
-            // The terminal is on screen again, so its tab's background marks are seen.
+            // The work surface is on screen again, so its tab's background marks are seen.
             self.clear_viewed_attention(cx);
             cx.notify();
             return;
@@ -11145,7 +11213,7 @@ impl ShelluneView {
         }
 
         if let Some(failure) = status.failure() {
-            let reason = failure.reason().to_owned();
+            let reason = crate::app::workspace::sanitize_diagnostic(failure.reason());
             let next_step =
                 copy::next_step_text(failure.next_step(), self.workspace.locale()).to_owned();
             // What to do comes first and in the reader's language; the transport's own
@@ -19583,9 +19651,8 @@ impl Render for ShelluneView {
         if let Some(id) = self.pane_focus_pending.take()
             && self.active == Some(id)
             && self.shows_terminal(self.workspace.destination())
-            && let Some(pane) = self.pane_for(id)
+            && let Some(handle) = self.work_focus_for(id, cx)
         {
-            let handle = pane.read(cx).focus_handle().clone();
             if !handle.is_focused(window) {
                 window.focus(&handle);
             }
@@ -19694,10 +19761,10 @@ impl Render for ShelluneView {
         // A pane that asked for the whole window keeps it only while it is the one
         // surface on screen (R18).
         self.settle_desktop_fullscreen(window);
-        // In full screen the session keeps the whole window: no tab strip and no
-        // session bar above the picture (R18). The pane's own controls are what
-        // leave it again.
-        let header = if self.desktop_fullscreen.is_some() {
+        self.settle_focus_mode();
+        // In full screen or focus mode the session keeps the whole window: no tab strip
+        // and no session bar above the workspace (R1, R18).
+        let header = if self.desktop_fullscreen.is_some() || self.focus_mode {
             None
         } else {
             Some(self.session_header(window, cx))
@@ -19905,6 +19972,9 @@ impl Render for ShelluneView {
             }))
             .on_action(cx.listener(|this, _: &ZoomPane, window, cx| {
                 this.toggle_active_zoom(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleFocusMode, window, cx| {
+                this.toggle_focus_mode(window, cx);
             }))
             .on_action(cx.listener(|this, _: &FocusPaneLeft, window, cx| {
                 this.focus_direction(crate::app::layout::Direction::Left, window, cx);

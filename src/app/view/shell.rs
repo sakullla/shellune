@@ -305,6 +305,18 @@ impl ShelluneView {
             .items_center()
             .gap(metrics.scale(spacing::HALF))
             .pr(metrics.scale(spacing::HAIRLINE))
+            .when(!compact && self.can_focus_mode(), |row| {
+                let tooltip = match self.keymap.label("view.focus") {
+                    Some(shortcut) => format!("{} ({shortcut})", ux.focus_mode_enter),
+                    None => ux.focus_mode_enter.to_owned(),
+                };
+                row.child(
+                    self.bar_icon("view.focus", Icon::Maximize, tooltip, self.focus_mode)
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            this.toggle_focus_mode(window, cx);
+                        })),
+                )
+            })
             .child(
                 self.bar_icon(
                     "palette.open",
@@ -392,17 +404,15 @@ impl ShelluneView {
         // A desktop surface is shown in the same tab and by the same bar; only a
         // session that has neither a terminal nor a picture has nothing to open.
         let has_terminal = self.pane_for(id).is_some() || self.desktop_for(id).is_some();
-        // While the connection card is on screen it is the one place to act on the
-        // attempt; the bar only says where it stands.
+        // While the connection card or an active failure/reconnecting banner is on screen,
+        // that surface is the single place stating the status and next action; the bar
+        // avoids duplicating the status chip or repeating Reconnect/Close until dismissed (R5).
         let card = self.connection_inline();
+        let banner_shown = self.banner_shown(id, cx);
         // "The session is over" is the projection's answer, not a second match on the
         // state here: a fresh variant must not turn into a silently different page.
         let ended = status.phase().is_over();
-        // A session that ended states its reason and its next step in the card over its
-        // terminal (R3, R17), and the bar keeps its Reconnect as well: it is one of the
-        // entries the user is told about (R8), and it is the one still in reach when a
-        // short pane leaves the card no room to show its own.
-        let can_reconnect = can_reconnect && !card;
+        let can_reconnect = can_reconnect && !card && !banner_shown;
 
         let left = div()
             .flex()
@@ -425,7 +435,7 @@ impl ShelluneView {
                     cx,
                 ),
             )
-            .when(!live, |row| {
+            .when(!live && !banner_shown, |row| {
                 row.child(components::chip(state_label, tone, metrics))
             })
             // "X11 off" is the default and says nothing; only a bridge that is up,
@@ -532,7 +542,7 @@ impl ShelluneView {
         // under a terminal lays them out itself, so in a pane too narrow for all of them a
         // control that does not fit is left out whole instead of being cut through (R3).
         // The menu is apart from them and always stays: it offers what was left out.
-        let kinds = self.session_bar_controls(id);
+        let kinds = self.session_bar_controls(id, cx);
         debug_assert_eq!(
             kinds.contains(&BarControl::Reconnect),
             can_reconnect,
@@ -572,8 +582,9 @@ impl ShelluneView {
                 .into_any_element(),
             );
         }
-        // A session that ended for good has one thing left to do.
-        if ended && !can_reconnect && !unsaved && !card {
+        // A session that ended for good has one thing left to do; when the banner already
+        // presents Close, avoid duplicating it in the bar until the banner is dismissed.
+        if ended && !can_reconnect && !unsaved && !card && !banner_shown {
             right.push(
                 self.icon_text_button(
                     SharedString::from("session.close"),
@@ -651,13 +662,14 @@ impl ShelluneView {
     ///
     /// The bar and the session's menu both read this list: a control that a narrow bar
     /// has no room for is offered in the menu instead (R9).
-    pub(super) fn session_bar_controls(&self, id: SessionId) -> Vec<BarControl> {
+    pub(super) fn session_bar_controls(&self, id: SessionId, cx: &App) -> Vec<BarControl> {
         let Some(session) = self.workspace.session(id) else {
             return Vec::new();
         };
         let status = crate::app::workspace::SessionStatus::of(session);
         let card = self.connection_inline();
-        let can_reconnect = may_reconnect(session) && !card;
+        let banner_shown = self.banner_shown(id, cx);
+        let can_reconnect = may_reconnect(session) && !card && !banner_shown;
         let unsaved = self.unsaved.iter().any(|(session, _)| *session == id);
         let ended = status.phase().is_over();
         let browsable =
@@ -670,7 +682,7 @@ impl ShelluneView {
         if unsaved {
             controls.push(BarControl::SaveHost);
         }
-        if ended && !can_reconnect && !unsaved && !card {
+        if ended && !can_reconnect && !unsaved && !card && !banner_shown {
             controls.push(BarControl::Close);
         }
         if browsable {
@@ -695,7 +707,7 @@ impl ShelluneView {
         if hidden == 0 {
             return Vec::new();
         }
-        let controls = self.session_bar_controls(id);
+        let controls = self.session_bar_controls(id, cx);
         let first = controls.len().saturating_sub(hidden);
         controls[first..].to_vec()
     }
@@ -720,6 +732,9 @@ impl ShelluneView {
     /// The session bar on its own, for when no terminal is on screen to carry it: the
     /// file view, or a session that has no terminal (yet).
     pub(super) fn standalone_session_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.focus_mode {
+            return None;
+        }
         let SessionBarParts {
             left,
             controls,

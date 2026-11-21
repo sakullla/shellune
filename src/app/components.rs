@@ -4366,4 +4366,17 @@ mod tests {
         assert!(cx.debug_bounds("progress.indeterminate").is_none());
         theme::set_motion(theme::Motion::Full);
     }
+
+    #[gpui::test]
+    fn progress_bar_sweeps_only_when_motion_is_allowed(cx: &mut gpui::TestAppContext) {
+        theme::set_motion(theme::Motion::Full);
+        let (_view, cx) = cx.add_window_view(|_window, _cx| Column {
+            width: 300.0,
+            piece: |metrics| progress_bar("sweep.full", Progress::Indeterminate, metrics),
+        });
+        cx.simulate_resize(gpui::size(px(800.0), px(900.0)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("progress.indeterminate").is_some());
+        assert!(cx.debug_bounds("progress.still").is_none());
+    }
 }

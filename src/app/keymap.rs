@@ -26,8 +26,8 @@ use crate::app::actions::{
     NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination, PreviousTab,
     ReconnectSession, ResizePaneDown, ResizePaneLeft, ResizePaneRight, ResizePaneUp, SelectTab1,
     SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9,
-    SplitPaneDown, SplitPaneRight, TerminalCopy, TerminalPaste, TerminalSearch, ToggleLanguage,
-    ToggleSidebar, ZoomPane,
+    SplitPaneDown, SplitPaneRight, TerminalCopy, TerminalPaste, TerminalSearch, ToggleFocusMode,
+    ToggleLanguage, ToggleSidebar, ZoomPane,
 };
 use crate::app::copy::Locale;
 use crate::app::nav::{Destination, Platform};
@@ -393,6 +393,13 @@ pub const ACTIONS: &[ActionSpec] = &[
         name_en: "Collapse or expand the sidebar",
         name_zh: "折叠或展开侧栏",
         defaults: &[],
+    },
+    ActionSpec {
+        id: "view.focus",
+        context: Context::Shell,
+        name_en: "Toggle focus mode",
+        name_zh: "切换专注视图",
+        defaults: &[DefaultKey::Literal("alt-shift-f")],
     },
     ActionSpec {
         id: "pane.split-right",
@@ -1051,6 +1058,7 @@ fn binding_for(spec: &'static ActionSpec, keystroke: &str) -> KeyBinding {
         "tab.select.8" => KeyBinding::new(keystroke, SelectTab8, context),
         "tab.select.9" => KeyBinding::new(keystroke, SelectTab9, context),
         "sidebar.toggle" => KeyBinding::new(keystroke, ToggleSidebar, context),
+        "view.focus" => KeyBinding::new(keystroke, ToggleFocusMode, context),
         "pane.split-right" => KeyBinding::new(keystroke, SplitPaneRight, context),
         "pane.split-down" => KeyBinding::new(keystroke, SplitPaneDown, context),
         "pane.zoom" => KeyBinding::new(keystroke, ZoomPane, context),
@@ -1584,5 +1592,34 @@ mod tests {
         assert_eq!(page_action(Destination::Transfers), None);
         assert_eq!(tab_jump_action(9).map(|spec| spec.id), Some("tab.select.9"));
         assert_eq!(tab_jump_action(10), None);
+    }
+
+    #[test]
+    fn focus_mode_shortcut_is_bound_without_conflicts() {
+        for platform in PLATFORMS {
+            let keymap = Keymap::defaults(platform);
+            assert_eq!(
+                keymap.keystroke("view.focus"),
+                Some("alt-shift-f"),
+                "{platform:?}"
+            );
+            assert_eq!(
+                keymap.first_conflict(),
+                None,
+                "view.focus must not collide with any existing action on {platform:?}"
+            );
+        }
+        assert_eq!(
+            keystroke_label("alt-shift-f", Platform::Windows),
+            "Alt+Shift+F"
+        );
+        assert_eq!(
+            keystroke_label("alt-shift-f", Platform::Linux),
+            "Alt+Shift+F"
+        );
+        assert_eq!(
+            keystroke_label("alt-shift-f", Platform::MacOs),
+            "\u{2325}\u{21e7}F"
+        );
     }
 }

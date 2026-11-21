@@ -258,13 +258,12 @@ impl ShelluneView {
         self.restore_focus(window, cx);
     }
 
-    /// Focuses the terminal on screen, or the current page when there is none.
+    /// Focuses the active terminal or desktop surface on screen, or the current page when there is none.
     pub(super) fn restore_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         let destination = self.workspace.destination();
         if self.shows_terminal(destination)
-            && let Some(pane) = self.active_pane()
+            && let Some(handle) = self.active_work_focus(cx)
         {
-            let handle = pane.read(cx).focus_handle().clone();
             window.focus(&handle);
         } else {
             window.focus(&self.destination_focus(destination).clone());

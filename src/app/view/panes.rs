@@ -444,7 +444,10 @@ impl ShelluneView {
             && !self.connection_behind_screen()
             && let Some(page) = self.connection_page(cx)
         {
-            return column.child(page).children(self.standalone_session_bar(cx));
+            return column
+                .child(page)
+                .children(self.standalone_session_bar(cx))
+                .children(self.focus_mode_exit_pill(cx));
         }
         column = column.children(self.layout_status_banners());
         let session_id = if self.workspace.layout().active_tab().is_some() {
@@ -469,8 +472,15 @@ impl ShelluneView {
         // too narrow to dock them - still states it above, as a card of its own (R3).
         let tree_shown = files.is_none() || self.files_docked();
         let desktop = session_id.is_some_and(|id| self.desktop_for(id).is_some());
+        // A remote desktop that has not shown a first frame renders its own centred
+        // status card; stacking the top status banner above it would duplicate the
+        // error and next step (ADR-5, R5). Once a frame has been painted, the last
+        // frame stays visible and the single top banner states why it ended.
+        let desktop_without_picture = session_id
+            .and_then(|id| self.desktop_for(id))
+            .is_some_and(|pane| pane.read(cx).surface().is_empty());
         let overlaid = tree_shown && !desktop;
-        let banner = (!overlaid)
+        let banner = (!overlaid && !desktop_without_picture)
             .then_some(session_id)
             .flatten()
             .filter(|id| self.pane_for(*id).is_some() || self.desktop_for(*id).is_some())
@@ -534,7 +544,44 @@ impl ShelluneView {
         if self.split_drag.is_some() {
             column = column.child(self.split_drag_canvas(cx));
         }
+        column = column.children(self.focus_mode_exit_pill(cx));
         column
+    }
+
+    /// Lightweight, discoverable corner affordance to leave focus mode without blocking
+    /// authentication, certificate, failure banners or the top-centre desktop reveal zone (R1).
+    fn focus_mode_exit_pill(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if !self.focus_mode || self.desktop_fullscreen.is_some() {
+            return None;
+        }
+        let metrics = self.metrics();
+        let ux = crate::app::copy::ux();
+        let tooltip = match self.keymap.label("view.focus") {
+            Some(shortcut) => format!("{} ({shortcut})", ux.focus_mode_exit),
+            None => ux.focus_mode_exit.to_owned(),
+        };
+        Some(
+            div()
+                .absolute()
+                .top(metrics.scale(spacing::TIGHT))
+                .right(metrics.scale(spacing::TIGHT))
+                .flex()
+                .items_center()
+                .rounded(px(radius::MEDIUM))
+                .bg(theme::faded(theme::swatch(palette::CHROME), 0.92))
+                .border_1()
+                .border_color(theme::swatch(palette::BORDER_STRONG))
+                .child(
+                    crate::app::components::icon_only_button(Icon::Restore, metrics)
+                        .size(metrics.hit_target())
+                        .id("focus.mode.exit")
+                        .debug_selector(|| "focus.mode.exit".to_owned())
+                        .tooltip(crate::app::components::tooltip(SharedString::from(tooltip)))
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            this.toggle_focus_mode(window, cx);
+                        })),
+                ),
+        )
     }
 
     /// The one status of the session on screen, when it has ended (R17).
@@ -1028,14 +1075,16 @@ impl ShelluneView {
             .size_full()
             .overflow_hidden()
             .when(!solo, |frame| {
-                frame
-                    .rounded(px(radius::MEDIUM))
-                    .border_1()
-                    .border_color(if active {
-                        theme::swatch(palette::ACCENT)
-                    } else {
-                        theme::swatch(palette::BORDER)
-                    })
+                let framed = frame.rounded(px(radius::MEDIUM));
+                if active {
+                    framed
+                        .border_2()
+                        .border_color(theme::swatch(palette::ACCENT))
+                } else {
+                    framed
+                        .border_1()
+                        .border_color(theme::swatch(palette::BORDER))
+                }
             })
             .when(active, |frame| {
                 frame.debug_selector(|| "pane.active".to_owned())
@@ -1061,7 +1110,7 @@ impl ShelluneView {
                     this.focus_leaf(pane, window, cx);
                 }),
             );
-        if !solo {
+        if !solo && !self.focus_mode {
             frame = frame.child(self.leaf_header(leaf, active, cx));
         }
         if leaf.is_pending() {
@@ -1076,8 +1125,12 @@ impl ShelluneView {
             && let Some(terminal) = self.pane_for(id)
         {
             // The pane the keys are in carries the session's half of the bar under its
-            // grid; the others keep their own bar alone.
-            if active && let Some(parts) = self.session_bar_parts(cx) {
+            // grid; the others keep their own bar alone. In focus mode the session chrome
+            // is hidden so the terminal keeps maximum room (R1).
+            if active
+                && !self.focus_mode
+                && let Some(parts) = self.session_bar_parts(cx)
+            {
                 terminal
                     .read(cx)
                     .set_session_slot(crate::app::terminal::SessionSlot {
@@ -1098,7 +1151,9 @@ impl ShelluneView {
             // A remote session that is reconnecting keeps its last screen under the
             // banner that says so, until the new terminal takes its place (ADR-6).
             if active {
-                if let Some(parts) = self.session_bar_parts(cx) {
+                if !self.focus_mode
+                    && let Some(parts) = self.session_bar_parts(cx)
+                {
                     screen
                         .read(cx)
                         .set_session_slot(crate::app::terminal::SessionSlot {
@@ -1171,12 +1226,11 @@ impl ShelluneView {
             // the weight of a word: the frame around it is the other half of the mark.
             .when(active, |row| row.bg(theme::swatch(palette::SURFACE)))
             .when(!active, |row| row.bg(theme::swatch(palette::CANVAS)))
-            .when(active, |row| {
-                row.child(
-                    crate::app::components::accent_mark(true, metrics)
-                        .debug_selector(|| "pane.active.mark".to_owned()),
-                )
-            })
+            .child(
+                crate::app::components::accent_mark(active, metrics).when(active, |mark| {
+                    mark.debug_selector(|| "pane.active.mark".to_owned())
+                }),
+            )
             .child(
                 div()
                     .flex_shrink()
