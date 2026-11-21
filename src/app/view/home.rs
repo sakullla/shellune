@@ -52,6 +52,9 @@ pub(crate) const SIDEBAR_FOLDED_WIDTH: f32 = 56.0;
 /// icons reach the same places with one press, and the fold button opens the words again.
 const SIDEBAR_FOLD_BELOW: f32 = 900.0;
 
+/// How many groups the sidebar needs before it offers to filter them.
+const GROUP_LOCATOR_FROM: usize = 8;
+
 /// How far one level of the group tree is indented, before zoom.
 const GROUP_INDENT: f32 = 12.0;
 
@@ -643,13 +646,22 @@ impl ShelluneView {
                     })),
             );
 
-        let locator = div()
-            .flex()
-            .flex_none()
-            .w_full()
-            .min_w_0()
-            .debug_selector(|| "hosts.groups.search".to_owned())
-            .child(self.group_search.clone());
+        // The locator is for finding one group among many. With a handful of groups it is
+        // a box that costs a row and an outline above a list that fits on screen, so it
+        // appears once there are enough groups to look through, and stays while it is in
+        // use: it holds a query, or the keyboard is in it.
+        let locator_needed = !self.hosts.group_query().trim().is_empty()
+            || self.group_search.read(cx).focus_handle().is_focused(window)
+            || crate::app::hosts::drawn_paths(&self.book, &self.groups).len() >= GROUP_LOCATOR_FROM;
+        let locator = locator_needed.then(|| {
+            div()
+                .flex()
+                .flex_none()
+                .w_full()
+                .min_w_0()
+                .debug_selector(|| "hosts.groups.search".to_owned())
+                .child(self.group_search.clone())
+        });
 
         let rows = self.sidebar_group_rows();
         let group_query_active = !self.hosts.group_query().trim().is_empty();
@@ -769,7 +781,7 @@ impl ShelluneView {
             .w_full()
             .gap(metrics.scale(spacing::HALF))
             .child(heading)
-            .child(locator)
+            .children(locator)
             .child(list_area)
     }
 

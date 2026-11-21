@@ -40599,6 +40599,57 @@ async fn command_palette_keeps_navigation_and_actions_visible_with_many_hosts(
 // Terminal, RDP/VNC, Home Groups & Multi-Protocol Experience Matrix (R1–R6, R9–R13)
 // ---------------------------------------------------------------------------
 
+/// A host in one group, for the tests that count groups.
+fn host_in_group(name: &str, group: &str) -> HostConfig {
+    let mut host = HostConfig::new(name, "10.0.3.1", 22, "ops").expect("valid ssh");
+    host.set_group_path(Some(GroupPath::parse(group).expect("valid path")));
+    host
+}
+
+#[gpui::test]
+async fn a_few_groups_get_no_group_locator(cx: &mut TestAppContext) {
+    let dir = TempDir::new("group-locator-few");
+    let store = dir.store();
+    let mut book = HostBook::new();
+    for (name, group) in [("a", "alpha"), ("b", "beta"), ("c", "gamma")] {
+        book.insert(host_in_group(name, group)).expect("insert");
+    }
+    store.save(&book).expect("save book");
+
+    let (_view, cx) = hosts_view(cx, store);
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("hosts.groups.search").is_none(),
+        "three groups fit on screen, so the sidebar draws no box to filter them"
+    );
+    assert!(
+        cx.debug_bounds("hosts.groups").is_some(),
+        "the groups themselves are still listed"
+    );
+}
+
+#[gpui::test]
+async fn many_groups_get_a_group_locator(cx: &mut TestAppContext) {
+    let dir = TempDir::new("group-locator-many");
+    let store = dir.store();
+    let mut book = HostBook::new();
+    for index in 0..8 {
+        book.insert(host_in_group(
+            &format!("n{index}"),
+            &format!("many-{index}"),
+        ))
+        .expect("insert");
+    }
+    store.save(&book).expect("save book");
+
+    let (_view, cx) = hosts_view(cx, store);
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("hosts.groups.search").is_some(),
+        "with this many groups the sidebar offers to filter them"
+    );
+}
+
 fn wide_representative_window() -> Size<Pixels> {
     size(px(1680.0), px(940.0))
 }
@@ -40613,6 +40664,15 @@ async fn r6_r13_representative_windows_matrix_keeps_primary_controls_inside_boun
     let mut ssh = HostConfig::new("prod-web", "10.0.1.10", 22, "ops").expect("valid ssh");
     ssh.set_group_path(Some(GroupPath::parse("prod/web").expect("valid path")));
     book.insert(ssh).expect("insert ssh");
+    // Enough groups for the sidebar to offer its group locator, so the matrix measures it.
+    for index in 0..8 {
+        let mut host =
+            HostConfig::new(format!("edge-{index}"), "10.0.2.10", 22, "ops").expect("valid ssh");
+        host.set_group_path(Some(
+            GroupPath::parse(&format!("edge/zone-{index}")).expect("valid path"),
+        ));
+        book.insert(host).expect("insert grouped ssh");
+    }
     book.insert_connection(desktop_record("prod-rdp"))
         .expect("insert rdp");
     book.insert_connection(vnc_record_sharing("prod-vnc", false))

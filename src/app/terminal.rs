@@ -77,6 +77,8 @@ const SEARCH_PANEL_MAX_HEIGHT_CAP: f32 = 260.0;
 
 /// The narrowest the search query field becomes once it holds a query.
 const SEARCH_QUERY_MIN_WIDTH: f32 = 80.0;
+/// The widest the find bar's query field grows on a wide pane.
+const SEARCH_FIELD_MAX_WIDTH: f32 = 360.0;
 
 /// The soft ring outside the search query field while it has the keyboard.
 const SEARCH_FOCUS_HALO: f32 = 2.0;
@@ -5063,13 +5065,17 @@ impl TerminalPane {
                             cx.notify();
                         }),
                     )
-                    .when(empty_query, |field| {
-                        field.flex_none().min_w(query_field_floor)
+                    // The field takes the line's spare room up to a readable cap, so a
+                    // query is not squeezed into the width of its placeholder while the
+                    // controls sit far away. An empty field never goes below its
+                    // placeholder, so that sentence is not cut through a word (R4).
+                    .flex_1()
+                    .min_w(if empty_query {
+                        query_field_floor
+                    } else {
+                        metrics.scale(SEARCH_QUERY_MIN_WIDTH)
                     })
-                    .when(!empty_query, |field| {
-                        field.flex_1().min_w(metrics.scale(SEARCH_QUERY_MIN_WIDTH))
-                    })
-                    .max_w_full()
+                    .max_w(metrics.scale(SEARCH_FIELD_MAX_WIDTH).max(query_field_floor))
                     .rounded(px(radius::SMALL))
                     .bg(theme::swatch(shell_palette::SURFACE))
                     .border_1()
@@ -5096,110 +5102,120 @@ impl TerminalPane {
                     })
                     .child(query_content),
             );
-        // Which keys do what, or — once the terminal has the keyboard again — the one
-        // thing the reader needs to know before typing: their keys go to the shell.
+        // The one thing the reader needs next to the field: which key ends the search, or
+        // - once the terminal has the keyboard again - where their keys go. The rest of the
+        // key map is in the tooltips of the controls it belongs to, so the bar is not a
+        // line of instructions.
         //
-        // The line is allowed to be narrower than its words: in a pane of a split tab
-        // (354 px at the minimum window) it is wider than the whole bar, and a line that
-        // could not shrink would be drawn past the pane's edge, where the rest of it —
-        // including the key that closes the bar — cannot be read or scrolled to (R4).
-        // It takes its own line and wraps there instead; the buttons stay whole.
-        bar = bar.child(
-            div()
-                .min_w_0()
-                .debug_selector(move || {
-                    if focused {
-                        "terminal.search.keys".to_owned()
-                    } else {
-                        "terminal.search.keys.terminal".to_owned()
-                    }
-                })
-                .text_size(metrics.caption_size())
-                .text_color(if focused {
-                    theme::swatch(shell_palette::TEXT_MUTED)
+        // The line may be narrower than its words: in a pane of a split tab it takes its own
+        // line and wraps there, and the buttons stay whole (R4).
+        let hint = div()
+            .min_w_0()
+            .flex_1()
+            .debug_selector(move || {
+                if focused {
+                    "terminal.search.keys".to_owned()
                 } else {
-                    theme::swatch(shell_palette::TEXT_SECONDARY)
-                })
-                .child(SharedString::from(
-                    if focused {
-                        strings.terminal_search_keys
-                    } else {
-                        strings.terminal_search_keyboard_terminal
-                    }
-                    .to_owned(),
-                )),
+                    "terminal.search.keys.terminal".to_owned()
+                }
+            })
+            .text_size(metrics.caption_size())
+            .text_color(if focused {
+                theme::swatch(shell_palette::TEXT_MUTED)
+            } else {
+                theme::swatch(shell_palette::TEXT_SECONDARY)
+            })
+            .child(SharedString::from(
+                if focused {
+                    strings.terminal_search_keys
+                } else {
+                    strings.terminal_search_keyboard_terminal
+                }
+                .to_owned(),
+            ));
+        let with_key =
+            |label: &'static str, key: &'static str| SharedString::from(format!("{label} ({key})"));
+        // Two arrows, then the switches, then the hint, then the close: the arrows are the
+        // verbs of a search, so they stand next to the count they move.
+        bar = bar.when_some(note, |bar, note| bar.child(note)).child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .child(
+                    components::icon_only_button(Icon::ChevronUp, metrics)
+                        .id("terminal.search.previous")
+                        .debug_selector(|| "terminal.search.previous".to_owned())
+                        .tooltip(components::tooltip(with_key(
+                            strings.terminal_search_previous,
+                            "Shift+Enter",
+                        )))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.previous_search_hit(cx);
+                        })),
+                )
+                .child(
+                    components::icon_only_button(Icon::ChevronDown, metrics)
+                        .id("terminal.search.next")
+                        .debug_selector(|| "terminal.search.next".to_owned())
+                        .tooltip(components::tooltip(with_key(
+                            strings.terminal_search_next,
+                            "Enter",
+                        )))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.next_search_hit(cx);
+                        })),
+                ),
         );
-        if let Some(note) = note {
-            bar = bar.child(note);
-        }
         bar.child(
-            components::compact_button(
-                strings.terminal_search_previous,
-                components::Variant::Ghost,
-                metrics,
-            )
-            .h(metrics.hit_target())
-            .px(metrics.scale(spacing::NARROW))
-            .id("terminal.search.previous")
-            .debug_selector(|| "terminal.search.previous".to_owned())
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.previous_search_hit(cx);
-            })),
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .child(Self::search_switch(
+                    "Aa",
+                    with_key(strings.terminal_search_case, "Alt+C"),
+                    self.search_options.case_sensitive,
+                    metrics,
+                    "terminal.search.case",
+                    Self::toggle_case_sensitive,
+                    cx,
+                ))
+                .child(Self::search_switch(
+                    ".*",
+                    with_key(strings.terminal_search_regex, "Alt+R"),
+                    self.search_options.regex,
+                    metrics,
+                    "terminal.search.regex",
+                    Self::toggle_regex,
+                    cx,
+                )),
         )
+        .child(hint)
         .child(
-            components::compact_button(
-                strings.terminal_search_next,
-                components::Variant::Ghost,
-                metrics,
-            )
-            .h(metrics.hit_target())
-            .px(metrics.scale(spacing::NARROW))
-            .id("terminal.search.next")
-            .debug_selector(|| "terminal.search.next".to_owned())
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.next_search_hit(cx);
-            })),
-        )
-        .child(Self::search_switch(
-            strings.terminal_search_case,
-            self.search_options.case_sensitive,
-            metrics,
-            "terminal.search.case",
-            Self::toggle_case_sensitive,
-            cx,
-        ))
-        .child(Self::search_switch(
-            strings.terminal_search_regex,
-            self.search_options.regex,
-            metrics,
-            "terminal.search.regex",
-            Self::toggle_regex,
-            cx,
-        ))
-        .child(
-            components::compact_button(
-                strings.terminal_search_close,
-                components::Variant::Ghost,
-                metrics,
-            )
-            .h(metrics.hit_target())
-            .px(metrics.scale(spacing::NARROW))
-            .id("terminal.search.close")
-            .debug_selector(|| "terminal.search.close".to_owned())
-            .on_click(cx.listener(|this, _event, window, cx| {
-                this.close_search(window, cx);
-            })),
+            components::icon_only_button(Icon::Close, metrics)
+                .id("terminal.search.close")
+                .debug_selector(|| "terminal.search.close".to_owned())
+                .tooltip(components::tooltip(with_key(
+                    strings.terminal_search_close,
+                    "Esc",
+                )))
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.close_search(window, cx);
+                })),
         )
     }
 
     /// One switch of the find bar.
     ///
-    /// Drawn as a capsule toggle with a check icon when active and a hollow mark when
-    /// off, so state is readable both by shape and by tokenised accent tint rather than
-    /// raw `[x]`/`[ ]` brackets (R3, R13). The identifier is also the debug selector, so
-    /// a test clicks the same control a person does.
+    /// A square the size of its neighbours holding a short glyph (`Aa`, `.*`), as in an
+    /// editor's find widget. Off it is quiet; on it sits on the accent tint with a thin
+    /// accent edge, so the state is read from the control itself and not from colour
+    /// alone. The full name and the key are in the tooltip (R3, R13). The identifier is
+    /// also the debug selector, so a test clicks the same control a person does.
     fn search_switch(
-        label: &'static str,
+        glyph: &'static str,
+        tooltip: SharedString,
         on: bool,
         metrics: Metrics,
         id: &'static str,
@@ -5210,45 +5226,23 @@ impl TerminalPane {
         let on_hover = theme::swatch_over(shell_palette::SURFACE_HOVER, shell_palette::ACCENT_TINT);
         let on_border = theme::swatch(shell_palette::ACCENT);
         let on_text = theme::swatch(shell_palette::ACCENT_ON_TINT);
-        let off_bg = theme::swatch(shell_palette::SURFACE);
-        let off_hover = theme::swatch_over(shell_palette::SURFACE_HOVER, shell_palette::SURFACE);
-        let off_border = theme::swatch(shell_palette::BORDER_STRONG);
+        let off_hover = theme::swatch_over(shell_palette::SURFACE_HOVER, shell_palette::CHROME);
         let off_text = theme::swatch(shell_palette::TEXT_SECONDARY);
         let off_hover_text = theme::swatch(shell_palette::TEXT_PRIMARY);
-        let off_mark = theme::swatch(shell_palette::TEXT_MUTED);
-        let indicator = if on {
-            div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .debug_selector(move || format!("{id}.on"))
-                .child(crate::app::icons::icon(
-                    Icon::Check,
-                    metrics.small_icon_size(),
-                    on_text,
-                ))
-        } else {
-            div()
-                .flex_none()
-                .w(metrics.scale(spacing::TIGHT))
-                .h(metrics.scale(spacing::TIGHT))
-                .rounded_full()
-                .border_1()
-                .border_color(off_mark)
-                .debug_selector(move || format!("{id}.off"))
-        };
+        let size = metrics.hit_target();
         div()
             .id(id)
             .debug_selector(move || id.to_owned())
             .flex()
             .flex_none()
             .items_center()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .h(metrics.hit_target())
+            .justify_center()
+            .min_w(size)
+            .h(size)
             .px(metrics.scale(spacing::NARROW))
-            .rounded_full()
+            .rounded(px(radius::MEDIUM))
             .border_1()
+            .font_family(monospace_family())
             .text_size(metrics.caption_size())
             .cursor_pointer()
             .when(on, |pill| {
@@ -5259,14 +5253,16 @@ impl TerminalPane {
                     .hover(move |style| style.bg(on_hover))
             })
             .when(!on, |pill| {
-                pill.bg(off_bg)
-                    .border_color(off_border)
+                pill.border_color(theme::clear())
                     .text_color(off_text)
                     .hover(move |style| style.bg(off_hover).text_color(off_hover_text))
             })
-            .child(indicator)
-            .child(SharedString::from(label))
-            .tooltip(components::tooltip(SharedString::from(label)))
+            .child(
+                div()
+                    .debug_selector(move || format!("{id}.{}", if on { "on" } else { "off" }))
+                    .child(glyph),
+            )
+            .tooltip(components::tooltip(tooltip))
             .on_click(cx.listener(move |this, _event, _window, cx| toggle(this, cx)))
     }
 
