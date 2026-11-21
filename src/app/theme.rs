@@ -994,12 +994,10 @@ pub fn set_zoom(zoom: Zoom) {
 /// How an object arrives on screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Enter {
-    /// Fades in where it is: toasts, tooltips, a chip.
-    Fade,
-    /// Fades in while rising a few pixels into place: cards, menus.
+    /// Rises a few pixels into place: cards, menus.
     #[cfg_attr(not(test), allow(dead_code))]
     Rise,
-    /// Fades in while settling from slightly above: dialogs and the splash. GPUI
+    /// Settles from slightly above: dialogs and the command palette. GPUI
     /// cannot scale a box, so the settle stands in for the slight zoom.
     #[cfg_attr(not(test), allow(dead_code))]
     Settle,
@@ -1010,7 +1008,6 @@ impl Enter {
     #[must_use]
     pub fn duration(self) -> Duration {
         match self {
-            Self::Fade => Motion::FAST,
             Self::Rise => Motion::BASE,
             Self::Settle => Motion::SLOW,
         }
@@ -1019,7 +1016,6 @@ impl Enter {
     /// How far the object travels, in logical pixels; negative is from above.
     fn travel(self) -> f32 {
         match self {
-            Self::Fade => 0.0,
             Self::Rise => 6.0,
             Self::Settle => -8.0,
         }
@@ -1044,7 +1040,7 @@ pub fn ease_out() -> impl Fn(f32) -> f32 {
 ///
 /// The travel never changes how the element is positioned: an element in the flow is
 /// offset relatively (its siblings do not move), and an absolutely placed one - a menu
-/// anchored to a button, a toast stack pinned to a corner - is nudged by a margin on the
+/// anchored to a button - is nudged by a margin on the
 /// edge it is anchored to, so it stays out of the flow and in its own place.
 pub fn enter<E>(element: E, id: impl Into<ElementId>, kind: Enter) -> AnyElement
 where
@@ -1054,21 +1050,12 @@ where
         return element.into_any_element();
     }
     let travel = kind.travel();
-    let start_opacity = match kind {
-        // A modal settling over a dimmed window should never start invisible while the
-        // backdrop is already painted, which reads as a dark-to-bright strobe flash.
-        Enter::Settle => 0.65,
-        Enter::Fade | Enter::Rise => 0.0,
-    };
     element
         .with_animation(
             id,
             Animation::new(kind.duration()).with_easing(ease_out()),
-            move |element, delta| {
-                let mut element = element.opacity(start_opacity + (1.0 - start_opacity) * delta);
-                if travel != 0.0 {
-                    travel_by(element.style(), px(travel * (1.0 - delta)));
-                }
+            move |mut element, delta| {
+                travel_by(element.style(), px(travel * (1.0 - delta)));
                 element
             },
         )
@@ -2445,7 +2432,6 @@ mod tests {
         assert_eq!(Motion::FAST.as_millis(), 120);
         assert_eq!(Motion::BASE.as_millis(), 200);
         assert_eq!(Motion::SLOW.as_millis(), 300);
-        assert!(Enter::Fade.duration() < Enter::Rise.duration());
         assert!(Enter::Rise.duration() < Enter::Settle.duration());
         let ease = super::ease_out();
         assert!(ease(0.0).abs() < f32::EPSILON && (ease(1.0) - 1.0).abs() < f32::EPSILON);
@@ -2485,6 +2471,23 @@ mod tests {
         super::fake_system_reduces_motion(false);
     }
 
+    /// Check the style that reaches layout on every animation frame.
+    #[derive(gpui::IntoElement)]
+    struct EnteringSurface(gpui::Div);
+
+    impl gpui::Styled for EnteringSurface {
+        fn style(&mut self) -> &mut gpui::StyleRefinement {
+            self.0.style()
+        }
+    }
+
+    impl gpui::RenderOnce for EnteringSurface {
+        fn render(mut self, _: &mut gpui::Window, _: &mut gpui::App) -> impl IntoElement {
+            assert_eq!(self.style().opacity.unwrap_or(1.0), 1.0);
+            self.0
+        }
+    }
+
     /// One object entering over a 200 px block, placed by `place`.
     struct Entrance {
         kind: Enter,
@@ -2505,7 +2508,7 @@ mod tests {
                 .flex()
                 .flex_col()
                 .child(gpui::div().h(px(200.0)).w_full().flex_none())
-                .child(super::enter(object, "entering", self.kind))
+                .child(super::enter(EnteringSurface(object), "entering", self.kind))
                 .child(
                     gpui::div()
                         .h(px(20.0))

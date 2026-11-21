@@ -214,13 +214,7 @@ impl ShelluneView {
                         view.dismiss_toast(id, cx);
                     })),
             );
-            // A toast fades in where it lands; it does not travel, so the stack never
-            // shifts under the pointer.
-            stack = stack.child(theme::enter(
-                card,
-                ("toast.enter", id as usize),
-                theme::Enter::Fade,
-            ));
+            stack = stack.child(card);
         }
         Some(stack)
     }

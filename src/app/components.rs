@@ -1594,7 +1594,7 @@ pub fn menu_section(label: impl Into<SharedString>, metrics: Metrics) -> Div {
         .child(label.into())
 }
 
-/// A [`menu_card`] with its entrance: it fades in and rises the few pixels into the
+/// A [`menu_card`] with its entrance: it rises the few pixels into the
 /// place it is anchored at, once per opening (`id` names the opening), and is simply
 /// there under reduced motion.
 ///
@@ -2412,13 +2412,13 @@ pub fn modal_icon(icon: Icon, tone: Option<Tone>, metrics: Metrics) -> Div {
         .child(icons::icon(icon, metrics.icon_size(), ink))
 }
 
-/// A centred dialog over a dimmed page.
+/// A centred dialog over the shared window scrim.
 ///
 /// The dialog is the overlay layer at the highest elevation, with the largest panel
 /// radius; the body scrolls between a fixed header and footer. The scrim takes every
 /// press so nothing behind it can be used, but a press on it does not close the
 /// dialog: what was typed is kept until the user closes it on purpose. With motion
-/// allowed the dialog fades in and settles into place.
+/// allowed the dialog settles into place at full opacity.
 pub fn modal(
     viewport: gpui::Size<Pixels>,
     id: &'static str,
@@ -2483,7 +2483,6 @@ pub fn modal_with(
         .debug_selector(move || format!("{id}.backdrop"))
         .absolute()
         .inset_0()
-        .bg(theme::scrim())
         .occlude();
     let backdrop = match dismiss {
         Some(dismiss) => backdrop.on_any_mouse_down(move |event, window, cx| {
@@ -2501,44 +2500,12 @@ pub fn modal_with(
         .justify_center()
         .w(viewport.width)
         .h(viewport.height)
-        .child(theme::enter(
-            backdrop,
-            SharedString::from(format!("{id}.backdrop.enter")),
-            Enter::Fade,
-        ))
+        .child(backdrop)
         .child(theme::enter(
             dialog,
             SharedString::from(format!("{id}.enter")),
             Enter::Settle,
         ))
-}
-
-/// How long the dimmed page takes to clear after a dialog closes.
-pub const SCRIM_EXIT: std::time::Duration = theme::Motion::BASE;
-
-/// The dimming a [`modal`] leaves behind as it closes, fading out (R5).
-///
-/// The dialog itself is gone at once: GPUI rebuilds the tree every frame, so keeping a
-/// closed dialog drawn would mean keeping every dialog's state alive after its answer.
-/// The dimming carries no state, so it alone eases away. It takes no presses - the
-/// page is usable again the moment the dialog is answered - and `key` restarts the
-/// fade for each dialog that closes. Under reduced motion there is nothing to draw:
-/// the window does not ask for it.
-pub fn modal_scrim_exit(viewport: gpui::Size<Pixels>, key: u64) -> AnyElement {
-    div()
-        .debug_selector(|| "modal.scrim.exit".to_owned())
-        .absolute()
-        .top_0()
-        .left_0()
-        .w(viewport.width)
-        .h(viewport.height)
-        .bg(theme::scrim())
-        .with_animation(
-            SharedString::from(format!("modal.scrim.exit.{key}")),
-            Animation::new(SCRIM_EXIT).with_easing(theme::ease_out()),
-            |scrim, delta| scrim.opacity(1.0 - delta),
-        )
-        .into_any_element()
 }
 
 // ---------------------------------------------------------------------------

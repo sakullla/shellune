@@ -789,7 +789,6 @@ impl ShelluneView {
     /// The palette over a dimmed window.
     pub(super) fn palette_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
         let field = self.palette.clone()?;
-        // Its dimming fades out when it closes, like a dialog's does (R5, R6).
         self.modal_drawn.set(true);
         let metrics = self.metrics();
         let strings = self.strings();
@@ -851,7 +850,7 @@ impl ShelluneView {
                 .child(label)
         };
         // The palette floats like a menu - the popover surface, its radius and the
-        // overlay elevation (ADR-7) - over its own dimming, and settles into place like a
+        // overlay elevation (ADR-7) - over the window scrim, and settles into place like a
         // dialog (R6).
         let panel = components::popover_surface()
             .flex()
@@ -918,7 +917,6 @@ impl ShelluneView {
                             .id("palette.backdrop")
                             .absolute()
                             .inset_0()
-                            .bg(theme::scrim())
                             .occlude()
                             .on_mouse_down(
                                 MouseButton::Left,

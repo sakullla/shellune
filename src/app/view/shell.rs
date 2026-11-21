@@ -1303,8 +1303,7 @@ impl ShelluneView {
     /// A centred dialog over a dimmed window, laid in the window's overlay layer.
     ///
     /// The dialog is [`components::modal`]; a press on the dimmed part does not close
-    /// it, so what was typed is kept until the user closes it on purpose. Drawing one
-    /// is noted, so the draw after it closes can fade the dimming out (R5).
+    /// it, so what was typed is kept until the user closes it on purpose.
     pub(super) fn modal(
         &self,
         window: &Window,

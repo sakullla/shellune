@@ -37911,92 +37911,38 @@ fn motion_to(view: &Entity<ShelluneView>, cx: &mut VisualTestContext, motion: Mo
 }
 
 #[gpui::test]
-async fn a_closed_dialog_leaves_its_dimming_to_fade_out_and_the_page_usable(
-    cx: &mut TestAppContext,
-) {
-    let dir = TempDir::new("scrim-exit");
+async fn closing_a_dialog_clears_the_scrim_before_the_next_action(cx: &mut TestAppContext) {
+    use crate::app::theme::ThemeChoice;
+
+    let dir = TempDir::new("dialog-scrim");
     let store = dir.store();
     seed(
         &store,
-        vec![
-            stored_host("web", "10.0.0.5", 22, "deploy", None),
-            stored_host("db", "10.0.0.6", 22, "postgres", None),
-        ],
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
     );
     let (view, cx) = hosts_view(cx, store);
-    motion_to(&view, cx, Motion::Full);
-    // Whether the window draws a fading dimming now. Asked of the view: a test frame
-    // keeps the bounds of what an earlier frame drew.
-    let fading =
-        |cx: &mut VisualTestContext| cx.update(|_window, app| view.read(app).scrim_exit_for_test());
-    let dialog = |cx: &mut VisualTestContext| {
-        cx.update(|_window, app| view.read(app).modal_shown_for_test())
-    };
-
-    // Nothing has closed yet, so nothing fades.
-    assert!(!fading(cx));
-    click(cx, "hosts.delete.0");
-    assert!(cx.debug_bounds("hosts.confirm.backdrop").is_some());
-    assert!(
-        !fading(cx),
-        "an open dialog has its own dimming, not a fading one"
-    );
-
-    // Escape answers the question: the dialog goes at once and its dimming fades out
-    // over the window (R5).
-    cx.simulate_keystrokes("escape");
-    cx.run_until_parked();
-    assert!(!dialog(cx), "the card goes at once");
-    assert!(fading(cx), "the dimming stays behind to fade out");
-    let viewport = cx.update(|window, _app| window.viewport_size());
-    let scrim = bounds_of(cx, "modal.scrim.exit");
-    assert!(
-        scrim.size.width >= viewport.width - px(0.5)
-            && scrim.size.height >= viewport.height - px(0.5),
-        "the fading dimming covers the window it dimmed: {scrim:?} in {viewport:?}"
-    );
-
-    // The fading dimming takes no presses: the page is usable the moment the question
-    // is answered, and a new dialog brings its own dimming.
-    click(cx, "hosts.delete.1");
-    assert!(
-        cx.update(|_window, app| view.read(app).hosts_state().pending_delete().is_some())
-            && dialog(cx),
-        "a press through the fading dimming reaches the page"
-    );
-    assert!(!fading(cx), "a dialog that opens ends the fade");
-
-    // The fade is gone once its time is up.
-    click(cx, "hosts.confirm.cancel");
-    assert!(!dialog(cx) && fading(cx));
-    cx.executor()
-        .advance_clock(crate::app::components::SCRIM_EXIT + std::time::Duration::from_millis(20));
-    cx.run_until_parked();
-    assert!(!fading(cx), "the dimming is gone once it has faded");
-
-    // A form closes the same way.
-    click(cx, "hosts.new");
-    assert!(cx.debug_bounds("hosts.editor.backdrop").is_some());
-    cx.simulate_keystrokes("escape");
-    cx.run_until_parked();
-    assert!(!dialog(cx), "Escape closes the form");
-    assert!(fading(cx), "a closed form's dimming fades out too");
-    cx.executor()
-        .advance_clock(crate::app::components::SCRIM_EXIT + std::time::Duration::from_millis(20));
-    cx.run_until_parked();
-    assert!(!fading(cx));
-
-    // With reduced motion the dimming goes with the dialog.
-    motion_to(&view, cx, Motion::Reduced);
-    click(cx, "hosts.delete.0");
-    assert!(dialog(cx));
-    cx.simulate_keystrokes("escape");
-    cx.run_until_parked();
-    assert!(!dialog(cx), "Escape closes the question");
-    assert!(
-        !fading(cx),
-        "reduced motion leaves no fading dimming behind"
-    );
+    for (choice, motion) in [
+        (ThemeChoice::Light, Motion::Full),
+        (ThemeChoice::Dark, Motion::Full),
+        (ThemeChoice::Dark, Motion::Reduced),
+    ] {
+        while cx.update(|_, app| view.read(app).theme_choice()) != choice {
+            cx.update(|_, app| view.update(app, |view, cx| view.cycle_theme(cx)));
+        }
+        motion_to(&view, cx, motion);
+        for open in ["hosts.delete.0", "hosts.new"] {
+            click(cx, open);
+            let viewport = cx.update(|window, _| window.viewport_size());
+            assert_eq!(bounds_of(cx, "modal.scrim").size, viewport);
+            crate::app::view::take_frame_marks();
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            let frames = crate::app::view::take_frame_marks();
+            assert!(!frames.is_empty());
+            assert!(frames.iter().all(|frame| !frame.dimmed));
+            assert!(cx.debug_bounds("modal.scrim.exit").is_none());
+        }
+    }
     motion_to(&view, cx, Motion::Full);
 }
 
@@ -38083,40 +38029,22 @@ async fn a_delete_question_keeps_every_key_but_escape(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn the_palette_settles_like_a_dialog_and_its_dimming_fades_on_close(cx: &mut TestAppContext) {
-    // The palette is a dialog-level layer: it is drawn on the dialog surface and,
-    // closed, leaves its dimming to fade out like every dialog's does (R5, R6).
+async fn the_palette_closes_without_dimming_the_page_it_returns_to(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
     cx.run_until_parked();
     motion_to(&view, cx, Motion::Full);
-    let fading =
-        |cx: &mut VisualTestContext| cx.update(|_window, app| view.read(app).scrim_exit_for_test());
-
     go(cx, crate::app::actions::OpenPalette);
-    assert!(cx.update(|_window, app| view.read(app).palette_open()));
     assert!(cx.debug_bounds("palette").is_some());
-    assert!(!fading(cx), "an open palette has its own dimming");
-
+    assert!(cx.debug_bounds("modal.scrim").is_some());
+    crate::app::view::take_frame_marks();
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     assert!(!cx.update(|_window, app| view.read(app).palette_open()));
-    assert!(fading(cx), "the palette's dimming stays behind to fade out");
-    cx.executor()
-        .advance_clock(crate::app::components::SCRIM_EXIT + std::time::Duration::from_millis(20));
-    cx.run_until_parked();
-    assert!(!fading(cx), "and is gone once it has faded");
-
-    // Reduced motion leaves nothing behind.
-    motion_to(&view, cx, Motion::Reduced);
-    go(cx, crate::app::actions::OpenPalette);
-    cx.simulate_keystrokes("escape");
-    cx.run_until_parked();
-    assert!(
-        !fading(cx),
-        "reduced motion takes the dimming with the palette"
-    );
-    motion_to(&view, cx, Motion::Full);
+    let frames = crate::app::view::take_frame_marks();
+    assert!(!frames.is_empty());
+    assert!(frames.iter().all(|frame| !frame.dimmed));
+    assert!(cx.debug_bounds("modal.scrim.exit").is_none());
 }
 
 #[gpui::test]

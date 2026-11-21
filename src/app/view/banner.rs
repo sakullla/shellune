@@ -296,11 +296,7 @@ impl ShelluneView {
             BannerState::Reconnecting => (self.reconnecting_banner(id, cx), None),
         };
         let first = self.banner_stops(id, &state).into_iter().next()?;
-        let mut parts = vec![theme::enter(
-            line,
-            SharedString::from(format!("session.banner.enter.{id:?}")),
-            theme::Enter::Fade,
-        )];
+        let mut parts = vec![line.into_any_element()];
         parts.extend(detail);
         Some((parts, self.banner_focus[first.slot()].clone()))
     }

@@ -910,13 +910,6 @@ pub struct ShelluneView {
     /// Whether this draw laid a dialog over the page. [`shell`]'s `modal` sets it, and
     /// the end of the draw reads and clears it.
     modal_drawn: std::cell::Cell<bool>,
-    /// Whether the last draw laid a dialog over the page.
-    modal_shown: bool,
-    /// The dimming a dialog left behind as it closed, while it fades out (R5): the
-    /// number of the fade, so a timer that belongs to an older one clears nothing.
-    scrim_exit: Option<u64>,
-    /// The number the next fade takes.
-    scrim_exit_count: u64,
     /// The interceptor that keeps every shortcut but Escape while a delete or close
     /// question is up, so nothing runs behind a question about something that cannot
     /// be undone. It exists only while such a question is open.
@@ -2897,9 +2890,6 @@ impl ShelluneView {
             paste_watch: None,
             paste_scroll: gpui::ScrollHandle::new(),
             modal_drawn: std::cell::Cell::new(false),
-            modal_shown: false,
-            scrim_exit: None,
-            scrim_exit_count: 0,
             question_watch: None,
             session_menu: None,
             session_more: None,
@@ -7840,18 +7830,6 @@ impl ShelluneView {
         self.ask_delete_host(id, cx);
     }
 
-    /// Whether the window draws the fading dimming of a dialog that just closed.
-    #[cfg(test)]
-    pub fn scrim_exit_for_test(&self) -> bool {
-        self.scrim_exit.is_some()
-    }
-
-    /// Whether the last draw laid a dialog over the page.
-    #[cfg(test)]
-    pub fn modal_shown_for_test(&self) -> bool {
-        self.modal_shown
-    }
-
     /// Drops the deletion question without touching anything.
     fn cancel_delete_host(&mut self, cx: &mut Context<Self>) {
         self.hosts.cancel_delete();
@@ -12393,42 +12371,6 @@ impl ShelluneView {
             }
         });
         self.question_watch = Some(watch);
-    }
-
-    /// Notes whether this draw laid a dialog over the page, and returns the fading
-    /// dimming of one that has just closed (R5).
-    ///
-    /// A dialog that was on screen at the last draw and is gone now leaves its dimming
-    /// behind for [`components::SCRIM_EXIT`], fading out; a dialog that opens meanwhile
-    /// brings its own dimming and ends the fade. Under reduced motion nothing is left
-    /// behind: the dimming goes with the dialog.
-    fn settle_scrim_exit(
-        &mut self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let drawn = self.modal_drawn.replace(false);
-        let closed = self.modal_shown && !drawn;
-        self.modal_shown = drawn;
-        if drawn || !theme::motion_allowed() {
-            self.scrim_exit = None;
-        } else if closed {
-            self.scrim_exit_count += 1;
-            let key = self.scrim_exit_count;
-            self.scrim_exit = Some(key);
-            cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(components::SCRIM_EXIT).await;
-                let _ = this.update(cx, |view, cx| {
-                    if view.scrim_exit == Some(key) {
-                        view.scrim_exit = None;
-                        cx.notify();
-                    }
-                });
-            })
-            .detach();
-        }
-        self.scrim_exit
-            .map(|key| components::modal_scrim_exit(window.viewport_size(), key))
     }
 
     /// What one frame drew of the host form, for the tests that prove the dialog is
@@ -19949,19 +19891,24 @@ impl Render for ShelluneView {
             self.close_transfer_question(window, cx),
             self.close_app_question(window, cx),
         ];
-        // The dimming of a dialog that just closed fades out over the page and under
-        // every floating layer: a menu or the palette opened while it fades is drawn
-        // above it, at full strength, rather than dimmed by a dialog that is gone
-        // (R5, R6). The toasts stay above everything, as they were.
         #[cfg(test)]
         self.record_frame(forms_drawn);
-        let scrim_exit = self.settle_scrim_exit(window, cx);
-        root.children(scrim_exit)
-            .children(layers.into_iter().flatten())
-            .children(self.toast_stack(cx))
-            // The start fading out over the page it became, above everything (R3).
-            .children(self.startup_crossfade())
-            .into_any_element()
+        // Draw one scrim for the current frame, including when one dialog replaces
+        // another. Each modal keeps its own backdrop for hit testing.
+        root.when(self.modal_drawn.replace(false), |root| {
+            root.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .bg(theme::scrim())
+                    .debug_selector(|| "modal.scrim".to_owned()),
+            )
+        })
+        .children(layers.into_iter().flatten())
+        .children(self.toast_stack(cx))
+        // The start fading out over the page it became, above everything (R3).
+        .children(self.startup_crossfade())
+        .into_any_element()
     }
 }
 
