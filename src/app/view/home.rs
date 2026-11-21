@@ -1340,6 +1340,11 @@ impl ShelluneView {
         let metrics = self.metrics();
         let strings = self.strings();
         let ux = copy::ux();
+        let count = if list.matched_len() == list.total() {
+            list.matched_len().to_string()
+        } else {
+            format!("{} / {}", list.matched_len(), list.total())
+        };
         let title = div()
             .flex()
             .flex_none()
@@ -1363,7 +1368,7 @@ impl ShelluneView {
                     .text_size(metrics.label_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .debug_selector(|| "header.count".to_owned())
-                    .child(SharedString::from(list.matched_len().to_string())),
+                    .child(components::line_text(count)),
             );
 
         let focused = self.hosts_search.read(cx).focus_handle().is_focused(window);
@@ -2692,9 +2697,8 @@ fn row_tools() -> Div {
     div().flex().flex_none().items_center().gap(px(0.0))
 }
 
-/// The place the tools stand in: it gives way before the name does, so a narrow or
-/// zoomed window clips the quiet icons from the left and keeps the name and the
-/// Connect button at the end; everything stays on the record's right-press menu.
+/// The secondary tools give way before the name does. Connect and More stay visible
+/// beside them, so a row's main action and its complete menu never depend on hover.
 fn row_tools_slot(tools: Div, cursor: bool) -> Div {
     div()
         .flex()
@@ -2707,6 +2711,29 @@ fn row_tools_slot(tools: Div, cursor: bool) -> Div {
                 .group_hover(components::ROW_GROUP, |style| style.opacity(1.0))
         })
         .child(tools)
+}
+
+/// The always-visible entry to every command a saved record offers.
+fn record_more_button(
+    selector: String,
+    id: HostId,
+    weak: &WeakEntity<ShelluneView>,
+    metrics: Metrics,
+) -> Stateful<Div> {
+    let open = weak.clone();
+    components::icon_only_button(Icon::More, metrics)
+        .id(SharedString::from(selector.clone()))
+        .debug_selector(move || selector.clone())
+        .tooltip(components::tooltip(copy::ux().home_card_more))
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            move |event: &gpui::MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                let _ = open.update(cx, |view, cx| {
+                    view.open_host_menu_at(id, event.position, window, cx);
+                });
+            },
+        )
 }
 
 /// One host inside the list: who it is, what it dials, its group, when it was reached,
@@ -2838,19 +2865,16 @@ fn host_row_element(
                     cx.stop_propagation();
                     let _ = delete.update(cx, |view, cx| view.ask_delete_host(id, cx));
                 }),
-        )
-        .child(
-            div().pl(metrics.scale(spacing::HALF)).child(
-                components::compact_button(strings.remote_connect, Variant::Secondary, metrics)
-                    .id(SharedString::from(format!("hosts.connect.{number}")))
-                    .debug_selector(move || format!("hosts.connect.{number}"))
-                    .tooltip(components::tooltip(ux.hosts_connect_hint))
-                    .on_click(move |_event, _window, cx| {
-                        cx.stop_propagation();
-                        let _ = connect.update(cx, |view, cx| view.connect_saved_host(id, cx));
-                    }),
-            ),
         );
+    let connect_button =
+        components::compact_button(strings.remote_connect, Variant::Secondary, metrics)
+            .id(SharedString::from(format!("hosts.connect.{number}")))
+            .debug_selector(move || format!("hosts.connect.{number}"))
+            .tooltip(components::tooltip(ux.hosts_connect_hint))
+            .on_click(move |_event, _window, cx| {
+                cx.stop_propagation();
+                let _ = connect.update(cx, |view, cx| view.connect_saved_host(id, cx));
+            });
 
     components::list_row_frame(state, metrics)
         .h(row_height)
@@ -2902,6 +2926,13 @@ fn host_row_element(
             metrics,
         ))
         .child(row_tools_slot(tools, cursor))
+        .child(connect_button)
+        .child(record_more_button(
+            format!("hosts.more.{number}"),
+            id,
+            weak,
+            metrics,
+        ))
 }
 
 /// One saved connection of another protocol inside the list.
@@ -2974,22 +3005,18 @@ fn connection_row_element(
                     cx.stop_propagation();
                     let _ = delete.update(cx, |view, cx| view.ask_delete_host(id, cx));
                 }),
-        )
-        .child(
-            div().pl(metrics.scale(spacing::HALF)).child(
-                components::compact_button(strings.remote_connect, Variant::Secondary, metrics)
-                    .id(SharedString::from(format!(
-                        "hosts.connection.connect.{number}"
-                    )))
-                    .debug_selector(move || format!("hosts.connection.connect.{number}"))
-                    .tooltip(components::tooltip(ux.hosts_connect_hint))
-                    .on_click(move |_event, _window, cx| {
-                        cx.stop_propagation();
-                        let _ =
-                            connect.update(cx, |view, cx| view.connect_saved_connection(id, cx));
-                    }),
-            ),
         );
+    let connect_button =
+        components::compact_button(strings.remote_connect, Variant::Secondary, metrics)
+            .id(SharedString::from(format!(
+                "hosts.connection.connect.{number}"
+            )))
+            .debug_selector(move || format!("hosts.connection.connect.{number}"))
+            .tooltip(components::tooltip(ux.hosts_connect_hint))
+            .on_click(move |_event, _window, cx| {
+                cx.stop_propagation();
+                let _ = connect.update(cx, |view, cx| view.connect_saved_connection(id, cx));
+            });
     components::list_row_frame(state, metrics)
         .h(row_height)
         .id(SharedString::from(format!("hosts.connection.id.{number}")))
@@ -3049,6 +3076,13 @@ fn connection_row_element(
             metrics,
         ))
         .child(row_tools_slot(tools, cursor))
+        .child(connect_button)
+        .child(record_more_button(
+            format!("hosts.connection.more.{number}"),
+            id,
+            weak,
+            metrics,
+        ))
 }
 
 /// The edge of a row's favourite star target, before zoom.

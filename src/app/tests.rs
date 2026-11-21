@@ -15153,6 +15153,33 @@ async fn the_palette_opens_from_a_terminal_and_switches_sessions(cx: &mut TestAp
 }
 
 #[gpui::test]
+async fn home_and_end_jump_to_the_palette_edges(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    go(cx, crate::app::actions::OpenPalette);
+
+    let (first, last) = cx.update(|_window, app| {
+        let titles = view.read(app).palette_titles();
+        (titles.first().cloned(), titles.last().cloned())
+    });
+    assert!(first.is_some() && last.is_some() && first != last);
+
+    cx.simulate_keystrokes("end");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).palette_selected_title()),
+        last
+    );
+    cx.simulate_keystrokes("home");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).palette_selected_title()),
+        first
+    );
+}
+
+#[gpui::test]
 async fn escape_closes_the_palette_without_running_anything(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
@@ -15202,6 +15229,13 @@ async fn a_search_without_a_match_says_so(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     assert!(cx.update(|_window, app| view.read(app).palette_open()));
+    cx.simulate_keystrokes("end home");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).palette_open())
+            && cx.debug_bounds("palette.empty").is_some(),
+        "edge navigation over no results keeps the empty state stable"
+    );
 }
 
 #[gpui::test]
@@ -33134,6 +33168,39 @@ async fn hosts_arrow_keys_and_context_menu_navigate_duplicate_and_dismiss_with_e
 }
 
 #[gpui::test]
+async fn visible_more_buttons_open_the_same_record_menu_without_connecting(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("record-more-buttons");
+    let store = dir.store();
+    let mut book = seed(
+        &store,
+        vec![stored_host("alpha", "10.0.0.1", 22, "deploy", None)],
+    );
+    book.insert_connection(desktop_record("office"))
+        .expect("the desktop record is inserted");
+    store.save(&book).expect("the book saves");
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    for selector in ["hosts.more.0", "hosts.connection.more.0"] {
+        click(cx, selector);
+        assert!(
+            cx.update(|_window, app| view.read(app).host_menu_open())
+                && cx.debug_bounds("host.menu.connect").is_some(),
+            "{selector} opens the record's complete menu"
+        );
+        assert!(
+            cx.update(|_window, app| view.read(app).open_sessions())
+                .is_empty(),
+            "opening {selector} does not start a connection"
+        );
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!cx.update(|_window, app| view.read(app).host_menu_open()));
+    }
+}
+
+#[gpui::test]
 async fn terminal_scrollback_jump_pill_select_all_and_font_reset_work_end_to_end(
     cx: &mut TestAppContext,
 ) {
@@ -33248,8 +33315,10 @@ async fn narrow_window_at_comfortable_text_keeps_hosts_row_and_actions_within_bo
     let viewport = cx.update(|window, _app| window.viewport_size());
     let row = bounds_of(cx, "hosts.row.0");
     let connect = bounds_of(cx, "hosts.connect.0");
+    let more = bounds_of(cx, "hosts.more.0");
     assert_within_width(row, viewport, "hosts.row.0 at 720x480 @ 115%");
     assert_within_width(connect, viewport, "hosts.connect.0 at 720x480 @ 115%");
+    assert_within_width(more, viewport, "hosts.more.0 at 720x480 @ 115%");
     // 720 is narrower than the 760 (scaled to 874 at 115%) the row needs for its
     // duplicate tool, so the tool is left out rather than pushing the actions out.
     assert!(
@@ -33356,6 +33425,7 @@ async fn the_home_is_a_sidebar_a_toolbar_and_one_list(cx: &mut TestAppContext) {
         "hosts.last.0",
         "hosts.connect.0",
         "hosts.edit.0",
+        "hosts.more.0",
     ] {
         assert!(
             row.contains(&bounds_of(cx, part).center()),
@@ -33398,6 +33468,11 @@ async fn the_sidebar_places_narrow_the_list_and_name_the_page(cx: &mut TestAppCo
     assert!(
         cx.debug_bounds("hosts.list.1").is_some(),
         "only the favourite is listed"
+    );
+    assert_eq!(
+        crate::app::components::drawn::shown("1 / 4").as_deref(),
+        Some("1 / 4"),
+        "the heading states both the matching and total record counts"
     );
 
     click(cx, "hosts.view.recent");

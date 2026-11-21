@@ -633,6 +633,14 @@ impl ShelluneView {
             .collect()
     }
 
+    /// The highlighted entry, for keyboard-navigation tests.
+    #[cfg(test)]
+    pub fn palette_selected_title(&self) -> Option<String> {
+        self.palette_results()
+            .get(self.palette_selected)
+            .map(|entry| entry.title.clone())
+    }
+
     /// The shortcut the palette lists for one entry, for the tests that check the
     /// palette reads the bindings in force rather than a copy of the defaults (R5).
     #[cfg(test)]
@@ -656,15 +664,28 @@ impl ShelluneView {
     fn palette_step(&mut self, delta: isize, cx: &mut Context<Self>) {
         let results = self.palette_results();
         self.palette_selected = palette::step(self.palette_selected, delta, results.len());
+        self.palette_reveal(&results, cx);
+    }
+
+    /// Jumps to the first or last result, including its group heading where there is one.
+    fn palette_edge(&mut self, last: bool, cx: &mut Context<Self>) {
+        let results = self.palette_results();
+        self.palette_selected = if last {
+            results.len().saturating_sub(1)
+        } else {
+            0
+        };
+        self.palette_reveal(&results, cx);
+    }
+
+    fn palette_reveal(&mut self, results: &[Entry], cx: &mut Context<Self>) {
         let searching = !self.palette_query.trim().is_empty();
-        if let Some(position) = rows(&results, searching)
+        let drawn = rows(results, searching);
+        if let Some(position) = drawn
             .iter()
             .position(|row| *row == Row::Item(self.palette_selected))
         {
-            // The heading above the first entry of a group scrolls in with it.
-            let position = if position > 0
-                && matches!(rows(&results, searching)[position - 1], Row::Heading(_))
-            {
+            let position = if position > 0 && matches!(drawn[position - 1], Row::Heading(_)) {
                 position - 1
             } else {
                 position
@@ -778,6 +799,8 @@ impl ShelluneView {
             "tab" => self.palette_step(1, cx),
             "pageup" => self.palette_step(-8, cx),
             "pagedown" => self.palette_step(8, cx),
+            "home" => self.palette_edge(false, cx),
+            "end" => self.palette_edge(true, cx),
             "enter" => self.palette_confirm(window, cx),
             "escape" => self.close_palette(window, cx),
             _ => return,
@@ -1093,11 +1116,22 @@ impl ShelluneView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_host_menu_at(id, event.position, window, cx);
+    }
+
+    /// Opens a record's menu from its visible More button as well as a right press.
+    pub(super) fn open_host_menu_at(
+        &mut self,
+        id: shellune_core::HostId,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.shell_menu_open = false;
         self.tab_menu = None;
         self.remember_focus(window, cx);
         self.hosts_cursor = Some(id);
-        self.host_menu = Some((id, event.position));
+        self.host_menu = Some((id, position));
         window.focus(&self.root_focus.clone());
         cx.notify();
     }
