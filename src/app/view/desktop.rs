@@ -761,7 +761,12 @@ impl DesktopPane {
         }
         self.certificate = None;
         self.set_pointer(None);
-        self.phase = DesktopPhase::Ended(failure.session_failure(reason, &target, was_live));
+        self.phase = DesktopPhase::Ended(failure.session_failure(
+            reason,
+            self.target.protocol(),
+            &target,
+            was_live,
+        ));
         self.connecting_since = None;
         self.polling = false;
         // Nothing is held after a session ended: the remote side would otherwise

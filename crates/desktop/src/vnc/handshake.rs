@@ -23,6 +23,8 @@ const HANDSHAKE: Duration = Duration::from_secs(20);
 pub(super) struct Transport {
     kind: Kind,
     pushback: Option<u8>,
+    #[cfg(windows)]
+    read_poll: Option<Duration>,
 }
 
 enum Kind {
@@ -35,6 +37,8 @@ impl Transport {
         Transport {
             kind: Kind::Plain(socket),
             pushback: None,
+            #[cfg(windows)]
+            read_poll: None,
         }
     }
 
@@ -45,13 +49,43 @@ impl Transport {
 
     /// Sets the read wait used by the update loop, through the TLS layer when one
     /// is in place.
-    pub(super) fn set_read_timeout(&self, wait: Option<Duration>) {
-        match &self.kind {
+    pub(super) fn poll_reads_every(&mut self, wait: Duration) -> io::Result<()> {
+        match &mut self.kind {
             Kind::Plain(stream) => {
-                let _ = stream.set_read_timeout(wait);
+                #[cfg(windows)]
+                {
+                    // Only this worker reads the socket. After readiness, recv
+                    // can use blocking mode without expiring an outstanding read.
+                    stream.set_read_timeout(None)?;
+                    self.read_poll = Some(wait);
+                    Ok(())
+                }
+                #[cfg(not(windows))]
+                stream.set_read_timeout(Some(wait))
             }
-            Kind::Secure(stream) => stream.sock.set_read_timeout(wait),
+            Kind::Secure(stream) => stream.sock.poll_reads_every(wait),
         }
+    }
+}
+
+#[cfg(windows)]
+fn wait_readable(stream: &TcpStream, wait: Duration) -> io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        POLLRDNORM, WSAGetLastError, WSAPOLLFD, WSAPoll,
+    };
+
+    let mut fd = WSAPOLLFD {
+        fd: stream.as_raw_socket() as _,
+        events: POLLRDNORM,
+        revents: 0,
+    };
+    // SAFETY: fd describes one socket borrowed for the duration of this call.
+    match unsafe { WSAPoll(&mut fd, 1, wait.as_millis().min(i32::MAX as u128) as i32) } {
+        -1 => Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() })),
+        0 => Err(io::ErrorKind::WouldBlock.into()),
+        // recv reports buffered data, EOF or the underlying socket error.
+        _ => Ok(()),
     }
 }
 
@@ -65,7 +99,13 @@ impl Read for Transport {
             return Ok(1);
         }
         match &mut self.kind {
-            Kind::Plain(stream) => stream.read(buffer),
+            Kind::Plain(stream) => {
+                #[cfg(windows)]
+                if let Some(wait) = self.read_poll {
+                    wait_readable(stream, wait)?;
+                }
+                stream.read(buffer)
+            }
             Kind::Secure(stream) => stream.read(buffer),
         }
     }
@@ -474,6 +514,8 @@ fn secure(
         .map(|stream| Transport {
             kind: Kind::Secure(Box::new(stream)),
             pushback: None,
+            #[cfg(windows)]
+            read_poll: None,
         })
         .map_err(|error| {
             if error.to_string().contains(CERTIFICATE_REJECTED) {
@@ -645,6 +687,41 @@ fn read_string(transport: &mut Transport) -> Result<String, Ended> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn idle_polls_preserve_the_next_bytes_and_report_a_real_close() {
+        use std::net::{Shutdown, TcpListener};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let mut transport = Transport::plain(socket);
+        transport
+            .poll_reads_every(Duration::from_millis(2))
+            .unwrap();
+        let mut byte = [0];
+        for expected in [1, 2, 3] {
+            assert_eq!(
+                transport.read(&mut byte).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            peer.write_all(&[expected]).unwrap();
+            transport.read_exact(&mut byte).unwrap();
+            assert_eq!(byte, [expected]);
+        }
+        peer.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(transport.read(&mut byte).unwrap(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_pending_socket_operation_allows_a_fresh_connection() {
+        use windows_sys::Win32::Networking::WinSock::WSA_IO_PENDING;
+        let ended = Ended::io(io::Error::from_raw_os_error(WSA_IO_PENDING), Failure::Io);
+        assert!(ended.reconnect);
+        assert_eq!(ended.failure, Failure::Io);
+        assert!(!Ended::new(Failure::ProtocolFailure, "invalid rectangle").reconnect);
+    }
 
     #[test]
     fn anonymous_vencrypt_sub_types_are_refused_with_a_readable_reason() {

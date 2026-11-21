@@ -93,6 +93,7 @@ pub(super) fn trace(step: &str) {
 pub(super) struct Ended {
     pub(super) failure: Failure,
     pub(super) reason: String,
+    reconnect: bool,
 }
 
 impl Ended {
@@ -100,6 +101,7 @@ impl Ended {
         Ended {
             failure,
             reason: reason.into(),
+            reconnect: failure == Failure::RemoteClosed,
         }
     }
 
@@ -111,7 +113,19 @@ impl Ended {
             _ if during != Failure::None => during,
             _ => Failure::Io,
         };
-        Ended::new(failure, error.to_string())
+        let mut ended = Ended::new(failure, error.to_string());
+        ended.reconnect |= matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe
+        );
+        // A pending Winsock operation gives us no completed byte count. Start
+        // a fresh session rather than repeating a possibly partial write.
+        #[cfg(windows)]
+        {
+            ended.reconnect |= error.raw_os_error()
+                == Some(windows_sys::Win32::Networking::WinSock::WSA_IO_PENDING);
+        }
+        ended
     }
 }
 

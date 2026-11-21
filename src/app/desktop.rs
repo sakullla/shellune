@@ -374,7 +374,13 @@ impl LinkFailure {
     /// about why a session ended. The reason is the layer's own text and never
     /// carries a credential.
     #[must_use]
-    pub fn session_failure(&self, reason: &str, target: &str, was_live: bool) -> SessionFailure {
+    pub fn session_failure(
+        &self,
+        reason: &str,
+        protocol: ProtocolKind,
+        target: &str,
+        was_live: bool,
+    ) -> SessionFailure {
         let detail = |fallback: &str| {
             if reason.trim().is_empty() {
                 fallback.to_owned()
@@ -400,14 +406,16 @@ impl LinkFailure {
             Self::Cancelled => SessionFailure::ConnectionFailed {
                 reason: "the connection attempt was cancelled".to_owned(),
             },
-            Self::Limit => SessionFailure::RemoteIoFailed {
+            Self::Limit => SessionFailure::DesktopIoFailed {
+                protocol,
                 host: target.to_owned(),
                 reason: detail("the session reached a limit of this build"),
             },
             Self::RemoteClosed => SessionFailure::ConnectionLost,
             Self::Protocol | Self::Io | Self::Internal | Self::Unknown(_) => {
                 if was_live {
-                    SessionFailure::RemoteIoFailed {
+                    SessionFailure::DesktopIoFailed {
+                        protocol,
                         host: target.to_owned(),
                         reason: detail("the desktop session stopped"),
                     }
@@ -2237,6 +2245,7 @@ mod tests {
         let target = "vnc.example.com:5901".to_owned();
         let failure = LinkFailure::UnsupportedSecurity.session_failure(
             "the server offered only security type 19",
+            ProtocolKind::Vnc,
             &target,
             false,
         );
@@ -2250,17 +2259,40 @@ mod tests {
 
     #[test]
     fn a_refused_credential_is_the_credential_problem_and_not_a_transport_one() {
-        let failure = LinkFailure::Authentication.session_failure("", "rdp:3389", false);
+        let failure =
+            LinkFailure::Authentication.session_failure("", ProtocolKind::Rdp, "rdp:3389", false);
         assert_eq!(failure, SessionFailure::AuthenticationFailed);
-        let rejected = LinkFailure::CertificateRejected.session_failure("", "rdp:3389", false);
+        let rejected = LinkFailure::CertificateRejected.session_failure(
+            "",
+            ProtocolKind::Rdp,
+            "rdp:3389",
+            false,
+        );
         assert_eq!(rejected, SessionFailure::HostKeyRejected);
     }
 
     #[test]
     fn a_live_session_that_stopped_is_not_reported_as_a_start_failure() {
-        let live = LinkFailure::Protocol.session_failure("read failed", "rdp:3389", true);
-        assert!(matches!(live, SessionFailure::RemoteIoFailed { .. }));
-        let never = LinkFailure::Protocol.session_failure("read failed", "rdp:3389", false);
+        let live = LinkFailure::Protocol.session_failure(
+            "read failed",
+            ProtocolKind::Rdp,
+            "rdp:3389",
+            true,
+        );
+        assert_eq!(live.to_string(), "RDP · rdp:3389 · read failed");
+        let vnc = LinkFailure::Io.session_failure(
+            "os error 997",
+            ProtocolKind::Vnc,
+            "127.0.0.1:5901",
+            true,
+        );
+        assert_eq!(vnc.to_string(), "VNC · 127.0.0.1:5901 · os error 997");
+        let never = LinkFailure::Protocol.session_failure(
+            "read failed",
+            ProtocolKind::Rdp,
+            "rdp:3389",
+            false,
+        );
         assert!(matches!(never, SessionFailure::ConnectionFailed { .. }));
     }
 

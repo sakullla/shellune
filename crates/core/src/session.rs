@@ -174,6 +174,15 @@ pub enum SessionFailure {
         /// What the transport reported.
         reason: String,
     },
+    /// A live remote desktop failed while exchanging frames or input.
+    DesktopIoFailed {
+        /// The protocol of the saved desktop connection.
+        protocol: ProtocolKind,
+        /// The desktop endpoint, including its port.
+        host: String,
+        /// Diagnostic from the desktop transport.
+        reason: String,
+    },
     /// A serial device stopped being usable while its session was open (R21).
     ///
     /// Kept apart from [Self::RemoteIoFailed] because there is no host and no SSH
@@ -257,6 +266,13 @@ impl std::fmt::Display for SessionFailure {
             }
             Self::RemoteIoFailed { host, reason } => {
                 write!(formatter, "the SSH session to {host} stopped: {reason}")
+            }
+            Self::DesktopIoFailed {
+                protocol,
+                host,
+                reason,
+            } => {
+                write!(formatter, "{} · {host} · {reason}", protocol.label())
             }
             Self::ConnectionRefused => formatter.write_str("the connection was refused"),
             Self::TimedOut => formatter.write_str("the connection timed out"),

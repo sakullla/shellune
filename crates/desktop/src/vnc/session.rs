@@ -1,8 +1,8 @@
 //! One VNC attempt: the handshake, the request that produces the first frame, the
 //! update loop, input and both clipboard forms.
 //!
-//! The socket is read with a short timeout so a cancel is noticed without a second
-//! reader, and bytes of a message that has not fully arrived stay buffered.
+//! Short waits for incoming bytes let the worker service input and cancellation
+//! while the desktop is idle. Incomplete messages stay buffered between reads.
 use super::clipboard::{self, EXTENDED_CLIPBOARD, Extended};
 use super::handshake::{self, Opened, Transport};
 use super::wire::{Incoming, Message, Rect};
@@ -47,7 +47,7 @@ pub(super) fn run(
                             publish(emit, control, &State::Closed, Failure::None, "");
                             return;
                         }
-                        if attempt < super::ATTEMPTS && ended.failure == Failure::RemoteClosed {
+                        if attempt < super::ATTEMPTS && ended.reconnect {
                             commands.disconnect();
                             publish(
                                 emit,
@@ -271,7 +271,7 @@ impl Session {
     }
 
     fn pump(&mut self, control: &Arc<Control>, commands: &Receiver<Command>) -> Result<(), Ended> {
-        self.transport.set_read_timeout(Some(POLL));
+        self.transport.poll_reads_every(POLL)?;
         self.configure()?;
         publish(&self.emit, control, &State::Connected, Failure::None, "");
         let mut chunk = vec![0u8; CHUNK];
@@ -296,7 +296,9 @@ impl Session {
                 Err(error)
                     if matches!(
                         error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
                     ) => {}
                 Err(error) => return Err(Ended::io(error, Failure::Io)),
             }
