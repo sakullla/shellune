@@ -3,8 +3,8 @@
 ; The release workflow compiles it on windows-latest with NSIS 3 (choco install
 ; nsis). Compile it locally with:
 ;
-;     makensis /DVERSION=0.4.12 /DBINARY=..\..\target\release\shellune.exe ^
-;              /DOUTFILE=dist\Shellune-0.4.12-setup.exe packaging\windows\shellune.nsi
+;     makensis /DVERSION=0.4.13 /DBINARY=..\..\target\release\shellune.exe ^
+;              /DOUTFILE=dist\Shellune-0.4.13-setup.exe packaging\windows\shellune.nsi
 ;
 ; Optional code signing (only when a certificate exists):
 ;
@@ -35,7 +35,7 @@ Unicode true
 !define MUI_UNICON "..\..\assets\icons\shellune.ico"
 
 !ifndef VERSION
-  !define VERSION "0.4.12"
+  !define VERSION "0.4.13"
 !endif
 !ifndef BINARY
   !define BINARY "..\..\target\release\shellune.exe"
