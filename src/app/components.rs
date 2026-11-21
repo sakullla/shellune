@@ -2501,7 +2501,11 @@ pub fn modal_with(
         .justify_center()
         .w(viewport.width)
         .h(viewport.height)
-        .child(backdrop)
+        .child(theme::enter(
+            backdrop,
+            SharedString::from(format!("{id}.backdrop.enter")),
+            Enter::Fade,
+        ))
         .child(theme::enter(
             dialog,
             SharedString::from(format!("{id}.enter")),

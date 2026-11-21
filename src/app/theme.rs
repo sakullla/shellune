@@ -161,15 +161,15 @@ impl std::fmt::LowerHex for Token {
 /// apart by lightness and edge; the shadows are faint.
 pub mod dark {
     /// The window's floor: behind the content area and around the terminal.
-    pub const CANVAS: u32 = 0x18191d;
+    pub const CANVAS: u32 = 0x16181d;
     /// The title bar, the tab strip, the sidebar and the status bar: the panel layer.
-    pub const CHROME: u32 = 0x1e2025;
+    pub const CHROME: u32 = 0x1c1f26;
     /// Panels, inputs, rows and cards.
-    pub const SURFACE: u32 = 0x1e2025;
+    pub const SURFACE: u32 = 0x1c1f26;
     /// Things that float over content: menus, popovers, tooltips and toasts.
-    pub const RAISED: u32 = 0x24262c;
+    pub const RAISED: u32 = 0x232730;
     /// Dialogs, the front-most layer.
-    pub const OVERLAY: u32 = 0x282a30;
+    pub const OVERLAY: u32 = 0x292d36;
     /// White at 5%, over whatever layer it is on.
     pub const SURFACE_HOVER: (u32, u8) = (0xffffff, 5);
     /// White at 8%.
@@ -177,153 +177,153 @@ pub mod dark {
     /// White at 10%.
     pub const SURFACE_PRESSED: (u32, u8) = (0xffffff, 10);
     /// White 7% over the panel.
-    pub const BORDER: u32 = 0x2e3034;
+    pub const BORDER: u32 = 0x2c2f35;
     /// White 12% over the panel.
-    pub const BORDER_STRONG: u32 = 0x393b3f;
-    pub const SEGMENT_TRACK: u32 = 0x141519;
-    pub const SEGMENT_THUMB: u32 = 0x2c2f36;
-    pub const TEXT_PRIMARY: u32 = 0xdce0e7;
-    pub const TEXT_SECONDARY: u32 = 0xb8bcc6;
-    pub const TEXT_MUTED: u32 = 0xa7aab4;
-    pub const ACCENT: u32 = 0x9fa3f5;
-    pub const ACCENT_HOVER: u32 = 0xacb0f7;
-    pub const ACCENT_PRESSED: u32 = 0x9296f1;
-    pub const ON_ACCENT: u32 = 0x18191d;
+    pub const BORDER_STRONG: u32 = 0x373a40;
+    pub const SEGMENT_TRACK: u32 = 0x13151a;
+    pub const SEGMENT_THUMB: u32 = 0x2a2f3a;
+    pub const TEXT_PRIMARY: u32 = 0xd9dee6;
+    pub const TEXT_SECONDARY: u32 = 0xb6bcc4;
+    pub const TEXT_MUTED: u32 = 0xa8aeb6;
+    pub const ACCENT: u32 = 0x82b0ff;
+    pub const ACCENT_HOVER: u32 = 0x94bcff;
+    pub const ACCENT_PRESSED: u32 = 0x70a3fa;
+    pub const ON_ACCENT: u32 = 0x16181d;
     /// The accent 14% over the panel.
-    pub const ACCENT_TINT: u32 = 0x303242;
-    pub const ACCENT_ON_TINT: u32 = 0xcad0fa;
-    pub const POSITIVE: u32 = 0x73c99b;
-    pub const WARNING: u32 = 0xdcb56b;
-    pub const DANGER: u32 = 0xef9494;
-    pub const INFO: u32 = 0x84b6ee;
-    pub const PLANNED: u32 = 0xa9acb4;
+    pub const ACCENT_TINT: u32 = 0x2a3344;
+    pub const ACCENT_ON_TINT: u32 = 0xc5dcff;
+    pub const POSITIVE: u32 = 0x72cc9a;
+    pub const WARNING: u32 = 0xdfb76c;
+    pub const DANGER: u32 = 0xf49696;
+    pub const INFO: u32 = 0x82b8f5;
+    pub const PLANNED: u32 = 0xa8aeb6;
     /// Each status colour 14% over the panel.
-    pub const POSITIVE_TINT: u32 = 0x2a3836;
-    pub const WARNING_TINT: u32 = 0x39352f;
-    pub const DANGER_TINT: u32 = 0x3b3035;
-    pub const INFO_TINT: u32 = 0x2c3541;
+    pub const POSITIVE_TINT: u32 = 0x283736;
+    pub const WARNING_TINT: u32 = 0x373430;
+    pub const DANGER_TINT: u32 = 0x3a3036;
+    pub const INFO_TINT: u32 = 0x2a3443;
     pub const DANGER_SOLID: u32 = 0xc42b1c;
-    pub const ON_DANGER: u32 = 0xf7f7f8;
-    pub const TRACK_OFF: u32 = 0x565963;
-    pub const TRACK_OFF_HOVER: u32 = 0x626570;
-    pub const TRACK_ON: u32 = 0x7479e0;
-    pub const TRACK_ON_HOVER: u32 = 0x7c81e6;
-    pub const KNOB: u32 = 0xf0f1f4;
-    pub const FOCUS_RING: u32 = 0xacb0f7;
-    pub const DISABLED_SURFACE: u32 = 0x212329;
-    pub const DISABLED_TEXT: u32 = 0x878a94;
-    pub const LOADING_TRACK: u32 = 0x303239;
-    pub const LOADING_FILL: u32 = 0x9fa3f5;
+    pub const ON_DANGER: u32 = 0xf7f8fa;
+    pub const TRACK_OFF: u32 = 0x565c66;
+    pub const TRACK_OFF_HOVER: u32 = 0x636a75;
+    pub const TRACK_ON: u32 = 0x4376dc;
+    pub const TRACK_ON_HOVER: u32 = 0x4f82e6;
+    pub const KNOB: u32 = 0xf0f3f8;
+    pub const FOCUS_RING: u32 = 0x94bcff;
+    pub const DISABLED_SURFACE: u32 = 0x20232b;
+    pub const DISABLED_TEXT: u32 = 0x898f97;
+    pub const LOADING_TRACK: u32 = 0x2e323c;
+    pub const LOADING_FILL: u32 = 0x82b0ff;
     pub const SCRIM: u32 = 0x000000;
     pub const SHADOW: u32 = 0x000000;
     /// The terminal's selection: the accent 32% over the terminal's background.
-    pub const SELECTION: u32 = 0x434663;
-    /// Eight low-chroma avatar pairs (tint, initials): indigo, steel, teal, sage, moss,
+    pub const SELECTION: u32 = 0x394965;
+    /// Eight low-chroma avatar pairs (tint, initials): slate blue, steel, teal, sage, moss,
     /// sand, clay and heather, each hue 18% over the panel.
     pub const AVATARS: [(u32, u32); 8] = [
-        (0x2f3145, 0xc0c2eb),
-        (0x2c3642, 0xbcd6ec),
-        (0x2b393c, 0xb9e0dd),
-        (0x2c3836, 0xbae0ca),
-        (0x323832, 0xcde0b9),
-        (0x3a3732, 0xe6d6b8),
-        (0x3a3132, 0xe6c3b8),
-        (0x392e38, 0xe6bad0),
+        (0x283244, 0xbcd3f5),
+        (0x2a3642, 0xbcd6ec),
+        (0x29393c, 0xb9e0dd),
+        (0x2a3836, 0xbae0ca),
+        (0x313832, 0xcde0b9),
+        (0x393732, 0xe6d6b8),
+        (0x393132, 0xe6c3b8),
+        (0x382e38, 0xe6bad0),
     ];
     pub const TAB_ACCENTS: [u32; 6] = [0x9cbcd8, 0xb9aecb, 0x8fc6cf, 0xaec79a, 0xd3bc9c, 0xd4a8ae];
 }
 
-/// The light palette: warm paper with soft graphite text and the same accent, deeper.
+/// The light palette: clean cool-neutral paper with graphite text and calm blue accent.
 ///
-/// The floor is warm paper white, the panels one step deeper warm grey and anything
-/// that floats is gentle ivory; the interaction fills are black veils (hover 4%,
-/// selected 6%, pressed 8%) over whichever layer they are on, and the hairlines are
-/// black over the panel (border 8%, strong border 14%).
+/// The floor is clean alabaster, the panels one step quieter cool grey and anything that
+/// floats is crisp white; the interaction fills are black veils (hover 4%, selected 6%,
+/// pressed 8%) over whichever layer they are on, and the hairlines are black over the
+/// panel (border 8%, strong border 14%).
 pub mod light {
-    pub const CANVAS: u32 = 0xf4f2ed;
-    pub const CHROME: u32 = 0xeceae4;
-    pub const SURFACE: u32 = 0xeceae4;
-    pub const RAISED: u32 = 0xfaf9f5;
-    pub const OVERLAY: u32 = 0xfaf9f5;
+    pub const CANVAS: u32 = 0xf7f8fa;
+    pub const CHROME: u32 = 0xf0f2f5;
+    pub const SURFACE: u32 = 0xf0f2f5;
+    pub const RAISED: u32 = 0xffffff;
+    pub const OVERLAY: u32 = 0xffffff;
     pub const SURFACE_HOVER: (u32, u8) = (0x000000, 4);
     pub const SURFACE_SELECTED: (u32, u8) = (0x000000, 6);
     pub const SURFACE_PRESSED: (u32, u8) = (0x000000, 8);
-    pub const BORDER: u32 = 0xd9d7d2;
-    pub const BORDER_STRONG: u32 = 0xcbc9c4;
-    pub const SEGMENT_TRACK: u32 = 0xe2e0da;
-    pub const SEGMENT_THUMB: u32 = 0xfaf9f5;
-    pub const TEXT_PRIMARY: u32 = 0x24262b;
-    pub const TEXT_SECONDARY: u32 = 0x4f5158;
-    pub const TEXT_MUTED: u32 = 0x595b63;
-    pub const ACCENT: u32 = 0x464cb8;
-    pub const ACCENT_HOVER: u32 = 0x3d43ab;
-    pub const ACCENT_PRESSED: u32 = 0x353b9e;
-    pub const ON_ACCENT: u32 = 0xfaf9f5;
-    /// The accent 10% over raised warm white.
-    pub const ACCENT_TINT: u32 = 0xe8e8ef;
-    pub const ACCENT_ON_TINT: u32 = 0x393fa8;
-    pub const POSITIVE: u32 = 0x1b663f;
-    pub const WARNING: u32 = 0x7a4f04;
-    pub const DANGER: u32 = 0xa82f37;
-    pub const INFO: u32 = 0x265ca1;
-    pub const PLANNED: u32 = 0x555661;
-    /// Each status colour 10% over raised warm white.
-    pub const POSITIVE_TINT: u32 = 0xe4eae3;
-    pub const WARNING_TINT: u32 = 0xede8dd;
-    pub const DANGER_TINT: u32 = 0xf2e5e2;
-    pub const INFO_TINT: u32 = 0xe5e9ed;
-    pub const DANGER_SOLID: u32 = 0xb82e24;
-    pub const ON_DANGER: u32 = 0xfaf9f5;
-    pub const TRACK_OFF: u32 = 0x82817c;
-    pub const TRACK_OFF_HOVER: u32 = 0x74736e;
-    pub const TRACK_ON: u32 = 0x464cb8;
-    pub const TRACK_ON_HOVER: u32 = 0x3d43ab;
-    pub const KNOB: u32 = 0xfaf9f5;
-    pub const FOCUS_RING: u32 = 0x3d43ab;
-    pub const DISABLED_SURFACE: u32 = 0xe8e6e0;
-    pub const DISABLED_TEXT: u32 = 0x74757c;
-    pub const LOADING_TRACK: u32 = 0xdedcd6;
-    pub const LOADING_FILL: u32 = 0x464cb8;
-    pub const SCRIM: u32 = 0x202124;
+    pub const BORDER: u32 = 0xdddfe1;
+    pub const BORDER_STRONG: u32 = 0xced0d3;
+    pub const SEGMENT_TRACK: u32 = 0xe6e8ec;
+    pub const SEGMENT_THUMB: u32 = 0xffffff;
+    pub const TEXT_PRIMARY: u32 = 0x1f2328;
+    pub const TEXT_SECONDARY: u32 = 0x4e545c;
+    pub const TEXT_MUTED: u32 = 0x595f67;
+    pub const ACCENT: u32 = 0x2359c8;
+    pub const ACCENT_HOVER: u32 = 0x1d4db5;
+    pub const ACCENT_PRESSED: u32 = 0x17419e;
+    pub const ON_ACCENT: u32 = 0xffffff;
+    /// The accent 10% over white.
+    pub const ACCENT_TINT: u32 = 0xe9eefa;
+    pub const ACCENT_ON_TINT: u32 = 0x1c49a8;
+    pub const POSITIVE: u32 = 0x166b3f;
+    pub const WARNING: u32 = 0x805100;
+    pub const DANGER: u32 = 0xb22b35;
+    pub const INFO: u32 = 0x1e5da8;
+    pub const PLANNED: u32 = 0x565c64;
+    /// Each status colour 10% over white.
+    pub const POSITIVE_TINT: u32 = 0xe8f0ec;
+    pub const WARNING_TINT: u32 = 0xf2eee6;
+    pub const DANGER_TINT: u32 = 0xf7eaeb;
+    pub const INFO_TINT: u32 = 0xe8eff6;
+    pub const DANGER_SOLID: u32 = 0xc42b1c;
+    pub const ON_DANGER: u32 = 0xffffff;
+    pub const TRACK_OFF: u32 = 0x848a92;
+    pub const TRACK_OFF_HOVER: u32 = 0x757b83;
+    pub const TRACK_ON: u32 = 0x2359c8;
+    pub const TRACK_ON_HOVER: u32 = 0x1d4db5;
+    pub const KNOB: u32 = 0xffffff;
+    pub const FOCUS_RING: u32 = 0x1d4db5;
+    pub const DISABLED_SURFACE: u32 = 0xebedf0;
+    pub const DISABLED_TEXT: u32 = 0x737981;
+    pub const LOADING_TRACK: u32 = 0xe0e3e8;
+    pub const LOADING_FILL: u32 = 0x2359c8;
+    pub const SCRIM: u32 = 0x111318;
     pub const SHADOW: u32 = 0x000000;
     /// The terminal's selection: the accent 22% over the light terminal's background.
-    pub const SELECTION: u32 = 0xcfcfe3;
+    pub const SELECTION: u32 = 0xc8d5ef;
     pub const AVATARS: [(u32, u32); 8] = [
-        (0xe4e5ec, 0x2c306e),
-        (0xe3e8ec, 0x2a4f6b),
-        (0xe2eceb, 0x266963),
-        (0xe3ece6, 0x286944),
-        (0xe8ece3, 0x456928),
-        (0xede9e2, 0x6b5326),
-        (0xede5e2, 0x6b3928),
-        (0xede3e8, 0x6b284a),
+        (0xe6ecf8, 0x1d438a),
+        (0xe4ebf2, 0x244d73),
+        (0xe2efee, 0x1f6660),
+        (0xe4f0e8, 0x22663f),
+        (0xeaf0e4, 0x426624),
+        (0xf2ede4, 0x6b5020),
+        (0xf2e7e4, 0x6b3524),
+        (0xf0e5ec, 0x6b264d),
     ];
     pub const TAB_ACCENTS: [u32; 6] = [0x2f5f86, 0x5d4a80, 0x1a6b74, 0x51662f, 0x8a5a20, 0x8b4450];
 
-    /// The terminal's default colours and its 16 ANSI colours, warm-paper light.
+    /// The terminal's default colours and its 16 ANSI colours, clean soft light.
     ///
     /// Keyed by the dark values of `shellune_terminal::palette`; a colour a program
     /// set itself (256-colour or true colour) is drawn as it asked.
     pub const TERMINAL: &[(u32, u32)] = &[
-        (0xd8dce4, 0x282c34), // foreground
-        (0x181a1f, 0xf6f4ef), // background
-        (0x8ea0e6, 0x4858b8), // cursor
-        (0x2a2e37, 0x363a42), // black
-        (0xd9878c, 0xb53c48), // red
-        (0x79bd96, 0x2b7344), // green
-        (0xd4b26a, 0x855a08), // yellow
-        (0x8aa8e6, 0x375ab5), // blue
-        (0xba96db, 0x813d9c), // magenta
-        (0x72bcc7, 0x196e7d), // cyan
-        (0xb3b9c4, 0x5d626e), // white
-        (0x8c93a0, 0x525763), // bright black
-        (0xe6a5a9, 0xa1313d), // bright red
-        (0x98cfaf, 0x226338), // bright green
-        (0xe3c78a, 0x734d05), // bright yellow
-        (0xa8bff0, 0x2d4da1), // bright blue
-        (0xceb2e8, 0x70318a), // bright magenta
-        (0x93cfd8, 0x125d6b), // bright cyan
-        (0xdce0e8, 0x3c404a), // bright white
+        (0xd4d9e2, 0x24292f), // foreground
+        (0x16181d, 0xf6f8fa), // background
+        (0x78a9ff, 0x2359c8), // cursor
+        (0x282c34, 0x32383f), // black
+        (0xe07a84, 0xb8323e), // red
+        (0x76c293, 0x1f6e3d), // green
+        (0xd9b56c, 0x855805), // yellow
+        (0x7aa6f0, 0x2359c8), // blue
+        (0xbe94e0, 0x7e399c), // magenta
+        (0x6cbdc9, 0x156c7d), // cyan
+        (0xb2b9c6, 0x57606a), // white
+        (0x8a92a1, 0x4d5560), // bright black
+        (0xec9ca4, 0xa22833), // bright red
+        (0x96d4ae, 0x175c32), // bright green
+        (0xe6cb8d, 0x704903), // bright yellow
+        (0x9ec0f8, 0x1b49a8), // bright blue
+        (0xd2b3eb, 0x6c2d87), // bright magenta
+        (0x8fd2dc, 0x0f5a69), // bright cyan
+        (0xdce1eb, 0x3b424c), // bright white
     ];
 }
 
@@ -426,7 +426,7 @@ pub mod palette {
         LOADING_TRACK;
         /// The progress itself.
         LOADING_FILL;
-        /// What a dialog lays over the page beneath it, at [`super::SCRIM_ALPHA`].
+        /// What a dialog lays over the page beneath it, at [`super::scrim_alpha`].
         SCRIM;
         /// The ink of an elevation shadow.
         SHADOW;
@@ -1054,12 +1054,18 @@ where
         return element.into_any_element();
     }
     let travel = kind.travel();
+    let start_opacity = match kind {
+        // A modal settling over a dimmed window should never start invisible while the
+        // backdrop is already painted, which reads as a dark-to-bright strobe flash.
+        Enter::Settle => 0.65,
+        Enter::Fade | Enter::Rise => 0.0,
+    };
     element
         .with_animation(
             id,
             Animation::new(kind.duration()).with_easing(ease_out()),
             move |element, delta| {
-                let mut element = element.opacity(delta);
+                let mut element = element.opacity(start_opacity + (1.0 - start_opacity) * delta);
                 if travel != 0.0 {
                     travel_by(element.style(), px(travel * (1.0 - delta)));
                 }
@@ -1240,11 +1246,21 @@ pub fn clear() -> Rgba {
     gpui::rgba(0x0000_0000)
 }
 
-/// How much of the page a dialog hides behind itself.
-///
-/// The page stays legible underneath: the backdrop only has to make the dialog the
-/// front-most object, not to black the window out.
-pub const SCRIM_ALPHA: f32 = 0.62;
+/// How much of the page a dialog hides behind itself in the dark palette.
+pub const SCRIM_ALPHA_DARK: f32 = 0.48;
+
+/// How much of the page a dialog hides behind itself in the light palette: gentler than
+/// dark mode so opening a sheet never slams a bright window to dark grey.
+pub const SCRIM_ALPHA_LIGHT: f32 = 0.26;
+
+/// The scrim opacity for the active palette.
+#[must_use]
+pub fn scrim_alpha() -> f32 {
+    match appearance() {
+        Appearance::Dark => SCRIM_ALPHA_DARK,
+        Appearance::Light => SCRIM_ALPHA_LIGHT,
+    }
+}
 
 /// The backdrop a dialog draws over the page beneath it.
 ///
@@ -1252,7 +1268,7 @@ pub const SCRIM_ALPHA: f32 = 0.62;
 /// not look like a second window and the page keeps its place.
 #[must_use]
 pub fn scrim() -> Rgba {
-    faded(swatch(palette::SCRIM), SCRIM_ALPHA)
+    faded(swatch(palette::SCRIM), scrim_alpha())
 }
 
 /// Semantic colour role attached to a state label, chip or dot.
@@ -2310,13 +2326,26 @@ mod tests {
 
     #[test]
     fn the_scrim_dims_the_page_it_covers() {
-        for (name, scrim, canvas) in [
-            ("dark", palette::SCRIM.dark(), palette::CANVAS.dark()),
-            ("light", palette::SCRIM.light(), palette::CANVAS.light()),
+        for (name, appearance, alpha, scrim, canvas) in [
+            (
+                "dark",
+                Appearance::Dark,
+                super::SCRIM_ALPHA_DARK,
+                palette::SCRIM.dark(),
+                palette::CANVAS.dark(),
+            ),
+            (
+                "light",
+                Appearance::Light,
+                super::SCRIM_ALPHA_LIGHT,
+                palette::SCRIM.light(),
+                palette::CANVAS.light(),
+            ),
         ] {
-            let covered = over(scrim, f64::from(super::SCRIM_ALPHA), canvas);
+            super::set_appearance(appearance);
+            let covered = over(scrim, f64::from(alpha), canvas);
             assert!(
-                (super::scrim().a - super::SCRIM_ALPHA).abs() < f32::EPSILON,
+                (super::scrim().a - alpha).abs() < f32::EPSILON,
                 "the {name} backdrop is drawn at the documented alpha"
             );
             let before = contrast::relative_luminance(canvas);
@@ -2326,6 +2355,7 @@ mod tests {
                 "the {name} scrim leaves the page at {after:.4} of its {before:.4} luminance"
             );
         }
+        super::set_appearance(Appearance::Dark);
     }
 
     #[test]
