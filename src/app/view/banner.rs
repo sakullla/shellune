@@ -86,7 +86,13 @@ impl ShelluneView {
         let status = self.workspace.status(id);
         match status.as_ref().map(SessionStatus::phase) {
             Some(SessionPhase::Ended) => status.map(BannerState::Ended),
-            Some(SessionPhase::Starting) if self.reconnect_screen(id).is_some() => {
+            Some(SessionPhase::Starting)
+                if self.reconnect_screen(id).is_some()
+                    && self
+                        .workspace
+                        .connection_wait(id)
+                        .is_none_or(|wait| wait.visible()) =>
+            {
                 Some(BannerState::Reconnecting)
             }
             // A remote desktop that ended states it in the same banner, above its own
@@ -287,6 +293,14 @@ impl ShelluneView {
         id: SessionId,
         cx: &mut Context<Self>,
     ) -> Option<(Vec<gpui::AnyElement>, FocusHandle)> {
+        if self.reconnect_screen(id).is_some()
+            && self
+                .workspace
+                .connection_wait(id)
+                .is_some_and(|wait| !wait.due(cx))
+        {
+            return None;
+        }
         if !self.banner_shown(id, cx) {
             return None;
         }
@@ -296,7 +310,15 @@ impl ShelluneView {
             BannerState::Reconnecting => (self.reconnecting_banner(id, cx), None),
         };
         let first = self.banner_stops(id, &state).into_iter().next()?;
-        let mut parts = vec![line.into_any_element()];
+        let line = match state {
+            BannerState::Reconnecting => theme::enter(
+                line,
+                SharedString::from(format!("session.reconnect.enter.{id:?}")),
+                theme::Enter::Rise,
+            ),
+            BannerState::Ended(_) => line.into_any_element(),
+        };
+        let mut parts = vec![line];
         parts.extend(detail);
         Some((parts, self.banner_focus[first.slot()].clone()))
     }

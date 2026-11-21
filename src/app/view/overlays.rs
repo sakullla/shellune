@@ -1301,7 +1301,7 @@ impl ShelluneView {
                         None => return,
                     },
                 };
-                self.start_shell(shell, Some(window), cx);
+                self.start_shell(shell, cx);
             }
             SessionKind::Remote { host } => {
                 if let Some(host) = self.book.host(host).cloned() {
@@ -2333,6 +2333,7 @@ impl ShelluneView {
             super::shell::ModalBehaviour {
                 scroll: Some(self.tab_list_scroll.clone()),
                 dismiss: None,
+                ..Default::default()
             },
         ))
     }

@@ -199,7 +199,7 @@ impl ShelluneView {
                     if !self.workspace.arm_split(axis) {
                         return;
                     }
-                    self.start_shell(shell, Some(window), cx);
+                    self.start_shell(shell, cx);
                 }
                 SessionKind::Remote { host } => {
                     self.workspace
@@ -596,7 +596,7 @@ impl ShelluneView {
     pub(super) fn status_card_floor(
         &self,
         scroll_id: SharedString,
-        card: gpui::AnyElement,
+        card: Option<gpui::AnyElement>,
     ) -> gpui::Div {
         let metrics = self.metrics();
         div()
@@ -620,7 +620,7 @@ impl ShelluneView {
                     .max_h_full()
                     .overflow_y_scroll()
                     .p(metrics.scale(spacing::BASE))
-                    .child(card),
+                    .children(card),
             )
     }
 
@@ -630,7 +630,11 @@ impl ShelluneView {
     /// It states the session's one status, the same words the tab and the bar use
     /// (R17); while the connection is being made the emblem is the loading mark and the
     /// line under the headline says where the terminal will appear.
-    pub(super) fn session_state_card(&self, id: SessionId) -> gpui::Div {
+    pub(super) fn session_state_card(
+        &self,
+        id: SessionId,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
         let metrics = self.metrics();
         let strings = self.strings();
         let locale = self.workspace.locale();
@@ -639,8 +643,13 @@ impl ShelluneView {
             .as_ref()
             .is_some_and(|status| status.phase() == crate::app::workspace::SessionPhase::Starting);
         // A start that comes up inside the floor draws no card at all.
-        if starting && !self.starting_state_due(id) {
-            return div();
+        if starting
+            && self
+                .workspace
+                .connection_wait(id)
+                .is_some_and(|wait| !wait.due(cx))
+        {
+            return None;
         }
         let tone = status
             .as_ref()
@@ -667,16 +676,18 @@ impl ShelluneView {
                     .unwrap_or_default(),
             )
         };
-        crate::app::components::status_card(
-            tone,
-            emblem,
-            div()
-                .debug_selector(|| "session.state.headline".to_owned())
-                .child(SharedString::from(headline)),
-            (!detail.is_empty()).then(|| div().child(SharedString::from(detail))),
-            metrics,
+        Some(
+            crate::app::components::status_card(
+                tone,
+                emblem,
+                div()
+                    .debug_selector(|| "session.state.headline".to_owned())
+                    .child(SharedString::from(headline)),
+                (!detail.is_empty()).then(|| div().child(SharedString::from(detail))),
+                metrics,
+            )
+            .debug_selector(|| "session.state.card".to_owned()),
         )
-        .debug_selector(|| "session.state.card".to_owned())
     }
 
     fn layout_status_banners(&self) -> Vec<gpui::Div> {
@@ -1105,10 +1116,10 @@ impl ShelluneView {
             let card = active
                 .then(|| self.active_failure_notice(Some(id), cx))
                 .flatten()
-                .unwrap_or_else(|| self.session_state_card(id));
+                .or_else(|| self.session_state_card(id, cx));
             frame = frame.child(self.status_card_floor(
                 SharedString::from(format!("pane.state.{pane}")),
-                self.entering_status_card(id, card),
+                card.map(|card| self.entering_status_card(id, card)),
             ));
         }
         div()
@@ -1594,7 +1605,7 @@ impl ShelluneView {
     pub(super) fn connect_leaf(
         &mut self,
         pane: PaneId,
-        window: Option<&mut Window>,
+        _window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
         let Some(leaf) = self
@@ -1616,7 +1627,7 @@ impl ShelluneView {
                     return;
                 };
                 self.workspace.arm_adopt(pane);
-                self.start_shell(shell, window, cx);
+                self.start_shell(shell, cx);
             }
             PaneTarget::Remote { host } => {
                 let Some(host) = self.book.host(host).cloned() else {
@@ -1662,8 +1673,7 @@ impl ShelluneView {
             .collect()
     }
 
-    /// Starts every waiting local pane of the active tab, one after another (a
-    /// local start finishes before it returns), and leaves the keyboard in the
+    /// Starts every waiting local pane of the active tab and leaves the keyboard in the
     /// active pane, or in the last one started.
     fn connect_waiting_local_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut panes = self.waiting_local_panes();

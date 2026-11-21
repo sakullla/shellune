@@ -223,7 +223,7 @@ impl Tab {
 
 /// The leaf an adopt overwrote, so a failed start can put that leaf back.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct HeldLeaf {
+pub(super) struct HeldLeaf {
     pane: PaneId,
     session: Option<SessionId>,
     target: PaneTarget,
@@ -488,20 +488,13 @@ impl SessionLayout {
         }
     }
 
-    /// Puts an adopted leaf back and reports whether `session` was the one just bound.
-    ///
-    /// A start that never produced a process must not delete the pane the user
-    /// already had. The leaf keeps its id, its place and the target it had.
-    pub fn revert_adopted(&mut self, session: SessionId) -> bool {
-        let Some(held) = self.adopted.take() else {
-            return false;
-        };
-        restore_held(&mut self.tabs, &held, session)
+    /// Transfers rollback ownership to the launch that bound this leaf.
+    pub(super) fn take_adopted(&mut self) -> Option<HeldLeaf> {
+        self.adopted.take()
     }
 
-    /// The launch is real, so the adopted leaf is no longer waiting to be restored.
-    pub fn clear_adopted(&mut self) {
-        self.adopted = None;
+    pub(super) fn revert_adopted(&mut self, session: SessionId, held: &HeldLeaf) -> bool {
+        restore_held(&mut self.tabs, held, session)
     }
 
     /// Splits the active pane with a leaf that has not been started.

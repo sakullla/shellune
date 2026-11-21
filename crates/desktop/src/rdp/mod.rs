@@ -83,9 +83,15 @@ pub(super) enum Command {
 /// Diagnostic trace, off unless `SHELLUNE_RDP_TRACE` is set. It goes to stderr so
 /// a probe can report the exact protocol step an attempt stopped at.
 pub(super) fn trace(step: &str) {
-    if std::env::var_os("SHELLUNE_RDP_TRACE").is_some() {
-        eprintln!("rdp trace: {step}");
+    if trace_enabled() {
+        thread_local! {static START: std::time::Instant=std::time::Instant::now();}
+        START.with(|start| eprintln!("rdp trace: +{} ms {step}", start.elapsed().as_millis()));
     }
+}
+
+pub(super) fn trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("SHELLUNE_RDP_TRACE").is_some())
 }
 
 /// The RDP half of `DesktopClient`.

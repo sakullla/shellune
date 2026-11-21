@@ -7,9 +7,9 @@
 use crate::{Event, Failure, State};
 use std::net::TcpStream;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 /// Where an event goes. The crate's mailbox or handler is wrapped once here so a
 /// session never has to know which one it is.
@@ -22,6 +22,7 @@ pub(crate) struct Control {
     state: AtomicU8,
     failure: Mutex<Failure>,
     certificate: Mutex<Question>,
+    certificate_changed: Condvar,
     next_question: AtomicU32,
 }
 
@@ -41,6 +42,7 @@ impl Default for Control {
                 id: 0,
                 answer: None,
             }),
+            certificate_changed: Condvar::new(),
             next_question: AtomicU32::new(0),
         }
     }
@@ -63,7 +65,12 @@ impl Control {
     }
 
     pub(crate) fn stop(&self) {
-        self.cancel.store(true, Ordering::SeqCst);
+        {
+            // Synchronize with the predicate check immediately before wait.
+            let _question = self.certificate.lock().unwrap_or_else(|e| e.into_inner());
+            self.cancel.store(true, Ordering::SeqCst);
+            self.certificate_changed.notify_all();
+        }
         if let Ok(slot) = self.socket.lock()
             && let Some(socket) = slot.as_ref()
         {
@@ -83,8 +90,11 @@ impl Control {
     ) -> bool {
         let id = self.next_question.fetch_add(1, Ordering::SeqCst) + 1;
         match self.certificate.lock() {
-            Ok(mut question) => *question = Question { id, answer: None },
-            Err(_) => return false,
+            Ok(mut question) if !self.cancelled() => {
+                *question = Question { id, answer: None };
+                self.certificate_changed.notify_all();
+            }
+            _ => return false,
         }
         emit(Event::Certificate {
             request_id: id,
@@ -94,28 +104,34 @@ impl Control {
             fingerprint,
             flags: 0,
         });
-        let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            if self.cancelled() || Instant::now() > deadline {
-                return false;
-            }
-            match self.certificate.lock() {
-                Ok(question) if question.id == id => {
-                    if let Some(answer) = question.answer {
-                        return answer;
-                    }
-                }
-                Ok(_) => return false,
-                Err(_) => return false,
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        let Ok(question) = self.certificate.lock() else {
+            return false;
+        };
+        let Ok((mut question, _)) =
+            self.certificate_changed
+                .wait_timeout_while(question, Duration::from_secs(120), |q| {
+                    q.id == id && q.answer.is_none() && !self.cancelled()
+                })
+        else {
+            return false;
+        };
+        if question.id != id {
+            return false;
         }
+        question.id = 0;
+        !self.cancelled() && question.answer.take() == Some(true)
     }
 
     pub(crate) fn answer(&self, request_id: u32, accept: bool) -> bool {
         match self.certificate.lock() {
-            Ok(mut question) if question.id == request_id && question.answer.is_none() => {
+            Ok(mut question)
+                if request_id != 0
+                    && question.id == request_id
+                    && question.answer.is_none()
+                    && !self.cancelled() =>
+            {
                 question.answer = Some(accept);
+                self.certificate_changed.notify_all();
                 true
             }
             _ => false,
@@ -180,4 +196,33 @@ pub(crate) fn publish(
         detail: 0,
         reason: reason.to_owned(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn a_certificate_decision_or_cancellation_wakes_the_waiter() {
+        for accept in [Some(true), Some(false), None] {
+            let control = Arc::new(Control::default());
+            let worker = control.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let emit: Emit = Arc::new(move |e| {
+                    if let Event::Certificate { request_id, .. } = e {
+                        tx.send(request_id).unwrap()
+                    }
+                });
+                worker.ask(&emit, "test", String::new(), String::new(), String::new())
+            });
+            let id = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if let Some(accept) = accept {
+                assert!(control.answer(id, accept));
+            } else {
+                control.stop();
+            }
+            assert_eq!(thread.join().unwrap(), accept == Some(true));
+            assert!(!control.answer(id, true));
+        }
+    }
 }

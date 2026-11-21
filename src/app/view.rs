@@ -499,12 +499,6 @@ pub struct ShelluneView {
     scripted_serials: Vec<(String, crate::app::serial::SerialLink)>,
     /// The session whose terminal is on screen.
     active: Option<SessionId>,
-    /// When each session first reported that it was starting.
-    ///
-    /// A session that comes up inside [`crate::app::CONNECT_STATE_FLOOR`] never draws
-    /// its state card: the terminal takes the pane's place without a "connecting"
-    /// frame in between. Cleared as soon as the session leaves the starting phase.
-    connecting_since: std::cell::RefCell<std::collections::HashMap<SessionId, std::time::Instant>>,
     /// Why the last local start failed, when it did.
     ///
     /// Kept beside the sessions instead of replacing them: a shell path that did not
@@ -1269,6 +1263,12 @@ impl HostConnectionFields {
         }
     }
 }
+
+enum LocalLaunch {
+    New(Option<crate::app::layout::HeldLeaf>),
+    Reconnect,
+}
+
 impl ShelluneView {
     /// Builds the shell in its initial state, reading the saved hosts.
     ///
@@ -2713,7 +2713,6 @@ impl ShelluneView {
             shell_path,
             custom_shell_open: false,
             shell_menu_open: false,
-            connecting_since: std::cell::RefCell::new(std::collections::HashMap::new()),
             files_menu: None,
             toasts: Vec::new(),
             next_toast: 0,
@@ -4442,25 +4441,6 @@ impl ShelluneView {
         self.active.and_then(|id| self.pane_for(id))
     }
 
-    /// Whether a session's starting state has lasted long enough to be drawn.
-    ///
-    /// The first draw of a start records the moment; a session that comes up inside
-    /// [`crate::app::CONNECT_STATE_FLOOR`] never draws its state card, so a quick
-    /// start goes straight to the terminal instead of flashing "connecting".
-    fn starting_state_due(&self, id: SessionId) -> bool {
-        let starting = self
-            .workspace
-            .status(id)
-            .is_some_and(|status| status.phase() == crate::app::workspace::SessionPhase::Starting);
-        let mut starts = self.connecting_since.borrow_mut();
-        if !starting {
-            starts.remove(&id);
-            return false;
-        }
-        let since = *starts.entry(id).or_insert_with(std::time::Instant::now);
-        since.elapsed() >= crate::app::CONNECT_STATE_FLOOR
-    }
-
     /// The desktop surface of one session, whether or not it is on screen.
     fn desktop_for(&self, id: SessionId) -> Option<&Entity<desktop::DesktopPane>> {
         self.panes
@@ -5011,47 +4991,58 @@ impl ShelluneView {
         // The record says the attempt is being made before the port is touched, so a
         // tab never shows an idle session while a device is being opened.
         self.workspace.session_starting(session);
-        let tag = self
-            .workspace
-            .session(session)
-            .map_or(EventTag::new(session, 0), shellune_core::Session::tag);
-        let grid = GridSize::initial();
-        let font_size = self.workspace.local_font_size();
-        let locale = self.workspace.locale();
-        // A test may have named the link this open should use: the device the record
-        // names can only be an in-memory pair on a machine with no port (R21).
+        self.open_serial_port(session, target, cx);
+    }
+
+    fn open_serial_port(
+        &mut self,
+        session: SessionId,
+        target: crate::app::serial::SerialTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tag) = self.workspace.session(session).map(Session::tag) else {
+            return;
+        };
+        self.show_terminal_start(session, cx);
         #[cfg(test)]
-        let scripted: Option<crate::app::serial::SerialLink> =
-            self.take_scripted_serial(target.device());
-        let pane = cx.new(|pane_cx| {
+        let scripted = self.take_scripted_serial(target.device());
+        let device = target.clone();
+        let open = cx.background_executor().spawn(async move {
             #[cfg(test)]
             if let Some(link) = scripted {
-                return TerminalPane::start_serial_with(
-                    link,
-                    target.device(),
-                    &target.config().summary(),
-                    target.local_echo(),
-                    tag,
-                    grid,
-                    font_size,
-                    locale,
-                    pane_cx,
-                );
+                return Ok(link);
             }
-            TerminalPane::start_serial(&target, tag, grid, font_size, locale, pane_cx)
+            crate::app::serial::SerialLink::open(&device)
         });
-        let state = pane.read(cx).state().clone();
-        match state.failure() {
-            Some(failure) => {
-                self.workspace.session_failed(session, failure);
-            }
-            None => {
-                self.workspace.session_connected(session);
-                self.workspace.clear_session_failure();
-            }
-        }
-        self.push_pane(tag, pane, cx);
-        self.checkpoint_layout();
+        cx.spawn(async move |this, cx| {
+            let opened = open.await;
+            let _ = this.update(cx, |view, cx| {
+                if !view.workspace.session_accepts_event(tag) {
+                    return;
+                }
+                let pane = cx.new(|pane_cx| {
+                    TerminalPane::from_serial(
+                        &target,
+                        opened,
+                        tag,
+                        GridSize::initial(),
+                        view.workspace.local_font_size(),
+                        view.workspace.locale(),
+                        pane_cx,
+                    )
+                });
+                if let Some(failure) = pane.read(cx).state().failure() {
+                    view.workspace.session_failed(session, failure);
+                } else {
+                    view.workspace.session_connected(session);
+                    view.workspace.clear_session_failure();
+                }
+                let focus = view.terminal_start_focused(session);
+                view.attach_pane(tag, pane, focus, cx);
+                view.checkpoint_layout();
+            });
+        })
+        .detach();
     }
 
     /// Records that a serial session cannot be started at all, and why.
@@ -5081,24 +5072,7 @@ impl ShelluneView {
             shellune_core::PaneTarget::serial(record.id()),
         );
         self.workspace.session_starting(session.id());
-        let tag = session.tag();
-        let grid = GridSize::initial();
-        let font_size = self.workspace.local_font_size();
-        let locale = self.workspace.locale();
-        let pane = cx.new(|pane_cx| {
-            TerminalPane::start_serial(&target, tag, grid, font_size, locale, pane_cx)
-        });
-        let state = pane.read(cx).state().clone();
-        match state.failure() {
-            Some(failure) => {
-                self.workspace.session_failed(session.id(), failure);
-            }
-            None => {
-                self.workspace.session_connected(session.id());
-                self.workspace.clear_session_failure();
-            }
-        }
-        self.push_pane(tag, pane, cx);
+        self.open_serial_port(session.id(), target, cx);
         session.id()
     }
 
@@ -6747,9 +6721,9 @@ impl ShelluneView {
     fn bind_shell_path(&mut self, cx: &mut Context<Self>) {
         let view = cx.entity().downgrade();
         self.shell_path.update(cx, |field, _cx| {
-            field.on_submit(move |text, window, app| {
-                view.update(app, |view, cx| view.start_custom_shell(text, window, cx))
-                    .unwrap_or(false)
+            field.on_submit(move |text, _window, app| {
+                let _ = view.update(app, |view, cx| view.start_custom_shell(text, cx));
+                false
             });
         });
     }
@@ -9143,6 +9117,7 @@ impl ShelluneView {
         let Some(id) = self.session_for_form(&target_host) else {
             return;
         };
+        self.workspace.reset_connection_wait(id);
         let forward_only = self.forward_only_dial;
         self.forward_only_dial = false;
         let pending_rules = if forward_only {
@@ -10326,39 +10301,15 @@ impl ShelluneView {
     ///
     /// The text is taken as written: a wrong path becomes a real launch failure,
     /// which is the only honest answer to a program that does not exist.
-    fn start_custom_shell(
-        &mut self,
-        program: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let program = program.trim().to_owned();
-        if program.is_empty() {
-            return false;
+    fn start_custom_shell(&mut self, program: String, cx: &mut Context<Self>) {
+        let program = program.trim();
+        if !program.is_empty() {
+            self.start_shell(LocalShell::new(program, program), cx);
         }
-        let shell = LocalShell::new(program.clone(), program);
-        self.start_shell(shell, Some(window), cx);
-        // Only a start that really produced a terminal may take the field away. Asking
-        // whether *some* pane is on screen is not the same question: a shell that
-        // failed to launch leaves the previous terminal in place and selected, so the
-        // old check closed and emptied the field over the path it had just rejected,
-        // and the user could not correct it. A launch failure is reported through
-        // `local_error`, so that is what decides here.
-        let started = self.local_error.is_none() && self.active_pane().is_some();
-        if started {
-            // The shell that started owns the keyboard, so what the user types next
-            // goes to it. The field closes and, because this returns true, empties:
-            // a second Return over the same path would start the shell again
-            // instead of reaching it.
-            self.custom_shell_open = false;
-            self.shell_menu_open = false;
-            cx.notify();
-        }
-        started
     }
 
     /// Starts whichever shell the picker currently points at.
-    fn start_from_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_from_picker(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let typed = if self.custom_shell_open {
             self.shell_path.read(cx).text().trim().to_owned()
         } else {
@@ -10378,7 +10329,7 @@ impl ShelluneView {
         } else {
             LocalShell::new(typed.clone(), typed)
         };
-        self.start_shell(shell, Some(window), cx);
+        self.start_shell(shell, cx);
     }
 
     /// Starts a shell and, when it really started, records the session.
@@ -10388,96 +10339,123 @@ impl ShelluneView {
     /// terminal and restarting the first one. A launch failure keeps no pane and no
     /// session record, so the destination cannot show a terminal that has no process
     /// behind it.
-    fn start_shell(
-        &mut self,
-        shell: LocalShell,
-        window: Option<&mut Window>,
-        cx: &mut Context<Self>,
-    ) {
-        self.local_error = None;
-        let grid = GridSize::initial();
-        let font_size = self.workspace.local_font_size();
-        let locale = self.workspace.locale();
+    fn start_shell(&mut self, shell: LocalShell, cx: &mut Context<Self>) {
         let session = self.workspace.register_local_session(&shell);
-        let id = session.id();
-        let tag = session.tag();
-        let mode = self.workspace.layout().session_mode(id);
-        let pane = cx.new(|pane_cx| {
-            let mut pane = TerminalPane::start(shell, tag, grid, font_size, locale, pane_cx);
-            pane.apply_presentation(mode);
-            pane
-        });
-        let state = pane.read(cx).state().clone();
-        if !state.accepts_input() {
-            let reason = state
-                .failure()
-                .map_or_else(|| state.label(locale), |failure| failure.to_string());
-            // A process that never ran is not a session. A new tab is removed. An
-            // adopt puts the existing leaf back to waiting so its target can be tried
-            // again; the reason stays on the workspace that still shows that leaf.
-            if !self.workspace.revert_failed_adopt(id) {
-                self.workspace.session_forgotten(id);
-            }
-            self.local_error = Some(reason.clone());
-            self.workspace
-                .fail_local_start(Failure::new(reason, Recovery::ChooseShell));
-            cx.notify();
-            return;
-        }
-
-        self.workspace.clear_adopted_launch();
-        self.workspace.session_connected(id);
-        self.workspace.clear_session_failure();
-        // The size the pane actually uses is the one the next session starts with.
-        self.workspace
-            .set_local_font_size(pane.read(cx).font_size());
-        if let Some(window) = window {
-            let handle = pane.read(cx).focus_handle().clone();
-            window.focus(&handle);
-        }
-        self.push_pane(tag, pane, cx);
-        self.checkpoint_layout();
+        let held = self.workspace.layout_mut().take_adopted();
+        self.launch_local(session.tag(), shell, LocalLaunch::New(held), cx);
     }
 
-    /// Starts the process of a session that is already recorded, and shows it.
-    ///
-    /// The reconnect path uses this: the record, its title and its place in the list
-    /// are already there, so only the process and the terminal are new.
     fn start_local_pane(&mut self, id: SessionId, shell: LocalShell, cx: &mut Context<Self>) {
-        let program = shell.program().to_owned();
-        let grid = GridSize::initial();
-        let font_size = self.workspace.local_font_size();
-        let locale = self.workspace.locale();
-        let Some(tag) = self.workspace.session(id).map(|session| session.tag()) else {
-            return;
-        };
-        let mode = self.workspace.layout().session_mode(id);
-        let pane = cx.new(|pane_cx| {
-            let mut pane = TerminalPane::start(shell, tag, grid, font_size, locale, pane_cx);
-            pane.apply_presentation(mode);
-            pane
-        });
-        let state = pane.read(cx).state().clone();
-        if !state.accepts_input() {
-            let reason = state
-                .failure()
-                .map_or_else(|| state.label(locale), |failure| failure.to_string());
-            self.local_error = Some(reason.clone());
-            self.workspace.session_failed(
-                id,
-                SessionFailure::LocalShellLaunchFailed {
-                    shell: program,
-                    reason,
-                },
-            );
-            cx.notify();
-            return;
+        if let Some(tag) = self.workspace.session(id).map(Session::tag) {
+            self.launch_local(tag, shell, LocalLaunch::Reconnect, cx);
         }
-        self.workspace.session_connected(id);
-        self.workspace.clear_session_failure();
-        self.workspace
-            .set_local_font_size(pane.read(cx).font_size());
-        self.push_pane(tag, pane, cx);
+    }
+
+    fn show_terminal_start(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.active = Some(id);
+        self.workspace.layout_mut().focus_session(id);
+        self.workspace.select(Destination::LocalShells);
+        self.session_terminal = true;
+        self.showing_connection_form = false;
+        cx.notify();
+    }
+
+    fn terminal_start_focused(&self, id: SessionId) -> bool {
+        self.active == Some(id)
+            && self.workspace.destination() == Destination::LocalShells
+            && self.workspace.layout().active_session() == Some(id)
+    }
+
+    fn launch_local(
+        &mut self,
+        tag: EventTag,
+        shell: LocalShell,
+        launch: LocalLaunch,
+        cx: &mut Context<Self>,
+    ) {
+        let id = tag.session;
+        let previous = self.active;
+        let destination = self.workspace.destination();
+        let custom = matches!(launch, LocalLaunch::New(_)) && self.custom_shell_open;
+        if custom {
+            self.custom_shell_open = false;
+            self.shell_menu_open = false;
+        }
+        self.local_error = None;
+        self.show_terminal_start(id, cx);
+        let program = shell.clone();
+        let grid = GridSize::initial();
+        let open = cx
+            .background_executor()
+            .spawn(async move { shellune_terminal::LocalSession::spawn(&program, grid, None) });
+        cx.spawn(async move |this, cx| {
+            let opened = open.await;
+            let _ = this.update(cx, |view, cx| {
+                if !view.workspace.session_accepts_event(tag) {
+                    return;
+                }
+                let focus = view.terminal_start_focused(id);
+                let session = match opened {
+                    Ok(session) => session,
+                    Err(error) => {
+                        let failure = error.session_failure();
+                        let reason = failure.to_string();
+                        if let LocalLaunch::New(held) = launch {
+                            if !held
+                                .is_some_and(|held| view.workspace.revert_failed_adopt(id, &held))
+                            {
+                                view.workspace.session_forgotten(id);
+                            }
+                            if focus {
+                                view.active = previous
+                                    .filter(|prev| view.workspace.layout_mut().focus_session(*prev))
+                                    .or_else(|| view.workspace.layout().active_session());
+                                view.workspace.select(destination);
+                                view.custom_shell_open = custom;
+                                if custom {
+                                    view.field_focus_pending =
+                                        Some(view.shell_path.read(cx).focus_handle().clone());
+                                }
+                            }
+                            view.workspace.fail_local_start(Failure::new(
+                                reason.clone(),
+                                Recovery::ChooseShell,
+                            ));
+                        } else {
+                            view.workspace.session_failed(id, failure);
+                        }
+                        view.local_error = Some(reason);
+                        cx.notify();
+                        return;
+                    }
+                };
+                if custom && view.shell_path.read(cx).text().trim() == shell.program() {
+                    view.shell_path
+                        .update(cx, |field, cx| field.set_text("", cx));
+                }
+                let mode = view.workspace.layout().session_mode(id);
+                let pane = cx.new(|pane_cx| {
+                    let mut pane = TerminalPane::from_local(
+                        shell,
+                        session,
+                        tag,
+                        grid,
+                        view.workspace.local_font_size(),
+                        view.workspace.locale(),
+                        pane_cx,
+                    );
+                    pane.apply_presentation(mode);
+                    pane
+                });
+                view.workspace.session_connected(id);
+                view.workspace.clear_session_failure();
+                view.workspace
+                    .set_local_font_size(pane.read(cx).font_size());
+                view.attach_pane(tag, pane, focus, cx);
+                view.checkpoint_layout();
+            });
+        })
+        .detach();
     }
 
     /// Mirrors what one pane reports into the session it belongs to.
@@ -13099,6 +13077,7 @@ impl ShelluneView {
         let live = self.active.is_some_and(|id| {
             self.pane_for(id).is_some()
                 || self.desktop_for(id).is_some()
+                || self.workspace.connection_wait(id).is_some()
                 || self.reconnect_screen(id).is_some()
         });
         // A waiting pane is drawn in the workspace, and so is a connection being set up
@@ -13214,16 +13193,16 @@ impl ShelluneView {
             // the reason, so it is drawn where the terminal would be instead of being
             // recorded and shown nowhere.
             let notice = if let (Some(status), Some(id)) = (&ended, id) {
-                self.failure_notice(id, status, cx)
+                Some(self.failure_notice(id, status, cx))
             } else {
                 // Nothing failed and there is nothing to draw: the state is still
                 // said, because an empty panel would look like a terminal that is
                 // merely blank.
-                self.session_state_card(session.id())
+                self.session_state_card(session.id(), cx)
             };
             frame = frame.child(self.status_card_floor(
                 SharedString::from(format!("session.state.{:?}", session.id())),
-                self.entering_status_card(session.id(), notice),
+                notice.map(|card| self.entering_status_card(session.id(), card)),
             ));
         }
         column.child(frame)
@@ -18533,7 +18512,11 @@ impl ShelluneView {
         let status = SessionStatus::of(session);
         let tone = status.tone();
         let state_label = status.headline(self.workspace.locale());
-        let starting = status.phase() == SessionPhase::Starting;
+        let starting = status.phase() == SessionPhase::Starting
+            && self
+                .workspace
+                .connection_wait(id)
+                .is_none_or(|wait| wait.due(cx));
         let kind_label = match kind {
             PaneKind::Local => strings.session_kind_local,
             PaneKind::Remote => strings.session_kind_remote,

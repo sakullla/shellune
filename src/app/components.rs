@@ -2359,6 +2359,8 @@ pub type ModalDismiss = Box<dyn Fn(&gpui::MouseDownEvent, &mut Window, &mut App)
 /// How one dialog differs from the shared behaviour of [`modal`].
 #[derive(Default)]
 pub struct ModalBehaviour {
+    /// Entrance to use in place of the default dialog motion.
+    pub entrance: Option<Enter>,
     /// The handle the scrolling body reports to, for a dialog that scrolls a field
     /// into view itself (the host editor).
     pub scroll: Option<gpui::ScrollHandle>,
@@ -2451,7 +2453,11 @@ pub fn modal_with(
         body,
         footer,
     } = content;
-    let ModalBehaviour { scroll, dismiss } = behaviour;
+    let ModalBehaviour {
+        scroll,
+        dismiss,
+        entrance,
+    } = behaviour;
     // The inset stays a small edge gap. Scaling it with the text turned a 200% minimum
     // window into a short dialog, and the failure's next line was drawn past the client
     // edge where it could not be read (R4).
@@ -2504,7 +2510,7 @@ pub fn modal_with(
         .child(theme::enter(
             dialog,
             SharedString::from(format!("{id}.enter")),
-            Enter::Settle,
+            entrance.unwrap_or(Enter::Settle),
         ))
 }
 

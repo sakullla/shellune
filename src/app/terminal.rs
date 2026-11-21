@@ -851,12 +851,10 @@ pub struct SearchBarState {
 }
 
 impl TerminalPane {
-    /// Starts a shell and wraps it in a pane.
-    ///
-    /// A launch failure is stored as [`PaneState::Failed`] and no process is kept,
-    /// so the caller cannot present a terminal that has nothing behind it.
-    pub fn start(
+    /// Wraps a local process after its PTY has opened on the background executor.
+    pub fn from_local(
         shell: LocalShell,
+        session: LocalSession,
         tag: EventTag,
         grid: GridSize,
         font_size: f32,
@@ -866,22 +864,13 @@ impl TerminalPane {
         let font_size = sanitize_font_size(font_size);
         let grid = grid.clamped();
         let core = TerminalCore::new(grid.cols, grid.rows, shellune_terminal::DEFAULT_SCROLLBACK);
-        let (source, state, environment_notes) = match LocalSession::spawn(&shell, grid, None) {
-            Ok(session) => {
-                // Taken before the session moves: what the shell could not be given is
-                // said once, at startup, and has to reach the bar the user reads.
-                let notes = session.environment().notes().to_vec();
-                (Some(PaneSource::Local(session)), PaneState::Live, notes)
-            }
-            Err(error) => (None, PaneState::Failed(error.session_failure()), Vec::new()),
-        };
-
+        let environment_notes = session.environment().notes().to_vec();
         let mut pane = Self {
             tag,
             core,
-            source,
+            source: Some(PaneSource::Local(session)),
             origin: PaneOrigin::Local(shell),
-            state,
+            state: PaneState::Live,
             #[cfg(test)]
             sent: Vec::new(),
             font_size,
@@ -1095,8 +1084,9 @@ impl TerminalPane {
     /// the user needs, and a tab that vanished would leave them with nothing to act on.
     /// The state is [`PaneState::Failed`], never [`PaneState::Live`], so nothing here is
     /// drawn as a connected terminal.
-    pub fn start_serial(
+    pub fn from_serial(
         target: &SerialTarget,
+        opened: Result<SerialLink, String>,
         tag: EventTag,
         grid: GridSize,
         font_size: f32,
@@ -1113,7 +1103,7 @@ impl TerminalPane {
             locale,
             cx,
         );
-        match SerialLink::open(target) {
+        match opened {
             Ok(link) => {
                 pane.source = Some(PaneSource::Serial(link));
                 pane.state = PaneState::Live;
@@ -1138,7 +1128,7 @@ impl TerminalPane {
     /// The tests drive the real path with a real [`SerialLink`] - reader, writer,
     /// bounded queue, close - over an in-memory port, because this machine has no
     /// serial device and no virtual pair. Nothing in the application opens a port this
-    /// way: a saved record always goes through [`TerminalPane::start_serial`].
+    /// way: a saved record always goes through [`SerialLink::open`].
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn start_serial_with(

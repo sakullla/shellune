@@ -66,7 +66,23 @@ impl Rectangle {
                         return Ok((Some(rect), false));
                     }
                     Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                        self.retry_at = (available.len() * 2).min(32768)
+                        // Raw and packed-palette tile lengths are known. Do not
+                        // postpone a complete tile until bytes of the next arrive.
+                        self.retry_at = match available[0] {
+                            0 => 1 + w * h * 3,
+                            1 => 4,
+                            colors @ 2..=16 => {
+                                let bits = if colors == 2 {
+                                    1
+                                } else if colors <= 4 {
+                                    2
+                                } else {
+                                    4
+                                };
+                                1 + usize::from(colors) * 3 + h * (w * bits).div_ceil(8)
+                            }
+                            _ => (available.len() * 2).min(32768),
+                        }
                     }
                     Err(e) => return Err(e.to_string()),
                 }
@@ -237,6 +253,51 @@ mod tests {
         }
         assert!(decode_tile(&mut &[129][..], 1, 1).is_err());
         assert!(decode_tile(&mut &[128, 1, 2, 3, 2][..], 1, 1).is_err());
+    }
+
+    #[test]
+    fn a_complete_raw_tile_does_not_wait_for_bytes_of_the_next_tile() {
+        let mut z = Decompress::new(true);
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        // Separate compressed flushes give the decoder part of the first tile,
+        // its exact remainder, then a second tile that must not be needed yet.
+        let mut raw = vec![0; 1 + 64 * 64 * 3];
+        for (i, b) in raw[1..].iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        encoder.write_all(&raw[..8000]).unwrap();
+        encoder.flush().unwrap();
+        let first = encoder.get_ref().len();
+        encoder.write_all(&raw[8000..]).unwrap();
+        encoder.flush().unwrap();
+        let second = encoder.get_ref().len();
+        encoder.write_all(&[1, 7, 8, 9]).unwrap();
+        encoder.flush().unwrap();
+        let data = encoder.get_ref();
+        let mut rect = Rectangle::new(0, 0, 65, 64, data.len());
+        assert!(rect.take(&mut z, &mut &data[..first]).unwrap().0.is_none());
+        let (tile, ended) = rect.take(&mut z, &mut &data[first..second]).unwrap();
+        assert!(matches!(
+            tile,
+            Some(Rect::Raw {
+                x: 0,
+                width: 64,
+                height: 64,
+                ..
+            })
+        ));
+        assert!(!ended);
+        let mut tail = &data[second..];
+        let (tile, _) = rect.take(&mut z, &mut tail).unwrap();
+        assert!(matches!(
+            tile,
+            Some(Rect::Raw {
+                x: 64,
+                width: 1,
+                ..
+            })
+        ));
+        assert!(rect.take(&mut z, &mut tail).unwrap().1);
     }
 
     #[test]

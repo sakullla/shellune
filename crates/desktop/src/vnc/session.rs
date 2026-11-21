@@ -336,7 +336,6 @@ impl Session {
             format.push(shift);
         }
         format.extend_from_slice(&[0, 0, 0]);
-        self.send(&format)?;
 
         // Only encodings this client decodes are requested. ZRLE compresses tiles across updates;
         // peers without it can select Hextile. Raw stays in the list so a
@@ -361,8 +360,9 @@ impl Session {
         for encoding in encodings {
             request.extend_from_slice(&encoding.to_be_bytes());
         }
-        self.send(&request)?;
-        self.request(false)
+        format.extend_from_slice(&request);
+        format.extend_from_slice(&self.region_request_bytes(3, false));
+        self.send(&format)
     }
 
     fn request(&mut self, incremental: bool) -> Result<(), Ended> {
@@ -370,11 +370,13 @@ impl Session {
     }
 
     fn request_region(&mut self, kind: u8, enabled: bool) -> Result<(), Ended> {
-        let mut message = vec![kind, u8::from(enabled)];
-        message.extend_from_slice(&[0, 0, 0, 0]);
-        message.extend_from_slice(&self.desktop.width.to_be_bytes());
-        message.extend_from_slice(&self.desktop.height.to_be_bytes());
-        self.send(&message)
+        self.send(&self.region_request_bytes(kind, enabled))
+    }
+
+    fn region_request_bytes(&self, kind: u8, enabled: bool) -> [u8; 10] {
+        let [wh, wl] = self.desktop.width.to_be_bytes();
+        let [hh, hl] = self.desktop.height.to_be_bytes();
+        [kind, u8::from(enabled), 0, 0, 0, 0, wh, wl, hh, hl]
     }
 
     /// Applies every queued input or clipboard command before the next read.

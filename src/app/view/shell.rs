@@ -1177,6 +1177,7 @@ impl ShelluneView {
             ModalBehaviour {
                 scroll: None,
                 dismiss: Some(dismiss),
+                ..Default::default()
             },
         ))
     }
@@ -1658,7 +1659,21 @@ impl ShelluneView {
             return None;
         }
         let content = self.connection_content(cx)?;
-        Some(self.modal(window, "remote.dialog", 600.0, content))
+        let entrance = self
+            .remote
+            .as_ref()
+            .filter(|panel| matches!(panel.status(), crate::app::remote::RemoteStatus::Connecting))
+            .map(|_| theme::Enter::Rise);
+        Some(self.modal_with(
+            window,
+            "remote.dialog",
+            600.0,
+            content,
+            ModalBehaviour {
+                entrance,
+                ..Default::default()
+            },
+        ))
     }
 
     /// Whether the connection being set up is drawn in its own tab rather than as a
@@ -1730,6 +1745,14 @@ impl ShelluneView {
         let strings = self.strings();
         let ux = copy::ux();
         let panel = self.remote.as_ref()?;
+        if matches!(panel.status(), crate::app::remote::RemoteStatus::Connecting)
+            && self
+                .form_session
+                .and_then(|id| self.workspace.connection_wait(id))
+                .is_some_and(|wait| !wait.due(cx))
+        {
+            return None;
+        }
         let host = panel.host();
         let (status_label, tone) = super::remote_status_label(panel.status(), strings);
         // The hint is about choosing a sign-in; while the server asks a question or
@@ -1923,12 +1946,9 @@ impl ShelluneView {
                     .debug_selector(|| "shell.custom.run".to_owned())
                     .when(!can_run, |button| button.opacity(0.5))
                     .when(can_run, |button| {
-                        button.on_click(cx.listener(|this, _event, window, cx| {
+                        button.on_click(cx.listener(|this, _event, _window, cx| {
                             let text = this.shell_path.read(cx).text().to_owned();
-                            if this.start_custom_shell(text, window, cx) {
-                                this.shell_path
-                                    .update(cx, |field, cx| field.set_text("", cx));
-                            }
+                            this.start_custom_shell(text, cx);
                         }))
                     }),
             );

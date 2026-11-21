@@ -547,6 +547,7 @@ pub struct Workspace {
     zoom: Zoom,
     motion: Motion,
     sessions: Section<Session>,
+    connection_waits: BTreeMap<SessionId, super::ConnectionWait>,
     hosts: Section<HostConfig>,
     transfers: Section<Transfer>,
     forwards: Section<ForwardRule>,
@@ -591,6 +592,7 @@ impl Workspace {
             // empty result instead of unread work. Which shell can be started is
             // decided by probing this machine, not by the build.
             sessions: Section::ready(Vec::new()),
+            connection_waits: BTreeMap::new(),
             // Reading the store is what fills this in, so it starts unread.
             hosts: Section::loading(),
             // The transfer list is a real, empty result: a task appears in it only
@@ -1293,20 +1295,20 @@ impl Workspace {
     ///
     /// The leaf goes back to waiting, with the target it had. A launch that opened
     /// a new tab is not this case: [`Self::session_forgotten`] still removes it.
-    pub fn revert_failed_adopt(&mut self, id: SessionId) -> bool {
-        if !self.layout.revert_adopted(id) {
+    pub(super) fn revert_failed_adopt(
+        &mut self,
+        id: SessionId,
+        held: &super::layout::HeldLeaf,
+    ) -> bool {
+        if !self.layout.revert_adopted(id, held) {
             return false;
         }
         self.forget_session_record(id);
         true
     }
 
-    /// A started shell owns the leaf, so a later failure must not restore the old one.
-    pub fn clear_adopted_launch(&mut self) {
-        self.layout.clear_adopted();
-    }
-
     fn forget_session_record(&mut self, id: SessionId) {
+        self.connection_waits.remove(&id);
         let remaining: Vec<Session> = self
             .sessions
             .items()
@@ -1357,6 +1359,15 @@ impl Workspace {
         self.transition(id, |session| session.begin_reconnect().is_ok())
     }
 
+    pub fn connection_wait(&self, id: SessionId) -> Option<&super::ConnectionWait> {
+        self.connection_waits.get(&id)
+    }
+
+    pub fn reset_connection_wait(&mut self, id: SessionId) {
+        self.connection_waits
+            .insert(id, super::ConnectionWait::new());
+    }
+
     fn transition(&mut self, id: SessionId, change: impl FnOnce(&mut Session) -> bool) -> bool {
         let Some(session) = self
             .sessions
@@ -1366,6 +1377,16 @@ impl Workspace {
         else {
             return false;
         };
-        change(session)
+        if !change(session) {
+            return false;
+        }
+        match session.state() {
+            SessionState::Connecting => self.reset_connection_wait(id),
+            SessionState::VerifyingHost | SessionState::Authenticating => {}
+            _ => {
+                self.connection_waits.remove(&id);
+            }
+        }
+        true
     }
 }

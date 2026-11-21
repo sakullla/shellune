@@ -22,6 +22,20 @@ cargo build --workspace --release
 The path to the produced binary is `$CARGO_TARGET_DIR/release/shellune` (or
 `shellune.exe` on Windows); `.cargo/config.toml` may move the target directory.
 
+## Running a local macOS build
+
+For LAN testing, launch a signed app bundle through Launch Services. The local
+bundle has its own stable identifier and appears as **Shellune Local** in System
+Settings → Privacy & Security → Local Network. Use the same Apple Development
+identity on subsequent builds.
+
+```sh
+local_out="$HOME/Library/Caches/com.shellune.Shellune.local/Build.noindex"
+python3 packaging/macos/make-app-bundle.py --local --binary /path/to/release/shellune --out "$local_out"
+codesign --force --sign "Apple Development" "$local_out/Shellune Local.app"
+open "$local_out/Shellune Local.app"
+```
+
 ## Signing and notarisation state
 
 - Windows: the portable zip contains an unsigned `shellune.exe`; SmartScreen shows

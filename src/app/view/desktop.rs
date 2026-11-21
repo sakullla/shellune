@@ -82,6 +82,13 @@ struct CertificateQuestion {
     fingerprint: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InitialClipboard {
+    WaitingForPicture,
+    Deferred,
+    Ready,
+}
+
 struct SignIn {
     cancel_focus: FocusHandle,
     connect_focus: FocusHandle,
@@ -274,13 +281,8 @@ pub struct DesktopPane {
     phase: DesktopPhase,
     /// The step of the connection the status card names (R19).
     stage: DesktopStage,
-    /// When this attempt started, while it is still connecting.
-    ///
-    /// `None` on a pane that was handed a link (tests, the capture) and on every
-    /// pane that is not connecting, so the status card is always drawn there. A real
-    /// attempt records the moment it starts, and a link that comes up in under
-    /// [`crate::app::CONNECT_STATE_FLOOR`] never draws the card at all.
-    connecting_since: Option<std::time::Instant>,
+    /// Progress deadline for the current dial or automatic reconnect.
+    connection_wait: Option<crate::app::ConnectionWait>,
     /// Last elapsed second displayed while waiting for a real connection.
     wait_seconds: Option<u64>,
     /// The step the session stopped on, kept so the reason can name it.
@@ -370,10 +372,11 @@ pub struct DesktopPane {
     /// The clipboard's number at the pane's last read of it, so an unchanged
     /// clipboard is not read again (see [clipboard_generation]).
     read_generation: Option<u64>,
-    /// Whether this session has yet to be offered the clipboard since it went live.
-    /// A pane that keeps the keyboard through a reconnect sees no focus event, so
-    /// the first frame drawn live and focused offers it instead (R1-R4).
-    offer_when_live: bool,
+    /// Defer automatic clipboard work until the first live picture has been drawn,
+    /// including for a pane that keeps focus during a reconnect.
+    initial_clipboard: InitialClipboard,
+    /// Enabled only for RDP startup timing diagnostics.
+    picture_trace: Option<(std::time::Instant, bool)>,
     /// The notices on screen, with their sentences, in the order they arrived.
     notices: Vec<(DesktopNotice, String)>,
     /// Every notice this session has shown, so each is shown once.
@@ -420,7 +423,7 @@ impl DesktopPane {
             input: InputQueue::new(),
             phase: DesktopPhase::NotStarted,
             stage: DesktopStage::NotStarted,
-            connecting_since: None,
+            connection_wait: None,
             wait_seconds: None,
             failed_stage: None,
             zoom: DesktopZoom::Fit,
@@ -465,7 +468,8 @@ impl DesktopPane {
             locale,
             shared: Vec::new(),
             read_generation: None,
-            offer_when_live: true,
+            initial_clipboard: InitialClipboard::WaitingForPicture,
+            picture_trace: None,
             notices: Vec::new(),
             noticed: Vec::new(),
             subscriptions: Vec::new(),
@@ -493,6 +497,7 @@ impl DesktopPane {
         let mut pane = Self::new(target, locale, certificate_store, cx);
         pane.link = Some(link);
         pane.phase = DesktopPhase::Connecting;
+        pane.connection_wait = Some(crate::app::ConnectionWait::new());
         pane.stage = DesktopStage::Connecting;
         pane
     }
@@ -730,8 +735,9 @@ impl DesktopPane {
             return;
         }
         if self.availability.is_built() {
+            self.phase = DesktopPhase::Connecting;
             self.stage = DesktopStage::Connecting;
-            self.connecting_since = Some(std::time::Instant::now());
+            self.connection_wait = Some(crate::app::ConnectionWait::new());
             self.provided_password = password.is_some_and(|p| !p.is_empty());
             self.pending_dial = Some(password.map(shellune_core::SecretString::new));
             if self.viewport.is_some() {
@@ -786,6 +792,9 @@ impl DesktopPane {
             } else {
                 self.previous_pin.as_deref()
             };
+        self.picture_trace = (self.target.protocol() == shellune_core::ProtocolKind::Rdp
+            && std::env::var_os("SHELLUNE_RDP_TRACE").is_some())
+        .then(|| (std::time::Instant::now(), false));
         match NativeLink::open(
             &self.target,
             password.as_ref().map(|p| p.expose()),
@@ -815,7 +824,8 @@ impl DesktopPane {
         self.link = Some(link);
         self.phase = DesktopPhase::Connecting;
         self.stage = DesktopStage::Connecting;
-        self.connecting_since = Some(std::time::Instant::now());
+        self.connection_wait
+            .get_or_insert_with(crate::app::ConnectionWait::new);
         self.failed_stage = None;
         self.surface.reset();
         self.set_pointer(None);
@@ -823,7 +833,7 @@ impl DesktopPane {
         // A new session has said nothing yet and has not seen this clipboard.
         self.shared.clear();
         self.read_generation = None;
-        self.offer_when_live = true;
+        self.initial_clipboard = InitialClipboard::WaitingForPicture;
         self.notices.clear();
         self.noticed.clear();
         self.start_polling(cx);
@@ -850,7 +860,7 @@ impl DesktopPane {
             &target,
             was_live,
         ));
-        self.connecting_since = None;
+        self.connection_wait = None;
         self.polling = false;
         // Nothing is held after a session ended: the remote side would otherwise
         // keep a modifier down for a connection that is gone.
@@ -1034,7 +1044,7 @@ impl DesktopPane {
             self.flush_input();
         }
         if self.phase == DesktopPhase::Connecting
-            && let Some(elapsed) = self.connecting_since.map(|since| since.elapsed())
+            && let Some(elapsed) = self.connection_wait.as_ref().map(|since| since.elapsed())
             && elapsed >= crate::app::CONNECT_STATE_FLOOR
             && self.wait_seconds != Some(elapsed.as_secs())
         {
@@ -1081,12 +1091,20 @@ impl DesktopPane {
                     // than written past the canvas; the session keeps running.
                     return true;
                 }
+                if let Some((_, content @ false)) = &mut self.picture_trace {
+                    *content = region
+                        .pixels
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .any(|p| p[0] | p[1] | p[2] != 0);
+                }
                 if self.phase == DesktopPhase::Connecting {
                     // The first complete region means the session is showing a
                     // picture: that is the moment it is live, not the state event.
                     self.phase = DesktopPhase::Live;
                     self.stage = DesktopStage::Establishing;
-                    self.connecting_since = None;
+                    self.connection_wait = None;
                 }
                 true
             }
@@ -1205,7 +1223,7 @@ impl DesktopPane {
         {
             return false;
         }
-        self.offer_when_live = false;
+        self.initial_clipboard = InitialClipboard::Ready;
         let generation = cx.clipboard_generation();
         if generation.is_some() && generation == self.read_generation {
             return false;
@@ -1283,12 +1301,13 @@ impl DesktopPane {
                 self.set_pointer(None);
                 if self.is_live() {
                     self.asked_size = (0, 0);
+                    self.initial_clipboard = InitialClipboard::WaitingForPicture;
                     self.input = InputQueue::new();
                     self.last_sent = None;
                     self.wheel_remainder = [0.0; 2];
                     self.send_problem = None;
                     self.stage = DesktopStage::Connecting;
-                    self.connecting_since = Some(std::time::Instant::now());
+                    self.connection_wait = Some(crate::app::ConnectionWait::new());
                     self.wait_seconds = None;
                 }
                 self.phase = DesktopPhase::Connecting;
@@ -1330,7 +1349,7 @@ impl DesktopPane {
                     self.certificate = None;
                     self.stage = DesktopStage::Authenticating;
                     self.phase = DesktopPhase::Connecting;
-                    self.connecting_since = None;
+                    self.connection_wait = None;
                     let user =
                         (self.target.protocol() == shellune_core::ProtocolKind::Rdp).then(|| {
                             cx.new(|cx| {
@@ -2670,7 +2689,7 @@ impl Render for DesktopPane {
             // remote program - by key or from its own menu - so this computer's
             // clipboard is offered then (R1-R4).
             let focused = cx.on_focus_in(&self.focus, window, |pane, _window, cx| {
-                if pane.share_clipboard(cx) {
+                if pane.initial_clipboard == InitialClipboard::Ready && pane.share_clipboard(cx) {
                     pane.flush_input();
                 }
                 cx.notify();
@@ -2682,6 +2701,7 @@ impl Render for DesktopPane {
                 cx.notify();
                 if window.is_window_active()
                     && pane.focus.is_focused(window)
+                    && pane.initial_clipboard == InitialClipboard::Ready
                     && pane.share_clipboard(cx)
                 {
                     pane.flush_input();
@@ -2707,23 +2727,51 @@ impl Render for DesktopPane {
             self.release_input();
         }
         self.was_active = active;
-        // The session went live - a first connection or a reconnect - while the
-        // picture held the keyboard, which no focus event reports: this computer's
-        // clipboard is offered now, so a paste from the remote program's own menu
-        // right away pastes it.
-        if self.offer_when_live
-            && active
-            && matches!(self.phase, DesktopPhase::Live)
-            && self.focus.is_focused(window)
-            && self.share_clipboard(cx)
-        {
-            self.flush_input();
-        }
         self.update_picture(window, cx);
+        if self.viewport.is_some()
+            && !self.images.is_empty()
+            && let Some((start, true)) = self.picture_trace
+        {
+            self.picture_trace = None;
+            window.defer(cx, move |_, _| {
+                eprintln!(
+                    "rdp view: +{} ms drew first non-black desktop update",
+                    start.elapsed().as_millis()
+                )
+            });
+        }
+        // First present the remote pixels. Reading and converting a Retina
+        // screenshot on the local clipboard can itself take several frames.
+        if self.initial_clipboard == InitialClipboard::WaitingForPicture && self.is_live() {
+            self.initial_clipboard = InitialClipboard::Deferred;
+            let pane = cx.entity().downgrade();
+            window.defer(cx, move |window, app| {
+                let _ = pane.update(app, |pane, cx| {
+                    if pane.initial_clipboard != InitialClipboard::Deferred {
+                        return;
+                    }
+                    pane.initial_clipboard = InitialClipboard::Ready;
+                    if pane.is_live()
+                        && window.is_window_active()
+                        && pane.focus.is_focused(window)
+                        && pane.share_clipboard(cx)
+                    {
+                        pane.flush_input();
+                        cx.notify();
+                    }
+                });
+            });
+        }
         // Whether the picture is what the body shows. The status card below stands in
         // for it while it is absent, and the warning strip belongs over the picture
         // only: drawing both would say the same thing twice before the first frame.
         let has_picture = !self.images.is_empty();
+        let show_status = self.certificate.is_none()
+            && (self.phase != DesktopPhase::Connecting
+                || self
+                    .connection_wait
+                    .as_ref()
+                    .is_none_or(|wait| wait.due(cx)));
         let entity = cx.entity().downgrade();
 
         let mut body = div()
@@ -2916,24 +2964,10 @@ impl Render for DesktopPane {
                 .child(image);
             body = body.child(surface);
         } else {
-            // A link that comes up in under the floor shows its picture instead of
-            // a card that flashes on the way; the pane keeps its space either way.
-            let early = matches!(self.phase, DesktopPhase::Connecting)
-                && self
-                    .connecting_since
-                    .is_some_and(|since| since.elapsed() < crate::app::CONNECT_STATE_FLOOR);
-            body = body.child(if early || self.certificate.is_some() {
-                div().flex_1()
-            } else {
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(self.status_card(metrics))
-            });
+            // The first child supplies the viewport used to dial at the negotiated size.
+            body = body.child(div().flex_1());
         }
-        if self.reconnecting() && self.certificate.is_none() {
+        if show_status && (!has_picture || self.reconnecting()) {
             body = body.child(
                 div()
                     .absolute()
@@ -2941,7 +2975,11 @@ impl Render for DesktopPane {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(self.status_card(metrics)),
+                    .child(theme::enter(
+                        self.status_card(metrics),
+                        "desktop.status.enter",
+                        theme::Enter::Rise,
+                    )),
             );
         }
         if has_picture && let Some(notice) = self.notice_strip(metrics, cx) {

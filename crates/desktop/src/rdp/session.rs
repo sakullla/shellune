@@ -16,7 +16,7 @@ use crate::{Event, Failure, State};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long the handshake may take before the attempt is abandoned.
 const HANDSHAKE: Duration = Duration::from_secs(20);
@@ -228,6 +228,7 @@ pub(super) fn run(
     if control.cancelled() {
         return;
     }
+    super::trace("starting connection");
     match connect(config, emit, control, &commands) {
         Ok(mut active) => {
             // The pump publishes Connected, and only once the logon is settled:
@@ -265,6 +266,54 @@ pub(super) fn run(
     }
 }
 
+/// Some Windows sessions clear the surface during activation, before the
+/// signed-in desktop is available. Keep showing every bitmap, including black.
+#[derive(Default, PartialEq, Eq)]
+enum StartupPicture {
+    #[default]
+    Empty,
+    Black,
+    RedrawAfter(Instant),
+    RedrawSent,
+    Content,
+}
+
+impl StartupPicture {
+    fn observe(&mut self, pixels: &[u8]) {
+        if *self == Self::Content || (*self == Self::RedrawSent && !super::trace_enabled()) {
+            return;
+        }
+        if pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| p[0] | p[1] | p[2] != 0)
+        {
+            super::trace("first non-black desktop pixels decoded");
+            *self = Self::Content;
+        } else if *self == Self::Empty {
+            super::trace("first bitmap is black");
+            *self = Self::Black;
+        }
+    }
+
+    /// Allow updates already on their way to arrive before requesting a repaint.
+    /// At most one additional refresh per activation, even for a genuinely black desktop.
+    fn redraw_due(&mut self, now: Instant) -> bool {
+        match self {
+            Self::Black => {
+                *self = Self::RedrawAfter(now + Duration::from_millis(200));
+                false
+            }
+            Self::RedrawAfter(deadline) if now >= *deadline => {
+                *self = Self::RedrawSent;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 struct Active {
     transport: Transport,
     channels: Channels,
@@ -277,6 +326,7 @@ struct Active {
     /// When an unconfirmed logon stops being waited for.
     logon_deadline: std::time::Instant,
     first_picture_deadline: Option<std::time::Instant>,
+    startup_picture: StartupPicture,
     deactivated: bool,
     clipboard: Clipboard,
     drive: Drive,
@@ -407,6 +457,7 @@ fn connect(
         fast_fragment: None,
         display: Default::default(),
         first_picture_deadline: None,
+        startup_picture: StartupPicture::default(),
         deactivated: false,
         logon_confirmed: false,
         frames: Frames::default(),
@@ -551,6 +602,16 @@ impl Active {
                 ));
             }
             self.announce_logon(emit, control);
+            if !self.deactivated
+                && self.logon_confirmed
+                && self.share.refresh_rects
+                && self.startup_picture.redraw_due(Instant::now())
+            {
+                self.share
+                    .refresh(&self.channels, &mut self.transport)
+                    .map_err(|e| Ended::io(e, Failure::ProtocolFailure))?;
+                super::trace("requested post-logon repaint of black desktop");
+            }
             if !self.deactivated {
                 self.drain(commands)?;
             }
@@ -745,6 +806,8 @@ impl Active {
             }
             1 => {
                 self.deactivated = false;
+                self.startup_picture = StartupPicture::default();
+                super::trace("server reactivated the desktop");
                 // Windows reactivates the share after a display layout change.
                 let share = Share::from_demand(&header)
                     .map_err(|e| Ended::io(e, Failure::ProtocolFailure))?;
@@ -844,6 +907,7 @@ impl Active {
                 ));
             }
             let pixels = update::pixels(&bitmap, self.share.width, self.share.height)?;
+            self.startup_picture.observe(&pixels);
             self.first_picture_deadline = None;
             emit(Event::Frame {
                 x: i32::from(bitmap.x),
@@ -910,6 +974,7 @@ mod tests {
             clipboard: Clipboard::new(false, Arc::clone(emit)),
             drive: Drive::new(None, Arc::clone(emit)),
             first_picture_deadline: Some(now + FIRST_PICTURE_WAIT),
+            startup_picture: StartupPicture::default(),
             deactivated: false,
             logon_deadline: now + LOGON_WAIT,
             logon_confirmed: false,
@@ -920,6 +985,24 @@ mod tests {
             fast_fragment: None,
             display: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_black_logon_surface_requests_one_repaint_unless_content_already_arrived() {
+        let now = Instant::now();
+        let mut picture = StartupPicture::default();
+        assert!(!picture.redraw_due(now));
+        picture.observe(&[0, 0, 0, 255]);
+        assert!(!picture.redraw_due(now));
+        assert!(!picture.redraw_due(now + Duration::from_millis(50)));
+        assert!(picture.redraw_due(now + Duration::from_secs(1)));
+        picture.observe(&[0, 0, 0, 255]);
+        assert!(!picture.redraw_due(now + Duration::from_secs(2)));
+        let mut picture = StartupPicture::default();
+        picture.observe(&[0, 0, 0, 255]);
+        assert!(!picture.redraw_due(now));
+        picture.observe(&[20, 20, 20, 255]);
+        assert!(!picture.redraw_due(now + Duration::from_secs(1)));
     }
 
     #[test]

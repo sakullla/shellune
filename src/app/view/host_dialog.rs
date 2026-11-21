@@ -1364,6 +1364,7 @@ impl ShelluneView {
             ModalBehaviour {
                 scroll: Some(self.host_body_scroll.clone()),
                 dismiss: None,
+                ..Default::default()
             },
         ))
     }
@@ -1939,6 +1940,7 @@ impl ShelluneView {
             ModalBehaviour {
                 scroll: Some(self.host_body_scroll.clone()),
                 dismiss: None,
+                ..Default::default()
             },
         ))
     }

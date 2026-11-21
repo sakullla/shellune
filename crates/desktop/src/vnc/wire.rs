@@ -120,6 +120,7 @@ struct PixelRectangle {
     height: usize,
     row: usize,
     hextile: Option<Tiles>,
+    startup: bool,
 }
 
 #[derive(Default)]
@@ -129,17 +130,46 @@ struct Tiles {
     background: [u8; 4],
     foreground: [u8; 4],
     band: Vec<u8>,
+    published_x: usize,
 }
 
 impl PixelRectangle {
     fn next_band(&mut self, cursor: &mut Cursor<'_>) -> Result<Option<Rect>, String> {
-        let rows = (self.height - self.row).min(BAND_ROWS);
-        let size = rows * self.width * BYTES_PER_PIXEL;
+        let max_rows = (self.height - self.row).min(BAND_ROWS);
+        let row_bytes = self.width * BYTES_PER_PIXEL;
+        // Start painting the initial rectangle as it arrives. Subsequent
+        // rectangles keep the larger bands to amortize frame delivery.
+        let rows = if !self.startup {
+            max_rows
+        } else if self.hextile.is_some() {
+            max_rows.min(16)
+        } else {
+            max_rows.min((cursor.data.len() - cursor.at) / row_bytes)
+        };
+        if rows == 0 {
+            return Ok(None);
+        }
+        let size = rows * row_bytes;
         let pixels = if let Some(tiles) = self.hextile.as_mut() {
             tiles.band.resize(size, 0);
             while tiles.y < rows {
                 let mut tile = Cursor::new(&cursor.data[cursor.at..]);
                 if !tiles.decode(&mut tile, self.width, rows)? {
+                    // On a slow first screen, paint the complete tiles we already
+                    // have, even when the rest of this tile row is still in flight.
+                    if self.startup && tiles.x > tiles.published_x {
+                        let left = tiles.published_x;
+                        let end = tiles.x;
+                        let pixels = tiles.span(self.width, rows, left, end);
+                        tiles.published_x = end;
+                        return Ok(Some(Rect::Raw {
+                            x: self.x + left as u16,
+                            y: self.y + self.row as u16,
+                            width: (end - left) as u16,
+                            height: rows as u16,
+                            pixels,
+                        }));
+                    }
                     return Ok(None);
                 }
                 cursor.at += tile.at;
@@ -150,6 +180,19 @@ impl PixelRectangle {
                 }
             }
             tiles.y = 0;
+            let left = std::mem::take(&mut tiles.published_x);
+            if left != 0 {
+                let pixels = tiles.span(self.width, rows, left, self.width);
+                let y = self.y + self.row as u16;
+                self.row += rows;
+                return Ok(Some(Rect::Raw {
+                    x: self.x + left as u16,
+                    y,
+                    width: (self.width - left) as u16,
+                    height: rows as u16,
+                    pixels,
+                }));
+            }
             std::mem::take(&mut tiles.band)
         } else {
             let Some(bytes) = cursor.take(size) else {
@@ -170,6 +213,14 @@ impl PixelRectangle {
 }
 
 impl Tiles {
+    fn span(&self, stride: usize, rows: usize, left: usize, right: usize) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity((right - left) * rows * BYTES_PER_PIXEL);
+        for row in self.band.chunks_exact(stride * BYTES_PER_PIXEL).take(rows) {
+            pixels.extend_from_slice(&row[left * BYTES_PER_PIXEL..right * BYTES_PER_PIXEL]);
+        }
+        pixels
+    }
+
     /// Commit colours and pixels only once the complete tile is available.
     fn decode(
         &mut self,
@@ -260,6 +311,7 @@ pub(crate) struct Incoming {
     offset: usize,
     remaining: Option<u16>,
     pixels: Option<PixelRectangle>,
+    seen_pixel_rectangle: bool,
     zrle: Option<super::zrle::Rectangle>,
     inflater: Option<flate2::Decompress>,
 }
@@ -352,8 +404,10 @@ impl Incoming {
                                 height: usize::from(height),
                                 row: 0,
                                 hextile: (encoding == HEXTILE).then(Tiles::default),
+                                startup: !self.seen_pixel_rectangle,
                             });
                         }
+                        self.seen_pixel_rectangle = true;
                         None
                     }
                     COPY_RECT => {
@@ -756,39 +810,42 @@ mod tests {
 
     #[test]
     fn fragmented_hextile_publishes_a_band_before_the_last_tile() {
-        // Eight solid 16x16 tiles make up the first 32x64 band. The next
-        // band inherits its background, then one subrect spans part of a tile.
+        // Eight solid 16x16 tiles cover the first 64 rows. The last
+        // row inherits its background and adds one foreground subrectangle.
         let mut body = vec![2, 11, 22, 33, 44];
         body.extend_from_slice(&[0; 7]);
         body.extend_from_slice(&[0, 4 | 8, 9, 8, 7, 6, 1, 0, 0]);
         let update = hextile_message(32, 65, &body);
         let mut incoming = Incoming::default();
-        let mut bands = 0;
+        let mut painted = vec![None; 32 * 65];
+        let mut first = true;
         for (i, byte) in update.iter().enumerate() {
             incoming.push(std::slice::from_ref(byte));
             if let Some(Message::Rectangle(Rect::Raw {
-                y, height, pixels, ..
+                x,
+                y,
+                width,
+                height,
+                pixels,
             })) = incoming.take().unwrap()
             {
-                if bands == 0 {
+                if first {
                     assert!(i + 1 < update.len());
-                    assert_eq!((y, height), (0, 64));
-                    assert!(
-                        pixels
-                            .as_chunks::<4>()
-                            .0
-                            .iter()
-                            .all(|pixel| *pixel == [11, 22, 33, 44])
-                    );
-                } else {
-                    assert_eq!((y, height), (64, 1));
-                    assert_eq!(&pixels[..4], &[11, 22, 33, 44]);
-                    assert_eq!(&pixels[64..68], &[9, 8, 7, 6]);
+                    assert_eq!((x, y, width, height), (0, 0, 16, 16));
+                    first = false;
                 }
-                bands += 1;
+                for dy in 0..usize::from(height) {
+                    for dx in 0..usize::from(width) {
+                        let dst = (usize::from(y) + dy) * 32 + usize::from(x) + dx;
+                        let pixel = pixels.as_chunks::<4>().0[dy * usize::from(width) + dx];
+                        assert!(painted[dst].replace(pixel).is_none());
+                    }
+                }
             }
         }
-        assert_eq!(bands, 2);
+        let mut expected = vec![Some([11, 22, 33, 44]); 32 * 65];
+        expected[64 * 32 + 16] = Some([9, 8, 7, 6]);
+        assert_eq!(painted, expected);
         assert!(matches!(incoming.take().unwrap(), Some(Message::UpdateEnd)));
         assert!(incoming.take().unwrap().is_none());
     }
@@ -821,7 +878,9 @@ mod tests {
             }
         }
         assert_eq!(painted, pixels);
-        assert_eq!(events, ["map", "band", "band", "end", "bell"]);
+        assert_eq!(events.first(), Some(&"map"));
+        assert_eq!(events[1..66], ["band"; 65]);
+        assert_eq!(events[66..], ["end", "bell"]);
     }
 
     #[test]

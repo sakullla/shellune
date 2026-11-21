@@ -8045,6 +8045,11 @@ async fn the_connection_dialog_names_the_target_and_stage_and_offers_cancel_and_
     cx.run_until_parked();
 
     assert!(
+        cx.debug_bounds("remote.stage").is_none(),
+        "a fast SSH attempt draws no loading card"
+    );
+    wait_for_loading_card(cx);
+    assert!(
         cx.debug_bounds("remote.stage").is_some(),
         "the dialog names the stage the attempt is really in"
     );
@@ -18088,6 +18093,7 @@ async fn connection_attempts_wait_and_cancel_on_their_own(cx: &mut TestAppContex
     cx.update(|_window, app| {
         view.update(app, |view, cx| view.script_remote_attempt(Vec::new(), cx));
     });
+    wait_for_loading_card(cx);
     // The first attempt keeps running behind its tab while the next host is chosen.
     click(cx, "remote.hide");
     click(cx, "hosts.connect.1");
@@ -18095,6 +18101,7 @@ async fn connection_attempts_wait_and_cancel_on_their_own(cx: &mut TestAppContex
         view.update(app, |view, cx| view.script_remote_attempt(Vec::new(), cx));
     });
     cx.run_until_parked();
+    wait_for_loading_card(cx);
     assert_eq!(
         cx.update(|_window, app| view.read(app).pending_attempt_count()),
         2
@@ -18148,6 +18155,7 @@ async fn one_attempt_failing_leaves_the_other_waiting(cx: &mut TestAppContext) {
             );
         });
     });
+    wait_for_loading_card(cx);
     click(cx, "remote.hide");
     click(cx, "hosts.connect.1");
     cx.update(|_window, app| {
@@ -18171,6 +18179,7 @@ async fn one_attempt_failing_leaves_the_other_waiting(cx: &mut TestAppContext) {
             .any(|session| matches!(session.state(), SessionState::Failed(_)))
     });
     assert!(failed, "the failed attempt is recorded on its own session");
+    wait_for_loading_card(cx);
     assert!(cx.debug_bounds("attempt.others").is_some());
     assert!(
         cx.debug_bounds("remote.failure").is_none(),
@@ -21566,6 +21575,7 @@ async fn a_tab_keeps_its_dot_title_and_close_inside_itself_at_any_width(cx: &mut
         });
     });
     cx.run_until_parked();
+    wait_for_loading_card(cx);
     assert_eq!(
         session_state(cx, &view, connecting),
         Some(SessionState::Connecting),
@@ -23327,8 +23337,8 @@ async fn a_trusted_x11_connection_asks_before_it_dials(cx: &mut TestAppContext) 
         1,
         "accepting the risks starts the attempt that uses them"
     );
-    // Closing the dialog ends that attempt, as closing any connecting form does.
-    click(cx, "remote.close");
+    // Its tab can already be closed during the loading delay.
+    click(cx, "session.tab.close.0");
     assert_eq!(
         cx.update(|_window, app| view.read(app).pending_attempt_count()),
         0
@@ -27354,6 +27364,22 @@ fn mount_scripted_desktop(
 }
 
 #[gpui::test]
+async fn a_fast_remote_desktop_never_draws_its_loading_card(cx: &mut TestAppContext) {
+    for record in [desktop_record("rdp"), vnc_record_sharing("vnc", false)] {
+        let (view, window) = cx.add_window_view(|_, cx| ShelluneView::new(cx));
+        let (link, _) = ScriptedLink::new(Vec::new());
+        let feed = link.feed();
+        let id = mount_scripted_desktop(&view, window, &record, link);
+        assert!(window.debug_bounds("desktop.status").is_none());
+        feed.feed(live_desktop_events());
+        pump_desktop(&view, window, id);
+        assert!(window.debug_bounds("desktop.picture").is_some());
+        wait_for_loading_card(window);
+        assert!(window.debug_bounds("desktop.status").is_none());
+    }
+}
+
+#[gpui::test]
 async fn a_desktop_tab_applies_every_region_in_the_order_it_arrived(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let desktop = (320u32, 200u32);
@@ -27914,6 +27940,21 @@ fn focus_desktop(view: &Entity<ShelluneView>, cx: &mut VisualTestContext, id: Se
     cx.run_until_parked();
 }
 
+/// Keep this attempt pending while the test clock also drives transport polling.
+fn hold_reconnect(view: &Entity<ShelluneView>, cx: &mut VisualTestContext, id: SessionId) {
+    cx.update(|_, app| {
+        view.update(app, |view, cx| {
+            view.install_scripted_session(id, shellune_ssh::ScriptedSession::new(), cx)
+        })
+    });
+}
+
+fn wait_for_loading_card(cx: &mut VisualTestContext) {
+    cx.run_until_parked();
+    cx.executor().advance_clock(crate::app::CONNECT_STATE_FLOOR);
+    cx.run_until_parked();
+}
+
 /// Draws the window once, the way the next frame will.
 ///
 /// A change made from a key or a click is drawn on the frame after the event that
@@ -28188,6 +28229,7 @@ async fn the_send_warning_is_drawn_once_before_the_first_frame(cx: &mut TestAppC
     cx.run_until_parked();
     redraw(cx);
 
+    wait_for_loading_card(cx);
     assert!(
         cx.debug_bounds("desktop.status").is_some(),
         "the card explains the session before any picture"
@@ -30499,6 +30541,8 @@ async fn a_desktop_connection_names_each_step_before_the_picture(cx: &mut TestAp
         "the first step is the connection itself"
     );
     assert_eq!(state, Some(SessionState::Connecting));
+    assert!(cx.debug_bounds("desktop.status").is_none());
+    wait_for_loading_card(cx);
     assert!(
         cx.debug_bounds("desktop.status").is_some(),
         "the step is stated on screen"
@@ -37222,6 +37266,9 @@ async fn a_reconnect_runs_under_a_banner_over_the_last_screen_and_can_be_cancell
     click(cx, "terminal.failure.next");
     assert_eq!(session_state(cx, &view, id), Some(SessionState::Connecting));
     assert!(cx.update(|_window, app| view.read(app).pane_of(id).is_none()));
+    assert!(!banner_shown(cx, &view, id));
+    hold_reconnect(&view, cx, id);
+    wait_for_loading_card(cx);
     assert!(banner_shown(cx, &view, id), "the reconnect has its banner");
     let banner = bounds_of(cx, "terminal.reconnecting");
     let grid = bounds_of(cx, "terminal.viewport");
@@ -37288,7 +37335,8 @@ async fn a_closed_banner_comes_back_after_a_reconnect_is_cancelled(cx: &mut Test
     assert!(!banner_shown(cx, &view, id), "the close hides the banner");
 
     cx.update(|_window, app| view.update(app, |view, cx| view.reconnect_session(id, cx)));
-    cx.run_until_parked();
+    hold_reconnect(&view, cx, id);
+    wait_for_loading_card(cx);
     assert_eq!(session_state(cx, &view, id), Some(SessionState::Connecting));
     assert!(banner_shown(cx, &view, id), "the reconnect states itself");
     click(cx, "terminal.reconnecting.cancel");
@@ -37305,7 +37353,8 @@ async fn a_closed_banner_comes_back_after_a_reconnect_is_cancelled(cx: &mut Test
 
     // The reconnecting banner closed during one attempt is back for the next one.
     cx.update(|_window, app| view.update(app, |view, cx| view.reconnect_session(id, cx)));
-    cx.run_until_parked();
+    hold_reconnect(&view, cx, id);
+    wait_for_loading_card(cx);
     assert!(banner_shown(cx, &view, id));
     click(cx, "terminal.reconnecting.dismiss");
     assert!(
@@ -37319,7 +37368,8 @@ async fn a_closed_banner_comes_back_after_a_reconnect_is_cancelled(cx: &mut Test
         "the cancel states the reason again"
     );
     cx.update(|_window, app| view.update(app, |view, cx| view.reconnect_session(id, cx)));
-    cx.run_until_parked();
+    hold_reconnect(&view, cx, id);
+    wait_for_loading_card(cx);
     assert_eq!(session_state(cx, &view, id), Some(SessionState::Connecting));
     assert!(
         banner_shown(cx, &view, id),
@@ -37829,6 +37879,7 @@ async fn a_state_card_in_a_short_pane_starts_at_its_top_and_scrolls_under_the_wh
         Some(SessionState::Connecting)
     );
     assert!(cx.update(|_window, app| view.read(app).pane_of(left).is_none()));
+    hold_reconnect(&view, cx, left);
     // The kept last screen would stand in the card's place (ADR-6); this test is about
     // the card of a session that has nothing to show.
     cx.update(|_window, app| {
@@ -37849,12 +37900,7 @@ async fn a_state_card_in_a_short_pane_starts_at_its_top_and_scrolls_under_the_wh
         cx.debug_bounds("session.state.card").is_none(),
         "a just-started connection draws no state card"
     );
-    // The floor is wall-clock time, so the test waits it out rather than advancing
-    // the simulated clock.
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    cx.run_until_parked();
-    redraw(cx);
-    cx.run_until_parked();
+    wait_for_loading_card(cx);
 
     let viewport = cx.update(|window, _app| window.viewport_size());
     let window = gpui::Bounds::new(point(px(0.0), px(0.0)), viewport);

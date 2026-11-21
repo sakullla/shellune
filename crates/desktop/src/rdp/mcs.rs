@@ -4,6 +4,8 @@ use std::io::{self, Read, Write};
 
 const T124_OID: &[u8] = &[0, 5, 0, 20, 124, 0, 1];
 const BASE_USER_ID: u16 = 1001;
+const SUPPORT_SKIP_CHANNEL_JOIN: u16 = 0x0800;
+const SKIP_CHANNEL_JOIN_SUPPORTED: u32 = 0x0008;
 
 fn ber(out: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
     out.extend_from_slice(tag);
@@ -73,7 +75,7 @@ fn core(width: u16, height: u16, percent: u32, selected: Security) -> Vec<u8> {
     body.extend_from_slice(&24u16.to_le_bytes()); // 32 bpp is requested in earlyCapabilityFlags
     body.extend_from_slice(&0x000fu16.to_le_bytes()); // 15, 16, 24 and 32 bit depths
     // Error-info PDUs and a 32-bit session are what this client renders.
-    body.extend_from_slice(&0x0003u16.to_le_bytes());
+    body.extend_from_slice(&(0x0003 | SUPPORT_SKIP_CHANNEL_JOIN).to_le_bytes());
     body.extend_from_slice(&[0; 64]); // client digital product id
     body.push(6); // connection type: broadband
     body.push(0); // pad
@@ -139,7 +141,13 @@ pub(super) struct Channels {
     pub(super) dynamic: Option<u16>,
 }
 
-fn server_channels(bytes: &[u8], count: usize) -> io::Result<(u16, Vec<u16>)> {
+struct ServerChannels {
+    global: u16,
+    ids: Vec<u16>,
+    skip_join: bool,
+}
+
+fn server_channels(bytes: &[u8], count: usize) -> io::Result<ServerChannels> {
     let mut p = Packet(bytes);
     let mut body = p.ber_value(&[0x7f, 0x66])?;
     p.finish()?;
@@ -160,6 +168,7 @@ fn server_channels(bytes: &[u8], count: usize) -> io::Result<(u16, Vec<u16>)> {
     let mut fields = Packet(gcc.take(len)?);
     gcc.finish()?;
     let mut network = None;
+    let mut skip_join = false;
     let mut secure = false;
     while !fields.0.is_empty() {
         let kind = fields.le16()?;
@@ -169,6 +178,15 @@ fn server_channels(bytes: &[u8], count: usize) -> io::Result<(u16, Vec<u16>)> {
             .ok_or_else(|| invalid("short GCC block"))?;
         let mut field = Packet(fields.take(usize::from(len))?);
         match kind {
+            0x0c01 => {
+                field.le32()?; // version
+                if !field.0.is_empty() {
+                    field.le32()?;
+                } // optional clientRequestedProtocols
+                if !field.0.is_empty() {
+                    skip_join = field.le32()? & SKIP_CHANNEL_JOIN_SUPPORTED != 0;
+                }
+            }
             0x0c02 => {
                 if field.le32()? != 0 || field.le32()? != 0 {
                     return Err(invalid("server selected standard security inside TLS"));
@@ -197,7 +215,12 @@ fn server_channels(bytes: &[u8], count: usize) -> io::Result<(u16, Vec<u16>)> {
     if !secure {
         return Err(invalid("missing server security settings"));
     }
-    network.ok_or_else(|| invalid("missing server network settings"))
+    let (global, ids) = network.ok_or_else(|| invalid("missing server network settings"))?;
+    Ok(ServerChannels {
+        global,
+        ids,
+        skip_join,
+    })
 }
 
 pub(super) fn connect(
@@ -221,9 +244,16 @@ pub(super) fn connect(
         io,
         &connect_initial(width, height, percent, security, &names)?,
     )?;
-    let (global, ids) = server_channels(&read_data(io)?, names.len())?;
-    write_data(io, &[4, 1, 0, 1, 0])?; // ErectDomainRequest
-    write_data(io, &[0x28])?; // AttachUserRequest
+    let ServerChannels {
+        global,
+        ids,
+        skip_join,
+    } = server_channels(&read_data(io)?, names.len())?;
+    let mut attach_request = Vec::new();
+    write_data(&mut attach_request, &[4, 1, 0, 1, 0])?; // ErectDomainRequest
+    write_data(&mut attach_request, &[0x28])?; // AttachUserRequest
+    io.write_all(&attach_request)?;
+    io.flush()?;
     let attach = read_data(io)?;
     let mut a = Packet(&attach);
     a.expect(&[0x2e, 0])?;
@@ -232,27 +262,31 @@ pub(super) fn connect(
     let user = offset
         .checked_add(BASE_USER_ID)
         .ok_or_else(|| invalid("invalid MCS user"))?;
-    // MS-RDPBCGR 1.3.1.1: all channel IDs are known after Attach User.
-    // Send the joins in one TLS write, then verify every confirmation before logon.
-    let base_channels = [user, global];
-    let channels = base_channels.iter().chain(&ids);
-    let mut batch = Vec::new();
-    for id in channels.clone() {
-        let mut join = vec![0x38];
-        join.extend_from_slice(&offset.to_be_bytes());
-        join.extend_from_slice(&id.to_be_bytes());
-        write_data(&mut batch, &join)?;
-    }
-    io.write_all(&batch)?;
-    io.flush()?;
-    for id in channels {
-        let response = read_data(io)?;
-        let mut joined = Packet(&response);
-        joined.expect(&[0x3e, 0])?;
-        if joined.be16()? != offset || joined.be16()? != *id || joined.be16()? != *id {
-            return Err(invalid("server confirmed a different MCS channel"));
+    // With bilateral skip-channel-join support, Attach User Confirm also
+    // confirms membership of the static, global and user channels.
+    if !skip_join {
+        // MS-RDPBCGR 1.3.1.1: all channel IDs are known after Attach User.
+        // Send the joins in one TLS write, then verify every confirmation before logon.
+        let base_channels = [user, global];
+        let channels = base_channels.iter().chain(&ids);
+        let mut batch = Vec::new();
+        for id in channels.clone() {
+            let mut join = vec![0x38];
+            join.extend_from_slice(&offset.to_be_bytes());
+            join.extend_from_slice(&id.to_be_bytes());
+            write_data(&mut batch, &join)?;
         }
-        joined.finish()?;
+        io.write_all(&batch)?;
+        io.flush()?;
+        for id in channels {
+            let response = read_data(io)?;
+            let mut joined = Packet(&response);
+            joined.expect(&[0x3e, 0])?;
+            if joined.be16()? != offset || joined.be16()? != *id || joined.be16()? != *id {
+                return Err(invalid("server confirmed a different MCS channel"));
+            }
+            joined.finish()?;
+        }
     }
     let mut ids = ids.into_iter();
     Ok(Channels {
@@ -341,5 +375,103 @@ mod scale_tests {
         assert_eq!(&block[212..216], &296u32.to_le_bytes());
         assert_eq!(&block[222..226], &200u32.to_le_bytes());
         assert_eq!(&block[226..230], &180u32.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::*;
+
+    struct Peer {
+        replies: io::Cursor<Vec<u8>>,
+        sent: Vec<u8>,
+    }
+
+    impl Read for Peer {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            self.replies.read(out)
+        }
+    }
+    impl Write for Peer {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.sent.write(data)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn reply(flags: Option<u32>) -> io::Result<Vec<u8>> {
+        let mut fields = Vec::new();
+        let mut core = 0x0008_0004u32.to_le_bytes().to_vec();
+        if let Some(flags) = flags {
+            core.extend_from_slice(&1u32.to_le_bytes());
+            core.extend_from_slice(&flags.to_le_bytes());
+        }
+        block(&mut fields, 0x0c01, &core);
+        block(&mut fields, 0x0c02, &[0; 8]);
+        let network: Vec<_> = [1003u16, 2, 1004, 1005]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        block(&mut fields, 0x0c03, &network);
+        let mut gcc = T124_OID.to_vec();
+        gcc.extend_from_slice(&[42, 0x14, 0x76, 0x0a, 1, 1, 0, 1, 0xc0, 0]);
+        gcc.extend_from_slice(b"McDn");
+        per_length(&mut gcc, fields.len())?;
+        gcc.extend_from_slice(&fields);
+        let mut content = Vec::new();
+        ber(&mut content, &[10], &[0]);
+        ber(&mut content, &[2], &[0]);
+        ber(&mut content, &[0x30], &[]);
+        ber(&mut content, &[4], &gcc);
+        let mut response = Vec::new();
+        ber(&mut response, &[0x7f, 0x66], &content);
+        Ok(response)
+    }
+
+    #[test]
+    fn skip_joins_only_when_the_server_acknowledges_the_client_flag() -> io::Result<()> {
+        let advertised = core(800, 600, 100, Security::Tls);
+        assert_ne!(
+            u16::from_le_bytes(advertised[140..142].try_into().unwrap()) & 0x0800,
+            0
+        );
+        for flags in [None, Some(0x4), Some(0x8)] {
+            let skip = flags == Some(8);
+            let mut replies = Vec::new();
+            write_data(&mut replies, &reply(flags)?)?;
+            write_data(&mut replies, &[0x2e, 0, 0, 5])?;
+            let ids = [1006u16, 1003, 1004, 1005];
+            if !skip {
+                for id in ids {
+                    let mut confirm = vec![0x3e, 0, 0, 5];
+                    confirm.extend_from_slice(&id.to_be_bytes());
+                    confirm.extend_from_slice(&id.to_be_bytes());
+                    write_data(&mut replies, &confirm)?;
+                }
+            }
+            let mut peer = Peer {
+                replies: io::Cursor::new(replies),
+                sent: Vec::new(),
+            };
+            let ch = connect(&mut peer, 800, 600, 100, Security::Tls, true, false)?;
+            assert_eq!(
+                (ch.user, ch.global, ch.clipboard, ch.dynamic),
+                (1006, 1003, Some(1004), Some(1005))
+            );
+            let mut wire = peer.sent.as_slice();
+            read_data(&mut wire)?; // Connect Initial
+            assert_eq!(read_data(&mut wire)?, [4, 1, 0, 1, 0]);
+            assert_eq!(read_data(&mut wire)?, [0x28]);
+            if !skip {
+                for id in ids {
+                    let [hi, lo] = id.to_be_bytes();
+                    assert_eq!(read_data(&mut wire)?, [0x38, 0, 5, hi, lo]);
+                }
+            }
+            assert!(wire.is_empty());
+        }
+        Ok(())
     }
 }

@@ -154,12 +154,51 @@ pub fn apply_keymap(cx: &mut App, keymap: &Keymap) {
 /// Number of tabs that have a jump shortcut.
 pub const TAB_JUMP_COUNT: usize = 9;
 
-/// A connection that comes up faster than this never draws its intermediate state.
-///
-/// A link that takes under a second should show its picture, not a status card that
-/// flashes on the way; the same floor covers the desktop pane and a session's state
-/// card, so a quick start looks the same in both.
-pub const CONNECT_STATE_FLOOR: std::time::Duration = std::time::Duration::from_millis(1000);
+/// Time a connection may take before its progress card appears.
+pub const CONNECT_STATE_FLOOR: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// One attempt owns its deadline and a single redraw while its progress is visible.
+#[derive(Debug)]
+pub struct ConnectionWait {
+    since: std::time::Instant,
+    wake: std::cell::OnceCell<gpui::Task<()>>,
+    expired: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl ConnectionWait {
+    fn new() -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            wake: Default::default(),
+            expired: Default::default(),
+        }
+    }
+
+    fn elapsed(&self) -> std::time::Duration {
+        self.since.elapsed()
+    }
+
+    fn visible(&self) -> bool {
+        self.expired.get() || self.elapsed() >= CONNECT_STATE_FLOOR
+    }
+
+    fn due<T: 'static>(&self, cx: &mut gpui::Context<T>) -> bool {
+        let remaining = CONNECT_STATE_FLOOR.saturating_sub(self.elapsed());
+        if self.expired.get() || remaining.is_zero() {
+            return true;
+        }
+        self.wake.get_or_init(|| {
+            let expired = self.expired.clone();
+            let timer = cx.background_executor().timer(remaining);
+            cx.spawn(async move |this, cx| {
+                timer.await;
+                expired.set(true);
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+        });
+        false
+    }
+}
 
 /// Default window size the layout is designed for.
 pub const DEFAULT_WINDOW_SIZE: (f32, f32) = (1120.0, 720.0);

@@ -83,6 +83,7 @@ pub(super) struct Share {
     bpp: u16,
     server: u16,
     pub(super) horizontal_wheel: bool,
+    pub(super) refresh_rects: bool,
     pub(super) large_pointers: bool,
 }
 
@@ -119,6 +120,7 @@ impl Share {
             bpp: 32,
             server: 0,
             horizontal_wheel: false,
+            refresh_rects: false,
             large_pointers: false,
         }
     }
@@ -138,6 +140,7 @@ impl Share {
         caps.take(2)?;
         let mut desktop = None;
         let mut horizontal_wheel = false;
+        let mut refresh_rects = false;
         let mut multifragment = false;
         let mut large_pointers = false;
         for _ in 0..count {
@@ -147,7 +150,10 @@ impl Share {
                 .checked_sub(4)
                 .ok_or_else(|| invalid("short capability set"))?;
             let mut cap = Packet(caps.take(usize::from(length))?);
-            if kind == 2 {
+            if kind == 1 {
+                cap.take(18)?;
+                refresh_rects = cap.u8()? != 0;
+            } else if kind == 2 {
                 let bpp = cap.le16()?;
                 cap.take(6)?;
                 let width = cap.le16()?;
@@ -180,6 +186,7 @@ impl Share {
             bpp,
             server: control.source,
             horizontal_wheel,
+            refresh_rects,
             large_pointers: multifragment && large_pointers,
         })
     }
@@ -238,19 +245,26 @@ impl Share {
         confirm.extend_from_slice(b"Shellune");
         confirm.extend_from_slice(&words(&[caps.count, 0]));
         confirm.extend_from_slice(&caps.bytes);
-        self.send_control(ch, out, 3, &confirm)?;
-        self.send_data(ch, out, 31, &words(&[1, self.server]))?;
-        self.send_data(ch, out, 20, &words(&[4, 0, 0, 0]))?; // cooperate
-        self.send_data(ch, out, 20, &words(&[1, 0, 0, 0]))?; // request control
-        self.send_data(ch, out, 39, &words(&[0, 0, 3, 50]))?; // first and last font list
+        // Connection finalization is one outbound flight. Font List enables
+        // graphics on Windows, so send it in the same TLS write as Confirm Active.
+        let mut batch = Vec::new();
+        self.send_control(ch, &mut batch, 3, &confirm)?;
+        self.send_data(ch, &mut batch, 31, &words(&[1, self.server]))?;
+        self.send_data(ch, &mut batch, 20, &words(&[4, 0, 0, 0]))?; // cooperate
+        self.send_data(ch, &mut batch, 20, &words(&[1, 0, 0, 0]))?; // request control
+        self.send_data(ch, &mut batch, 39, &words(&[0, 0, 3, 50]))?; // first and last font list
         // Ask for the whole desktop once: a server only sends what it considers
         // damaged, and a fresh client has drawn nothing yet.
-        self.refresh(ch, out)
+        if self.refresh_rects {
+            self.refresh(ch, &mut batch)?;
+        }
+        out.write_all(&batch)?;
+        out.flush()
     }
 
     /// PDUTYPE2_REFRESH_RECT over the whole desktop. This is how a client that has
     /// just activated gets a full first picture instead of waiting for damage.
-    fn refresh(&self, ch: &Channels, out: &mut impl Write) -> io::Result<()> {
+    pub(super) fn refresh(&self, ch: &Channels, out: &mut impl Write) -> io::Result<()> {
         let mut body = vec![1u8]; // one area
         body.extend_from_slice(&[0; 3]); // pad
         body.extend_from_slice(&words(&[
