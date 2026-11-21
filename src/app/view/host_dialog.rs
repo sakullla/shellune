@@ -1131,7 +1131,8 @@ impl ShelluneView {
                 row_height * GROUP_PICKER_ROWS
                     + px(components::HAIRLINE_WIDTH) * (GROUP_PICKER_ROWS - 1.0),
             )
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            .track_scroll(&self.group_picker_scroll);
 
         for (index, path) in filtered.into_iter().enumerate() {
             let text = path.to_canonical();
@@ -1199,6 +1200,7 @@ impl ShelluneView {
     /// Writes `next` into the open SSH or non-SSH dialog's Group field and draft.
     fn apply_dialog_group_text(&mut self, for_ssh: bool, next: String, cx: &mut Context<Self>) {
         self.group_picker_highlight = 0;
+        self.group_picker_scroll.scroll_to_item(0);
         if for_ssh {
             if let Some(draft) = self.hosts.draft_mut() {
                 draft.set_text(HostField::Group, next.clone());
@@ -1264,11 +1266,15 @@ impl ShelluneView {
         match event.keystroke.key.as_str() {
             "down" => {
                 self.group_picker_highlight = (self.group_picker_highlight + 1).min(last);
+                self.group_picker_scroll
+                    .scroll_to_item(self.group_picker_highlight);
                 cx.notify();
                 true
             }
             "up" => {
                 self.group_picker_highlight = self.group_picker_highlight.saturating_sub(1).min(last);
+                self.group_picker_scroll
+                    .scroll_to_item(self.group_picker_highlight);
                 cx.notify();
                 true
             }

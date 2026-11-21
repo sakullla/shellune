@@ -606,6 +606,8 @@ pub struct ShelluneView {
     focused_group_path: Option<GroupPath>,
     /// Highlighted candidate index inside the host/connection form's searchable group picker (R12).
     group_picker_highlight: usize,
+    /// Scroll handle for the host/connection form's searchable group picker (R12).
+    group_picker_scroll: gpui::ScrollHandle,
     /// Keyboard stops for the Home sidebar's fixed places: All, Favorites, Recent, Local.
     sidebar_place_focus: [FocusHandle; 4],
     /// The host or connection row whose right-click menu is open, and where the pointer opened it.
@@ -2764,6 +2766,7 @@ impl ShelluneView {
             group_list_focus: cx.focus_handle().tab_stop(true),
             focused_group_path: None,
             group_picker_highlight: 0,
+            group_picker_scroll: gpui::ScrollHandle::new(),
             sidebar_place_focus: [
                 cx.focus_handle().tab_stop(true),
                 cx.focus_handle().tab_stop(true),
@@ -6859,6 +6862,7 @@ impl ShelluneView {
             if view.hosts.search() != phrase {
                 view.hosts.set_search(phrase);
                 view.hosts_cursor = None;
+                view.sync_focused_group_after_query();
                 cx.notify();
             }
         })

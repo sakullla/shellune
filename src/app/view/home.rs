@@ -714,7 +714,8 @@ impl ShelluneView {
             let count = rows_rc.len();
             let weak = cx.entity().downgrade();
             let section_clone = section.clone();
-            let list_focused = self.group_list_focus.is_focused(window);
+            let list_focused = self.group_list_focus.is_focused(window)
+                || self.group_search.read(cx).focus_handle().is_focused(window);
             let focused_path = self.focused_group_path.clone();
             let drawn = self.group_rows_drawn.clone();
             let row_height = metrics.control_height() + metrics.scale(spacing::HALF);
@@ -801,10 +802,11 @@ impl ShelluneView {
         }
     }
 
-    /// Keeps `focused_group_path` aligned with the filtered rows while `group_query` changes.
+    /// Keeps `focused_group_path` aligned with the visible rows when group or host search changes.
     pub(super) fn sync_focused_group_after_query(&mut self) {
         let drawn = self.drawn_group_paths();
         if drawn.is_empty() {
+            self.focused_group_path = None;
             return;
         }
         let still_visible = self
@@ -864,13 +866,15 @@ impl ShelluneView {
         self.focused_group_path.iter().cloned().collect()
     }
 
-    /// The sidebar group whose row holds the keys, if one does.
+    /// The sidebar group whose row holds the keys, if one is currently visible.
     pub(super) fn focused_group(&self, window: &Window) -> Option<GroupPath> {
-        if self.group_list_focus.is_focused(window) {
-            self.focused_group_path.clone()
-        } else {
-            None
+        if !self.group_list_focus.is_focused(window) {
+            return None;
         }
+        let path = self.focused_group_path.as_ref()?;
+        self.drawn_group_paths()
+            .contains(path)
+            .then(|| path.clone())
     }
 
     /// The groups the sidebar draws, top to bottom: the rows the keyboard walks.
@@ -985,6 +989,61 @@ impl ShelluneView {
             .iter()
             .position(|handle| handle.is_focused(window));
         let focused_group = self.focused_group(window);
+        let group_list_focused = self.group_list_focus.is_focused(window);
+        if focused_place.is_none() && focused_group.is_none() && group_list_focused {
+            if self.workspace.destination() != Destination::Hosts || self.hosts_keys_blocked() {
+                return false;
+            }
+            let modifiers = &event.keystroke.modifiers;
+            if modifiers.number_of_modifiers() != 0 {
+                return false;
+            }
+            let key = event.keystroke.key.as_str();
+            let drawn = if self.home_sidebar_folded() {
+                Vec::new()
+            } else {
+                self.drawn_group_paths()
+            };
+            match key {
+                "tab" => {
+                    self.focus_hosts_search(window, cx);
+                    return true;
+                }
+                "escape" => {
+                    let handle = self.destination_focus(Destination::Hosts).clone();
+                    window.focus(&handle);
+                    cx.notify();
+                    return true;
+                }
+                "down" => {
+                    if let Some(first) = drawn.first().cloned() {
+                        self.focus_group_row(&first, window, cx);
+                    } else {
+                        window.focus(&self.sidebar_place_focus[3].clone());
+                        cx.notify();
+                    }
+                    return true;
+                }
+                "up" => {
+                    if let Some(last) = drawn.last().cloned() {
+                        self.focus_group_row(&last, window, cx);
+                    } else {
+                        window.focus(&self.sidebar_place_focus[2].clone());
+                        cx.notify();
+                    }
+                    return true;
+                }
+                "enter" | "space" => {
+                    if let Some(first) = drawn.first().cloned() {
+                        self.focus_group_row(&first, window, cx);
+                        self.show_home_section(HomeSection::Group(first), cx);
+                        return true;
+                    }
+                    return false;
+                }
+                _ => return false,
+            }
+        }
         let current = match (focused_place, focused_group) {
             (Some(0), _) => SidebarStop::Place(0, HomeSection::All),
             (Some(1), _) => SidebarStop::Place(1, HomeSection::Favorites),
