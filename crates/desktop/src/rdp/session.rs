@@ -491,6 +491,7 @@ struct Active {
     drive: Drive,
     /// The button state the host last reported, so each edge carries its button.
     buttons: u32,
+    pointer_position: Option<(u16, u16)>,
     pointers: super::pointer::Pointers,
 }
 
@@ -599,6 +600,7 @@ fn connect(
         clipboard: Clipboard::new(config.clipboard, Arc::clone(emit)),
         drive: Drive::new(config.drive.clone(), Arc::clone(emit)),
         buttons: 0,
+        pointer_position: None,
         pointers: Default::default(),
         logon: None,
         frames: Frames::default(),
@@ -677,6 +679,7 @@ impl Active {
                 .activate(&self.channels, &mut self.transport)
                 .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
             self.share = share;
+            self.pointer_position = None;
             self.clipboard
                 .announce(&self.channels, &mut self.transport)
                 .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
@@ -789,8 +792,21 @@ impl Active {
                 Some(Command::Pointer { buttons, x, y }) => {
                     let flags = super::pointer_flags(self.buttons, buttons);
                     self.buttons = buttons;
-                    self.pointer(flags, x, y)
-                        .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+                    if flags & 0x0400 != 0 && !self.share.horizontal_wheel {
+                        continue;
+                    }
+                    // A wheel PDU's coordinates may be ignored. Move over the
+                    // target first, even if the user scrolled without hovering.
+                    let moved = self.pointer_position != Some((x, y));
+                    if moved && flags & 0x0600 != 0 {
+                        self.pointer(0x0800, x, y)
+                            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+                    }
+                    if moved || flags != 0x0800 {
+                        self.pointer(flags, x, y)
+                            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+                    }
+                    self.pointer_position = Some((x, y));
                 }
                 Some(Command::Clipboard(entries)) => self
                     .clipboard
@@ -943,11 +959,7 @@ impl Active {
                     "the server sent a bitmap depth it did not negotiate",
                 ));
             }
-            let used = update::draw(&mut self.frame, self.stride, self.height, &bitmap)
-                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-            // Advance by what the stream used, not by the length the server
-            // declared: one of them counts a header pad the other does not write.
-            p.take(used)
+            update::draw(&mut self.frame, self.stride, self.height, &bitmap)
                 .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
             let pixels = update::region(&self.frame, self.stride, &bitmap);
             if pixels.len() > MAX_FRAME_BYTES {

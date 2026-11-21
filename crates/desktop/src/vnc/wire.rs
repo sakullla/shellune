@@ -253,6 +253,8 @@ pub(crate) struct Incoming {
     offset: usize,
     remaining: Option<u16>,
     pixels: Option<PixelRectangle>,
+    zrle: Option<super::zrle::Rectangle>,
+    inflater: Option<flate2::Decompress>,
 }
 
 impl Incoming {
@@ -274,6 +276,19 @@ impl Incoming {
             }
             let data = &self.pending[self.offset..];
             let mut cursor = Cursor::new(data);
+            if let Some(rect) = &mut self.zrle {
+                let mut input = data;
+                let z = self
+                    .inflater
+                    .get_or_insert_with(|| flate2::Decompress::new(true));
+                let (tile, done) = rect.take(z, &mut input)?;
+                self.offset += data.len() - input.len();
+                if done {
+                    self.zrle = None;
+                    continue;
+                }
+                return Ok(tile.map(Message::Rectangle));
+            }
             if let Some(rect) = &mut self.pixels {
                 let band = rect.next_band(&mut cursor)?;
                 self.offset += cursor.at;
@@ -297,7 +312,7 @@ impl Incoming {
                     return Ok(None);
                 };
                 let rect = match encoding {
-                    RAW | HEXTILE => {
+                    RAW | HEXTILE | 16 => {
                         let bytes = u64::from(width) * u64::from(height) * 4;
                         if bytes == 0
                             || bytes > MAX_FRAME_BYTES as u64
@@ -308,14 +323,30 @@ impl Incoming {
                                 "invalid pixel rectangle of {width}x{height} at {x},{y}"
                             ));
                         }
-                        self.pixels = Some(PixelRectangle {
-                            x,
-                            y,
-                            width: usize::from(width),
-                            height: usize::from(height),
-                            row: 0,
-                            hextile: (encoding == HEXTILE).then(Tiles::default),
-                        });
+                        if encoding == 16 {
+                            let Some(length) = cursor.i32() else {
+                                return Ok(None);
+                            };
+                            if length <= 0 || length as usize > MAX_FRAME_BYTES * 2 {
+                                return Err("invalid ZRLE compressed size".into());
+                            }
+                            self.zrle = Some(super::zrle::Rectangle::new(
+                                x,
+                                y,
+                                width,
+                                height,
+                                length as usize,
+                            ));
+                        } else {
+                            self.pixels = Some(PixelRectangle {
+                                x,
+                                y,
+                                width: usize::from(width),
+                                height: usize::from(height),
+                                row: 0,
+                                hextile: (encoding == HEXTILE).then(Tiles::default),
+                            });
+                        }
                         None
                     }
                     COPY_RECT => {
@@ -595,7 +626,7 @@ mod tests {
         let mut update = vec![0u8, 0];
         update.extend_from_slice(&1u16.to_be_bytes());
         update.extend_from_slice(&[0, 0, 0, 0, 0, 1, 0, 1]);
-        update.extend_from_slice(&16i32.to_be_bytes());
+        update.extend_from_slice(&7i32.to_be_bytes()); // Tight is not negotiated.
         let mut incoming = Incoming::default();
         incoming.push(&update);
         assert!(incoming.take().is_err());

@@ -1,13 +1,36 @@
 //! Nonblocking callback mailbox. Pending rectangles are composited, not discarded:
 //! a slow UI receives the latest pixels without accumulating an unlimited video.
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::{Event, MAX_FRAME_BYTES};
 
 const MAX_NOTIFICATIONS: usize = 128;
+
+#[derive(Clone, Copy)]
+struct Damage {
+    left: usize,
+    top: usize,
+    right: usize,
+    bottom: usize,
+}
+
+impl Damage {
+    fn union(self, b: Self) -> Self {
+        Self {
+            left: self.left.min(b.left),
+            top: self.top.min(b.top),
+            right: self.right.max(b.right),
+            bottom: self.bottom.max(b.bottom),
+        }
+    }
+    fn area(self) -> usize {
+        (self.right - self.left) * (self.bottom - self.top)
+    }
+}
 
 #[derive(Default)]
 struct Pending {
@@ -16,13 +39,14 @@ struct Pending {
     width: u32,
     height: u32,
     pixels: Vec<u8>,
-    dirty: Option<(usize, usize, usize, usize)>,
+    dirty: VecDeque<Damage>,
 }
 
 #[derive(Default)]
 pub(crate) struct Mailbox {
     pending: Mutex<Pending>,
     ready: Condvar,
+    pub(crate) awaiting_reconnect_frame: Arc<AtomicBool>,
 }
 
 impl Mailbox {
@@ -72,10 +96,13 @@ impl Mailbox {
                             )
                         )
                     });
+                    if pending.width != 0 {
+                        self.awaiting_reconnect_frame.store(true, Ordering::Release);
+                    }
                     pending.pixels.clear();
                     pending.width = 0;
                     pending.height = 0;
-                    pending.dirty = None;
+                    pending.dirty.clear();
                 }
                 // Only the newest unconsumed clipboard value is useful.
                 if matches!(event, Event::Clipboard { .. }) {
@@ -112,19 +139,25 @@ impl Mailbox {
         self.ready.notify_one();
     }
 
+    fn pop(&self, pending: &mut Pending) -> Option<Event> {
+        let event = pending.pop()?;
+        if matches!(event, Event::Frame { .. }) {
+            self.awaiting_reconnect_frame
+                .store(false, Ordering::Release);
+        }
+        Some(event)
+    }
+
     pub(crate) fn try_recv(&self) -> Result<Event, TryRecvError> {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop()
-            .ok_or(TryRecvError::Empty)
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        self.pop(&mut pending).ok_or(TryRecvError::Empty)
     }
 
     pub(crate) fn recv_timeout(&self, timeout: Duration) -> Result<Event, RecvTimeoutError> {
         let start = Instant::now();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if let Some(event) = pending.pop() {
+            if let Some(event) = self.pop(&mut pending) {
                 return Ok(event);
             }
             let Some(left) = timeout.checked_sub(start.elapsed()) else {
@@ -141,7 +174,7 @@ impl Mailbox {
     pub(crate) fn drain(&self) -> Vec<Event> {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         let mut events = Vec::with_capacity(pending.events.len());
-        while let Some(event) = pending.pop() {
+        while let Some(event) = self.pop(&mut pending) {
             events.push(event);
         }
         events
@@ -183,26 +216,40 @@ impl Pending {
             self.width = dw;
             self.height = dh;
             self.pixels = vec![0; bytes as usize];
-            self.dirty = None;
+            self.dirty.clear();
         }
         for row in 0..h {
             let dst = ((y + row) * dw as usize + x) * 4;
             let src = row * stride as usize;
             self.pixels[dst..dst + w * 4].copy_from_slice(&pixels[src..src + w * 4]);
         }
-        self.dirty = Some(match self.dirty {
-            Some((left, top, right, bottom)) => {
-                (left.min(x), top.min(y), right.max(x + w), bottom.max(y + h))
+        let mut region = Damage {
+            left: x,
+            top: y,
+            right: x + w,
+            bottom: y + h,
+        };
+        self.dirty.retain(|&old| {
+            let joined = region.union(old);
+            if joined.area() <= (region.area() + old.area()) * 2 {
+                region = joined;
+                false
+            } else {
+                true
             }
-            None => (x, y, x + w, y + h),
         });
+        // Bound metadata even when a producer scatters single-pixel updates.
+        if self.dirty.len() >= 64 {
+            region = self.dirty.drain(..).fold(region, Damage::union);
+        }
+        self.dirty.push_back(region);
         true
     }
 
     fn pop(&mut self) -> Option<Event> {
         match self.events.pop_front()? {
             Some(event) => {
-                if self.dirty.is_none()
+                if self.dirty.is_empty()
                     && matches!(
                         event,
                         Event::State {
@@ -218,7 +265,15 @@ impl Pending {
                 Some(event)
             }
             None => {
-                let (x, y, right, bottom) = self.dirty.take()?;
+                let Damage {
+                    left: x,
+                    top: y,
+                    right,
+                    bottom,
+                } = self.dirty.pop_front()?;
+                if !self.dirty.is_empty() {
+                    self.events.push_front(None);
+                }
                 let (w, h) = (right - x, bottom - y);
                 let mut pixels = Vec::with_capacity(w * h * 4);
                 for row in y..bottom {
@@ -255,6 +310,44 @@ mod tests {
             pixels: vec![value; 4],
         }
     }
+    #[test]
+    fn separated_4k_patches_stay_small_and_reconnect_waits_for_consumption() {
+        let queue = Mailbox::default();
+        for (x, y) in [(0, 0), (3824, 2144)] {
+            queue.deliver(Event::Frame {
+                x,
+                y,
+                width: 16,
+                height: 16,
+                desktop_width: 3840,
+                desktop_height: 2160,
+                stride: 64,
+                pixels: vec![7; 1024],
+            });
+        }
+        let patches: Vec<_> = queue
+            .drain()
+            .into_iter()
+            .map(|e| match e {
+                Event::Frame { pixels, .. } => pixels.len(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(patches, [1024, 1024]);
+        queue.deliver(Event::State {
+            state: crate::State::Connecting,
+            failure: crate::Failure::None,
+            detail: 0,
+            reason: String::new(),
+        });
+        queue.deliver(pixel(1, 9));
+        assert!(queue.awaiting_reconnect_frame.load(Ordering::Acquire));
+        assert!(matches!(queue.try_recv(), Ok(Event::State { .. })));
+        assert!(queue.awaiting_reconnect_frame.load(Ordering::Acquire));
+        assert!(matches!(queue.try_recv(), Ok(Event::Frame { .. })));
+        assert!(!queue.awaiting_reconnect_frame.load(Ordering::Acquire));
+    }
+
     #[test]
     fn slow_consumer_keeps_latest_pixels_with_constant_storage() {
         let queue = Mailbox::default();

@@ -521,7 +521,12 @@ impl DesktopClient {
         let emit: control::Emit = Arc::new(move |event| deliver(&emit_sink, event));
         let backend = match protocol {
             Protocol::Rdp => Backend::Rdp(Box::new(rdp::Client::new(emit))),
-            Protocol::Vnc => Backend::Vnc(Box::new(vnc::Client::new(emit))),
+            Protocol::Vnc => Backend::Vnc(Box::new(vnc::Client::new(
+                emit,
+                receiver
+                    .as_ref()
+                    .map(|m| Arc::clone(&m.awaiting_reconnect_frame)),
+            ))),
         };
         Ok(DesktopClient {
             protocol,

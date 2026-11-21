@@ -28212,9 +28212,10 @@ async fn the_zoom_control_scales_the_picture_and_the_pointer_follows_it(cx: &mut
     cx.simulate_mouse_up(centre, MouseButton::Left, Modifiers::default());
 
     // Pixel-sized touchpad deltas combine into one remote wheel step.
-    for _ in 0..4 {
+    for phase in [gpui::TouchPhase::Started, gpui::TouchPhase::Ended].repeat(2) {
         cx.simulate_event(ScrollWheelEvent {
             position: centre,
+            touch_phase: phase,
             delta: ScrollDelta::Pixels(point(px(0.0), px(-10.0))),
             ..Default::default()
         });
@@ -28226,11 +28227,26 @@ async fn the_zoom_control_scales_the_picture_and_the_pointer_follows_it(cx: &mut
         .iter()
         .filter(|input| {
             matches!(input,
-                DesktopInput::Pointer { buttons, .. } if buttons.contains(Buttons::WHEEL_UP)
+                DesktopInput::Pointer { buttons, .. } if buttons.contains(Buttons::WHEEL_DOWN)
             )
         })
         .count();
     assert_eq!(wheel_presses, 1);
+    for (delta, expected) in [
+        (point(0.0, 1.0), Buttons::WHEEL_UP),
+        (point(-1.0, 0.0), Buttons::WHEEL_RIGHT),
+        (point(1.0, 0.0), Buttons::WHEEL_LEFT),
+    ] {
+        let start = log.lock().unwrap().inputs.len();
+        cx.simulate_event(ScrollWheelEvent {
+            position: centre,
+            delta: ScrollDelta::Lines(delta),
+            ..Default::default()
+        });
+        assert!(matches!(&log.lock().unwrap().inputs[start..],
+            [DesktopInput::Pointer { buttons, x: 800, y: 450 }, DesktopInput::Pointer { buttons: released, .. }]
+            if *buttons == expected && *released == Buttons::none()));
+    }
 
     // A panned picture must still put the reported pixel directly under the pointer.
     cx.simulate_event(ScrollWheelEvent {
@@ -28326,12 +28342,9 @@ async fn a_certificate_that_may_not_be_trusted_is_refused_at_once_and_releases_t
     );
 }
 
-/// A peer that paints the cursor into its frames keeps that cursor until it
-/// explicitly supplies a shape.
+/// Show a precise local target while waiting for the VNC cursor.
 #[gpui::test]
-async fn a_live_vnc_picture_hides_the_local_pointer_until_the_session_ends(
-    cx: &mut TestAppContext,
-) {
+async fn vnc_uses_a_visible_local_pointer_until_a_shape_arrives(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let (link, _log) = ScriptedLink::new(live_desktop_events());
     let feed = link.feed();
@@ -28349,12 +28362,12 @@ async fn a_live_vnc_picture_hides_the_local_pointer_until_the_session_ends(
     assert!(live, "the frame put the session in its live step");
     assert_eq!(
         cursor,
-        gpui::CursorStyle::None,
-        "a live VNC picture shows the server's pointer, not a second local one"
+        gpui::CursorStyle::Crosshair,
+        "motion is visible before the server supplies a shape"
     );
     let picture = cx
         .debug_bounds("desktop.surface")
-        .expect("the picture the cursor is hidden over is drawn");
+        .expect("the remote picture is drawn");
     cx.simulate_mouse_move(
         point(
             picture.origin.x + picture.size.width / 2.0,
@@ -28396,6 +28409,49 @@ async fn a_live_vnc_picture_hides_the_local_pointer_until_the_session_ends(
     );
 }
 
+#[gpui::test]
+async fn reconnecting_desktop_freezes_the_old_picture_and_discards_input(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, log) = ScriptedLink::new(vec![LinkEvent::Frame(solid(
+        0,
+        0,
+        2,
+        2,
+        (2, 2),
+        [7, 8, 9, 255],
+    ))]);
+    let feed = link.feed();
+    let id = mount_scripted_desktop(&view, cx, &vnc_record_sharing("desk", true), link);
+    let point = bounds_of(cx, "desktop.picture").center();
+    cx.simulate_mouse_down(point, MouseButton::Left, Modifiers::default());
+    let count = log.lock().unwrap().inputs.len();
+    feed.feed(vec![LinkEvent::State {
+        state: LinkState::Connecting,
+        failure: LinkFailure::None,
+        reason: "reconnecting".into(),
+        detail: 0,
+    }]);
+    pump_desktop(&view, cx, id);
+    assert_eq!(&desktop_canvas(&view, cx, id)[..4], &[7, 8, 9, 255]);
+    cx.simulate_mouse_up(point, MouseButton::Left, Modifiers::default());
+    cx.simulate_click(point, Modifiers::default());
+    assert_eq!(log.lock().unwrap().inputs.len(), count);
+    feed.feed(vec![LinkEvent::Frame(solid(
+        0,
+        0,
+        1,
+        1,
+        (2, 2),
+        [3, 4, 5, 255],
+    ))]);
+    pump_desktop(&view, cx, id);
+    let pixels = desktop_canvas(&view, cx, id);
+    assert_eq!(&pixels[..4], &[3, 4, 5, 255]);
+    assert!(pixels[4..].iter().all(|&p| p == 0));
+    cx.simulate_click(point, Modifiers::default());
+    assert!(log.lock().unwrap().inputs.len() > count);
+}
+
 /// Local motion must remain visible while the link sends no new frames.
 #[gpui::test]
 async fn desktop_pointer_follows_local_motion_without_another_frame(cx: &mut TestAppContext) {
@@ -28412,7 +28468,7 @@ async fn desktop_pointer_follows_local_motion_without_another_frame(cx: &mut Tes
     let feed = link.feed();
     let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
     let picture = bounds_of(cx, "desktop.picture");
-    let scale = f32::from(picture.size.width) / 800.0;
+    let scale = (f32::from(picture.size.width) / 800.0).max(1.0);
     for offset in [0.0, 40.0, -27.0] {
         let point = picture.center() + point(px(offset), px(offset));
         cx.simulate_mouse_move(point, None, Modifiers::default());
@@ -28420,6 +28476,36 @@ async fn desktop_pointer_follows_local_motion_without_another_frame(cx: &mut Tes
         let cursor = bounds_of(cx, "desktop.pointer");
         assert!((f32::from(cursor.origin.x - point.x) + scale).abs() < 1.1);
         assert!((f32::from(cursor.origin.y - point.y) + 2.0 * scale).abs() < 1.1);
+    }
+    assert_eq!(
+        cx.update(|_, app| view
+            .read(app)
+            .desktop_of(id)
+            .unwrap()
+            .read(app)
+            .surface_cursor_for_test()),
+        gpui::CursorStyle::None
+    );
+    for shape in [
+        shellune_desktop::PointerShape::Hidden,
+        shellune_desktop::PointerShape::Bitmap {
+            width: 1,
+            height: 1,
+            hotspot: (0, 0),
+            pixels: vec![0; 4].into(),
+        },
+    ] {
+        feed.feed(vec![LinkEvent::Pointer(shape)]);
+        pump_desktop(&view, cx, id);
+        assert_eq!(
+            cx.update(|_, app| view
+                .read(app)
+                .desktop_of(id)
+                .unwrap()
+                .read(app)
+                .surface_cursor_for_test()),
+            gpui::CursorStyle::Crosshair
+        );
     }
     feed.feed(vec![LinkEvent::Pointer(
         shellune_desktop::PointerShape::Default,
@@ -28436,9 +28522,9 @@ async fn desktop_pointer_follows_local_motion_without_another_frame(cx: &mut Tes
     );
 }
 
-/// RDP peers that do not supply pointer updates retain the embedded cursor.
+/// A live RDP surface also has an immediate local fallback.
 #[gpui::test]
-async fn an_rdp_picture_hides_the_local_pointer_like_a_vnc_one(cx: &mut TestAppContext) {
+async fn rdp_uses_a_visible_local_pointer_until_a_shape_arrives(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let (link, _log) = ScriptedLink::new(live_desktop_events());
     let feed = link.feed();
@@ -28455,8 +28541,8 @@ async fn an_rdp_picture_hides_the_local_pointer_like_a_vnc_one(cx: &mut TestAppC
     assert!(live, "the frame put the session in its live step");
     assert_eq!(
         cursor,
-        gpui::CursorStyle::None,
-        "the server's pointer is in the frame, so the local one is not drawn over it"
+        gpui::CursorStyle::Crosshair,
+        "the local pointer is visible during negotiation"
     );
 
     // The pointer comes back when the picture is gone: an ended session is not a

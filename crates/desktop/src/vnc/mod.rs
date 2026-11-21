@@ -8,6 +8,7 @@ mod clipboard;
 mod handshake;
 mod session;
 mod wire;
+mod zrle;
 
 pub(crate) use clipboard::{latin1_to_utf8, utf8_to_latin1};
 
@@ -126,16 +127,21 @@ pub(super) struct Client {
     emit: Emit,
     control: Arc<Control>,
     commands: Option<Sender<Command>>,
+    awaiting_reconnect_frame: Option<Arc<std::sync::atomic::AtomicBool>>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl Client {
-    pub(super) fn new(emit: Emit) -> Client {
+    pub(super) fn new(
+        emit: Emit,
+        awaiting_reconnect_frame: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Client {
         Client {
             config: Config::default(),
             emit,
             control: Arc::new(Control::default()),
             commands: None,
+            awaiting_reconnect_frame,
             worker: None,
         }
     }
@@ -187,7 +193,7 @@ impl Client {
         if self.config.host.is_empty() {
             return Err(Error::Argument);
         }
-        let (sender, receiver) = input::channel();
+        let (sender, receiver) = input::channel(self.awaiting_reconnect_frame.clone());
         let emit = Arc::clone(&self.emit);
         let control = Arc::clone(&self.control);
         let config = self.config.snapshot();

@@ -433,9 +433,12 @@ pub struct DesktopSurface {
     width: u32,
     height: u32,
     pixels: Vec<u8>,
-    dirty: bool,
+    dirty_tiles: Vec<bool>,
     applied: u64,
 }
+
+/// Limits each replacement texture to one MiB on a large desktop.
+pub const DESKTOP_TILE: u32 = 512;
 
 impl DesktopSurface {
     /// A surface with no picture yet.
@@ -474,7 +477,7 @@ impl DesktopSurface {
         self.width = 0;
         self.height = 0;
         self.pixels.clear();
-        self.dirty = true;
+        self.dirty_tiles.clear();
         self.applied = 0;
     }
 
@@ -517,7 +520,8 @@ impl DesktopSurface {
             self.height = height;
             let bytes = width as usize * height as usize * 4;
             self.pixels = vec![0u8; bytes];
-            self.dirty = true;
+            self.dirty_tiles =
+                vec![true; (width.div_ceil(DESKTOP_TILE) * height.div_ceil(DESKTOP_TILE)) as usize];
         }
         let canvas_stride = self.width as usize * 4;
         for line in 0..region.height as usize {
@@ -535,15 +539,35 @@ impl DesktopSurface {
             }
         }
         self.applied += 1;
-        self.dirty = true;
+        let columns = width.div_ceil(DESKTOP_TILE);
+        for y in region.y as u32 / DESKTOP_TILE..=(bottom as u32 - 1) / DESKTOP_TILE {
+            for x in region.x as u32 / DESKTOP_TILE..=(right as u32 - 1) / DESKTOP_TILE {
+                self.dirty_tiles[(y * columns + x) as usize] = true;
+            }
+        }
         true
     }
 
-    /// Whether anything changed since the last time the window took a picture.
-    pub fn take_dirty(&mut self) -> bool {
-        let dirty = self.dirty;
-        self.dirty = false;
-        dirty
+    pub fn take_dirty_tiles(&mut self) -> impl Iterator<Item = usize> + '_ {
+        self.dirty_tiles
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, dirty)| std::mem::take(dirty).then_some(i))
+    }
+
+    /// A packed BGRA tile from the composited surface.
+    pub fn tile(&self, index: usize) -> (u32, u32, Vec<u8>) {
+        let columns = self.width.div_ceil(DESKTOP_TILE);
+        let x = index as u32 % columns * DESKTOP_TILE;
+        let y = index as u32 / columns * DESKTOP_TILE;
+        let w = DESKTOP_TILE.min(self.width - x);
+        let h = DESKTOP_TILE.min(self.height - y);
+        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+        for row in y..y + h {
+            let at = ((row * self.width + x) * 4) as usize;
+            pixels.extend_from_slice(&self.pixels[at..at + (w * 4) as usize]);
+        }
+        (w, h, pixels)
     }
 }
 
@@ -575,6 +599,10 @@ impl Buttons {
     pub const WHEEL_UP: Buttons = Buttons(8);
     /// One wheel step down.
     pub const WHEEL_DOWN: Buttons = Buttons(16);
+    /// One wheel step left.
+    pub const WHEEL_LEFT: Buttons = Buttons(32);
+    /// One wheel step right.
+    pub const WHEEL_RIGHT: Buttons = Buttons(64);
 
     /// No button at all.
     #[must_use]
@@ -1347,6 +1375,14 @@ impl DesktopLink for NativeLink {
                 Buttons::WHEEL_DOWN,
                 shellune_desktop::PointerButtons::WHEEL_DOWN,
             ),
+            (
+                Buttons::WHEEL_LEFT,
+                shellune_desktop::PointerButtons::WHEEL_LEFT,
+            ),
+            (
+                Buttons::WHEEL_RIGHT,
+                shellune_desktop::PointerButtons::WHEEL_RIGHT,
+            ),
         ] {
             if buttons.contains(bit) {
                 mask = mask.with(button);
@@ -1884,6 +1920,31 @@ mod tests {
         // which is what proves nothing was coalesced past its own rectangle.
         assert_eq!(&surface.pixels()[0..4], &[1, 2, 3, 255]);
         assert!(canvas_is_bgra(&surface));
+    }
+
+    #[test]
+    fn distant_changes_rebuild_only_two_4k_texture_tiles() {
+        let mut surface = DesktopSurface::new();
+        let desktop = (3840, 2160);
+        let first = scripted::solid(0, 0, 16, 16, desktop, [1, 2, 3, 255]);
+        surface.apply(&first);
+        assert_eq!(surface.take_dirty_tiles().count(), 40);
+        surface.apply(&first);
+        surface.apply(&scripted::solid(
+            3824,
+            2144,
+            16,
+            16,
+            desktop,
+            [4, 5, 6, 255],
+        ));
+        let tiles: Vec<_> = surface.take_dirty_tiles().collect();
+        assert_eq!(tiles, [0, 39]);
+        let (w, h, corner) = surface.tile(39);
+        assert_eq!((w, h), (256, 112));
+        assert_eq!(&corner[corner.len() - 4..], &[4, 5, 6, 255]);
+        assert_eq!(surface.tile(0).2.len() + corner.len(), 1_163_264);
+        assert_eq!(surface.take_dirty_tiles().count(), 0);
     }
 
     #[test]

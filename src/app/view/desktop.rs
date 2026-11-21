@@ -257,6 +257,8 @@ pub struct DesktopPane {
     pointer_shape: Option<PointerShape>,
     pointer_image: Option<Arc<RenderImage>>,
     pointer_dirty: bool,
+    #[cfg(test)]
+    presented_cursor: CursorStyle,
     input: InputQueue,
     phase: DesktopPhase,
     /// The step of the connection the status card names (R19).
@@ -286,7 +288,7 @@ pub struct DesktopPane {
     /// sent twice.
     last_sent: Option<(u16, u16)>,
     /// Fractional wheel steps from a precision touchpad.
-    wheel_remainder: f32,
+    wheel_remainder: [f32; 2],
     certificate: Option<CertificateQuestion>,
     certificate_reject_focus: FocusHandle,
     certificate_trust_focus: FocusHandle,
@@ -336,8 +338,8 @@ pub struct DesktopPane {
     /// losing activation happens once instead of on every frame of an inactive
     /// window.
     was_active: bool,
-    /// The picture the window draws, rebuilt once per batch of frames.
-    image: Option<Arc<RenderImage>>,
+    /// Cached desktop tiles in row-major order. A frame replaces its dirty tiles.
+    images: Vec<Arc<RenderImage>>,
     image_size: (u32, u32),
     locale: Locale,
     /// The parts of the clipboard content last offered to the remote side or written
@@ -370,7 +372,7 @@ impl DesktopPane {
             if let Some(image) = pane.pointer_image.take() {
                 cx.drop_image(image, None);
             }
-            if let Some(image) = pane.image.take() {
+            for image in pane.images.drain(..) {
                 cx.drop_image(image, None);
             }
         })
@@ -384,6 +386,8 @@ impl DesktopPane {
             pointer_shape: None,
             pointer_image: None,
             pointer_dirty: false,
+            #[cfg(test)]
+            presented_cursor: CursorStyle::Arrow,
             input: InputQueue::new(),
             phase: DesktopPhase::NotStarted,
             stage: DesktopStage::NotStarted,
@@ -396,7 +400,7 @@ impl DesktopPane {
             viewport: None,
             asked_size: FIRST_DESKTOP_SIZE,
             last_sent: None,
-            wheel_remainder: 0.0,
+            wheel_remainder: [0.0; 2],
             certificate: None,
             certificate_reject_focus: cx.focus_handle(),
             certificate_trust_focus: cx.focus_handle(),
@@ -416,7 +420,7 @@ impl DesktopPane {
             polling: false,
             watching_focus: false,
             was_active: false,
-            image: None,
+            images: Vec::new(),
             image_size: (0, 0),
             locale,
             shared: Vec::new(),
@@ -813,6 +817,10 @@ impl DesktopPane {
         matches!(self.phase, DesktopPhase::Live)
     }
 
+    fn reconnecting(&self) -> bool {
+        self.phase == DesktopPhase::Connecting && !self.surface.is_empty()
+    }
+
     fn set_pointer(&mut self, shape: Option<PointerShape>) {
         self.pointer_shape = shape;
         self.pointer_dirty = true;
@@ -831,6 +839,7 @@ impl DesktopPane {
             pixels,
             ..
         }) = &self.pointer_shape
+            && pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0)
             && let Some(buffer) =
                 image::ImageBuffer::from_raw((*width).into(), (*height).into(), pixels.to_vec())
         {
@@ -838,10 +847,10 @@ impl DesktopPane {
         }
     }
 
-    /// A peer that has not sent a shape may already be painting its cursor.
-    fn surface_cursor(&self) -> CursorStyle {
+    /// A native precision cursor remains visible until there is a bitmap to paint.
+    fn fallback_cursor(&self) -> CursorStyle {
         if self.is_live() && !matches!(self.pointer_shape, Some(PointerShape::Default)) {
-            CursorStyle::None
+            CursorStyle::Crosshair
         } else {
             CursorStyle::Arrow
         }
@@ -851,7 +860,7 @@ impl DesktopPane {
     #[cfg(test)]
     #[must_use]
     pub fn surface_cursor_for_test(&self) -> CursorStyle {
-        self.surface_cursor()
+        self.presented_cursor
     }
 
     /// Whether the controls over the picture are drawn.
@@ -905,7 +914,17 @@ impl DesktopPane {
         // Input is flushed before the batch is applied so a key pressed during the
         // last interval reaches the peer in the same order the user produced it.
         let had_problem = self.send_problem.is_some();
-        self.flush_input();
+        if !events.iter().any(|event| {
+            matches!(
+                event,
+                LinkEvent::State {
+                    state: LinkState::Connecting,
+                    ..
+                }
+            )
+        }) {
+            self.flush_input();
+        }
         if self.phase == DesktopPhase::Connecting
             && let Some(elapsed) = self.connecting_since.map(|since| since.elapsed())
             && elapsed >= crate::app::CONNECT_STATE_FLOOR
@@ -935,7 +954,13 @@ impl DesktopPane {
                 true
             }
             LinkEvent::Frame(region) => {
-                if !self.surface.apply(&region) {
+                if self.reconnecting() {
+                    let mut next = DesktopSurface::new();
+                    if !next.apply(&region) {
+                        return true;
+                    }
+                    self.surface = next;
+                } else if !self.surface.apply(&region) {
                     // A region that does not fit its own desktop is refused rather
                     // than written past the canvas; the session keeps running.
                     return true;
@@ -1137,9 +1162,16 @@ impl DesktopPane {
         match state {
             LinkState::Idle | LinkState::Connecting => {
                 self.set_pointer(None);
-                if !matches!(self.phase, DesktopPhase::Live) {
-                    self.phase = DesktopPhase::Connecting;
+                if self.is_live() {
+                    self.input = InputQueue::new();
+                    self.last_sent = None;
+                    self.wheel_remainder = [0.0; 2];
+                    self.send_problem = None;
+                    self.stage = DesktopStage::Connecting;
+                    self.connecting_since = Some(std::time::Instant::now());
+                    self.wait_seconds = None;
                 }
+                self.phase = DesktopPhase::Connecting;
                 true
             }
             LinkState::Connected => {
@@ -1214,37 +1246,55 @@ impl DesktopPane {
         self.fail(LinkFailure::CertificateRejected, "", cx);
     }
 
-    /// The picture for the current canvas, rebuilt once per batch.
-    fn picture(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<Arc<RenderImage>> {
-        let (width, height) = self.surface.size();
-        if self.surface.is_empty() {
-            if let Some(old) = self.image.take() {
+    fn update_picture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.surface.size() != self.image_size {
+            for old in self.images.drain(..) {
                 cx.drop_image(old, Some(window));
             }
-            return None;
+            self.image_size = self.surface.size();
         }
-        let changed = self.surface.take_dirty();
-        if !changed && self.image.is_some() && self.image_size == (width, height) {
-            return self.image.clone();
+        let dirty: Vec<_> = self.surface.take_dirty_tiles().collect();
+        for index in dirty {
+            let (width, height, bytes) = self.surface.tile(index);
+            let buffer =
+                image::ImageBuffer::from_raw(width, height, bytes).expect("packed desktop tile");
+            let tile = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
+            if let Some(slot) = self.images.get_mut(index) {
+                cx.drop_image(std::mem::replace(slot, tile), Some(window));
+            } else {
+                self.images.push(tile);
+            }
         }
-        let Some(buffer) =
-            image::ImageBuffer::from_raw(width, height, self.surface.pixels().to_vec())
-        else {
-            return self.image.clone();
-        };
-        let frame = image::Frame::new(buffer);
-        let picture = Arc::new(RenderImage::new(vec![frame]));
-        // Each RenderImage has its own atlas key, even when the dimensions match.
-        if let Some(old) = self.image.replace(picture.clone()) {
-            cx.drop_image(old, Some(window));
-        }
-        self.image_size = (width, height);
-        Some(picture)
+    }
+
+    /// Position both sides from the same source edges so adjacent tiles meet at every zoom.
+    fn picture_tiles(&self, rect: Bounds<Pixels>) -> impl Iterator<Item = gpui::Img> + '_ {
+        use crate::app::desktop::DESKTOP_TILE;
+        let (width, height) = self.image_size;
+        let cols = width.div_ceil(DESKTOP_TILE);
+        self.images.iter().enumerate().map(move |(i, tile)| {
+            let x = i as u32 % cols * DESKTOP_TILE;
+            let y = i as u32 / cols * DESKTOP_TILE;
+            let left = rect.size.width * (x as f32 / width as f32);
+            let top = rect.size.height * (y as f32 / height as f32);
+            let right = rect.size.width * ((x + DESKTOP_TILE).min(width) as f32 / width as f32);
+            let bottom = rect.size.height * ((y + DESKTOP_TILE).min(height) as f32 / height as f32);
+            img(tile.clone())
+                .absolute()
+                .left(left)
+                .top(top)
+                .w(right - left)
+                .h(bottom - top)
+                .object_fit(gpui::ObjectFit::Fill)
+        })
     }
 
     // ---------------------------------------------------------------- input
 
     fn flush_input(&mut self) {
+        if self.reconnecting() {
+            return;
+        }
         let Some(link) = self.link.as_ref() else {
             return;
         };
@@ -1290,7 +1340,7 @@ impl DesktopPane {
             self.flush_input();
         }
         self.last_sent = None;
-        self.wheel_remainder = 0.0;
+        self.wheel_remainder = [0.0; 2];
     }
 
     /// The remote pixel under a window position, through the fit the picture is
@@ -1300,7 +1350,7 @@ impl DesktopPane {
     /// measured from the last painted frame, so entering or leaving the full screen
     /// changes the numbers the pointer is mapped through and nothing else.
     fn remote_point(&self, position: gpui::Point<Pixels>) -> Option<(u16, u16)> {
-        if self.certificate.is_some() {
+        if self.certificate.is_some() || !self.is_live() {
             return None;
         }
         to_remote_in(
@@ -1351,12 +1401,15 @@ impl DesktopPane {
     }
 
     fn on_mouse_up(&mut self, button: MouseButton, event: &MouseUpEvent, cx: &mut Context<Self>) {
-        if self.certificate.is_some() {
+        if self.certificate.is_some() || !self.is_live() {
             return;
         }
         let Some(bit) = pointer_button(button) else {
             return;
         };
+        if !self.input.held_buttons().contains(bit) {
+            return;
+        }
         let buttons = self.input.held_buttons().without(bit);
         let position = self
             .remote_point(event.position)
@@ -1372,43 +1425,37 @@ impl DesktopPane {
             ScrollDelta::Lines(delta) => (delta.x, delta.y),
             ScrollDelta::Pixels(delta) => (f32::from(delta.x) / 40.0, f32::from(delta.y) / 40.0),
         };
-        if !self.zoom.is_fit() && event.modifiers.shift {
-            // A picture larger than the pane is moved by the wheel the user holds
-            // Shift for, so the plain wheel keeps going to the remote application
-            // as it always did (R18).
-            let scale = 40.0;
-            self.wheel_remainder = 0.0;
-            self.pan_by(-dx * scale, -dy * scale, cx);
-            return;
-        }
-        // The pointer a wheel step is sent at is the one the event was caused at,
-        // which GPUI reports in the event rather than in the scroll delta.
         let Some((x, y)) = self.remote_point(event.position) else {
             return;
         };
-        let delta = if dy.abs() >= dx.abs() { dy } else { dx };
-        if matches!(event.touch_phase, gpui::TouchPhase::Started)
-            || self.wheel_remainder * delta < 0.0
-        {
-            self.wheel_remainder = 0.0;
-        }
-        let total = self.wheel_remainder + delta;
-        let steps = total.trunc().clamp(-10.0, 10.0) as i32;
-        self.wheel_remainder = if matches!(event.touch_phase, gpui::TouchPhase::Ended) {
-            0.0
-        } else {
-            total.fract()
-        };
-        if steps == 0 {
+        cx.stop_propagation();
+        if !self.zoom.is_fit() && event.modifiers.shift {
+            self.wheel_remainder = [0.0; 2];
+            self.pan_by(-dx * 40.0, -dy * 40.0, cx);
             return;
         }
-        let step = if steps < 0 {
-            Buttons::WHEEL_UP
-        } else {
-            Buttons::WHEEL_DOWN
-        };
-        for _ in 0..steps.unsigned_abs() {
-            self.input.push_wheel(x, y, step);
+        // GPUI deltas describe content movement. Negative Y reveals later rows
+        // and negative X reveals columns to the right. Keep sub-notch motion
+        // across short touchpad gestures, independently for each axis.
+        let mut sent = false;
+        for (remainder, (delta, positive, negative)) in self.wheel_remainder.iter_mut().zip([
+            (dy, Buttons::WHEEL_UP, Buttons::WHEEL_DOWN),
+            (dx, Buttons::WHEEL_LEFT, Buttons::WHEEL_RIGHT),
+        ]) {
+            if *remainder * delta < 0.0 {
+                *remainder = 0.0;
+            }
+            let total = *remainder + delta;
+            *remainder = total.fract();
+            let steps = total.trunc().clamp(-10.0, 10.0) as i32;
+            let button = if steps > 0 { positive } else { negative };
+            for _ in 0..steps.unsigned_abs() {
+                self.input.push_wheel(x, y, button);
+                sent = true;
+            }
+        }
+        if !sent {
+            return;
         }
         self.last_sent = Some((x, y));
         self.flush_input();
@@ -1489,6 +1536,9 @@ impl DesktopPane {
                 _ => {}
             }
         }
+        if self.reconnecting() {
+            return;
+        }
         if keystroke.modifiers.platform && !cfg!(target_os = "macos") {
             // The Windows or Super key is not forwarded (see remote_modifiers), so a
             // key pressed with it would reach the remote side as its bare letter -
@@ -1550,9 +1600,20 @@ impl DesktopPane {
             }
             return;
         }
+        if self.reconnecting() {
+            return;
+        }
         let Some(codes) = key_codes(&event.keystroke.key) else {
             return;
         };
+        if !self
+            .input
+            .held_keys()
+            .iter()
+            .any(|held| held.scancode == codes.scancode && held.extended == codes.extended)
+        {
+            return;
+        }
         self.input.push_key(codes, false);
         self.flush_input();
         cx.stop_propagation();
@@ -1577,7 +1638,14 @@ impl DesktopPane {
             ),
             DesktopPhase::Connecting => (
                 Tone::Neutral,
-                self.stage.headline(strings).to_owned(),
+                if self.reconnecting() {
+                    crate::app::copy::fill(
+                        crate::app::copy::ux_for(self.locale).banner_reconnecting,
+                        &[("target", &self.target.target())],
+                    )
+                } else {
+                    self.stage.headline(strings).to_owned()
+                },
                 match self.wait_seconds {
                     Some(seconds) => format!(
                         "{}  ·  {} {}:{:02}",
@@ -2125,11 +2193,11 @@ impl Render for DesktopPane {
         {
             self.flush_input();
         }
-        let picture = self.picture(window, cx);
+        self.update_picture(window, cx);
         // Whether the picture is what the body shows. The status card below stands in
         // for it while it is absent, and the warning strip belongs over the picture
         // only: drawing both would say the same thing twice before the first frame.
-        let has_picture = picture.is_some();
+        let has_picture = !self.images.is_empty();
         let entity = cx.entity().downgrade();
 
         let mut body = div()
@@ -2190,9 +2258,6 @@ impl Render for DesktopPane {
                     this.on_mouse_up(MouseButton::Right, event, cx);
                 }),
             )
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
-                this.on_scroll(event, cx);
-            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key_down(event, window, cx);
             }))
@@ -2217,85 +2282,106 @@ impl Render for DesktopPane {
                 }
             }));
 
-        match picture {
-            Some(picture) => {
-                // The image is drawn with the fit its own inverse expects, so the
-                // pixel under the pointer is the pixel that was drawn there (R18).
-                // At the Fit step that fit is GPUI's own Contain over the whole
-                // pane; at a zoom step the picture is drawn at the size the
-                // geometry says and moved by the pan, and the pane crops it.
-                // Share the fitted and panned rectangle with pointer hit testing.
-                // Bounds use window coordinates; the image is placed in its pane.
-                let image = if let Some(viewport) = self.viewport {
-                    let rect = content_rect_in(viewport, self.surface.size(), self.zoom, self.pan);
-                    let mut picture_layer = div()
-                        .absolute()
-                        .overflow_hidden()
-                        .left(rect.origin.x - viewport.origin.x)
-                        .top(rect.origin.y - viewport.origin.y)
-                        .w(rect.size.width)
-                        .h(rect.size.height)
-                        .debug_selector(|| "desktop.picture".to_owned())
-                        .child(img(picture).size_full());
-                    let position = window.mouse_position();
-                    if self.is_live()
-                        && self.controls_hovered
-                        && !self.bar_hovered
-                        && self.certificate.is_none()
-                        && rect.contains(&position)
-                        && let Some(PointerShape::Bitmap {
-                            width,
-                            height,
-                            hotspot,
-                            ..
-                        }) = &self.pointer_shape
-                        && let Some(cursor) = &self.pointer_image
-                    {
-                        let scale = rect.size.width / self.surface.size().0 as f32;
-                        picture_layer = picture_layer.child(
-                            img(cursor.clone())
-                                .absolute()
-                                .debug_selector(|| "desktop.pointer".to_owned())
-                                .left(position.x - rect.origin.x - scale * f32::from(hotspot.0))
-                                .top(position.y - rect.origin.y - scale * f32::from(hotspot.1))
-                                .w(scale * f32::from(*width))
-                                .h(scale * f32::from(*height)),
-                        );
-                    }
-                    cursor_over(picture_layer, self.surface_cursor()).into_any_element()
-                } else {
-                    img(picture)
-                        .size_full()
-                        .object_fit(gpui::ObjectFit::Contain)
-                        .into_any_element()
-                };
-                let surface = div()
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
+        #[cfg(test)]
+        {
+            self.presented_cursor = CursorStyle::Arrow;
+        }
+        if has_picture {
+            // The image is drawn with the fit its own inverse expects, so the
+            // pixel under the pointer is the pixel that was drawn there (R18).
+            // At the Fit step that fit is GPUI's own Contain over the whole
+            // pane; at a zoom step the picture is drawn at the size the
+            // geometry says and moved by the pan, and the pane crops it.
+            // Share the fitted and panned rectangle with pointer hit testing.
+            // Bounds use window coordinates; the image is placed in its pane.
+            let image = if let Some(viewport) = self.viewport {
+                let rect = content_rect_in(viewport, self.surface.size(), self.zoom, self.pan);
+                let mut picture_layer = div()
+                    .absolute()
                     .overflow_hidden()
-                    .debug_selector(|| "desktop.surface".to_owned())
-                    .child(image);
-                body = body.child(surface);
-            }
-            None => {
-                // A link that comes up in under the floor shows its picture instead of
-                // a card that flashes on the way; the pane keeps its space either way.
-                let early = matches!(self.phase, DesktopPhase::Connecting)
-                    && self
-                        .connecting_since
-                        .is_some_and(|since| since.elapsed() < crate::app::CONNECT_STATE_FLOOR);
-                body = body.child(if early || self.certificate.is_some() {
-                    div().flex_1()
-                } else {
-                    div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(self.status_card(metrics))
-                });
-            }
+                    .left(rect.origin.x - viewport.origin.x)
+                    .top(rect.origin.y - viewport.origin.y)
+                    .w(rect.size.width)
+                    .h(rect.size.height)
+                    .debug_selector(|| "desktop.picture".to_owned())
+                    .children(self.picture_tiles(rect));
+                let position = window.mouse_position();
+                let mut style = self.fallback_cursor();
+                if self.is_live()
+                    && self.controls_hovered
+                    && !self.bar_hovered
+                    && self.certificate.is_none()
+                    && rect.contains(&position)
+                    && let Some(PointerShape::Bitmap {
+                        width,
+                        height,
+                        hotspot,
+                        ..
+                    }) = &self.pointer_shape
+                    && let Some(cursor) = &self.pointer_image
+                {
+                    style = CursorStyle::None;
+                    // Keep small shapes legible when fitting a large screen.
+                    let scale =
+                        px((f32::from(rect.size.width) / self.surface.size().0 as f32)
+                            .clamp(1.0, 2.0));
+                    picture_layer = picture_layer.child(
+                        img(cursor.clone())
+                            .absolute()
+                            .debug_selector(|| "desktop.pointer".to_owned())
+                            .left(position.x - rect.origin.x - scale * f32::from(hotspot.0))
+                            .top(position.y - rect.origin.y - scale * f32::from(hotspot.1))
+                            .w(scale * f32::from(*width))
+                            .h(scale * f32::from(*height)),
+                    );
+                }
+                #[cfg(test)]
+                {
+                    self.presented_cursor = style;
+                }
+                cursor_over(picture_layer, style).into_any_element()
+            } else {
+                div().size_full().into_any_element()
+            };
+            let surface = div()
+                .flex_1()
+                .min_h_0()
+                .relative()
+                .overflow_hidden()
+                .debug_selector(|| "desktop.surface".to_owned())
+                .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                    this.on_scroll(event, cx);
+                }))
+                .child(image);
+            body = body.child(surface);
+        } else {
+            // A link that comes up in under the floor shows its picture instead of
+            // a card that flashes on the way; the pane keeps its space either way.
+            let early = matches!(self.phase, DesktopPhase::Connecting)
+                && self
+                    .connecting_since
+                    .is_some_and(|since| since.elapsed() < crate::app::CONNECT_STATE_FLOOR);
+            body = body.child(if early || self.certificate.is_some() {
+                div().flex_1()
+            } else {
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(self.status_card(metrics))
+            });
+        }
+        if self.reconnecting() && self.certificate.is_none() {
+            body = body.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(self.status_card(metrics)),
+            );
         }
         if has_picture && let Some(notice) = self.notice_strip(metrics, cx) {
             body = body.child(notice);

@@ -142,7 +142,7 @@ impl Client {
         if self.config.host.is_empty() {
             return Err(crate::Error::Argument);
         }
-        let (sender, receiver) = input::channel();
+        let (sender, receiver) = input::channel(None);
         let emit = Arc::clone(&self.emit);
         let control = Arc::clone(&self.control);
         let config = Config {
@@ -278,10 +278,10 @@ pub(super) fn pointer_flags(previous: u32, buttons: u32) -> u16 {
         return 0x0200 | 0x0100 | 0x0088;
     }
     if buttons & SD_BUTTON_WHEEL_LEFT != 0 && previous & SD_BUTTON_WHEEL_LEFT == 0 {
-        return 0x0400 | 0x0078;
+        return 0x0400 | 0x0188;
     }
     if buttons & SD_BUTTON_WHEEL_RIGHT != 0 && previous & SD_BUTTON_WHEEL_RIGHT == 0 {
-        return 0x0400 | 0x0088;
+        return 0x0400 | 0x0078;
     }
     let mut flags = MOVE;
     for (mask, flag) in [
@@ -325,7 +325,9 @@ mod tests {
             pointer_flags(0, SD_BUTTON_WHEEL_DOWN),
             0x0200 | 0x0100 | 0x0088
         );
-        // The step bit clears again; that clearing is not a second wheel event.
+        assert_eq!(pointer_flags(0, SD_BUTTON_WHEEL_LEFT), 0x0400 | 0x0188);
+        assert_eq!(pointer_flags(0, SD_BUTTON_WHEEL_RIGHT), 0x0400 | 0x0078);
+        // Clearing the step bit does not generate a second wheel event.
         assert_eq!(pointer_flags(SD_BUTTON_WHEEL_UP, 0), 0x0800);
     }
 }

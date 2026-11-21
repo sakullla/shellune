@@ -48,6 +48,7 @@ pub(super) fn run(
                             return;
                         }
                         if attempt < super::ATTEMPTS && ended.failure == Failure::RemoteClosed {
+                            commands.disconnect();
                             publish(
                                 emit,
                                 control,
@@ -290,7 +291,7 @@ impl Session {
                 Ok(read) => {
                     self.stats.bytes += read as u64;
                     self.incoming.push(&chunk[..read]);
-                    self.messages()?;
+                    self.messages(commands)?;
                 }
                 Err(error)
                     if matches!(
@@ -318,12 +319,20 @@ impl Session {
         format.extend_from_slice(&[0, 0, 0]);
         self.send(&format)?;
 
-        // Only encodings this client decodes are requested. Hextile is offered
-        // first: it carries a screen of text and UI in a fraction of raw's bytes,
-        // and TigerVNC and libvncserver both speak it. Raw stays in the list so a
+        // Only encodings this client decodes are requested. ZRLE compresses tiles across updates;
+        // peers without it can select Hextile. Raw stays in the list so a
         // server that supports nothing else still has a way to answer.
-        let mut encodings: Vec<i32> =
-            vec![5, 0, 1, -223, -224, super::wire::RICH_CURSOR, -312, -313];
+        let mut encodings: Vec<i32> = vec![
+            16,
+            5,
+            0,
+            1,
+            -223,
+            -224,
+            super::wire::RICH_CURSOR,
+            -312,
+            -313,
+        ];
         if self.clipboard {
             encodings.push(EXTENDED_CLIPBOARD);
         }
@@ -362,7 +371,7 @@ impl Session {
     }
 
     /// Publishes available pixel bands and requests the next update at the end.
-    fn messages(&mut self) -> Result<(), Ended> {
+    fn messages(&mut self, commands: &Receiver<Command>) -> Result<(), Ended> {
         loop {
             let message = self
                 .incoming
@@ -381,6 +390,9 @@ impl Session {
                         .apply(rect)
                         .map_err(|reason| Ended::new(Failure::ProtocolFailure, reason))?
                     {
+                        if self.stats.frames == 0 {
+                            commands.resume();
+                        }
                         self.stats.frames += 1;
                         (self.emit)(event);
                     }
@@ -458,27 +470,24 @@ impl Session {
         self.send(&message)
     }
 
-    /// Pointer buttons use the RFB mask. A wheel step is one press and its release,
-    /// which is how a server sees a click of wheel button 4 or 5.
+    /// RFB buttons 4–7 are momentary wheel presses. Write each press and
+    /// release together so one wheel step needs only one transport flush.
     fn pointer(&mut self, x: u16, y: u16, buttons: u32) -> Result<(), Ended> {
-        let mask = (buttons & 0x7) as u8;
-        self.send_pointer(x, y, mask)?;
-        if buttons & 0x8 != 0 {
-            self.send_pointer(x, y, mask | 0x8)?;
-            self.send_pointer(x, y, mask)?;
+        let held = (buttons & 7) as u8;
+        let [xh, xl] = x.to_be_bytes();
+        let [yh, yl] = y.to_be_bytes();
+        let event = |mask| [5, mask, xh, xl, yh, yl];
+        if buttons & 0x78 == 0 {
+            return self.send(&event(held));
         }
-        if buttons & 0x10 != 0 {
-            self.send_pointer(x, y, mask | 0x10)?;
-            self.send_pointer(x, y, mask)?;
+        let mut messages = Vec::with_capacity(12);
+        for bit in [8, 16, 32, 64] {
+            if buttons & u32::from(bit) != 0 {
+                messages.extend_from_slice(&event(held | bit));
+                messages.extend_from_slice(&event(held));
+            }
         }
-        Ok(())
-    }
-
-    fn send_pointer(&mut self, x: u16, y: u16, mask: u8) -> Result<(), Ended> {
-        let mut message = vec![5u8, mask];
-        message.extend_from_slice(&x.to_be_bytes());
-        message.extend_from_slice(&y.to_be_bytes());
-        self.send(&message)
+        self.send(&messages)
     }
 
     fn offer(&mut self, entries: &[crate::ClipboardEntry]) -> Result<(), Ended> {

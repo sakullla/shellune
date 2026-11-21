@@ -18,10 +18,8 @@ pub(super) struct Bitmap<'a> {
     pub(super) bitmaps: (u16, u16),
     pub(super) bpp: u16,
     pub(super) compressed: bool,
-    /// The rectangle's bytes, from its first header byte to the end of the update.
-    /// A decoder consumes what the stream needs; `length` is what the server said.
+    /// Only this rectangle's bitmap stream, after any compression header.
     pub(super) data: &'a [u8],
-    pub(super) length: usize,
 }
 
 /// Reads the common BITMAP_DATA header used by both the slow and fast paths.
@@ -34,8 +32,12 @@ pub(super) fn rect<'a>(p: &mut Packet<'a>) -> io::Result<Bitmap<'a>> {
     if right < left || bottom < top {
         return Err(invalid("inverted RDP bitmap rectangle"));
     }
-    let width = right - left + 1;
-    let height = bottom - top + 1;
+    let width = (right - left)
+        .checked_add(1)
+        .ok_or_else(|| invalid("invalid bitmap width"))?;
+    let height = (bottom - top)
+        .checked_add(1)
+        .ok_or_else(|| invalid("invalid bitmap height"))?;
     // The header repeats the size; the destination extents stay authoritative so
     // a rectangle that disagrees with its own bounds is rejected below.
     let stated_width = p.le16()?;
@@ -51,13 +53,17 @@ pub(super) fn rect<'a>(p: &mut Packet<'a>) -> io::Result<Bitmap<'a>> {
     }
     let bpp = p.le16()?;
     let flags = p.le16()?;
-    let length = usize::try_from(p.le32()?).map_err(|_| invalid("RDP bitmap too long"))?;
-    if length == 0 {
-        return Err(invalid("empty RDP bitmap"));
+    let length = usize::from(p.le16()?);
+    let mut stream = Packet(p.take(length)?);
+    if flags & 1 != 0 && flags & 0x0400 == 0 {
+        stream.take(8)?; // TS_CD_HEADER is included in bitmapLength.
     }
-    // The declared length is not trusted for the cursor: some servers count header
-    // bytes they never write, and the decoder knows exactly how much it consumed.
-    let data = p.0;
+    if stream.0.is_empty()
+        || u64::from(stated_width) * u64::from(stated_height) * 4 > crate::MAX_FRAME_BYTES as u64
+    {
+        return Err(invalid("invalid bitmap size"));
+    }
+    let data = stream.0;
     Ok(Bitmap {
         x: left,
         y: top,
@@ -67,7 +73,6 @@ pub(super) fn rect<'a>(p: &mut Packet<'a>) -> io::Result<Bitmap<'a>> {
         bpp,
         compressed: flags & 1 != 0,
         data,
-        length,
     })
 }
 
@@ -329,23 +334,21 @@ fn delta(byte: u8) -> i32 {
 }
 
 /// Decodes one compressed rectangle into a packed BGRA image, top row first,
-/// together with the number of bytes the stream used. The consumed count is what
-/// the caller advances by: servers disagree about whether the compressed header's
-/// two-byte pad is counted in the rectangle's length.
+/// together with the number of bytes used by its codec.
 pub(super) fn decompress(bitmap: &Bitmap<'_>) -> io::Result<(Vec<u8>, usize)> {
     let width = usize::from(bitmap.bitmaps.0);
     let height = usize::from(bitmap.bitmaps.1);
     let mut failure = None;
     if bitmap.bpp == 32
-        && let Some((start, marker)) = planar_marker(bitmap.data, width, height)
+        && let Some(&marker @ (0x30 | 0x10)) = bitmap.data.first()
     {
         let planes: &[usize] = if marker == 0x30 {
             &[2, 1, 0]
         } else {
             &[3, 2, 1, 0]
         };
-        match planar_rle(&bitmap.data[start..], width, height, planes) {
-            Ok((pixels, used)) => return Ok((pixels, start + used)),
+        match planar_rle(bitmap.data, width, height, planes) {
+            Ok((pixels, used)) => return Ok((pixels, used)),
             Err(error) => failure = Some(error),
         }
     }
@@ -363,50 +366,19 @@ pub(super) fn decompress(bitmap: &Bitmap<'_>) -> io::Result<(Vec<u8>, usize)> {
     }
 }
 
-/// Finds the planar marker and the number of header bytes before it.
-///
-/// A bare marker is the protocol's own form. Some servers put the last three
-/// 16-bit fields of the compressed header in front of it — xrdp writes six of the
-/// eight bytes — so those are recognised by the scan width and the uncompressed
-/// size they must carry.
-fn planar_marker(data: &[u8], width: usize, height: usize) -> Option<(usize, u8)> {
-    let sizes_match = |scan: &[u8], raw: &[u8]| {
-        usize::from(u16::from_le_bytes([scan[0], scan[1]])) == width * 4
-            && usize::from(u16::from_le_bytes([raw[0], raw[1]])) == width * height * 4
-    };
-    if data.len() > 8
-        && data[0] == 0
-        && data[1] == 0
-        && matches!(data[8], 0x10 | 0x30)
-        && sizes_match(&data[2..4], &data[4..6])
-    {
-        return Some((8, data[8]));
-    }
-    if data.len() > 6 && matches!(data[6], 0x10 | 0x30) && sizes_match(&data[2..4], &data[4..6]) {
-        return Some((6, data[6]));
-    }
-    match data.first() {
-        Some(&marker @ (0x10 | 0x30)) => Some((0, marker)),
-        _ => None,
-    }
-}
-
-/// Copies one rectangle into the desktop buffer. `stride` is the buffer's row
-/// length in bytes; `desktop_height` bounds the copy so a lying header cannot
-/// write past the buffer.
-/// Copies one rectangle into the desktop buffer and reports how many of its bytes
-/// the stream used. `stride` is the buffer's row length in bytes;
-/// `desktop_height` bounds the copy so a lying header cannot write past the buffer.
+/// Paints a bounded bitmap into the negotiated desktop.
 pub(super) fn draw(
     frame: &mut [u8],
     stride: usize,
     desktop_height: u16,
     bitmap: &Bitmap<'_>,
-) -> io::Result<usize> {
+) -> io::Result<()> {
     if bitmap.width == 0 || bitmap.height == 0 {
         return Err(invalid("empty RDP bitmap rectangle"));
     }
-    if u32::from(bitmap.y) + u32::from(bitmap.height) > u32::from(desktop_height) {
+    if usize::from(bitmap.x) + usize::from(bitmap.width) > stride / 4
+        || u32::from(bitmap.y) + u32::from(bitmap.height) > u32::from(desktop_height)
+    {
         return Err(invalid("RDP bitmap lies outside the desktop"));
     }
     let row = stride
@@ -422,18 +394,20 @@ pub(super) fn draw(
     let row_bytes = usize::from(bitmap.width) * 4;
     // A decoded bitmap is packed BGRA at the bitmap's own size; only the part
     // that lands on the desktop is copied.
-    let (pixels, consumed) = if bitmap.compressed {
-        decompress(bitmap).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "{}x{} compressed bitmap: {error}",
-                    bitmap.bitmaps.0, bitmap.bitmaps.1
-                ),
-            )
-        })?
+    let pixels = if bitmap.compressed {
+        decompress(bitmap)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{}x{} compressed bitmap: {error}",
+                        bitmap.bitmaps.0, bitmap.bitmaps.1
+                    ),
+                )
+            })?
+            .0
     } else {
-        (unpack(bitmap)?, bitmap.length)
+        unpack(bitmap)?
     };
     let bitmap_row = usize::from(bitmap.bitmaps.0) * 4;
     if pixels.len() < bitmap_row * usize::from(bitmap.bitmaps.1) {
@@ -444,7 +418,7 @@ pub(super) fn draw(
         let start = row + line * stride;
         frame[start..start + row_bytes].copy_from_slice(&pixels[source..source + row_bytes]);
     }
-    Ok(consumed)
+    Ok(())
 }
 
 /// Expands an uncompressed rectangle into packed BGRA at its own size.
@@ -454,7 +428,7 @@ fn unpack(bitmap: &Bitmap<'_>) -> io::Result<Vec<u8>> {
     let source_row = match bitmap.bpp {
         32 => width * 4,
         24 => width * 3,
-        16 => width * 2,
+        15 | 16 => width * 2,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -462,7 +436,8 @@ fn unpack(bitmap: &Bitmap<'_>) -> io::Result<Vec<u8>> {
             ));
         }
     };
-    let needed = source_row
+    let source_stride = source_row.next_multiple_of(4);
+    let needed = source_stride
         .checked_mul(height)
         .ok_or_else(|| invalid("RDP bitmap size overflow"))?;
     if bitmap.data.len() < needed {
@@ -470,7 +445,8 @@ fn unpack(bitmap: &Bitmap<'_>) -> io::Result<Vec<u8>> {
     }
     let mut pixels = vec![0u8; width * height * 4];
     for line in 0..height {
-        let source = &bitmap.data[line * source_row..(line + 1) * source_row];
+        let offset = (height - 1 - line) * source_stride;
+        let source = &bitmap.data[offset..offset + source_row];
         let target = &mut pixels[line * width * 4..(line + 1) * width * 4];
         match bitmap.bpp {
             32 => target.copy_from_slice(source),
@@ -484,7 +460,7 @@ fn unpack(bitmap: &Bitmap<'_>) -> io::Result<Vec<u8>> {
                     pixel.copy_from_slice(&[bytes[0], bytes[1], bytes[2], 0xff]);
                 }
             }
-            16 => {
+            15 | 16 => {
                 for (pixel, bytes) in target
                     .as_chunks_mut::<4>()
                     .0
@@ -492,12 +468,17 @@ fn unpack(bitmap: &Bitmap<'_>) -> io::Result<Vec<u8>> {
                     .zip(source.as_chunks::<2>().0)
                 {
                     let value = u16::from_le_bytes([bytes[0], bytes[1]]);
-                    let red = ((value >> 10) & 0x1f) as u8;
-                    let green = ((value >> 5) & 0x1f) as u8;
+                    let (red, green) = if bitmap.bpp == 16 {
+                        let g = ((value >> 5) & 0x3f) as u8;
+                        ((value >> 11) as u8, (g << 2) | (g >> 4))
+                    } else {
+                        let g = ((value >> 5) & 0x1f) as u8;
+                        (((value >> 10) & 0x1f) as u8, (g << 3) | (g >> 2))
+                    };
                     let blue = (value & 0x1f) as u8;
                     pixel.copy_from_slice(&[
                         (blue << 3) | (blue >> 2),
-                        (green << 3) | (green >> 2),
+                        green,
                         (red << 3) | (red >> 2),
                         0xff,
                     ]);
@@ -533,9 +514,37 @@ mod tests {
             bitmaps: (width, height),
             bpp,
             compressed: true,
-            length: data.len(),
             data,
         }
+    }
+
+    #[test]
+    fn wire_lengths_separate_padded_raw_and_compressed_rectangles() {
+        let mut wire = Vec::new();
+        for field in [0u16, 0, 0, 1, 1, 2, 24, 0, 8] {
+            wire.extend(field.to_le_bytes());
+        }
+        wire.extend([1, 2, 3, 0, 4, 5, 6, 0]);
+        for flags in [1, 0x401] {
+            let header = if flags == 1 { 8 } else { 0 };
+            for field in [1u16, 0, 1, 0, 1, 1, 24, flags, 4 + header] {
+                wire.extend(field.to_le_bytes());
+            }
+            if header != 0 {
+                wire.extend([0, 0, 4, 0, 4, 0, 4, 0]);
+            }
+            wire.extend([0x81, 7, 8, 9]);
+        }
+        let mut p = Packet(&wire);
+        let mut frame = [0u8; 16];
+        draw(&mut frame, 8, 2, &rect(&mut p).unwrap()).unwrap();
+        assert_eq!(&frame[..4], &[4, 5, 6, 255]);
+        assert_eq!(&frame[8..12], &[1, 2, 3, 255]);
+        for _ in 0..2 {
+            draw(&mut frame, 8, 2, &rect(&mut p).unwrap()).unwrap();
+            assert_eq!(&frame[4..8], &[7, 8, 9, 255]);
+        }
+        assert!(p.0.is_empty());
     }
 
     #[test]

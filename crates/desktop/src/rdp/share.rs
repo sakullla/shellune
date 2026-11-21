@@ -4,6 +4,8 @@ use super::wire::{Packet, Security, invalid};
 use std::io::{self, Write};
 use zeroize::Zeroizing;
 
+const INPUT_FLAG_MOUSE_HWHEEL: u16 = 0x0100;
+
 fn words(values: &[u16]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
@@ -74,6 +76,7 @@ pub(super) struct Share {
     pub(super) height: u16,
     bpp: u16,
     server: u16,
+    pub(super) horizontal_wheel: bool,
 }
 
 pub(super) struct Control<'a> {
@@ -108,6 +111,7 @@ impl Share {
             height,
             bpp: 32,
             server: 0,
+            horizontal_wheel: false,
         }
     }
 
@@ -125,6 +129,7 @@ impl Share {
         let count = caps.le16()?;
         caps.take(2)?;
         let mut desktop = None;
+        let mut horizontal_wheel = false;
         for _ in 0..count {
             let kind = caps.le16()?;
             let length = caps
@@ -147,6 +152,8 @@ impl Share {
                     ));
                 }
                 desktop = Some((width, height, bpp));
+            } else if kind == 13 {
+                horizontal_wheel = cap.le16()? & INPUT_FLAG_MOUSE_HWHEEL != 0;
             }
         }
         caps.finish()?;
@@ -158,6 +165,7 @@ impl Share {
             height,
             bpp,
             server: control.source,
+            horizontal_wheel,
         })
     }
 
@@ -169,9 +177,7 @@ impl Share {
         // Slow-path updates and keyboard input. Only advertise orders/codecs that
         // can actually be rendered; the server falls back to bitmap rectangles.
         caps.add(1, &words(&[0, 0, 0x200, 0, 0, 0, 0, 0, 0, 0]));
-        // Bitmap capability: 32-bit rectangles, resizable desktop, and compression
-        // explicitly off — this client renders raw rectangles only, so asking for
-        // RLE and then refusing it would break every update.
+        // Prefer raw rectangles. Some servers still send classic compressed bitmaps.
         caps.add(
             2,
             &words(&[self.bpp, 1, 1, 1, self.width, self.height, 0, 1, 0, 0, 1, 0]),
@@ -182,7 +188,12 @@ impl Share {
         // TS_POINTER_CAPABILITYSET: 24-bit color pointers and cached shapes.
         caps.add(8, &words(&[1, super::pointer::CACHE_SIZE]));
         caps.add(9, &words(&[0, 0])); // share
-        let mut input = words(&[1, 0]); // scan code input
+        let wheel = if self.horizontal_wheel {
+            INPUT_FLAG_MOUSE_HWHEEL
+        } else {
+            0
+        };
+        let mut input = words(&[1 | wheel, 0]); // scan code and negotiated wheel input
         for v in [0x409u32, 4, 0, 12] {
             input.extend_from_slice(&v.to_le_bytes());
         }
