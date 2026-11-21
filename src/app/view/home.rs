@@ -21,17 +21,18 @@ use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, Div, FocusHandle, IntoElement, Pixels, Point, SharedString, Stateful,
-    WeakEntity, Window, div, px, uniform_list,
+    AnyElement, Context, Div, IntoElement, Pixels, Point, SharedString, Stateful, WeakEntity,
+    Window, div, px, uniform_list,
 };
-use shellune_core::{GroupPath, HostId, SessionKind, SessionState};
+use shellune_core::{GroupPath, HostId, ProtocolKind, SessionKind, SessionState};
 
 use super::shell::ModalContent;
 use crate::app::components::{self, ControlState, Variant};
 use crate::app::copy::{self, Strings, UxStrings};
 use crate::app::hosts::{
-    GroupAction, HomeSection, HostGroupRow, HostList, HostListRow, HostSort, HostStatusFilter,
-    HostView, QuickTarget, SelectionScope, format_unix, parse_quick_target,
+    GroupAction, HomeSection, HostList, HostListRow, HostProtocolFilter, HostSort,
+    HostStatusFilter, HostView, QuickTarget, SelectionScope, SidebarGroupRow, format_unix,
+    parse_quick_target,
 };
 use crate::app::icons::{self, Icon};
 use crate::app::nav::Destination;
@@ -144,6 +145,8 @@ struct ConnectionRowView {
     show_duplicate: bool,
     /// Whether the window is wide enough for the tag and time columns.
     show_meta: bool,
+    /// Whether any SSH host is currently selected, showing the SSH-only multi-select boundary.
+    selecting: bool,
 }
 
 /// One host of the list, with what its row shows.
@@ -216,6 +219,11 @@ impl ShelluneView {
         })
     }
 
+    /// Whether any saved record (SSH, RDP, VNC or Serial) has an open session in this window (R11).
+    pub(super) fn record_is_open(&self, id: HostId) -> bool {
+        self.host_is_open(id) || self.connection_is_open(id)
+    }
+
     // -----------------------------------------------------------------------
     // The places, the search and the menus
     // -----------------------------------------------------------------------
@@ -266,7 +274,7 @@ impl ShelluneView {
         self.home_direct_target().is_some()
             && !self
                 .hosts
-                .list(&self.book, &self.groups, &|id| self.host_is_open(id))
+                .list(&self.book, &self.groups, &|id| self.record_is_open(id))
                 .is_empty()
     }
 
@@ -404,17 +412,21 @@ impl ShelluneView {
         }
         let list = self
             .hosts
-            .list(&self.book, &self.groups, &|id| self.host_is_open(id));
+            .list(&self.book, &self.groups, &|id| self.record_is_open(id));
         // Behind the fading start the sidebar arrives first and the list just after it
         // (R3); at any other time both are simply there.
         page.flex_row()
-            .child(self.home_entrance(self.home_sidebar(&list, cx), "startup.page.sidebar", 0))
+            .child(self.home_entrance(
+                self.home_sidebar(&list, window, cx),
+                "startup.page.sidebar",
+                0,
+            ))
             .child(self.home_entrance(self.home_main(&list, window, cx), "startup.page.list", 1))
     }
 
     /// The sidebar: every record, the favourites, the recent hosts, the groups, and the
     /// local terminal at its foot. Folded, it is a rail of the same places as icons.
-    fn home_sidebar(&self, list: &HostList, cx: &mut Context<Self>) -> Div {
+    fn home_sidebar(&self, list: &HostList, window: &Window, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
         let ux = copy::ux();
@@ -541,7 +553,7 @@ impl ShelluneView {
                     })),
             );
         } else {
-            bar = bar.child(self.home_group_tree(&section, cx));
+            bar = bar.child(self.home_group_tree(&section, window, cx));
         }
 
         // The local terminal sits at the sidebar's foot: it is this computer, not a
@@ -561,7 +573,8 @@ impl ShelluneView {
         };
         let local_focus = self.sidebar_place_focus[3].clone();
         let local_focus_click = local_focus.clone();
-        bar.child(div().flex_1().min_h_0()).child(
+        bar.when(folded, |bar| bar.child(div().flex_1().min_h_0()))
+            .child(
             div()
                 .relative()
                 .flex()
@@ -601,9 +614,14 @@ impl ShelluneView {
         )
     }
 
-    /// The groups of the sidebar: the heading with "+", and the tree under it, each group
-    /// a place to show with its count (R18, ADR-3).
-    fn home_group_tree(&self, section: &HomeSection, cx: &mut Context<Self>) -> Div {
+    /// The groups of the sidebar: heading with "+", independent group locator, and a
+    /// virtualized `uniform_list` tree with O(1) focus (R9, R10, ADR-6).
+    fn home_group_tree(
+        &self,
+        section: &HomeSection,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let metrics = self.metrics();
         let ux = copy::ux();
         let heading = div()
@@ -625,120 +643,258 @@ impl ShelluneView {
                     })),
             );
 
-        let mut rows = div()
-            .id("hosts.groups.scroll")
-            .debug_selector(|| "hosts.groups".to_owned())
+        let locator = div()
             .flex()
-            .flex_col()
-            .flex_shrink()
-            .min_h_0()
+            .flex_none()
             .w_full()
-            .gap(metrics.scale(spacing::HALF))
-            .overflow_y_scroll();
-        // A row of the tree is a group to show. The hosts in no group are not one: every
-        // record reaches them, and their rows say they have no group.
-        let tree = self.group_tree_rows();
-        let groups: Vec<(usize, &HostGroupRow)> = tree
-            .iter()
-            .enumerate()
-            .filter(|(_, group)| group.path.is_some())
-            .collect();
-        for (position, (number, group)) in groups.iter().enumerate() {
-            let Some(path) = &group.path else {
-                continue;
-            };
-            let branch = groups
-                .get(position + 1)
-                .is_some_and(|(_, next)| next.depth > group.depth);
-            rows = rows.child(self.group_tree_row(group, path, *number, branch, section, cx));
-        }
-        // The tree follows the search, so an empty tree under a search only means the
-        // search hid the groups. The hint to make a group is for a book that has none.
-        let searching = !self.hosts.search().trim().is_empty()
-            || self.hosts.filter().status() != HostStatusFilter::Any;
-        if groups.is_empty() && !searching {
-            rows = rows.child(
-                div()
-                    .px(metrics.scale(spacing::TIGHT))
-                    .py(metrics.scale(spacing::HAIRLINE))
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .debug_selector(|| "hosts.groups.empty".to_owned())
-                    .child(ux.hosts_group_empty),
-            );
-        }
+            .min_w_0()
+            .debug_selector(|| "hosts.groups.search".to_owned())
+            .child(self.group_search.clone());
+
+        let rows = self.sidebar_group_rows();
+        let group_query_active = !self.hosts.group_query().trim().is_empty();
+        let host_narrowing = !self.hosts.search().trim().is_empty()
+            || self.hosts.filter().status() != HostStatusFilter::Any
+            || self.hosts.filter().protocol() != HostProtocolFilter::All;
+
+        let list_area = if rows.is_empty() {
+            let mut empty_box = div()
+                .id("hosts.groups.scroll")
+                .debug_selector(|| "hosts.groups".to_owned())
+                .track_focus(&self.group_list_focus)
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .gap(metrics.scale(spacing::HALF));
+            if group_query_active {
+                empty_box = empty_box.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .gap(metrics.scale(spacing::HALF))
+                        .px(metrics.scale(spacing::TIGHT))
+                        .py(metrics.scale(spacing::HAIRLINE))
+                        .debug_selector(|| "hosts.groups.nomatch".to_owned())
+                        .child(
+                            div()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .child(ux.hosts_group_no_match),
+                        )
+                        .child(
+                            components::compact_button(
+                                ux.hosts_group_search_clear,
+                                Variant::Ghost,
+                                metrics,
+                            )
+                            .id("hosts.groups.nomatch.clear")
+                            .debug_selector(|| "hosts.groups.nomatch.clear".to_owned())
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                this.clear_group_query(window, cx);
+                            })),
+                        ),
+                );
+            } else if !host_narrowing {
+                empty_box = empty_box.child(
+                    div()
+                        .px(metrics.scale(spacing::TIGHT))
+                        .py(metrics.scale(spacing::HAIRLINE))
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .debug_selector(|| "hosts.groups.empty".to_owned())
+                        .child(ux.hosts_group_empty),
+                );
+            }
+            empty_box
+        } else {
+            let rows_rc = Rc::new(rows);
+            let count = rows_rc.len();
+            let weak = cx.entity().downgrade();
+            let section_clone = section.clone();
+            let list_focused = self.group_list_focus.is_focused(window);
+            let focused_path = self.focused_group_path.clone();
+            let drawn = self.group_rows_drawn.clone();
+            let row_height = metrics.control_height() + metrics.scale(spacing::HALF);
+            let vlist = uniform_list("hosts.groups.list", count, move |range, _window, _cx| {
+                drawn.set(drawn.get().max(range.len()));
+                let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
+                for index in range {
+                    let row = &rows_rc[index];
+                    let is_focused =
+                        list_focused && focused_path.as_ref() == Some(&row.path);
+                    items.push(
+                        group_tree_row_element(
+                            row,
+                            index,
+                            &section_clone,
+                            is_focused,
+                            row_height,
+                            &weak,
+                            metrics,
+                        )
+                        .into_any_element(),
+                    );
+                }
+                items
+            })
+            .track_scroll(self.group_scroll.clone())
+            .flex_1()
+            .h_full()
+            .w_full()
+            .min_h_0()
+            .debug_selector(|| "hosts.groups.list".to_owned());
+
+            div()
+                .id("hosts.groups.scroll")
+                .debug_selector(|| "hosts.groups".to_owned())
+                .track_focus(&self.group_list_focus)
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(vlist)
+        };
+
         div()
             .flex()
             .flex_col()
-            .flex_shrink()
+            .flex_1()
             .min_h_0()
             .w_full()
             .gap(metrics.scale(spacing::HALF))
             .child(heading)
-            .child(rows)
+            .child(locator)
+            .child(list_area)
     }
 
-    /// The group tree the sidebar reads.
-    fn group_tree_rows(&self) -> Vec<HostGroupRow> {
+    /// The virtualized sidebar group rows (R9, R10).
+    pub(super) fn sidebar_group_rows(&self) -> Vec<SidebarGroupRow> {
         self.hosts
-            .group_tree(&self.book, &self.groups, &|id| self.host_is_open(id))
+            .sidebar_group_rows(&self.book, &self.groups, &|id| self.record_is_open(id))
     }
 
-    /// The keyboard stop of one sidebar group row, made the first time it is asked for.
-    pub(super) fn group_focus_handle(&self, path: &GroupPath, cx: &mut App) -> FocusHandle {
-        self.group_focus
-            .borrow_mut()
-            .entry(path.clone())
-            .or_insert_with(|| cx.focus_handle().tab_stop(true))
-            .clone()
+    /// Migrates `focused_group_path` after a group rename/delete/reload so it always
+    /// points at a visible group (or `None` when no group is visible) (R10).
+    pub(super) fn migrate_group_focus_after_change(&mut self, previous_index: Option<usize>) {
+        let drawn = self.drawn_group_paths();
+        if let Some(current) = &self.focused_group_path {
+            if let Some(idx) = drawn.iter().position(|path| path == current) {
+                self.group_scroll
+                    .scroll_to_item(idx, gpui::ScrollStrategy::Center);
+                return;
+            }
+            let next = previous_index
+                .and_then(|idx| drawn.get(idx))
+                .or_else(|| drawn.last())
+                .cloned();
+            self.focused_group_path = next.clone();
+            if let Some(target) = next
+                && let Some(idx) = drawn.iter().position(|path| *path == target)
+            {
+                self.group_scroll
+                    .scroll_to_item(idx, gpui::ScrollStrategy::Center);
+            }
+        }
     }
 
-    /// Lets go of the keyboard stops of groups that are no longer in the tree: a group
-    /// renamed or deleted takes its row's handle with it (T9).
-    pub(super) fn prune_group_focus(&self) {
-        let paths: std::collections::HashSet<GroupPath> =
-            crate::app::hosts::drawn_paths(&self.book, &self.groups)
-                .into_iter()
-                .collect();
-        self.group_focus
-            .borrow_mut()
-            .retain(|path, _| paths.contains(path));
+    /// Keeps `focused_group_path` aligned with the filtered rows while `group_query` changes.
+    pub(super) fn sync_focused_group_after_query(&mut self) {
+        let drawn = self.drawn_group_paths();
+        if drawn.is_empty() {
+            return;
+        }
+        let still_visible = self
+            .focused_group_path
+            .as_ref()
+            .is_some_and(|path| drawn.contains(path));
+        if !still_visible {
+            self.focused_group_path = drawn.first().cloned();
+            self.group_scroll
+                .scroll_to_item(0, gpui::ScrollStrategy::Top);
+        }
     }
 
-    /// The groups that hold a keyboard stop of their own, for a test.
+    /// Clears the independent sidebar group locator without touching host search/filters/sort,
+    /// and migrates keyboard focus safely back into the visible group tree (R9, R10).
+    pub(super) fn clear_group_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.group_search
+            .update(cx, |field, cx| field.set_text(String::new(), cx));
+        self.hosts.set_group_query(String::new());
+        let drawn = self.drawn_group_paths();
+        let target = self
+            .focused_group_path
+            .as_ref()
+            .filter(|path| drawn.contains(path))
+            .cloned()
+            .or_else(|| match self.hosts.section() {
+                HomeSection::Group(path) if drawn.contains(&path) => Some(path),
+                _ => drawn.first().cloned(),
+            });
+        if let Some(path) = target {
+            self.focus_group_row(&path, window, cx);
+        } else {
+            self.focused_group_path = None;
+            window.focus(&self.sidebar_place_focus[0].clone());
+            cx.notify();
+        }
+    }
+
+    /// Activates the highlighted (or first) group from the sidebar group locator on Enter (R9).
+    pub(super) fn activate_located_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let drawn = self.drawn_group_paths();
+        let target = self
+            .focused_group_path
+            .as_ref()
+            .filter(|path| drawn.contains(path))
+            .cloned()
+            .or_else(|| drawn.first().cloned());
+        if let Some(path) = target {
+            self.show_home_section(HomeSection::Group(path.clone()), cx);
+            self.focus_group_row(&path, window, cx);
+        }
+    }
+
+    /// The group that currently holds virtual keyboard focus, for compatibility with tests.
     #[cfg(test)]
     pub fn group_focus_paths_for_test(&self) -> Vec<GroupPath> {
-        let mut paths: Vec<GroupPath> = self.group_focus.borrow().keys().cloned().collect();
-        paths.sort();
-        paths
+        self.focused_group_path.iter().cloned().collect()
     }
 
     /// The sidebar group whose row holds the keys, if one does.
     pub(super) fn focused_group(&self, window: &Window) -> Option<GroupPath> {
-        self.group_focus
-            .borrow()
-            .iter()
-            .find(|(_, handle)| handle.is_focused(window))
-            .map(|(path, _)| path.clone())
+        if self.group_list_focus.is_focused(window) {
+            self.focused_group_path.clone()
+        } else {
+            None
+        }
     }
 
     /// The groups the sidebar draws, top to bottom: the rows the keyboard walks.
-    fn drawn_group_paths(&self) -> Vec<GroupPath> {
-        self.group_tree_rows()
+    pub(super) fn drawn_group_paths(&self) -> Vec<GroupPath> {
+        self.sidebar_group_rows()
             .into_iter()
-            .filter_map(|group| group.path)
+            .map(|row| row.path)
             .collect()
     }
 
-    /// Gives the keys to one sidebar group row.
+    /// Gives the keys to one sidebar group row and scrolls it into view (R10).
     pub(super) fn focus_group_row(
         &mut self,
         path: &GroupPath,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let handle = self.group_focus_handle(path, cx);
-        window.focus(&handle);
+        self.focused_group_path = Some(path.clone());
+        window.focus(&self.group_list_focus);
+        let drawn = self.drawn_group_paths();
+        if let Some(idx) = drawn.iter().position(|candidate| candidate == path) {
+            self.group_scroll
+                .scroll_to_item(idx, gpui::ScrollStrategy::Center);
+        }
         cx.notify();
     }
 
@@ -787,6 +943,41 @@ impl ShelluneView {
             Place(usize, HomeSection),
             Group(GroupPath),
             Local,
+        }
+
+        let group_search_focused = self.group_search.read(cx).focus_handle().is_focused(window);
+        if group_search_focused {
+            if self.workspace.destination() != Destination::Hosts || self.hosts_keys_blocked() {
+                return false;
+            }
+            let modifiers = &event.keystroke.modifiers;
+            if modifiers.number_of_modifiers() != 0 {
+                return false;
+            }
+            let key = event.keystroke.key.as_str();
+            if matches!(key, "up" | "down") {
+                let drawn = self.drawn_group_paths();
+                if drawn.is_empty() {
+                    return true;
+                }
+                let current_idx = self
+                    .focused_group_path
+                    .as_ref()
+                    .and_then(|p| drawn.iter().position(|c| c == p));
+                let next_idx = match (current_idx, key) {
+                    (Some(idx), "down") => (idx + 1).min(drawn.len() - 1),
+                    (Some(idx), "up") => idx.saturating_sub(1),
+                    (None, "down") => 0,
+                    (None, _) => drawn.len() - 1,
+                    _ => 0,
+                };
+                self.focused_group_path = Some(drawn[next_idx].clone());
+                self.group_scroll
+                    .scroll_to_item(next_idx, gpui::ScrollStrategy::Center);
+                cx.notify();
+                return true;
+            }
+            return false;
         }
 
         let focused_place = self
@@ -909,110 +1100,6 @@ impl ShelluneView {
         }
     }
 
-    /// One group of the sidebar: its chevron, its name and how many records it holds. A
-    /// press shows it; a right press, or the "⋯" the pointer reveals, offers to rename
-    /// or delete it. The row is a keyboard stop: with the keys on it, F2 renames and
-    /// Delete deletes (ADR-3).
-    ///
-    /// Only a branch has a chevron; a leaf keeps the chevron's room so names still line
-    /// up, but offers nothing to open.
-    fn group_tree_row(
-        &self,
-        group: &HostGroupRow,
-        path: &GroupPath,
-        number: usize,
-        branch: bool,
-        section: &HomeSection,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let metrics = self.metrics();
-        let path = path.clone();
-        let chosen = matches!(section, HomeSection::Group(shown) if *shown == path);
-        let label = path.segments().last().cloned().unwrap_or_default();
-        let chevron = if group.expanded {
-            Icon::ChevronDown
-        } else {
-            Icon::ChevronRight
-        };
-        let toggle_path = path.clone();
-        let pick_path = path.clone();
-        let more_path = path.clone();
-        let focus = self.group_focus_handle(&path, cx);
-        let focus_on_press = focus.clone();
-        let menu_path = path;
-        let ring = theme::swatch(palette::FOCUS_RING);
-        let more = components::icon_only_button(Icon::More, metrics)
-            .size(metrics.scale(CHEVRON_SIZE))
-            .invisible()
-            .group_hover(GROUP_ROW, |style| style.visible())
-            .id(SharedString::from(format!("hosts.tree.{number}.more")))
-            .debug_selector(move || format!("hosts.tree.{number}.more"))
-            .tooltip(components::tooltip(copy::ux().home_card_more))
-            .on_click(
-                cx.listener(move |this, event: &gpui::ClickEvent, _window, cx| {
-                    cx.stop_propagation();
-                    this.shell_menu_open = false;
-                    this.host_menu = None;
-                    this.home_menu = Some(HomeMenu::Group(more_path.clone(), event.position()));
-                    cx.notify();
-                }),
-            );
-        let toggle = if branch {
-            components::icon_only_button(chevron, metrics)
-                .size(metrics.scale(CHEVRON_SIZE))
-                .id(SharedString::from(format!("hosts.tree.{number}.toggle")))
-                .debug_selector(move || format!("hosts.tree.{number}.toggle"))
-                .on_click(cx.listener(move |this, _event, _window, cx| {
-                    cx.stop_propagation();
-                    this.toggle_group_row(Some(toggle_path.clone()), cx);
-                }))
-                .into_any_element()
-        } else {
-            div()
-                .flex_none()
-                .size(metrics.scale(CHEVRON_SIZE))
-                .into_any_element()
-        };
-        div()
-            .id(SharedString::from(format!("hosts.tree.{number}")))
-            .debug_selector(move || format!("hosts.tree.{number}"))
-            .group(GROUP_ROW)
-            .track_focus(&focus)
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(metrics.scale(spacing::HALF))
-            .w_full()
-            .min_w_0()
-            .pl(metrics.scale(GROUP_INDENT * group.depth as f32))
-            // The ring says which group the keys are on; its room is kept at rest so
-            // focusing a row moves nothing.
-            .border_1()
-            .border_color(theme::clear())
-            .rounded(px(radius::MEDIUM))
-            .focus(move |style| style.border_color(ring))
-            .child(toggle)
-            .child(
-                components::sidebar_item(Icon::Folder, label, Some(group.hosts), chosen, metrics)
-                    .flex_1(),
-            )
-            .child(more)
-            .on_click(cx.listener(move |this, _event, window, cx| {
-                window.focus(&focus_on_press);
-                this.show_home_section(HomeSection::Group(pick_path.clone()), cx);
-            }))
-            .on_mouse_down(
-                gpui::MouseButton::Right,
-                cx.listener(move |this, event: &gpui::MouseDownEvent, _window, cx| {
-                    cx.stop_propagation();
-                    this.shell_menu_open = false;
-                    this.host_menu = None;
-                    this.home_menu = Some(HomeMenu::Group(menu_path.clone(), event.position));
-                    cx.notify();
-                }),
-            )
-    }
-
     /// The right side of the page: the toolbar, what the page has to say, and the list.
     fn home_main(&self, list: &HostList, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics();
@@ -1064,12 +1151,16 @@ impl ShelluneView {
         }
         // A list narrowed or ordered by the filter menu says so, and offers one press to
         // drop it: a filter that hides hosts without naming itself is how a list looks
-        // empty for no reason (R4).
+        // empty for no reason (R4, R11).
         let status = self.hosts.filter().status();
+        let protocol = self.hosts.filter().protocol();
         let sort_applies = self.hosts.section() != HomeSection::Recent;
         let sort = self.hosts.sort();
         let sort_active = sort_applies && sort != HostSort::Saved;
-        if status != HostStatusFilter::Any || sort_active {
+        if status != HostStatusFilter::Any
+            || protocol != HostProtocolFilter::All
+            || sort_active
+        {
             let mut chips = div()
                 .flex()
                 .flex_none()
@@ -1077,6 +1168,20 @@ impl ShelluneView {
                 .flex_wrap()
                 .gap(metrics.scale(spacing::TIGHT))
                 .debug_selector(|| "hosts.filters".to_owned());
+            if protocol != HostProtocolFilter::All {
+                chips = chips.child(
+                    components::chip(format!("{} ×", protocol.label(ux)), Tone::Accent, metrics)
+                        .id("hosts.filter.protocol")
+                        .debug_selector(|| "hosts.filter.protocol".to_owned())
+                        .cursor_pointer()
+                        .tooltip(components::tooltip(ux.hosts_filter_clear))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.hosts.set_protocol_filter(HostProtocolFilter::All);
+                            this.hosts_cursor = None;
+                            cx.notify();
+                        })),
+                );
+            }
             if status != HostStatusFilter::Any {
                 chips = chips.child(
                     components::chip(format!("{} ×", status.label(ux)), Tone::Accent, metrics)
@@ -1115,6 +1220,7 @@ impl ShelluneView {
                         .debug_selector(|| "hosts.filter.clear".to_owned())
                         .on_click(cx.listener(|this, _event, _window, cx| {
                             this.hosts.set_status_filter(HostStatusFilter::Any);
+                            this.hosts.set_protocol_filter(HostProtocolFilter::All);
                             this.hosts.set_sort(HostSort::Saved);
                             this.hosts_cursor = None;
                             cx.notify();
@@ -1196,6 +1302,7 @@ impl ShelluneView {
             ));
 
         let narrowing = self.hosts.filter().status() != HostStatusFilter::Any
+            || self.hosts.filter().protocol() != HostProtocolFilter::All
             || (self.hosts.section() != HomeSection::Recent
                 && self.hosts.sort() != HostSort::Saved);
         let filter_open = self.home_menu == Some(HomeMenu::Filter);
@@ -1305,6 +1412,30 @@ impl ShelluneView {
             HomeMenu::Filter => {
                 let mut card = components::menu_card("hosts.filter.menu", metrics)
                     .w(metrics.scale(MENU_WIDTH))
+                    .child(components::menu_section(ux.hosts_protocol_label, metrics));
+                for protocol in HostProtocolFilter::ALL {
+                    let chosen = self.hosts.filter().protocol() == protocol;
+                    card = card.child(
+                        components::menu_entry(
+                            protocol.label(ux),
+                            protocol.debug_selector(),
+                            None,
+                            true,
+                            false,
+                            metrics,
+                        )
+                        .children(chosen.then(|| menu_check(metrics)))
+                        .on_click(cx.listener(
+                            move |this, _event, _window, cx| {
+                                this.hosts.set_protocol_filter(protocol);
+                                this.hosts_cursor = None;
+                                this.close_home_menu(cx);
+                            },
+                        )),
+                    );
+                }
+                card = card
+                    .child(components::menu_divider(metrics))
                     .child(components::menu_section(ux.hosts_status_label, metrics));
                 for status in HostStatusFilter::ALL {
                     let chosen = self.hosts.filter().status() == status;
@@ -1569,6 +1700,14 @@ impl ShelluneView {
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .child(SharedString::from(scope_text)),
             )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "hosts.selection.scope_note".to_owned())
+                    .child(ux.hosts_selection_ssh_only),
+            )
             .child(scopes)
             .child(
                 components::compact_button(ux.hosts_select_scope, Variant::Secondary, metrics)
@@ -1670,7 +1809,10 @@ impl ShelluneView {
         if book_empty && !searching {
             return self.home_welcome(cx);
         }
-        if searching || self.hosts.filter().status() != HostStatusFilter::Any {
+        if searching
+            || self.hosts.filter().status() != HostStatusFilter::Any
+            || self.hosts.filter().protocol() != HostProtocolFilter::All
+        {
             let clear = components::button_sized(
                 ux.hosts_filter_clear,
                 Variant::Secondary,
@@ -2028,6 +2170,7 @@ impl ShelluneView {
                         favorite: self.book.is_favorite(row.id),
                         show_duplicate,
                         show_meta,
+                        selecting: !self.hosts.selected().is_empty(),
                     }));
                     connections += 1;
                 }
@@ -2179,6 +2322,115 @@ impl ShelluneView {
             },
         ))
     }
+}
+
+/// One virtualized group row inside `hosts.groups.list` (R9, R10, ADR-6).
+///
+/// Carries no per-row `FocusHandle`: focus lives on the single container `group_list_focus`
+/// and is drawn via `is_focused`, keeping focus handles `O(1)` at any tree size.
+fn group_tree_row_element(
+    group: &SidebarGroupRow,
+    number: usize,
+    section: &HomeSection,
+    is_focused: bool,
+    row_height: Pixels,
+    weak: &WeakEntity<ShelluneView>,
+    metrics: Metrics,
+) -> Stateful<Div> {
+    let path = group.path.clone();
+    let chosen = matches!(section, HomeSection::Group(shown) if *shown == path);
+    let label = if group.show_full_path {
+        path.to_canonical()
+    } else {
+        path.segments().last().cloned().unwrap_or_default()
+    };
+    let chevron = if group.expanded {
+        Icon::ChevronDown
+    } else {
+        Icon::ChevronRight
+    };
+    let toggle_path = path.clone();
+    let pick_path = path.clone();
+    let more_path = path.clone();
+    let menu_path = path;
+    let toggle_weak = weak.clone();
+    let pick_weak = weak.clone();
+    let more_weak = weak.clone();
+    let menu_weak = weak.clone();
+    let ring = theme::swatch(palette::FOCUS_RING);
+    let more = components::icon_only_button(Icon::More, metrics)
+        .size(metrics.scale(CHEVRON_SIZE))
+        .invisible()
+        .group_hover(GROUP_ROW, |style| style.visible())
+        .id(SharedString::from(format!("hosts.tree.{number}.more")))
+        .debug_selector(move || format!("hosts.tree.{number}.more"))
+        .tooltip(components::tooltip(copy::ux().home_card_more))
+        .on_click(move |event: &gpui::ClickEvent, _window, cx| {
+            cx.stop_propagation();
+            let _ = more_weak.update(cx, |this, cx| {
+                this.shell_menu_open = false;
+                this.host_menu = None;
+                this.home_menu = Some(HomeMenu::Group(more_path.clone(), event.position()));
+                cx.notify();
+            });
+        });
+    let toggle = if group.has_children {
+        components::icon_only_button(chevron, metrics)
+            .size(metrics.scale(CHEVRON_SIZE))
+            .id(SharedString::from(format!("hosts.tree.{number}.toggle")))
+            .debug_selector(move || format!("hosts.tree.{number}.toggle"))
+            .on_click(move |_event, _window, cx| {
+                cx.stop_propagation();
+                let _ = toggle_weak.update(cx, |this, cx| {
+                    this.toggle_group_row(Some(toggle_path.clone()), cx);
+                });
+            })
+            .into_any_element()
+    } else {
+        div()
+            .flex_none()
+            .size(metrics.scale(CHEVRON_SIZE))
+            .into_any_element()
+    };
+    div()
+        .id(SharedString::from(format!("hosts.tree.{number}")))
+        .debug_selector(move || format!("hosts.tree.{number}"))
+        .group(GROUP_ROW)
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(metrics.scale(spacing::HALF))
+        .h(row_height)
+        .w_full()
+        .min_w_0()
+        .pl(metrics.scale(GROUP_INDENT * group.depth as f32))
+        .border_1()
+        .border_color(if is_focused { ring } else { theme::clear() })
+        .rounded(px(radius::MEDIUM))
+        .child(toggle)
+        .child(
+            components::sidebar_item(Icon::Folder, label, Some(group.hosts), chosen, metrics)
+                .flex_1(),
+        )
+        .child(more)
+        .on_click(move |_event, window, cx| {
+            let _ = pick_weak.update(cx, |this, cx| {
+                this.focus_group_row(&pick_path, window, cx);
+                this.show_home_section(HomeSection::Group(pick_path.clone()), cx);
+            });
+        })
+        .on_mouse_down(
+            gpui::MouseButton::Right,
+            move |event: &gpui::MouseDownEvent, _window, cx| {
+                cx.stop_propagation();
+                let _ = menu_weak.update(cx, |this, cx| {
+                    this.shell_menu_open = false;
+                    this.host_menu = None;
+                    this.home_menu = Some(HomeMenu::Group(menu_path.clone(), event.position));
+                    cx.notify();
+                });
+            },
+        )
 }
 
 /// The check that marks the current choice of a menu.
@@ -2438,16 +2690,29 @@ fn host_row_element(
                         }),
                 ),
         );
-    let beside = host.key_missing.clone().map(|(label, tip)| {
-        div()
-            .id(SharedString::from(format!("hosts.key-missing.{number}")))
-            .debug_selector(move || format!("hosts.key-missing.{number}"))
+    let beside = {
+        let mut badges = div()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::HALF))
             .min_w_0()
-            .flex_shrink()
-            .tooltip(components::tooltip(tip))
-            .child(components::chip_within(label, Tone::Warning, metrics))
-            .into_any_element()
-    });
+            .child(
+                components::tag(ProtocolKind::Ssh.label(), metrics)
+                    .debug_selector(move || format!("hosts.protocol.badge.{number}")),
+            );
+        if let Some((label, tip)) = host.key_missing.clone() {
+            badges = badges.child(
+                div()
+                    .id(SharedString::from(format!("hosts.key-missing.{number}")))
+                    .debug_selector(move || format!("hosts.key-missing.{number}"))
+                    .min_w_0()
+                    .flex_shrink()
+                    .tooltip(components::tooltip(tip))
+                    .child(components::chip_within(label, Tone::Warning, metrics)),
+            );
+        }
+        Some(badges.into_any_element())
+    };
     let last = host
         .last
         .clone()
@@ -2661,7 +2926,18 @@ fn connection_row_element(
                 let _ = menu_row.update(cx, |view, cx| view.open_host_menu(id, event, window, cx));
             },
         )
-        .child(super::host_avatar(connection.name.as_ref(), false, metrics))
+        .child(
+            div()
+                .id(SharedString::from(format!(
+                    "hosts.connection.leading.{number}"
+                )))
+                .flex_none()
+                .when(connection.selecting, |slot| {
+                    slot.opacity(0.45)
+                        .tooltip(components::tooltip(ux.hosts_selection_ssh_only))
+                })
+                .child(super::host_avatar(connection.name.as_ref(), false, metrics)),
+        )
         .child(row_text(
             connection.name.clone(),
             connection.target.clone(),

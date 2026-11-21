@@ -59,8 +59,8 @@ use crate::app::files::{
 use crate::app::forwarding::{ForwardCenter, ForwardConfirm};
 use crate::app::hosts::{
     ConnectionChoice, ConnectionDraft, ConnectionField, ConnectionFormField, GroupAction,
-    HostDraft, HostField, HostsPanel, ImportPanel, ProtocolDraft, group_path_from_text,
-    import_message, unimported_hosts,
+    HostDraft, HostField, HostProtocolFilter, HostSort, HostStatusFilter, HostsPanel, ImportPanel,
+    ProtocolDraft, group_path_from_text, import_message, unimported_hosts,
 };
 use crate::app::icons::{self, Icon};
 use crate::app::keymap::{self, Keymap, Problem};
@@ -547,6 +547,8 @@ pub struct ShelluneView {
     /// Whether the batch page is already asking the runner what happened.
     batch_polling: bool,
     hosts_search: Entity<TextField>,
+    /// Independent sidebar group locator input (R9).
+    group_search: Entity<TextField>,
     /// The six form fields, present only while the editor is open.
     host_fields: Option<HostFields>,
     /// The host form's three override numbers, present only while the editor is open
@@ -594,11 +596,16 @@ pub struct ShelluneView {
     hosts_rows_drawn: std::rc::Rc<std::cell::Cell<usize>>,
     /// The host or connection row currently highlighted by keyboard navigation or a single click.
     hosts_cursor: Option<HostId>,
-    /// The keyboard stop of each sidebar group row, made the first time the row is drawn.
-    ///
-    /// A group is renamed with F2 and deleted with Delete while its row holds the keys
-    /// (ADR-3), so every row needs a focus of its own that survives redraws.
-    group_focus: RefCell<HashMap<GroupPath, FocusHandle>>,
+    /// The virtualized sidebar group list's scroll handle (R10).
+    group_scroll: UniformListScrollHandle,
+    /// The widest slice of group rows one frame asked the group list to build (R10).
+    group_rows_drawn: std::rc::Rc<std::cell::Cell<usize>>,
+    /// Single O(1) keyboard focus container for the virtualized sidebar group list (R10).
+    group_list_focus: FocusHandle,
+    /// Virtual keyboard focus target inside the sidebar group list (R10).
+    focused_group_path: Option<GroupPath>,
+    /// Highlighted candidate index inside the host/connection form's searchable group picker (R12).
+    group_picker_highlight: usize,
     /// Keyboard stops for the Home sidebar's fixed places: All, Favorites, Recent, Local.
     sidebar_place_focus: [FocusHandle; 4],
     /// The host or connection row whose right-click menu is open, and where the pointer opened it.
@@ -2602,6 +2609,14 @@ impl ShelluneView {
             field.set_clearable(true, cx);
             field
         });
+        let group_search_placeholder =
+            copy::ux_for(workspace.locale()).hosts_group_search_placeholder;
+        let group_search = cx.new(|cx| {
+            let mut field = TextField::new(group_search_placeholder, cx);
+            field.set_leading_icon(Icon::Search, cx);
+            field.set_clearable(true, cx);
+            field
+        });
         let keys_search = cx.new(|cx| {
             let mut field = TextField::new(strings.keys_search_placeholder, cx);
             field.set_leading_icon(Icon::Search, cx);
@@ -2731,6 +2746,7 @@ impl ShelluneView {
             batch: crate::app::batch::BatchPanel::new(),
             batch_polling: false,
             hosts_search,
+            group_search,
             host_fields: None,
             import: ImportPanel::new(),
             import_path: None,
@@ -2743,7 +2759,11 @@ impl ShelluneView {
             hosts_scroll: UniformListScrollHandle::new(),
             hosts_rows_drawn: std::rc::Rc::new(std::cell::Cell::new(0)),
             hosts_cursor: None,
-            group_focus: RefCell::new(HashMap::new()),
+            group_scroll: UniformListScrollHandle::new(),
+            group_rows_drawn: std::rc::Rc::new(std::cell::Cell::new(0)),
+            group_list_focus: cx.focus_handle().tab_stop(true),
+            focused_group_path: None,
+            group_picker_highlight: 0,
             sidebar_place_focus: [
                 cx.focus_handle().tab_stop(true),
                 cx.focus_handle().tab_stop(true),
@@ -3540,7 +3560,9 @@ impl ShelluneView {
         self.hosts_search
             .update(cx, |field, cx| field.set_text(String::new(), cx));
         self.hosts.set_search(String::new());
-        self.hosts.clear_filters();
+        self.hosts.set_status_filter(HostStatusFilter::Any);
+        self.hosts.set_protocol_filter(HostProtocolFilter::All);
+        self.hosts.set_sort(HostSort::Saved);
         self.hosts_cursor = None;
         cx.notify();
     }
@@ -3550,7 +3572,7 @@ impl ShelluneView {
     pub(super) fn connectable_host_rows(&self) -> Vec<(usize, HostId)> {
         let list = self
             .hosts
-            .list(&self.book, &self.groups, &|id| self.host_is_open(id));
+            .list(&self.book, &self.groups, &|id| self.record_is_open(id));
         // The "connect to …" row of an address search is the list's first row.
         let mut snapshot_index = usize::from(self.home_direct_row(&list).is_some());
         let mut out = Vec::new();
@@ -4090,6 +4112,19 @@ impl ShelluneView {
             }
         };
 
+        let previous_drawn = self.drawn_group_paths();
+        let previous_focus_idx = self
+            .focused_group_path
+            .as_ref()
+            .and_then(|p| previous_drawn.iter().position(|candidate| candidate == p));
+        let renamed_target = match &action {
+            GroupAction::Rename(from) => group_path_from_text(editor.name())
+                .ok()
+                .flatten()
+                .map(|to| (from.clone(), to)),
+            _ => None,
+        };
+
         self.finish_group_write(writer);
         match outcome {
             Ok(outcome) => {
@@ -4102,15 +4137,28 @@ impl ShelluneView {
                     self.recheck_open_hosts();
                     self.hosts.retain_selected(&self.book);
                 }
-                // A renamed or deleted group takes its row's keyboard stop with it.
-                self.prune_group_focus();
+                if let Some((from, to)) = &renamed_target {
+                    if let Some(filter) = self.hosts.filter().group().cloned()
+                        && let Some(rebased) = rebase_group_path(&filter, from, to)
+                    {
+                        self.hosts.set_group_filter(Some(rebased));
+                    }
+                    if let Some(focused) = self.focused_group_path.clone()
+                        && let Some(rebased) = rebase_group_path(&focused, from, to)
+                    {
+                        self.focused_group_path = Some(rebased);
+                    }
+                }
+                // Migrate virtual focus after rename/delete to a valid visible group.
+                self.migrate_group_focus_after_change(previous_focus_idx);
                 self.group_problem = None;
                 let message = outcome.message;
                 self.close_group_dialog(cx);
-                // The group the change was about may have been renamed or removed, so a
-                // filter naming it would hide everything afterwards.
+                // The group the change was about may have been removed, so a filter naming
+                // it would hide everything afterwards.
+                let all_paths = crate::app::hosts::drawn_paths(&self.book, &self.groups);
                 if let Some(filter) = self.hosts.filter().group().cloned()
-                    && !self.groups.contains(&filter)
+                    && !all_paths.contains(&filter)
                 {
                     self.hosts.set_group_filter(None);
                 }
@@ -4161,6 +4209,47 @@ impl ShelluneView {
     #[cfg(test)]
     pub fn hosts_scroll(&self) -> &UniformListScrollHandle {
         &self.hosts_scroll
+    }
+
+    /// The widest slice of group rows one frame asked the virtualized sidebar group list to build (R10).
+    #[cfg(test)]
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn group_rows_drawn(&self) -> usize {
+        self.group_rows_drawn.get()
+    }
+
+    /// The virtualized sidebar group list's scroll handle, for tests (R10).
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn group_scroll(&self) -> &UniformListScrollHandle {
+        &self.group_scroll
+    }
+
+    /// How many focus handles the virtualized sidebar group list allocates (always O(1)) (R10).
+    #[cfg(test)]
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn group_focus_node_count_for_test(&self) -> usize {
+        1
+    }
+
+    /// The sidebar group locator field's focus handle, for tests (R9).
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn group_search_focus_for_test(&self, cx: &gpui::App) -> FocusHandle {
+        self.group_search.read(cx).focus_handle().clone()
+    }
+
+    /// Writes a query into the sidebar group locator field, for tests (R9).
+    #[cfg(any(test, feature = "ui-capture"))]
+    #[allow(dead_code)]
+    pub fn search_groups(&mut self, query: &str, cx: &mut Context<Self>) {
+        self.group_search
+            .update(cx, |field, cx| field.set_text(query, cx));
+        self.hosts.set_group_query(query);
+        self.sync_focused_group_after_query();
+        cx.notify();
     }
 
     /// The host list views, the open form and the last message.
@@ -4602,6 +4691,10 @@ impl ShelluneView {
             (
                 &self.hosts_search,
                 copy::ux_for(self.workspace.locale()).home_quick_placeholder,
+            ),
+            (
+                &self.group_search,
+                copy::ux_for(self.workspace.locale()).hosts_group_search_placeholder,
             ),
             (&self.keys_search, strings.keys_search_placeholder),
             (&self.remote_fields.password, strings.auth_password),
@@ -6770,6 +6863,26 @@ impl ShelluneView {
             }
         })
         .detach();
+
+        let group_search = self.group_search.clone();
+        let group_view = cx.entity().downgrade();
+        group_search.update(cx, |field, _cx| {
+            field.on_submit(move |_text, window, app| {
+                let _ = group_view.update(app, |view, cx| {
+                    view.activate_located_group(window, cx);
+                });
+                false
+            });
+        });
+        cx.observe(&group_search, |view, field, cx| {
+            let query = field.read(cx).text().to_owned();
+            if view.hosts.group_query() != query {
+                view.hosts.set_group_query(query);
+                view.sync_focused_group_after_query();
+                cx.notify();
+            }
+        })
+        .detach();
     }
 
     /// The host a search would open: the first one of the list as it is drawn, while a
@@ -7601,6 +7714,9 @@ impl ShelluneView {
                 }
                 let label = bad_field.label(self.strings());
                 self.hosts.set_message(format!("{label}: {problem}"), true);
+                if bad_field.is_basic() {
+                    self.host_body_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+                }
                 cx.notify();
                 return None;
             }
@@ -7661,6 +7777,18 @@ impl ShelluneView {
                             entity.update(cx, |f, cx| f.set_invalid(is_bad, cx));
                         }
                     }
+                }
+                if matches!(
+                    located,
+                    Some(Ok(
+                        HostField::Name
+                            | HostField::Address
+                            | HostField::Port
+                            | HostField::User
+                            | HostField::Group
+                    ))
+                ) {
+                    self.host_body_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
                 }
                 self.hosts.set_message(reason, true);
                 cx.notify();
@@ -12587,6 +12715,12 @@ impl ShelluneView {
             }
             self.toggle_files(id, cx);
             self.reclaim_focus(window, cx);
+            return true;
+        }
+        if self.workspace.destination() == Destination::Hosts
+            && self.group_search.read(cx).focus_handle().is_focused(window)
+        {
+            self.clear_group_query(window, cx);
             return true;
         }
         if self.workspace.destination() == Destination::Hosts
@@ -20880,6 +21014,23 @@ pub(crate) fn host_initials(name: &str) -> String {
         initials.extend(second.to_uppercase());
     }
     initials
+}
+
+/// Rebases `path` when ancestor `from` is renamed to `to`.
+fn rebase_group_path(path: &GroupPath, from: &GroupPath, to: &GroupPath) -> Option<GroupPath> {
+    if !path.starts_with(from) {
+        return None;
+    }
+    let suffix = &path.segments()[from.segments().len()..];
+    if suffix.is_empty() {
+        return Some(to.clone());
+    }
+    let mut joined = to.to_canonical();
+    for segment in suffix {
+        joined.push('/');
+        joined.push_str(segment);
+    }
+    GroupPath::parse(&joined).ok()
 }
 
 /// A rounded square with the initials of a host, so a list is scanned by name shape.

@@ -2929,6 +2929,50 @@ pub struct UxStrings {
     pub hosts_status_recent: &'static str,
     /// Status filter: a host the book never recorded a connection for
     pub hosts_status_never: &'static str,
+    /// Label of the protocol filter
+    pub hosts_protocol_label: &'static str,
+    /// Protocol filter: every protocol
+    pub hosts_protocol_all: &'static str,
+    /// Sidebar group locator placeholder
+    pub hosts_group_search_placeholder: &'static str,
+    /// Sidebar group locator empty result
+    pub hosts_group_no_match: &'static str,
+    /// Sidebar group locator clear button
+    pub hosts_group_search_clear: &'static str,
+    /// Multi-select scope boundary note: batch & move apply to SSH hosts only
+    pub hosts_selection_ssh_only: &'static str,
+    /// Group selector empty match hint in host/connection form
+    pub hosts_group_picker_empty: &'static str,
+    /// Validation: port is not a number
+    pub validation_port_not_number: &'static str,
+    /// Validation: port out of range
+    pub validation_port_range: &'static str,
+    /// Validation: address port conflicts with port field
+    pub validation_address_port_conflict: &'static str,
+    /// Validation: baud is not a number
+    pub validation_baud_not_number: &'static str,
+    /// Validation: baud out of range
+    pub validation_baud_range: &'static str,
+    /// Validation: data bits is not a number
+    pub validation_data_bits_not_number: &'static str,
+    /// Validation: data bits out of range
+    pub validation_data_bits_range: &'static str,
+    /// Validation: address is empty
+    pub validation_address_empty: &'static str,
+    /// Validation: address contains whitespace
+    pub validation_address_whitespace: &'static str,
+    /// Validation: user is empty
+    pub validation_user_empty: &'static str,
+    /// Validation: user contains whitespace
+    pub validation_user_whitespace: &'static str,
+    /// Validation: name is empty
+    pub validation_name_empty: &'static str,
+    /// Validation: serial device is empty
+    pub validation_device_empty: &'static str,
+    /// Validation: field contains control characters
+    pub validation_control_char: &'static str,
+    /// Validation: group path is invalid
+    pub validation_group_invalid: &'static str,
     /// Label of the selection scope
     pub hosts_scope_label: &'static str,
     /// Scope: the hosts the current search and filters keep
@@ -3592,6 +3636,28 @@ impl UxStrings {
             self.hosts_status_connected,
             self.hosts_status_recent,
             self.hosts_status_never,
+            self.hosts_protocol_label,
+            self.hosts_protocol_all,
+            self.hosts_group_search_placeholder,
+            self.hosts_group_no_match,
+            self.hosts_group_search_clear,
+            self.hosts_selection_ssh_only,
+            self.hosts_group_picker_empty,
+            self.validation_port_not_number,
+            self.validation_port_range,
+            self.validation_address_port_conflict,
+            self.validation_baud_not_number,
+            self.validation_baud_range,
+            self.validation_data_bits_not_number,
+            self.validation_data_bits_range,
+            self.validation_address_empty,
+            self.validation_address_whitespace,
+            self.validation_user_empty,
+            self.validation_user_whitespace,
+            self.validation_name_empty,
+            self.validation_device_empty,
+            self.validation_control_char,
+            self.validation_group_invalid,
             self.hosts_scope_label,
             self.hosts_scope_current,
             self.hosts_scope_all,
@@ -4059,6 +4125,28 @@ included",
     hosts_status_connected: "Connected now",
     hosts_status_recent: "Reached before",
     hosts_status_never: "Never reached",
+    hosts_protocol_label: "Protocol",
+    hosts_protocol_all: "All protocols",
+    hosts_group_search_placeholder: "Filter groups…",
+    hosts_group_no_match: "No matching groups",
+    hosts_group_search_clear: "Clear",
+    hosts_selection_ssh_only: "SSH hosts only",
+    hosts_group_picker_empty: "No matching group; save will create this path",
+    validation_port_not_number: "{text} is not a port number; use 1-65535",
+    validation_port_range: "{raw} is outside the valid range 1-65535",
+    validation_address_port_conflict: "The address names port {typed} but the port field says {field}; keep one of them",
+    validation_baud_not_number: "{text} is not a baud rate; use 50-4000000",
+    validation_baud_range: "{value} is outside the range 50-4000000 this build accepts",
+    validation_data_bits_not_number: "{text} is not a number of data bits; use 5-8",
+    validation_data_bits_range: "{value} is outside the range 5-8 this build accepts",
+    validation_address_empty: "Address is required",
+    validation_address_whitespace: "Address cannot contain whitespace",
+    validation_user_empty: "User is required",
+    validation_user_whitespace: "User cannot contain whitespace",
+    validation_name_empty: "Name is required",
+    validation_device_empty: "Serial device is required",
+    validation_control_char: "Cannot contain control characters",
+    validation_group_invalid: "Group path is invalid",
     hosts_scope_label: "Select from",
     hosts_scope_current: "Current results",
     hosts_scope_all: "All hosts",
@@ -4521,6 +4609,28 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     hosts_status_connected: "当前已连接",
     hosts_status_recent: "曾经连接过",
     hosts_status_never: "从未连接",
+    hosts_protocol_label: "协议",
+    hosts_protocol_all: "全部协议",
+    hosts_group_search_placeholder: "定位分组…",
+    hosts_group_no_match: "没有匹配的分组",
+    hosts_group_search_clear: "清除",
+    hosts_selection_ssh_only: "仅限 SSH 主机",
+    hosts_group_picker_empty: "没有匹配的分组，保存时将按输入路径创建",
+    validation_port_not_number: "{text} 不是有效端口号，请填写 1-65535",
+    validation_port_range: "{raw} 超出有效端口范围 1-65535",
+    validation_address_port_conflict: "地址中指定了端口 {typed}，但端口栏为 {field}，请只保留一个",
+    validation_baud_not_number: "{text} 不是有效波特率，请填写 50-4000000",
+    validation_baud_range: "{value} 超出支持的波特率范围 50-4000000",
+    validation_data_bits_not_number: "{text} 不是有效数据位，请填写 5-8",
+    validation_data_bits_range: "{value} 超出支持的数据位范围 5-8",
+    validation_address_empty: "请填写地址",
+    validation_address_whitespace: "地址不能包含空白字符",
+    validation_user_empty: "请填写用户名",
+    validation_user_whitespace: "用户名不能包含空白字符",
+    validation_name_empty: "请填写名称",
+    validation_device_empty: "请填写串口设备路径",
+    validation_control_char: "不能包含控制字符",
+    validation_group_invalid: "分组路径格式无效",
     hosts_scope_label: "选择范围",
     hosts_scope_current: "当前结果",
     hosts_scope_all: "全部主机",

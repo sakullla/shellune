@@ -1079,7 +1079,7 @@ impl HostDraft {
                 HostConfig::new("probe", "probe", 22, "probe").expect("valid probe")
             });
             if let Err(err) = probe.set_address(self.address.clone()) {
-                return Some((Ok(HostField::Address), err.to_string()));
+                return Some((Ok(HostField::Address), localized_host_error(&err)));
             }
         }
         if let Err(reason) = parse_port(&self.port) {
@@ -1091,7 +1091,7 @@ impl HostDraft {
                 HostConfig::new("probe", "probe", 22, "probe").expect("valid probe")
             });
             if let Err(err) = probe.set_user(self.user.clone()) {
-                return Some((Ok(HostField::User), err.to_string()));
+                return Some((Ok(HostField::User), localized_host_error(&err)));
             }
         }
         let effective = self.effective_name();
@@ -1100,14 +1100,14 @@ impl HostDraft {
                 HostConfig::new("probe", "probe", 22, "probe").expect("valid probe")
             });
             if let Err(err) = probe.set_name(effective) {
-                return Some((Ok(HostField::Name), err.to_string()));
+                return Some((Ok(HostField::Name), localized_host_error(&err)));
             }
         }
         let group_trimmed = self.group.trim();
         if !group_trimmed.is_empty()
             && let Err(err) = GroupPath::parse(group_trimmed)
         {
-            return Some((Ok(HostField::Group), err.to_string()));
+            return Some((Ok(HostField::Group), localized_group_error(&err)));
         }
         if let Err((field, problem)) = self.connection.resolve() {
             return Some((Err(field), connection_refusal(field, &problem)));
@@ -1128,13 +1128,13 @@ impl HostDraft {
             Some(saved) => {
                 let mut host = saved.clone();
                 host.set_name(self.effective_name())
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| localized_host_error(&error))?;
                 host.set_address(self.address.clone())
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| localized_host_error(&error))?;
                 host.set_port(u32::from(port.get()))
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| localized_host_error(&error))?;
                 host.set_user(self.user.clone())
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| localized_host_error(&error))?;
                 self.apply_group(&mut host)?;
                 // A blank field clears the path instead of storing an empty string, and
                 // the value is only ever the path to the key.
@@ -1151,7 +1151,7 @@ impl HostDraft {
                     port.get(),
                     self.user.clone(),
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| localized_host_error(&error))?;
                 self.apply_group(&mut host)?;
                 host.set_identity_file(self.identity_for_method());
                 self.apply_sign_in(&mut host);
@@ -1173,7 +1173,7 @@ impl HostDraft {
             host.set_group_path(None);
             return Ok(());
         }
-        let path = GroupPath::parse(text).map_err(|error| error.to_string())?;
+        let path = GroupPath::parse(text).map_err(|error| localized_group_error(&error))?;
         host.set_group_path(Some(path));
         Ok(())
     }
@@ -1281,20 +1281,37 @@ impl HostDraft {
     }
 }
 
-/// The reason a host form's keepalive numbers were refused, in one sentence.
-///
-/// The sentence names the field, because the form has three numbers and the user has to
-/// know which one to correct. The wording is the domain's own for a range refusal so the
-/// limit it names is the limit that really applies.
+/// The reason a host form's keepalive numbers were refused, in the active language.
 fn connection_refusal(field: ConnectionField, problem: &ConnectionInputError) -> String {
-    let name = field.id().replace('-', " ");
-    match problem {
-        ConnectionInputError::Missing => format!("{name} is empty; type a whole number"),
-        ConnectionInputError::NotANumber { text } => {
-            format!("{name}: {text} is not a whole number")
+    let locale = crate::app::copy::Locale::current();
+    let ux = crate::app::copy::ux_for(locale);
+    let detail = connection_problem_text(problem, locale);
+    format!("{}: {detail}", field.label(ux))
+}
+
+/// Localizes a domain SSH host validation error into the active window language.
+fn localized_host_error(error: &shellune_core::HostValidationError) -> String {
+    let ux = crate::app::copy::ux();
+    match error {
+        shellune_core::HostValidationError::EmptyName => ux.validation_name_empty.to_owned(),
+        shellune_core::HostValidationError::EmptyAddress => ux.validation_address_empty.to_owned(),
+        shellune_core::HostValidationError::AddressContainsWhitespace => {
+            ux.validation_address_whitespace.to_owned()
         }
-        ConnectionInputError::Negative { text } => format!("{name}: {text} is below zero"),
-        ConnectionInputError::Refused(error) => format!("{name}: {error}"),
+        shellune_core::HostValidationError::EmptyUser => ux.validation_user_empty.to_owned(),
+        shellune_core::HostValidationError::PortOutOfRange { value } => {
+            crate::app::copy::fill(ux.validation_port_range, &[("raw", &value.to_string())])
+        }
+    }
+}
+
+/// Localizes a group path parse error when the locale is not English, preserving
+/// detailed English diagnostics in English mode.
+fn localized_group_error(error: &impl std::fmt::Display) -> String {
+    if crate::app::copy::Locale::current() == crate::app::copy::Locale::English {
+        error.to_string()
+    } else {
+        crate::app::copy::ux().validation_group_invalid.to_owned()
     }
 }
 
@@ -1307,10 +1324,12 @@ fn parse_port(text: &str) -> Result<Port, String> {
     if text.is_empty() {
         return Ok(Port::DEFAULT);
     }
+    let ux = crate::app::copy::ux();
     let raw: u32 = text
         .parse()
-        .map_err(|_| format!("{text} is not a port number; use 1-65535"))?;
-    Port::new(raw).map_err(|error| error.to_string())
+        .map_err(|_| crate::app::copy::fill(ux.validation_port_not_number, &[("text", text)]))?;
+    Port::new(raw)
+        .map_err(|_| crate::app::copy::fill(ux.validation_port_range, &[("raw", &raw.to_string())]))
 }
 
 /// What the last action produced, in the words of the layer that produced it.
@@ -1339,6 +1358,8 @@ impl HostsMessage {
 pub struct HostsPanel {
     view: HostView,
     search: String,
+    /// Independent sidebar group locator query (R9): never alters host search or filters.
+    group_query: String,
     draft: Option<HostDraft>,
     /// The form of a connection whose protocol is not SSH (R2, R18).
     ///
@@ -1436,6 +1457,17 @@ impl HostsPanel {
     /// Sets the search phrase, which every view applies.
     pub fn set_search(&mut self, phrase: impl Into<String>) {
         self.search = phrase.into();
+    }
+
+    /// The independent sidebar group locator query (R9).
+    #[must_use]
+    pub fn group_query(&self) -> &str {
+        &self.group_query
+    }
+
+    /// Sets the sidebar group locator query without touching host search, filters or sort.
+    pub fn set_group_query(&mut self, query: impl Into<String>) {
+        self.group_query = query.into();
     }
 
     /// The open form, if any.
@@ -1686,6 +1718,14 @@ impl HostsPanel {
     pub fn set_status_filter(&mut self, status: HostStatusFilter) {
         if self.filter.status != status {
             self.filter.status = status;
+            self.pending_delete = None;
+        }
+    }
+
+    /// Narrows the list to one connection protocol, or drops that narrowing (R11).
+    pub fn set_protocol_filter(&mut self, protocol: HostProtocolFilter) {
+        if self.filter.protocol != protocol {
+            self.filter.protocol = protocol;
             self.pending_delete = None;
         }
     }
@@ -1967,6 +2007,133 @@ impl HostsPanel {
             .collect()
     }
 
+    /// Sidebar group rows for the virtualized group tree (R9, R10).
+    ///
+    /// Runs in `O(G + H * depth)` using precomputed child maps and ancestor counts so
+    /// hundreds of groups stay responsive. When `group_query` is non-empty, matches by
+    /// segment name or full canonical path (case-insensitive), keeps all ancestors,
+    /// auto-expands matched branches, ignores host-search hiding, and flags duplicate
+    /// leaf names so the renderer shows their full canonical path.
+    #[must_use]
+    pub fn sidebar_group_rows(
+        &self,
+        book: &HostBook,
+        groups: &GroupBook,
+        open: &dyn Fn(HostId) -> bool,
+    ) -> Vec<SidebarGroupRow> {
+        let mut counts: std::collections::HashMap<GroupPath, usize> =
+            std::collections::HashMap::new();
+        for host in book.hosts() {
+            if self.matches_without_group(book, host, open) {
+                let mut current = host.group_path();
+                while let Some(path) = current {
+                    *counts.entry(path.clone()).or_insert(0) += 1;
+                    current = path.parent();
+                }
+            }
+        }
+        let searched: BTreeSet<HostId> = book
+            .search_connections(&self.search)
+            .iter()
+            .map(ConnectionRecord::id)
+            .collect();
+        for record in book.connections() {
+            if self.matches_connection_without_group(book, record, &searched, open) {
+                let mut current = record.group_path();
+                while let Some(path) = current {
+                    *counts.entry(path.clone()).or_insert(0) += 1;
+                    current = path.parent();
+                }
+            }
+        }
+
+        let all_paths = drawn_paths(book, groups);
+        let query = self.group_query.trim().to_lowercase();
+        let query_active = !query.is_empty();
+        let narrow_search = !query_active && !self.search.trim().is_empty();
+
+        let (included, direct_matches, duplicate_leaves): (
+            BTreeSet<GroupPath>,
+            BTreeSet<GroupPath>,
+            BTreeSet<String>,
+        ) = if query_active {
+            let mut direct = BTreeSet::new();
+            let mut inc = BTreeSet::new();
+            let mut leaf_counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for path in &all_paths {
+                let canonical = path.to_canonical().to_lowercase();
+                if canonical.contains(&query) {
+                    direct.insert(path.clone());
+                    if let Some(leaf) = path.segments().last() {
+                        *leaf_counts.entry(leaf.to_lowercase()).or_insert(0) += 1;
+                    }
+                    let mut cur = Some(path.clone());
+                    while let Some(p) = cur {
+                        cur = p.parent();
+                        inc.insert(p);
+                    }
+                }
+            }
+            let dups = leaf_counts
+                .into_iter()
+                .filter(|(_, count)| *count > 1)
+                .map(|(leaf, _)| leaf)
+                .collect();
+            (inc, direct, dups)
+        } else {
+            let inc: BTreeSet<GroupPath> = all_paths
+                .into_iter()
+                .filter(|path| !narrow_search || counts.get(path).copied().unwrap_or(0) > 0)
+                .collect();
+            (inc, BTreeSet::new(), BTreeSet::new())
+        };
+
+        let mut children_map: std::collections::HashMap<Option<GroupPath>, Vec<GroupPath>> =
+            std::collections::HashMap::new();
+        for path in &included {
+            children_map
+                .entry(path.parent())
+                .or_default()
+                .push(path.clone());
+        }
+
+        let mut rows = Vec::with_capacity(included.len());
+        let mut stack: Vec<(GroupPath, usize)> = Vec::new();
+        if let Some(roots) = children_map.get(&None) {
+            for root in roots.iter().rev() {
+                stack.push((root.clone(), 0));
+            }
+        }
+        while let Some((path, depth)) = stack.pop() {
+            let children = children_map.get(&Some(path.clone()));
+            let has_children = children.is_some_and(|list| !list.is_empty());
+            let expanded = query_active || self.is_expanded(&path);
+            let matched = direct_matches.contains(&path);
+            let show_full_path = query_active
+                && matched
+                && path
+                    .segments()
+                    .last()
+                    .is_some_and(|leaf| duplicate_leaves.contains(&leaf.to_lowercase()));
+            rows.push(SidebarGroupRow {
+                hosts: counts.get(&path).copied().unwrap_or(0),
+                path,
+                depth,
+                expanded,
+                has_children,
+                matched,
+                show_full_path,
+            });
+            if expanded && let Some(children) = children {
+                for child in children.iter().rev() {
+                    stack.push((child.clone(), depth + 1));
+                }
+            }
+        }
+        rows
+    }
+
     /// Writes the headers of the whole tree, in order.
     fn push_tree(
         &self,
@@ -2127,13 +2294,20 @@ impl HostsPanel {
                 _ => return false,
             }
         }
-        self.matches_favorite(book, host.id()) && self.matches_status(book, host, open)
+        self.matches_favorite(book, host.id())
+            && self.matches_protocol(ProtocolKind::Ssh)
+            && self.matches_status(book, host, open)
     }
 
     /// Whether one record survives the favourites filter: every record does while it
     /// is off, and only a marked one while it is on.
     fn matches_favorite(&self, book: &HostBook, id: HostId) -> bool {
         !self.filter.favorites || book.is_favorite(id)
+    }
+
+    /// Whether a protocol survives the protocol filter.
+    fn matches_protocol(&self, protocol: ProtocolKind) -> bool {
+        self.filter.protocol.matches(protocol)
     }
 
     /// Whether one host survives everything but the group, for the tree that chooses it.
@@ -2145,6 +2319,7 @@ impl HostsPanel {
     ) -> bool {
         self.search_hits(host)
             && self.matches_favorite(book, host.id())
+            && self.matches_protocol(ProtocolKind::Ssh)
             && self.matches_status(book, host, open)
     }
 
@@ -2181,7 +2356,10 @@ impl HostsPanel {
     ) -> bool {
         // The phrase is matched by the book, which is the one matcher over names,
         // protocols and targets; this list only applies it to the records it draws.
-        if !searched.contains(&record.id()) || !self.matches_favorite(book, record.id()) {
+        if !searched.contains(&record.id())
+            || !self.matches_favorite(book, record.id())
+            || !self.matches_protocol(record.protocol())
+        {
             return false;
         }
         match self.filter.status {
@@ -2618,6 +2796,63 @@ impl HostStatusFilter {
     }
 }
 
+/// The connection protocol a host list is narrowed by (R11).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HostProtocolFilter {
+    /// Every protocol (SSH, RDP, VNC and Serial).
+    #[default]
+    All,
+    /// SSH hosts only.
+    Ssh,
+    /// RDP connections only.
+    Rdp,
+    /// VNC connections only.
+    Vnc,
+    /// Serial connections only.
+    Serial,
+}
+
+impl HostProtocolFilter {
+    /// Every protocol filter option, in menu order.
+    pub const ALL: [Self; 5] = [Self::All, Self::Ssh, Self::Rdp, Self::Vnc, Self::Serial];
+
+    /// Label of the protocol filter, in the active language.
+    #[must_use]
+    pub fn label(self, ux: &UxStrings) -> &'static str {
+        match self {
+            Self::All => ux.hosts_protocol_all,
+            Self::Ssh => ProtocolKind::Ssh.label(),
+            Self::Rdp => ProtocolKind::Rdp.label(),
+            Self::Vnc => ProtocolKind::Vnc.label(),
+            Self::Serial => ProtocolKind::Serial.label(),
+        }
+    }
+
+    /// Debug selector of the protocol filter entry, used by the tests.
+    #[must_use]
+    pub fn debug_selector(self) -> &'static str {
+        match self {
+            Self::All => "hosts.protocol.all",
+            Self::Ssh => "hosts.protocol.ssh",
+            Self::Rdp => "hosts.protocol.rdp",
+            Self::Vnc => "hosts.protocol.vnc",
+            Self::Serial => "hosts.protocol.serial",
+        }
+    }
+
+    /// Whether a record of `protocol` passes this filter.
+    #[must_use]
+    pub fn matches(self, protocol: ProtocolKind) -> bool {
+        match self {
+            Self::All => true,
+            Self::Ssh => protocol == ProtocolKind::Ssh,
+            Self::Rdp => protocol == ProtocolKind::Rdp,
+            Self::Vnc => protocol == ProtocolKind::Vnc,
+            Self::Serial => protocol == ProtocolKind::Serial,
+        }
+    }
+}
+
 /// The narrowing the list applies beside the search phrase.
 ///
 /// A group filter is a place in the tree and includes everything inside it, so picking
@@ -2626,6 +2861,7 @@ impl HostStatusFilter {
 pub struct HostFilter {
     group: Option<GroupPath>,
     status: HostStatusFilter,
+    protocol: HostProtocolFilter,
     /// Whether only the records marked as favourites are kept.
     favorites: bool,
 }
@@ -2643,6 +2879,12 @@ impl HostFilter {
         self.status
     }
 
+    /// The connection protocol the list is narrowed to (R11).
+    #[must_use]
+    pub fn protocol(&self) -> HostProtocolFilter {
+        self.protocol
+    }
+
     /// Whether only the favourite records are kept.
     #[cfg(test)]
     #[must_use]
@@ -2654,7 +2896,10 @@ impl HostFilter {
     #[cfg(test)]
     #[must_use]
     pub fn is_narrowing(&self) -> bool {
-        self.group.is_some() || self.status != HostStatusFilter::Any || self.favorites
+        self.group.is_some()
+            || self.status != HostStatusFilter::Any
+            || self.protocol != HostProtocolFilter::All
+            || self.favorites
     }
 }
 
@@ -2737,6 +2982,25 @@ pub struct HostGroupRow {
     pub hosts: usize,
     /// Whether its rows are drawn under it.
     pub expanded: bool,
+}
+
+/// One row of the virtualized sidebar group tree (R9, R10).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidebarGroupRow {
+    /// The canonical group path.
+    pub path: GroupPath,
+    /// Depth in the tree, starting at 0.
+    pub depth: usize,
+    /// Number of kept records (any protocol) inside this group and its descendants.
+    pub hosts: usize,
+    /// Whether this branch is currently expanded.
+    pub expanded: bool,
+    /// Whether this group has children in the current tree (independent of collapse state).
+    pub has_children: bool,
+    /// Whether this row directly matched an active `group_query`.
+    pub matched: bool,
+    /// Whether to display the full canonical path to distinguish duplicate leaf names.
+    pub show_full_path: bool,
 }
 
 /// One saved host of the flattened list.
@@ -3085,6 +3349,25 @@ pub(crate) fn drawn_paths(book: &HostBook, groups: &GroupBook) -> Vec<GroupPath>
         }
     }
     paths.into_iter().collect()
+}
+
+/// Saved group paths narrowed case-insensitively by what the user typed in the form's
+/// group field (R12). Empty input returns every saved group path in canonical order.
+#[must_use]
+pub(crate) fn filtered_group_paths(
+    book: &HostBook,
+    groups: &GroupBook,
+    query: &str,
+) -> Vec<GroupPath> {
+    let query = query.trim().to_lowercase();
+    let paths = drawn_paths(book, groups);
+    if query.is_empty() {
+        return paths;
+    }
+    paths
+        .into_iter()
+        .filter(|path| path.to_canonical().to_lowercase().contains(&query))
+        .collect()
 }
 
 /// The paths directly inside one parent, in order.
@@ -3855,22 +4138,56 @@ impl std::fmt::Display for ConnectionProblem {
     }
 }
 
-/// Names the field a domain refusal belongs to.
+/// Names the field a domain refusal belongs to, with a localized message.
 fn problem_of(error: shellune_core::ConnectionValidationError) -> ConnectionProblem {
     use shellune_core::ConnectionValidationError as Refusal;
-    let field = match error {
-        Refusal::EmptyAddress | Refusal::AddressContainsWhitespace => ConnectionFormField::Address,
-        Refusal::EmptyName => ConnectionFormField::Name,
-        Refusal::PortOutOfRange { .. } => ConnectionFormField::Port,
-        Refusal::UserContainsWhitespace => ConnectionFormField::User,
-        Refusal::EmptyDevice | Refusal::DeviceContainsControlCharacter => {
-            ConnectionFormField::Device
-        }
-        Refusal::DriveFolderContainsControlCharacter => ConnectionFormField::DriveFolder,
-        Refusal::BaudOutOfRange { .. } => ConnectionFormField::Baud,
-        Refusal::DataBitsOutOfRange { .. } => ConnectionFormField::DataBits,
+    let ux = crate::app::copy::ux();
+    let (field, reason) = match error {
+        Refusal::EmptyAddress => (
+            ConnectionFormField::Address,
+            ux.validation_address_empty.to_owned(),
+        ),
+        Refusal::AddressContainsWhitespace => (
+            ConnectionFormField::Address,
+            ux.validation_address_whitespace.to_owned(),
+        ),
+        Refusal::EmptyName => (
+            ConnectionFormField::Name,
+            ux.validation_name_empty.to_owned(),
+        ),
+        Refusal::PortOutOfRange { value } => (
+            ConnectionFormField::Port,
+            crate::app::copy::fill(ux.validation_port_range, &[("raw", &value.to_string())]),
+        ),
+        Refusal::UserContainsWhitespace => (
+            ConnectionFormField::User,
+            ux.validation_user_whitespace.to_owned(),
+        ),
+        Refusal::EmptyDevice => (
+            ConnectionFormField::Device,
+            ux.validation_device_empty.to_owned(),
+        ),
+        Refusal::DeviceContainsControlCharacter => (
+            ConnectionFormField::Device,
+            ux.validation_control_char.to_owned(),
+        ),
+        Refusal::DriveFolderContainsControlCharacter => (
+            ConnectionFormField::DriveFolder,
+            ux.validation_control_char.to_owned(),
+        ),
+        Refusal::BaudOutOfRange { value } => (
+            ConnectionFormField::Baud,
+            crate::app::copy::fill(ux.validation_baud_range, &[("value", &value.to_string())]),
+        ),
+        Refusal::DataBitsOutOfRange { value } => (
+            ConnectionFormField::DataBits,
+            crate::app::copy::fill(
+                ux.validation_data_bits_range,
+                &[("value", &value.to_string())],
+            ),
+        ),
     };
-    ConnectionProblem::new(field, error.to_string())
+    ConnectionProblem::new(field, reason)
 }
 
 /// Reads the port of a connection, falling back to the protocol's own default.
@@ -3881,16 +4198,17 @@ fn connection_port(text: &str) -> Result<Port, ConnectionProblem> {
         // filled in; reaching here is the same answer rather than a refusal.
         return Ok(Port::DEFAULT);
     }
+    let ux = crate::app::copy::ux();
     let raw: u32 = text.parse().map_err(|_| {
         ConnectionProblem::new(
             ConnectionFormField::Port,
-            format!("{text} is not a port number; use 1-65535"),
+            crate::app::copy::fill(ux.validation_port_not_number, &[("text", text)]),
         )
     })?;
     Port::new(raw).map_err(|_| {
         ConnectionProblem::new(
             ConnectionFormField::Port,
-            format!("{raw} is outside the valid range 1-65535"),
+            crate::app::copy::fill(ux.validation_port_range, &[("raw", &raw.to_string())]),
         )
     })
 }
@@ -3925,6 +4243,7 @@ fn desktop_endpoint(
     if !plain {
         return Ok((address.to_owned(), field_port));
     }
+    let ux = crate::app::copy::ux();
     let typed_port = typed
         .parse::<u32>()
         .ok()
@@ -3932,7 +4251,7 @@ fn desktop_endpoint(
         .ok_or_else(|| {
             ConnectionProblem::new(
                 ConnectionFormField::Address,
-                format!("{typed} is outside the valid range 1-65535"),
+                crate::app::copy::fill(ux.validation_port_range, &[("raw", typed)]),
             )
         })?;
     if field_port.get() == default_port || field_port == typed_port {
@@ -3940,10 +4259,12 @@ fn desktop_endpoint(
     }
     Err(ConnectionProblem::new(
         ConnectionFormField::Address,
-        format!(
-            "The address names port {} but the port field says {}; keep one of them",
-            typed_port.get(),
-            field_port.get()
+        crate::app::copy::fill(
+            ux.validation_address_port_conflict,
+            &[
+                ("typed", &typed_port.get().to_string()),
+                ("field", &field_port.get().to_string()),
+            ],
         ),
     ))
 }
@@ -3951,16 +4272,17 @@ fn desktop_endpoint(
 /// Reads a line speed, refusing anything the platform could not be asked for.
 fn parse_baud(text: &str) -> Result<u32, ConnectionProblem> {
     let text = text.trim();
+    let ux = crate::app::copy::ux();
     let value: u32 = text.parse().map_err(|_| {
         ConnectionProblem::new(
             ConnectionFormField::Baud,
-            format!("{text} is not a baud rate; use 50-4000000"),
+            crate::app::copy::fill(ux.validation_baud_not_number, &[("text", text)]),
         )
     })?;
     if !(shellune_core::MIN_SERIAL_BAUD..=shellune_core::MAX_SERIAL_BAUD).contains(&value) {
         return Err(ConnectionProblem::new(
             ConnectionFormField::Baud,
-            format!("{value} is outside the range 50-4000000 this build accepts"),
+            crate::app::copy::fill(ux.validation_baud_range, &[("value", &value.to_string())]),
         ));
     }
     Ok(value)
@@ -3969,17 +4291,21 @@ fn parse_baud(text: &str) -> Result<u32, ConnectionProblem> {
 /// Reads how many data bits one frame carries.
 fn parse_data_bits(text: &str) -> Result<u8, ConnectionProblem> {
     let text = text.trim();
+    let ux = crate::app::copy::ux();
     let value: u8 = text.parse().map_err(|_| {
         ConnectionProblem::new(
             ConnectionFormField::DataBits,
-            format!("{text} is not a number of data bits; use 5-8"),
+            crate::app::copy::fill(ux.validation_data_bits_not_number, &[("text", text)]),
         )
     })?;
     if !(shellune_core::MIN_SERIAL_DATA_BITS..=shellune_core::MAX_SERIAL_DATA_BITS).contains(&value)
     {
         return Err(ConnectionProblem::new(
             ConnectionFormField::DataBits,
-            format!("{value} is outside the range 5-8 this build accepts"),
+            crate::app::copy::fill(
+                ux.validation_data_bits_range,
+                &[("value", &value.to_string())],
+            ),
         ));
     }
     Ok(value)
@@ -4773,7 +5099,10 @@ mod tests {
             Some(ConnectionField::KeepaliveMisses)
         );
         let refusal = draft.build(None).expect_err("the form is refused");
-        assert!(refusal.contains("keepalive misses"), "{refusal}");
+        assert!(
+            refusal.contains(ConnectionField::KeepaliveMisses.label(crate::app::copy::ux())),
+            "{refusal}"
+        );
         assert_eq!(
             draft.connection().text(ConnectionField::KeepaliveMisses),
             "0",
@@ -4883,7 +5212,7 @@ mod tests {
         assert_eq!(draft.editing(), None);
         assert_eq!(
             draft.build(None),
-            Err("host name cannot be empty".to_owned())
+            Err(crate::app::copy::ux().validation_name_empty.to_owned())
         );
     }
 
@@ -5523,5 +5852,150 @@ mod tests {
         panel.clear_filters();
         assert!(!panel.filter().favorites(), "clearing the filters drops it");
         assert_eq!(panel.list(&book, &groups, &|_| false).matched_len(), 3);
+    }
+
+    #[test]
+    fn sidebar_group_query_keeps_ancestors_disambiguates_duplicate_leaves_and_ignores_host_search() {
+        let mut book = HostBook::new();
+        let mut groups = GroupBook::new();
+        let prod_web = GroupPath::parse("Prod/Web").expect("valid path");
+        let staging_web = GroupPath::parse("Staging/Web").expect("valid path");
+        let prod_db = GroupPath::parse("Prod/DB").expect("valid path");
+        groups.insert(&prod_web).expect("insert");
+        groups.insert(&staging_web).expect("insert");
+        groups.insert(&prod_db).expect("insert");
+
+        let mut h = host("only-db", "10.0.0.10", 22, "ops", None);
+        h.set_group_path(Some(prod_db.clone()));
+        book.insert(h).expect("insert host");
+
+        let mut panel = HostsPanel::new();
+        // Collapse Prod to confirm `has_children` stays true and `group_query` auto-expands it.
+        let prod = GroupPath::parse("Prod").expect("valid path");
+        panel.set_expanded(&prod, false);
+        let collapsed_rows = panel.sidebar_group_rows(&book, &groups, &|_| false);
+        let prod_row = collapsed_rows
+            .iter()
+            .find(|r| r.path == prod)
+            .expect("Prod row present");
+        assert!(
+            prod_row.has_children,
+            "collapsed parent must keep its branch chevron"
+        );
+        assert!(!prod_row.expanded);
+
+        // Set a host search that matches nothing; group locator must still find groups.
+        panel.set_search("no-such-host-anywhere");
+        panel.set_group_query("web");
+        let rows = panel.sidebar_group_rows(&book, &groups, &|_| false);
+        let paths: Vec<String> = rows.iter().map(|r| r.path.to_canonical()).collect();
+        assert_eq!(paths, vec!["Prod", "Prod/Web", "Staging", "Staging/Web"]);
+        assert!(rows.iter().all(|r| r.expanded), "matched paths auto-expand");
+        let prod_web_row = rows.iter().find(|r| r.path == prod_web).unwrap();
+        let staging_web_row = rows.iter().find(|r| r.path == staging_web).unwrap();
+        assert!(prod_web_row.show_full_path, "duplicate leaf shows full path");
+        assert!(
+            staging_web_row.show_full_path,
+            "duplicate leaf shows full path"
+        );
+
+        // Clearing group_query leaves host search untouched.
+        panel.set_group_query("");
+        assert_eq!(panel.search(), "no-such-host-anywhere");
+    }
+
+    #[test]
+    fn protocol_filter_combines_with_connected_status_across_all_protocols() {
+        let mut book = HostBook::new();
+        let groups = GroupBook::new();
+        let ssh = host("ssh-box", "10.0.0.1", 22, "ops", None);
+        let ssh_id = ssh.id();
+        book.insert(ssh).expect("ssh");
+
+        let rdp = rdp_record("rdp-box", "10.0.0.2", "admin");
+        let rdp_id = rdp.id();
+        book.insert_connection(rdp).expect("rdp");
+
+        let vnc = ConnectionRecord::Vnc(
+            VncConfig::new("vnc-box", "10.0.0.3").expect("valid vnc"),
+        );
+        let vnc_id = vnc.id();
+        book.insert_connection(vnc).expect("vnc");
+
+        let serial = serial_record("com-box", "/dev/ttyUSB0");
+        let serial_id = serial.id();
+        book.insert_connection(serial).expect("serial");
+
+        let mut panel = HostsPanel::new();
+        let open_all = |id: HostId| id == ssh_id || id == rdp_id || id == vnc_id || id == serial_id;
+        assert_eq!(panel.list(&book, &groups, &open_all).matched_len(), 4);
+
+        // Connected status filter sees all 4 protocols when open_all is passed.
+        panel.set_status_filter(HostStatusFilter::Connected);
+        assert_eq!(panel.list(&book, &groups, &open_all).matched_len(), 4);
+
+        // Narrowing by each protocol returns only that protocol.
+        for (proto, expected) in [
+            (HostProtocolFilter::Ssh, 1),
+            (HostProtocolFilter::Rdp, 1),
+            (HostProtocolFilter::Vnc, 1),
+            (HostProtocolFilter::Serial, 1),
+        ] {
+            panel.set_protocol_filter(proto);
+            assert_eq!(
+                panel.list(&book, &groups, &open_all).matched_len(),
+                expected,
+                "protocol filter {proto:?} keeps its connected record"
+            );
+        }
+
+        // Combined with non-connected predicate yields 0.
+        panel.set_protocol_filter(HostProtocolFilter::Rdp);
+        assert_eq!(panel.list(&book, &groups, &|_| false).matched_len(), 0);
+    }
+
+    #[test]
+    fn filtered_group_paths_searches_hundreds_of_groups_without_an_eight_item_cap() {
+        let book = HostBook::new();
+        let mut groups = GroupBook::new();
+        for i in 0..250 {
+            let path = GroupPath::parse(&format!("Region{:02}/Service{:03}", i / 25, i))
+                .expect("valid path");
+            groups.insert(&path).expect("insert");
+        }
+        let all = filtered_group_paths(&book, &groups, "");
+        assert!(all.len() > 250, "all saved paths returned without 8-item cap");
+        let narrowed = filtered_group_paths(&book, &groups, "service24");
+        assert!(
+            narrowed.iter().any(|p| p.to_canonical().contains("Service249")),
+            "deeply ordered group is reachable by real-time filter"
+        );
+    }
+
+    #[test]
+    fn validation_messages_localize_for_chinese_and_english() {
+        let zh = crate::app::copy::ux_for(crate::app::copy::Locale::Chinese);
+        let en = crate::app::copy::ux_for(crate::app::copy::Locale::English);
+        let zh_port = crate::app::copy::fill(zh.validation_port_not_number, &[("text", "abc")]);
+        let en_port = crate::app::copy::fill(en.validation_port_not_number, &[("text", "abc")]);
+        assert!(
+            zh_port.contains("端口"),
+            "expected Chinese port message, got: {zh_port}"
+        );
+        assert!(
+            en_port.contains("port number"),
+            "expected English port message, got: {en_port}"
+        );
+
+        let mut draft = ProtocolDraft::create(ProtocolKind::Rdp);
+        draft.set_text(ConnectionFormField::Address, "10.0.0.1");
+        draft.set_text(ConnectionFormField::Port, "abc");
+        let err = draft.build().unwrap_err();
+        assert_eq!(err.field(), ConnectionFormField::Port);
+        assert!(
+            err.reason() == en_port || err.reason() == zh_port,
+            "validation uses localized template, got: {}",
+            err.reason()
+        );
     }
 }

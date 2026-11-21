@@ -47,6 +47,9 @@ const HOST_EDITOR_ID: &str = "hosts.editor";
 /// How many candidates the jump picker shows before its list scrolls.
 const JUMP_PICKER_ROWS: f32 = 6.0;
 
+/// How many group candidates the searchable group selector shows before scrolling (R12).
+const GROUP_PICKER_ROWS: f32 = 5.0;
+
 /// The widest a host's name is drawn in the jump picker before its address.
 const JUMP_NAME_MAX_WIDTH: f32 = 200.0;
 
@@ -1064,8 +1067,10 @@ impl ShelluneView {
         column
     }
 
-    /// Quick-pick pills for existing saved groups, so assigning a host to an existing
-    /// group takes one click rather than typing the exact path.
+    /// Real-time filtered, scrollable group selector for SSH and non-SSH forms (R12).
+    ///
+    /// Replaces the old 8-chip cap so hundreds of saved groups remain searchable and
+    /// selectable by pointer or keyboard while still allowing any custom new path.
     fn group_suggestions_row(
         &self,
         current: &str,
@@ -1073,63 +1078,211 @@ impl ShelluneView {
         for_ssh: bool,
         cx: &mut Context<Self>,
     ) -> Option<Div> {
-        let paths = crate::app::hosts::drawn_paths(&self.book, &self.groups);
-        if paths.is_empty() {
+        let all_paths = crate::app::hosts::drawn_paths(&self.book, &self.groups);
+        if all_paths.is_empty() {
             return None;
         }
         let metrics = self.metrics();
+        let ux = copy::ux();
         let current_trimmed = current.trim();
-        let mut row = div()
+        let filtered =
+            crate::app::hosts::filtered_group_paths(&self.book, &self.groups, current_trimmed);
+        let row_height = metrics.compact_control_height();
+        let highlighted = if filtered.is_empty() {
+            None
+        } else {
+            Some(self.group_picker_highlight.min(filtered.len() - 1))
+        };
+
+        let mut container = div()
             .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(metrics.scale(spacing::HALF))
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .p(metrics.scale(spacing::HAIRLINE))
+            .rounded(px(radius::MEDIUM))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .bg(theme::swatch(palette::CHROME))
             .debug_selector(move || format!("{prefix}.group.suggestions"));
-        for (index, path) in paths.into_iter().take(8).enumerate() {
+
+        if filtered.is_empty() {
+            container = container.child(
+                div()
+                    .px(metrics.scale(spacing::TIGHT))
+                    .py(metrics.scale(spacing::HALF))
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(move || format!("{prefix}.group.suggestions.empty"))
+                    .child(ux.hosts_group_picker_empty),
+            );
+            return Some(container);
+        }
+
+        let hover = theme::swatch(palette::SURFACE_HOVER);
+        let mut list = div()
+            .id(SharedString::from(format!("{prefix}.group.suggestions.scroll")))
+            .flex()
+            .flex_col()
+            .gap(px(components::HAIRLINE_WIDTH))
+            .w_full()
+            .min_w_0()
+            .max_h(
+                row_height * GROUP_PICKER_ROWS
+                    + px(components::HAIRLINE_WIDTH) * (GROUP_PICKER_ROWS - 1.0),
+            )
+            .overflow_y_scroll();
+
+        for (index, path) in filtered.into_iter().enumerate() {
             let text = path.to_canonical();
             let chosen = current_trimmed == text;
+            let active = highlighted == Some(index);
             let pick_text = text.clone();
             let id = format!("{prefix}.group.pick.{index}");
             let selector = id.clone();
-            row = row.child(
-                components::chip(
-                    text,
-                    if chosen { Tone::Accent } else { Tone::Neutral },
-                    metrics,
-                )
-                .id(SharedString::from(id))
-                .debug_selector(move || selector.clone())
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _event, _window, cx| {
-                    let next = if chosen {
-                        String::new()
-                    } else {
-                        pick_text.clone()
-                    };
-                    if for_ssh {
-                        if let Some(draft) = this.hosts.draft_mut() {
-                            draft.set_text(HostField::Group, next.clone());
-                        }
-                        if let Some(fields) = this.host_fields.as_ref() {
-                            let group_field = fields.group.clone();
-                            group_field.update(cx, |f, cx| f.set_text(next, cx));
-                        }
-                    } else {
-                        if let Some(draft) = this.hosts.protocol_draft_mut() {
-                            draft.set_text(ConnectionFormField::Group, next.clone());
-                        }
-                        if let Some(fields) = this.protocol_fields.as_ref()
-                            && let Some(group_field) =
-                                fields.get(ConnectionFormField::Group).cloned()
-                        {
-                            group_field.update(cx, |f, cx| f.set_text(next, cx));
-                        }
-                    }
-                    cx.notify();
-                })),
+            list = list.child(
+                div()
+                    .id(SharedString::from(id))
+                    .debug_selector(move || selector.clone())
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .h(row_height)
+                    .px(metrics.scale(spacing::TIGHT))
+                    .rounded(px(radius::SMALL))
+                    .cursor_pointer()
+                    .when(chosen || active, |row| {
+                        row.bg(theme::swatch(palette::SURFACE_SELECTED))
+                    })
+                    .when(!chosen && !active, |row| {
+                        row.hover(move |style| style.bg(hover))
+                    })
+                    .child(icons::icon(
+                        Icon::Folder,
+                        metrics.small_icon_size(),
+                        theme::swatch(if chosen {
+                            palette::ACCENT
+                        } else {
+                            palette::TEXT_MUTED
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(text)),
+                    )
+                    .when(chosen, |row| {
+                        row.child(icons::icon(
+                            Icon::Check,
+                            metrics.small_icon_size(),
+                            theme::swatch(palette::ACCENT),
+                        ))
+                    })
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        let next = if chosen {
+                            String::new()
+                        } else {
+                            pick_text.clone()
+                        };
+                        this.apply_dialog_group_text(for_ssh, next, cx);
+                    })),
             );
         }
-        Some(row)
+        Some(container.child(list))
+    }
+
+    /// Writes `next` into the open SSH or non-SSH dialog's Group field and draft.
+    fn apply_dialog_group_text(&mut self, for_ssh: bool, next: String, cx: &mut Context<Self>) {
+        self.group_picker_highlight = 0;
+        if for_ssh {
+            if let Some(draft) = self.hosts.draft_mut() {
+                draft.set_text(HostField::Group, next.clone());
+            }
+            if let Some(fields) = self.host_fields.as_ref() {
+                let group_field = fields.group.clone();
+                group_field.update(cx, |f, cx| f.set_text(next, cx));
+            }
+        } else {
+            if let Some(draft) = self.hosts.protocol_draft_mut() {
+                draft.set_text(ConnectionFormField::Group, next.clone());
+            }
+            if let Some(fields) = self.protocol_fields.as_ref()
+                && let Some(group_field) = fields.get(ConnectionFormField::Group).cloned()
+            {
+                group_field.update(cx, |f, cx| f.set_text(next, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Handles Up/Down/Enter keyboard selection when the dialog's Group field is focused (R12).
+    fn handle_group_picker_key(
+        &mut self,
+        for_ssh: bool,
+        event: &KeyDownEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if event.keystroke.modifiers.number_of_modifiers() != 0 {
+            return false;
+        }
+        let group_focused = if for_ssh {
+            self.host_fields
+                .as_ref()
+                .is_some_and(|f| f.group.read(cx).focus_handle().is_focused(window))
+        } else {
+            self.protocol_fields
+                .as_ref()
+                .and_then(|f| f.get(ConnectionFormField::Group))
+                .is_some_and(|f| f.read(cx).focus_handle().is_focused(window))
+        };
+        if !group_focused {
+            return false;
+        }
+        let current = if for_ssh {
+            self.hosts
+                .draft()
+                .map(|d| d.text(HostField::Group).to_owned())
+                .unwrap_or_default()
+        } else {
+            self.hosts
+                .protocol_draft()
+                .map(|d| d.text(ConnectionFormField::Group).to_owned())
+                .unwrap_or_default()
+        };
+        let candidates =
+            crate::app::hosts::filtered_group_paths(&self.book, &self.groups, &current);
+        if candidates.is_empty() {
+            return false;
+        }
+        let last = candidates.len() - 1;
+        match event.keystroke.key.as_str() {
+            "down" => {
+                self.group_picker_highlight = (self.group_picker_highlight + 1).min(last);
+                cx.notify();
+                true
+            }
+            "up" => {
+                self.group_picker_highlight = self.group_picker_highlight.saturating_sub(1).min(last);
+                cx.notify();
+                true
+            }
+            "enter" if !current.trim().is_empty() => {
+                let picked = candidates[self.group_picker_highlight.min(last)].to_canonical();
+                if current.trim() != picked {
+                    self.apply_dialog_group_text(for_ssh, picked, cx);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
     }
 
     /// The dialog over a dimmed window, while a host is being created or edited.
@@ -1175,13 +1328,17 @@ impl ShelluneView {
             .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::LOOSE))
             .py(metrics.scale(spacing::BASE))
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "enter"
                     && event.keystroke.modifiers.number_of_modifiers() == 1
                     && event.keystroke.modifiers.secondary()
                 {
                     cx.stop_propagation();
                     this.save_and_connect(cx);
+                    return;
+                }
+                if this.handle_group_picker_key(true, event, window, cx) {
+                    cx.stop_propagation();
                 }
             }));
         // A new record may be of another protocol. The chooser is here so the form the
@@ -1407,24 +1564,33 @@ impl ShelluneView {
 
     /// One typed field of the protocol form.
     fn protocol_field(&self, field: ConnectionFormField) -> Div {
-        self.protocol_field_sized(field, 0.5)
+        self.protocol_field_sized(field, 0.5, None)
     }
 
-    /// One typed field of the protocol form, taking the share of the row it is given.
-    ///
-    /// A password is the only field of its line, so it takes the whole row rather than
-    /// half of one beside nothing (ADR-7).
-    fn protocol_field_sized(&self, field: ConnectionFormField, grow: f32) -> Div {
+    /// One typed field of the protocol form, taking the share of the row it is given
+    /// with unified short-field floor and optional label support (R12).
+    fn protocol_field_sized(
+        &self,
+        field: ConnectionFormField,
+        grow: f32,
+        label: Option<&'static str>,
+    ) -> Div {
         let metrics = self.metrics();
-        let label = field.label(self.strings());
+        let label = label.unwrap_or_else(|| field.label(self.strings()));
         let entity = self
             .protocol_fields
             .as_ref()
             .and_then(|fields| fields.get(field))
             .cloned();
-        // Every protocol field shares its row evenly and stacks under its neighbour when
-        // the dialog is too narrow for both (ADR-7).
-        let mut cell = components::form_cell(grow, components::FORM_FIELD_MIN_WIDTH, metrics)
+        let floor = if matches!(
+            field,
+            ConnectionFormField::Port | ConnectionFormField::Baud | ConnectionFormField::DataBits
+        ) {
+            components::FORM_SHORT_FIELD_MIN_WIDTH
+        } else {
+            components::FORM_FIELD_MIN_WIDTH
+        };
+        let mut cell = components::form_cell(grow, floor, metrics)
             .child(components::form_label(label, metrics));
         if let Some(entity) = entity {
             cell = cell.child(
@@ -1477,16 +1643,20 @@ impl ShelluneView {
         let mut body = div()
             .flex()
             .flex_col()
-            .gap(metrics.scale(spacing::BASE))
+            .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::LOOSE))
             .py(metrics.scale(spacing::BASE))
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "enter"
                     && event.keystroke.modifiers.number_of_modifiers() == 1
                     && event.keystroke.modifiers.secondary()
                 {
                     cx.stop_propagation();
                     this.save_and_connect_connection(cx);
+                    return;
+                }
+                if this.handle_group_picker_key(false, event, window, cx) {
+                    cx.stop_propagation();
                 }
             }));
 
@@ -1508,8 +1678,8 @@ impl ShelluneView {
             match field {
                 ConnectionFormField::Address => {
                     basic = basic.child(line(
-                        self.protocol_field(ConnectionFormField::Address),
-                        self.protocol_field(ConnectionFormField::Port),
+                        self.protocol_field_sized(ConnectionFormField::Address, 0.72, None),
+                        self.protocol_field_sized(ConnectionFormField::Port, 0.28, None),
                     ));
                 }
                 ConnectionFormField::Port => {}
@@ -1526,7 +1696,7 @@ impl ShelluneView {
                     // form closes. The box decides whether it is kept in the store.
                     let remembered = draft.remember();
                     basic = basic.child(
-                        self.protocol_field_sized(ConnectionFormField::Secret, 1.0)
+                        self.protocol_field_sized(ConnectionFormField::Secret, 1.0, None)
                             .child(
                                 checkbox(
                                     "connection.field.remember",
@@ -1814,20 +1984,32 @@ impl ShelluneView {
                 }
                 ConnectionFormField::Device => {
                     basic = basic.child(line(
-                        self.protocol_field(ConnectionFormField::Device),
-                        self.protocol_field(ConnectionFormField::Baud),
+                        self.protocol_field_sized(ConnectionFormField::Device, 0.68, None),
+                        self.protocol_field_sized(ConnectionFormField::Baud, 0.32, None),
                     ));
                 }
                 ConnectionFormField::Baud => {}
                 ConnectionFormField::DataBits => {
                     has_options = true;
-                    options = options.child(self.protocol_field(ConnectionFormField::DataBits));
+                    options = options.child(self.protocol_field_sized(
+                        ConnectionFormField::DataBits,
+                        0.32,
+                        None,
+                    ));
                 }
                 ConnectionFormField::Name => {
                     basic = basic
                         .child(line(
-                            self.protocol_field(ConnectionFormField::Name),
-                            self.protocol_field(ConnectionFormField::Group),
+                            self.protocol_field_sized(
+                                ConnectionFormField::Name,
+                                0.5,
+                                Some(ux.host_name_optional),
+                            ),
+                            self.protocol_field_sized(
+                                ConnectionFormField::Group,
+                                0.5,
+                                Some(ux.host_group_optional),
+                            ),
                         ))
                         .children(self.group_suggestions_row(
                             draft.text(ConnectionFormField::Group),
