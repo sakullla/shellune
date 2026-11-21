@@ -19763,8 +19763,12 @@ impl Render for ShelluneView {
         self.settle_focus_mode();
         // In full screen or focus mode the session keeps the whole window: no tab strip
         // and no session bar above the workspace (R1, R18).
-        let header = if self.desktop_fullscreen.is_some() || self.focus_mode {
+        let header = if self.desktop_fullscreen.is_some() {
             None
+        } else if self.focus_mode {
+            // The system's window buttons stay on screen in focus mode, so a blank
+            // caption strip keeps them off the first line of the session.
+            self.focus_mode_caption()
         } else {
             Some(self.session_header(window, cx))
         };

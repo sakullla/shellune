@@ -601,8 +601,9 @@ impl DesktopClient {
             return Ok(());
         }
         if let Some(client) = self.vnc_mut() {
-            // RFB authenticates with one secret; a user name or domain has no
-            // place in it.
+            // The user name is optional and used only by servers that ask for one;
+            // a domain has no place in RFB.
+            client.set_user(user.map(str::trim).filter(|user| !user.is_empty()));
             client.set_password(password);
             return Ok(());
         }

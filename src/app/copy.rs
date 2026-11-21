@@ -2858,6 +2858,8 @@ pub struct UxStrings {
     pub host_group_optional: &'static str,
     /// Host dialog: the password of the automatic method
     pub host_password_optional: &'static str,
+    /// Label of the user name a VNC server asks for only sometimes.
+    pub host_user_optional: &'static str,
     /// Host dialog: the key file is protected by a passphrase
     pub host_key_has_passphrase: &'static str,
     /// Host dialog: the folded section
@@ -3605,6 +3607,7 @@ impl UxStrings {
             self.host_name_optional,
             self.host_group_optional,
             self.host_password_optional,
+            self.host_user_optional,
             self.host_key_has_passphrase,
             self.host_advanced_title,
             self.host_advanced_hint,
@@ -4095,6 +4098,7 @@ included",
     host_name_optional: "Name (optional)",
     host_group_optional: "Group (optional)",
     host_password_optional: "Password (optional)",
+    host_user_optional: "User (optional)",
     host_key_has_passphrase: "This key has a passphrase",
     host_advanced_title: "Advanced",
     host_advanced_hint: "Jump hosts, ProxyCommand, startup command, file transfer, X11, keepalive",
@@ -4581,6 +4585,7 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     host_name_optional: "名称（可选）",
     host_group_optional: "分组（可选）",
     host_password_optional: "密码（可选）",
+    host_user_optional: "用户名（可选）",
     host_key_has_passphrase: "这个私钥设置了口令",
     host_advanced_title: "高级设置",
     host_advanced_hint: "跳板机、代理命令、启动命令、文件传输、X11、保活",

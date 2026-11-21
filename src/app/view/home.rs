@@ -2725,10 +2725,11 @@ fn host_row_element(
         ControlState::Resting
     };
     // The checkbox shares the avatar's place, as in a mail client: the avatar shows at
-    // rest, and the box takes its place under the pointer, on the keyboard's row, or
-    // once a selection has started - so picking hosts costs the list no column of empty
+    // rest, and the box takes its place under the pointer or once a selection has
+    // started. The keyboard's row keeps its avatar: its accent bar and tools already
+    // mark it, and a box there made it look picked - so picking hosts costs the list no column of empty
     // boxes.
-    let picking = selected || cursor || host.selecting;
+    let picking = selected || host.selecting;
     let avatar = super::host_avatar(host.name.as_ref(), selected, metrics);
     let leading = div()
         .relative()

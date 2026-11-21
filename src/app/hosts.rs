@@ -3506,6 +3506,7 @@ impl ConnectionFormField {
             ProtocolKind::Vnc => &[
                 Self::Address,
                 Self::Port,
+                Self::User,
                 Self::Secret,
                 Self::Security,
                 Self::Clipboard,
@@ -3736,6 +3737,7 @@ impl ProtocolDraft {
                     .unwrap_or_default();
                 draft.address = config.address().to_owned();
                 draft.port = config.port().to_string();
+                draft.user = config.user().unwrap_or_default().to_owned();
                 draft.security = config.security();
                 draft.clipboard = config.clipboard();
                 draft.remember = config.remembers_secret();
@@ -4034,6 +4036,9 @@ impl ProtocolDraft {
                 let name = default_name(name, &address);
                 let mut config = VncConfig::new(name, address).map_err(problem_of)?;
                 config.set_port(port.get().into()).map_err(problem_of)?;
+                config
+                    .set_user(Some(self.user.trim()))
+                    .map_err(problem_of)?;
                 config.set_security(self.security);
                 config.set_clipboard(self.clipboard);
                 config.set_remember_secret(self.keeps_secret());
@@ -4399,8 +4404,11 @@ mod tests {
             vnc.contains(&ConnectionFormField::Secret),
             "a VNC server can ask for a password too"
         );
+        assert!(
+            vnc.contains(&ConnectionFormField::User),
+            "a VNC server can ask for a user name too"
+        );
         for withheld in [
-            ConnectionFormField::User,
             ConnectionFormField::Domain,
             ConnectionFormField::Certificate,
             ConnectionFormField::Device,

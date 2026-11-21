@@ -1421,8 +1421,9 @@ impl RdpConfig {
 
 /// A saved VNC connection (R18).
 ///
-/// VNC authentication is a password and nothing else, so this record has no user
-/// and no domain field rather than two fields that would always be empty.
+/// VNC authentication is a password, so the user is optional: only servers that sign
+/// in with a user name and password (VeNCrypt's plain form) read it. There is no
+/// domain field, which no VNC server asks for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "VncConfigWire")]
 pub struct VncConfig {
@@ -1434,6 +1435,9 @@ pub struct VncConfig {
     group_path: Option<GroupPath>,
     address: String,
     port: Port,
+    /// The user name for servers that ask for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
     /// How much this connection insists on encryption.
     #[serde(default, skip_serializing_if = "security_is_default")]
     security: VncSecurity,
@@ -1460,6 +1464,8 @@ struct VncConfigWire {
     address: String,
     port: Port,
     #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
     security: VncSecurity,
     #[serde(default)]
     remember_secret: bool,
@@ -1479,6 +1485,7 @@ impl TryFrom<VncConfigWire> for VncConfig {
             group_path,
             address: connection_address(wire.address)?,
             port: connection_port(u32::from(wire.port.get()))?,
+            user: connection_user(wire.user)?,
             security: wire.security,
             remember_secret: wire.remember_secret,
             clipboard: wire.clipboard,
@@ -1504,6 +1511,7 @@ impl VncConfig {
             group_path: None,
             address: connection_address(address.into())?,
             port: Port(DEFAULT_VNC_PORT),
+            user: None,
             security: VncSecurity::default(),
             remember_secret: false,
             clipboard: true,
@@ -1532,6 +1540,12 @@ impl VncConfig {
     #[must_use]
     pub fn port(&self) -> Port {
         self.port
+    }
+
+    /// The user name for servers that ask for one, when one was chosen.
+    #[must_use]
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_deref()
     }
 
     /// The single grouping label an earlier build would have written.
@@ -1572,7 +1586,10 @@ impl VncConfig {
     /// What the connection would dial, as one line for the list.
     #[must_use]
     pub fn target(&self) -> String {
-        format!("{}:{}", self.address, self.port)
+        match self.user() {
+            Some(user) => format!("{user}@{}:{}", self.address, self.port),
+            None => format!("{}:{}", self.address, self.port),
+        }
     }
 
     /// Renames the connection.
@@ -1606,6 +1623,20 @@ impl VncConfig {
     /// Returns `ConnectionValidationError::PortOutOfRange` outside `1..=65535`.
     pub fn set_port(&mut self, port: u32) -> Result<(), ConnectionValidationError> {
         self.port = connection_port(port)?;
+        Ok(())
+    }
+
+    /// Sets or clears the user name.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionValidationError::UserContainsWhitespace` for a user with
+    /// whitespace in it.
+    pub fn set_user(
+        &mut self,
+        user: Option<impl Into<String>>,
+    ) -> Result<(), ConnectionValidationError> {
+        self.user = connection_user(user.map(Into::into))?;
         Ok(())
     }
 
@@ -3158,11 +3189,33 @@ mod connection_tests {
             "name": "wall",
             "address": "10.0.0.7",
             "port": 5900,
-            "user": "alice"
+            "domain": "CORP"
         });
         let error = serde_json::from_value::<ConnectionRecord>(text)
-            .expect_err("VNC has no user, so a record that carries one is not this build's");
-        assert!(error.to_string().contains("user"), "{error}");
+            .expect_err("VNC has no domain, so a record that carries one is not this build's");
+        assert!(error.to_string().contains("domain"), "{error}");
+    }
+
+    #[test]
+    fn a_vnc_user_is_optional_and_survives_a_round_trip() {
+        let mut vnc = VncConfig::new("wall", "10.0.0.7").expect("valid");
+        assert_eq!(vnc.user(), None);
+        let bare = serde_json::to_value(ConnectionRecord::Vnc(vnc.clone())).expect("writes");
+        assert!(
+            bare.get("user").is_none(),
+            "a blank user leaves the key out"
+        );
+        assert_eq!(vnc.target(), "10.0.0.7:5900");
+
+        vnc.set_user(Some(" alice ")).expect("valid");
+        assert_eq!(vnc.target(), "alice@10.0.0.7:5900");
+        let text = serde_json::to_value(ConnectionRecord::Vnc(vnc.clone())).expect("writes");
+        let back: ConnectionRecord = serde_json::from_value(text).expect("reads");
+        assert_eq!(back, ConnectionRecord::Vnc(vnc.clone()));
+
+        assert!(vnc.set_user(Some("al ice")).is_err());
+        vnc.set_user(None::<String>).expect("clears");
+        assert_eq!(vnc.user(), None);
     }
 
     #[test]

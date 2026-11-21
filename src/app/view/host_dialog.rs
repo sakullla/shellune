@@ -1692,6 +1692,17 @@ impl ShelluneView {
                     ));
                 }
                 ConnectionFormField::Port => {}
+                // VNC asks for a user name only on some servers: it stands alone, since a
+                // domain has no place in it.
+                ConnectionFormField::User
+                    if !draft.fields().contains(&ConnectionFormField::Domain) =>
+                {
+                    basic = basic.child(self.protocol_field_sized(
+                        ConnectionFormField::User,
+                        1.0,
+                        Some(strings.host_user_optional),
+                    ));
+                }
                 ConnectionFormField::User => {
                     basic = basic.child(line(
                         self.protocol_field(ConnectionFormField::User),

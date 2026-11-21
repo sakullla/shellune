@@ -146,7 +146,7 @@ impl DesktopTarget {
                 name: config.name().to_owned(),
                 address: config.address().to_owned(),
                 port: config.port().get(),
-                user: None,
+                user: config.user().map(str::to_owned),
                 domain: None,
                 certificate: RdpCertificatePolicy::Ask,
                 security: config.security(),

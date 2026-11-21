@@ -38,6 +38,7 @@ pub(super) struct Config {
     pub(super) certificate_pin: Option<String>,
     pub(super) host: String,
     pub(super) port: u16,
+    pub(super) user: String,
     pub(super) password: String,
     /// Which security types may be negotiated: the crate's VncSecurity bits.
     pub(super) security: u32,
@@ -52,6 +53,7 @@ impl Default for Config {
             certificate_pin: None,
             host: String::new(),
             port: 5900,
+            user: String::new(),
             password: String::new(),
             // None and VncAuth: the two types that need no TLS backend.
             security: 0x1 | 0x2,
@@ -68,6 +70,7 @@ impl Config {
             certificate_pin: self.certificate_pin.clone(),
             host: self.host.clone(),
             port: self.port,
+            user: self.user.clone(),
             password: self.password.clone(),
             security: self.security,
             width: self.width,
@@ -173,8 +176,13 @@ impl Client {
         self.config.port = if port == 0 { 5900 } else { port };
     }
 
-    /// RFB has one secret: the session password. A user name or domain has no
-    /// place in it, so only the password is kept.
+    /// The optional user name. Only VeNCrypt's user-and-password form uses it; plain
+    /// VNC authentication has no place for one. A domain has none either.
+    pub(super) fn set_user(&mut self, user: Option<&str>) {
+        self.config.user = user.unwrap_or_default().to_owned();
+    }
+
+    /// The session password.
     pub(super) fn set_password(&mut self, password: Option<&str>) {
         self.config.password = password.unwrap_or_default().to_owned();
     }

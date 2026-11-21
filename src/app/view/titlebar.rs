@@ -105,6 +105,22 @@ impl ShelluneView {
         }
     }
 
+    /// The blank caption focus mode leaves at the top of the window on macOS.
+    ///
+    /// The tab strip is hidden there, but the system still draws its window buttons
+    /// over the session. The strip is as tall as the top row, so the buttons keep the
+    /// place they were given, and it drags the window like the row it stands for.
+    pub(super) fn focus_mode_caption(&self) -> Option<Div> {
+        (Platform::current() == Platform::MacOs).then(|| {
+            div().flex_none().child(
+                self.drag_area("focus.caption")
+                    .w_full()
+                    .h(self.metrics().header_height())
+                    .bg(theme::swatch(palette::CANVAS)),
+            )
+        })
+    }
+
     /// Minimise, maximise or restore, and close, at the right end of the top row.
     ///
     /// Only drawn on Windows. Each button is a window control area, so hovering the

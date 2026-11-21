@@ -164,6 +164,8 @@ pub(super) enum SubType {
     X509None,
     /// TLS with a certificate, then VNC authentication.
     X509Vnc,
+    /// TLS with a certificate, then a user name and password.
+    X509Plain,
     /// LibVNCServer's no-authentication form, without TLS.
     PlainNone,
     /// LibVNCServer's VNC authentication form, without TLS.
@@ -175,17 +177,29 @@ impl SubType {
         match self {
             SubType::X509None => VENCRYPT_X509_NONE,
             SubType::X509Vnc => VENCRYPT_X509_VNC,
+            SubType::X509Plain => VENCRYPT_X509_PLAIN,
             SubType::PlainNone => VENCRYPT_COMPAT_NONE,
             SubType::PlainVnc => VENCRYPT_COMPAT_VNC,
         }
     }
 
     fn tls(self) -> bool {
-        matches!(self, SubType::X509None | SubType::X509Vnc)
+        matches!(
+            self,
+            SubType::X509None | SubType::X509Vnc | SubType::X509Plain
+        )
     }
 
     fn needs_password(self) -> bool {
-        matches!(self, SubType::X509Vnc | SubType::PlainVnc)
+        matches!(
+            self,
+            SubType::X509Vnc | SubType::X509Plain | SubType::PlainVnc
+        )
+    }
+
+    /// Whether the sub-type sends a user name along with the password.
+    fn needs_user(self) -> bool {
+        self == SubType::X509Plain
     }
 }
 
@@ -204,17 +218,33 @@ pub(super) const ANONYMOUS_TLS_REASON: &str =
 
 /// Picks the best sub-type this client can complete.
 ///
-/// A certificate beats the unwrapped compatibility forms, and VNC
-/// authentication beats no credentials when a password is available. The
+/// A certificate beats the unwrapped compatibility forms. With a user name the
+/// user-and-password form (inside TLS) comes first; with only a password VNC
+/// authentication does; with nothing, the forms that ask for no credentials. The
+/// user-and-password form stays a last candidate otherwise, so a server that offers
+/// nothing else is answered with a request for credentials and not a refusal. The
 /// anonymous TLS forms (257, 258) are never candidates: they need an anonymous
 /// Diffie-Hellman cipher suite, which this build does not have.
-pub(super) fn choose_subtype(subtypes: &[u32], has_password: bool) -> Result<SubType, Refusal> {
-    let order: &[SubType] = if has_password {
+pub(super) fn choose_subtype(
+    subtypes: &[u32],
+    has_password: bool,
+    has_user: bool,
+) -> Result<SubType, Refusal> {
+    let order: &[SubType] = if has_user {
+        &[
+            SubType::X509Plain,
+            SubType::X509Vnc,
+            SubType::X509None,
+            SubType::PlainVnc,
+            SubType::PlainNone,
+        ]
+    } else if has_password {
         &[
             SubType::X509Vnc,
             SubType::X509None,
             SubType::PlainVnc,
             SubType::PlainNone,
+            SubType::X509Plain,
         ]
     } else {
         &[
@@ -222,6 +252,7 @@ pub(super) fn choose_subtype(subtypes: &[u32], has_password: bool) -> Result<Sub
             SubType::X509Vnc,
             SubType::PlainNone,
             SubType::PlainVnc,
+            SubType::X509Plain,
         ]
     };
     for kind in order {
@@ -468,6 +499,25 @@ fn authenticate(transport: &mut Transport, password: &str) -> Result<(), Ended> 
     send(transport, &answer)
 }
 
+/// VeNCrypt's user-and-password form: both lengths, then both strings. Only sent
+/// inside TLS, so the password is never on the wire in the clear.
+fn authenticate_plain(transport: &mut Transport, user: &str, password: &str) -> Result<(), Ended> {
+    let (Ok(user_len), Ok(password_len)) =
+        (u32::try_from(user.len()), u32::try_from(password.len()))
+    else {
+        return Err(Ended::new(
+            Failure::CredentialsRequired,
+            "the user name or password is too long for the VNC server",
+        ));
+    };
+    let mut message = Vec::with_capacity(8 + user.len() + password.len());
+    message.extend_from_slice(&user_len.to_be_bytes());
+    message.extend_from_slice(&password_len.to_be_bytes());
+    message.extend_from_slice(user.as_bytes());
+    message.extend_from_slice(password.as_bytes());
+    send(transport, &message)
+}
+
 fn response(password: &str, challenge: &[u8; 16]) -> [u8; 16] {
     use des::Des;
     use des::cipher::{BlockCipherEncrypt, KeyInit};
@@ -588,7 +638,11 @@ fn vencrypt(
         .map(|chunk| u32::from_be_bytes(*chunk))
         .collect();
     super::trace(&format!("VeNCrypt sub-types {subtypes:?}"));
-    let kind = match choose_subtype(&subtypes, !config.password.is_empty()) {
+    let kind = match choose_subtype(
+        &subtypes,
+        !config.password.is_empty(),
+        !config.user.is_empty(),
+    ) {
         Ok(kind) => kind,
         Err(Refusal::Anonymous) => {
             return Err(Ended::new(
@@ -618,6 +672,12 @@ fn vencrypt(
             "the selected VNC policy requires an encrypted transport",
         ));
     }
+    if kind.needs_user() && config.user.is_empty() {
+        return Err(Ended::new(
+            Failure::CredentialsRequired,
+            "the VNC server requires a user name",
+        ));
+    }
     if kind.needs_password() && config.password.is_empty() {
         return Err(Ended::new(
             Failure::CredentialsRequired,
@@ -635,7 +695,9 @@ fn vencrypt(
             transport.push_back(marker);
         }
         let mut inner = secure(transport, config, emit, control)?;
-        if kind.needs_password() {
+        if kind.needs_user() {
+            authenticate_plain(&mut inner, &config.user, &config.password)?;
+        } else if kind.needs_password() {
             authenticate(&mut inner, &config.password)?;
         }
         Ok(inner)
@@ -765,38 +827,79 @@ mod tests {
 
     #[test]
     fn anonymous_vencrypt_sub_types_are_refused_with_a_readable_reason() {
-        assert_eq!(choose_subtype(&[258], true), Err(Refusal::Anonymous));
-        assert_eq!(choose_subtype(&[257], false), Err(Refusal::Anonymous));
-        assert_eq!(choose_subtype(&[257, 258], true), Err(Refusal::Anonymous));
+        assert_eq!(choose_subtype(&[258], true, false), Err(Refusal::Anonymous));
+        assert_eq!(
+            choose_subtype(&[257], false, false),
+            Err(Refusal::Anonymous)
+        );
+        assert_eq!(
+            choose_subtype(&[257, 258], true, false),
+            Err(Refusal::Anonymous)
+        );
         assert!(ANONYMOUS_TLS_REASON.contains("anonymous TLS"));
         assert!(ANONYMOUS_TLS_REASON.contains("cannot provide"));
     }
 
     #[test]
     fn a_certificate_sub_type_wins_over_an_anonymous_one() {
-        assert_eq!(choose_subtype(&[258, 261], true), Ok(SubType::X509Vnc));
-        assert_eq!(choose_subtype(&[257, 260], false), Ok(SubType::X509None));
-        assert_eq!(choose_subtype(&[261, 260], true), Ok(SubType::X509Vnc));
+        assert_eq!(
+            choose_subtype(&[258, 261], true, false),
+            Ok(SubType::X509Vnc)
+        );
+        assert_eq!(
+            choose_subtype(&[257, 260], false, false),
+            Ok(SubType::X509None)
+        );
+        assert_eq!(
+            choose_subtype(&[261, 260], true, false),
+            Ok(SubType::X509Vnc)
+        );
         // Selecting X509Vnc lets the UI request a missing password.
-        assert_eq!(choose_subtype(&[261], false), Ok(SubType::X509Vnc));
+        assert_eq!(choose_subtype(&[261], false, false), Ok(SubType::X509Vnc));
     }
 
     #[test]
     fn libvnc_plain_forms_are_accepted_without_tls() {
-        assert_eq!(choose_subtype(&[1], false), Ok(SubType::PlainNone));
-        assert_eq!(choose_subtype(&[1, 2], true), Ok(SubType::PlainVnc));
-        assert_eq!(choose_subtype(&[1, 2], false), Ok(SubType::PlainNone));
-        assert_eq!(choose_subtype(&[2], false), Ok(SubType::PlainVnc));
-        assert_eq!(choose_subtype(&[1, 260], true), Ok(SubType::X509None));
+        assert_eq!(choose_subtype(&[1], false, false), Ok(SubType::PlainNone));
+        assert_eq!(choose_subtype(&[1, 2], true, false), Ok(SubType::PlainVnc));
+        assert_eq!(
+            choose_subtype(&[1, 2], false, false),
+            Ok(SubType::PlainNone)
+        );
+        assert_eq!(choose_subtype(&[2], false, false), Ok(SubType::PlainVnc));
+        assert_eq!(
+            choose_subtype(&[1, 260], true, false),
+            Ok(SubType::X509None)
+        );
+    }
+
+    #[test]
+    fn a_user_name_selects_the_user_and_password_form_inside_tls() {
+        assert_eq!(
+            choose_subtype(&[261, 262], true, true),
+            Ok(SubType::X509Plain)
+        );
+        // Without a user name the password form still wins when both are offered.
+        assert_eq!(
+            choose_subtype(&[261, 262], true, false),
+            Ok(SubType::X509Vnc)
+        );
+        // A server that offers only the user form is answered with a request for
+        // credentials, not a refusal.
+        assert_eq!(choose_subtype(&[262], false, false), Ok(SubType::X509Plain));
+        assert!(SubType::X509Plain.tls() && SubType::X509Plain.needs_user());
     }
 
     #[test]
     fn the_old_numbering_is_not_read_as_a_password_type() {
         // 3 and 6 are not VeNCrypt sub-types; treating them as TLSVnc/X509Vnc
         // would select a number the server does not offer.
-        assert_eq!(choose_subtype(&[3, 6], true), Err(Refusal::Unsupported));
         assert_eq!(
-            choose_subtype(&[256, 259, 262, 263, 264], true),
+            choose_subtype(&[3, 6], true, false),
+            Err(Refusal::Unsupported)
+        );
+        assert_eq!(
+            choose_subtype(&[256, 259, 263, 264], true, false),
             Err(Refusal::Unsupported)
         );
     }
