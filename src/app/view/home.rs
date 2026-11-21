@@ -802,7 +802,7 @@ impl ShelluneView {
         }
     }
 
-    /// Keeps `focused_group_path` aligned with the visible rows when group or host search changes.
+    /// Keeps `focused_group_path` aligned with the visible rows when `group_query` changes.
     pub(super) fn sync_focused_group_after_query(&mut self) {
         let drawn = self.drawn_group_paths();
         if drawn.is_empty() {
@@ -814,9 +814,23 @@ impl ShelluneView {
             .as_ref()
             .is_some_and(|path| drawn.contains(path));
         if !still_visible {
-            self.focused_group_path = drawn.first().cloned();
-            self.group_scroll
-                .scroll_to_item(0, gpui::ScrollStrategy::Top);
+            if self.hosts.group_query().trim().is_empty() {
+                self.focused_group_path = None;
+            } else {
+                self.focused_group_path = drawn.first().cloned();
+                self.group_scroll
+                    .scroll_to_item(0, gpui::ScrollStrategy::Top);
+            }
+        }
+    }
+
+    /// Clears `focused_group_path` when host search hides the currently focused group,
+    /// preserving `group_scroll` and leaving `None` untouched (R10).
+    pub(super) fn prune_hidden_focused_group(&mut self) {
+        if let Some(current) = &self.focused_group_path
+            && !self.drawn_group_paths().contains(current)
+        {
+            self.focused_group_path = None;
         }
     }
 

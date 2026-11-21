@@ -6862,7 +6862,7 @@ impl ShelluneView {
             if view.hosts.search() != phrase {
                 view.hosts.set_search(phrase);
                 view.hosts_cursor = None;
-                view.sync_focused_group_after_query();
+                view.prune_hidden_focused_group();
                 cx.notify();
             }
         })
