@@ -1,8 +1,6 @@
 //! Bitmap rectangles from the Share Data and Fast-Path output PDUs.
 //!
-//! The session keeps one BGRA desktop buffer; each rectangle is copied into it and
-//! then published as the dirty region. Only formats the client advertises are
-//! accepted: a rectangle in any other compression is an error, never a guess.
+//! Each bitmap produces one packed BGRA patch for the frame mailbox to composite.
 use super::wire::{Packet, invalid};
 use std::io;
 
@@ -76,10 +74,8 @@ pub(super) fn rect<'a>(p: &mut Packet<'a>) -> io::Result<Bitmap<'a>> {
     })
 }
 
-/// The legacy pixel RLE: one stream of orders that describes the bitmap from the
-/// bottom row up, three bytes per pixel. It is what xrdp emits for a compressed
-/// bitmap even when the desktop depth is 32 bits, so it is decoded here rather
-/// than refused.
+/// Interleaved RLE describes the bitmap from the bottom row up. Some xrdp
+/// sessions also use the 24-bit encoding on a 32-bit desktop.
 struct Rle<'a> {
     data: &'a [u8],
     at: usize,
@@ -94,9 +90,30 @@ impl<'a> Rle<'a> {
         self.at += 1;
         Ok(value)
     }
+
+    fn color(&mut self, bpp: u16) -> io::Result<[u8; 3]> {
+        if matches!(bpp, 15 | 16) {
+            Ok(high_color([self.byte()?, self.byte()?], bpp))
+        } else {
+            Ok([self.byte()?, self.byte()?, self.byte()?])
+        }
+    }
 }
 
-fn legacy_rle(data: &[u8], width: usize, height: usize) -> io::Result<(Vec<u8>, usize)> {
+fn high_color(bytes: [u8; 2], bpp: u16) -> [u8; 3] {
+    let value = u16::from_le_bytes(bytes);
+    let (red, green) = if bpp == 16 {
+        let g = ((value >> 5) & 0x3f) as u8;
+        ((value >> 11) as u8, (g << 2) | (g >> 4))
+    } else {
+        let g = ((value >> 5) & 0x1f) as u8;
+        (((value >> 10) & 0x1f) as u8, (g << 3) | (g >> 2))
+    };
+    let blue = (value & 0x1f) as u8;
+    [(blue << 3) | (blue >> 2), green, (red << 3) | (red >> 2)]
+}
+
+fn legacy_rle(data: &[u8], width: usize, height: usize, bpp: u16) -> io::Result<(Vec<u8>, usize)> {
     let stride = width * 4;
     let mut out = vec![0u8; stride * height];
     let mut rle = Rle { data, at: 0 };
@@ -160,12 +177,12 @@ fn legacy_rle(data: &[u8], width: usize, height: usize) -> io::Result<(Vec<u8>, 
                 }
             }
             8 => {
-                colour1 = [rle.byte()?, rle.byte()?, rle.byte()?];
-                colour2 = [rle.byte()?, rle.byte()?, rle.byte()?];
+                colour1 = rle.color(bpp)?;
+                colour2 = rle.color(bpp)?;
             }
-            3 => colour2 = [rle.byte()?, rle.byte()?, rle.byte()?],
+            3 => colour2 = rle.color(bpp)?,
             6 | 7 => {
-                mix = [rle.byte()?, rle.byte()?, rle.byte()?];
+                mix = rle.color(bpp)?;
                 opcode -= 5;
             }
             9 => {
@@ -193,6 +210,19 @@ fn legacy_rle(data: &[u8], width: usize, height: usize) -> io::Result<(Vec<u8>, 
                 row = Some(rows * stride);
             }
             let start = row.unwrap_or(0) + x * 4;
+            if opcode == 3 {
+                // REGULAR_COLOR_RUN can cover several scanlines. Write each
+                // contiguous span in one fill while keeping the bottom-up rows.
+                let span = count.min(width - x);
+                let [blue, green, red] = colour2;
+                out[start..start + span * 4]
+                    .as_chunks_mut::<4>()
+                    .0
+                    .fill([blue, green, red, 0xff]);
+                count -= span;
+                x += span;
+                continue;
+            }
             let below = previous.map(|line| line + x * 4);
             let pixel: [u8; 3] = match opcode {
                 0 => {
@@ -230,8 +260,7 @@ fn legacy_rle(data: &[u8], width: usize, height: usize) -> io::Result<(Vec<u8>, 
                         None => [0, 0, 0],
                     }
                 }
-                3 => colour2,
-                4 => [rle.byte()?, rle.byte()?, rle.byte()?],
+                4 => rle.color(bpp)?,
                 8 => {
                     if bicolour {
                         bicolour = false;
@@ -256,6 +285,9 @@ fn legacy_rle(data: &[u8], width: usize, height: usize) -> io::Result<(Vec<u8>, 
             count -= 1;
             x += 1;
         }
+    }
+    if rows != 0 || x != width {
+        return Err(invalid("incomplete interleaved bitmap"));
     }
     Ok((out, rle.at))
 }
@@ -339,6 +371,30 @@ pub(super) fn decompress(bitmap: &Bitmap<'_>) -> io::Result<(Vec<u8>, usize)> {
     let width = usize::from(bitmap.bitmaps.0);
     let height = usize::from(bitmap.bitmaps.1);
     let mut failure = None;
+    // RDP6 also permits uncompressed planes inside a compressed rectangle.
+    // The exact size distinguishes them from an interleaved RLE order.
+    if bitmap.bpp == 32
+        && let Some((&header @ (0 | 0x20), data)) = bitmap.data.split_first()
+    {
+        let plane_size = width * height;
+        let has_alpha = header == 0;
+        let plane_bytes = plane_size * if has_alpha { 4 } else { 3 };
+        if data.len() == plane_bytes || data.len() == plane_bytes + 1 {
+            let rgb = &data[if has_alpha { plane_size } else { 0 }..];
+            let mut pixels = Vec::with_capacity(plane_size * 4);
+            for row in (0..height).rev() {
+                for i in row * width..(row + 1) * width {
+                    pixels.extend_from_slice(&[
+                        rgb[2 * plane_size + i],
+                        rgb[plane_size + i],
+                        rgb[i],
+                        0xff,
+                    ]);
+                }
+            }
+            return Ok((pixels, bitmap.data.len()));
+        }
+    }
     if bitmap.bpp == 32
         && let Some(&marker @ (0x30 | 0x10)) = bitmap.data.first()
     {
@@ -353,7 +409,7 @@ pub(super) fn decompress(bitmap: &Bitmap<'_>) -> io::Result<(Vec<u8>, usize)> {
         }
     }
     match bitmap.bpp {
-        24 | 32 => match legacy_rle(bitmap.data, width, height) {
+        15 | 16 | 24 | 32 => match legacy_rle(bitmap.data, width, height, bitmap.bpp) {
             Ok(result) => Ok(result),
             Err(error) => Err(failure.unwrap_or(error)),
         },
@@ -366,69 +422,56 @@ pub(super) fn decompress(bitmap: &Bitmap<'_>) -> io::Result<(Vec<u8>, usize)> {
     }
 }
 
-/// Paints a bounded bitmap into the negotiated desktop.
-pub(super) fn draw(
-    frame: &mut [u8],
-    stride: usize,
-    desktop_height: u16,
+/// Decodes the visible part of one bitmap, top row first.
+pub(super) fn pixels(
     bitmap: &Bitmap<'_>,
-) -> io::Result<()> {
+    desktop_width: u16,
+    desktop_height: u16,
+) -> io::Result<Vec<u8>> {
     if bitmap.width == 0 || bitmap.height == 0 {
         return Err(invalid("empty RDP bitmap rectangle"));
     }
-    if usize::from(bitmap.x) + usize::from(bitmap.width) > stride / 4
+    if u32::from(bitmap.x) + u32::from(bitmap.width) > u32::from(desktop_width)
         || u32::from(bitmap.y) + u32::from(bitmap.height) > u32::from(desktop_height)
     {
         return Err(invalid("RDP bitmap lies outside the desktop"));
     }
-    let row = stride
-        .checked_mul(usize::from(bitmap.y))
-        .and_then(|offset| offset.checked_add(usize::from(bitmap.x) * 4))
-        .ok_or_else(|| invalid("RDP bitmap offset overflow"))?;
-    if row
-        .checked_add(usize::from(bitmap.height - 1) * stride + usize::from(bitmap.width) * 4)
-        .is_none_or(|end| end > frame.len())
-    {
-        return Err(invalid("RDP bitmap lies outside the desktop buffer"));
+    if !bitmap.compressed {
+        return unpack(bitmap);
     }
+    let (decoded, _) = decompress(bitmap).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "{}x{} compressed bitmap: {error}",
+                bitmap.bitmaps.0, bitmap.bitmaps.1
+            ),
+        )
+    })?;
+    if bitmap.bitmaps == (bitmap.width, bitmap.height) {
+        return Ok(decoded);
+    }
+    // Only clipped patches need another allocation. Keep the mailbox allocation
+    // proportional to the visible area even when the source bitmap was much larger.
     let row_bytes = usize::from(bitmap.width) * 4;
-    // A decoded bitmap is packed BGRA at the bitmap's own size; only the part
-    // that lands on the desktop is copied.
-    let pixels = if bitmap.compressed {
-        decompress(bitmap)
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "{}x{} compressed bitmap: {error}",
-                        bitmap.bitmaps.0, bitmap.bitmaps.1
-                    ),
-                )
-            })?
-            .0
-    } else {
-        unpack(bitmap)?
-    };
-    let bitmap_row = usize::from(bitmap.bitmaps.0) * 4;
-    if pixels.len() < bitmap_row * usize::from(bitmap.bitmaps.1) {
-        return Err(invalid("truncated RDP bitmap data"));
+    let mut visible = Vec::with_capacity(row_bytes * usize::from(bitmap.height));
+    for row in decoded
+        .chunks_exact(usize::from(bitmap.bitmaps.0) * 4)
+        .take(usize::from(bitmap.height))
+    {
+        visible.extend_from_slice(&row[..row_bytes]);
     }
-    for line in 0..usize::from(bitmap.height) {
-        let source = line * bitmap_row;
-        let start = row + line * stride;
-        frame[start..start + row_bytes].copy_from_slice(&pixels[source..source + row_bytes]);
-    }
-    Ok(())
+    Ok(visible)
 }
 
-/// Expands an uncompressed rectangle into packed BGRA at its own size.
+/// Copies visible pixels from bottom-up, four-byte-aligned scanlines.
 fn unpack(bitmap: &Bitmap<'_>) -> io::Result<Vec<u8>> {
-    let width = usize::from(bitmap.bitmaps.0);
-    let height = usize::from(bitmap.bitmaps.1);
-    let source_row = match bitmap.bpp {
-        32 => width * 4,
-        24 => width * 3,
-        15 | 16 => width * 2,
+    let width = usize::from(bitmap.width);
+    let height = usize::from(bitmap.height);
+    let bytes_per_pixel = match bitmap.bpp {
+        32 => 4,
+        24 => 3,
+        15 | 16 => 2,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -436,17 +479,18 @@ fn unpack(bitmap: &Bitmap<'_>) -> io::Result<Vec<u8>> {
             ));
         }
     };
-    let source_stride = source_row.next_multiple_of(4);
+    let source_height = usize::from(bitmap.bitmaps.1);
+    let source_stride = (usize::from(bitmap.bitmaps.0) * bytes_per_pixel).next_multiple_of(4);
     let needed = source_stride
-        .checked_mul(height)
+        .checked_mul(source_height)
         .ok_or_else(|| invalid("RDP bitmap size overflow"))?;
     if bitmap.data.len() < needed {
         return Err(invalid("truncated RDP bitmap data"));
     }
     let mut pixels = vec![0u8; width * height * 4];
     for line in 0..height {
-        let offset = (height - 1 - line) * source_stride;
-        let source = &bitmap.data[offset..offset + source_row];
+        let offset = (source_height - 1 - line) * source_stride;
+        let source = &bitmap.data[offset..offset + width * bytes_per_pixel];
         let target = &mut pixels[line * width * 4..(line + 1) * width * 4];
         match bitmap.bpp {
             32 => target.copy_from_slice(source),
@@ -467,38 +511,14 @@ fn unpack(bitmap: &Bitmap<'_>) -> io::Result<Vec<u8>> {
                     .iter_mut()
                     .zip(source.as_chunks::<2>().0)
                 {
-                    let value = u16::from_le_bytes([bytes[0], bytes[1]]);
-                    let (red, green) = if bitmap.bpp == 16 {
-                        let g = ((value >> 5) & 0x3f) as u8;
-                        ((value >> 11) as u8, (g << 2) | (g >> 4))
-                    } else {
-                        let g = ((value >> 5) & 0x1f) as u8;
-                        (((value >> 10) & 0x1f) as u8, (g << 3) | (g >> 2))
-                    };
-                    let blue = (value & 0x1f) as u8;
-                    pixel.copy_from_slice(&[
-                        (blue << 3) | (blue >> 2),
-                        green,
-                        (red << 3) | (red >> 2),
-                        0xff,
-                    ]);
+                    let [blue, green, red] = high_color(*bytes, bitmap.bpp);
+                    pixel.copy_from_slice(&[blue, green, red, 0xff]);
                 }
             }
             _ => unreachable!(),
         }
     }
     Ok(pixels)
-}
-
-/// A tightly packed copy of one rectangle, the shape `Event::Frame` carries.
-pub(super) fn region(frame: &[u8], stride: usize, bitmap: &Bitmap<'_>) -> Vec<u8> {
-    let row = usize::from(bitmap.width) * 4;
-    let mut pixels = Vec::with_capacity(row * usize::from(bitmap.height));
-    for line in 0..usize::from(bitmap.height) {
-        let start = usize::from(bitmap.y) * stride + line * stride + usize::from(bitmap.x) * 4;
-        pixels.extend_from_slice(&frame[start..start + row]);
-    }
-    pixels
 }
 
 #[cfg(test)]
@@ -536,13 +556,15 @@ mod tests {
             wire.extend([0x81, 7, 8, 9]);
         }
         let mut p = Packet(&wire);
-        let mut frame = [0u8; 16];
-        draw(&mut frame, 8, 2, &rect(&mut p).unwrap()).unwrap();
-        assert_eq!(&frame[..4], &[4, 5, 6, 255]);
-        assert_eq!(&frame[8..12], &[1, 2, 3, 255]);
+        assert_eq!(
+            pixels(&rect(&mut p).unwrap(), 2, 2).unwrap(),
+            [4, 5, 6, 255, 1, 2, 3, 255]
+        );
         for _ in 0..2 {
-            draw(&mut frame, 8, 2, &rect(&mut p).unwrap()).unwrap();
-            assert_eq!(&frame[4..8], &[7, 8, 9, 255]);
+            assert_eq!(
+                pixels(&rect(&mut p).unwrap(), 2, 2).unwrap(),
+                [7, 8, 9, 255]
+            );
         }
         assert!(p.0.is_empty());
     }
@@ -591,5 +613,52 @@ mod tests {
         assert!(decompress(&bitmap(2, 2, 32, &[0x10, 0x20, 1])).is_err());
         // A depth this client never asks for is refused rather than misread.
         assert!(decompress(&bitmap(2, 2, 8, &[0x04])).is_err());
+    }
+
+    #[test]
+    fn clipped_patches_keep_the_top_left_pixels_from_bottom_up_scanlines() {
+        let raw = [9, 8, 7, 6, 5, 4, 0, 0, 1, 2, 3, 4, 5, 6, 0, 0];
+        let rle = [0x84, 9, 8, 7, 6, 5, 4, 1, 2, 3, 4, 5, 6];
+        for (data, compressed) in [(raw.as_slice(), false), (rle.as_slice(), true)] {
+            let mut patch = bitmap(1, 1, 24, data);
+            patch.bitmaps = (2, 2);
+            patch.x = 639;
+            patch.y = 479;
+            patch.compressed = compressed;
+            assert_eq!(pixels(&patch, 640, 480).unwrap(), [1, 2, 3, 255]);
+            assert!(pixels(&patch, 639, 480).is_err());
+            assert!(pixels(&patch, 640, 479).is_err());
+        }
+    }
+
+    #[test]
+    fn compressed_updates_cover_the_negotiated_color_depths() {
+        for (bpp, green) in [(15, 0x03e0_u16), (16, 0x07e0)] {
+            let [lo, hi] = green.to_le_bytes();
+            let bytes = [0x61, lo, hi]; // one color run
+            assert_eq!(
+                pixels(&bitmap(1, 1, bpp, &bytes), 1, 1).unwrap(),
+                [0, 255, 0, 255]
+            );
+        }
+        for header in [0, 0x20] {
+            let mut planes = vec![header];
+            if header == 0 {
+                planes.extend([255, 255]);
+            }
+            planes.extend([1, 2, 3, 4, 5, 6, 0]); // R, G, B planes and pad
+            assert_eq!(
+                pixels(&bitmap(1, 2, 32, &planes), 1, 2).unwrap(),
+                [6, 4, 2, 255, 5, 3, 1, 255]
+            );
+        }
+    }
+
+    #[test]
+    fn a_color_run_can_cross_scanlines_and_end_before_the_next_order() {
+        let encoded = [0x65, 9, 8, 7, 0x61, 1, 2, 3];
+        let mut expected = [9, 8, 7, 255].repeat(6);
+        expected[8..12].copy_from_slice(&[1, 2, 3, 255]);
+        assert_eq!(pixels(&bitmap(3, 2, 24, &encoded), 3, 2).unwrap(), expected);
     }
 }

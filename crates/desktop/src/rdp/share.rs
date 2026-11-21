@@ -5,6 +5,8 @@ use std::io::{self, Write};
 use zeroize::Zeroizing;
 
 const INPUT_FLAG_MOUSE_HWHEEL: u16 = 0x0100;
+const NEGOTIATE_ORDER_SUPPORT: u16 = 0x0002;
+const ZERO_BOUNDS_DELTAS_SUPPORT: u16 = 0x0008;
 
 fn words(values: &[u16]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -177,17 +179,23 @@ impl Share {
         // Slow-path updates and keyboard input. Only advertise orders/codecs that
         // can actually be rendered; the server falls back to bitmap rectangles.
         caps.add(1, &words(&[0, 0, 0x200, 0, 0, 0, 0, 0, 0, 0]));
-        // Prefer raw rectangles. Some servers still send classic compressed bitmaps.
+        // MS-RDPBCGR 2.2.7.1.2 requires both bitmapCompressionFlag and
+        // multipleRectangleSupport, even when no drawing orders are supported.
         caps.add(
             2,
-            &words(&[self.bpp, 1, 1, 1, self.width, self.height, 0, 1, 0, 0, 1, 0]),
+            &words(&[self.bpp, 1, 1, 1, self.width, self.height, 0, 1, 1, 0, 1, 0]),
         );
         let mut orders = vec![0; 84];
-        orders[20..32].copy_from_slice(&words(&[1, 20, 0, 1, 0, 2]));
+        let order_flags = NEGOTIATE_ORDER_SUPPORT | ZERO_BOUNDS_DELTAS_SUPPORT;
+        orders[20..32].copy_from_slice(&words(&[1, 20, 0, 1, 0, order_flags]));
         caps.add(3, &orders);
+        // Required client cache capabilities describe zero entries for this
+        // bitmap-only renderer (MS-RDPBCGR 2.2.7.1).
+        caps.add(4, &[0; 36]); // revision 1 bitmap cache
         // TS_POINTER_CAPABILITYSET: 24-bit color pointers and cached shapes.
         caps.add(8, &words(&[1, super::pointer::CACHE_SIZE]));
         caps.add(9, &words(&[0, 0])); // share
+        caps.add(12, &words(&[0, 0])); // no sound beeps
         let wheel = if self.horizontal_wheel {
             INPUT_FLAG_MOUSE_HWHEEL
         } else {
@@ -200,6 +208,9 @@ impl Share {
         input.extend_from_slice(&[0; 64]);
         caps.add(13, &input);
         caps.add(14, &words(&[1, 0])); // font list
+        caps.add(15, &0u32.to_le_bytes()); // no brush cache
+        caps.add(16, &[0; 48]); // ten empty glyph caches, no fragments or glyph support
+        caps.add(17, &[0; 8]); // no offscreen bitmap cache
         caps.add(20, &0u32.to_le_bytes()); // static virtual channels, no compression
         let mut confirm = self.id.to_le_bytes().to_vec();
         confirm.extend_from_slice(&words(&[1002, 8, (caps.bytes.len() + 4) as u16]));
@@ -284,5 +295,70 @@ impl Share {
             return Err(invalid("server used unnegotiated bulk compression"));
         }
         Ok((kind, p.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirm_active_advertises_the_required_bitmap_and_order_flags() -> io::Result<()> {
+        let channels = Channels {
+            user: 1004,
+            global: 1003,
+            clipboard: None,
+            drive: None,
+        };
+        let mut sent = Vec::new();
+        Share::pending(1280, 720).activate(&channels, &mut sent)?;
+        let data = super::super::wire::read_data(&mut sent.as_slice())?;
+        let mut first = Packet(&data);
+        first.expect(&[0x64])?;
+        first.take(5)?; // MCS initiator, channel, priority
+        let length = first.per_length()?;
+        let header = control(&mut Packet(first.take(length)?))?;
+        assert_eq!(header.kind, 3);
+        let mut confirm = Packet(header.body);
+        confirm.take(6)?; // share ID and originator
+        let descriptor_len = confirm.le16()?;
+        let caps_len = confirm.le16()?;
+        confirm.take(usize::from(descriptor_len))?;
+        let mut caps = Packet(confirm.take(usize::from(caps_len))?);
+        confirm.finish()?;
+        let count = caps.le16()?;
+        caps.take(2)?;
+        let mut bitmap_compression = None;
+        let mut order_flags = None;
+        let mut disabled = std::collections::BTreeMap::new();
+        for _ in 0..count {
+            let kind = caps.le16()?;
+            let len = caps.le16()?;
+            let mut cap = Packet(caps.take(usize::from(len) - 4)?);
+            match kind {
+                2 => {
+                    cap.take(16)?;
+                    bitmap_compression = Some(cap.le16()?);
+                }
+                3 => {
+                    cap.take(30)?;
+                    order_flags = Some(cap.le16()?);
+                    assert_eq!(cap.take(32)?, &[0; 32]); // bitmap-only renderer
+                }
+                4 | 12 | 15 | 16 | 17 => {
+                    assert!(cap.0.iter().all(|byte| *byte == 0));
+                    disabled.insert(kind, len);
+                }
+                _ => {}
+            }
+        }
+        caps.finish()?;
+        assert_eq!(bitmap_compression, Some(1));
+        assert_eq!(order_flags.map(|flags| flags & 0x000a), Some(0x000a));
+        assert_eq!(
+            disabled,
+            [(4, 40), (12, 8), (15, 8), (16, 52), (17, 12)].into()
+        );
+        Ok(())
     }
 }

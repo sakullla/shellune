@@ -3137,10 +3137,44 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
     ) -> Result<()> {
-        self.invalidator.debug_assert_paint();
+        let factor = self.scale_factor();
+        let bounds = bounds
+            .scale(factor)
+            .map_origin(|origin| origin.floor())
+            .map_size(|size| size.ceil());
+        self.paint_scaled_image(
+            bounds,
+            corner_radii.scale(factor),
+            data,
+            frame_index,
+            grayscale,
+        )
+    }
 
-        let scale_factor = self.scale_factor();
-        let bounds = bounds.scale(scale_factor);
+    /// Paint the first frame of a tile whose edges are already aligned in device pixels.
+    pub fn paint_image_tile(
+        &mut self,
+        bounds: Bounds<DevicePixels>,
+        data: Arc<RenderImage>,
+    ) -> Result<()> {
+        self.paint_scaled_image(
+            bounds.map(ScaledPixels::from),
+            Corners::default(),
+            data,
+            0,
+            false,
+        )
+    }
+
+    fn paint_scaled_image(
+        &mut self,
+        bounds: Bounds<ScaledPixels>,
+        corner_radii: Corners<ScaledPixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
         let params = RenderImageParams {
             image_id: data.id,
             frame_index,
@@ -3158,17 +3192,13 @@ impl Window {
                 )))
             })?
             .expect("Callback above only returns Some");
-        let content_mask = self.content_mask().scale(scale_factor);
-        let corner_radii = corner_radii.scale(scale_factor);
+        let content_mask = self.content_mask().scale(self.scale_factor());
         let opacity = self.element_opacity();
-
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
             pad: 0,
             grayscale,
-            bounds: bounds
-                .map_origin(|origin| origin.floor())
-                .map_size(|size| size.ceil()),
+            bounds,
             content_mask,
             corner_radii,
             tile,

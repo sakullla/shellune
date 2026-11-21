@@ -67,10 +67,10 @@ fn core(width: u16, height: u16, selected: Security) -> Vec<u8> {
     body.extend_from_slice(&0u32.to_le_bytes()); // keyboard subtype
     body.extend_from_slice(&12u32.to_le_bytes()); // function keys
     body.extend_from_slice(&[0; 64]); // imeFileName
-    body.extend_from_slice(&32u16.to_le_bytes()); // post-beta2 colour depth, in bits
+    body.extend_from_slice(&0xca04u16.to_le_bytes()); // RNS_UD_COLOR_24BPP
     body.extend_from_slice(&1u16.to_le_bytes()); // client product id
     body.extend_from_slice(&0u32.to_le_bytes()); // serial number
-    body.extend_from_slice(&32u16.to_le_bytes()); // high colour depth
+    body.extend_from_slice(&24u16.to_le_bytes()); // 32 bpp is requested in earlyCapabilityFlags
     body.extend_from_slice(&0x000fu16.to_le_bytes()); // 15, 16, 24 and 32 bit depths
     // Error-info PDUs and a 32-bit session are what this client renders.
     body.extend_from_slice(&0x0003u16.to_le_bytes());

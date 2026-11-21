@@ -8,7 +8,7 @@
 //! layout, focus, key and pointer events, the status card and the certificate
 //! question.
 
-use std::sync::Arc;
+use std::{rc::Rc, sync::Arc};
 
 use gpui::prelude::*;
 use gpui::{
@@ -339,7 +339,7 @@ pub struct DesktopPane {
     /// window.
     was_active: bool,
     /// Cached desktop tiles in row-major order. A frame replaces its dirty tiles.
-    images: Vec<Arc<RenderImage>>,
+    images: Rc<Vec<Arc<RenderImage>>>,
     image_size: (u32, u32),
     locale: Locale,
     /// The parts of the clipboard content last offered to the remote side or written
@@ -372,7 +372,7 @@ impl DesktopPane {
             if let Some(image) = pane.pointer_image.take() {
                 cx.drop_image(image, None);
             }
-            for image in pane.images.drain(..) {
+            for image in Rc::make_mut(&mut pane.images).drain(..) {
                 cx.drop_image(image, None);
             }
         })
@@ -420,7 +420,7 @@ impl DesktopPane {
             polling: false,
             watching_focus: false,
             was_active: false,
-            images: Vec::new(),
+            images: Rc::default(),
             image_size: (0, 0),
             locale,
             shared: Vec::new(),
@@ -1254,45 +1254,51 @@ impl DesktopPane {
 
     fn update_picture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.surface.size() != self.image_size {
-            for old in self.images.drain(..) {
+            for old in Rc::make_mut(&mut self.images).drain(..) {
                 cx.drop_image(old, Some(window));
             }
             self.image_size = self.surface.size();
         }
         let dirty: Vec<_> = self.surface.take_dirty_tiles().collect();
+        if dirty.is_empty() {
+            return;
+        }
+        let images = Rc::make_mut(&mut self.images);
         for index in dirty {
             let (width, height, bytes) = self.surface.tile(index);
             let buffer =
                 image::ImageBuffer::from_raw(width, height, bytes).expect("packed desktop tile");
             let tile = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
-            if let Some(slot) = self.images.get_mut(index) {
+            if let Some(slot) = images.get_mut(index) {
                 cx.drop_image(std::mem::replace(slot, tile), Some(window));
             } else {
-                self.images.push(tile);
+                images.push(tile);
             }
         }
     }
 
-    /// Position both sides from the same source edges so adjacent tiles meet at every zoom.
-    fn picture_tiles(&self, rect: Bounds<Pixels>) -> impl Iterator<Item = gpui::Img> + '_ {
-        use crate::app::desktop::DESKTOP_TILE;
-        let (width, height) = self.image_size;
-        let cols = width.div_ceil(DESKTOP_TILE);
-        self.images.iter().enumerate().map(move |(i, tile)| {
-            let x = i as u32 % cols * DESKTOP_TILE;
-            let y = i as u32 / cols * DESKTOP_TILE;
-            let left = rect.size.width * (x as f32 / width as f32);
-            let top = rect.size.height * (y as f32 / height as f32);
-            let right = rect.size.width * ((x + DESKTOP_TILE).min(width) as f32 / width as f32);
-            let bottom = rect.size.height * ((y + DESKTOP_TILE).min(height) as f32 / height as f32);
-            img(tile.clone())
-                .absolute()
-                .left(left)
-                .top(top)
-                .w(right - left)
-                .h(bottom - top)
-                .object_fit(gpui::ObjectFit::Fill)
-        })
+    /// Lay out the desktop once. Moving the cursor reuses all cached tile images.
+    fn picture_tiles(&self) -> impl IntoElement + 'static {
+        let images = Rc::clone(&self.images);
+        let size = self.image_size;
+        gpui::canvas(
+            |_, _, _| (),
+            move |bounds, (), window, _| {
+                let scale = window.scale_factor();
+                let clip = window.content_mask().bounds;
+                for (index, image) in images.iter().enumerate() {
+                    let tile = desktop_tile_bounds(bounds, size, index, scale);
+                    if !tile.is_empty()
+                        && tile.to_pixels(scale).intersects(&clip)
+                        && let Err(error) = window.paint_image_tile(tile, Arc::clone(image))
+                    {
+                        eprintln!("could not paint desktop tile: {error}");
+                    }
+                }
+            },
+        )
+        .absolute()
+        .inset_0()
     }
 
     // ---------------------------------------------------------------- input
@@ -2133,6 +2139,31 @@ impl DesktopPane {
     }
 }
 
+/// Round each shared source edge once in window coordinates. Rounding a tile's
+/// position and width independently can leave a physical pixel unpainted.
+fn desktop_tile_bounds(
+    bounds: Bounds<Pixels>,
+    desktop: (u32, u32),
+    index: usize,
+    scale: f32,
+) -> Bounds<gpui::DevicePixels> {
+    use crate::app::desktop::DESKTOP_TILE;
+    let (width, height) = desktop;
+    let columns = width.div_ceil(DESKTOP_TILE);
+    let x = index as u32 % columns * DESKTOP_TILE;
+    let y = index as u32 / columns * DESKTOP_TILE;
+    let edge = |origin: Pixels, length: Pixels, offset: u32, total: u32| {
+        let position = origin + length * (offset.min(total) as f32 / total as f32);
+        gpui::DevicePixels((f32::from(position) * scale).round() as i32)
+    };
+    let x_edge = |x| edge(bounds.left(), bounds.size.width, x, width);
+    let y_edge = |y| edge(bounds.top(), bounds.size.height, y, height);
+    Bounds::from_corners(
+        gpui::point(x_edge(x), y_edge(y)),
+        gpui::point(x_edge(x + DESKTOP_TILE), y_edge(y + DESKTOP_TILE)),
+    )
+}
+
 /// Shows `cursor` while the pointer is over `element`.
 ///
 /// GPUI has no cursor builder on a `Div` in this version: the element reads
@@ -2326,7 +2357,7 @@ impl Render for DesktopPane {
                     .w(rect.size.width)
                     .h(rect.size.height)
                     .debug_selector(|| "desktop.picture".to_owned())
-                    .children(self.picture_tiles(rect));
+                    .child(self.picture_tiles());
                 let position = window.mouse_position();
                 let mut style = self.fallback_cursor();
                 if self.is_live()
@@ -2513,6 +2544,42 @@ impl DesktopPane {
         // fit the pointer is mapped through.
         if link.resize(width, height).is_ok() {
             self.asked_size = (width, height);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tile_tests {
+    use super::*;
+    #[test]
+    fn adjoining_tiles_cover_the_panned_desktop_at_fractional_dpi() {
+        let bounds = Bounds::new(
+            gpui::point(px(-13.25), px(47.4)),
+            gpui::size(px(1243.2), px(810.1)),
+        );
+        let desktop = (2940, 1912);
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            let tile = |index| desktop_tile_bounds(bounds, desktop, index, scale);
+            for index in 0..24 {
+                if index % 6 < 5 {
+                    assert_eq!(tile(index).right(), tile(index + 1).left());
+                }
+                if index < 18 {
+                    assert_eq!(tile(index).bottom(), tile(index + 6).top());
+                }
+            }
+            assert_eq!(
+                tile(0).left().0,
+                (f32::from(bounds.left()) * scale).round() as i32
+            );
+            assert_eq!(
+                tile(23).right().0,
+                (f32::from(bounds.right()) * scale).round() as i32
+            );
+            assert_eq!(
+                tile(23).bottom().0,
+                (f32::from(bounds.bottom()) * scale).round() as i32
+            );
         }
     }
 }

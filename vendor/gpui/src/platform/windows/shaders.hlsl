@@ -1140,6 +1140,7 @@ struct PolychromeSpriteVertexOutput {
     nointerpolation uint sprite_id: TEXCOORD0;
     float4 position: SV_Position;
     float2 tile_position: POSITION;
+    nointerpolation float4 tile_uv_limits: TEXCOORD1;
     float4 clip_distance: SV_ClipDistance;
 };
 
@@ -1147,6 +1148,7 @@ struct PolychromeSpriteFragmentInput {
     nointerpolation uint sprite_id: TEXCOORD0;
     float4 position: SV_Position;
     float2 tile_position: POSITION;
+    nointerpolation float4 tile_uv_limits: TEXCOORD1;
 };
 
 StructuredBuffer<PolychromeSprite> poly_sprites: register(t1);
@@ -1157,9 +1159,15 @@ PolychromeSpriteVertexOutput polychrome_sprite_vertex(uint vertex_id: SV_VertexI
     float4 device_position = to_device_position(unit_vertex, sprite.bounds);
     float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
                                                     sprite.content_mask);
-    float2 tile_position = to_tile_position(unit_vertex, sprite.tile);
+    float2 atlas_size;
+    t_sprite.GetDimensions(atlas_size.x, atlas_size.y);
+    float2 origin = float2(sprite.tile.bounds.origin);
+    float2 size = float2(sprite.tile.bounds.size);
+    float2 tile_position = (origin + unit_vertex * size) / atlas_size;
 
     PolychromeSpriteVertexOutput output;
+    // A scaled transparent image must never sample a neighboring atlas tile.
+    output.tile_uv_limits = float4((origin + 0.5) / atlas_size, (origin + size - 0.5) / atlas_size);
     output.position = device_position;
     output.tile_position = tile_position;
     output.sprite_id = sprite_id;
@@ -1169,7 +1177,8 @@ PolychromeSpriteVertexOutput polychrome_sprite_vertex(uint vertex_id: SV_VertexI
 
 float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Target {
     PolychromeSprite sprite = poly_sprites[input.sprite_id];
-    float4 sample = t_sprite.Sample(s_sprite, input.tile_position);
+    float2 uv = clamp(input.tile_position, input.tile_uv_limits.xy, input.tile_uv_limits.zw);
+    float4 sample = t_sprite.Sample(s_sprite, uv);
     float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
     float4 color = sample;

@@ -12,7 +12,7 @@ use super::update;
 use super::wire::{self, Packet};
 use super::{Command, Config, Control, Emit, publish};
 use crate::input::Receiver;
-use crate::{Event, Failure, MAX_FRAME_BYTES, State};
+use crate::{Event, Failure, State};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
@@ -104,6 +104,7 @@ const LOGON_WAIT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(32);
 
 /// Ends one attempt with the business failure it maps to.
+#[derive(Debug)]
 struct Ended {
     failure: Failure,
     reason: String,
@@ -237,6 +238,514 @@ pub(super) fn run(
                 &ended.reason,
             );
         }
+    }
+}
+
+struct Active {
+    transport: Transport,
+    channels: Channels,
+    share: Share,
+    logon_confirmed: bool,
+    /// Bytes of a PDU that has not fully arrived yet.
+    frames: Frames,
+    /// Whether Connected has been published.
+    connected: bool,
+    /// When an unconfirmed logon stops being waited for.
+    logon_deadline: std::time::Instant,
+    clipboard: Clipboard,
+    drive: Drive,
+    /// The button state the host last reported, so each edge carries its button.
+    buttons: u32,
+    pointer_position: Option<(u16, u16)>,
+    pointers: super::pointer::Pointers,
+}
+
+fn connect(
+    config: &Config,
+    emit: &Emit,
+    control: &Arc<Control>,
+    commands: &Receiver<Command>,
+) -> Result<Active, Ended> {
+    let address = format!("{}:{}", config.host, config.port);
+    let endpoints = address
+        .to_socket_addrs()
+        .map_err(|error| Ended::io(error, Failure::Connect))?;
+    let mut last = Ended::new(Failure::Connect, "no address resolved for the RDP server");
+    let mut socket = None;
+    for endpoint in endpoints {
+        match TcpStream::connect_timeout(&endpoint, HANDSHAKE) {
+            Ok(stream) => {
+                socket = Some(stream);
+                break;
+            }
+            Err(error) => last = Ended::io(error, Failure::Connect),
+        }
+    }
+    let socket = socket.ok_or(last)?;
+    socket.set_nodelay(true).ok();
+    socket
+        .set_read_timeout(Some(HANDSHAKE))
+        .map_err(|error| Ended::io(error, Failure::Connect))?;
+    control.attach(&socket);
+
+    let mut transport = Transport::Plain(socket);
+    // The X.224 negotiation only offers external security; the old standard RDP
+    // security is never selected.
+    let selected = wire::negotiate(&mut transport, true)
+        .map_err(|error| Ended::io(error, Failure::Connect))?;
+    super::trace(&format!("negotiated security {selected:?}"));
+
+    let verify = {
+        let control = Arc::clone(control);
+        let emit = Arc::clone(emit);
+        let host = config.host.clone();
+        Arc::new(
+            move |subject: String, issuer: String, fingerprint: String| {
+                control.ask(&emit, &host, subject, issuer, fingerprint)
+            },
+        ) as Arc<security::Ask>
+    };
+    super::trace("tls handshake starting");
+    let mut secure = security::tls(transport, &config.host, verify).map_err(|error| {
+        if error.to_string().contains(security::CERTIFICATE_REJECTED) {
+            Ended::new(
+                Failure::CertificateRejected,
+                "the RDP certificate was rejected",
+            )
+        } else {
+            Ended::io(error, Failure::Tls)
+        }
+    })?;
+    super::trace("tls handshake done");
+    security::authenticate(
+        &mut secure,
+        selected,
+        &config.host,
+        &config.user,
+        &config.domain,
+        &config.password,
+    )
+    .map_err(|error| Ended::io(error, Failure::Authentication))?;
+    super::trace("authentication done");
+    let mut transport = Transport::Secure(Box::new(secure));
+
+    if control.cancelled() {
+        return Err(Ended::new(Failure::Cancelled, "cancelled"));
+    }
+    let channels = mcs::connect(
+        &mut transport,
+        config.width,
+        config.height,
+        selected,
+        config.clipboard,
+        config.drive.is_some(),
+    )
+    .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+    super::trace("mcs connected");
+
+    share::login(
+        &channels,
+        &mut transport,
+        &config.user,
+        &config.domain,
+        &config.password,
+        selected,
+    )
+    .map_err(|error| Ended::io(error, Failure::Authentication))?;
+    super::trace("login pdu sent");
+
+    let mut active = Active {
+        transport,
+        channels,
+        share: Share::pending(config.width, config.height),
+        clipboard: Clipboard::new(config.clipboard, Arc::clone(emit)),
+        drive: Drive::new(config.drive.clone(), Arc::clone(emit)),
+        buttons: 0,
+        pointer_position: None,
+        pointers: Default::default(),
+        logon_confirmed: false,
+        frames: Frames::default(),
+        connected: false,
+        logon_deadline: std::time::Instant::now() + LOGON_WAIT,
+    };
+    active.await_activation(control)?;
+    // A synchronize event is how a client reports the keyboard toggle state;
+    // servers expect it before forwarding input.
+    active
+        .share
+        .input(&active.channels, &mut active.transport, 0, 0, 0, 0)
+        .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+    super::trace("desktop activated");
+    // From here on the loop must come back often enough to notice a cancel and to
+    // decide that a logon was never confirmed.
+    active.set_poll_timeout(POLL);
+    let _ = commands;
+    Ok(active)
+}
+
+/// Set Error Info carries a disconnect reason from any stage (MS-RDPBCGR
+/// 2.2.5.1.1). Only Save Session Info confirms the logon here.
+fn logon_pdu(kind: u8, payload: &[u8]) -> Result<bool, Ended> {
+    if kind != 47 {
+        return Ok(kind == 38);
+    }
+    let code = Packet(payload)
+        .le32()
+        .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+    let (failure, reason) = match code {
+        0 => return Ok(false), // ERRINFO_NONE
+        0x0007 => (Failure::Connect, "the RDP server denied the connection"),
+        0x0009 => (
+            Failure::Authentication,
+            "the account lacks remote desktop access",
+        ),
+        0x000a => (
+            Failure::Authentication,
+            "the RDP server requires fresh credentials",
+        ),
+        0x10ea => (
+            Failure::ProtocolFailure,
+            "the RDP server rejected the client capabilities in Confirm Active",
+        ),
+        0x1000..=0x1fff => (
+            Failure::ProtocolFailure,
+            "the RDP server reported a protocol error",
+        ),
+        _ => (Failure::RemoteClosed, "the RDP server ended the connection"),
+    };
+    Err(Ended::new(
+        failure,
+        format!("{reason} (code {code}, 0x{code:08X})"),
+    ))
+}
+
+impl Active {
+    /// Reads until the server activates the desktop, then acknowledges it. The wait
+    /// is bounded: a server that never activates is a failed attempt, not a hang.
+    fn await_activation(&mut self, control: &Arc<Control>) -> Result<(), Ended> {
+        let deadline = std::time::Instant::now() + HANDSHAKE;
+        loop {
+            if control.cancelled() {
+                return Err(Ended::new(Failure::Cancelled, "cancelled"));
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(Ended::new(
+                    Failure::Io,
+                    "the server did not activate the desktop in time",
+                ));
+            }
+            let Some(body) = self.read_slow()? else {
+                continue;
+            };
+            let Some((kind, header)) = self.control(&body) else {
+                continue;
+            };
+            if kind != 1 {
+                continue;
+            }
+            let share = Share::from_demand(&header)
+                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+            share
+                .activate(&self.channels, &mut self.transport)
+                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+            self.share = share;
+            self.pointer_position = None;
+            self.clipboard
+                .announce(&self.channels, &mut self.transport)
+                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+            return Ok(());
+        }
+    }
+
+    /// Sets a short read wait on the socket under the TLS layer, so the loop
+    /// returns to its cancellation and deadline checks between updates.
+    fn set_poll_timeout(&self, wait: Duration) {
+        match &self.transport {
+            Transport::Plain(socket) => {
+                let _ = socket.set_read_timeout(Some(wait));
+            }
+            Transport::Secure(secure) => {
+                if let Transport::Plain(socket) = &secure.sock {
+                    let _ = socket.set_read_timeout(Some(wait));
+                }
+            }
+        }
+    }
+
+    fn announce_logon(&mut self, emit: &Emit, control: &Control) {
+        if self.connected {
+            return;
+        }
+        let reason = if self.logon_confirmed {
+            ""
+        } else if std::time::Instant::now() > self.logon_deadline {
+            "logon not confirmed: the server authenticates through its own screen"
+        } else {
+            return;
+        };
+        publish(emit, control, &State::Connected, Failure::None, reason);
+        self.connected = true;
+    }
+
+    fn pump(
+        &mut self,
+        emit: &Emit,
+        control: &Arc<Control>,
+        commands: &Receiver<Command>,
+    ) -> Result<(), Ended> {
+        loop {
+            if control.cancelled() {
+                let _ = self.drive.close(&self.channels, &mut self.transport);
+                return Err(Ended::new(Failure::Cancelled, "cancelled"));
+            }
+            self.announce_logon(emit, control);
+            self.drain(commands)?;
+            self.clipboard
+                .poll(&self.channels, &mut self.transport)
+                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+            match read_chunk(&mut self.transport, &mut self.frames) {
+                Ok(None) => continue,
+                Ok(Some(Incoming::Slow(body))) => {
+                    self.slow(&body, emit)?;
+                }
+                Ok(Some(Incoming::Fast)) => {
+                    return Err(Ended::new(
+                        Failure::ProtocolFailure,
+                        "the server sent fast-path output the client did not offer",
+                    ));
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => return Err(Ended::io(error, Failure::RemoteClosed)),
+            }
+        }
+    }
+
+    /// Applies every queued input or clipboard command before the next read.
+    fn drain(&mut self, commands: &Receiver<Command>) -> Result<(), Ended> {
+        for _ in 0..64 {
+            match commands.pop() {
+                Some(Command::Key {
+                    scancode,
+                    down,
+                    extended,
+                }) => self
+                    .key(scancode, down, extended)
+                    .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?,
+                Some(Command::Pointer { buttons, x, y }) => {
+                    let flags = super::pointer_flags(self.buttons, buttons);
+                    self.buttons = buttons;
+                    if flags & 0x0400 != 0 && !self.share.horizontal_wheel {
+                        continue;
+                    }
+                    // A wheel PDU's coordinates may be ignored. Move over the
+                    // target first, even if the user scrolled without hovering.
+                    let moved = self.pointer_position != Some((x, y));
+                    if moved && flags & 0x0600 != 0 {
+                        self.pointer(0x0800, x, y)
+                            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+                    }
+                    if moved || flags != 0x0800 {
+                        self.pointer(flags, x, y)
+                            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+                    }
+                    self.pointer_position = Some((x, y));
+                }
+                Some(Command::Clipboard(entries)) => self
+                    .clipboard
+                    .offer(&self.channels, &mut self.transport, &entries)
+                    .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?,
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads bytes until a whole PDU is buffered. A timeout part-way through keeps
+    /// what arrived, so the next call continues the same PDU instead of starting in
+    /// the middle of it.
+    fn read(&mut self) -> io::Result<Incoming> {
+        next_frame(&mut self.transport, &mut self.frames)
+    }
+
+    fn read_slow(&mut self) -> Result<Option<Vec<u8>>, Ended> {
+        match self.read() {
+            Ok(Incoming::Slow(body)) => Ok(Some(body)),
+            Ok(Incoming::Fast) => Ok(None),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(Ended::io(error, Failure::ProtocolFailure)),
+        }
+    }
+
+    /// Strips the X.224 and MCS headers and returns the Share Control header and
+    /// its body when the PDU belongs to the global channel. Anything else (a
+    /// static channel message, another MCS primitive) is not a share control PDU
+    /// and is reported as absent, never guessed at.
+    fn control<'a>(&'a self, body: &'a [u8]) -> Option<(u16, share::Control<'a>)> {
+        let mut p = Packet(body);
+        if p.u8().ok()? != 2 {
+            return None;
+        }
+        p.take(2).ok()?;
+        let payload = if p.0.first() == Some(&0x68) {
+            match self.channels.receive(p.0).ok()? {
+                (id, payload) if id == self.channels.global => payload,
+                _ => return None,
+            }
+        } else {
+            p.0
+        };
+        let mut p = Packet(payload);
+        let control = share::control(&mut p).ok()?;
+        Some((control.kind, control))
+    }
+
+    fn slow(&mut self, body: &[u8], emit: &Emit) -> Result<(), Ended> {
+        let mut p = Packet(body);
+        if p.u8()
+            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?
+            != 2
+        {
+            return Ok(());
+        }
+        p.take(2)
+            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+        if p.0.first() != Some(&0x68) {
+            // Anything but an MCS SendDataIndication is not a share message this
+            // client renders; the X.224 layer owns it.
+            return Ok(());
+        }
+        // The MCS opcode is the same on every channel, so the channel ID decides
+        // what the body is: a static channel's own data, or the global channel's
+        // Share Control PDUs.
+        let (id, payload) = self
+            .channels
+            .receive(p.0)
+            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+        if Some(id) == self.channels.clipboard {
+            self.clipboard
+                .on_data(&self.channels, &mut self.transport, payload)
+                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+            return Ok(());
+        }
+        if Some(id) == self.channels.drive {
+            self.drive
+                .on_data(&self.channels, &mut self.transport, payload)
+                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+            return Ok(());
+        }
+        if id != self.channels.global {
+            return Ok(());
+        }
+        let mut p = Packet(payload);
+        let header =
+            share::control(&mut p).map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+        match header.kind {
+            7 => {
+                let (kind, payload) = self
+                    .share
+                    .data(header.body)
+                    .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+                if logon_pdu(kind, payload)? {
+                    super::trace("server confirmed logon");
+                    self.logon_confirmed = true;
+                }
+                if kind == 2 {
+                    self.bitmap_update(payload, emit)?;
+                } else if kind == 27
+                    && let Some(shape) = self
+                        .pointers
+                        .update(payload)
+                        .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?
+                {
+                    emit(Event::Pointer(shape));
+                }
+            }
+            2 => {
+                return Err(Ended::new(
+                    Failure::RemoteClosed,
+                    "the server deactivated the desktop",
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn bitmap_update(&mut self, payload: &[u8], emit: &Emit) -> Result<(), Ended> {
+        let mut p = Packet(payload);
+        let kind = p
+            .le16()
+            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+        // TS_UPDATE_BITMAP_DATA is updateType then numberRectangles: the palette
+        // update is the one with a pad field, not this one.
+        let count = p
+            .le16()
+            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+        if kind != 1 {
+            // Palette and other update types carry nothing this client renders.
+            return Ok(());
+        }
+        for _ in 0..count {
+            let bitmap =
+                update::rect(&mut p).map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+            if bitmap.bpp != self.share.bpp() {
+                return Err(Ended::new(
+                    Failure::ProtocolFailure,
+                    "the server sent a bitmap depth it did not negotiate",
+                ));
+            }
+            let pixels = update::pixels(&bitmap, self.share.width, self.share.height)
+                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+            emit(Event::Frame {
+                x: i32::from(bitmap.x),
+                y: i32::from(bitmap.y),
+                width: i32::from(bitmap.width),
+                height: i32::from(bitmap.height),
+                desktop_width: u32::from(self.share.width),
+                desktop_height: u32::from(self.share.height),
+                stride: u32::from(bitmap.width) * 4,
+                pixels,
+            });
+        }
+        Ok(())
+    }
+
+    /// Slow-path keyboard input: the same event the fast path carries, inside a
+    /// Share Data PDU. Every server accepts it, which a fast-path PDU is not
+    /// guaranteed to be.
+    fn key(&mut self, scancode: u8, down: bool, extended: bool) -> io::Result<()> {
+        self.share.input(
+            &self.channels,
+            &mut self.transport,
+            4, // INPUT_EVENT_SCANCODE
+            keyboard_flags(down, extended),
+            u16::from(scancode),
+            0,
+        )
+    }
+
+    /// Slow-path pointer input (INPUT_EVENT_MOUSE), with the same flag encoding
+    /// the fast path uses.
+    fn pointer(&mut self, flags: u16, x: u16, y: u16) -> io::Result<()> {
+        self.share.input(
+            &self.channels,
+            &mut self.transport,
+            0x8001, // INPUT_EVENT_MOUSE
+            flags,
+            x,
+            y,
+        )
     }
 }
 
@@ -450,562 +959,31 @@ mod tests {
 
     #[test]
     fn a_logon_confirmation_maps_to_its_outcome() {
-        // PDUTYPE2_SAVE_SESSION_INFO confirms the logon.
-        assert_eq!(logon_pdu(38, &[1, 0, 0, 0]), Some(Logon::Confirmed));
-        // PDUTYPE2_SET_ERROR_INFO with zero is a confirmation ...
-        assert_eq!(logon_pdu(47, &[0, 0, 0, 0]), Some(Logon::Confirmed));
-        // ... and with a code is a refusal that keeps the code.
-        assert_eq!(logon_pdu(47, &5u32.to_le_bytes()), Some(Logon::Refused(5)));
-        // Anything else is not a logon result.
-        assert_eq!(logon_pdu(2, &[0, 0, 0, 0]), None);
-        assert_eq!(logon_pdu(47, &[0, 0]), None);
-    }
-}
-
-/// What the server said about the logon.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Logon {
-    /// The server confirmed the logon.
-    Confirmed,
-    /// The server refused it, with the error code it gave.
-    Refused(u32),
-}
-
-struct Active {
-    transport: Transport,
-    channels: Channels,
-    share: Share,
-    /// Set when the server says the logon succeeded or failed.
-    logon: Option<Logon>,
-    /// Bytes of a PDU that has not fully arrived yet.
-    frames: Frames,
-    /// Whether Connected has been published.
-    connected: bool,
-    /// When an unconfirmed logon stops being waited for.
-    logon_deadline: std::time::Instant,
-    frame: Vec<u8>,
-    stride: usize,
-    width: u16,
-    height: u16,
-    clipboard: Clipboard,
-    drive: Drive,
-    /// The button state the host last reported, so each edge carries its button.
-    buttons: u32,
-    pointer_position: Option<(u16, u16)>,
-    pointers: super::pointer::Pointers,
-}
-
-fn connect(
-    config: &Config,
-    emit: &Emit,
-    control: &Arc<Control>,
-    commands: &Receiver<Command>,
-) -> Result<Active, Ended> {
-    let address = format!("{}:{}", config.host, config.port);
-    let endpoints = address
-        .to_socket_addrs()
-        .map_err(|error| Ended::io(error, Failure::Connect))?;
-    let mut last = Ended::new(Failure::Connect, "no address resolved for the RDP server");
-    let mut socket = None;
-    for endpoint in endpoints {
-        match TcpStream::connect_timeout(&endpoint, HANDSHAKE) {
-            Ok(stream) => {
-                socket = Some(stream);
-                break;
-            }
-            Err(error) => last = Ended::io(error, Failure::Connect),
-        }
-    }
-    let socket = socket.ok_or(last)?;
-    socket.set_nodelay(true).ok();
-    socket
-        .set_read_timeout(Some(HANDSHAKE))
-        .map_err(|error| Ended::io(error, Failure::Connect))?;
-    control.attach(&socket);
-
-    let mut transport = Transport::Plain(socket);
-    // The X.224 negotiation only offers external security; the old standard RDP
-    // security is never selected.
-    let selected = wire::negotiate(&mut transport, true)
-        .map_err(|error| Ended::io(error, Failure::Connect))?;
-    super::trace(&format!("negotiated security {selected:?}"));
-
-    let verify = {
-        let control = Arc::clone(control);
-        let emit = Arc::clone(emit);
-        let host = config.host.clone();
-        Arc::new(
-            move |subject: String, issuer: String, fingerprint: String| {
-                control.ask(&emit, &host, subject, issuer, fingerprint)
-            },
-        ) as Arc<security::Ask>
-    };
-    super::trace("tls handshake starting");
-    let mut secure = security::tls(transport, &config.host, verify).map_err(|error| {
-        if error.to_string().contains(security::CERTIFICATE_REJECTED) {
-            Ended::new(
-                Failure::CertificateRejected,
-                "the RDP certificate was rejected",
-            )
-        } else {
-            Ended::io(error, Failure::Tls)
-        }
-    })?;
-    super::trace("tls handshake done");
-    security::authenticate(
-        &mut secure,
-        selected,
-        &config.host,
-        &config.user,
-        &config.domain,
-        &config.password,
-    )
-    .map_err(|error| Ended::io(error, Failure::Authentication))?;
-    super::trace("authentication done");
-    let mut transport = Transport::Secure(Box::new(secure));
-
-    if control.cancelled() {
-        return Err(Ended::new(Failure::Cancelled, "cancelled"));
-    }
-    let channels = mcs::connect(
-        &mut transport,
-        config.width,
-        config.height,
-        selected,
-        config.clipboard,
-        config.drive.is_some(),
-    )
-    .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-    super::trace("mcs connected");
-
-    share::login(
-        &channels,
-        &mut transport,
-        &config.user,
-        &config.domain,
-        &config.password,
-        selected,
-    )
-    .map_err(|error| Ended::io(error, Failure::Authentication))?;
-    super::trace("login pdu sent");
-
-    let mut active = Active {
-        transport,
-        channels,
-        share: Share::pending(config.width, config.height),
-        frame: vec![0; usize::from(config.width) * usize::from(config.height) * 4],
-        stride: usize::from(config.width) * 4,
-        width: config.width,
-        height: config.height,
-        clipboard: Clipboard::new(config.clipboard, Arc::clone(emit)),
-        drive: Drive::new(config.drive.clone(), Arc::clone(emit)),
-        buttons: 0,
-        pointer_position: None,
-        pointers: Default::default(),
-        logon: None,
-        frames: Frames::default(),
-        connected: false,
-        logon_deadline: std::time::Instant::now() + LOGON_WAIT,
-    };
-    active.await_activation(control)?;
-    // A synchronize event is how a client reports the keyboard toggle state;
-    // servers expect it before forwarding input.
-    active
-        .share
-        .input(&active.channels, &mut active.transport, 0, 0, 0, 0)
-        .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-    super::trace("desktop activated");
-    // From here on the loop must come back often enough to notice a cancel and to
-    // decide that a logon was never confirmed.
-    active.set_poll_timeout(POLL);
-    let _ = commands;
-    Ok(active)
-}
-
-/// The logon outcome a share data PDU carries: PDUTYPE2_SAVE_SESSION_INFO
-/// confirms it, PDUTYPE2_SET_ERROR_INFO reports a code — zero is success and
-/// anything else is a refusal.
-fn logon_pdu(kind: u8, payload: &[u8]) -> Option<Logon> {
-    match kind {
-        38 => Some(Logon::Confirmed),
-        47 => {
-            let bytes = payload.get(..4)?;
-            let code = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            Some(if code == 0 {
-                Logon::Confirmed
-            } else {
-                Logon::Refused(code)
-            })
-        }
-        _ => None,
-    }
-}
-
-impl Active {
-    /// Reads until the server activates the desktop, then acknowledges it. The wait
-    /// is bounded: a server that never activates is a failed attempt, not a hang.
-    fn await_activation(&mut self, control: &Arc<Control>) -> Result<(), Ended> {
-        let deadline = std::time::Instant::now() + HANDSHAKE;
-        loop {
-            if control.cancelled() {
-                return Err(Ended::new(Failure::Cancelled, "cancelled"));
-            }
-            if std::time::Instant::now() > deadline {
-                return Err(Ended::new(
-                    Failure::Io,
-                    "the server did not activate the desktop in time",
-                ));
-            }
-            let Some(body) = self.read_slow()? else {
-                continue;
-            };
-            let Some((kind, header)) = self.control(&body) else {
-                continue;
-            };
-            if kind != 1 {
-                continue;
-            }
-            let share = Share::from_demand(&header)
-                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-            let width = share.width;
-            let height = share.height;
-            if width != self.width || height != self.height {
-                self.width = width;
-                self.height = height;
-                self.stride = usize::from(width) * 4;
-                self.frame = vec![0; self.stride * usize::from(height)];
-            }
-            share
-                .activate(&self.channels, &mut self.transport)
-                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-            self.share = share;
-            self.pointer_position = None;
-            self.clipboard
-                .announce(&self.channels, &mut self.transport)
-                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-            return Ok(());
-        }
+        assert!(logon_pdu(38, &[1, 0, 0, 0]).unwrap());
+        assert!(!logon_pdu(47, &[0; 4]).unwrap());
+        assert!(!logon_pdu(2, &[]).unwrap());
+        assert_eq!(
+            logon_pdu(47, &[0, 0]).unwrap_err().failure,
+            Failure::ProtocolFailure
+        );
     }
 
-    /// Publishes Connected once, and only when the logon is settled: confirmed by
-    /// the server, or unconfirmed after the wait because the server reports logon
-    /// results only on its own screen (xrdp without CredSSP). A refusal is an
-    /// authentication failure and never a session.
-    /// Sets a short read wait on the socket under the TLS layer, so the loop
-    /// returns to its cancellation and deadline checks between updates.
-    fn set_poll_timeout(&self, wait: Duration) {
-        match &self.transport {
-            Transport::Plain(socket) => {
-                let _ = socket.set_read_timeout(Some(wait));
-            }
-            Transport::Secure(secure) => {
-                if let Transport::Plain(socket) = &secure.sock {
-                    let _ = socket.set_read_timeout(Some(wait));
-                }
-            }
+    #[test]
+    fn bad_capabilities_and_authentication_have_distinct_failure_reasons() {
+        let rejected = logon_pdu(47, &4330u32.to_le_bytes()).unwrap_err();
+        assert_eq!(rejected.failure, Failure::ProtocolFailure);
+        assert!(rejected.reason.contains("capabilities"));
+        assert!(rejected.reason.contains("0x000010EA"));
+        for (code, failure) in [
+            (9u32, Failure::Authentication),
+            (10, Failure::Authentication),
+            (5, Failure::RemoteClosed),
+            (0x10d4, Failure::ProtocolFailure),
+        ] {
+            assert_eq!(
+                logon_pdu(47, &code.to_le_bytes()).unwrap_err().failure,
+                failure
+            );
         }
-    }
-
-    fn announce_logon(&mut self, emit: &Emit, control: &Control) -> Result<(), Ended> {
-        if self.connected {
-            return Ok(());
-        }
-        match self.logon {
-            Some(Logon::Refused(code)) => Err(Ended::new(
-                Failure::Authentication,
-                format!("the server refused the logon (code {code})"),
-            )),
-            Some(Logon::Confirmed) => {
-                publish(emit, control, &State::Connected, Failure::None, "");
-                self.connected = true;
-                Ok(())
-            }
-            None if std::time::Instant::now() > self.logon_deadline => {
-                publish(
-                    emit,
-                    control,
-                    &State::Connected,
-                    Failure::None,
-                    "logon not confirmed: the server authenticates through its own screen",
-                );
-                self.connected = true;
-                Ok(())
-            }
-            None => Ok(()),
-        }
-    }
-
-    fn pump(
-        &mut self,
-        emit: &Emit,
-        control: &Arc<Control>,
-        commands: &Receiver<Command>,
-    ) -> Result<(), Ended> {
-        loop {
-            if control.cancelled() {
-                let _ = self.drive.close(&self.channels, &mut self.transport);
-                return Err(Ended::new(Failure::Cancelled, "cancelled"));
-            }
-            self.announce_logon(emit, control)?;
-            self.drain(commands)?;
-            self.clipboard
-                .poll(&self.channels, &mut self.transport)
-                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-            match read_chunk(&mut self.transport, &mut self.frames) {
-                Ok(None) => continue,
-                Ok(Some(Incoming::Slow(body))) => {
-                    self.slow(&body, emit)?;
-                    if let Some(Logon::Refused(code)) = self.logon {
-                        return Err(Ended::new(
-                            Failure::Authentication,
-                            format!("the server refused the logon (code {code})"),
-                        ));
-                    }
-                }
-                Ok(Some(Incoming::Fast)) => {
-                    return Err(Ended::new(
-                        Failure::ProtocolFailure,
-                        "the server sent fast-path output the client did not offer",
-                    ));
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) => {}
-                Err(error) => return Err(Ended::io(error, Failure::RemoteClosed)),
-            }
-        }
-    }
-
-    /// Applies every queued input or clipboard command before the next read.
-    fn drain(&mut self, commands: &Receiver<Command>) -> Result<(), Ended> {
-        for _ in 0..64 {
-            match commands.pop() {
-                Some(Command::Key {
-                    scancode,
-                    down,
-                    extended,
-                }) => self
-                    .key(scancode, down, extended)
-                    .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?,
-                Some(Command::Pointer { buttons, x, y }) => {
-                    let flags = super::pointer_flags(self.buttons, buttons);
-                    self.buttons = buttons;
-                    if flags & 0x0400 != 0 && !self.share.horizontal_wheel {
-                        continue;
-                    }
-                    // A wheel PDU's coordinates may be ignored. Move over the
-                    // target first, even if the user scrolled without hovering.
-                    let moved = self.pointer_position != Some((x, y));
-                    if moved && flags & 0x0600 != 0 {
-                        self.pointer(0x0800, x, y)
-                            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-                    }
-                    if moved || flags != 0x0800 {
-                        self.pointer(flags, x, y)
-                            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-                    }
-                    self.pointer_position = Some((x, y));
-                }
-                Some(Command::Clipboard(entries)) => self
-                    .clipboard
-                    .offer(&self.channels, &mut self.transport, &entries)
-                    .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?,
-                None => break,
-            }
-        }
-        Ok(())
-    }
-
-    /// Reads bytes until a whole PDU is buffered. A timeout part-way through keeps
-    /// what arrived, so the next call continues the same PDU instead of starting in
-    /// the middle of it.
-    fn read(&mut self) -> io::Result<Incoming> {
-        next_frame(&mut self.transport, &mut self.frames)
-    }
-
-    fn read_slow(&mut self) -> Result<Option<Vec<u8>>, Ended> {
-        match self.read() {
-            Ok(Incoming::Slow(body)) => Ok(Some(body)),
-            Ok(Incoming::Fast) => Ok(None),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                Ok(None)
-            }
-            Err(error) => Err(Ended::io(error, Failure::ProtocolFailure)),
-        }
-    }
-
-    /// Strips the X.224 and MCS headers and returns the Share Control header and
-    /// its body when the PDU belongs to the global channel. Anything else (a
-    /// static channel message, another MCS primitive) is not a share control PDU
-    /// and is reported as absent, never guessed at.
-    fn control<'a>(&'a self, body: &'a [u8]) -> Option<(u16, share::Control<'a>)> {
-        let mut p = Packet(body);
-        if p.u8().ok()? != 2 {
-            return None;
-        }
-        p.take(2).ok()?;
-        let payload = if p.0.first() == Some(&0x68) {
-            match self.channels.receive(p.0).ok()? {
-                (id, payload) if id == self.channels.global => payload,
-                _ => return None,
-            }
-        } else {
-            p.0
-        };
-        let mut p = Packet(payload);
-        let control = share::control(&mut p).ok()?;
-        Some((control.kind, control))
-    }
-
-    fn slow(&mut self, body: &[u8], emit: &Emit) -> Result<(), Ended> {
-        let mut p = Packet(body);
-        if p.u8()
-            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?
-            != 2
-        {
-            return Ok(());
-        }
-        p.take(2)
-            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-        if p.0.first() != Some(&0x68) {
-            // Anything but an MCS SendDataIndication is not a share message this
-            // client renders; the X.224 layer owns it.
-            return Ok(());
-        }
-        // The MCS opcode is the same on every channel, so the channel ID decides
-        // what the body is: a static channel's own data, or the global channel's
-        // Share Control PDUs.
-        let (id, payload) = self
-            .channels
-            .receive(p.0)
-            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-        if Some(id) == self.channels.clipboard {
-            self.clipboard
-                .on_data(&self.channels, &mut self.transport, payload)
-                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-            return Ok(());
-        }
-        if Some(id) == self.channels.drive {
-            self.drive
-                .on_data(&self.channels, &mut self.transport, payload)
-                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-            return Ok(());
-        }
-        if id != self.channels.global {
-            return Ok(());
-        }
-        let mut p = Packet(payload);
-        let header =
-            share::control(&mut p).map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-        match header.kind {
-            7 => {
-                let (kind, payload) = self
-                    .share
-                    .data(header.body)
-                    .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-                if let Some(logon) = logon_pdu(kind, payload) {
-                    super::trace(&format!("logon pdu kind={kind} {logon:?}"));
-                    self.logon = Some(logon);
-                }
-                if kind == 2 {
-                    self.bitmap_update(payload, emit)?;
-                } else if kind == 27
-                    && let Some(shape) = self
-                        .pointers
-                        .update(payload)
-                        .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?
-                {
-                    emit(Event::Pointer(shape));
-                }
-            }
-            2 => {
-                return Err(Ended::new(
-                    Failure::RemoteClosed,
-                    "the server deactivated the desktop",
-                ));
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn bitmap_update(&mut self, payload: &[u8], emit: &Emit) -> Result<(), Ended> {
-        let mut p = Packet(payload);
-        let kind = p
-            .le16()
-            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-        // TS_UPDATE_BITMAP_DATA is updateType then numberRectangles: the palette
-        // update is the one with a pad field, not this one.
-        let count = p
-            .le16()
-            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-        if kind != 1 {
-            // Palette and other update types carry nothing this client renders.
-            return Ok(());
-        }
-        for _ in 0..count {
-            let bitmap =
-                update::rect(&mut p).map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-            if bitmap.bpp != self.share.bpp() {
-                return Err(Ended::new(
-                    Failure::ProtocolFailure,
-                    "the server sent a bitmap depth it did not negotiate",
-                ));
-            }
-            update::draw(&mut self.frame, self.stride, self.height, &bitmap)
-                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-            let pixels = update::region(&self.frame, self.stride, &bitmap);
-            if pixels.len() > MAX_FRAME_BYTES {
-                return Err(Ended::new(
-                    Failure::Limit,
-                    "the frame exceeds the accepted size",
-                ));
-            }
-            emit(Event::Frame {
-                x: i32::from(bitmap.x),
-                y: i32::from(bitmap.y),
-                width: i32::from(bitmap.width),
-                height: i32::from(bitmap.height),
-                desktop_width: u32::from(self.width),
-                desktop_height: u32::from(self.height),
-                stride: u32::try_from(usize::from(bitmap.width) * 4).unwrap_or(0),
-                pixels,
-            });
-        }
-        Ok(())
-    }
-
-    /// Slow-path keyboard input: the same event the fast path carries, inside a
-    /// Share Data PDU. Every server accepts it, which a fast-path PDU is not
-    /// guaranteed to be.
-    fn key(&mut self, scancode: u8, down: bool, extended: bool) -> io::Result<()> {
-        self.share.input(
-            &self.channels,
-            &mut self.transport,
-            4, // INPUT_EVENT_SCANCODE
-            keyboard_flags(down, extended),
-            u16::from(scancode),
-            0,
-        )
-    }
-
-    /// Slow-path pointer input (INPUT_EVENT_MOUSE), with the same flag encoding
-    /// the fast path uses.
-    fn pointer(&mut self, flags: u16, x: u16, y: u16) -> io::Result<()> {
-        self.share.input(
-            &self.channels,
-            &mut self.transport,
-            0x8001, // INPUT_EVENT_MOUSE
-            flags,
-            x,
-            y,
-        )
     }
 }

@@ -9,6 +9,7 @@ re-run the check each one names before accepting the upgrade.
 
 | patch | files | why |
 | --- | --- | --- |
+| Desktop image tiles | `src/window.rs`, `src/platform/windows/shaders.hlsl` | adjoining desktop tiles share physical pixel edges and enlarged cursors sample only their own atlas image |
 | Frame readback | `src/platform.rs`, `src/window.rs`, `src/platform/windows/{window,directx_renderer}.rs` | the capture tool reads the frame a hidden window rendered |
 | Initial window background | `src/platform.rs`, `src/platform/windows/window.rs` | a light window does not open on a black flash |
 | Clipboard images and mixed items | `src/platform.rs`, `src/platform/windows/{clipboard,dib}.rs`, `src/platform/windows.rs`, `src/platform/linux/x11/{client,clipboard}.rs`, `src/platform/linux/wayland/clipboard.rs`, `src/platform/mac/platform.rs` | remote-desktop clipboard: screenshots and text-plus-image copies |
