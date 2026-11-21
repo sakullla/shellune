@@ -624,7 +624,9 @@ fn history_completion_in_a_local_bash_line_editor() {
     session.run(
         r#"PS1='\[\e]133;A\a\]local> \[\e]133;B\a\]'; PROMPT_COMMAND="printf '\033]133;D;0\a'"; if [ "${BASH_VERSINFO[0]:-0}" -gt 4 ] || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 4 ]; }; then PS0=$'\e]133;C\a'; else trap 'case "$BASH_COMMAND" in printf*) ;; *) printf "\033]133;C\a" ;; esac' DEBUG; fi"#,
     );
-    session.wait_for("local prompt ready", contains("local> "));
+    session.wait_for("local prompt ready", |_, screen| {
+        screen.lines().any(|row| row.trim_end() == "local>")
+    });
     session.run("echo local-completion");
     session.poll_until("Bash recorded the executed command", |session, _, _| {
         session
