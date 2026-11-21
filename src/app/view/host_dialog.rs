@@ -1700,7 +1700,7 @@ impl ShelluneView {
                     basic = basic.child(self.protocol_field_sized(
                         ConnectionFormField::User,
                         1.0,
-                        Some(strings.host_user_optional),
+                        Some(copy::ux().host_user_optional),
                     ));
                 }
                 ConnectionFormField::User => {
