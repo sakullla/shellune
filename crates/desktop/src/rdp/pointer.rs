@@ -1,4 +1,4 @@
-//! Slow-path pointer updates (MS-RDPBCGR 2.2.9.1.1.4). We negotiate
+//! Color and cached pointer updates for both RDP output paths. We negotiate
 //! color pointers without the optional multi-depth pointer capability.
 use super::wire::{Packet, invalid};
 use crate::PointerShape;
@@ -22,23 +22,28 @@ impl Pointers {
                 0x7f00 => PointerShape::Default,
                 _ => return Ok(None),
             },
-            6 => {
-                let index = usize::from(p.le16()?);
-                let slot = self
-                    .cache
-                    .get_mut(index)
-                    .ok_or_else(|| invalid("pointer cache index out of range"))?;
-                let shape = color_pointer(&mut p)?;
-                *slot = Some(shape.clone());
-                shape
-            }
-            7 => {
-                let index = usize::from(p.le16()?);
-                return Ok(self.cache.get(index).and_then(Clone::clone));
-            }
+            6 | 7 => return self.shape(kind == 7, &mut p),
             // Remote position notifications must not rewind local input in flight.
             _ => return Ok(None),
         };
+        Ok(Some(shape))
+    }
+
+    pub(super) fn shape(
+        &mut self,
+        cached: bool,
+        p: &mut Packet<'_>,
+    ) -> io::Result<Option<PointerShape>> {
+        let index = usize::from(p.le16()?);
+        if cached {
+            return Ok(self.cache.get(index).and_then(Clone::clone));
+        }
+        let slot = self
+            .cache
+            .get_mut(index)
+            .ok_or_else(|| invalid("pointer cache index out of range"))?;
+        let shape = color_pointer(p)?;
+        *slot = Some(shape.clone());
         Ok(Some(shape))
     }
 }

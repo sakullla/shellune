@@ -35,20 +35,30 @@ impl Frames {
 
     /// The next complete PDU body, when one is buffered.
     fn take(&mut self) -> io::Result<Option<Incoming>> {
-        if self.pending.len() < 4 {
+        let [first, second, rest @ ..] = &self.pending[..] else {
             return Ok(None);
-        }
-        let slow = self.pending[0] == 3;
+        };
+        let slow = *first == 3;
         let (header, total) = if slow {
-            if self.pending[1] != 0 {
+            if *second != 0 {
                 return Err(wire::invalid("invalid TPKT version"));
             }
-            let length = usize::from(u16::from_be_bytes([self.pending[2], self.pending[3]]));
-            (4usize, length)
+            let [hi, lo, ..] = rest else { return Ok(None) };
+            (4, usize::from(u16::from_be_bytes([*hi, *lo])))
         } else {
-            // Fast-path: one header byte, a 16-bit length, then the updates.
-            let length = usize::from(u16::from_be_bytes([self.pending[1], self.pending[2]]));
-            (3usize, length)
+            // Enhanced security is provided by TLS. Fast-path output has action 0
+            // and a one- or two-byte length determinant including the header.
+            if first & 0xc3 != 0 {
+                return Err(wire::invalid("unsupported RDP fast-path output header"));
+            }
+            if second & 0x80 == 0 {
+                (2, usize::from(*second))
+            } else {
+                let Some(lo) = rest.first() else {
+                    return Ok(None);
+                };
+                (3, usize::from(u16::from_be_bytes([second & 0x7f, *lo])))
+            }
         };
         if total < header {
             return Err(wire::invalid("short RDP pdu"));
@@ -62,7 +72,7 @@ impl Frames {
         Ok(Some(if slow {
             Incoming::Slow(body)
         } else {
-            Incoming::Fast
+            Incoming::Fast(body)
         }))
     }
 }
@@ -99,6 +109,8 @@ fn read_chunk(transport: &mut impl Read, frames: &mut Frames) -> io::Result<Opti
 /// How long the server has to confirm or refuse the logon. A server that says
 /// nothing in this window is reported as unconfirmed rather than accepted.
 const LOGON_WAIT: Duration = Duration::from_secs(10);
+/// Maximum wait for the first decoded bitmap after activation.
+const FIRST_PICTURE_WAIT: Duration = Duration::from_secs(60);
 /// One read wait once the desktop is up: the loop returns to its cancellation and
 /// deadline checks after each, and a partial record stays buffered.
 const POLL: Duration = Duration::from_millis(32);
@@ -184,7 +196,7 @@ impl Write for Transport {
 
 enum Incoming {
     Slow(Vec<u8>),
-    Fast,
+    Fast(Vec<u8>),
 }
 
 /// Runs one attempt and reports how it ended.
@@ -252,6 +264,7 @@ struct Active {
     connected: bool,
     /// When an unconfirmed logon stops being waited for.
     logon_deadline: std::time::Instant,
+    first_picture_deadline: Option<std::time::Instant>,
     clipboard: Clipboard,
     drive: Drive,
     /// The button state the host last reported, so each edge carries its button.
@@ -363,6 +376,7 @@ fn connect(
         buttons: 0,
         pointer_position: None,
         pointers: Default::default(),
+        first_picture_deadline: None,
         logon_confirmed: false,
         frames: Frames::default(),
         connected: false,
@@ -378,6 +392,7 @@ fn connect(
     super::trace("desktop activated");
     // From here on the loop must come back often enough to notice a cancel and to
     // decide that a logon was never confirmed.
+    active.first_picture_deadline = Some(std::time::Instant::now() + FIRST_PICTURE_WAIT);
     active.set_poll_timeout(POLL);
     let _ = commands;
     Ok(active)
@@ -498,6 +513,15 @@ impl Active {
                 let _ = self.drive.close(&self.channels, &mut self.transport);
                 return Err(Ended::new(Failure::Cancelled, "cancelled"));
             }
+            if self
+                .first_picture_deadline
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                return Err(Ended::new(
+                    Failure::Io,
+                    "the RDP server did not send a desktop picture within 60 seconds of activation",
+                ));
+            }
             self.announce_logon(emit, control);
             self.drain(commands)?;
             self.clipboard
@@ -508,11 +532,9 @@ impl Active {
                 Ok(Some(Incoming::Slow(body))) => {
                     self.slow(&body, emit)?;
                 }
-                Ok(Some(Incoming::Fast)) => {
-                    return Err(Ended::new(
-                        Failure::ProtocolFailure,
-                        "the server sent fast-path output the client did not offer",
-                    ));
+                Ok(Some(Incoming::Fast(body))) => {
+                    self.fast(&body, emit)
+                        .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
                 }
                 Err(error)
                     if matches!(
@@ -574,7 +596,7 @@ impl Active {
     fn read_slow(&mut self) -> Result<Option<Vec<u8>>, Ended> {
         match self.read() {
             Ok(Incoming::Slow(body)) => Ok(Some(body)),
-            Ok(Incoming::Fast) => Ok(None),
+            Ok(Incoming::Fast(_)) => Ok(None),
             Err(error)
                 if matches!(
                     error.kind(),
@@ -661,7 +683,8 @@ impl Active {
                     self.logon_confirmed = true;
                 }
                 if kind == 2 {
-                    self.bitmap_update(payload, emit)?;
+                    self.bitmap_update(payload, emit)
+                        .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
                 } else if kind == 27
                     && let Some(shape) = self
                         .pointers
@@ -682,31 +705,56 @@ impl Active {
         Ok(())
     }
 
-    fn bitmap_update(&mut self, payload: &[u8], emit: &Emit) -> Result<(), Ended> {
+    fn fast(&mut self, body: &[u8], emit: &Emit) -> io::Result<()> {
+        let mut p = Packet(body);
+        while !p.0.is_empty() {
+            let header = p.u8()?;
+            if header & 0x30 != 0 {
+                return Err(wire::invalid("unnegotiated fast-path fragmentation"));
+            }
+            match header >> 6 {
+                0 => {}
+                2 if p.u8()? == 0 => {}
+                _ => return Err(wire::invalid("unnegotiated fast-path compression")),
+            }
+            let len = p.le16()?;
+            let data = p.take(usize::from(len))?;
+            match header & 15 {
+                1 => self.bitmap_update(data, emit)?,
+                5 => emit(Event::Pointer(crate::PointerShape::Hidden)),
+                6 => emit(Event::Pointer(crate::PointerShape::Default)),
+                kind @ (9 | 10) => {
+                    if let Some(shape) = self.pointers.shape(kind == 10, &mut Packet(data))? {
+                        emit(Event::Pointer(shape));
+                    }
+                }
+                // Synchronize, palette and position updates do not draw pixels.
+                2 | 3 | 8 => {}
+                _ => return Err(wire::invalid("unsupported fast-path update")),
+            }
+        }
+        Ok(())
+    }
+
+    fn bitmap_update(&mut self, payload: &[u8], emit: &Emit) -> io::Result<()> {
         let mut p = Packet(payload);
-        let kind = p
-            .le16()
-            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+        let kind = p.le16()?;
         // TS_UPDATE_BITMAP_DATA is updateType then numberRectangles: the palette
         // update is the one with a pad field, not this one.
-        let count = p
-            .le16()
-            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+        let count = p.le16()?;
         if kind != 1 {
             // Palette and other update types carry nothing this client renders.
             return Ok(());
         }
         for _ in 0..count {
-            let bitmap =
-                update::rect(&mut p).map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+            let bitmap = update::rect(&mut p)?;
             if bitmap.bpp != self.share.bpp() {
-                return Err(Ended::new(
-                    Failure::ProtocolFailure,
+                return Err(wire::invalid(
                     "the server sent a bitmap depth it did not negotiate",
                 ));
             }
-            let pixels = update::pixels(&bitmap, self.share.width, self.share.height)
-                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+            let pixels = update::pixels(&bitmap, self.share.width, self.share.height)?;
+            self.first_picture_deadline = None;
             emit(Event::Frame {
                 x: i32::from(bitmap.x),
                 y: i32::from(bitmap.y),
@@ -752,6 +800,95 @@ impl Active {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn activated(emit: &Emit) -> Active {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let transport =
+            Transport::Plain(TcpStream::connect(listener.local_addr().unwrap()).unwrap());
+        let now = std::time::Instant::now();
+        Active {
+            transport,
+            channels: Channels {
+                user: 1004,
+                global: 1003,
+                clipboard: None,
+                drive: None,
+            },
+            share: Share::pending(1280, 720),
+            frames: Frames::default(),
+            clipboard: Clipboard::new(false, Arc::clone(emit)),
+            drive: Drive::new(None, Arc::clone(emit)),
+            first_picture_deadline: Some(now + FIRST_PICTURE_WAIT),
+            logon_deadline: now + LOGON_WAIT,
+            logon_confirmed: false,
+            connected: false,
+            buttons: 0,
+            pointer_position: None,
+            pointers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn windows_fast_path_delivers_a_headerless_bitmap_after_pointer_updates() {
+        let (tx, events) = std::sync::mpsc::channel();
+        let emit: Emit = Arc::new(move |event| tx.send(event).unwrap());
+        let mut active = activated(&emit);
+        // The short pointer PDU and the start of the next length determinant
+        // can arrive in one TLS read.
+        active.frames.push(&[0, 5, 6, 0, 0, 0, 0x80]);
+        let Some(Incoming::Fast(pointer)) = active.frames.take().unwrap() else {
+            panic!("pointer PDU")
+        };
+        active.fast(&pointer, &emit).unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            Event::Pointer(crate::PointerShape::Default)
+        ));
+        assert!(active.first_picture_deadline.is_some());
+        assert!(active.frames.take().unwrap().is_none());
+
+        // One packet contains a synchronize update followed by one 8x4
+        // uncompressed RDP6 planar bitmap (alpha, red, green, blue).
+        let mut bitmap = Vec::new();
+        for word in [1u16, 1, 0, 0, 7, 3, 8, 4, 32, 0x0401, 129] {
+            bitmap.extend_from_slice(&word.to_le_bytes());
+        }
+        bitmap.push(0);
+        for plane in [255, 42, 33, 24] {
+            bitmap.extend_from_slice(&[plane; 32]);
+        }
+        let mut tail = vec![(3 + 3 + 3 + bitmap.len()) as u8, 3, 0, 0, 1];
+        tail.extend_from_slice(&(bitmap.len() as u16).to_le_bytes());
+        tail.extend_from_slice(&bitmap);
+        active.frames.push(&tail);
+        let Some(Incoming::Fast(body)) = active.frames.take().unwrap() else {
+            panic!("bitmap PDU")
+        };
+        active.fast(&body, &emit).unwrap();
+        let Event::Frame {
+            width,
+            height,
+            pixels,
+            ..
+        } = events.try_recv().unwrap()
+        else {
+            panic!("decoded bitmap")
+        };
+        assert_eq!((width, height), (8, 4));
+        assert_eq!(pixels, [24, 33, 42, 255].repeat(32));
+        assert!(active.first_picture_deadline.is_none());
+    }
+
+    #[test]
+    fn activation_without_pixels_ends_with_a_first_picture_error() {
+        let emit: Emit = Arc::new(|_| {});
+        let mut active = activated(&emit);
+        active.first_picture_deadline = Some(std::time::Instant::now());
+        let (_, commands) = crate::input::channel(None);
+        let ended = active.pump(&emit, &Arc::default(), &commands).unwrap_err();
+        assert_eq!(ended.failure, Failure::Io);
+        assert!(ended.reason.contains("desktop picture"));
+    }
 
     #[test]
     fn a_pdu_split_by_a_timeout_is_still_parsed() {
@@ -831,7 +968,7 @@ mod tests {
         };
         match incoming {
             Incoming::Slow(body) => assert_eq!(body, b"abcdef"),
-            Incoming::Fast => panic!("the PDU was slow-path"),
+            Incoming::Fast(_) => panic!("the PDU was slow-path"),
         }
         peer.join().expect("peer thread");
     }

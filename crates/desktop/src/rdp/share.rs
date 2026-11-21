@@ -4,6 +4,8 @@ use super::wire::{Packet, Security, invalid};
 use std::io::{self, Write};
 use zeroize::Zeroizing;
 
+const FASTPATH_OUTPUT_SUPPORTED: u16 = 0x0001;
+const NO_BITMAP_COMPRESSION_HDR: u16 = 0x0400;
 const INPUT_FLAG_MOUSE_HWHEEL: u16 = 0x0100;
 const NEGOTIATE_ORDER_SUPPORT: u16 = 0x0002;
 const ZERO_BOUNDS_DELTAS_SUPPORT: u16 = 0x0008;
@@ -176,9 +178,10 @@ impl Share {
             count: 0,
             bytes: Vec::new(),
         };
-        // Slow-path updates and keyboard input. Only advertise orders/codecs that
-        // can actually be rendered; the server falls back to bitmap rectangles.
-        caps.add(1, &words(&[0, 0, 0x200, 0, 0, 0, 0, 0, 0, 0]));
+        // Windows sends bitmap updates on the fast path. Negotiate headerless
+        // compression so bitmapLength starts at the actual codec stream.
+        let extra_flags = FASTPATH_OUTPUT_SUPPORTED | NO_BITMAP_COMPRESSION_HDR;
+        caps.add(1, &words(&[0, 0, 0x200, 0, 0, extra_flags, 0, 0, 0, 0]));
         // MS-RDPBCGR 2.2.7.1.2 requires both bitmapCompressionFlag and
         // multipleRectangleSupport, even when no drawing orders are supported.
         caps.add(
@@ -328,6 +331,7 @@ mod tests {
         confirm.finish()?;
         let count = caps.le16()?;
         caps.take(2)?;
+        let mut general_flags = None;
         let mut bitmap_compression = None;
         let mut order_flags = None;
         let mut disabled = std::collections::BTreeMap::new();
@@ -336,6 +340,10 @@ mod tests {
             let len = caps.le16()?;
             let mut cap = Packet(caps.take(usize::from(len) - 4)?);
             match kind {
+                1 => {
+                    cap.take(10)?;
+                    general_flags = Some(cap.le16()?);
+                }
                 2 => {
                     cap.take(16)?;
                     bitmap_compression = Some(cap.le16()?);
@@ -353,6 +361,7 @@ mod tests {
             }
         }
         caps.finish()?;
+        assert_eq!(general_flags.map(|flags| flags & 0x0401), Some(0x0401));
         assert_eq!(bitmap_compression, Some(1));
         assert_eq!(order_flags.map(|flags| flags & 0x000a), Some(0x000a));
         assert_eq!(
