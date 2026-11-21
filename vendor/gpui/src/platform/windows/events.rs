@@ -864,26 +864,37 @@ impl WindowsWindowInner {
             return None;
         }
 
+        let mut cursor_point = POINT {
+            x: lparam.signed_loword().into(),
+            y: lparam.signed_hiword().into(),
+        };
+        unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
         let mut lock = self.state.borrow_mut();
-        if let Some(mut callback) = lock.callbacks.hit_test_window_control.take() {
+        let drag_caption = if let Some(mut callback) = lock.callbacks.hit_test_window_control.take()
+        {
+            let position = logical_point(
+                cursor_point.x as f32,
+                cursor_point.y as f32,
+                lock.scale_factor,
+            );
             drop(lock);
-            let area = callback();
+            let area = callback(position);
             self.state.borrow_mut().callbacks.hit_test_window_control = Some(callback);
-            if let Some(area) = area {
-                return match area {
-                    WindowControlArea::Drag => Some(HTCAPTION as _),
-                    WindowControlArea::Close => Some(HTCLOSE as _),
-                    WindowControlArea::Max => Some(HTMAXBUTTON as _),
-                    WindowControlArea::Min => Some(HTMINBUTTON as _),
-                };
+            match area {
+                Some(WindowControlArea::Close) => return Some(HTCLOSE as _),
+                Some(WindowControlArea::Max) => return Some(HTMAXBUTTON as _),
+                Some(WindowControlArea::Min) => return Some(HTMINBUTTON as _),
+                Some(WindowControlArea::Drag) => true,
+                None => false,
             }
         } else {
             drop(lock);
-        }
+            false
+        };
 
         if !self.hide_title_bar {
             // If the OS draws the title bar, we don't need to handle hit test messages.
-            return None;
+            return drag_caption.then_some(HTCAPTION as _);
         }
 
         // default handler for resize areas
@@ -910,16 +921,11 @@ impl WindowsWindowInner {
         let dpi = unsafe { GetDpiForWindow(handle) };
         let frame_y = unsafe { GetSystemMetricsForDpi(SM_CYFRAME, dpi) };
 
-        let mut cursor_point = POINT {
-            x: lparam.signed_loword().into(),
-            y: lparam.signed_hiword().into(),
-        };
-        unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
         if !self.state.borrow().is_maximized() && cursor_point.y >= 0 && cursor_point.y <= frame_y {
             return Some(HTTOP as _);
         }
 
-        Some(HTCLIENT as _)
+        Some(if drag_caption { HTCAPTION } else { HTCLIENT } as _)
     }
 
     fn handle_nc_mouse_move_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {

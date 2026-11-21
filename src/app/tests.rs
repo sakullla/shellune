@@ -19433,6 +19433,31 @@ async fn start_all_starts_every_waiting_local_pane(cx: &mut TestAppContext) {
 // ---------------------------------------------------------------------------
 
 #[gpui::test]
+#[cfg(target_os = "windows")]
+async fn the_caption_uses_the_hit_test_position_even_before_the_next_mouse_move(
+    cx: &mut TestAppContext,
+) {
+    let (_view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let caption = bounds_of(cx, "header.drag").center();
+    let maximize = bounds_of(cx, "window.maximize").center();
+    let search = bounds_of(cx, "palette.open").center();
+    cx.simulate_mouse_move(maximize, None, Modifiers::default());
+    cx.update(|window, _| {
+        assert_eq!(
+            window.window_control_at(maximize),
+            Some(gpui::WindowControlArea::Max)
+        );
+        assert_eq!(
+            window.window_control_at(caption),
+            Some(gpui::WindowControlArea::Drag)
+        );
+        assert_eq!(window.window_control_at(search), None);
+    });
+}
+
+#[gpui::test]
 async fn a_press_on_the_caption_does_not_take_the_keyboard(cx: &mut TestAppContext) {
     // The caption is for moving the window. A press there must not move the keyboard
     // out of the terminal, or the next keystroke would go nowhere.

@@ -14,7 +14,7 @@
 //! `ShelluneView::on_window_should_close`).
 
 use gpui::prelude::*;
-use gpui::{Context, Div, MouseButton, Stateful, Window, WindowControlArea, div, px};
+use gpui::{Context, Div, Stateful, Window, WindowControlArea, div, px};
 
 use super::ShelluneView;
 use crate::app::icons::{self, Icon};
@@ -89,18 +89,9 @@ impl ShelluneView {
     pub(super) fn drag_area(&self, id: &'static str) -> Stateful<Div> {
         let area = div().id(id).debug_selector(move || id.to_owned()).occlude();
         match Platform::current() {
-            // Windows: a press here hands the window to the system's own move loop,
-            // so dragging, Aero Snap and moving between screens behave as on any
-            // caption. The application starts it itself instead of relying on the
-            // system's hit test, which did not reach the caption reliably. A double
-            // click maximises or restores, as on the system's caption.
-            Platform::Windows => area.on_mouse_down(MouseButton::Left, |event, window, _cx| {
-                if event.click_count >= 2 {
-                    win32::toggle_maximize(window);
-                } else {
-                    win32::begin_move(window);
-                }
-            }),
+            // Windows owns the whole caption gesture, including its double-click
+            // interval, drag threshold and snapping.
+            Platform::Windows => area.window_control_area(WindowControlArea::Drag),
             // macOS drags the top of a window natively; the double click is forwarded so
             // it does what the user chose in the system settings.
             Platform::MacOs => area.on_click(|event, window, _cx| {
@@ -225,11 +216,9 @@ mod win32 {
     #[cfg(target_os = "windows")]
     mod imp {
         use gpui::Window;
-        use windows_sys::Win32::Foundation::{HWND, POINT};
-        use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+        use windows_sys::Win32::Foundation::HWND;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            GetCursorPos, HTCAPTION, IsZoomed, PostMessageW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE,
-            SC_RESTORE, WM_NCLBUTTONDOWN, WM_SYSCOMMAND,
+            IsZoomed, PostMessageW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, WM_SYSCOMMAND,
         };
 
         /// None in tests: gpui's test windows have no system window, and asking one
@@ -258,21 +247,6 @@ mod win32 {
             }
         }
 
-        /// Turns the press into a press on the caption: the system runs its move loop
-        /// from where the pointer is, with snapping and screen changes.
-        pub fn begin_move(window: &mut Window) {
-            let Some(hwnd) = hwnd(window) else {
-                return;
-            };
-            let mut point = POINT { x: 0, y: 0 };
-            unsafe {
-                GetCursorPos(&mut point);
-                ReleaseCapture();
-                let packed = ((point.y as u16 as u32) << 16) | (point.x as u16 as u32);
-                PostMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, packed as isize);
-            }
-        }
-
         pub fn minimize(window: &mut Window) {
             system_command(window, SC_MINIMIZE);
         }
@@ -290,10 +264,7 @@ mod win32 {
     }
 
     #[cfg(target_os = "windows")]
-    pub use imp::{begin_move, close, minimize, toggle_maximize};
-
-    #[cfg(not(target_os = "windows"))]
-    pub fn begin_move(_window: &mut Window) {}
+    pub use imp::{close, minimize, toggle_maximize};
 
     #[cfg(not(target_os = "windows"))]
     pub fn minimize(window: &mut Window) {

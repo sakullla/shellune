@@ -1132,16 +1132,9 @@ impl Window {
         });
         platform_window.on_hit_test_window_control({
             let mut cx = cx.to_async();
-            Box::new(move || {
+            Box::new(move |position| {
                 handle
-                    .update(&mut cx, |_, window, _cx| {
-                        for (area, hitbox) in &window.rendered_frame.window_control_hitboxes {
-                            if window.mouse_hit_test.ids.contains(&hitbox.id) {
-                                return Some(*area);
-                            }
-                        }
-                        None
-                    })
+                    .update(&mut cx, |_, window, _cx| window.window_control_at(position))
                     .log_err()
                     .unwrap_or(None)
             })
@@ -3334,6 +3327,26 @@ impl Window {
     pub fn insert_window_control_hitbox(&mut self, area: WindowControlArea, hitbox: Hitbox) {
         self.invalidator.debug_assert_paint();
         self.next_frame.window_control_hitboxes.push((area, hitbox));
+    }
+
+    /// Returns the frontmost native window control at a window-relative position.
+    pub fn window_control_at(&self, position: Point<Pixels>) -> Option<WindowControlArea> {
+        let frame = &self.rendered_frame;
+        let controls = &frame.window_control_hitboxes;
+        if !controls
+            .iter()
+            .any(|(_, hitbox)| hitbox.bounds.contains(&position))
+        {
+            return None;
+        }
+        // A native hit test can precede the move event for this position.
+        let hits = frame.hit_test(position);
+        hits.ids[..hits.hover_hitbox_count].iter().find_map(|id| {
+            controls
+                .iter()
+                .find(|(_, hitbox)| hitbox.id == *id)
+                .map(|(area, _)| *area)
+        })
     }
 
     /// Sets the key context for the current element. This context will be used to translate
