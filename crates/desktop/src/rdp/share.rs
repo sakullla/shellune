@@ -4,6 +4,8 @@ use super::wire::{Packet, Security, invalid};
 use std::io::{self, Write};
 use zeroize::Zeroizing;
 
+/// Enough for a 96x96 32-bpp cursor and its masks (MS-RDPBCGR 2.2.7.2.7).
+pub(super) const MULTIFRAGMENT_LIMIT: u32 = 65536;
 const FASTPATH_OUTPUT_SUPPORTED: u16 = 0x0001;
 const NO_BITMAP_COMPRESSION_HDR: u16 = 0x0400;
 const INPUT_FLAG_MOUSE_HWHEEL: u16 = 0x0100;
@@ -53,7 +55,7 @@ pub(super) fn login(
     }
     pdu.extend_from_slice(&[0; 172]); // UTC time-zone information
     pdu.extend_from_slice(&[0; 4]); // clientSessionId
-    pdu.extend_from_slice(&0x0000_000fu32.to_le_bytes()); // reduce bandwidth for classic bitmap desktops
+    pdu.extend_from_slice(&0x0000_000du32.to_le_bytes()); // keep full-window dragging enabled
     pdu.extend_from_slice(&[0; 2]); // no reconnect cookie
     ch.send(out, ch.global, &pdu)
 }
@@ -81,6 +83,7 @@ pub(super) struct Share {
     bpp: u16,
     server: u16,
     pub(super) horizontal_wheel: bool,
+    pub(super) large_pointers: bool,
 }
 
 pub(super) struct Control<'a> {
@@ -116,6 +119,7 @@ impl Share {
             bpp: 32,
             server: 0,
             horizontal_wheel: false,
+            large_pointers: false,
         }
     }
 
@@ -134,6 +138,8 @@ impl Share {
         caps.take(2)?;
         let mut desktop = None;
         let mut horizontal_wheel = false;
+        let mut multifragment = false;
+        let mut large_pointers = false;
         for _ in 0..count {
             let kind = caps.le16()?;
             let length = caps
@@ -158,6 +164,10 @@ impl Share {
                 desktop = Some((width, height, bpp));
             } else if kind == 13 {
                 horizontal_wheel = cap.le16()? & INPUT_FLAG_MOUSE_HWHEEL != 0;
+            } else if kind == 26 {
+                multifragment = cap.le32()? >= 38055;
+            } else if kind == 27 {
+                large_pointers = cap.le16()? & 1 != 0;
             }
         }
         caps.finish()?;
@@ -170,6 +180,7 @@ impl Share {
             bpp,
             server: control.source,
             horizontal_wheel,
+            large_pointers: multifragment && large_pointers,
         })
     }
 
@@ -195,8 +206,15 @@ impl Share {
         // Required client cache capabilities describe zero entries for this
         // bitmap-only renderer (MS-RDPBCGR 2.2.7.1).
         caps.add(4, &[0; 36]); // revision 1 bitmap cache
-        // TS_POINTER_CAPABILITYSET: 24-bit color pointers and cached shapes.
-        caps.add(8, &words(&[1, super::pointer::CACHE_SIZE]));
+        // Both caches are supported, including New Pointer updates at the server's chosen depth.
+        caps.add(
+            8,
+            &words(&[1, super::pointer::CACHE_SIZE, super::pointer::CACHE_SIZE]),
+        );
+        if self.large_pointers {
+            caps.add(26, &MULTIFRAGMENT_LIMIT.to_le_bytes());
+            caps.add(27, &1u16.to_le_bytes());
+        }
         caps.add(9, &words(&[0, 0])); // share
         caps.add(12, &words(&[0, 0])); // no sound beeps
         let wheel = if self.horizontal_wheel {
@@ -308,6 +326,7 @@ mod tests {
     #[test]
     fn confirm_active_advertises_the_required_bitmap_and_order_flags() -> io::Result<()> {
         let channels = Channels {
+            dynamic: None,
             user: 1004,
             global: 1003,
             clipboard: None,

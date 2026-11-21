@@ -35,6 +35,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// What the host asked the session to configure before it connected.
 pub(super) struct Config {
+    pub(super) certificate_pin: Option<String>,
     pub(super) host: String,
     pub(super) port: u16,
     pub(super) password: String,
@@ -48,6 +49,7 @@ pub(super) struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
+            certificate_pin: None,
             host: String::new(),
             port: 5900,
             password: String::new(),
@@ -63,6 +65,7 @@ impl Default for Config {
 impl Config {
     pub(super) fn snapshot(&self) -> Config {
         Config {
+            certificate_pin: self.certificate_pin.clone(),
             host: self.host.clone(),
             port: self.port,
             password: self.password.clone(),
@@ -78,6 +81,7 @@ impl Config {
 pub(super) enum Command {
     Key { keysym: u32, down: bool },
     Pointer { x: u16, y: u16, buttons: u32 },
+    Resize(u16, u16),
     Clipboard(Vec<ClipboardEntry>),
 }
 
@@ -158,6 +162,10 @@ impl Client {
             awaiting_reconnect_frame,
             worker: None,
         }
+    }
+
+    pub(super) fn set_certificate_pin(&mut self, pin: Option<&str>) {
+        self.config.certificate_pin = pin.map(str::to_owned);
     }
 
     pub(super) fn set_server(&mut self, host: &str, port: u16) {
@@ -281,6 +289,10 @@ impl Client {
             return Ok(());
         }
         self.command(Command::Key { keysym, down })
+    }
+
+    pub(super) fn resize(&self, w: u16, h: u16) -> Result<(), Error> {
+        self.command(Command::Resize(w, h))
     }
 
     pub(super) fn pointer(&self, x: u16, y: u16, buttons: u32) -> Result<(), Error> {

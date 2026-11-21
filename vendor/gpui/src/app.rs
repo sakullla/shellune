@@ -1074,6 +1074,11 @@ impl App {
         self.platform.read_from_primary()
     }
 
+    /// The native pasteboard change count, when the platform supplies one.
+    pub fn clipboard_generation(&self) -> Option<u64> {
+        self.platform.clipboard_generation()
+    }
+
     /// Reads data from the platform clipboard.
     pub fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         self.platform.read_from_clipboard()

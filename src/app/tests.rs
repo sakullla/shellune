@@ -306,6 +306,24 @@ async fn the_top_bar_and_the_home_fit_inside_the_design_window(cx: &mut TestAppC
 }
 
 #[gpui::test]
+async fn the_batch_library_entry_only_appears_on_the_hosts_home(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_, cx| ShelluneView::new(cx));
+    let count = |cx: &mut VisualTestContext| {
+        cx.update(|_, app| view.update(app, |v, cx| v.batch_topbar_control(cx).len()))
+    };
+    assert_eq!(count(cx), 1);
+    let (link, _) = ScriptedLink::new(live_desktop_events());
+    mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+    assert_eq!(count(cx), 0);
+    go(cx, GoToSettings);
+    assert_eq!(count(cx), 0);
+    go(cx, GoToHosts);
+    assert_eq!(count(cx), 1);
+    click(cx, "topbar.batch");
+    assert!(cx.update(|_, app| view.read(app).batch_panel().view().is_open()));
+}
+
+#[gpui::test]
 async fn the_narrow_window_still_shows_the_top_bar_and_the_home(cx: &mut TestAppContext) {
     let (_view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(narrow_window());
@@ -21697,7 +21715,7 @@ fn assert_current_tab_whole_beside_notices(
              {bounds:?} then {after:?}"
         );
     }
-    for selector in [next, "palette.open", "nav.settings", "topbar.batch"] {
+    for selector in [next, "palette.open", "nav.settings"] {
         assert_fits_inside(bounds_of(cx, selector), viewport, selector);
         assert_pointer_target(cx, selector);
     }
@@ -27961,6 +27979,18 @@ async fn a_desktop_pane_takes_the_whole_window_and_gives_it_back(cx: &mut TestAp
         "the pane that asked is the one the window is showing"
     );
     let fullscreen = bounds_of(cx, "desktop.surface");
+    let scale = cx.update(|window, _| window.scale_factor());
+    let layout_for = |bounds: gpui::Bounds<Pixels>| {
+        (
+            (f32::from(bounds.size.width) * scale).floor() as u32 & !1,
+            (f32::from(bounds.size.height) * scale).floor() as u32,
+            (scale * 100.).round() as u32,
+        )
+    };
+    assert_eq!(
+        log.lock().unwrap().resizes.last(),
+        Some(&layout_for(fullscreen))
+    );
     assert!(
         fullscreen.size.height > picture.size.height,
         "the picture is drawn in the space the tab strip gave back: {fullscreen:?} was {picture:?}"
@@ -28022,6 +28052,10 @@ async fn a_desktop_pane_takes_the_whole_window_and_gives_it_back(cx: &mut TestAp
         None
     );
     let restored = bounds_of(cx, "desktop.surface");
+    assert_eq!(
+        log.lock().unwrap().resizes.last(),
+        Some(&layout_for(restored))
+    );
     assert!(
         (f32::from(restored.size.height) - f32::from(picture.size.height)).abs() < 1.0
             && (f32::from(restored.size.width) - f32::from(picture.size.width)).abs() < 1.0,
@@ -28493,7 +28527,7 @@ async fn desktop_pointer_follows_local_motion_without_another_frame(cx: &mut Tes
     let feed = link.feed();
     let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
     let picture = bounds_of(cx, "desktop.picture");
-    let scale = (f32::from(picture.size.width) / 800.0).max(1.0);
+    let scale = f32::from(picture.size.width) / 800.0;
     for offset in [0.0, 40.0, -27.0] {
         let point = picture.center() + point(px(offset), px(offset));
         cx.simulate_mouse_move(point, None, Modifiers::default());
@@ -28529,7 +28563,7 @@ async fn desktop_pointer_follows_local_motion_without_another_frame(cx: &mut Tes
                 .unwrap()
                 .read(app)
                 .surface_cursor_for_test()),
-            gpui::CursorStyle::Crosshair
+            gpui::CursorStyle::None
         );
     }
     feed.feed(vec![LinkEvent::Pointer(
@@ -28543,7 +28577,7 @@ async fn desktop_pointer_follows_local_motion_without_another_frame(cx: &mut Tes
             .unwrap()
             .read(app)
             .surface_cursor_for_test()),
-        gpui::CursorStyle::Arrow
+        gpui::CursorStyle::None
     );
 }
 
@@ -28566,7 +28600,7 @@ async fn rdp_uses_a_visible_local_pointer_until_a_shape_arrives(cx: &mut TestApp
     assert!(live, "the frame put the session in its live step");
     assert_eq!(
         cursor,
-        gpui::CursorStyle::Crosshair,
+        gpui::CursorStyle::Arrow,
         "the local pointer is visible during negotiation"
     );
 
@@ -28740,6 +28774,80 @@ async fn the_folded_handle_stays_drawn_and_pressable_with_the_pointer_on_it(
 
     click(cx, "desktop.controls.expand");
     assert!(!state(cx).0, "the handle under the pointer unfolds the bar");
+}
+
+#[gpui::test]
+async fn a_desktop_authentication_challenge_opens_a_masked_password_form(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_, cx| ShelluneView::new(cx));
+    let (link, _) = ScriptedLink::new(vec![LinkEvent::State {
+        state: LinkState::Failed(LinkFailure::CredentialsRequired),
+        failure: LinkFailure::CredentialsRequired,
+        detail: 0,
+        reason: String::new(),
+    }]);
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("login"), link);
+    redraw(cx);
+    for (w, h) in [(1120., 720.), (380., 540.)] {
+        cx.simulate_resize(gpui::size(px(w), px(h)));
+        cx.run_until_parked();
+        redraw(cx);
+        let card = bounds_of(cx, "desktop.signin.card");
+        let pane = bounds_of(cx, "desktop.signin");
+        assert!(
+            card.size.width >= px(300.) && card.size.width <= px(442.),
+            "card {card:?}, pane {pane:?}"
+        );
+        assert!(
+            card.size.height < pane.size.height
+                && (card.center().y - pane.center().y).abs() < px(2.),
+            "card {card:?}, pane {pane:?}"
+        );
+        assert!(bounds_of(cx, "desktop.signin.password").size.width > card.size.width - px(60.));
+    }
+    assert!(cx.debug_bounds("desktop.signin.password").is_some());
+    assert!(cx.debug_bounds("desktop.signin.user").is_some());
+    assert!(cx.update(|_, app| {
+        view.read(app)
+            .desktop_of(id)
+            .unwrap()
+            .read(app)
+            .phase()
+            .accepts_input()
+    }));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.update(|_, app| {
+        view.read(app)
+            .desktop_of(id)
+            .unwrap()
+            .read(app)
+            .phase()
+            .failure()
+            .is_some()
+    }));
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn control_space_from_the_keyboard_reaches_the_remote_pane(cx: &mut TestAppContext) {
+    use crate::app::desktop::{CONTROL_LEFT, key_codes};
+    let (view, cx) = cx.add_window_view(|_, cx| ShelluneView::new(cx));
+    let (link, log) = ScriptedLink::new(live_desktop_events());
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("keys"), link);
+    focus_desktop_drawn(&view, cx, id);
+    let start = sent(&log).len();
+    cx.simulate_keystrokes("ctrl-space");
+    release_key(cx, "ctrl-space");
+    cx.simulate_modifiers_change(Modifiers::none());
+    let space = key_codes("space").unwrap();
+    let sequence = [
+        (CONTROL_LEFT, true),
+        (space, true),
+        (space, false),
+        (CONTROL_LEFT, false),
+    ]
+    .map(|(codes, down)| DesktopInput::Key { codes, down });
+    assert_eq!(sent(&log)[start..], sequence);
 }
 
 #[gpui::test]
@@ -29147,7 +29255,7 @@ async fn focusing_the_picture_offers_the_clipboard_once_and_again_only_when_it_c
 }
 
 #[gpui::test]
-async fn a_picture_on_this_clipboard_is_offered_as_png_and_dib(cx: &mut TestAppContext) {
+async fn a_picture_on_this_clipboard_is_offered_as_a_windows_dib(cx: &mut TestAppContext) {
     use crate::app::desktop::ClipboardKind;
 
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
@@ -29170,10 +29278,10 @@ async fn a_picture_on_this_clipboard_is_offered_as_png_and_dib(cx: &mut TestAppC
     let kinds: Vec<ClipboardKind> = offered.iter().map(|entry| entry.kind).collect();
     assert_eq!(
         kinds,
-        vec![ClipboardKind::Text, ClipboardKind::Png, ClipboardKind::Dib],
-        "text and picture both go, the picture in the two forms Windows programs paste"
+        vec![ClipboardKind::Text, ClipboardKind::Dib],
+        "RDP carries the caption and the image format it negotiated"
     );
-    assert_eq!(offered[1].bytes, png, "a PNG is passed on as it was");
+    assert_eq!(offered[1].bytes[..4], 40u32.to_le_bytes());
 }
 
 #[gpui::test]

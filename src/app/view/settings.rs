@@ -1317,9 +1317,11 @@ impl ShelluneView {
                         )
                         .id("settings.policy.reset")
                         .debug_selector(|| "settings.policy.reset".to_owned())
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.reset_connection_defaults(cx);
-                        })),
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.reset_connection_defaults(cx);
+                            },
+                        )),
                     ),
             );
         }

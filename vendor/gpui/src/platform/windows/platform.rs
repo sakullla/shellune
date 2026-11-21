@@ -571,6 +571,15 @@ impl Platform for WindowsPlatform {
         write_to_clipboard(item);
     }
 
+    fn clipboard_generation(&self) -> Option<u64> {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetClipboardSequenceNumber() -> u32;
+        }
+        let number = unsafe { GetClipboardSequenceNumber() };
+        (number != 0).then_some(u64::from(number))
+    }
+
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         read_from_clipboard()
     }

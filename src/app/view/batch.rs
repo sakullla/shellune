@@ -674,43 +674,50 @@ impl ShelluneView {
     /// and - only while this window is driving a run - the run's own state, which
     /// returns to the same page with its selection and output still in place (R11,
     /// R13). The state is the model's, so an indicator cannot show a run that ended.
-    pub(super) fn batch_topbar_control(&self, cx: &mut Context<Self>) -> Vec<Stateful<Div>> {
+    pub(in crate::app) fn batch_topbar_control(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Vec<Stateful<Div>> {
         let ux = copy::ux();
         let metrics = self.metrics();
-        let selected = self.batch.view().is_open();
         let notice = self.batch_notice();
         let form = self.topbar_notice_form();
-        // A compact row has no room for the run's own indicator, so the entry carries
-        // it: a mark in the run's tone, the run's state in its tooltip, and a press that
-        // returns to the run - whose page switches to the saved tasks too (R2, R9, R13).
-        let folded = notice.clone().filter(|_| form == NoticeForm::Folded);
-        let tooltip = match &folded {
-            Some((label, _)) => format!("{label} · {}", ux.batch_run_background_hint),
-            None => format!("{} · {}", ux.batch_center_open, ux.batch_center_open_hint),
-        };
-        let entry = components::icon_only_button(Icon::Layers, metrics)
-            .relative()
-            .id("topbar.batch")
-            .debug_selector(|| "topbar.batch".to_owned())
-            .tooltip(components::tooltip(SharedString::from(tooltip)))
-            .when(selected, |button| {
-                button.bg(theme::swatch(palette::SURFACE_SELECTED))
-            })
-            .when_some(folded.clone(), |button, (_, tone)| {
-                button.child(super::shell::notice_badge(
-                    tone,
-                    "topbar.batch.active",
-                    metrics,
-                ))
-            })
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                if folded.is_some() && this.batch.show_active_run() {
-                    cx.notify();
-                } else {
-                    this.open_batch_library(cx);
-                }
-            }));
-        let mut controls = vec![entry];
+        let home = self.home_is_shown();
+        let mut controls = Vec::new();
+        if home {
+            let selected = self.batch.view().is_open();
+            // A compact row has no room for the run's own indicator, so the entry carries
+            // it: a mark in the run's tone, the run's state in its tooltip, and a press that
+            // returns to the run - whose page switches to the saved tasks too (R2, R9, R13).
+            let folded = notice.clone().filter(|_| form == NoticeForm::Folded);
+            let tooltip = match &folded {
+                Some((label, _)) => format!("{label} · {}", ux.batch_run_background_hint),
+                None => format!("{} · {}", ux.batch_center_open, ux.batch_center_open_hint),
+            };
+            let entry = components::icon_only_button(Icon::Layers, metrics)
+                .relative()
+                .id("topbar.batch")
+                .debug_selector(|| "topbar.batch".to_owned())
+                .tooltip(components::tooltip(SharedString::from(tooltip)))
+                .when(selected, |button| {
+                    button.bg(theme::swatch(palette::SURFACE_SELECTED))
+                })
+                .when_some(folded.clone(), |button, (_, tone)| {
+                    button.child(super::shell::notice_badge(
+                        tone,
+                        "topbar.batch.active",
+                        metrics,
+                    ))
+                })
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    if folded.is_some() && this.batch.show_active_run() {
+                        cx.notify();
+                    } else {
+                        this.open_batch_library(cx);
+                    }
+                }));
+            controls.push(entry);
+        }
         let Some((label, tone)) = notice else {
             return controls;
         };
@@ -720,8 +727,8 @@ impl ShelluneView {
             }
         });
         match form {
-            NoticeForm::Folded => {}
-            NoticeForm::Icon => controls.push(
+            NoticeForm::Folded if home => {}
+            NoticeForm::Folded | NoticeForm::Icon => controls.push(
                 super::shell::notice_icon(
                     "topbar.batch.active",
                     Icon::Play,

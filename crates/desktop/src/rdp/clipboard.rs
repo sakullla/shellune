@@ -25,18 +25,27 @@ const CF_UNICODETEXT: u16 = 13;
 const CF_DIB: u16 = 8;
 const CF_DIBV5: u16 = 17;
 
+#[derive(Default)]
+enum RemoteRequest {
+    #[default]
+    Idle,
+    Waiting(u16),
+    // CLIPRDR responses do not identify their format. Drain the previous
+    // request before asking for the most recently advertised clipboard.
+    Superseded(Option<u16>),
+}
+
 pub(super) struct Clipboard {
     enabled: bool,
     emit: super::Emit,
     /// What the last local copy offered, keyed by remote format id.
     offered: Vec<(u16, Vec<u8>)>,
     /// The format id this client asked for and has not received yet.
-    pending: Option<u16>,
-    /// Whether the server answered the capability exchange.
+    pending: RemoteRequest,
+    /// The server's Monitor Ready enables local format announcements.
     ready: bool,
-    /// When the last announcement went out, so a channel that was not ready yet
-    /// is retried instead of staying silent.
-    announced: Option<std::time::Instant>,
+    incoming: Vec<u8>,
+    expected: Option<usize>,
     /// Whether the server has refused this client's formats since the last time it
     /// offered any of its own.
     refused: bool,
@@ -48,43 +57,83 @@ impl Clipboard {
             enabled,
             emit,
             offered: Vec::new(),
-            pending: None,
+            pending: RemoteRequest::Idle,
             ready: false,
-            announced: None,
+            incoming: Vec::new(),
+            expected: None,
             refused: false,
         }
     }
 
-    /// Called once the static channel exists: capabilities and monitor ready are
-    /// the two messages a server waits for before sending its own format list.
-    pub(super) fn announce(&mut self, ch: &Channels, out: &mut impl Write) -> io::Result<()> {
-        if !self.enabled {
-            return Ok(());
+    fn send_formats(&self, ch: &Channels, out: &mut impl Write, id: u16) -> io::Result<()> {
+        // We negotiate short names. A format ID is four bytes followed by a
+        // 32-byte name, including for standard formats whose name is empty.
+        let mut list = Vec::with_capacity(self.offered.len() * 36);
+        for (format, _) in &self.offered {
+            list.extend_from_slice(&u32::from(*format).to_le_bytes());
+            list.extend_from_slice(&[0; 32]);
         }
-        let Some(id) = ch.clipboard else {
-            return Ok(());
-        };
-        // CB_CLIP_CAPS: one general capability set, version 2, no long names.
-        let caps = [1u16, 0, 1, 0, 0, 0, 0, 0];
-        self.send(ch, out, id, CB_CLIP_CAPS, 0, &words(&caps))?;
-        self.send(ch, out, id, CB_MONITOR_READY, CB_RESPONSE_OK, &[])?;
-        self.announced = Some(std::time::Instant::now());
-        Ok(())
+        self.send(ch, out, id, CB_FORMAT_LIST, 0, &list)
     }
 
-    /// Re-announces while the server has not answered: the channel exists before
-    /// the server's clipboard service is attached, and a first announcement can
-    /// fall into that gap.
-    pub(super) fn poll(&mut self, ch: &Channels, out: &mut impl Write) -> io::Result<()> {
-        if !self.enabled || self.ready {
+    pub(super) fn receive(
+        &mut self,
+        ch: &Channels,
+        out: &mut impl Write,
+        body: &[u8],
+    ) -> io::Result<()> {
+        match self.chunk(ch, out, body) {
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                self.expected = None;
+                self.pending = RemoteRequest::Idle;
+                self.incoming.clear();
+                if !self.refused {
+                    self.refused = true;
+                    (self.emit)(Event::Notice {
+                        notice: crate::Notice::ClipboardRefused,
+                    });
+                }
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    fn chunk(&mut self, ch: &Channels, out: &mut impl Write, body: &[u8]) -> io::Result<()> {
+        let mut p = Packet(body);
+        let total = p.le32()? as usize;
+        let flags = p.le32()?;
+        if flags & 1 != 0 {
+            self.incoming.clear();
+            self.expected = Some(total);
+            if total > MAX_CLIPBOARD_IMAGE_BYTES + 8 {
+                self.expected = None;
+                if let RemoteRequest::Superseded(next) = std::mem::take(&mut self.pending)
+                    && let Some(id) = ch.clipboard
+                {
+                    self.request(ch, out, id, next)?;
+                }
+                (self.emit)(Event::Notice {
+                    notice: crate::Notice::ClipboardTooLarge(ClipboardKind::Dib),
+                });
+            }
+        }
+        if self.expected != Some(total) {
             return Ok(());
         }
-        if let Some(at) = self.announced
-            && at.elapsed() < std::time::Duration::from_secs(2)
-        {
-            return Ok(());
+        if self.incoming.len() + p.0.len() > total {
+            return Err(invalid("invalid clipboard chunk length"));
         }
-        self.announce(ch, out)
+        self.incoming.extend_from_slice(p.0);
+        if flags & 2 != 0 {
+            self.expected = None;
+            let message = std::mem::take(&mut self.incoming);
+            if message.len() != total {
+                return Err(invalid("incomplete clipboard message"));
+            }
+            self.on_data(ch, out, &message)?;
+        }
+        Ok(())
     }
 
     /// Offers the local clipboard. An image is only offered as a DIB: the PNG form
@@ -93,7 +142,7 @@ impl Clipboard {
         &mut self,
         ch: &Channels,
         out: &mut impl Write,
-        entries: &[ClipboardEntry],
+        entries: Vec<ClipboardEntry>,
     ) -> io::Result<()> {
         let Some(id) = ch.clipboard else {
             return Err(io::Error::new(
@@ -107,17 +156,19 @@ impl Clipboard {
                 "clipboard sharing is off",
             ));
         }
-        let stored = formats(entries)?;
         // Text over the bound is cut, and the caller is told it was.
         let cut = entries.iter().any(|entry| {
-            entry.kind == ClipboardKind::Text
-                && std::str::from_utf8(&entry.bytes)
-                    .map(|text| cut_text(text, MAX_CLIPBOARD_TEXT_BYTES).len() < entry.bytes.len())
-                    .unwrap_or(false)
+            entry.kind == ClipboardKind::Text && entry.bytes.len() > MAX_CLIPBOARD_TEXT_BYTES
         });
-        let list: Vec<u16> = stored.iter().map(|(id, _)| *id).collect();
+        let empty = entries.is_empty();
+        let stored = formats(entries)?;
+        if stored.is_empty() && !empty {
+            return Ok(());
+        }
         self.offered = stored;
-        self.send(ch, out, id, CB_FORMAT_LIST, 0, &words(&list))?;
+        if self.ready {
+            self.send_formats(ch, out, id)?;
+        }
         if cut {
             (self.emit)(Event::Notice {
                 notice: crate::Notice::ClipboardTooLarge(ClipboardKind::Text),
@@ -153,18 +204,12 @@ impl Clipboard {
                     });
                 }
                 let chosen = preferred(data)?;
-                if let Some(format) = chosen {
-                    self.pending = Some(format);
-                    self.send(
-                        ch,
-                        out,
-                        id,
-                        CB_FORMAT_DATA_REQUEST,
-                        0,
-                        &u32::from(format).to_le_bytes(),
-                    )?;
-                }
                 self.send(ch, out, id, CB_FORMAT_LIST_RESPONSE, CB_RESPONSE_OK, &[])?;
+                if matches!(self.pending, RemoteRequest::Idle) {
+                    self.request(ch, out, id, chosen)?;
+                } else {
+                    self.pending = RemoteRequest::Superseded(chosen);
+                }
             }
             CB_FORMAT_DATA_REQUEST => {
                 let mut request = Packet(data);
@@ -173,10 +218,10 @@ impl Clipboard {
                     .offered
                     .iter()
                     .find(|(id, _)| *id == format)
-                    .map(|(_, bytes)| bytes.clone());
+                    .map(|(_, bytes)| bytes.as_slice());
                 match found {
                     Some(bytes) => {
-                        self.send(ch, out, id, CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, &bytes)?
+                        self.send(ch, out, id, CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, bytes)?
                     }
                     None => {
                         self.send(ch, out, id, CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_FAIL, &[])?
@@ -184,19 +229,20 @@ impl Clipboard {
                 }
             }
             CB_FORMAT_DATA_RESPONSE => {
-                if flags & CB_RESPONSE_OK == 0 {
-                    self.pending = None;
-                    return Ok(());
-                }
+                let format = match std::mem::take(&mut self.pending) {
+                    RemoteRequest::Superseded(next) => return self.request(ch, out, id, next),
+                    RemoteRequest::Waiting(format) if flags & CB_RESPONSE_OK != 0 => format,
+                    _ => return Ok(()),
+                };
                 let mut cut_short = false;
-                let entry = match self.pending.take() {
-                    Some(CF_UNICODETEXT) => {
+                let entry = match format {
+                    CF_UNICODETEXT => {
                         let text = from_utf16(data)?;
                         let cut = cut_text(&text, MAX_CLIPBOARD_TEXT_BYTES);
                         cut_short = cut.len() < text.len();
                         ClipboardEntry::text(cut)
                     }
-                    Some(CF_DIB) | Some(CF_DIBV5) => {
+                    CF_DIB | CF_DIBV5 => {
                         if data.len() > MAX_CLIPBOARD_IMAGE_BYTES {
                             (self.emit)(Event::Notice {
                                 notice: crate::Notice::ClipboardTooLarge(ClipboardKind::Dib),
@@ -219,22 +265,48 @@ impl Clipboard {
                     });
                 }
             }
-            CB_CLIP_CAPS => {
-                // The server's capabilities close the exchange; answering here
-                // also covers a server that only speaks after its own start-up.
+            CB_CLIP_CAPS => {} // No optional capabilities are requested.
+            CB_MONITOR_READY => {
                 self.ready = true;
-                self.announce(ch, out)?;
+                // One general capability set, length 12, version 2, no flags.
+                self.send(
+                    ch,
+                    out,
+                    id,
+                    CB_CLIP_CAPS,
+                    0,
+                    &words(&[1, 0, 1, 12, 2, 0, 0, 0]),
+                )?;
+                self.send_formats(ch, out, id)?;
             }
-            CB_FORMAT_LIST_RESPONSE => {
-                if flags & CB_RESPONSE_OK == 0 && !self.refused {
-                    self.refused = true;
-                    (self.emit)(Event::Notice {
-                        notice: crate::Notice::ClipboardRefused,
-                    });
-                }
+            CB_FORMAT_LIST_RESPONSE if flags & CB_RESPONSE_OK == 0 && !self.refused => {
+                self.refused = true;
+                (self.emit)(Event::Notice {
+                    notice: crate::Notice::ClipboardRefused,
+                });
             }
-            CB_MONITOR_READY => {}
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn request(
+        &mut self,
+        ch: &Channels,
+        out: &mut impl Write,
+        id: u16,
+        format: Option<u16>,
+    ) -> io::Result<()> {
+        if let Some(format) = format {
+            self.send(
+                ch,
+                out,
+                id,
+                CB_FORMAT_DATA_REQUEST,
+                0,
+                &u32::from(format).to_le_bytes(),
+            )?;
+            self.pending = RemoteRequest::Waiting(format);
         }
         Ok(())
     }
@@ -248,18 +320,17 @@ impl Clipboard {
         flags: u16,
         data: &[u8],
     ) -> io::Result<()> {
-        let mut message = Vec::with_capacity(data.len() + 8);
-        message.extend_from_slice(&kind.to_le_bytes());
-        message.extend_from_slice(&flags.to_le_bytes());
-        message.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        message.extend_from_slice(data);
-        ch.send(out, id, &message)
+        let mut header = [0u8; 8];
+        header[..2].copy_from_slice(&kind.to_le_bytes());
+        header[2..4].copy_from_slice(&flags.to_le_bytes());
+        header[4..].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        ch.send_channel(out, id, &header, data)
     }
 }
 
 /// The formats one local copy offers and the bytes each carries, in the order the
 /// format list announces them: text as CF_UNICODETEXT, an image as CF_DIB.
-fn formats(entries: &[ClipboardEntry]) -> io::Result<Vec<(u16, Vec<u8>)>> {
+fn formats(entries: Vec<ClipboardEntry>) -> io::Result<Vec<(u16, Vec<u8>)>> {
     let mut stored = Vec::new();
     for entry in entries {
         match entry.kind {
@@ -277,14 +348,9 @@ fn formats(entries: &[ClipboardEntry]) -> io::Result<Vec<(u16, Vec<u8>)>> {
                         "clipboard image is too large",
                     ));
                 }
-                stored.push((CF_DIB, entry.bytes.clone()));
+                stored.push((CF_DIB, entry.bytes));
             }
-            ClipboardKind::Png => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "an RDP clipboard carries images as a DIB",
-                ));
-            }
+            ClipboardKind::Png => continue,
         }
     }
     Ok(stored)
@@ -293,7 +359,7 @@ fn formats(entries: &[ClipboardEntry]) -> io::Result<Vec<(u16, Vec<u8>)>> {
 /// Test hook: the formats a local copy offers, through the same conversion the
 /// channel uses. Errors are reported as an empty list.
 pub(crate) fn probe_offer(entries: &[ClipboardEntry]) -> Vec<(u16, Vec<u8>)> {
-    formats(entries).unwrap_or_default()
+    formats(entries.to_vec()).unwrap_or_default()
 }
 
 /// Test hook: runs the channel's offer path over `entries` and returns what it
@@ -308,13 +374,15 @@ pub(crate) fn probe_offer_events(entries: &[ClipboardEntry]) -> (Vec<u8>, Vec<Ev
     });
     let mut clipboard = Clipboard::new(true, emit);
     let channels = Channels {
+        dynamic: None,
         user: 1005,
         global: 1003,
         clipboard: Some(1004),
         drive: None,
     };
     let mut out = Vec::new();
-    let _ = clipboard.offer(&channels, &mut out, entries);
+    clipboard.ready = true;
+    let _ = clipboard.offer(&channels, &mut out, entries.to_vec());
     let events = events.lock().map(|slot| slot.clone()).unwrap_or_default();
     (out, events)
 }
@@ -336,13 +404,14 @@ pub(crate) fn probe_receive(
     // The IDs a server would have assigned: the MCS user is 1001 + the attach
     // offset, so sending through them never underflows.
     let channels = Channels {
+        dynamic: None,
         user: 1005,
         global: 1003,
         clipboard: Some(1004),
         drive: None,
     };
     let mut out = Vec::new();
-    if let Ok(stored) = formats(offered) {
+    if let Ok(stored) = formats(offered.to_vec()) {
         clipboard.offered = stored;
     }
     for (kind, flags, data) in messages {
@@ -366,24 +435,17 @@ fn words(values: &[u16]) -> Vec<u8> {
 
 /// The first format this client can carry, in its own preference order.
 fn preferred(data: &[u8]) -> io::Result<Option<u16>> {
-    let mut p = Packet(data);
-    let mut seen = Vec::new();
-    while !p.0.is_empty() {
-        let raw = p.le16()?;
-        let format = if raw & 0x8000 != 0 {
-            // A registered format name follows the 4-byte id; skip it.
-            p.take(2)?;
-            let length = usize::from(p.le16()?);
-            p.take(length.saturating_mul(2))?;
-            raw
-        } else {
-            raw
-        };
-        seen.push(format);
+    let (formats, rest) = data.as_chunks::<36>();
+    if !rest.is_empty() {
+        return Err(invalid("invalid short clipboard format list"));
     }
     Ok([CF_UNICODETEXT, CF_DIBV5, CF_DIB]
         .into_iter()
-        .find(|wanted| seen.contains(wanted)))
+        .find(|wanted| {
+            formats
+                .iter()
+                .any(|entry| entry[..4] == u32::from(*wanted).to_le_bytes())
+        }))
 }
 
 /// CF_UNICODETEXT bytes for `text`: the conversion a session offers with.
@@ -398,10 +460,17 @@ pub(crate) fn text_from_cf_unicode(bytes: &[u8]) -> Option<Vec<u8>> {
 
 /// UTF-16LE, CRLF line ends and a terminating NUL, as CF_UNICODETEXT defines it.
 fn to_utf16(text: &str) -> Vec<u8> {
-    let normalised = text.replace("\r\n", "\n").replace('\n', "\r\n");
-    let mut units: Vec<u16> = normalised.encode_utf16().collect();
-    units.push(0);
-    units.iter().flat_map(|unit| unit.to_le_bytes()).collect()
+    let mut bytes = Vec::with_capacity(text.len() * 2 + 2);
+    let mut previous = 0;
+    for unit in text.encode_utf16() {
+        if unit == 10 && previous != 13 {
+            bytes.extend_from_slice(&13u16.to_le_bytes());
+        }
+        bytes.extend_from_slice(&unit.to_le_bytes());
+        previous = unit;
+    }
+    bytes.extend_from_slice(&[0, 0]);
+    bytes
 }
 
 /// Reads up to the first NUL; an odd trailing byte is ignored.

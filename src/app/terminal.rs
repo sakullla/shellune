@@ -4683,9 +4683,7 @@ impl TerminalPane {
         let mut panel = div()
             .absolute()
             .when(dodge_bottom, |panel| panel.top(px(0.0)).border_b_1())
-            .when(!dodge_bottom, |panel| {
-                panel.bottom(bar_height).border_t_1()
-            })
+            .when(!dodge_bottom, |panel| panel.bottom(bar_height).border_t_1())
             .left(px(0.0))
             .right(px(0.0))
             // The bar grows with the text; the panel stops at a height that still

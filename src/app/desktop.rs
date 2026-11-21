@@ -21,6 +21,7 @@
 //! instead of opening a pane that could never show a picture.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{Bounds, ObjectFit, Pixels, px, size};
@@ -193,6 +194,10 @@ impl DesktopTarget {
         self.user.as_deref()
     }
 
+    pub fn set_user(&mut self, user: String) {
+        self.user = Some(user);
+    }
+
     /// The Windows domain, when the record has one.
     #[must_use]
     pub fn domain(&self) -> Option<&str> {
@@ -347,6 +352,7 @@ pub enum LinkFailure {
     Tls,
     /// The credentials were refused.
     Authentication,
+    CredentialsRequired,
     /// The certificate was not accepted.
     CertificateRejected,
     /// The server offered only a security type this build cannot negotiate.
@@ -389,7 +395,9 @@ impl LinkFailure {
             }
         };
         match self {
-            Self::Authentication => SessionFailure::AuthenticationFailed,
+            Self::Authentication | Self::CredentialsRequired => {
+                SessionFailure::AuthenticationFailed
+            }
             Self::CertificateRejected => SessionFailure::HostKeyRejected,
             Self::UnsupportedSecurity => SessionFailure::ConnectionFailed {
                 reason: format!(
@@ -440,13 +448,13 @@ impl LinkFailure {
 pub struct DesktopSurface {
     width: u32,
     height: u32,
-    pixels: Vec<u8>,
+    tiles: Vec<Option<Arc<[u8]>>>,
     dirty_tiles: Vec<bool>,
     applied: u64,
 }
 
-/// Limits each replacement texture to one MiB on a large desktop.
-pub const DESKTOP_TILE: u32 = 512;
+/// Maximum upload for a small update confined to a single tile: 256 KiB.
+pub const DESKTOP_TILE: u32 = 256;
 
 impl DesktopSurface {
     /// A surface with no picture yet.
@@ -464,13 +472,22 @@ impl DesktopSurface {
     /// Whether anything has been drawn.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.width == 0 || self.height == 0 || self.pixels.is_empty()
+        self.width == 0 || self.height == 0 || self.tiles.is_empty()
     }
 
-    /// The BGRA canvas, height rows of width * 4 bytes.
-    #[must_use]
-    pub fn pixels(&self) -> &[u8] {
-        &self.pixels
+    /// Pack a snapshot for pixel-level assertions. Painting uses the tiles directly.
+    #[cfg(test)]
+    pub fn pixels(&self) -> Vec<u8> {
+        let mut snapshot = vec![0; self.width as usize * self.height as usize * 4];
+        for (i, tile) in self.tiles.iter().enumerate() {
+            let Some(tile) = tile else { continue };
+            let (x, y, w, _) = self.tile_rect(i);
+            for (line, row) in tile.chunks_exact(w as usize * 4).enumerate() {
+                let at = ((y as usize + line) * self.width as usize + x as usize) * 4;
+                snapshot[at..at + row.len()].copy_from_slice(row);
+            }
+        }
+        snapshot
     }
 
     /// How many regions have been applied, which is what proves none was dropped.
@@ -484,7 +501,7 @@ impl DesktopSurface {
     pub fn reset(&mut self) {
         self.width = 0;
         self.height = 0;
-        self.pixels.clear();
+        self.tiles.clear();
         self.dirty_tiles.clear();
         self.applied = 0;
     }
@@ -526,34 +543,53 @@ impl DesktopSurface {
         if self.width != width || self.height != height {
             self.width = width;
             self.height = height;
-            let bytes = width as usize * height as usize * 4;
-            self.pixels = vec![0u8; bytes];
-            self.dirty_tiles =
-                vec![true; (width.div_ceil(DESKTOP_TILE) * height.div_ceil(DESKTOP_TILE)) as usize];
+            let count = (width.div_ceil(DESKTOP_TILE) * height.div_ceil(DESKTOP_TILE)) as usize;
+            self.tiles = vec![None; count];
+            self.dirty_tiles = vec![true; count];
         }
-        let canvas_stride = self.width as usize * 4;
-        for line in 0..region.height as usize {
-            let source = line * stride;
-            let destination = (region.y as usize + line) * canvas_stride + region.x as usize * 4;
-            self.pixels[destination..destination + row]
-                .copy_from_slice(&region.pixels[source..source + row]);
-            // RFB's fourth byte is padding, commonly zero. Remote desktop pixels
-            // are opaque; interpreting that padding as alpha hides the picture.
-            for pixel in self.pixels[destination..destination + row]
-                .as_chunks_mut::<4>()
-                .0
-            {
-                pixel[3] = 255;
+        let columns = width.div_ceil(DESKTOP_TILE);
+        let (left, top, right, bottom) = (
+            region.x as u32,
+            region.y as u32,
+            right as u32,
+            bottom as u32,
+        );
+        for ty in top / DESKTOP_TILE..=(bottom - 1) / DESKTOP_TILE {
+            for tx in left / DESKTOP_TILE..=(right - 1) / DESKTOP_TILE {
+                let i = (ty * columns + tx) as usize;
+                let (x, y, w, h) = self.tile_rect(i);
+                let x0 = left.max(x);
+                let length = (right.min(x + w) - x0) as usize * 4;
+                let tile =
+                    self.tiles[i].get_or_insert_with(|| vec![0; (w * h * 4) as usize].into());
+                for line in top.max(y)..bottom.min(y + h) {
+                    let src = (line - top) as usize * stride + (x0 - left) as usize * 4;
+                    let dst = ((line - y) * w + x0 - x) as usize * 4;
+                    let input = &region.pixels[src..src + length];
+                    if tile[dst..dst + length] == *input
+                        && input.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255)
+                    {
+                        continue;
+                    }
+                    let target = &mut Arc::make_mut(tile)[dst..dst + length];
+                    for (pixel, source) in target
+                        .as_chunks_mut::<4>()
+                        .0
+                        .iter_mut()
+                        .zip(input.as_chunks::<4>().0)
+                    {
+                        *pixel = [source[0], source[1], source[2], 255];
+                    }
+                    self.dirty_tiles[i] = true;
+                }
             }
         }
         self.applied += 1;
-        let columns = width.div_ceil(DESKTOP_TILE);
-        for y in region.y as u32 / DESKTOP_TILE..=(bottom as u32 - 1) / DESKTOP_TILE {
-            for x in region.x as u32 / DESKTOP_TILE..=(right as u32 - 1) / DESKTOP_TILE {
-                self.dirty_tiles[(y * columns + x) as usize] = true;
-            }
-        }
         true
+    }
+
+    pub fn has_dirty_tiles(&self) -> bool {
+        self.dirty_tiles.iter().any(|d| *d)
     }
 
     pub fn take_dirty_tiles(&mut self) -> impl Iterator<Item = usize> + '_ {
@@ -563,19 +599,24 @@ impl DesktopSurface {
             .filter_map(|(i, dirty)| std::mem::take(dirty).then_some(i))
     }
 
-    /// A packed BGRA tile from the composited surface.
-    pub fn tile(&self, index: usize) -> (u32, u32, Vec<u8>) {
+    fn tile_rect(&self, index: usize) -> (u32, u32, u32, u32) {
         let columns = self.width.div_ceil(DESKTOP_TILE);
         let x = index as u32 % columns * DESKTOP_TILE;
         let y = index as u32 / columns * DESKTOP_TILE;
-        let w = DESKTOP_TILE.min(self.width - x);
-        let h = DESKTOP_TILE.min(self.height - y);
-        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
-        for row in y..y + h {
-            let at = ((row * self.width + x) * 4) as usize;
-            pixels.extend_from_slice(&self.pixels[at..at + (w * 4) as usize]);
-        }
-        (w, h, pixels)
+        (
+            x,
+            y,
+            DESKTOP_TILE.min(self.width - x),
+            DESKTOP_TILE.min(self.height - y),
+        )
+    }
+
+    pub fn tile(&self, index: usize) -> Option<(u32, u32, Arc<[u8]>)> {
+        let (_, _, w, h) = self.tile_rect(index);
+        self.tiles[index].clone().map(|p| (w, h, p))
+    }
+    pub fn tile_count(&self) -> usize {
+        self.tiles.len()
     }
 }
 
@@ -1279,7 +1320,7 @@ pub trait DesktopLink: Send + 'static {
     /// Answers a certificate question.
     fn answer_certificate(&self, request_id: u32, accept: bool) -> Result<(), LinkError>;
     /// Tells the protocol the window changed size.
-    fn resize(&self, width: u32, height: u32) -> Result<(), LinkError>;
+    fn resize(&self, width: u32, height: u32, percent: u32) -> Result<(), LinkError>;
     /// Stops the worker and releases what it owns. Safe to call twice.
     fn shutdown(&mut self);
 }
@@ -1297,6 +1338,8 @@ impl NativeLink {
     pub fn open(
         target: &DesktopTarget,
         password: Option<&str>,
+        pin: Option<&str>,
+        percent: u32,
         width: u32,
         height: u32,
     ) -> Result<Self, LinkError> {
@@ -1306,6 +1349,8 @@ impl NativeLink {
             _ => return Err(LinkError::Argument),
         };
         let mut client = shellune_desktop::DesktopClient::new(protocol).map_err(native_error)?;
+        client.set_certificate_pin(pin);
+        client.set_display_scale(percent).map_err(native_error)?;
         client
             .set_server(target.address(), target.port())
             .map_err(native_error)?;
@@ -1409,12 +1454,10 @@ impl DesktopLink for NativeLink {
             .map_err(native_error)
     }
 
-    fn resize(&self, _width: u32, _height: u32) -> Result<(), LinkError> {
-        // The desktop size is taken before the connection is made and the handle is
-        // owned by this value behind a mutable borrow, so a live session cannot be
-        // renegotiated from here. Saying so lets the surface scale the picture it
-        // already has instead of claiming a remote resize it never asked for.
-        Err(LinkError::State)
+    fn resize(&self, width: u32, height: u32, percent: u32) -> Result<(), LinkError> {
+        self.client
+            .resize_scaled(width, height, percent)
+            .map_err(native_error)
     }
 
     fn shutdown(&mut self) {
@@ -1511,6 +1554,7 @@ fn native_failure(failure: shellune_desktop::Failure) -> LinkFailure {
         shellune_desktop::Failure::None => LinkFailure::None,
         shellune_desktop::Failure::Connect => LinkFailure::Connect,
         shellune_desktop::Failure::Tls => LinkFailure::Tls,
+        shellune_desktop::Failure::CredentialsRequired => LinkFailure::CredentialsRequired,
         shellune_desktop::Failure::Authentication => LinkFailure::Authentication,
         shellune_desktop::Failure::CertificateRejected => LinkFailure::CertificateRejected,
         shellune_desktop::Failure::UnsupportedSecurity => LinkFailure::UnsupportedSecurity,
@@ -1542,7 +1586,7 @@ pub fn encryption_note(target: &DesktopTarget) -> &'static str {
 }
 
 /// Whether a surface holds a complete BGRA canvas for its size.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 #[must_use]
 pub fn canvas_is_bgra(surface: &DesktopSurface) -> bool {
     let (width, height) = surface.size();
@@ -1570,7 +1614,7 @@ pub mod scripted {
         /// Certificate answers as (request, accepted).
         pub answers: Vec<(u32, bool)>,
         /// Sizes the surface asked for.
-        pub resizes: Vec<(u32, u32)>,
+        pub resizes: Vec<(u32, u32, u32)>,
         /// Every clipboard offer the surface sent to the peer, in order.
         pub clipboard: Vec<Vec<ClipboardEntry>>,
     }
@@ -1685,12 +1729,12 @@ pub mod scripted {
             Ok(())
         }
 
-        fn resize(&self, width: u32, height: u32) -> Result<(), LinkError> {
+        fn resize(&self, width: u32, height: u32, percent: u32) -> Result<(), LinkError> {
             let mut log = match self.log.lock() {
                 Ok(log) => log,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            log.resizes.push((width, height));
+            log.resizes.push((width, height, percent));
             Ok(())
         }
 
@@ -1936,8 +1980,12 @@ mod tests {
         let desktop = (3840, 2160);
         let first = scripted::solid(0, 0, 16, 16, desktop, [1, 2, 3, 255]);
         surface.apply(&first);
-        assert_eq!(surface.take_dirty_tiles().count(), 40);
+        assert_eq!(surface.take_dirty_tiles().count(), 135);
+        let (_, _, retained) = surface.tile(0).unwrap();
         surface.apply(&first);
+        assert_eq!(surface.take_dirty_tiles().count(), 0);
+        assert!(Arc::ptr_eq(&retained, &surface.tile(0).unwrap().2));
+        surface.apply(&scripted::solid(0, 0, 1, 1, desktop, [9, 9, 9, 255]));
         surface.apply(&scripted::solid(
             3824,
             2144,
@@ -1946,12 +1994,16 @@ mod tests {
             desktop,
             [4, 5, 6, 255],
         ));
-        let tiles: Vec<_> = surface.take_dirty_tiles().collect();
-        assert_eq!(tiles, [0, 39]);
-        let (w, h, corner) = surface.tile(39);
+        assert_eq!(surface.take_dirty_tiles().collect::<Vec<_>>(), [0, 134]);
+        let (w, h, corner) = surface.tile(134).unwrap();
         assert_eq!((w, h), (256, 112));
         assert_eq!(&corner[corner.len() - 4..], &[4, 5, 6, 255]);
-        assert_eq!(surface.tile(0).2.len() + corner.len(), 1_163_264);
+        assert_eq!(
+            &retained[..4],
+            &[1, 2, 3, 255],
+            "a retained render frame remains immutable"
+        );
+        assert_eq!(surface.tile(0).unwrap().2.len() + corner.len(), 376_832);
         assert_eq!(surface.take_dirty_tiles().count(), 0);
     }
 

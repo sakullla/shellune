@@ -155,6 +155,7 @@ pub enum Failure {
     Connect,
     Tls,
     Authentication,
+    CredentialsRequired,
     CertificateRejected,
     UnsupportedSecurity,
     ProtocolFailure,
@@ -613,11 +614,9 @@ impl DesktopClient {
     pub fn set_size(&mut self, width: u32, height: u32) -> Result<(), Error> {
         // A desktop whose frame cannot fit the accepted size is refused here,
         // before an attempt allocates it. Both protocols share the bound.
-        if u64::from(width) * u64::from(height) * 4 > MAX_FRAME_BYTES as u64
-            || width == 0
-            || height == 0
-            || width > u32::from(u16::MAX)
-            || height > u32::from(u16::MAX)
+        if !(1..=u32::from(u16::MAX)).contains(&width)
+            || !(1..=u32::from(u16::MAX)).contains(&height)
+            || u64::from(width) * u64::from(height) * 4 > MAX_FRAME_BYTES as u64
         {
             return Err(Error::Argument);
         }
@@ -628,6 +627,50 @@ impl DesktopClient {
         if let Some(client) = self.vnc_mut() {
             client.set_size(width, height);
             return Ok(());
+        }
+        Err(Error::State)
+    }
+
+    /// Use the previously approved SHA-256 fingerprint for this endpoint.
+    pub fn set_certificate_pin(&mut self, pin: Option<&str>) {
+        if let Some(client) = self.rdp_mut() {
+            client.set_certificate_pin(pin);
+        }
+        if let Some(client) = self.vnc_mut() {
+            client.set_certificate_pin(pin);
+        }
+    }
+
+    /// Set the initial RDP desktop scale. RFB negotiates pixel dimensions only.
+    pub fn set_display_scale(&mut self, percent: u32) -> Result<(), Error> {
+        if !(100..=500).contains(&percent) {
+            return Err(Error::Argument);
+        }
+        if let Some(client) = self.rdp_mut() {
+            client.set_scale(percent);
+        }
+        Ok(())
+    }
+
+    /// Requests a new framebuffer size without disconnecting the active session.
+    pub fn resize(&self, width: u32, height: u32) -> Result<(), Error> {
+        self.resize_scaled(width, height, 100)
+    }
+
+    /// Update pixel size and desktop DPI together when the window moves or resizes.
+    pub fn resize_scaled(&self, width: u32, height: u32, percent: u32) -> Result<(), Error> {
+        if !(100..=500).contains(&percent)
+            || !(200..=8192).contains(&width)
+            || !(200..=8192).contains(&height)
+            || u64::from(width) * u64::from(height) * 4 > MAX_FRAME_BYTES as u64
+        {
+            return Err(Error::Argument);
+        }
+        if let Some(client) = self.rdp() {
+            return client.resize(width as u16, height as u16, percent);
+        }
+        if let Some(client) = self.vnc() {
+            return client.resize(width as u16, height as u16);
         }
         Err(Error::State)
     }
@@ -784,7 +827,7 @@ impl DesktopClient {
     /// [`Notice::ClipboardTooLarge`] on the event stream once the session takes the
     /// group; it is never an error. An image over [`MAX_CLIPBOARD_IMAGE_BYTES`] is
     /// [`Error::Argument`], as is text that is not UTF-8 or a repeated kind. RDP
-    /// offers every entry, VNC only the text. A connection with sharing off answers
+    /// offers text and DIB, VNC only the text. A connection with sharing off answers
     /// [`Error::Unavailable`].
     pub fn push_clipboard(&self, entries: &[ClipboardEntry]) -> Result<(), Error> {
         if entries.len() > MAX_CLIPBOARD_ENTRIES {
@@ -1028,6 +1071,7 @@ pub fn failure_name(failure: Failure) -> String {
         Failure::Connect => "connect",
         Failure::Tls => "tls",
         Failure::Authentication => "authentication",
+        Failure::CredentialsRequired => "credentials-required",
         Failure::CertificateRejected => "certificate-rejected",
         Failure::UnsupportedSecurity => "unsupported-security",
         Failure::ProtocolFailure => "protocol",

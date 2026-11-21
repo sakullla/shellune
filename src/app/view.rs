@@ -4318,7 +4318,7 @@ impl ShelluneView {
         self.workspace.session_starting(session.id());
         let tag = session.tag();
         let locale = self.workspace.locale();
-        let pane = cx.new(|cx| desktop::DesktopPane::new(target, locale, cx));
+        let pane = cx.new(|cx| desktop::DesktopPane::new(target, locale, self.trust.clone(), cx));
         // The same password rule the window's own start uses: a typed one first, then
         // a kept one, and nothing when there is neither.
         let password = self.desktop_password(record);
@@ -4359,7 +4359,9 @@ impl ShelluneView {
         self.workspace.session_starting(session.id());
         let tag = session.tag();
         let locale = self.workspace.locale();
-        let pane = cx.new(|cx| desktop::DesktopPane::with_link(target, link, locale, cx));
+        let pane = cx.new(|cx| {
+            desktop::DesktopPane::with_link(target, link, locale, self.trust.clone(), cx)
+        });
         self.attach_desktop(tag, pane, cx);
         session.id()
     }
@@ -4951,7 +4953,7 @@ impl ShelluneView {
         {
             self.desktop_starts += 1;
         }
-        let pane = cx.new(|cx| desktop::DesktopPane::new(target, locale, cx));
+        let pane = cx.new(|cx| desktop::DesktopPane::new(target, locale, self.trust.clone(), cx));
         pane.update(cx, |pane, cx| pane.start(password.as_deref(), cx));
         self.attach_desktop(tag, pane, cx);
     }
@@ -7667,8 +7669,7 @@ impl ShelluneView {
                         let entity = fields.get(candidate).clone();
                         let is_bad = located == Some(Ok(candidate));
                         if is_bad {
-                            self.field_focus_pending =
-                                Some(entity.read(cx).focus_handle().clone());
+                            self.field_focus_pending = Some(entity.read(cx).focus_handle().clone());
                         }
                         entity.update(cx, |f, cx| f.set_invalid(is_bad, cx));
                     }
@@ -12003,10 +12004,7 @@ impl ShelluneView {
                 div()
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(SharedString::from(format!(
-                        "+{}",
-                        selected_ids.len() - 24
-                    ))),
+                    .child(SharedString::from(format!("+{}", selected_ids.len() - 24))),
             );
         }
         let body = div()
@@ -12335,8 +12333,7 @@ impl ShelluneView {
                 .closing
                 .is_some_and(|id| self.close_needs_confirmation(id))
             || (self.workspace.destination() == Destination::Hosts
-                && (self.hosts.pending_delete().is_some()
-                    || self.hosts.is_asking_batch_delete()))
+                && (self.hosts.pending_delete().is_some() || self.hosts.is_asking_batch_delete()))
     }
 
     /// Keeps every shortcut but Escape from running while a question is up.
@@ -12486,8 +12483,7 @@ impl ShelluneView {
             self.cancel_delete_host(cx);
             return true;
         }
-        if self.workspace.destination() == Destination::Hosts
-            && self.hosts.is_asking_batch_delete()
+        if self.workspace.destination() == Destination::Hosts && self.hosts.is_asking_batch_delete()
         {
             self.cancel_batch_delete_hosts(cx);
             return true;
@@ -14585,10 +14581,7 @@ impl ShelluneView {
         let on_the_listing = self
             .files_keyboard_stop(window, cx)
             .is_some_and(|(at, stop)| at == source && stop == FilesStop::Body);
-        if on_the_listing
-            && (modifiers.control || modifiers.platform)
-            && !modifiers.alt
-        {
+        if on_the_listing && (modifiers.control || modifiers.platform) && !modifiers.alt {
             match key {
                 "a" if !modifiers.shift => {
                     self.files.mark_all(id, source, true);
@@ -16091,7 +16084,11 @@ impl ShelluneView {
         match session {
             Some(id) => {
                 self.transfers.clear_finished_for_session(id);
-                if self.transfer_problem.as_ref().is_some_and(|(s, _)| *s == id) {
+                if self
+                    .transfer_problem
+                    .as_ref()
+                    .is_some_and(|(s, _)| *s == id)
+                {
                     self.transfer_problem = None;
                 }
                 if self
@@ -16124,7 +16121,10 @@ impl ShelluneView {
             .filter(|task| task.is_active())
             .count();
         let clearable = self.transfers.has_finished_for_session(id)
-            || self.transfer_problem.as_ref().is_some_and(|(s, _)| *s == id)
+            || self
+                .transfer_problem
+                .as_ref()
+                .is_some_and(|(s, _)| *s == id)
             || self
                 .transfer_skipped_folders
                 .as_ref()
@@ -18578,14 +18578,16 @@ impl ShelluneView {
         .flex_shrink()
         .min_w(self.tab_min_width() + mark_room)
         .tooltip(components::tooltip(tooltip))
-        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-            this.activate_in(id, window, cx);
-            if event.click_count() == 2
-                && let Some(tab) = this.workspace.tab_of_session(id)
-            {
-                this.open_tab_rename(tab, window, cx);
-            }
-        }))
+        .on_click(
+            cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                this.activate_in(id, window, cx);
+                if event.click_count() == 2
+                    && let Some(tab) = this.workspace.tab_of_session(id)
+                {
+                    this.open_tab_rename(tab, window, cx);
+                }
+            }),
+        )
         // A middle click closes a tab and a right click offers the other tab
         // actions, as in a browser or any other tabbed terminal.
         .on_mouse_down(

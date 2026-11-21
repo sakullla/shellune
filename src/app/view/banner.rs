@@ -587,8 +587,7 @@ impl ShelluneView {
             }
             Some(SessionStep::Close) => {
                 let button = if narrow {
-                    components::icon_only_button(Icon::Close, metrics)
-                        .size(metrics.hit_target())
+                    components::icon_only_button(Icon::Close, metrics).size(metrics.hit_target())
                 } else {
                     components::compact_button(strings.session_close, Variant::Secondary, metrics)
                 }

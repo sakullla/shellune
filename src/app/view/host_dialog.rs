@@ -1119,7 +1119,8 @@ impl ShelluneView {
                             draft.set_text(ConnectionFormField::Group, next.clone());
                         }
                         if let Some(fields) = this.protocol_fields.as_ref()
-                            && let Some(group_field) = fields.get(ConnectionFormField::Group).cloned()
+                            && let Some(group_field) =
+                                fields.get(ConnectionFormField::Group).cloned()
                         {
                             group_field.update(cx, |f, cx| f.set_text(next, cx));
                         }
@@ -1300,13 +1301,12 @@ impl ShelluneView {
 
         // The refusal takes a line of its own above the actions; the actions stay on
         // the right, the one that connects last and filled.
-        let save_connect_shortcut = if crate::app::Platform::current()
-            == crate::app::Platform::MacOs
-        {
-            "⌘↵"
-        } else {
-            "Ctrl+Enter"
-        };
+        let save_connect_shortcut =
+            if crate::app::Platform::current() == crate::app::Platform::MacOs {
+                "⌘↵"
+            } else {
+                "Ctrl+Enter"
+            };
         let footer = components::modal_footer(metrics)
             .children(refusal.map(|refusal| refusal.w_full()))
             .child(
@@ -1876,13 +1876,12 @@ impl ShelluneView {
             |this, cx| this.close_connection_editor(cx),
         );
 
-        let save_connect_shortcut = if crate::app::Platform::current()
-            == crate::app::Platform::MacOs
-        {
-            "⌘↵"
-        } else {
-            "Ctrl+Enter"
-        };
+        let save_connect_shortcut =
+            if crate::app::Platform::current() == crate::app::Platform::MacOs {
+                "⌘↵"
+            } else {
+                "Ctrl+Enter"
+            };
         let footer = components::modal_footer(metrics)
             .children(refusal.map(|refusal| refusal.w_full()))
             .child(

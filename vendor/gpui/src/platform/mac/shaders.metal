@@ -662,6 +662,7 @@ fragment float4 monochrome_sprite_fragment(
 struct PolychromeSpriteVertexOutput {
   float4 position [[position]];
   float2 tile_position;
+  float4 tile_uv_limits [[flat]];
   uint sprite_id [[flat]];
   float clip_distance [[clip_distance]][4];
 };
@@ -669,6 +670,7 @@ struct PolychromeSpriteVertexOutput {
 struct PolychromeSpriteFragmentInput {
   float4 position [[position]];
   float2 tile_position;
+  float4 tile_uv_limits [[flat]];
   uint sprite_id [[flat]];
 };
 
@@ -688,9 +690,12 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
   float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
                                                  sprite.content_mask.bounds);
   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
+  float2 half_texel = 0.5 / float2(atlas_size->width, atlas_size->height);
   return PolychromeSpriteVertexOutput{
       device_position,
       tile_position,
+      float4(to_tile_position(float2(0.0), sprite.tile, atlas_size) + half_texel,
+             to_tile_position(float2(1.0), sprite.tile, atlas_size) - half_texel),
       sprite_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
@@ -703,7 +708,8 @@ fragment float4 polychrome_sprite_fragment(
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
                                           min_filter::linear);
   float4 sample =
-      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+      atlas_texture.sample(atlas_texture_sampler, clamp(input.tile_position,
+          input.tile_uv_limits.xy, input.tile_uv_limits.zw));
   float distance =
       quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 

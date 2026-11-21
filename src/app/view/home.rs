@@ -1261,13 +1261,12 @@ impl ShelluneView {
                     .child(filter)
                     .child(more)
                     .child({
-                        let shortcut = if crate::app::Platform::current()
-                            == crate::app::Platform::MacOs
-                        {
-                            "⌘N"
-                        } else {
-                            "Ctrl+N"
-                        };
+                        let shortcut =
+                            if crate::app::Platform::current() == crate::app::Platform::MacOs {
+                                "⌘N"
+                            } else {
+                                "Ctrl+N"
+                            };
                         let new_tip = format!("{} ({shortcut})", strings.primary_hosts);
                         components::icon_label_button(
                             Icon::Plus,
@@ -1768,9 +1767,11 @@ impl ShelluneView {
                         .h(metrics.compact_control_height())
                         .id("hosts.group.new_host")
                         .debug_selector(|| "hosts.group.new_host".to_owned())
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.open_create_host(cx);
-                        })),
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.open_create_host(cx);
+                            },
+                        )),
                     )
                     .child(
                         all.id("hosts.group.all")

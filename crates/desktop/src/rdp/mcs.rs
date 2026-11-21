@@ -42,7 +42,7 @@ fn block(out: &mut Vec<u8>, kind: u16, value: &[u8]) {
 /// the protocol defines, because the server reads this block positionally: a
 /// shifted field is read as the next one, which is how a client ends up with a
 /// desktop of 0 pixels and no picture.
-fn core(width: u16, height: u16, selected: Security) -> Vec<u8> {
+fn core(width: u16, height: u16, percent: u32, selected: Security) -> Vec<u8> {
     let mut body = Vec::with_capacity(230);
     body.extend_from_slice(&0x0008_0004u32.to_le_bytes()); // RDP 5.0+
     body.extend_from_slice(&width.to_le_bytes());
@@ -78,23 +78,14 @@ fn core(width: u16, height: u16, selected: Security) -> Vec<u8> {
     body.push(6); // connection type: broadband
     body.push(0); // pad
     body.extend_from_slice(&(selected as u32).to_le_bytes());
-    // Physical size in millimetres at 96 dpi, so a resize request carries a sane
-    // monitory hint instead of zero.
-    body.extend_from_slice(
-        &u32::from(width)
-            .saturating_mul(254)
-            .div_euclid(960)
-            .to_le_bytes(),
-    );
-    body.extend_from_slice(
-        &u32::from(height)
-            .saturating_mul(254)
-            .div_euclid(960)
-            .to_le_bytes(),
-    );
+    for pixels in [width, height] {
+        body.extend_from_slice(
+            &super::display::physical_mm(u32::from(pixels), percent).to_le_bytes(),
+        );
+    }
     body.extend_from_slice(&0u16.to_le_bytes()); // landscape
-    body.extend_from_slice(&100u32.to_le_bytes()); // desktop scale factor, percent
-    body.extend_from_slice(&100u32.to_le_bytes()); // device scale factor, percent
+    body.extend_from_slice(&percent.to_le_bytes());
+    body.extend_from_slice(&super::display::device_scale(percent).to_le_bytes());
     debug_assert_eq!(body.len(), 230);
     body
 }
@@ -102,11 +93,12 @@ fn core(width: u16, height: u16, selected: Security) -> Vec<u8> {
 fn connect_initial(
     width: u16,
     height: u16,
+    percent: u32,
     selected: Security,
     names: &[&[u8; 8]],
 ) -> io::Result<Vec<u8>> {
     let mut blocks = Vec::new();
-    block(&mut blocks, 0xc001, &core(width, height, selected));
+    block(&mut blocks, 0xc001, &core(width, height, percent, selected));
     block(&mut blocks, 0xc002, &[0; 8]); // enhanced security sets both encryption fields to zero
     if !names.is_empty() {
         let mut net = (names.len() as u32).to_le_bytes().to_vec();
@@ -144,6 +136,7 @@ pub(super) struct Channels {
     pub(super) global: u16,
     pub(super) clipboard: Option<u16>,
     pub(super) drive: Option<u16>,
+    pub(super) dynamic: Option<u16>,
 }
 
 fn server_channels(bytes: &[u8], count: usize) -> io::Result<(u16, Vec<u16>)> {
@@ -211,6 +204,7 @@ pub(super) fn connect(
     io: &mut (impl Read + Write),
     width: u16,
     height: u16,
+    percent: u32,
     security: Security,
     clipboard: bool,
     drive: bool,
@@ -222,7 +216,11 @@ pub(super) fn connect(
     if drive {
         names.push(b"rdpdr\0\0\0");
     }
-    write_data(io, &connect_initial(width, height, security, &names)?)?;
+    names.push(b"drdynvc\0");
+    write_data(
+        io,
+        &connect_initial(width, height, percent, security, &names)?,
+    )?;
     let (global, ids) = server_channels(&read_data(io)?, names.len())?;
     write_data(io, &[4, 1, 0, 1, 0])?; // ErectDomainRequest
     write_data(io, &[0x28])?; // AttachUserRequest
@@ -262,23 +260,57 @@ pub(super) fn connect(
         global,
         clipboard: if clipboard { ids.next() } else { None },
         drive: if drive { ids.next() } else { None },
+        dynamic: ids.next(),
     })
 }
 
 impl Channels {
+    /// Static virtual channel PDUs use a total length and FIRST/LAST flags
+    /// on each chunk (MS-RDPBCGR 2.2.6.1). No channel compression is offered.
+    pub(super) fn send_channel(
+        &self,
+        out: &mut impl Write,
+        id: u16,
+        header: &[u8],
+        data: &[u8],
+    ) -> io::Result<()> {
+        const CHUNK: usize = 1600;
+        let length = u32::try_from(header.len() + data.len())
+            .map_err(|_| invalid("channel PDU too large"))?;
+        let mut source = header.chain(data);
+        let mut remaining = length as usize;
+        let mut packet = [0u8; CHUNK + 8];
+        packet[..4].copy_from_slice(&length.to_le_bytes());
+        while remaining > 0 {
+            let n = remaining.min(CHUNK);
+            let flags = u32::from(remaining == length as usize) | (u32::from(n == remaining) << 1);
+            packet[4..8].copy_from_slice(&flags.to_le_bytes());
+            source.read_exact(&mut packet[8..8 + n])?;
+            self.send(out, id, &packet[..8 + n])?;
+            remaining -= n;
+        }
+        Ok(())
+    }
+
     pub(super) fn send(
         &self,
         stream: &mut impl Write,
         channel: u16,
         value: &[u8],
     ) -> io::Result<()> {
-        let mut message = vec![0x64];
+        // One TLS write per outbound PDU, including pointer and keyboard input.
+        let mut message = zeroize::Zeroizing::new(Vec::with_capacity(15 + value.len()));
+        message.extend_from_slice(&[3, 0, 0, 0, 2, 0xf0, 0x80, 0x64]);
         message.extend_from_slice(&(self.user - BASE_USER_ID).to_be_bytes());
         message.extend_from_slice(&channel.to_be_bytes());
         message.push(0x70); // high priority, begin/end
         per_length(&mut message, value.len())?;
         message.extend_from_slice(value);
-        write_data(stream, &message)
+        let length =
+            u16::try_from(message.len()).map_err(|_| invalid("TPKT exceeds 65535 bytes"))?;
+        message[2..4].copy_from_slice(&length.to_be_bytes());
+        stream.write_all(&message)?;
+        stream.flush()
     }
 
     pub(super) fn receive<'a>(&self, pdu: &'a [u8]) -> io::Result<(u16, &'a [u8])> {
@@ -295,5 +327,19 @@ impl Channels {
         let body = p.take(len)?;
         p.finish()?;
         Ok((id, body))
+    }
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+    #[test]
+    fn retina_core_data_has_physical_pixels_and_scaled_dpi() {
+        let block = core(2240, 1348, 200, Security::Tls);
+        assert_eq!(&block[4..6], &2240u16.to_le_bytes());
+        assert_eq!(&block[6..8], &1348u16.to_le_bytes());
+        assert_eq!(&block[212..216], &296u32.to_le_bytes());
+        assert_eq!(&block[222..226], &200u32.to_le_bytes());
+        assert_eq!(&block[226..230], &180u32.to_le_bytes());
     }
 }

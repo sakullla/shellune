@@ -4,8 +4,7 @@
 //! window, a server or the native libraries:
 //!
 //! * [local_offer] turns what this computer's clipboard holds into the entries the
-//!   backend offers the remote side: the text, and an image as both PNG and DIB,
-//!   because Windows programs paste one or the other and the remote side picks.
+//!   backend offers the remote side: text and DIB for RDP, text for VNC.
 //! * [local_item] turns what the remote side copied into the one item this
 //!   computer's clipboard takes: the text and the image together, a DIB decoded to
 //!   PNG first because that is what this computer's clipboard carries.
@@ -20,6 +19,7 @@ use image::codecs::bmp::BmpDecoder;
 use image::{DynamicImage, ImageDecoder, RgbaImage};
 
 use crate::app::desktop::{ClipboardEntry, ClipboardKind};
+use shellune_core::ProtocolKind;
 
 /// The largest image entry the backend takes or delivers, in bytes.
 pub const MAX_IMAGE_BYTES: usize = shellune_desktop::MAX_CLIPBOARD_IMAGE_BYTES;
@@ -39,51 +39,51 @@ pub struct LocalOffer {
     /// The entries to send, each kind at most once. Empty when nothing could be
     /// offered.
     pub entries: Vec<ClipboardEntry>,
-    /// Whether an image was on the clipboard and was left out because neither of
-    /// its forms fits the bound.
+    /// Whether an image was too large for the negotiated clipboard format.
     pub image_too_large: bool,
 }
 
 /// The entries this computer's clipboard offers the remote side.
 ///
-/// Text goes as it is; the backend cuts text over its own bound and says so. The
-/// first image goes as PNG and as DIB: a PNG on the clipboard is passed through as
-/// it is, any other format is decoded and encoded again. A form over the image
-/// bound is left out rather than refused, so the other form still reaches the remote
-/// side; an image neither form of which fits is reported. A format this build cannot
-/// decode (SVG, a damaged file) is left out without a word, because the remote side
-/// could not paste it either. File lists are not clipboard content here: a folder
-/// mapping carries files (R5).
+/// Decode an image only when the peer's protocol can carry it.
 #[must_use]
-pub fn local_offer(item: &ClipboardItem) -> LocalOffer {
-    offer_within(item, MAX_IMAGE_BYTES)
+pub fn local_offer(item: &ClipboardItem, protocol: ProtocolKind) -> LocalOffer {
+    offer_within(item, protocol, MAX_IMAGE_BYTES)
 }
 
-/// [local_offer] with the image bound as a parameter, so the bound is tested
-/// without encoding a picture of tens of megabytes.
-fn offer_within(item: &ClipboardItem, bound: usize) -> LocalOffer {
+fn offer_within(item: &ClipboardItem, protocol: ProtocolKind, bound: usize) -> LocalOffer {
     let mut offer = LocalOffer::default();
-    if let Some(text) = item.text().filter(|text| !text.is_empty()) {
+    if let Some(text) = item.text().filter(|s| !s.is_empty()) {
         offer.entries.push(ClipboardEntry::text(&text));
     }
-    let image = item.entries().iter().find_map(|entry| match entry {
+    if protocol != ProtocolKind::Rdp {
+        return offer;
+    }
+    let Some(image) = item.entries().iter().find_map(|entry| match entry {
         gpui::ClipboardEntry::Image(image) => Some(image),
         _ => None,
-    });
-    if let Some(image) = image
-        && let Some(decoded) = decode(image)
+    }) else {
+        return offer;
+    };
+    let Some(format) = raster_format(image.format) else {
+        return offer;
+    };
+    let Ok(decoder) =
+        image::ImageReader::with_format(Cursor::new(image.bytes.as_slice()), format).into_decoder()
+    else {
+        return offer;
+    };
+    let (w, h) = decoder.dimensions();
+    let size = u64::from(w)
+        .saturating_mul(u64::from(h))
+        .saturating_mul(4)
+        .saturating_add(u64::from(BITMAPINFOHEADER_SIZE));
+    if size > bound as u64 || decoder.total_bytes() > MAX_DECODED_BYTES {
+        offer.image_too_large = true;
+    } else if let Ok(image) = DynamicImage::from_decoder(decoder)
+        && let Some(dib) = rgba_to_dib(&image.into_rgba8())
     {
-        let png = if image.format == ImageFormat::Png {
-            Some(image.bytes.clone())
-        } else {
-            encode_png(&decoded)
-        };
-        let dib = rgba_to_dib(&decoded.to_rgba8());
-        let png = png.filter(|png| png.len() <= bound);
-        let dib = dib.filter(|dib| dib.len() <= bound);
-        offer.image_too_large = png.is_none() && dib.is_none();
-        offer.entries.extend(png.map(ClipboardEntry::png));
-        offer.entries.extend(dib.map(ClipboardEntry::dib));
+        offer.entries.push(ClipboardEntry::dib(dib));
     }
     offer
 }
@@ -194,8 +194,8 @@ fn is_png(bytes: &[u8]) -> bool {
 }
 
 /// The picture of a clipboard image, or `None` for a format this build cannot draw.
-fn decode(image: &Image) -> Option<DynamicImage> {
-    let format = match image.format {
+fn raster_format(format: ImageFormat) -> Option<image::ImageFormat> {
+    Some(match format {
         ImageFormat::Png => image::ImageFormat::Png,
         ImageFormat::Jpeg => image::ImageFormat::Jpeg,
         ImageFormat::Webp => image::ImageFormat::WebP,
@@ -204,8 +204,7 @@ fn decode(image: &Image) -> Option<DynamicImage> {
         ImageFormat::Tiff => image::ImageFormat::Tiff,
         // A vector picture has no pixels until it is drawn at a size.
         ImageFormat::Svg => return None,
-    };
-    image::load_from_memory_with_format(&image.bytes, format).ok()
+    })
 }
 
 /// The picture as a PNG file.
@@ -447,11 +446,14 @@ mod tests {
 
     #[test]
     fn local_text_is_offered_alone() {
-        let offer = local_offer(&ClipboardItem::new_string("你好\nworld".to_owned()));
+        let offer = local_offer(
+            &ClipboardItem::new_string("你好\nworld".to_owned()),
+            ProtocolKind::Rdp,
+        );
         assert_eq!(offer.entries, vec![ClipboardEntry::text("你好\nworld")]);
         assert!(!offer.image_too_large);
         assert!(
-            local_offer(&ClipboardItem::new_string(String::new()))
+            local_offer(&ClipboardItem::new_string(String::new()), ProtocolKind::Rdp)
                 .entries
                 .is_empty(),
             "an empty clipboard offers nothing"
@@ -459,41 +461,31 @@ mod tests {
     }
 
     #[test]
-    fn a_local_png_is_offered_as_itself_and_as_a_dib() {
+    fn a_local_png_is_offered_as_a_dib_only_to_rdp() {
         let image = picture();
-        let png = png_of(&image);
-        let offer = local_offer(&ClipboardItem::new_image(&Image::from_bytes(
-            ImageFormat::Png,
-            png.clone(),
-        )));
-        assert_eq!(offer.entries.len(), 2);
-        assert_eq!(
-            offer.entries[0],
-            ClipboardEntry::png(png),
-            "the PNG as it was"
-        );
-        assert_eq!(offer.entries[1].kind, ClipboardKind::Dib);
-        let back = decode_png(&dib_to_png(&offer.entries[1].bytes).expect("the DIB decodes"));
+        let item = ClipboardItem::new_image(&Image::from_bytes(ImageFormat::Png, png_of(&image)));
+        let offer = local_offer(&item, ProtocolKind::Rdp);
+        assert_eq!(offer.entries.len(), 1);
+        assert!(local_offer(&item, ProtocolKind::Vnc).entries.is_empty());
+        assert_eq!(offer.entries[0].kind, ClipboardKind::Dib);
+        let back = decode_png(&dib_to_png(&offer.entries[0].bytes).expect("the DIB decodes"));
         assert_eq!(back, image);
     }
 
     #[test]
-    fn a_local_jpeg_with_text_is_offered_as_text_png_and_dib() {
+    fn a_local_jpeg_with_text_is_offered_as_text_and_dib() {
         let image = picture();
         let jpeg = encoded(&image, image::ImageFormat::Jpeg);
         let item = ClipboardItem::new_entries(vec![
             gpui::ClipboardEntry::from("caption".to_owned()),
             gpui::ClipboardEntry::Image(Image::from_bytes(ImageFormat::Jpeg, jpeg)),
         ]);
-        let kinds: Vec<ClipboardKind> = local_offer(&item)
+        let kinds: Vec<ClipboardKind> = local_offer(&item, ProtocolKind::Rdp)
             .entries
             .iter()
             .map(|entry| entry.kind)
             .collect();
-        assert_eq!(
-            kinds,
-            vec![ClipboardKind::Text, ClipboardKind::Png, ClipboardKind::Dib]
-        );
+        assert_eq!(kinds, vec![ClipboardKind::Text, ClipboardKind::Dib]);
     }
 
     #[test]
@@ -505,14 +497,14 @@ mod tests {
                 b"<svg xmlns='http://www.w3.org/2000/svg'/>".to_vec(),
             )),
         ]);
-        let offer = local_offer(&item);
+        let offer = local_offer(&item, ProtocolKind::Rdp);
         assert_eq!(offer.entries, vec![ClipboardEntry::text("label")]);
         assert!(
             !offer.image_too_large,
             "an undrawable image is not too large"
         );
         let damaged = ClipboardItem::new_image(&Image::from_bytes(ImageFormat::Png, vec![1, 2]));
-        assert!(local_offer(&damaged).entries.is_empty());
+        assert!(local_offer(&damaged, ProtocolKind::Rdp).entries.is_empty());
     }
 
     #[test]
@@ -524,7 +516,7 @@ mod tests {
             gpui::ClipboardEntry::from("still here".to_owned()),
             gpui::ClipboardEntry::Image(Image::from_bytes(ImageFormat::Png, png.clone())),
         ]);
-        let offer = offer_within(&item, png.len().min(dib_len) - 1);
+        let offer = offer_within(&item, ProtocolKind::Rdp, dib_len - 1);
         assert!(offer.image_too_large);
         assert_eq!(
             offer.entries,
@@ -532,10 +524,8 @@ mod tests {
             "the text still goes"
         );
 
-        // A form that fits still goes when the other does not, and that is no loss
-        // worth a notice: the remote side pastes the form it has.
-        let bound = png.len().max(dib_len) - 1;
-        let offer = offer_within(&item, bound);
+        let bound = dib_len;
+        let offer = offer_within(&item, ProtocolKind::Rdp, bound);
         assert!(!offer.image_too_large);
         assert_eq!(offer.entries.len(), 2, "the text and the form that fits");
         assert!(offer.entries.iter().all(|entry| entry.bytes.len() <= bound));

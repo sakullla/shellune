@@ -1226,7 +1226,9 @@ impl ShelluneView {
                 .h(metrics.hit_target())
                 .id(SharedString::from(format!("pane.zoom.{pane}")))
                 .debug_selector(|| "pane.zoom".to_owned())
-                .tooltip(crate::app::components::tooltip(SharedString::from(zoom_tip)))
+                .tooltip(crate::app::components::tooltip(SharedString::from(
+                    zoom_tip,
+                )))
                 .on_click(cx.listener(|this, _event, window, cx| {
                     cx.stop_propagation();
                     this.toggle_active_zoom(window, cx);
@@ -1506,14 +1508,16 @@ impl ShelluneView {
         .flex_shrink()
         .min_w(self.tab_min_width())
         .tooltip(crate::app::components::tooltip(tooltip))
-        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-            this.select_tab(index, window, cx);
-            if event.click_count() == 2
-                && let Some(tab) = this.workspace.layout().tabs().get(index).map(|t| t.id())
-            {
-                this.open_tab_rename(tab, window, cx);
-            }
-        }))
+        .on_click(
+            cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                this.select_tab(index, window, cx);
+                if event.click_count() == 2
+                    && let Some(tab) = this.workspace.layout().tabs().get(index).map(|t| t.id())
+                {
+                    this.open_tab_rename(tab, window, cx);
+                }
+            }),
+        )
         .on_mouse_down(
             MouseButton::Middle,
             cx.listener(move |this, _event, _window, cx| {

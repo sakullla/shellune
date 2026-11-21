@@ -1047,7 +1047,8 @@ impl ShelluneView {
                     }
                     match event.keystroke.key.as_str() {
                         "left" | "right" => {
-                            this.startup_run.focus_open_folder = !this.startup_run.focus_open_folder;
+                            this.startup_run.focus_open_folder =
+                                !this.startup_run.focus_open_folder;
                             cx.notify();
                             cx.stop_propagation();
                         }
@@ -1268,10 +1269,13 @@ impl ShelluneView {
                         components::button(strings.continue_start, Variant::Primary, metrics)
                             .id("startup.continue")
                             .debug_selector(|| "startup.continue".to_owned())
-                            .when(!self.pointer_input && !self.startup_run.focus_open_folder, |b| {
-                                b.border_2()
-                                    .border_color(theme::swatch(palette::FOCUS_RING))
-                            })
+                            .when(
+                                !self.pointer_input && !self.startup_run.focus_open_folder,
+                                |b| {
+                                    b.border_2()
+                                        .border_color(theme::swatch(palette::FOCUS_RING))
+                                },
+                            )
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.continue_startup(cx);
                             })),
@@ -1285,10 +1289,13 @@ impl ShelluneView {
                         )
                         .id("startup.open_folder")
                         .debug_selector(|| "startup.open_folder".to_owned())
-                        .when(!self.pointer_input && self.startup_run.focus_open_folder, |b| {
-                            b.border_2()
-                                .border_color(theme::swatch(palette::FOCUS_RING))
-                        })
+                        .when(
+                            !self.pointer_input && self.startup_run.focus_open_folder,
+                            |b| {
+                                b.border_2()
+                                    .border_color(theme::swatch(palette::FOCUS_RING))
+                            },
+                        )
                         .on_click(cx.listener(
                             |this, _event, _window, cx| {
                                 this.open_data_folder(cx);

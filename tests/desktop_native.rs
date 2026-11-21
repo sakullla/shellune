@@ -372,7 +372,7 @@ fn read_message(stream: &mut TcpStream, message_type: u8) -> Option<ClientMessag
             // big-endian size and the NUL-terminated text.
             let flags = u32::from_be_bytes(payload.get(..4)?.try_into().ok()?);
             let mut text = None;
-            if flags & EXT_PROVIDE != 0 {
+            if flags & EXT_CAPS == 0 && flags & EXT_PROVIDE != 0 {
                 let plain = zlib_inflate(&payload[4..])?;
                 let declared = u32::from_be_bytes(plain.get(..4)?.try_into().ok()?) as usize;
                 let mut body = plain.get(4..4 + declared)?.to_vec();
@@ -1362,6 +1362,7 @@ fn utf16(text: &str) -> Vec<u8> {
 /// The CLIPRDR messages inside one session reply, as (kind, flags, data).
 fn cliprdr_replies(bytes: &[u8]) -> Vec<(u16, u16, Vec<u8>)> {
     let mut replies = Vec::new();
+    let mut message = Vec::new();
     let mut at = 0usize;
     while at + 4 <= bytes.len() && bytes[at] == 3 {
         let total = usize::from(u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]));
@@ -1387,17 +1388,35 @@ fn cliprdr_replies(bytes: &[u8]) -> Vec<(u16, u16, Vec<u8>)> {
         if index + length > mcs.len() {
             break;
         }
-        let value = &mcs[index..index + length];
-        if value.len() >= 8 {
-            let kind = u16::from_le_bytes([value[0], value[1]]);
-            let flags = u16::from_le_bytes([value[2], value[3]]);
-            let size = u32::from_le_bytes([value[4], value[5], value[6], value[7]]) as usize;
-            let data = value[8..(8 + size).min(value.len())].to_vec();
-            replies.push((kind, flags, data));
+        let chunk = &mcs[index..index + length];
+        let channel_len = u32::from_le_bytes(chunk[..4].try_into().unwrap()) as usize;
+        let flags = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+        if flags & 1 != 0 {
+            message.clear();
+        }
+        assert!(chunk.len() <= 1608);
+        message.extend_from_slice(&chunk[8..]);
+        if flags & 2 != 0 {
+            assert_eq!(message.len(), channel_len);
+            let kind = u16::from_le_bytes(message[..2].try_into().unwrap());
+            let flags = u16::from_le_bytes(message[2..4].try_into().unwrap());
+            let n = u32::from_le_bytes(message[4..8].try_into().unwrap()) as usize;
+            assert_eq!(message.len(), 8 + n);
+            replies.push((kind, flags, message[8..].to_vec()));
         }
         at += total;
     }
     replies
+}
+
+fn short_formats(ids: &[u16]) -> Vec<u8> {
+    ids.iter()
+        .flat_map(|id| {
+            let mut record = [0u8; 36];
+            record[..4].copy_from_slice(&u32::from(*id).to_le_bytes());
+            record
+        })
+        .collect()
 }
 
 /// A local copy offers text as CF_UNICODETEXT and an image as CF_DIB, in the order
@@ -1407,6 +1426,7 @@ fn cliprdr_replies(bytes: &[u8]) -> Vec<(u16, u16, Vec<u8>)> {
 fn an_rdp_copy_offers_text_and_a_dib_and_never_a_png() {
     let offered = probe::rdp_clipboard_offer(&[
         ClipboardEntry::text("a\nb"),
+        ClipboardEntry::png(vec![1, 2, 3]),
         ClipboardEntry::dib(vec![1, 2, 3]),
     ]);
     assert_eq!(
@@ -1425,10 +1445,7 @@ fn an_rdp_copy_offers_text_and_a_dib_and_never_a_png() {
 /// carry: text before any image.
 #[test]
 fn a_remote_rdp_format_list_is_answered_with_one_request() {
-    let mut list = Vec::new();
-    for format in [0x1234u16, CF_UNICODETEXT, CF_DIB] {
-        list.extend_from_slice(&format.to_le_bytes());
-    }
+    let list = short_formats(&[0x1234, CF_UNICODETEXT, CF_DIB]);
     let (events, replies) = probe::rdp_clipboard_receive(&[], &[(0x0002, 0, list)]);
     assert!(events.is_empty(), "{events:?}");
     let messages = cliprdr_replies(&replies);
@@ -1437,18 +1454,11 @@ fn a_remote_rdp_format_list_is_answered_with_one_request() {
         2,
         "a request and the list response: {messages:?}"
     );
-    assert_eq!(messages[0].0, 0x0004, "CB_FORMAT_DATA_REQUEST");
+    assert_eq!(messages[0], (0x0003, 0x0001, vec![]));
     assert_eq!(
-        u32::from_le_bytes([
-            messages[0].2[0],
-            messages[0].2[1],
-            messages[0].2[2],
-            messages[0].2[3]
-        ]),
-        u32::from(CF_UNICODETEXT)
+        messages[1],
+        (0x0004, 0, u32::from(CF_UNICODETEXT).to_le_bytes().to_vec())
     );
-    assert_eq!(messages[1].0, 0x0003, "CB_FORMAT_LIST_RESPONSE");
-    assert_eq!(messages[1].1, 0x0001, "CB_RESPONSE_OK");
 }
 
 /// The answer to that request becomes one clipboard event; an incoming request is
@@ -1456,7 +1466,7 @@ fn a_remote_rdp_format_list_is_answered_with_one_request() {
 #[test]
 fn an_rdp_clipboard_answer_becomes_one_event_and_a_request_is_served() {
     // A remote copy is announced, requested, and only then answered.
-    let copy = CF_UNICODETEXT.to_le_bytes().to_vec();
+    let copy = short_formats(&[CF_UNICODETEXT]);
     let (events, _) = probe::rdp_clipboard_receive(
         &[],
         &[(0x0002, 0, copy), (0x0005, 0x0001, utf16("remote\r\ntext"))],
@@ -1469,14 +1479,58 @@ fn an_rdp_clipboard_answer_becomes_one_event_and_a_request_is_served() {
     );
 
     let offered = [ClipboardEntry::text("local")];
-    let mut request = CF_UNICODETEXT.to_le_bytes().to_vec();
-    request.extend_from_slice(&[0, 0]);
+    let request = u32::from(CF_UNICODETEXT).to_le_bytes().to_vec();
     let (_, replies) = probe::rdp_clipboard_receive(&offered, &[(0x0004, 0, request)]);
     let messages = cliprdr_replies(&replies);
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert_eq!(messages[0].0, 0x0005, "CB_FORMAT_DATA_RESPONSE");
     assert_eq!(messages[0].1, 0x0001, "CB_RESPONSE_OK");
     assert_eq!(messages[0].2, utf16("local"));
+}
+
+#[test]
+fn an_rdp_screenshot_can_be_requested_across_multiple_channel_chunks() {
+    let dib = vec![0x55; 6400];
+    let entries = [
+        ClipboardEntry::png(vec![1, 2, 3]),
+        ClipboardEntry::dib(dib.clone()),
+    ];
+    let (encoded, _) = probe::rdp_clipboard_offer_events(&entries);
+    assert_eq!(
+        cliprdr_replies(&encoded),
+        [(2, 0, short_formats(&[CF_DIB]))]
+    );
+    let (_, encoded) = probe::rdp_clipboard_receive(
+        &entries,
+        &[(4, 0, u32::from(CF_DIB).to_le_bytes().to_vec())],
+    );
+    assert_eq!(cliprdr_replies(&encoded), [(5, 1, dib)]);
+}
+
+#[test]
+fn rapid_remote_copies_only_deliver_data_from_the_latest_format_list() {
+    let (events, replies) = probe::rdp_clipboard_receive(
+        &[],
+        &[
+            (2, 0, short_formats(&[CF_DIB])),
+            (2, 0, short_formats(&[CF_UNICODETEXT])),
+            (5, 1, vec![1, 2, 3, 4]),
+            (5, 1, utf16("latest")),
+        ],
+    );
+    assert_eq!(
+        events,
+        [Event::Clipboard {
+            entries: vec![ClipboardEntry::text("latest")]
+        }]
+    );
+    assert_eq!(
+        cliprdr_replies(&replies)
+            .iter()
+            .map(|s| s.0)
+            .collect::<Vec<_>>(),
+        [3, 4, 3, 4]
+    );
 }
 
 /// An image over its bound is dropped and reported; text over its bound is cut at
@@ -1487,7 +1541,7 @@ fn an_oversized_remote_rdp_entry_is_cut_or_reported() {
     let (events, _) = probe::rdp_clipboard_receive(
         &[],
         &[
-            (0x0002, 0, CF_DIB.to_le_bytes().to_vec()),
+            (0x0002, 0, short_formats(&[CF_DIB])),
             (0x0005, 0x0001, image),
         ],
     );
@@ -1503,7 +1557,7 @@ fn an_oversized_remote_rdp_entry_is_cut_or_reported() {
     let (events, _) = probe::rdp_clipboard_receive(
         &[],
         &[
-            (0x0002, 0, CF_UNICODETEXT.to_le_bytes().to_vec()),
+            (0x0002, 0, short_formats(&[CF_UNICODETEXT])),
             (0x0005, 0x0001, text),
         ],
     );
@@ -1680,7 +1734,7 @@ fn a_declined_drive_is_reported_with_how_it_was_declined() {
 #[test]
 fn a_refused_rdp_clipboard_is_reported_and_withdrawn() {
     // A format list first, so the client is waiting for the answer.
-    let copy = CF_UNICODETEXT.to_le_bytes().to_vec();
+    let copy = short_formats(&[CF_UNICODETEXT]);
     let (events, _) =
         probe::rdp_clipboard_receive(&[], &[(0x0002, 0, copy), (0x0003, 0x0002, Vec::new())]);
     assert_eq!(
@@ -1691,11 +1745,11 @@ fn a_refused_rdp_clipboard_is_reported_and_withdrawn() {
     );
 
     // The server offers a format list again: the clipboard is usable.
-    let list = CF_UNICODETEXT.to_le_bytes().to_vec();
+    let list = short_formats(&[CF_UNICODETEXT]);
     let (events, _) = probe::rdp_clipboard_receive(
         &[],
         &[
-            (0x0002, 0, CF_UNICODETEXT.to_le_bytes().to_vec()),
+            (0x0002, 0, short_formats(&[CF_UNICODETEXT])),
             (0x0003, 0x0002, Vec::new()),
             (0x0002, 0, list),
         ],
@@ -2000,12 +2054,12 @@ fn a_vnc_peer_with_extended_clipboard_exchanges_utf8_both_ways() {
         cut_texts(&peer),
         [
             ClientMessage::ExtendedCutText {
-                flags: EXT_NOTIFY | EXT_TEXT,
+                flags: EXT_CAPS | EXT_TEXT | EXT_REQUEST | EXT_PEEK | EXT_NOTIFY | EXT_PROVIDE,
                 text: None
             },
-            provided
+            provided,
         ],
-        "exactly one text went out, and no classic cut text"
+        "the server accepts text up to its advertised size directly"
     );
     drop(client);
     assert_eq!(leaked_handles(), 0);

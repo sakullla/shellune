@@ -24,6 +24,7 @@ pub(crate) const CERTIFICATE_REJECTED: &str = "certificate rejected";
 pub(crate) type Ask = dyn Fn(String, String, String) -> bool + Send + Sync;
 
 struct Trust {
+    pin: Option<String>,
     platform: rustls_platform_verifier::Verifier,
     ask: Arc<Ask>,
 }
@@ -43,30 +44,32 @@ impl ServerCertVerifier for Trust {
         ocsp: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        match self
+        let verified = self
             .platform
-            .verify_server_cert(end_entity, intermediates, name, ocsp, now)
+            .verify_server_cert(end_entity, intermediates, name, ocsp, now);
+        match &verified {
+            Ok(_) if self.pin.is_none() => return verified,
+            Ok(_) | Err(rustls::Error::InvalidCertificate(_)) => {}
+            _ => return verified,
+        }
+        let (_, certificate) = X509Certificate::from_der(end_entity.as_ref()).map_err(|_| {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+        })?;
+        let fingerprint = Sha256::digest(end_entity.as_ref())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        if self.pin.as_deref() == Some(&fingerprint)
+            || (self.ask)(
+                certificate.subject().to_string(),
+                certificate.issuer().to_string(),
+                fingerprint,
+            )
         {
-            Err(error @ rustls::Error::InvalidCertificate(_)) => {
-                let Ok((_, certificate)) = X509Certificate::from_der(end_entity.as_ref()) else {
-                    return Err(error);
-                };
-                let fingerprint = Sha256::digest(end_entity.as_ref())
-                    .iter()
-                    .map(|value| format!("{value:02x}"))
-                    .collect::<Vec<_>>()
-                    .join(":");
-                if (self.ask)(
-                    certificate.subject().to_string(),
-                    certificate.issuer().to_string(),
-                    fingerprint,
-                ) {
-                    Ok(ServerCertVerified::assertion())
-                } else {
-                    Err(rustls::Error::General(CERTIFICATE_REJECTED.into()))
-                }
-            }
-            result => result,
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(CERTIFICATE_REJECTED.into()))
         }
     }
 
@@ -101,10 +104,12 @@ impl ServerCertVerifier for Trust {
 pub(crate) fn tls<S: Read + Write>(
     socket: S,
     host: &str,
+    pin: Option<String>,
     ask: Arc<Ask>,
 ) -> io::Result<SecureStream<S>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let trust = Trust {
+        pin,
         platform: rustls_platform_verifier::Verifier::new(provider.clone())
             .map_err(io::Error::other)?,
         ask,

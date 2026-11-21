@@ -348,9 +348,7 @@ impl ShelluneView {
                         metrics.scale(theme::HIT_TARGET)
                     }),
             )
-            // The task centre sits beside the page tools: its entry is always there, and
-            // a run this window is driving says so in the same row, so leaving it for
-            // another page never loses it (R11, R13).
+            // The task library belongs to the home page; an active run has its own indicator.
             .children(self.batch_topbar_control(cx))
             // A failed sync or a conflict waiting for an answer is said here, on every
             // page, and a press opens the sync settings (R8, R10).
@@ -1025,34 +1023,32 @@ impl ShelluneView {
                     })),
             )
             .when(!compact, |control| {
-                control
-                    .child(components::divider_vertical(metrics))
-                    .child(
-                        components::icon_only_button(Icon::ChevronDown, metrics)
-                            // Its own width, but never narrower than a pointer target (R4).
-                            .w(metrics.hit_target())
-                            .h(size)
-                            .rounded_r(px(radius::MEDIUM))
-                            .rounded_l(px(0.0))
-                            .when(open, |button| {
-                                button.bg(theme::swatch(palette::SURFACE_SELECTED))
-                            })
-                            .id("shell.menu")
-                            .debug_selector(|| "shell.menu".to_owned())
-                            .when(!open, |button| {
-                                button.tooltip(components::tooltip(ux.new_tab_menu))
-                            })
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.tab_menu = None;
-                                this.session_more = None;
-                                this.session_menu = None;
-                                this.host_menu = None;
-                                // The header's menu, wherever the home page's one was.
-                                this.shell_menu_open = !(this.shell_menu_open && !this.shell_menu_home);
-                                this.shell_menu_home = false;
-                                cx.notify();
-                            })),
-                    )
+                control.child(components::divider_vertical(metrics)).child(
+                    components::icon_only_button(Icon::ChevronDown, metrics)
+                        // Its own width, but never narrower than a pointer target (R4).
+                        .w(metrics.hit_target())
+                        .h(size)
+                        .rounded_r(px(radius::MEDIUM))
+                        .rounded_l(px(0.0))
+                        .when(open, |button| {
+                            button.bg(theme::swatch(palette::SURFACE_SELECTED))
+                        })
+                        .id("shell.menu")
+                        .debug_selector(|| "shell.menu".to_owned())
+                        .when(!open, |button| {
+                            button.tooltip(components::tooltip(ux.new_tab_menu))
+                        })
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.tab_menu = None;
+                            this.session_more = None;
+                            this.session_menu = None;
+                            this.host_menu = None;
+                            // The header's menu, wherever the home page's one was.
+                            this.shell_menu_open = !(this.shell_menu_open && !this.shell_menu_home);
+                            this.shell_menu_home = false;
+                            cx.notify();
+                        })),
+                )
             });
         // Records where the control is drawn, for the menu that hangs from it.
         let anchor = self.shell_menu_anchor.clone();
@@ -2422,7 +2418,9 @@ impl ShelluneView {
         if self.snippet_panel.is_editing() {
             return;
         }
-        let filtered = self.snippet_panel.filtered_indices(self.snippets.snippets());
+        let filtered = self
+            .snippet_panel
+            .filtered_indices(self.snippets.snippets());
         let len = filtered.len();
         let secondary = event.keystroke.modifiers.number_of_modifiers() == 1
             && event.keystroke.modifiers.secondary();
@@ -2534,7 +2532,9 @@ impl ShelluneView {
                     .debug_selector(|| "snippets.empty".to_owned()),
                 );
             }
-            let filtered = self.snippet_panel.filtered_indices(self.snippets.snippets());
+            let filtered = self
+                .snippet_panel
+                .filtered_indices(self.snippets.snippets());
             if count > 0
                 && let Some(search) = self.snippet_panel.search_field().cloned()
             {

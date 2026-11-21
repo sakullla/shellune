@@ -1,5 +1,6 @@
 use crate::{DevicePixels, Pixels, Result, SharedString, Size, size};
 use smallvec::SmallVec;
+use std::sync::Arc;
 
 use image::{Delay, Frame};
 use std::{
@@ -44,7 +45,12 @@ pub struct RenderImage {
     pub id: ImageId,
     /// The scale factor of this image on render.
     pub(crate) scale_factor: f32,
-    data: SmallVec<[Frame; 1]>,
+    data: ImageFrames,
+}
+
+enum ImageFrames {
+    Animation(SmallVec<[Frame; 1]>),
+    Bgra(Size<DevicePixels>, Arc<[u8]>),
 }
 
 impl PartialEq for RenderImage {
@@ -58,26 +64,51 @@ impl Eq for RenderImage {}
 impl RenderImage {
     /// Create a new image from the given data.
     pub fn new(data: impl Into<SmallVec<[Frame; 1]>>) -> Self {
+        Self::from_frames(ImageFrames::Animation(data.into()))
+    }
+
+    /// Shares a packed BGRA buffer with its producer. Retained frames stay immutable.
+    pub fn from_bgra(size: Size<DevicePixels>, pixels: Arc<[u8]>) -> Self {
+        assert!(
+            size.width.0 > 0
+                && size.height.0 > 0
+                && size.width.0 as u64 * size.height.0 as u64 * 4 == pixels.len() as u64
+        );
+        Self::from_frames(ImageFrames::Bgra(size, pixels))
+    }
+
+    fn from_frames(data: ImageFrames) -> Self {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
         Self {
             id: ImageId(NEXT_ID.fetch_add(1, SeqCst)),
             scale_factor: 1.0,
-            data: data.into(),
+            data,
         }
     }
 
     /// Convert this image into a byte slice.
     pub fn as_bytes(&self, frame_index: usize) -> Option<&[u8]> {
-        self.data
-            .get(frame_index)
-            .map(|frame| frame.buffer().as_raw().as_slice())
+        match &self.data {
+            ImageFrames::Animation(frames) => frames
+                .get(frame_index)
+                .map(|frame| frame.buffer().as_raw().as_slice()),
+            ImageFrames::Bgra(_, pixels) => (frame_index == 0).then_some(pixels.as_ref()),
+        }
     }
 
     /// Get the size of this image, in pixels.
     pub fn size(&self, frame_index: usize) -> Size<DevicePixels> {
-        let (width, height) = self.data[frame_index].buffer().dimensions();
-        size(width.into(), height.into())
+        match &self.data {
+            ImageFrames::Animation(frames) => {
+                let (w, h) = frames[frame_index].buffer().dimensions();
+                size(w.into(), h.into())
+            }
+            ImageFrames::Bgra(size, _) => {
+                assert_eq!(frame_index, 0);
+                *size
+            }
+        }
     }
 
     /// Get the size of this image, in pixels for display, adjusted for the scale factor.
@@ -88,12 +119,21 @@ impl RenderImage {
 
     /// Get the delay of this frame from the previous
     pub fn delay(&self, frame_index: usize) -> Delay {
-        self.data[frame_index].delay()
+        match &self.data {
+            ImageFrames::Animation(frames) => frames[frame_index].delay(),
+            ImageFrames::Bgra(..) => {
+                assert_eq!(frame_index, 0);
+                Delay::from_numer_denom_ms(0, 1)
+            }
+        }
     }
 
     /// Get the number of frames for this image.
     pub fn frame_count(&self) -> usize {
-        self.data.len()
+        match &self.data {
+            ImageFrames::Animation(frames) => frames.len(),
+            ImageFrames::Bgra(..) => 1,
+        }
     }
 }
 

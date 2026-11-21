@@ -59,32 +59,22 @@ impl PlatformAtlas for MetalAtlas {
 
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.0.lock();
-        let Some(id) = lock.tiles_by_key.get(key).map(|v| v.texture_id) else {
+        let Some(tile) = lock.tiles_by_key.remove(key) else {
             return;
         };
-
+        let id = tile.texture_id;
         let textures = match id.kind {
             AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
             AtlasTextureKind::Polychrome => &mut lock.polychrome_textures,
         };
-
-        let Some(texture_slot) = textures
-            .textures
-            .iter_mut()
-            .find(|texture| texture.as_ref().is_some_and(|v| v.id == id))
-        else {
-            return;
-        };
-
-        if let Some(mut texture) = texture_slot.take() {
-            texture.decrement_ref_count();
-
-            if texture.is_unreferenced() {
-                textures.free_list.push(id.index as usize);
-                lock.tiles_by_key.remove(key);
-            } else {
-                *texture_slot = Some(texture);
-            }
+        let slot = &mut textures.textures[id.index as usize];
+        let texture = slot.as_mut().expect("live atlas key has a texture");
+        texture.decrement_ref_count();
+        // Keep previously submitted Metal draws immutable. Recycle the texture
+        // index only once all its entries are gone; retire each key immediately.
+        if texture.is_unreferenced() {
+            *slot = None;
+            textures.free_list.push(id.index as usize);
         }
     }
 }

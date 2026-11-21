@@ -300,60 +300,64 @@ fn planar_rle(
     height: usize,
     planes: &[usize],
 ) -> io::Result<(Vec<u8>, usize)> {
-    let mut rle = Rle { data, at: 1 };
+    let mut stream = Packet(&data[1..]);
     let stride = width * 4;
-    let mut out = vec![0u8; stride * height];
+    let mut out = vec![255; stride * height];
+    // Keep the previous scanline contiguous. Zero-delta runs (common when a
+    // window is dragged) already contain the next row's values.
+    let mut scanline = vec![0u8; width];
     for &offset in planes {
-        let mut color: i32;
-        let mut previous: Option<usize> = None;
         for line in 0..height {
-            let row = (height - 1 - line) * stride;
-            let mut x = 0usize;
-            color = 0;
+            let mut x = 0;
+            let mut last = 0u8;
             while x < width {
-                let code = rle.byte()?;
-                let mut replen = usize::from(code & 0x0f);
-                let mut collen = usize::from((code >> 4) & 0x0f);
-                let reversed = (replen << 4) | collen;
-                if (16..=47).contains(&reversed) {
-                    replen = reversed;
-                    collen = 0;
+                let code = stream.u8()?;
+                let mut raw = usize::from(code >> 4);
+                let mut run = usize::from(code & 15);
+                if run == 1 || run == 2 {
+                    run = run * 16 + raw;
+                    raw = 0;
                 }
-                while x < width && collen > 0 {
-                    let byte = rle.byte()?;
-                    // color keeps the row delta, not the reconstructed value: the
-                    // run that follows repeats this same delta over the row below.
-                    let value = match previous {
-                        Some(at) => {
-                            color = delta(byte);
-                            out[at + x * 4 + offset] as i32 + color
-                        }
-                        None => {
-                            color = i32::from(byte);
-                            color
-                        }
-                    };
-                    out[row + x * 4 + offset] = value as u8;
-                    x += 1;
-                    collen -= 1;
+                if raw + run == 0 || raw + run > width - x {
+                    return Err(invalid("invalid planar scanline length"));
                 }
-                while x < width && replen > 0 {
-                    let value = match previous {
-                        Some(at) => out[at + x * 4 + offset] as i32 + color,
-                        None => color,
-                    };
-                    out[row + x * 4 + offset] = value as u8;
-                    x += 1;
-                    replen -= 1;
+                let literals = stream.take(raw)?;
+                if offset != 3 {
+                    let dest = &mut scanline[x..x + raw];
+                    if line == 0 {
+                        dest.copy_from_slice(literals);
+                        if let Some(&v) = literals.last() {
+                            last = v;
+                        }
+                        scanline[x + raw..x + raw + run].fill(last);
+                    } else {
+                        for (v, &d) in dest.iter_mut().zip(literals) {
+                            last = delta(d) as u8;
+                            *v = v.wrapping_add(last);
+                        }
+                        if last != 0 {
+                            for v in &mut scanline[x + raw..x + raw + run] {
+                                *v = v.wrapping_add(last);
+                            }
+                        }
+                    }
+                }
+                x += raw + run;
+            }
+            if offset != 3 {
+                let row = (height - 1 - line) * stride;
+                for (pixel, value) in out[row..row + stride]
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(&scanline)
+                {
+                    pixel[offset] = *value;
                 }
             }
-            previous = Some(row);
         }
     }
-    for pixel in out.as_chunks_mut::<4>().0 {
-        pixel[3] = 0xff;
-    }
-    Ok((out, rle.at))
+    Ok((out, data.len() - stream.0.len()))
 }
 
 /// A signed delta, zig-zagged into one byte: 0 stays 0, 1 is -1, 2 is 1, ...

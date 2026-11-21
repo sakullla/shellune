@@ -1142,12 +1142,16 @@ impl ShelluneView {
             .max_h(max_height)
             .overflow_y_scroll()
             .child(
-                item(strings.remote_connect, "host.menu.connect", Icon::Plug, false).on_click(
-                    cx.listener(move |this, _event, window, cx| {
-                        this.close_host_menu(window, cx);
-                        this.connect_saved_connection(id, cx);
-                    }),
-                ),
+                item(
+                    strings.remote_connect,
+                    "host.menu.connect",
+                    Icon::Plug,
+                    false,
+                )
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.close_host_menu(window, cx);
+                    this.connect_saved_connection(id, cx);
+                })),
             );
         if is_ssh {
             menu = menu.child(
@@ -1185,14 +1189,18 @@ impl ShelluneView {
             )
             .child(divider())
             .child(
-                item(ux.host_copy_target, "host.menu.copy_target", Icon::Copy, false).on_click(
-                    cx.listener(move |this, _event, window, cx| {
-                        let copied = target.clone();
-                        this.close_host_menu(window, cx);
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copied));
-                        window.dispatch_action(Box::new(crate::app::actions::ShowCopied), cx);
-                    }),
-                ),
+                item(
+                    ux.host_copy_target,
+                    "host.menu.copy_target",
+                    Icon::Copy,
+                    false,
+                )
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    let copied = target.clone();
+                    this.close_host_menu(window, cx);
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copied));
+                    window.dispatch_action(Box::new(crate::app::actions::ShowCopied), cx);
+                })),
             )
             .child(
                 item(strings.host_edit, "host.menu.edit", Icon::Pencil, false).on_click(
@@ -1301,7 +1309,9 @@ impl ShelluneView {
                     self.open_remote(&host, cx);
                 }
             }
-            SessionKind::Rdp { host } | SessionKind::Vnc { host } | SessionKind::Serial { host } => {
+            SessionKind::Rdp { host }
+            | SessionKind::Vnc { host }
+            | SessionKind::Serial { host } => {
                 if self.book.connection(host).is_some() {
                     self.connect_saved_connection(host, cx);
                 }

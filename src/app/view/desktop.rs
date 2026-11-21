@@ -26,12 +26,37 @@ use crate::app::desktop::{
     ALT_LEFT, Availability, Buttons, CONTROL_LEFT, ClipboardEntry, ClipboardKind,
     DESKTOP_POLL_INTERVAL, DesktopLink, DesktopSurface, DesktopTarget, DesktopZoom, DriveProblem,
     InputQueue, KeyCodes, LinkEvent, LinkFailure, LinkState, NativeLink, Notice, SHIFT_LEFT,
-    availability, clamp_pan, content_rect, content_rect_in, encryption_note, key_codes,
-    to_remote_in,
+    availability, clamp_pan, content_rect_in, encryption_note, key_codes, to_remote_in,
 };
 use crate::app::desktop_clipboard;
 use crate::app::icons::{self, Icon};
+use crate::app::text_field::TextField;
 use crate::app::theme::{self, Elevated, Metrics, Tone, palette, spacing};
+
+#[cfg(all(target_os = "macos", not(test)))]
+mod mac_hotkeys {
+    use std::{ffi::c_void, ptr::NonNull};
+    #[link(name = "Carbon", kind = "framework")]
+    unsafe extern "C" {
+        fn PushSymbolicHotKeyMode(options: u32) -> *mut c_void;
+        fn PopSymbolicHotKeyMode(token: *mut c_void);
+    }
+
+    /// The Carbon mode stack is main-thread-only. The pane owns its token
+    /// while it has keyboard focus and Carbon limits it to the foreground app.
+    pub(super) struct Capture(NonNull<c_void>);
+    impl Capture {
+        pub(super) fn acquire() -> Option<Self> {
+            // kHIHotKeyModeAllDisabledExceptUniversalAccess.
+            NonNull::new(unsafe { PushSymbolicHotKeyMode(2) }).map(Self)
+        }
+    }
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            unsafe { PopSymbolicHotKeyMode(self.0.as_ptr()) };
+        }
+    }
+}
 
 /// The size a session asks for before the window has measured anything.
 ///
@@ -55,6 +80,15 @@ struct CertificateQuestion {
     subject: String,
     issuer: String,
     fingerprint: String,
+}
+
+struct SignIn {
+    cancel_focus: FocusHandle,
+    connect_focus: FocusHandle,
+    user: Option<gpui::Entity<TextField>>,
+    password: gpui::Entity<TextField>,
+    focus_pending: bool,
+    rejection: Option<String>,
 }
 
 /// Where a desktop pane is in its own terms (R17).
@@ -222,31 +256,6 @@ fn shortcut_modifier_held(modifiers: &Modifiers) -> bool {
     modifiers.control || (cfg!(target_os = "macos") && modifiers.platform)
 }
 
-/// A number the system moves on whenever anything is put on the clipboard, or
-/// `None` where there is none to ask.
-///
-/// Reading the clipboard is not free: a Windows screenshot is a bitmap that is
-/// encoded to PNG on every read, on the window's thread. The pane asks this first
-/// and reads only when something was copied since its last read.
-#[cfg(all(windows, not(test)))]
-fn clipboard_generation() -> Option<u32> {
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn GetClipboardSequenceNumber() -> u32;
-    }
-    // SAFETY: the call takes no arguments and touches no memory of this process.
-    let number = unsafe { GetClipboardSequenceNumber() };
-    // Zero is the answer of a session that may not see the clipboard's number.
-    (number != 0).then_some(number)
-}
-
-/// The tests write a clipboard of their own that has no such number, and other
-/// systems keep none GPUI exposes.
-#[cfg(not(all(windows, not(test))))]
-fn clipboard_generation() -> Option<u32> {
-    None
-}
-
 /// One remote desktop on screen.
 pub struct DesktopPane {
     target: DesktopTarget,
@@ -256,6 +265,8 @@ pub struct DesktopPane {
     surface: DesktopSurface,
     pointer_shape: Option<PointerShape>,
     pointer_image: Option<Arc<RenderImage>>,
+    #[cfg(target_os = "macos")]
+    native_cursor: Option<(f32, gpui::BitmapCursor)>,
     pointer_dirty: bool,
     #[cfg(test)]
     presented_cursor: CursorStyle,
@@ -284,12 +295,21 @@ pub struct DesktopPane {
     viewport: Option<Bounds<Pixels>>,
     /// The size last asked of the protocol, so a resize is sent once.
     asked_size: (u32, u32),
+    asked_scale: u32,
+    pending_dial: Option<Option<shellune_core::SecretString>>,
     /// The last remote pixel a motion reported, so movement inside one pixel is not
     /// sent twice.
     last_sent: Option<(u16, u16)>,
     /// Fractional wheel steps from a precision touchpad.
     wheel_remainder: [f32; 2],
     certificate: Option<CertificateQuestion>,
+    certificate_store: shellune_storage::TrustStore,
+    previous_pin: Option<String>,
+    remember_certificate: bool,
+    pin_error: Option<String>,
+    sign_in: Option<SignIn>,
+    provided_password: bool,
+    certificate_remember_focus: FocusHandle,
     certificate_reject_focus: FocusHandle,
     certificate_trust_focus: FocusHandle,
     /// What the protocol layer said about why it ended, kept verbatim.
@@ -338,8 +358,10 @@ pub struct DesktopPane {
     /// losing activation happens once instead of on every frame of an inactive
     /// window.
     was_active: bool,
+    #[cfg(all(target_os = "macos", not(test)))]
+    hotkey_capture: Option<mac_hotkeys::Capture>,
     /// Cached desktop tiles in row-major order. A frame replaces its dirty tiles.
-    images: Rc<Vec<Arc<RenderImage>>>,
+    images: Rc<Vec<Option<Arc<RenderImage>>>>,
     image_size: (u32, u32),
     locale: Locale,
     /// The parts of the clipboard content last offered to the remote side or written
@@ -347,7 +369,7 @@ pub struct DesktopPane {
     shared: Vec<u64>,
     /// The clipboard's number at the pane's last read of it, so an unchanged
     /// clipboard is not read again (see [clipboard_generation]).
-    read_generation: Option<u32>,
+    read_generation: Option<u64>,
     /// Whether this session has yet to be offered the clipboard since it went live.
     /// A pane that keeps the keyboard through a reconnect sees no focus event, so
     /// the first frame drawn live and focused offers it instead (R1-R4).
@@ -366,13 +388,18 @@ pub struct DesktopPane {
 
 impl DesktopPane {
     /// A pane for a target that has not been started.
-    pub fn new(target: DesktopTarget, locale: Locale, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        target: DesktopTarget,
+        locale: Locale,
+        certificate_store: shellune_storage::TrustStore,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.on_release(|pane: &mut Self, cx| {
             pane.close_link(cx);
             if let Some(image) = pane.pointer_image.take() {
                 cx.drop_image(image, None);
             }
-            for image in Rc::make_mut(&mut pane.images).drain(..) {
+            for image in Rc::make_mut(&mut pane.images).drain(..).flatten() {
                 cx.drop_image(image, None);
             }
         })
@@ -385,6 +412,8 @@ impl DesktopPane {
             surface: DesktopSurface::new(),
             pointer_shape: None,
             pointer_image: None,
+            #[cfg(target_os = "macos")]
+            native_cursor: None,
             pointer_dirty: false,
             #[cfg(test)]
             presented_cursor: CursorStyle::Arrow,
@@ -399,9 +428,18 @@ impl DesktopPane {
             fullscreen: false,
             viewport: None,
             asked_size: FIRST_DESKTOP_SIZE,
+            asked_scale: 100,
+            pending_dial: None,
             last_sent: None,
             wheel_remainder: [0.0; 2],
             certificate: None,
+            certificate_store,
+            previous_pin: None,
+            remember_certificate: false,
+            pin_error: None,
+            sign_in: None,
+            provided_password: false,
+            certificate_remember_focus: cx.focus_handle(),
             certificate_reject_focus: cx.focus_handle(),
             certificate_trust_focus: cx.focus_handle(),
             layer_reason: None,
@@ -420,6 +458,8 @@ impl DesktopPane {
             polling: false,
             watching_focus: false,
             was_active: false,
+            #[cfg(all(target_os = "macos", not(test)))]
+            hotkey_capture: None,
             images: Rc::default(),
             image_size: (0, 0),
             locale,
@@ -447,9 +487,10 @@ impl DesktopPane {
         target: DesktopTarget,
         link: Box<dyn DesktopLink>,
         locale: Locale,
+        certificate_store: shellune_storage::TrustStore,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut pane = Self::new(target, locale, cx);
+        let mut pane = Self::new(target, locale, certificate_store, cx);
         pane.link = Some(link);
         pane.phase = DesktopPhase::Connecting;
         pane.stage = DesktopStage::Connecting;
@@ -515,10 +556,7 @@ impl DesktopPane {
         if window.is_fullscreen() != fullscreen {
             window.toggle_fullscreen();
         }
-        // A full screen is a bigger space, so the picture is re-fitted as soon as
-        // the layout measures it; the size the protocol was asked for does not
-        // change, because the pane cannot renegotiate a live session and a
-        // remote resize would drop the picture it is showing.
+        // The next layout supplies the fullscreen dimensions to the live link.
         cx.notify();
     }
 
@@ -694,12 +732,21 @@ impl DesktopPane {
         if self.availability.is_built() {
             self.stage = DesktopStage::Connecting;
             self.connecting_since = Some(std::time::Instant::now());
-            let (width, height) = self.asked_size;
-            match NativeLink::open(&self.target, password, width, height) {
-                Ok(link) => {
-                    self.attach(Box::new(link), cx);
-                }
-                Err(error) => self.fail(LinkFailure::Connect, &error.reason(), cx),
+            self.provided_password = password.is_some_and(|p| !p.is_empty());
+            self.pending_dial = Some(password.map(shellune_core::SecretString::new));
+            if self.viewport.is_some() {
+                self.dial_pending(cx);
+            } else {
+                // Usually the first layout starts the dial with the exact pixel size.
+                // A background tab may have no layout until it is selected.
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(120))
+                        .await;
+                    let _ = this.update(cx, |pane, cx| pane.dial_pending(cx));
+                })
+                .detach();
+                cx.notify();
             }
             return;
         }
@@ -714,6 +761,42 @@ impl DesktopPane {
             ),
         });
         cx.notify();
+    }
+
+    fn dial_pending(&mut self, cx: &mut Context<Self>) {
+        let Some(password) = self.pending_dial.take() else {
+            return;
+        };
+        let (width, height) = self.asked_size;
+        let pin = match self.certificate_store.desktop_certificate(
+            self.protocol_label(),
+            self.target.address(),
+            self.target.port(),
+        ) {
+            Ok(pin) => pin,
+            Err(error) => {
+                self.fail(LinkFailure::Io, &error.to_string(), cx);
+                return;
+            }
+        };
+        self.previous_pin = pin;
+        let allowed_pin =
+            if self.target.certificate() == shellune_core::RdpCertificatePolicy::Reject {
+                None
+            } else {
+                self.previous_pin.as_deref()
+            };
+        match NativeLink::open(
+            &self.target,
+            password.as_ref().map(|p| p.expose()),
+            allowed_pin,
+            self.asked_scale,
+            width,
+            height,
+        ) {
+            Ok(link) => self.attach(Box::new(link), cx),
+            Err(error) => self.fail(LinkFailure::Connect, &error.reason(), cx),
+        }
     }
 
     fn protocol_label(&self) -> &'static str {
@@ -778,6 +861,8 @@ impl DesktopPane {
     }
 
     fn close_link(&mut self, cx: &gpui::App) {
+        self.pending_dial = None;
+        self.sign_in = None;
         if let Some(mut link) = self.link.take() {
             // Wake pending network I/O now. A DNS lookup or TCP connect may still
             // have to finish before the backend can join its worker.
@@ -827,6 +912,13 @@ impl DesktopPane {
     }
 
     fn set_pointer(&mut self, shape: Option<PointerShape>) {
+        if self.pointer_shape == shape {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.native_cursor = None;
+        }
         self.pointer_shape = shape;
         self.pointer_dirty = true;
     }
@@ -838,26 +930,37 @@ impl DesktopPane {
         if let Some(old) = self.pointer_image.take() {
             cx.drop_image(old, Some(window));
         }
+        let shape = match &self.pointer_shape {
+            Some(PointerShape::Default)
+                if self.target.protocol() == shellune_core::ProtocolKind::Rdp =>
+            {
+                Some(windows_arrow())
+            }
+            other => other.as_ref(),
+        };
         if let Some(PointerShape::Bitmap {
             width,
             height,
             pixels,
             ..
-        }) = &self.pointer_shape
-            && pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0)
-            && let Some(buffer) =
-                image::ImageBuffer::from_raw((*width).into(), (*height).into(), pixels.to_vec())
+        }) = shape
         {
-            self.pointer_image = Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])));
+            self.pointer_image = Some(Arc::new(RenderImage::from_bgra(
+                gpui::size(
+                    gpui::DevicePixels(i32::from(*width)),
+                    gpui::DevicePixels(i32::from(*height)),
+                ),
+                pixels.clone(),
+            )));
         }
     }
 
     /// A native precision cursor remains visible until there is a bitmap to paint.
     fn fallback_cursor(&self) -> CursorStyle {
-        if self.is_live() && !matches!(self.pointer_shape, Some(PointerShape::Default)) {
-            CursorStyle::Crosshair
-        } else {
-            CursorStyle::Arrow
+        match (&self.pointer_shape, self.is_live(), self.target.protocol()) {
+            (Some(PointerShape::Hidden), true, _) => CursorStyle::None,
+            (None, true, shellune_core::ProtocolKind::Vnc) => CursorStyle::Crosshair,
+            _ => CursorStyle::Arrow,
         }
     }
 
@@ -945,10 +1048,18 @@ impl DesktopPane {
             return self.phase.accepts_input() || matches!(self.phase, DesktopPhase::NotStarted);
         }
         let mut keep = true;
+        let mut redraw = had_problem != self.send_problem.is_some();
         for event in events {
+            redraw |= match &event {
+                LinkEvent::Frame(_) => !self.is_live(),
+                LinkEvent::Pointer(shape) => self.pointer_shape.as_ref() != Some(shape),
+                _ => true,
+            };
             keep = self.apply(event, cx) && keep;
         }
-        cx.notify();
+        if redraw || self.surface.has_dirty_tiles() {
+            cx.notify();
+        }
         keep
     }
 
@@ -1028,6 +1139,8 @@ impl DesktopPane {
                     return false;
                 }
                 self.release_input();
+                self.remember_certificate = false;
+                self.pin_error = None;
                 self.certificate = Some(question);
                 self.stage = DesktopStage::VerifyingCertificate;
                 cx.notify();
@@ -1061,13 +1174,13 @@ impl DesktopPane {
             return;
         };
         self.shared = desktop_clipboard::prints(&item);
-        let before = clipboard_generation();
+        let before = cx.clipboard_generation();
         cx.write_to_clipboard(item);
         // What is on the clipboard now is what was just shared; reading it back
         // would only find that out again. The write reports no failure, so only a
         // number that moved proves it landed: a clipboard another program held open
         // keeps its old content, which must still be read and offered later.
-        let after = clipboard_generation();
+        let after = cx.clipboard_generation();
         if after != before {
             self.read_generation = after;
         }
@@ -1093,7 +1206,7 @@ impl DesktopPane {
             return false;
         }
         self.offer_when_live = false;
-        let generation = clipboard_generation();
+        let generation = cx.clipboard_generation();
         if generation.is_some() && generation == self.read_generation {
             return false;
         }
@@ -1108,10 +1221,10 @@ impl DesktopPane {
         if prints.is_empty() || desktop_clipboard::already_shared(&prints, &self.shared) {
             return false;
         }
-        let offer = desktop_clipboard::local_offer(&item);
+        let offer = desktop_clipboard::local_offer(&item, self.target.protocol());
         self.shared = prints;
         if offer.image_too_large {
-            self.note(Notice::ClipboardTooLarge(ClipboardKind::Png));
+            self.note(Notice::ClipboardTooLarge(ClipboardKind::Dib));
         }
         if offer.entries.is_empty() {
             return false;
@@ -1169,6 +1282,7 @@ impl DesktopPane {
             LinkState::Idle | LinkState::Connecting => {
                 self.set_pointer(None);
                 if self.is_live() {
+                    self.asked_size = (0, 0);
                     self.input = InputQueue::new();
                     self.last_sent = None;
                     self.wheel_remainder = [0.0; 2];
@@ -1204,6 +1318,47 @@ impl DesktopPane {
                 } else {
                     reported
                 };
+                if failure == LinkFailure::CredentialsRequired
+                    || (failure == LinkFailure::Authentication
+                        && self.provided_password
+                        && !self.is_live())
+                {
+                    let rejected =
+                        (failure == LinkFailure::Authentication).then(|| reason.to_owned());
+                    self.close_link(cx);
+                    self.polling = false;
+                    self.certificate = None;
+                    self.stage = DesktopStage::Authenticating;
+                    self.phase = DesktopPhase::Connecting;
+                    self.connecting_since = None;
+                    let user =
+                        (self.target.protocol() == shellune_core::ProtocolKind::Rdp).then(|| {
+                            cx.new(|cx| {
+                                let mut field = TextField::new("", cx);
+                                field.set_text(self.target.user().unwrap_or_default(), cx);
+                                field
+                            })
+                        });
+                    let password = cx.new(|cx| {
+                        let mut field = TextField::new("", cx);
+                        field.set_masked(true, cx);
+                        field.set_revealable(true, cx);
+                        field
+                    });
+                    for field in user.iter().chain(std::iter::once(&password)) {
+                        cx.observe(field, |_, _, cx| cx.notify()).detach();
+                    }
+                    self.sign_in = Some(SignIn {
+                        cancel_focus: cx.focus_handle(),
+                        connect_focus: cx.focus_handle(),
+                        user,
+                        password,
+                        focus_pending: true,
+                        rejection: rejected,
+                    });
+                    cx.notify();
+                    return false;
+                }
                 self.fail(failure, reason, cx);
                 false
             }
@@ -1225,6 +1380,20 @@ impl DesktopPane {
     /// held. Accepting starts the sign-in, which is the next visible step; refusing
     /// ends the session, and ending it shuts the link down.
     pub fn answer_certificate(&mut self, accept: bool, cx: &mut Context<Self>) {
+        if accept
+            && self.remember_certificate
+            && let Some(question) = &self.certificate
+            && let Err(error) = self.certificate_store.remember_desktop_certificate(
+                self.protocol_label(),
+                self.target.address(),
+                self.target.port(),
+                &question.fingerprint,
+            )
+        {
+            self.pin_error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
         let Some(question) = self.certificate.take() else {
             return;
         };
@@ -1254,7 +1423,7 @@ impl DesktopPane {
 
     fn update_picture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.surface.size() != self.image_size {
-            for old in Rc::make_mut(&mut self.images).drain(..) {
+            for old in Rc::make_mut(&mut self.images).drain(..).flatten() {
                 cx.drop_image(old, Some(window));
             }
             self.image_size = self.surface.size();
@@ -1264,16 +1433,17 @@ impl DesktopPane {
             return;
         }
         let images = Rc::make_mut(&mut self.images);
+        images.resize_with(self.surface.tile_count(), || None);
         for index in dirty {
-            let (width, height, bytes) = self.surface.tile(index);
-            let buffer =
-                image::ImageBuffer::from_raw(width, height, bytes).expect("packed desktop tile");
-            let tile = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
-            if let Some(slot) = images.get_mut(index) {
-                cx.drop_image(std::mem::replace(slot, tile), Some(window));
-            } else {
-                images.push(tile);
+            if let Some(old) = images[index].take() {
+                cx.drop_image(old, Some(window));
             }
+            images[index] = self.surface.tile(index).map(|(w, h, bytes)| {
+                Arc::new(RenderImage::from_bgra(
+                    gpui::size(gpui::DevicePixels(w as i32), gpui::DevicePixels(h as i32)),
+                    bytes,
+                ))
+            });
         }
     }
 
@@ -1287,6 +1457,9 @@ impl DesktopPane {
                 let scale = window.scale_factor();
                 let clip = window.content_mask().bounds;
                 for (index, image) in images.iter().enumerate() {
+                    let Some(image) = image else {
+                        continue;
+                    };
                     let tile = desktop_tile_bounds(bounds, size, index, scale);
                     if !tile.is_empty()
                         && tile.to_pixels(scale).intersects(&clip)
@@ -1348,6 +1521,10 @@ impl DesktopPane {
     /// active one and when the session is closed. The releases go through the same
     /// queue as everything else, so the order the user produced is kept.
     pub fn release_input(&mut self) {
+        #[cfg(all(target_os = "macos", not(test)))]
+        {
+            self.hotkey_capture = None;
+        }
         if self.input.release_all() > 0 {
             self.flush_input();
         }
@@ -1398,7 +1575,11 @@ impl DesktopPane {
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         // The overlay follows movement at display speed, including movement
         // inside one magnified desktop pixel. The cached desktop is reused.
-        if self.pointer_image.is_some() {
+        #[cfg(target_os = "macos")]
+        let software_cursor = self.native_cursor.is_none();
+        #[cfg(not(target_os = "macos"))]
+        let software_cursor = true;
+        if software_cursor && self.pointer_image.is_some() {
             cx.notify();
         }
         let Some((x, y)) = self.remote_point(event.position) else {
@@ -1408,8 +1589,11 @@ impl DesktopPane {
             self.input.push_pointer(x, y, self.input.held_buttons());
             self.last_sent = Some((x, y));
         }
-        // Sample motion once per input tick. Press, release and key handlers
-        // flush the last position first, preserving their order during drags.
+        // Do not wait for the UI polling timer during a drag. The worker queue
+        // coalesces consecutive moves without crossing a press or release.
+        if self.input.held_buttons().any_button() {
+            self.flush_input();
+        }
     }
 
     fn on_mouse_up(&mut self, button: MouseButton, event: &MouseUpEvent, cx: &mut Context<Self>) {
@@ -1482,14 +1666,24 @@ impl DesktopPane {
                 && !keystroke.modifiers.alt
                 && !keystroke.modifiers.platform
             {
-                let trust = self.certificate_reject_focus.is_focused(window)
-                    || (!self.certificate_trust_focus.is_focused(window)
-                        && keystroke.modifiers.shift);
-                window.focus(if trust {
-                    &self.certificate_trust_focus
+                let mut stops = vec![
+                    &self.certificate_reject_focus,
+                    &self.certificate_trust_focus,
+                ];
+                if self
+                    .certificate
+                    .as_ref()
+                    .is_some_and(|q| !q.fingerprint.is_empty())
+                {
+                    stops.push(&self.certificate_remember_focus);
+                }
+                let active = stops.iter().position(|f| f.is_focused(window));
+                let next = if keystroke.modifiers.shift {
+                    (active.unwrap_or(0) + stops.len() - 1) % stops.len()
                 } else {
-                    &self.certificate_reject_focus
-                });
+                    active.map_or(0, |n| (n + 1) % stops.len())
+                };
+                window.focus(stops[next]);
                 cx.stop_propagation();
             } else if keystroke.key == "escape" && keystroke.modifiers == Modifiers::default() {
                 window.focus(&self.focus);
@@ -2020,6 +2214,192 @@ impl DesktopPane {
             .child(handle)
     }
 
+    fn submit_credentials(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(fields) = &self.sign_in else {
+            return;
+        };
+        if let Some(user) = &fields.user {
+            let name = user.read(cx).text().trim();
+            if name.is_empty() {
+                window.focus(user.read(cx).focus_handle());
+                return;
+            }
+            self.target.set_user(name.to_owned());
+        }
+        let password = shellune_core::SecretString::new(fields.password.read(cx).text());
+        if password.is_empty() {
+            window.focus(fields.password.read(cx).focus_handle());
+            return;
+        }
+        fields
+            .password
+            .update(cx, |field, cx| field.set_text("", cx));
+        self.sign_in = None;
+        window.focus(&self.focus);
+        self.start(Some(password.expose()), cx);
+    }
+
+    fn sign_in_form(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let strings = self.locale.strings();
+        let metrics = theme::metrics();
+        let fields = self.sign_in.as_mut().expect("sign-in form is active");
+        let password = fields.password.clone();
+        let user = fields.user.clone();
+        if std::mem::take(&mut fields.focus_pending) {
+            let field = user
+                .as_ref()
+                .filter(|f| f.read(cx).text().is_empty())
+                .unwrap_or(&password);
+            window.focus(field.read(cx).focus_handle());
+        }
+        let ready = !password.read(cx).text().is_empty()
+            && user
+                .as_ref()
+                .is_none_or(|u| !u.read(cx).text().trim().is_empty());
+        let row = |label, field: gpui::Entity<TextField>, selector: &'static str| {
+            div()
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .w_full()
+                .gap(metrics.scale(spacing::NARROW))
+                .child(components::form_label(label, metrics))
+                .child(
+                    div()
+                        .w_full()
+                        .debug_selector(move || selector.to_owned())
+                        .child(field),
+                )
+        };
+        let cancel_focus = fields.cancel_focus.clone();
+        let connect_focus = fields.connect_focus.clone();
+        let mut stops: Vec<FocusHandle> = user
+            .iter()
+            .chain(std::iter::once(&password))
+            .map(|field| field.read(cx).focus_handle().clone())
+            .collect();
+        stops.push(cancel_focus.clone());
+        if ready {
+            stops.push(connect_focus.clone());
+        }
+        let connect = if ready {
+            components::button(strings.remote_connect, Variant::Primary, metrics)
+        } else {
+            components::button_with_state(
+                strings.remote_connect,
+                Variant::Primary,
+                components::ControlState::Disabled,
+                metrics,
+            )
+        };
+        let card = components::status_card(
+            Tone::Info,
+            icons::icon(Icon::Lock, metrics.icon_size(), Tone::Info.text()).into_any_element(),
+            div().child(strings.desktop_credentials_title),
+            Some(div().child(format!("{} · {}", self.target.name(), self.target.target()))),
+            metrics,
+        )
+        .debug_selector(|| "desktop.signin.card".to_owned())
+        .gap(metrics.scale(spacing::BASE))
+        .children(fields.rejection.clone().map(|reason| {
+            div()
+                .text_size(metrics.caption_size())
+                .text_color(Tone::Danger.text())
+                .child(reason)
+        }))
+        .children(
+            user.clone()
+                .map(|field| row(strings.host_field_user, field, "desktop.signin.user")),
+        )
+        .child(row(
+            strings.auth_password,
+            password.clone(),
+            "desktop.signin.password",
+        ))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .justify_end()
+                .gap(metrics.scale(spacing::TIGHT))
+                .child(
+                    components::button(strings.host_cancel, Variant::Secondary, metrics)
+                        .id("desktop.signin.cancel")
+                        .track_focus(&cancel_focus)
+                        .focus(|s| {
+                            s.border_2()
+                                .border_color(theme::swatch(palette::FOCUS_RING))
+                        })
+                        .on_click(cx.listener(|pane, _, _, cx| {
+                            pane.sign_in = None;
+                            pane.fail(LinkFailure::Cancelled, "", cx);
+                        })),
+                )
+                .child(connect.id("desktop.signin.connect").when(ready, |btn| {
+                    btn.track_focus(&connect_focus)
+                        .focus(|s| {
+                            s.border_2()
+                                .border_color(theme::swatch(palette::FOCUS_RING))
+                        })
+                        .on_click(
+                            cx.listener(|pane, _, window, cx| pane.submit_credentials(window, cx)),
+                        )
+                })),
+        );
+        div()
+            .id("desktop.signin")
+            .track_focus(&self.focus)
+            .debug_selector(|| "desktop.signin".to_owned())
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .bg(theme::swatch(palette::CANVAS))
+            .child(
+                div()
+                    .id("desktop.signin.scroll")
+                    .w_full()
+                    .min_h_0()
+                    .max_h_full()
+                    .overflow_y_scroll()
+                    .p(metrics.scale(spacing::BASE))
+                    .child(components::status_card_slot(card, metrics)),
+            )
+            .capture_key_down(cx.listener(move |pane, event: &KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "enter" | "space" if cancel_focus.is_focused(window) => {
+                        pane.sign_in = None;
+                        pane.fail(LinkFailure::Cancelled, "", cx);
+                    }
+                    "enter" => pane.submit_credentials(window, cx),
+                    "space" if connect_focus.is_focused(window) => {
+                        pane.submit_credentials(window, cx)
+                    }
+                    "escape" => {
+                        pane.sign_in = None;
+                        pane.fail(LinkFailure::Cancelled, "", cx);
+                    }
+                    "tab" => {
+                        let at = stops.iter().position(|f| f.is_focused(window));
+                        let next = if event.keystroke.modifiers.shift {
+                            (at.unwrap_or(0) + stops.len() - 1) % stops.len()
+                        } else {
+                            at.map_or(0, |n| (n + 1) % stops.len())
+                        };
+                        window.focus(&stops[next]);
+                    }
+                    _ => return,
+                }
+                cx.stop_propagation();
+            }))
+    }
+
     fn certificate_card(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
         let strings = self.locale.strings();
         let Some(question) = &self.certificate else {
@@ -2071,6 +2451,37 @@ impl DesktopPane {
                     })),
                 ),
             );
+        }
+        if let Some(pin) = &self.previous_pin
+            && pin != &question.fingerprint
+        {
+            details = details
+                .child(label(strings.desktop_certificate_changed))
+                .child(pin.clone());
+        }
+        if !question.fingerprint.is_empty() {
+            details = details.child(
+                components::checkbox(
+                    "desktop.certificate.remember",
+                    strings.desktop_certificate_remember,
+                    self.remember_certificate,
+                    metrics,
+                )
+                .track_focus(&self.certificate_remember_focus)
+                .focus(|style| {
+                    style
+                        .border_1()
+                        .border_color(theme::swatch(palette::FOCUS_RING))
+                })
+                .on_click(cx.listener(|pane, _, _, cx| {
+                    pane.remember_certificate = !pane.remember_certificate;
+                    pane.pin_error = None;
+                    cx.notify();
+                })),
+            );
+        }
+        if let Some(error) = &self.pin_error {
+            details = details.child(error.clone());
         }
         components::status_card(
             Tone::Warning,
@@ -2139,6 +2550,53 @@ impl DesktopPane {
     }
 }
 
+/// Windows sends no pixels for SYSPTR_DEFAULT. Use a white, dark-outlined
+/// arrow until the server selects a specific (possibly user-customized) shape.
+fn windows_arrow() -> &'static PointerShape {
+    static ARROW: std::sync::OnceLock<PointerShape> = std::sync::OnceLock::new();
+    ARROW.get_or_init(|| {
+        let rows = [
+            "#",
+            "##",
+            "#.#",
+            "#..#",
+            "#...#",
+            "#....#",
+            "#.....#",
+            "#......#",
+            "#.......#",
+            "#........#",
+            "#.........#",
+            "#..........#",
+            "#...........#",
+            "#.......#####",
+            "#...#...#",
+            "#..# #...#",
+            "#.#  #...#",
+            "##    #...#",
+            "#     #...#",
+            "       ###",
+        ];
+        let mut pixels = vec![0; 16 * rows.len() * 4];
+        for (y, row) in rows.iter().enumerate() {
+            for (x, v) in row.bytes().enumerate() {
+                let pixel = match v {
+                    b'#' => [0, 0, 0, 255],
+                    b'.' => [255; 4],
+                    _ => continue,
+                };
+                pixels[(y * 16 + x) * 4..(y * 16 + x + 1) * 4].copy_from_slice(&pixel);
+            }
+        }
+        PointerShape::Bitmap {
+            width: 16,
+            height: rows.len() as u16,
+            hotspot: (0, 0),
+            pixels: pixels.into(),
+        }
+    })
+}
+
 /// Round each shared source edge once in window coordinates. Rounding a tile's
 /// position and width independently can leave a physical pixel unpainted.
 fn desktop_tile_bounds(
@@ -2189,6 +2647,9 @@ fn pointer_button(button: MouseButton) -> Option<Buttons> {
 impl Render for DesktopPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let metrics = theme::metrics();
+        if self.sign_in.is_some() {
+            return self.sign_in_form(window, cx);
+        }
         self.update_pointer_image(window, cx);
         if !self.watching_focus {
             // A picture that lost the keyboard may be showing a modifier the remote
@@ -2211,10 +2672,14 @@ impl Render for DesktopPane {
             let focused = cx.on_focus_in(&self.focus, window, |pane, _window, cx| {
                 if pane.share_clipboard(cx) {
                     pane.flush_input();
-                    cx.notify();
                 }
+                cx.notify();
             });
             let activated = cx.observe_window_activation(window, |pane, window, cx| {
+                if !window.is_window_active() {
+                    pane.release_input();
+                }
+                cx.notify();
                 if window.is_window_active()
                     && pane.focus.is_focused(window)
                     && pane.share_clipboard(cx)
@@ -2230,6 +2695,14 @@ impl Render for DesktopPane {
         // stops being the active one everything it may have held is let go (R17).
         // The flag makes that one transition, not one release per frame.
         let active = window.is_window_active();
+        #[cfg(all(target_os = "macos", not(test)))]
+        if active && self.is_live() && self.certificate.is_none() && self.focus.is_focused(window) {
+            if self.hotkey_capture.is_none() {
+                self.hotkey_capture = mac_hotkeys::Capture::acquire();
+            }
+        } else {
+            self.hotkey_capture = None;
+        }
         if self.was_active && !active {
             self.release_input();
         }
@@ -2264,10 +2737,10 @@ impl Render for DesktopPane {
             .bg(theme::swatch(palette::CANVAS))
             .key_context(crate::app::TERMINAL_KEY_CONTEXT)
             .track_focus(&self.focus)
-            .on_children_prepainted(move |bounds, _window, app| {
+            .on_children_prepainted(move |bounds, window, app| {
                 if let Some(bounds) = bounds.first().copied() {
                     let _ = entity.update(app, |pane, cx| {
-                        pane.set_viewport(bounds, cx);
+                        pane.set_viewport(bounds, window.scale_factor(), cx);
                     });
                 }
             })
@@ -2358,35 +2831,70 @@ impl Render for DesktopPane {
                     .h(rect.size.height)
                     .debug_selector(|| "desktop.picture".to_owned())
                     .child(self.picture_tiles());
-                let position = window.mouse_position();
                 let mut style = self.fallback_cursor();
+                let shape = match &self.pointer_shape {
+                    Some(PointerShape::Default)
+                        if self.target.protocol() == shellune_core::ProtocolKind::Rdp =>
+                    {
+                        Some(windows_arrow())
+                    }
+                    other => other.as_ref(),
+                };
                 if self.is_live()
-                    && self.controls_hovered
-                    && !self.bar_hovered
                     && self.certificate.is_none()
-                    && rect.contains(&position)
                     && let Some(PointerShape::Bitmap {
                         width,
                         height,
                         hotspot,
                         ..
-                    }) = &self.pointer_shape
+                    }) = shape
                     && let Some(cursor) = &self.pointer_image
                 {
-                    style = CursorStyle::None;
-                    // Keep small shapes legible when fitting a large screen.
-                    let scale =
-                        px((f32::from(rect.size.width) / self.surface.size().0 as f32)
-                            .clamp(1.0, 2.0));
-                    picture_layer = picture_layer.child(
-                        img(cursor.clone())
-                            .absolute()
-                            .debug_selector(|| "desktop.pointer".to_owned())
-                            .left(position.x - rect.origin.x - scale * f32::from(hotspot.0))
-                            .top(position.y - rect.origin.y - scale * f32::from(hotspot.1))
-                            .w(scale * f32::from(*width))
-                            .h(scale * f32::from(*height)),
-                    );
+                    let scale = if self.pointer_shape == Some(PointerShape::Default) {
+                        1.0
+                    } else {
+                        f32::from(rect.size.width) / self.surface.size().0 as f32
+                    };
+                    #[cfg(target_os = "macos")]
+                    let native_style = {
+                        if !self
+                            .native_cursor
+                            .as_ref()
+                            .is_some_and(|(old, _)| *old == scale)
+                        {
+                            self.native_cursor = window
+                                .bitmap_cursor(cursor, *hotspot, scale)
+                                .map(|c| (scale, c));
+                        }
+                        self.native_cursor.as_ref().map(|(_, c)| c.style())
+                    };
+                    #[cfg(not(target_os = "macos"))]
+                    let native_style: Option<CursorStyle> = None;
+                    if let Some(native) = native_style {
+                        style = native;
+                    } else {
+                        let position = window.mouse_position();
+                        if self.controls_hovered && !self.bar_hovered && rect.contains(&position) {
+                            style = CursorStyle::None;
+                            picture_layer = picture_layer.child(
+                                img(cursor.clone())
+                                    .absolute()
+                                    .debug_selector(|| "desktop.pointer".to_owned())
+                                    .left(
+                                        position.x
+                                            - rect.origin.x
+                                            - px(scale * f32::from(hotspot.0)),
+                                    )
+                                    .top(
+                                        position.y
+                                            - rect.origin.y
+                                            - px(scale * f32::from(hotspot.1)),
+                                    )
+                                    .w(px(scale * f32::from(*width)))
+                                    .h(px(scale * f32::from(*height))),
+                            );
+                        }
+                    }
                 }
                 #[cfg(test)]
                 {
@@ -2505,52 +3013,66 @@ impl Render for DesktopPane {
 impl DesktopPane {
     /// Keeps the space the picture is drawn in, and renegotiates the remote size
     /// when it changed.
-    fn set_viewport(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
-        let previous = self.viewport;
-        self.viewport = Some(bounds);
-        if previous == Some(bounds) {
-            return;
+    fn set_viewport(&mut self, bounds: Bounds<Pixels>, scale: f32, cx: &mut Context<Self>) {
+        if self.viewport != Some(bounds) {
+            self.viewport = Some(bounds);
+            cx.notify();
         }
-        // The fit is computed from this measurement, so the frame that learned it
-        // asks for the one that draws with it.
-        cx.notify();
-        // The remote desktop is resized to the space it has, in the same fit the
-        // picture is drawn with: the desktop keeps its aspect ratio, so the size is
-        // what the drawn rectangle can hold.
-        let Some(link) = self.link.as_ref() else {
+        let Some(size) = framebuffer_size(bounds.size, scale) else {
             return;
         };
-        if !matches!(self.phase, DesktopPhase::Live | DesktopPhase::Connecting) {
-            return;
+        // If the framebuffer was capped, use its effective pixels per logical point.
+        let percent = ((size.0 as f32 / f32::from(bounds.size.width)).min(scale) * 100.)
+            .round()
+            .clamp(100., 500.) as u32;
+        if size != self.asked_size || percent != self.asked_scale {
+            if let Some(link) = &self.link
+                && (!self.phase.accepts_input() || link.resize(size.0, size.1, percent).is_err())
+            {
+                return;
+            }
+            self.asked_size = size;
+            self.asked_scale = percent;
         }
-        let size = self.surface.size();
-        let width = if size.0 == 0 {
-            f32::from(bounds.size.width).max(1.0) as u32
-        } else {
-            f32::from(content_rect(bounds, size).size.width).max(1.0) as u32
-        };
-        let height = if size.1 == 0 {
-            f32::from(bounds.size.height).max(1.0) as u32
-        } else {
-            f32::from(content_rect(bounds, size).size.height).max(1.0) as u32
-        };
-        if (width, height) == self.asked_size {
-            return;
-        }
-        // One ask per change: a drag that resizes the window every frame would
-        // otherwise renegotiate the session on every frame. A link that cannot
-        // renegotiate a live session (the native one, which takes its size before it
-        // dials) says so, and the picture is then scaled into the new space by the
-        // fit the pointer is mapped through.
-        if link.resize(width, height).is_ok() {
-            self.asked_size = (width, height);
+        if self.pending_dial.is_some() {
+            self.dial_pending(cx);
         }
     }
+}
+
+/// Use the pane's physical pixels independently of local zoom or the previous
+/// framebuffer's aspect ratio. Retain the aspect ratio when limiting a 5K/8K display.
+fn framebuffer_size(size: gpui::Size<Pixels>, scale: f32) -> Option<(u32, u32)> {
+    let w = f64::from(f32::from(size.width) * scale);
+    let h = f64::from(f32::from(size.height) * scale);
+    if w < 1.0 || h < 1.0 {
+        return None;
+    }
+    let limit = (shellune_desktop::MAX_FRAME_BYTES as f64 / (4.0 * w * h))
+        .sqrt()
+        .min(8192.0 / w.max(h))
+        .min(1.0);
+    let w = ((w * limit).floor() as u32).clamp(200, 8192) & !1;
+    let h = ((h * limit).floor() as u32).clamp(200, 8192);
+    Some((w, h))
 }
 
 #[cfg(test)]
 mod tile_tests {
     use super::*;
+    #[test]
+    fn retina_window_and_fullscreen_request_the_entire_physical_viewport() {
+        assert_eq!(
+            framebuffer_size(gpui::size(px(1120.), px(674.)), 2.),
+            Some((2240, 1348))
+        );
+        assert_eq!(
+            framebuffer_size(gpui::size(px(1470.), px(923.)), 2.),
+            Some((2940, 1846))
+        );
+        assert_eq!(framebuffer_size(gpui::size(px(0.), px(400.)), 2.), None);
+    }
+
     #[test]
     fn adjoining_tiles_cover_the_panned_desktop_at_fractional_dpi() {
         let bounds = Bounds::new(
@@ -2560,12 +3082,14 @@ mod tile_tests {
         let desktop = (2940, 1912);
         for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
             let tile = |index| desktop_tile_bounds(bounds, desktop, index, scale);
-            for index in 0..24 {
-                if index % 6 < 5 {
+            let cols = desktop.0.div_ceil(crate::app::desktop::DESKTOP_TILE) as usize;
+            let count = cols * desktop.1.div_ceil(crate::app::desktop::DESKTOP_TILE) as usize;
+            for index in 0..count {
+                if index % cols < cols - 1 {
                     assert_eq!(tile(index).right(), tile(index + 1).left());
                 }
                 if index < 18 {
-                    assert_eq!(tile(index).bottom(), tile(index + 6).top());
+                    assert_eq!(tile(index).bottom(), tile(index + cols).top());
                 }
             }
             assert_eq!(
@@ -2573,11 +3097,11 @@ mod tile_tests {
                 (f32::from(bounds.left()) * scale).round() as i32
             );
             assert_eq!(
-                tile(23).right().0,
+                tile(count - 1).right().0,
                 (f32::from(bounds.right()) * scale).round() as i32
             );
             assert_eq!(
-                tile(23).bottom().0,
+                tile(count - 1).bottom().0,
                 (f32::from(bounds.bottom()) * scale).round() as i32
             );
         }

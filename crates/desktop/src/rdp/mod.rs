@@ -4,6 +4,7 @@
 //! event stream, cancellation and clipboard rules with the VNC engine, but it never
 //! calls FreeRDP and owns its socket and protocol state.
 mod clipboard;
+mod display;
 mod drive;
 mod mcs;
 mod pointer;
@@ -32,11 +33,13 @@ pub(super) use crate::control::{Control, Emit, publish};
 
 /// What the host asked the session to configure before it connected.
 pub(super) struct Config {
+    pub(super) certificate_pin: Option<String>,
     pub(super) host: String,
     pub(super) port: u16,
     pub(super) user: String,
     pub(super) password: String,
     pub(super) domain: String,
+    pub(super) scale_percent: u32,
     pub(super) width: u16,
     pub(super) height: u16,
     pub(super) clipboard: bool,
@@ -46,11 +49,13 @@ pub(super) struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
+            certificate_pin: None,
             host: String::new(),
             port: 3389,
             user: String::new(),
             password: String::new(),
             domain: String::new(),
+            scale_percent: 100,
             width: 1024,
             height: 768,
             clipboard: true,
@@ -71,6 +76,7 @@ pub(super) enum Command {
         x: u16,
         y: u16,
     },
+    Resize(u16, u16, u32),
     Clipboard(Vec<ClipboardEntry>),
 }
 
@@ -100,6 +106,10 @@ impl Client {
             commands: None,
             worker: None,
         }
+    }
+
+    pub(super) fn set_certificate_pin(&mut self, pin: Option<&str>) {
+        self.config.certificate_pin = pin.map(str::to_owned);
     }
 
     pub(super) fn set_server(&mut self, host: &str, port: u16) {
@@ -146,11 +156,13 @@ impl Client {
         let emit = Arc::clone(&self.emit);
         let control = Arc::clone(&self.control);
         let config = Config {
+            certificate_pin: self.config.certificate_pin.clone(),
             host: self.config.host.clone(),
             port: self.config.port,
             user: self.config.user.clone(),
             password: self.config.password.clone(),
             domain: self.config.domain.clone(),
+            scale_percent: self.config.scale_percent,
             width: self.config.width,
             height: self.config.height,
             clipboard: self.config.clipboard,
@@ -232,6 +244,14 @@ impl Client {
         self.command(Command::Pointer { buttons, x, y })
     }
 
+    pub(super) fn set_scale(&mut self, percent: u32) {
+        self.config.scale_percent = percent;
+    }
+
+    pub(super) fn resize(&self, width: u16, height: u16, percent: u32) -> Result<(), crate::Error> {
+        self.command(Command::Resize(width, height, percent))
+    }
+
     /// The settings an attempt would use, for diagnostics: it proves the options
     /// reached this engine without a server.
     pub(super) fn describe(&self) -> String {
@@ -283,7 +303,7 @@ pub(super) fn pointer_flags(previous: u32, buttons: u32) -> u16 {
     if buttons & SD_BUTTON_WHEEL_RIGHT != 0 && previous & SD_BUTTON_WHEEL_RIGHT == 0 {
         return 0x0400 | 0x0078;
     }
-    let mut flags = MOVE;
+    let mut flags = 0;
     for (mask, flag) in [
         (SD_BUTTON_LEFT, 0x1000u16),
         (SD_BUTTON_RIGHT, 0x2000),
@@ -296,7 +316,7 @@ pub(super) fn pointer_flags(previous: u32, buttons: u32) -> u16 {
             }
         }
     }
-    flags
+    if flags == 0 { MOVE } else { flags }
 }
 
 #[cfg(test)]
@@ -305,13 +325,13 @@ mod tests {
 
     #[test]
     fn a_press_and_a_release_both_name_their_button() {
-        // Press: move with the button and the down bit.
-        assert_eq!(pointer_flags(0, SD_BUTTON_LEFT), 0x0800 | 0x1000 | 0x8000);
+        // A button edge and a movement are distinct RDP mouse events.
+        assert_eq!(pointer_flags(0, SD_BUTTON_LEFT), 0x1000 | 0x8000);
         // Release: the same button bit without the down bit, so a server knows
         // which button came up.
-        assert_eq!(pointer_flags(SD_BUTTON_LEFT, 0), 0x0800 | 0x1000);
-        assert_eq!(pointer_flags(SD_BUTTON_RIGHT, 0), 0x0800 | 0x2000);
-        assert_eq!(pointer_flags(SD_BUTTON_MIDDLE, 0), 0x0800 | 0x4000);
+        assert_eq!(pointer_flags(SD_BUTTON_LEFT, 0), 0x1000);
+        assert_eq!(pointer_flags(SD_BUTTON_RIGHT, 0), 0x2000);
+        assert_eq!(pointer_flags(SD_BUTTON_MIDDLE, 0), 0x4000);
         // A plain move carries no button at all.
         assert_eq!(pointer_flags(0, 0), 0x0800);
         // Holding a button while moving does not repeat the press.

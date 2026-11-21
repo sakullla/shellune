@@ -231,9 +231,17 @@ struct Session {
     clipboard: bool,
     /// Whether the server speaks the extended clipboard and can carry text.
     extended: bool,
+    clipboard_flags: u32,
+    auto_text_limit: u32,
+    local_text: Option<Vec<u8>>,
     /// None until the server acknowledges the extension, then the subscribed area.
     continuous: Option<(u16, u16)>,
     continuous_announced: bool,
+    screen: Option<(u32, u32)>,
+    desired_size: Option<(u16, u16)>,
+    resize_after: std::time::Instant,
+    resizing: bool,
+    full_refresh: bool,
     /// The Latin-1 notice is said once per session.
     latin1_reported: bool,
     stats: Stats,
@@ -248,8 +256,16 @@ impl Session {
             emit: Arc::clone(emit),
             clipboard: config.clipboard,
             extended: false,
+            clipboard_flags: 0,
+            auto_text_limit: 0,
+            local_text: None,
             continuous: None,
             continuous_announced: false,
+            screen: None,
+            desired_size: Some((config.width, config.height)),
+            resize_after: std::time::Instant::now(),
+            resizing: false,
+            full_refresh: false,
             latin1_reported: false,
             stats: Stats::default(),
         }
@@ -280,6 +296,7 @@ impl Session {
                 return Err(Ended::new(Failure::Cancelled, "cancelled"));
             }
             self.drain(commands)?;
+            self.resize_if_ready()?;
             match self.transport.read(&mut chunk) {
                 Ok(0) => {
                     super::trace("server closed the connection");
@@ -291,7 +308,7 @@ impl Session {
                 Ok(read) => {
                     self.stats.bytes += read as u64;
                     self.incoming.push(&chunk[..read]);
-                    self.messages(commands)?;
+                    self.messages(control, commands)?;
                 }
                 Err(error)
                     if matches!(
@@ -329,6 +346,7 @@ impl Session {
             5,
             0,
             1,
+            -308,
             -223,
             -224,
             super::wire::RICH_CURSOR,
@@ -365,6 +383,10 @@ impl Session {
             match commands.pop() {
                 Some(Command::Key { keysym, down }) => self.key(keysym, down)?,
                 Some(Command::Pointer { x, y, buttons }) => self.pointer(x, y, buttons)?,
+                Some(Command::Resize(w, h)) => {
+                    self.desired_size = Some((w, h));
+                    self.resize_after = std::time::Instant::now() + Duration::from_millis(200);
+                }
                 Some(Command::Clipboard(entries)) => self.offer(&entries)?,
                 None => break,
             }
@@ -373,8 +395,17 @@ impl Session {
     }
 
     /// Publishes available pixel bands and requests the next update at the end.
-    fn messages(&mut self, commands: &Receiver<Command>) -> Result<(), Ended> {
+    fn messages(&mut self, control: &Control, commands: &Receiver<Command>) -> Result<(), Ended> {
+        let mut serviced = std::time::Instant::now();
         loop {
+            // A single compressed read may contain a whole desktop's worth of tiles.
+            if serviced.elapsed() >= Duration::from_millis(4) {
+                if control.cancelled() {
+                    return Err(Ended::new(Failure::Cancelled, "cancelled"));
+                }
+                self.drain(commands)?;
+                serviced = std::time::Instant::now();
+            }
             let message = self
                 .incoming
                 .take()
@@ -386,7 +417,30 @@ impl Session {
                 self.stats.messages += 1;
             }
             match message {
+                Message::Layout {
+                    width,
+                    height,
+                    reason,
+                    result,
+                    screen,
+                } => {
+                    if reason == 1 {
+                        self.resizing = false;
+                    }
+                    if reason != 1 || result == 0 {
+                        self.screen = screen;
+                        if (width, height) != (self.desktop.width, self.desktop.height) {
+                            self.desktop
+                                .resize(width, height)
+                                .map_err(|e| Ended::new(Failure::ProtocolFailure, e))?;
+                            self.full_refresh = true;
+                        }
+                    }
+                }
                 Message::Rectangle(rect) => {
+                    if matches!(rect, Rect::Resize { .. }) {
+                        self.full_refresh = true;
+                    }
                     if let Some(event) = self
                         .desktop
                         .apply(rect)
@@ -402,13 +456,15 @@ impl Session {
                 Message::Pointer(shape) => (self.emit)(Event::Pointer(shape)),
                 Message::UpdateEnd => {
                     let size = (self.desktop.width, self.desktop.height);
+                    let full = std::mem::take(&mut self.full_refresh);
                     match self.continuous {
-                        None => self.request(true)?,
+                        None => self.request(!full)?,
                         Some(region) if region != size => {
                             self.request_region(150, true)?;
                             self.continuous = Some(size);
                             self.request(false)?;
                         }
+                        Some(_) if full => self.request(false)?,
                         _ => {}
                     }
                 }
@@ -435,6 +491,7 @@ impl Session {
                 Message::CutText(bytes) => {
                     super::trace(&format!("classic cut text of {} bytes", bytes.len()));
                     if self.clipboard {
+                        self.local_text = None;
                         clipboard::deliver(&self.emit, clipboard::classic(&bytes));
                     }
                 }
@@ -444,23 +501,81 @@ impl Session {
                         continue;
                     }
                     match clipboard::parse_extended(&payload) {
-                        Some(Extended::Caps { text }) => {
-                            if text {
-                                self.extended = true;
+                        Some(Extended::Caps { flags, text_limit }) => {
+                            self.extended = flags & clipboard::EXT_TEXT != 0;
+                            self.clipboard_flags = flags;
+                            self.auto_text_limit = text_limit;
+                            let mut caps = (clipboard::EXT_CAPS
+                                | clipboard::EXT_TEXT
+                                | clipboard::EXT_NOTIFY
+                                | clipboard::EXT_PEEK
+                                | clipboard::EXT_REQUEST
+                                | clipboard::EXT_PROVIDE)
+                                .to_be_bytes()
+                                .to_vec();
+                            caps.extend_from_slice(
+                                &((crate::MAX_CLIPBOARD_TEXT_BYTES + 1) as u32).to_be_bytes(),
+                            );
+                            self.cut_text_extended(&caps)?;
+                        }
+                        Some(Extended::Notify(has_text)) => {
+                            self.local_text = None;
+                            if has_text && self.clipboard_flags & clipboard::EXT_REQUEST != 0 {
+                                self.cut_text_extended(
+                                    &(clipboard::EXT_REQUEST | clipboard::EXT_TEXT).to_be_bytes(),
+                                )?;
                             }
                         }
+                        Some(Extended::Request) => self.provide_local_text()?,
+                        Some(Extended::Peek)
+                            if self.clipboard_flags & clipboard::EXT_NOTIFY != 0 =>
+                        {
+                            let format = if self.local_text.is_some() {
+                                clipboard::EXT_TEXT
+                            } else {
+                                0
+                            };
+                            self.cut_text_extended(
+                                &(clipboard::EXT_NOTIFY | format).to_be_bytes(),
+                            )?;
+                        }
                         Some(Extended::Text(text)) => {
-                            // A provided text proves the server can carry one.
+                            self.local_text = None;
                             self.extended = true;
                             clipboard::deliver(&self.emit, text);
                         }
-                        Some(Extended::Other) => super::trace("extended request/peek"),
+                        Some(Extended::Other | Extended::Peek) => {}
                         None => super::trace("an extended cut text did not decode"),
                     }
                 }
                 Message::Bell | Message::Ignored => {}
             }
         }
+    }
+
+    fn resize_if_ready(&mut self) -> Result<(), Ended> {
+        let (Some((id, flags)), Some((w, h))) = (self.screen, self.desired_size) else {
+            return Ok(());
+        };
+        if self.resizing || std::time::Instant::now() < self.resize_after {
+            return Ok(());
+        }
+        self.desired_size = None;
+        if (self.desktop.width, self.desktop.height) == (w, h) {
+            return Ok(());
+        }
+        let mut packet = vec![251, 0];
+        packet.extend_from_slice(&w.to_be_bytes());
+        packet.extend_from_slice(&h.to_be_bytes());
+        packet.extend_from_slice(&[1, 0]);
+        packet.extend_from_slice(&id.to_be_bytes());
+        packet.extend_from_slice(&[0; 4]);
+        packet.extend_from_slice(&w.to_be_bytes());
+        packet.extend_from_slice(&h.to_be_bytes());
+        packet.extend_from_slice(&flags.to_be_bytes());
+        self.send(&packet)?;
+        self.resizing = true;
+        Ok(())
     }
 
     fn key(&mut self, keysym: u32, down: bool) -> Result<(), Ended> {
@@ -501,9 +616,19 @@ impl Session {
         };
         let text = String::from_utf8_lossy(&entry.bytes).into_owned();
         if self.extended {
-            let (notify, provide) = clipboard::provide(&text);
-            self.cut_text_extended(&notify)?;
-            self.cut_text_extended(&provide)?;
+            self.local_text = Some(entry.bytes.clone());
+            if text.len() < self.auto_text_limit as usize
+                && self.clipboard_flags & clipboard::EXT_PROVIDE != 0
+            {
+                self.provide_local_text()?;
+            } else if self.clipboard_flags & clipboard::EXT_NOTIFY != 0 {
+                self.cut_text_extended(
+                    &(clipboard::EXT_NOTIFY | clipboard::EXT_TEXT).to_be_bytes(),
+                )?;
+            } else if self.clipboard_flags == 0 {
+                // Older peers may send Provide without sending capabilities first.
+                self.provide_local_text()?;
+            }
             return Ok(());
         }
         // Plain cut text is Latin-1. Text that does not fit is not sent at all: a
@@ -520,6 +645,14 @@ impl Session {
                 Ok(())
             }
         }
+    }
+
+    fn provide_local_text(&mut self) -> Result<(), Ended> {
+        if let Some(text) = self.local_text.as_deref() {
+            let payload = clipboard::provide(text).map_err(|e| Ended::io(e, Failure::Io))?;
+            self.cut_text_extended(&payload)?;
+        }
+        Ok(())
     }
 
     fn cut_text(&mut self, bytes: &[u8]) -> Result<(), Ended> {

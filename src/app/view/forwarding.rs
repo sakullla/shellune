@@ -926,11 +926,7 @@ impl ShelluneView {
                 components::list_row_frame(ControlState::Resting, metrics)
                     .flex_wrap()
                     .debug_selector(move || format!("forwards.row.{index}"))
-                    .child(components::leading_icon(
-                        Icon::Forward,
-                        icon_tone,
-                        metrics,
-                    ))
+                    .child(components::leading_icon(Icon::Forward, icon_tone, metrics))
                     .child(
                         div()
                             .flex()

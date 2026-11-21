@@ -9,10 +9,11 @@ re-run the check each one names before accepting the upgrade.
 
 | patch | files | why |
 | --- | --- | --- |
-| Desktop image tiles | `src/window.rs`, `src/platform/windows/shaders.hlsl` | adjoining desktop tiles share physical pixel edges and enlarged cursors sample only their own atlas image |
+| Desktop image tiles | `src/window.rs`, `src/platform/windows/shaders.hlsl`, `src/platform/mac/shaders.metal` | adjoining desktop tiles share physical pixel edges and enlarged cursors sample only their own atlas image |
+| Remote desktop frames and cursors | `src/assets.rs`, `src/platform/mac/{bitmap_cursor,metal_atlas,platform}.rs` | immutable shared BGRA tiles, retirement of replaced atlas keys, and hit-tested native AppKit bitmap cursors |
 | Frame readback | `src/platform.rs`, `src/window.rs`, `src/platform/windows/{window,directx_renderer}.rs` | the capture tool reads the frame a hidden window rendered |
 | Initial window background | `src/platform.rs`, `src/platform/windows/window.rs` | a light window does not open on a black flash |
-| Clipboard images and mixed items | `src/platform.rs`, `src/platform/windows/{clipboard,dib}.rs`, `src/platform/windows.rs`, `src/platform/linux/x11/{client,clipboard}.rs`, `src/platform/linux/wayland/clipboard.rs`, `src/platform/mac/platform.rs` | remote-desktop clipboard: screenshots and text-plus-image copies |
+| Clipboard images and mixed items | `src/platform.rs`, `src/platform/windows/{clipboard,dib}.rs`, `src/platform/windows.rs`, `src/platform/linux/x11/{client,clipboard}.rs`, `src/platform/linux/wayland/clipboard.rs`, `src/platform/mac/platform.rs` | remote-desktop clipboard: screenshots and text-plus-image copies; macOS and Windows expose the pasteboard change count so an unchanged image need not be read again |
 | Truncated text measure cache | `src/elements/text.rs` | a truncated line draws its "…" instead of a cut letter |
 
 ### Frame readback

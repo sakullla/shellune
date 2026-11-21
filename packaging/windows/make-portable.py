@@ -3,7 +3,7 @@
 
 Usage:
     python packaging/windows/make-portable.py --binary <path to shellune.exe> \
-        [--version 0.4.17] [--out dist]
+        [--version 0.4.18] [--out dist]
 
 The result is a directory plus a zip:
 

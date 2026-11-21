@@ -7,6 +7,8 @@ mod linux;
 
 #[cfg(target_os = "macos")]
 mod mac;
+#[cfg(target_os = "macos")]
+pub use mac::BitmapCursor;
 
 #[cfg(any(
     all(
@@ -276,6 +278,10 @@ pub(crate) trait Platform: 'static {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn read_from_primary(&self) -> Option<ClipboardItem>;
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
+
+    fn clipboard_generation(&self) -> Option<u64> {
+        None
+    }
 
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>>;
     fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>>;
@@ -1470,6 +1476,9 @@ impl From<&str> for PromptButton {
 /// The style of the cursor (pointer)
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum CursorStyle {
+    /// A registered AppKit bitmap cursor.
+    #[cfg(target_os = "macos")]
+    Bitmap(usize),
     /// The default cursor
     Arrow,
 

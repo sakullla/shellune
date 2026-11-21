@@ -217,7 +217,12 @@ pub(super) fn choose_subtype(subtypes: &[u32], has_password: bool) -> Result<Sub
             SubType::PlainNone,
         ]
     } else {
-        &[SubType::X509None, SubType::PlainNone]
+        &[
+            SubType::X509None,
+            SubType::X509Vnc,
+            SubType::PlainNone,
+            SubType::PlainVnc,
+        ]
     };
     for kind in order {
         if subtypes.contains(&kind.wire()) {
@@ -246,6 +251,12 @@ pub(super) fn open(config: &Config, emit: &Emit, control: &Arc<Control>) -> Resu
     super::trace(&format!("protocol version answered as 3.{minor}"));
     let chosen = security_type(&mut transport, config, minor)?;
     super::trace(&format!("security type {chosen}"));
+    if config.certificate_pin.is_some() && chosen != VENCRYPT {
+        return Err(Ended::new(
+            Failure::CertificateRejected,
+            "the remembered VNC server must present its certificate",
+        ));
+    }
     let result_version = match chosen {
         NONE => (minor >= 8).then_some(minor),
         VNC_AUTH => {
@@ -445,6 +456,12 @@ fn type_allowed(kind: u8, mask: u32) -> bool {
 /// VNC authentication: the server's 16-byte challenge encrypted with the
 /// password as a DES key.
 fn authenticate(transport: &mut Transport, password: &str) -> Result<(), Ended> {
+    if password.is_empty() {
+        return Err(Ended::new(
+            Failure::CredentialsRequired,
+            "the VNC server requires a password",
+        ));
+    }
     let mut challenge = [0u8; 16];
     read_exact(transport, &mut challenge)?;
     let answer = response(password, &challenge);
@@ -510,23 +527,28 @@ fn secure(
             },
         ) as Arc<tls::Ask>
     };
-    tls::tls(transport, &config.host, verify)
-        .map(|stream| Transport {
-            kind: Kind::Secure(Box::new(stream)),
-            pushback: None,
-            #[cfg(windows)]
-            read_poll: None,
-        })
-        .map_err(|error| {
-            if error.to_string().contains(CERTIFICATE_REJECTED) {
-                Ended::new(
-                    Failure::CertificateRejected,
-                    "the TLS certificate was rejected",
-                )
-            } else {
-                Ended::io(error, Failure::Tls)
-            }
-        })
+    tls::tls(
+        transport,
+        &config.host,
+        config.certificate_pin.clone(),
+        verify,
+    )
+    .map(|stream| Transport {
+        kind: Kind::Secure(Box::new(stream)),
+        pushback: None,
+        #[cfg(windows)]
+        read_poll: None,
+    })
+    .map_err(|error| {
+        if error.to_string().contains(CERTIFICATE_REJECTED) {
+            Ended::new(
+                Failure::CertificateRejected,
+                "the TLS certificate was rejected",
+            )
+        } else {
+            Ended::io(error, Failure::Tls)
+        }
+    })
 }
 
 /// VeNCrypt: version, sub-type, then the TLS-wrapped authentication it names.
@@ -584,6 +606,24 @@ fn vencrypt(
             ));
         }
     };
+    if config.certificate_pin.is_some() && !kind.tls() {
+        return Err(Ended::new(
+            Failure::CertificateRejected,
+            "the remembered VNC server must present its certificate",
+        ));
+    }
+    if !kind.tls() && config.security & crate::VncSecurity::DEFAULT.0 == 0 {
+        return Err(Ended::new(
+            Failure::UnsupportedSecurity,
+            "the selected VNC policy requires an encrypted transport",
+        ));
+    }
+    if kind.needs_password() && config.password.is_empty() {
+        return Err(Ended::new(
+            Failure::CredentialsRequired,
+            "the VNC server requires a password",
+        ));
+    }
     super::trace(&format!("VeNCrypt sub-type {kind:?}"));
     send(&mut transport, &kind.wire().to_be_bytes())?;
     if kind.tls() {
@@ -737,9 +777,8 @@ mod tests {
         assert_eq!(choose_subtype(&[258, 261], true), Ok(SubType::X509Vnc));
         assert_eq!(choose_subtype(&[257, 260], false), Ok(SubType::X509None));
         assert_eq!(choose_subtype(&[261, 260], true), Ok(SubType::X509Vnc));
-        // A VNC-authentication sub-type needs a password; without one the
-        // certificate form that carries no credentials is the only usable one.
-        assert_eq!(choose_subtype(&[261], false), Err(Refusal::Unsupported));
+        // Selecting X509Vnc lets the UI request a missing password.
+        assert_eq!(choose_subtype(&[261], false), Ok(SubType::X509Vnc));
     }
 
     #[test]
@@ -747,7 +786,7 @@ mod tests {
         assert_eq!(choose_subtype(&[1], false), Ok(SubType::PlainNone));
         assert_eq!(choose_subtype(&[1, 2], true), Ok(SubType::PlainVnc));
         assert_eq!(choose_subtype(&[1, 2], false), Ok(SubType::PlainNone));
-        assert_eq!(choose_subtype(&[2], false), Err(Refusal::Unsupported));
+        assert_eq!(choose_subtype(&[2], false), Ok(SubType::PlainVnc));
         assert_eq!(choose_subtype(&[1, 260], true), Ok(SubType::X509None));
     }
 

@@ -421,6 +421,45 @@ impl TrustStore {
         self.root.join(TRUST_FILE_NAME)
     }
 
+    /// Desktop TLS exceptions are local to the protocol, hostname and port.
+    /// Separate files keep simultaneous decisions for different hosts independent.
+    fn certificate_name(protocol: &str, host: &str, port: u16) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(format!("{protocol}\0{}\0{port}", host.to_ascii_lowercase()));
+        format!("{digest:x}")
+    }
+
+    pub fn desktop_certificate(
+        &self,
+        protocol: &str,
+        host: &str,
+        port: u16,
+    ) -> std::io::Result<Option<String>> {
+        let path = self
+            .root
+            .join("desktop-certificates")
+            .join(Self::certificate_name(protocol, host, port));
+        match std::fs::read_to_string(path) {
+            Ok(value) => Ok(Some(value)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn remember_desktop_certificate(
+        &self,
+        protocol: &str,
+        host: &str,
+        port: u16,
+        fingerprint: &str,
+    ) -> Result<(), StorageError> {
+        write_atomic_file(
+            &self.root.join("desktop-certificates"),
+            &Self::certificate_name(protocol, host, port),
+            fingerprint.as_bytes(),
+        )
+    }
+
     /// Reads the accepted identities.
     ///
     /// A missing file is the first run and yields an empty library, because an empty
@@ -519,6 +558,44 @@ mod tests {
         let fingerprint = shellune_core::sha256_fingerprint(&[byte; 32]).expect("a digest");
         HostKey::new(algorithm, fingerprint, format!("public-key-{byte}"))
             .expect("a valid identity")
+    }
+
+    #[test]
+    fn remembered_certificates_are_scoped_to_protocol_host_and_port() {
+        let root = scratch_root();
+        let store = TrustStore::at(&root);
+        store
+            .remember_desktop_certificate("RDP", "Desk", 3389, "first")
+            .unwrap();
+        let reopened = TrustStore::at(&root);
+        assert_eq!(
+            reopened
+                .desktop_certificate("RDP", "desk", 3389)
+                .unwrap()
+                .as_deref(),
+            Some("first")
+        );
+        for (protocol, host, port) in [
+            ("VNC", "desk", 3389),
+            ("RDP", "desk", 3390),
+            ("RDP", "other", 3389),
+        ] {
+            assert_eq!(
+                reopened.desktop_certificate(protocol, host, port).unwrap(),
+                None
+            );
+        }
+        reopened
+            .remember_desktop_certificate("RDP", "desk", 3389, "replacement")
+            .unwrap();
+        assert_eq!(
+            store
+                .desktop_certificate("RDP", "desk", 3389)
+                .unwrap()
+                .as_deref(),
+            Some("replacement")
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

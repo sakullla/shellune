@@ -35,6 +35,13 @@ pub(crate) enum Rect {
 pub(crate) enum Message {
     Rectangle(Rect),
     Pointer(crate::PointerShape),
+    Layout {
+        width: u16,
+        height: u16,
+        reason: u16,
+        result: u16,
+        screen: Option<(u32, u32)>,
+    },
     UpdateEnd,
     EndContinuous,
     Fence {
@@ -400,6 +407,30 @@ impl Incoming {
                         self.remaining = Some(remaining - 1);
                         self.offset += cursor.at;
                         return Ok(Some(Message::Pointer(shape)));
+                    }
+                    -308 => {
+                        let Some(header) = cursor.take(4) else {
+                            return Ok(None);
+                        };
+                        let count = usize::from(header[0]);
+                        let Some(screens) = cursor.take(count * 16) else {
+                            return Ok(None);
+                        };
+                        let screen = (count == 1).then(|| {
+                            (
+                                u32::from_be_bytes(screens[0..4].try_into().unwrap()),
+                                u32::from_be_bytes(screens[12..16].try_into().unwrap()),
+                            )
+                        });
+                        self.remaining = Some(remaining - 1);
+                        self.offset += cursor.at;
+                        return Ok(Some(Message::Layout {
+                            width,
+                            height,
+                            reason: x,
+                            result: y,
+                            screen,
+                        }));
                     }
                     DESKTOP_SIZE => Some(Rect::Resize { width, height }),
                     LAST_RECT => {

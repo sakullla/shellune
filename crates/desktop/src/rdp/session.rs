@@ -26,16 +26,22 @@ const HANDSHAKE: Duration = Duration::from_secs(20);
 #[derive(Default)]
 struct Frames {
     pending: Vec<u8>,
+    offset: usize,
 }
 
 impl Frames {
     fn push(&mut self, bytes: &[u8]) {
+        if self.offset != 0 {
+            self.pending.drain(..self.offset);
+            self.offset = 0;
+        }
         self.pending.extend_from_slice(bytes);
     }
 
     /// The next complete PDU body, when one is buffered.
     fn take(&mut self) -> io::Result<Option<Incoming>> {
-        let [first, second, rest @ ..] = &self.pending[..] else {
+        let pending = &self.pending[self.offset..];
+        let [first, second, rest @ ..] = pending else {
             return Ok(None);
         };
         let slow = *first == 3;
@@ -63,12 +69,11 @@ impl Frames {
         if total < header {
             return Err(wire::invalid("short RDP pdu"));
         }
-        if self.pending.len() < total {
+        if pending.len() < total {
             return Ok(None);
         }
-        let rest = self.pending.split_off(total);
-        let frame = std::mem::replace(&mut self.pending, rest);
-        let body = frame[header..].to_vec();
+        let body = pending[header..total].to_vec();
+        self.offset += total;
         Ok(Some(if slow {
             Incoming::Slow(body)
         } else {
@@ -133,7 +138,14 @@ impl Ended {
     fn io(error: io::Error, during: Failure) -> Ended {
         let failure = match error.kind() {
             io::ErrorKind::PermissionDenied => Failure::Authentication,
-            io::ErrorKind::Unsupported => Failure::UnsupportedSecurity,
+            io::ErrorKind::Unsupported if during == Failure::Connect => {
+                Failure::UnsupportedSecurity
+            }
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                if during == Failure::Authentication =>
+            {
+                Failure::Io
+            }
             io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset => Failure::RemoteClosed,
             _ if during != Failure::None => during,
             _ => Failure::Io,
@@ -265,12 +277,15 @@ struct Active {
     /// When an unconfirmed logon stops being waited for.
     logon_deadline: std::time::Instant,
     first_picture_deadline: Option<std::time::Instant>,
+    deactivated: bool,
     clipboard: Clipboard,
     drive: Drive,
     /// The button state the host last reported, so each edge carries its button.
     buttons: u32,
     pointer_position: Option<(u16, u16)>,
     pointers: super::pointer::Pointers,
+    fast_fragment: Option<(u8, Vec<u8>)>,
+    display: super::display::Display,
 }
 
 fn connect(
@@ -308,6 +323,12 @@ fn connect(
         .map_err(|error| Ended::io(error, Failure::Connect))?;
     super::trace(&format!("negotiated security {selected:?}"));
 
+    if selected != wire::Security::Tls && (config.user.is_empty() || config.password.is_empty()) {
+        return Err(Ended::new(
+            Failure::CredentialsRequired,
+            "Windows requires an account and password",
+        ));
+    }
     let verify = {
         let control = Arc::clone(control);
         let emit = Arc::clone(emit);
@@ -319,7 +340,13 @@ fn connect(
         ) as Arc<security::Ask>
     };
     super::trace("tls handshake starting");
-    let mut secure = security::tls(transport, &config.host, verify).map_err(|error| {
+    let mut secure = security::tls(
+        transport,
+        &config.host,
+        config.certificate_pin.clone(),
+        verify,
+    )
+    .map_err(|error| {
         if error.to_string().contains(security::CERTIFICATE_REJECTED) {
             Ended::new(
                 Failure::CertificateRejected,
@@ -349,6 +376,7 @@ fn connect(
         &mut transport,
         config.width,
         config.height,
+        config.scale_percent,
         selected,
         config.clipboard,
         config.drive.is_some(),
@@ -376,7 +404,10 @@ fn connect(
         buttons: 0,
         pointer_position: None,
         pointers: Default::default(),
+        fast_fragment: None,
+        display: Default::default(),
         first_picture_deadline: None,
+        deactivated: false,
         logon_confirmed: false,
         frames: Frames::default(),
         connected: false,
@@ -465,9 +496,6 @@ impl Active {
                 .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
             self.share = share;
             self.pointer_position = None;
-            self.clipboard
-                .announce(&self.channels, &mut self.transport)
-                .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
             return Ok(());
         }
     }
@@ -523,8 +551,10 @@ impl Active {
                 ));
             }
             self.announce_logon(emit, control);
-            self.drain(commands)?;
-            self.clipboard
+            if !self.deactivated {
+                self.drain(commands)?;
+            }
+            self.display
                 .poll(&self.channels, &mut self.transport)
                 .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
             match read_chunk(&mut self.transport, &mut self.frames) {
@@ -559,14 +589,22 @@ impl Active {
                     .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?,
                 Some(Command::Pointer { buttons, x, y }) => {
                     let flags = super::pointer_flags(self.buttons, buttons);
+                    if (self.buttons & 7 == 0) != (buttons & 7 == 0) {
+                        // Service drag motion even while the server is waiting for
+                        // input before repainting. Restore the idle wait on release.
+                        self.set_poll_timeout(if buttons & 7 != 0 {
+                            Duration::from_millis(8)
+                        } else {
+                            POLL
+                        });
+                    }
                     self.buttons = buttons;
                     if flags & 0x0400 != 0 && !self.share.horizontal_wheel {
                         continue;
                     }
-                    // A wheel PDU's coordinates may be ignored. Move over the
-                    // target first, even if the user scrolled without hovering.
+                    // Position the cursor before a button edge or wheel step.
                     let moved = self.pointer_position != Some((x, y));
-                    if moved && flags & 0x0600 != 0 {
+                    if moved && flags != 0x0800 {
                         self.pointer(0x0800, x, y)
                             .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
                     }
@@ -576,9 +614,10 @@ impl Active {
                     }
                     self.pointer_position = Some((x, y));
                 }
+                Some(Command::Resize(w, h, percent)) => self.display.resize(w, h, percent),
                 Some(Command::Clipboard(entries)) => self
                     .clipboard
-                    .offer(&self.channels, &mut self.transport, &entries)
+                    .offer(&self.channels, &mut self.transport, entries)
                     .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?,
                 None => break,
             }
@@ -654,9 +693,15 @@ impl Active {
             .channels
             .receive(p.0)
             .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+        if Some(id) == self.channels.dynamic {
+            return self
+                .display
+                .channel(&self.channels, &mut self.transport, id, payload)
+                .map_err(|error| Ended::io(error, Failure::ProtocolFailure));
+        }
         if Some(id) == self.channels.clipboard {
             self.clipboard
-                .on_data(&self.channels, &mut self.transport, payload)
+                .receive(&self.channels, &mut self.transport, payload)
                 .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
             return Ok(());
         }
@@ -694,11 +739,22 @@ impl Active {
                     emit(Event::Pointer(shape));
                 }
             }
-            2 => {
-                return Err(Ended::new(
-                    Failure::RemoteClosed,
-                    "the server deactivated the desktop",
-                ));
+            6 => {
+                self.deactivated = true;
+                self.first_picture_deadline = Some(std::time::Instant::now() + FIRST_PICTURE_WAIT);
+            }
+            1 => {
+                self.deactivated = false;
+                // Windows reactivates the share after a display layout change.
+                let share = Share::from_demand(&header)
+                    .map_err(|e| Ended::io(e, Failure::ProtocolFailure))?;
+                share
+                    .activate(&self.channels, &mut self.transport)
+                    .map_err(|e| Ended::io(e, Failure::ProtocolFailure))?;
+                self.share = share;
+                self.pointer_position = None;
+                self.pointers = Default::default();
+                self.fast_fragment = None;
             }
             _ => {}
         }
@@ -709,7 +765,7 @@ impl Active {
         let mut p = Packet(body);
         while !p.0.is_empty() {
             let header = p.u8()?;
-            if header & 0x30 != 0 {
+            if header & 0x30 != 0 && !self.share.large_pointers {
                 return Err(wire::invalid("unnegotiated fast-path fragmentation"));
             }
             match header >> 6 {
@@ -719,19 +775,50 @@ impl Active {
             }
             let len = p.le16()?;
             let data = p.take(usize::from(len))?;
-            match header & 15 {
-                1 => self.bitmap_update(data, emit)?,
-                5 => emit(Event::Pointer(crate::PointerShape::Hidden)),
-                6 => emit(Event::Pointer(crate::PointerShape::Default)),
-                kind @ (9 | 10) => {
-                    if let Some(shape) = self.pointers.shape(kind == 10, &mut Packet(data))? {
-                        emit(Event::Pointer(shape));
+            let code = header & 15;
+            match (header >> 4) & 3 {
+                0 if self.fast_fragment.is_none() => self.fast_update(code, data, emit)?,
+                2 if self.fast_fragment.is_none() => {
+                    self.fast_fragment = Some((code, data.to_vec()))
+                }
+                fragment @ (1 | 3) => {
+                    let Some((previous, buffer)) = self.fast_fragment.as_mut() else {
+                        return Err(wire::invalid("missing initial fast-path fragment"));
+                    };
+                    if *previous != code
+                        || buffer.len() + data.len() > share::MULTIFRAGMENT_LIMIT as usize
+                    {
+                        return Err(wire::invalid("invalid fast-path fragment sequence"));
+                    }
+                    buffer.extend_from_slice(data);
+                    if fragment == 1 {
+                        let (_, complete) = self.fast_fragment.take().unwrap();
+                        self.fast_update(code, &complete, emit)?;
                     }
                 }
-                // Synchronize, palette and position updates do not draw pixels.
-                2 | 3 | 8 => {}
-                _ => return Err(wire::invalid("unsupported fast-path update")),
+                _ => return Err(wire::invalid("interleaved fast-path fragments")),
             }
+        }
+        Ok(())
+    }
+
+    fn fast_update(&mut self, code: u8, data: &[u8], emit: &Emit) -> io::Result<()> {
+        match code {
+            1 => self.bitmap_update(data, emit)?,
+            5 => emit(Event::Pointer(crate::PointerShape::Hidden)),
+            6 => emit(Event::Pointer(crate::PointerShape::Default)),
+            9 => emit(Event::Pointer(self.pointers.shape(24, &mut Packet(data))?)),
+            10 => {
+                if let Some(shape) = self.pointers.cached(&mut Packet(data))? {
+                    emit(Event::Pointer(shape));
+                }
+            }
+            11 => emit(Event::Pointer(
+                self.pointers.new_pointer(&mut Packet(data))?,
+            )),
+            2 => self.bitmap_update(data, emit)?,
+            3 | 8 => {}
+            _ => return Err(wire::invalid("unsupported fast-path update")),
         }
         Ok(())
     }
@@ -741,6 +828,9 @@ impl Active {
         let kind = p.le16()?;
         // TS_UPDATE_BITMAP_DATA is updateType then numberRectangles: the palette
         // update is the one with a pad field, not this one.
+        if kind == 2 {
+            return self.pointers.palette(&mut p);
+        }
         let count = p.le16()?;
         if kind != 1 {
             // Palette and other update types carry nothing this client renders.
@@ -809,6 +899,7 @@ mod tests {
         Active {
             transport,
             channels: Channels {
+                dynamic: None,
                 user: 1004,
                 global: 1003,
                 clipboard: None,
@@ -819,13 +910,45 @@ mod tests {
             clipboard: Clipboard::new(false, Arc::clone(emit)),
             drive: Drive::new(None, Arc::clone(emit)),
             first_picture_deadline: Some(now + FIRST_PICTURE_WAIT),
+            deactivated: false,
             logon_deadline: now + LOGON_WAIT,
             logon_confirmed: false,
             connected: false,
             buttons: 0,
             pointer_position: None,
             pointers: Default::default(),
+            fast_fragment: None,
+            display: Default::default(),
         }
+    }
+
+    #[test]
+    fn fragmented_windows_alpha_pointer_is_emitted_and_cached_after_its_last_fragment() {
+        let (tx, events) = std::sync::mpsc::channel();
+        let emit: Emit = Arc::new(move |event| tx.send(event).unwrap());
+        let mut active = activated(&emit);
+        active.share.large_pointers = true;
+        let mut pdu = Vec::new();
+        for word in [32u16, 1, 0, 0, 1, 2, 0, 8] {
+            pdu.extend_from_slice(&word.to_le_bytes());
+        }
+        pdu.extend_from_slice(&[1, 3, 5, 128, 4, 6, 8, 0]);
+        let mut first = vec![0x2b, 12, 0];
+        first.extend_from_slice(&pdu[..12]);
+        active.fast(&first, &emit).unwrap();
+        assert!(events.try_recv().is_err());
+        let mut last = vec![0x1b, 12, 0];
+        last.extend_from_slice(&pdu[12..]);
+        active.fast(&last, &emit).unwrap();
+        let Event::Pointer(shape) = events.try_recv().unwrap() else {
+            panic!("pointer")
+        };
+        let crate::PointerShape::Bitmap { pixels, .. } = &shape else {
+            panic!("bitmap")
+        };
+        assert_eq!(&**pixels, &[4, 6, 8, 0, 1, 3, 5, 128]);
+        active.fast(&[10, 2, 0, 1, 0], &emit).unwrap();
+        assert_eq!(events.try_recv().unwrap(), Event::Pointer(shape));
     }
 
     #[test]
@@ -977,6 +1100,7 @@ mod tests {
     /// scancode, read back out of the Share Data PDU a server would receive.
     fn keyboard_pdu(down: bool, scancode: u8, extended: bool) -> (u16, u16) {
         let channels = Channels {
+            dynamic: None,
             user: 1003,
             global: 1007,
             clipboard: None,

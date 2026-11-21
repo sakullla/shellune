@@ -511,6 +511,7 @@ pub(crate) fn probe_replies(
     let emit: super::Emit = std::sync::Arc::new(|_event| {});
     let mut drive = Drive::new(Some(folder.to_path_buf()), emit);
     let channels = Channels {
+        dynamic: None,
         user: 1005,
         global: 1003,
         clipboard: None,
@@ -696,6 +697,7 @@ pub(crate) fn probe_drive_reply(folder: &str, result: u32) -> Vec<Event> {
     });
     let mut drive = Drive::new(Some(std::path::PathBuf::from(folder)), emit);
     let channels = Channels {
+        dynamic: None,
         user: 1005,
         global: 1003,
         clipboard: None,

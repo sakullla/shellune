@@ -984,6 +984,8 @@ impl Platform for MacPlatform {
             }
 
             let new_cursor: id = match style {
+                CursorStyle::Bitmap(key) => super::bitmap_cursor::lookup(key)
+                    .unwrap_or_else(|| msg_send![class!(NSCursor), arrowCursor]),
                 CursorStyle::Arrow => msg_send![class!(NSCursor), arrowCursor],
                 CursorStyle::IBeam => msg_send![class!(NSCursor), IBeamCursor],
                 CursorStyle::Crosshair => msg_send![class!(NSCursor), crosshairCursor],
@@ -1130,6 +1132,12 @@ impl Platform for MacPlatform {
                 }
             }
         }
+    }
+
+    fn clipboard_generation(&self) -> Option<u64> {
+        let pasteboard = self.0.lock().pasteboard;
+        let count: isize = unsafe { msg_send![pasteboard, changeCount] };
+        u64::try_from(count).ok()
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {

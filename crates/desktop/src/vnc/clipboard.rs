@@ -17,6 +17,8 @@ pub(crate) const EXTENDED_CLIPBOARD: i32 = 0xC0A1_E5CEu32 as i32;
 
 pub(crate) const EXT_TEXT: u32 = 1;
 pub(crate) const EXT_CAPS: u32 = 1 << 24;
+pub(crate) const EXT_REQUEST: u32 = 1 << 25;
+pub(crate) const EXT_PEEK: u32 = 1 << 26;
 pub(crate) const EXT_NOTIFY: u32 = 1 << 27;
 pub(crate) const EXT_PROVIDE: u32 = 1 << 28;
 
@@ -53,18 +55,20 @@ pub(crate) struct RemoteText {
 /// Decodes classic cut text and cuts it at the last whole character within the
 /// bound, reporting that it did.
 pub(crate) fn classic(text: &[u8]) -> RemoteText {
-    bound(latin1_to_utf8(text))
+    let mut decoded = bound(latin1_to_utf8(
+        &text[..text.len().min(MAX_CLIPBOARD_TEXT_BYTES)],
+    ));
+    decoded.cut |= text.len() > MAX_CLIPBOARD_TEXT_BYTES;
+    decoded
 }
 
-fn bound(utf8: Vec<u8>) -> RemoteText {
+fn bound(mut utf8: Vec<u8>) -> RemoteText {
     if utf8.len() <= MAX_CLIPBOARD_TEXT_BYTES {
         return RemoteText { utf8, cut: false };
     }
     let len = cut_clipboard_text(&utf8, MAX_CLIPBOARD_TEXT_BYTES);
-    RemoteText {
-        utf8: utf8[..len].to_vec(),
-        cut: true,
-    }
+    utf8.truncate(len);
+    RemoteText { utf8, cut: true }
 }
 
 /// Hands one remote text to the consumer, with the notice a cut earns.
@@ -88,10 +92,16 @@ pub(crate) fn deliver(emit: &Emit, text: RemoteText) {
 /// What one extended clipboard message held.
 pub(crate) enum Extended {
     /// The server announced its capabilities; the text bit says it can carry text.
-    Caps { text: bool },
+    Caps {
+        flags: u32,
+        text_limit: u32,
+    },
+    Notify(bool),
+    Request,
+    Peek,
     /// The server provided a text.
     Text(RemoteText),
-    /// A message this client does not act on (a request or a peek).
+    /// A message with an unsupported action or format.
     Other,
 }
 
@@ -100,49 +110,62 @@ pub(crate) enum Extended {
 pub(crate) fn parse_extended(payload: &[u8]) -> Option<Extended> {
     let flags = u32::from_be_bytes(payload.get(..4)?.try_into().ok()?);
     if flags & EXT_CAPS != 0 {
-        return Some(Extended::Caps {
-            text: flags & EXT_TEXT != 0,
-        });
+        let text_limit = if flags & EXT_TEXT != 0 {
+            u32::from_be_bytes(payload.get(4..8)?.try_into().ok()?)
+        } else {
+            0
+        };
+        return Some(Extended::Caps { flags, text_limit });
+    }
+    if flags & EXT_NOTIFY != 0 {
+        return Some(Extended::Notify(flags & EXT_TEXT != 0));
+    }
+    if flags & EXT_REQUEST != 0 && flags & EXT_TEXT != 0 {
+        return Some(Extended::Request);
+    }
+    if flags & EXT_PEEK != 0 {
+        return Some(Extended::Peek);
     }
     if flags & EXT_PROVIDE == 0 {
         return Some(Extended::Other);
     }
-    // The text is a zlib stream. Servers that flush it with Z_SYNC_FLUSH and no
-    // final block (TigerVNC does) never end it properly, so a decoder error after
-    // the bytes arrived is the end of the stream, not a failure.
-    let mut plain = Vec::new();
+    if flags & EXT_TEXT == 0 {
+        return Some(Extended::Other);
+    }
+    // The first format is text. Read only its bounded prefix, including room
+    // for the terminating NUL. A sync-flushed Provide need not end the zlib stream.
     let mut decoder = ZlibDecoder::new(&payload[4..]);
-    let mut chunk = [0u8; 4096];
-    loop {
-        match decoder.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(read) => plain.extend_from_slice(&chunk[..read]),
-            Err(_) => break,
-        }
+    let mut length = [0; 4];
+    decoder.read_exact(&mut length).ok()?;
+    let declared = u32::from_be_bytes(length) as usize;
+    let mut bytes = vec![0; declared.min(MAX_CLIPBOARD_TEXT_BYTES + 1)];
+    decoder.read_exact(&mut bytes).ok()?;
+    let truncated = declared > bytes.len();
+    if truncated
+        && let Err(error) = std::str::from_utf8(&bytes)
+        && error.error_len().is_none()
+    {
+        bytes.truncate(error.valid_up_to());
     }
-    let declared = u32::from_be_bytes(plain.get(..4)?.try_into().ok()?) as usize;
-    let mut body = plain.get(4..4 + declared)?.to_vec();
-    while body.last() == Some(&0) {
-        body.pop();
+    while bytes.last() == Some(&0) {
+        bytes.pop();
     }
-    let utf8 = String::from_utf8_lossy(&body).into_owned().into_bytes();
-    Some(Extended::Text(bound(utf8)))
+    let mut text = bound(match std::str::from_utf8(&bytes) {
+        Ok(_) => bytes,
+        Err(_) => String::from_utf8_lossy(&bytes).into_owned().into_bytes(),
+    });
+    text.cut |= truncated;
+    Some(Extended::Text(text))
 }
 
-/// The message a client sends to say it copied `text`: an empty Notify followed by
-/// a compressed Provide, which is the form every extended clipboard peer reads.
-pub(crate) fn provide(text: &str) -> (Vec<u8>, Vec<u8>) {
-    let notify = (EXT_NOTIFY | EXT_TEXT).to_be_bytes().to_vec();
-    let mut plain = ((text.len() + 1) as u32).to_be_bytes().to_vec();
-    plain.extend_from_slice(text.as_bytes());
-    plain.push(0);
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    // Writing into a Vec does not fail; a compression failure would be a bug.
-    let _ = encoder.write_all(&plain);
-    let compressed = encoder.finish().unwrap_or_default();
-    let mut payload = (EXT_PROVIDE | EXT_TEXT).to_be_bytes().to_vec();
-    payload.extend_from_slice(&compressed);
-    (notify, payload)
+/// Encode the text directly into the Provide PDU, including its terminating NUL.
+pub(crate) fn provide(text: &[u8]) -> std::io::Result<Vec<u8>> {
+    let payload = (EXT_PROVIDE | EXT_TEXT).to_be_bytes().to_vec();
+    let mut encoder = ZlibEncoder::new(payload, Compression::default());
+    encoder.write_all(&((text.len() + 1) as u32).to_be_bytes())?;
+    encoder.write_all(text)?;
+    encoder.write_all(&[0])?;
+    encoder.finish()
 }
 
 #[cfg(test)]
@@ -166,11 +189,7 @@ mod tests {
 
     #[test]
     fn a_provided_text_is_read_back_through_its_compression() {
-        let (notify, provide) = provide("远端 ✓ text");
-        assert_eq!(
-            u32::from_be_bytes(notify[..4].try_into().unwrap()),
-            EXT_NOTIFY | EXT_TEXT
-        );
+        let provide = provide("远端 ✓ text".as_bytes()).unwrap();
         let Some(Extended::Text(text)) = parse_extended(&provide) else {
             panic!("a provided text");
         };
@@ -182,10 +201,25 @@ mod tests {
     fn capabilities_say_whether_text_is_carried() {
         let mut caps = (EXT_CAPS | EXT_TEXT).to_be_bytes().to_vec();
         caps.extend_from_slice(&(1u32 << 20).to_be_bytes());
-        let Some(Extended::Caps { text }) = parse_extended(&caps) else {
+        let Some(Extended::Caps { flags, text_limit }) = parse_extended(&caps) else {
             panic!("capabilities");
         };
-        assert!(text);
+        assert_ne!(flags & EXT_TEXT, 0);
+        assert_eq!(text_limit, 1 << 20);
+    }
+
+    #[test]
+    fn oversized_extended_text_is_cut_at_a_character_boundary() {
+        let text = format!("{}界界", "x".repeat(MAX_CLIPBOARD_TEXT_BYTES - 1));
+        let packet = provide(text.as_bytes()).unwrap();
+        let Some(Extended::Text(decoded)) = parse_extended(&packet) else {
+            panic!("text")
+        };
+        assert!(decoded.cut);
+        assert_eq!(
+            decoded.utf8,
+            text.as_bytes()[..MAX_CLIPBOARD_TEXT_BYTES - 1]
+        );
     }
 
     #[test]
