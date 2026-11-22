@@ -9,9 +9,11 @@
 //!
 //! [`BiometryProtectedEntry`] is how an enrollment change surfaces: an item
 //! saved under `biometryCurrentSet` stops working once the enrolled set
-//! changes, and the failed read is reported as
-//! [`BiometricError::EnrollmentChanged`] so the caller disables biometric
-//! unlocking on this machine and asks for the current passphrase instead.
+//! changes, and a read that can no longer decode under that protection is
+//! reported as [`BiometricError::EnrollmentChanged`] so the caller disables
+//! biometric unlocking on this machine and asks for the current passphrase.
+//! A read the user cancelled, or an answer that did not match, keeps its own
+//! error — cancelling the Touch ID prompt must never read as a reset.
 
 use block2::RcBlock;
 use objc2::rc::Retained;
@@ -59,10 +61,21 @@ const LA_ERROR_APP_CANCEL: isize = -9;
 const LA_ERROR_INVALID_CONTEXT: isize = -10;
 const LA_ERROR_NOT_INTERACTIVE: isize = -11;
 
-// Keychain status codes (Security/SecBase.h) that decide what a failed read
-// of the protected item means.
-const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
-const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
+// Keychain status codes (Security/SecBase.h), each with the wording the
+// header documents for it. The mapping below hangs on those wordings, not on
+// guesswork about what a status "probably" means.
+const ERR_SEC_USER_CANCELED: i32 = -128; // "User canceled the operation."
+const ERR_SEC_NOT_AVAILABLE: i32 = -25291; // "No keychain is available."
+const ERR_SEC_AUTH_FAILED: i32 = -25293; // "The user name or passphrase you entered is not correct."
+const ERR_SEC_NO_SUCH_KEYCHAIN: i32 = -25294; // "The specified keychain could not be found."
+const ERR_SEC_INVALID_KEYCHAIN: i32 = -25295; // "The specified keychain is not a valid keychain file."
+const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300; // "The specified item could not be found in the keychain."
+const ERR_SEC_NO_DEFAULT_KEYCHAIN: i32 = -25307; // "A default keychain could not be found."
+const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308; // "User interaction is not allowed."
+const ERR_SEC_INTERACTION_REQUIRED: i32 = -25315; // "User interaction is required, but is currently not allowed."
+const ERR_SEC_IN_DARK_WAKE: i32 = -25320; // "In dark wake, no UI possible"
+const ERR_SEC_DECODE: i32 = -26275; // "Unable to decode the provided data."
+const ERR_SEC_MISSING_ENTITLEMENT: i32 = -34018; // "A required entitlement is not present."
 
 /// The system's own verification, by way of LocalAuthentication.
 #[derive(Clone, Copy, Debug, Default)]
@@ -187,6 +200,96 @@ fn map_error(code: isize, domain: &str) -> BiometricError {
     }
 }
 
+/// What a failed read of the biometry-protected entry means, decided from the
+/// keychain status alone so it can be tested without a keychain.
+///
+/// The mapping is the contract: a user who cancels the Touch ID prompt the
+/// read raised was not verified, but nothing about the machine's protection
+/// changed, so that answer must stay a [`ProtectedReadFailure::Cancelled`]
+/// ("ask again later") and never an enrollment change ("disable the
+/// protection and re-enable with the passphrase"). See [`map_read_status`]
+/// for where each status comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProtectedReadFailure {
+    /// No protected entry exists.
+    Missing,
+    /// The user backed out of the prompt the read raised. Not a failure, and
+    /// never a pass.
+    Cancelled,
+    /// The system cannot ask the user right now: no interaction allowed,
+    /// interaction required but not allowed, or dark wake.
+    Busy { reason: String },
+    /// The system asked and the answer did not match.
+    Failed,
+    /// The entry's content can no longer be decoded under the protection it
+    /// was saved with — the signature of a `biometryCurrentSet` item whose
+    /// enrolled set changed. This machine's biometric protection was reset.
+    EnrollmentChanged { reason: String },
+    /// A status the table cannot pin down, and a keychain that is missing or
+    /// misconfigured. The caller asks again or falls back to the current
+    /// passphrase. Never a pass, and never on its own a reason to disable
+    /// the machine's biometric protection.
+    Unavailable { reason: String },
+}
+
+impl From<ProtectedReadFailure> for BiometricError {
+    fn from(failure: ProtectedReadFailure) -> Self {
+        match failure {
+            ProtectedReadFailure::Missing => Self::Unavailable {
+                reason: "no protected keychain entry exists".to_owned(),
+            },
+            ProtectedReadFailure::Cancelled => Self::Cancelled,
+            ProtectedReadFailure::Busy { reason } => Self::Busy { reason },
+            ProtectedReadFailure::Failed => Self::Failed,
+            ProtectedReadFailure::EnrollmentChanged { reason } => {
+                Self::EnrollmentChanged { reason }
+            }
+            ProtectedReadFailure::Unavailable { reason } => Self::Unavailable { reason },
+        }
+    }
+}
+
+/// Decides what a failed read of the protected entry means, from the status
+/// the keychain returned and the documented meaning of each code
+/// (Security framework, `SecBase.h`, quoted beside the constants above).
+///
+/// Only `errSecDecode` — the item's content cannot be decoded under the
+/// protection it was saved with — is treated as the protection being reset:
+/// that is the documented signature of what a `biometryCurrentSet`
+/// invalidation leaves behind. Every status the table cannot pin down is
+/// deliberately the conservative [`ProtectedReadFailure::Unavailable`]:
+/// the asymmetry is on purpose, because asking again or falling back to the
+/// passphrase costs the user a moment, while mistaking a cancellation for an
+/// invalidation would silently switch the machine to a weaker gate — the one
+/// outcome R3 and R4 forbid. A user cancellation (-128) is reported as such;
+/// an authentication mismatch (-25293) is a failed verification, not a reset.
+#[must_use]
+fn map_read_status(status: i32) -> ProtectedReadFailure {
+    match status {
+        ERR_SEC_ITEM_NOT_FOUND => ProtectedReadFailure::Missing,
+        ERR_SEC_USER_CANCELED => ProtectedReadFailure::Cancelled,
+        ERR_SEC_INTERACTION_NOT_ALLOWED | ERR_SEC_INTERACTION_REQUIRED | ERR_SEC_IN_DARK_WAKE => {
+            ProtectedReadFailure::Busy {
+                reason: format!("the keychain cannot ask the user right now (status {status})"),
+            }
+        }
+        ERR_SEC_AUTH_FAILED => ProtectedReadFailure::Failed,
+        ERR_SEC_DECODE => ProtectedReadFailure::EnrollmentChanged {
+            reason: "the protected keychain item no longer decodes".to_owned(),
+        },
+        ERR_SEC_NOT_AVAILABLE
+        | ERR_SEC_NO_SUCH_KEYCHAIN
+        | ERR_SEC_INVALID_KEYCHAIN
+        | ERR_SEC_NO_DEFAULT_KEYCHAIN
+        | ERR_SEC_MISSING_ENTITLEMENT => ProtectedReadFailure::Unavailable {
+            reason: format!("the keychain is unavailable or misconfigured (status {status})"),
+        },
+        other => ProtectedReadFailure::Unavailable {
+            reason: format!("the protected keychain entry refused the read (status {other})"),
+        },
+    }
+}
+
 /// The vault's local unseal secret as a keychain item only the current
 /// biometric set can open.
 ///
@@ -195,7 +298,8 @@ fn map_error(code: isize, domain: &str) -> BiometricError {
 /// re-enrollment breaks this machine's protection on purpose instead of
 /// quietly falling back to the device passcode. Reading it is what raises the
 /// system's own biometric prompt; when the protection no longer holds, the
-/// read fails and is reported as [`BiometricError::EnrollmentChanged`].
+/// read fails as [`BiometricError::EnrollmentChanged`] — while a cancelled
+/// prompt stays [`BiometricError::Cancelled`], per [`map_read_status`].
 pub struct BiometryProtectedEntry {
     account: &'static str,
 }
@@ -232,30 +336,32 @@ impl BiometryProtectedEntry {
     /// Reads the secret; `Ok(None)` only when no protected entry exists.
     ///
     /// Reading is what asks the user: the keychain raises the system's
-    /// biometric prompt for an item under `biometryCurrentSet`.
+    /// biometric prompt for an item under `biometryCurrentSet`. Nothing is
+    /// ever released without that prompt succeeding.
     ///
     /// # Errors
     ///
-    /// A read that cannot ask the user right now is [`BiometricError::Busy`];
-    /// any other failure means the protection this entry was saved under no
-    /// longer holds — a changed enrollment above all — and is reported as
-    /// [`BiometricError::EnrollmentChanged`] rather than retried quietly.
+    /// [`map_read_status`] decides, from the status the keychain returned: a
+    /// cancelled prompt is [`BiometricError::Cancelled`] and a mismatch is
+    /// [`BiometricError::Failed`] — neither disables the machine's biometric
+    /// protection. Only a read whose content no longer decodes under the
+    /// protection it was saved with is [`BiometricError::EnrollmentChanged`].
+    /// A system that cannot ask right now answers [`BiometricError::Busy`];
+    /// anything the table cannot pin down is the conservative
+    /// [`BiometricError::Unavailable`], never a pass.
     pub fn load(&self) -> Result<Option<SecretString>, BiometricError> {
         match get_generic_password(SERVICE, self.account) {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(secret) => Ok(Some(SecretString::new(secret))),
+                // The entry answered with bytes this build never writes: the
+                // protection served something other than what was saved.
                 Err(_) => Err(BiometricError::EnrollmentChanged {
                     reason: "the protected keychain item no longer decodes".to_owned(),
                 }),
             },
-            Err(error) => match error.code() {
-                ERR_SEC_ITEM_NOT_FOUND => Ok(None),
-                ERR_SEC_INTERACTION_NOT_ALLOWED => Err(BiometricError::Busy {
-                    reason: format!("the keychain cannot ask the user right now: {error}"),
-                }),
-                _ => Err(BiometricError::EnrollmentChanged {
-                    reason: format!("the protected keychain item refused the read: {error}"),
-                }),
+            Err(error) => match map_read_status(error.code()) {
+                ProtectedReadFailure::Missing => Ok(None),
+                failure => Err(failure.into()),
             },
         }
     }
@@ -317,5 +423,118 @@ mod tests {
             .expect(
                 "evaluatePolicy:localizedReason:reply: takes a policy, a reason and a reply block",
             );
+    }
+
+    #[test]
+    fn a_cancelled_keychain_read_is_not_an_enrollment_change() {
+        // -128 is errSecUserCanceled, "User canceled the operation": the
+        // regular result of a user backing out of the Touch ID prompt a read
+        // of the biometryCurrentSet entry raises. Treating it as an
+        // enrollment change would permanently disable this machine's
+        // biometric protection on one ordinary cancellation — the opposite
+        // of "cancelled is not a pass, and not a reset either".
+        assert_eq!(map_read_status(-128), ProtectedReadFailure::Cancelled);
+        assert!(BiometricError::from(map_read_status(-128)).is_cancelled());
+        assert!(
+            !BiometricError::from(map_read_status(-128)).is_enrollment_changed(),
+            "a cancellation must never disable the machine's biometric protection"
+        );
+    }
+
+    #[test]
+    fn an_authentication_mismatch_is_a_failed_read_not_a_reset() {
+        // -25293 is errSecAuthFailed, "The user name or passphrase you
+        // entered is not correct": the system asked and the answer did not
+        // match. The entry still works; the user can be asked again.
+        assert_eq!(map_read_status(-25293), ProtectedReadFailure::Failed);
+        assert_eq!(
+            BiometricError::from(map_read_status(-25293)),
+            BiometricError::Failed
+        );
+    }
+
+    #[test]
+    fn a_missing_entry_is_absent_and_a_stalled_system_is_busy() {
+        // -25300 is errSecItemNotFound: the one status that means "nothing
+        // was saved", which load answers as Ok(None).
+        assert_eq!(map_read_status(-25300), ProtectedReadFailure::Missing);
+
+        // The three documented "cannot ask the user right now" statuses:
+        // -25308 errSecInteractionNotAllowed, -25315
+        // errSecInteractionRequired, -25320 errSecInDarkWake.
+        for status in [-25308, -25315, -25320] {
+            assert!(
+                matches!(map_read_status(status), ProtectedReadFailure::Busy { .. }),
+                "status {status} means the system cannot ask right now"
+            );
+        }
+    }
+
+    #[test]
+    fn an_undecodable_entry_is_the_only_reset_signature() {
+        // -26275 is errSecDecode, "Unable to decode the provided data": the
+        // content can no longer be decoded under the protection it was saved
+        // with, which is what a biometryCurrentSet invalidation leaves.
+        assert!(
+            map_read_status(-26275)
+                == ProtectedReadFailure::EnrollmentChanged {
+                    reason: "the protected keychain item no longer decodes".to_owned()
+                }
+        );
+        assert!(
+            BiometricError::from(map_read_status(-26275)).is_enrollment_changed(),
+            "an entry that no longer decodes is the machine's protection being reset"
+        );
+    }
+
+    #[test]
+    fn a_status_the_table_cannot_pin_down_is_conservatively_not_a_reset() {
+        // Statuses outside the table (-25316 errSecDataNotAvailable, and a
+        // code nothing maps to) are "ask again or use the passphrase": never
+        // a pass, and never a reason to disable the protection on their own.
+        // The same holds for the documented broken-keychain statuses
+        // (-25291, -25294, -25295, -25307, -34018).
+        for status in [-25316, -1, -25291, -25294, -25295, -25307, -34018] {
+            let error = BiometricError::from(map_read_status(status));
+            assert!(
+                !error.is_enrollment_changed(),
+                "status {status} must not read as a reset"
+            );
+            assert!(
+                !error.is_cancelled(),
+                "status {status} must not read as a pass"
+            );
+            assert!(
+                matches!(error, BiometricError::Unavailable { .. }),
+                "status {status} is the conservative ask-again answer: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_local_authentication_error_mapping_keeps_its_outcomes_apart() {
+        // The LAError side of the model is unchanged: cancellation, mismatch,
+        // nothing enrolled, locked out, and no hardware stay distinct.
+        assert_eq!(map_error(-2, LA_ERROR_DOMAIN), BiometricError::Cancelled);
+        assert_eq!(map_error(-9, LA_ERROR_DOMAIN), BiometricError::Cancelled);
+        assert_eq!(map_error(-3, LA_ERROR_DOMAIN), BiometricError::Cancelled);
+        assert_eq!(map_error(-1, LA_ERROR_DOMAIN), BiometricError::Failed);
+        assert!(matches!(
+            map_error(-8, LA_ERROR_DOMAIN),
+            BiometricError::Busy { .. }
+        ));
+        assert!(matches!(
+            map_error(-7, LA_ERROR_DOMAIN),
+            BiometricError::NotEnrolled { .. }
+        ));
+        assert!(matches!(
+            map_error(-6, LA_ERROR_DOMAIN),
+            BiometricError::Unavailable { .. }
+        ));
+        // A foreign domain is never interpreted as a LocalAuthentication code.
+        assert!(matches!(
+            map_error(-2, "com.example.Other"),
+            BiometricError::Unavailable { .. }
+        ));
     }
 }
