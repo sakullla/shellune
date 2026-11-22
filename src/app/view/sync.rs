@@ -278,6 +278,14 @@ fn sync_error_text(error: &SyncError, strings: &SyncStrings) -> String {
             )
         }
         SyncError::PassphraseMissing => strings.error_passphrase_missing.to_owned(),
+        SyncError::Vault(error) => format!(
+            "{} {}",
+            strings.error_remote_document,
+            detail(&error.to_string())
+        ),
+        SyncError::Rollback { .. } => {
+            format!("{} {}", strings.error_server, detail(&error.to_string()))
+        }
         SyncError::Remote(error) => webdav_error_text(error, strings),
         SyncError::RemoteDocument(PortableError::WrongPassphrase) => {
             strings.error_remote_passphrase.to_owned()
@@ -1882,6 +1890,7 @@ impl ShelluneView {
             remote_platform: "linux".to_owned(),
             remote_app_version: env!("CARGO_PKG_VERSION").to_owned(),
             remote_created_unix: 1_794_816_000,
+            vault: Vec::new(),
         });
         self.sync.dialog = true;
         cx.notify();
@@ -1941,6 +1950,7 @@ impl ShelluneView {
             remote_platform: "macos".to_owned(),
             remote_app_version: env!("CARGO_PKG_VERSION").to_owned(),
             remote_created_unix: 1_794_816_000,
+            vault: Vec::new(),
         });
         self.sync.dialog = true;
         cx.notify();

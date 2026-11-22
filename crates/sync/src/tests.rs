@@ -9,18 +9,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use shellune_core::{
-    AuthMethodKind, ConnectionRecord, HostConfig, HostId, SecretString, SerialConfig,
+    AuthMethodKind, ConnectionRecord, CredentialId, CredentialMeta, HostConfig, HostId,
+    SecretString, SerialConfig, VaultRecordVersion,
 };
 use shellune_storage::{
-    AppSecret, ForwardStore, GroupStore, HostStore, KdfParams, KeymapEntry, KeymapPreferences,
-    LocalData, LocalState, MemorySecrets, Platform, PlatformField, PortableError, PreferencesStore,
-    SecretStore, ShelluneData, SnippetStore, TrustStore,
+    AppSecret, ExportOptions, ForwardStore, GroupStore, HostStore, KdfParams, KeySource,
+    KeymapEntry, KeymapPreferences, LocalData, LocalState, MemorySecrets, PassphrasePurpose,
+    Platform, PlatformField, PortableError, PreferencesStore, SecretStore, ShelluneData,
+    SnippetStore, TrustStore, UnsealSource, VaultCipher, VaultContent, VaultCredentialRecord,
+    VaultStore, VaultStoreError,
 };
 
 use crate::testing::WebDavServer;
 use crate::{
     LastResult, REMOTE_FILE_NAME, Resolution, SyncConfig, SyncError, SyncOutcome, SyncService,
-    WebDavError,
+    VaultChoice, VaultChoiceKey, VaultChoiceSide, VaultConflict, VaultRecordKind, WebDavError,
 };
 
 const USER: &str = "alice";
@@ -1538,4 +1541,919 @@ fn turning_password_sync_off_here_is_kept_when_the_cloud_only_connected() {
     assert_eq!(recent_of(&a, "db"), Some((1_000, 1)));
     assert_eq!(remote_recent(&server, "db"), Some((1_000, 1)));
     expect_up_to_date(a.service.sync());
+}
+
+// ---------------------------------------------------------------------------
+// The encrypted vault on sync (R5, R6, R8)
+// ---------------------------------------------------------------------------
+
+/// The secret inside the vault records, so the tests can tell travel from loss.
+const VAULT_SECRET: &str = "vault-secret-correct-battery";
+/// A changed secret, for edit scenarios.
+const VAULT_SECRET_2: &str = "vault-secret-changed-staple";
+/// A second changed secret, from the other machine.
+const VAULT_SECRET_3: &str = "vault-secret-late-copper";
+
+fn cheap_kdf() -> KdfParams {
+    KdfParams::new(64, 1, 1).expect("cheap parameters")
+}
+
+fn ssh_hosts_of(state: &LocalState) -> Vec<HostConfig> {
+    state
+        .hosts
+        .records()
+        .iter()
+        .filter_map(|record| match record {
+            ConnectionRecord::Ssh(host) => Some(host.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn vault_store(machine: &Machine) -> VaultStore {
+    VaultStore::at(&machine.root)
+}
+
+fn open_vault(machine: &Machine) -> VaultContent {
+    vault_store(machine)
+        .open(&UnsealSource::LocalMachine, &*machine.secrets)
+        .expect("this machine's vault opens")
+}
+
+fn save_vault(machine: &Machine, content: &VaultContent) {
+    let hosts = ssh_hosts_of(&machine.load());
+    let mut content = content.clone();
+    // The vault's reference mirror is a function of the host book; the editing
+    // service keeps the two together, and so does this helper.
+    content.set_references(&shellune_storage::HostReference::snapshot(&hosts));
+    vault_store(machine)
+        .save(
+            &content,
+            &hosts,
+            &[UnsealSource::LocalMachine],
+            cheap_kdf(),
+            &*machine.secrets,
+        )
+        .expect("the vault saves");
+}
+
+fn create_vault(machine: &Machine, edit: impl FnOnce(&mut VaultContent)) {
+    let mut content = VaultContent::new();
+    edit(&mut content);
+    save_vault(machine, &content);
+}
+
+/// Replaces one credential record with a changed version — a new secret or a
+/// new version — the way a future editing service will: the body has no
+/// in-place update, so the content is rebuilt around the change.
+fn replace_credential(
+    machine: &Machine,
+    id: CredentialId,
+    change: impl FnOnce(VaultCredentialRecord) -> VaultCredentialRecord,
+) {
+    let mut change = Some(change);
+    let content = open_vault(machine);
+    let mut rebuilt = VaultContent::new();
+    for key in content.keys().cloned() {
+        rebuilt.insert_key(key).expect("the key returns");
+    }
+    for record in content.credentials().cloned() {
+        if record.meta().id() == id {
+            rebuilt
+                .insert_credential(change.take().expect("one record")(record))
+                .expect("replaces");
+        } else {
+            rebuilt.insert_credential(record).expect("returns");
+        }
+    }
+    rebuilt.set_references(content.references());
+    rebuilt.set_trust(content.trust().clone());
+    save_vault(machine, &rebuilt);
+}
+
+/// The same credential record with another version, keeping name and user.
+fn credential_at(
+    record: &VaultCredentialRecord,
+    counter: u64,
+    device: &str,
+    secret: &str,
+) -> VaultCredentialRecord {
+    let meta = record.meta();
+    VaultCredentialRecord::new(
+        CredentialMeta::new(
+            meta.id(),
+            meta.name().to_owned(),
+            meta.user().map(str::to_owned),
+            VaultRecordVersion::new(counter, device),
+        ),
+        SecretString::new(secret),
+    )
+}
+
+fn credential_named(
+    id: CredentialId,
+    name: &str,
+    counter: u64,
+    secret: &str,
+) -> VaultCredentialRecord {
+    VaultCredentialRecord::new(
+        CredentialMeta::new(
+            id,
+            name,
+            Some("deploy".to_owned()),
+            VaultRecordVersion::new(counter, "device-a"),
+        ),
+        SecretString::new(secret),
+    )
+}
+
+fn secret_of(content: &VaultContent, id: CredentialId) -> Option<String> {
+    content
+        .credential(id)
+        .and_then(|record| record.secret())
+        .map(|secret| secret.expose().to_owned())
+}
+
+fn add_host_with_credential(
+    state: &mut LocalState,
+    name: &str,
+    credential: CredentialId,
+) -> HostId {
+    let mut host = HostConfig::new(name, "10.0.0.9", 22, "deploy").expect("host");
+    host.set_auth(Some(AuthMethodKind::Password));
+    host.set_credential_id(Some(credential));
+    let id = host.id();
+    state.hosts.insert(host).expect("inserted");
+    id
+}
+
+/// Points the machine at an account with no password, leaving no WebDAV
+/// password in its store: the sync passphrase is the only secret left.
+fn connect_passwordless(machine: &Machine, server: &WebDavServer) {
+    machine
+        .service
+        .save_config(&SyncConfig::new(server.url(), USER))
+        .expect("settings saved");
+}
+
+/// Two machines, both with the vault travelling, that synced `baseline`.
+fn synced_vault_pair(
+    name: &str,
+    server: &WebDavServer,
+    baseline: impl FnOnce(&mut VaultContent),
+) -> (Machine, Machine) {
+    let a = Machine::new(&format!("{name}-a"), Platform::Linux);
+    let b = Machine::new(&format!("{name}-b"), Platform::Linux);
+    for machine in [&a, &b] {
+        machine.connect(server);
+        machine.update_config(|config| config.sync_secrets = true);
+    }
+    create_vault(&a, baseline);
+    expect_uploaded(a.service.sync());
+    expect_pulled(b.service.sync());
+    (a, b)
+}
+
+#[track_caller]
+fn expect_vault_conflict(
+    outcome: Result<SyncOutcome, SyncError>,
+    count: usize,
+) -> Vec<VaultConflict> {
+    match outcome {
+        Ok(SyncOutcome::Conflict(report)) => {
+            assert_eq!(
+                report.vault.len(),
+                count,
+                "the conflicts: {:?}",
+                report.vault
+            );
+            report.vault
+        }
+        other => panic!("expected {count} vault conflicts, got {other:?}"),
+    }
+}
+
+fn choice_for_record(id: CredentialId, side: VaultChoiceSide) -> VaultChoice {
+    VaultChoice {
+        key: VaultChoiceKey::Record {
+            kind: VaultRecordKind::Credential,
+            id: id.to_string(),
+        },
+        side,
+    }
+}
+
+#[test]
+fn the_vault_travels_sealed_under_the_webdav_password() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let a = Machine::new("vault-travel-a", Platform::Windows);
+    let b = Machine::new("vault-travel-b", Platform::Linux);
+    for machine in [&a, &b] {
+        machine.connect(&server);
+        machine.update_config(|config| config.sync_secrets = true);
+    }
+    let credential = CredentialId::new();
+    a.edit(|state| {
+        add_host_with_credential(state, "web", credential);
+    });
+    create_vault(&a, |content| {
+        content
+            .insert_credential(credential_named(credential, "Prod login", 1, VAULT_SECRET))
+            .expect("inserts");
+    });
+
+    // No sync passphrase is set anywhere: the WebDAV password is the unseal
+    // secret (R5), and nothing else is asked for.
+    assert!(a.service.passphrase().expect("read").is_none());
+    expect_uploaded(a.service.sync());
+    let text = remote_text(&server);
+    assert!(text.contains("\"vault\""), "{text}");
+    assert!(!text.contains(VAULT_SECRET), "{text}");
+    assert!(!text.contains(DAV_PASSWORD), "{text}");
+    assert_eq!(remote_document(&server).version(), 2);
+
+    // A second machine with the same account and password restores the vault,
+    // rebound to the same records, and is told what version it landed on.
+    let pulled = expect_pulled(b.service.sync());
+    let restored = pulled.vault_restored.expect("the vault travelled");
+    assert!(restored.first_sync, "a first adoption says so");
+    assert_eq!(restored.live_records, 1);
+    assert!(restored.global_counter >= 1);
+    let vault = open_vault(&b);
+    assert_eq!(secret_of(&vault, credential).as_deref(), Some(VAULT_SECRET));
+    let state = b.load();
+    let web = state
+        .hosts
+        .records()
+        .iter()
+        .find_map(|record| match record {
+            ConnectionRecord::Ssh(host) if host.name() == "web" => Some(host.clone()),
+            _ => None,
+        })
+        .expect("the host arrived");
+    assert_eq!(web.credential_id(), Some(credential));
+    assert_eq!(
+        vault.references(),
+        &shellune_storage::HostReference::snapshot(&ssh_hosts_of(&state))
+    );
+    expect_up_to_date(a.service.sync());
+    expect_up_to_date(b.service.sync());
+    assert!(a.service.state().vault.is_some());
+    assert!(b.service.state().vault.is_some());
+    // The vault file holds no plaintext secret either.
+    let vault_text =
+        std::fs::read_to_string(b.root.join(shellune_storage::VAULT_FILE_NAME)).expect("read");
+    assert!(!vault_text.contains(VAULT_SECRET), "{vault_text}");
+}
+
+#[test]
+fn a_passwordless_webdav_requires_a_sync_passphrase_before_the_vault_travels() {
+    let server = WebDavServer::start(USER, "");
+    let a = Machine::new("passphrase-a", Platform::Linux);
+    connect_passwordless(&a, &server);
+    a.update_config(|config| config.sync_secrets = true);
+    let credential = CredentialId::new();
+    a.edit(|state| {
+        add_host_with_credential(state, "web", credential);
+    });
+    create_vault(&a, |content| {
+        content
+            .insert_credential(credential_named(credential, "Prod login", 1, VAULT_SECRET))
+            .expect("inserts");
+    });
+
+    // Without a passphrase nothing leaves the machine (R5).
+    assert_eq!(a.service.sync().unwrap_err(), SyncError::PassphraseMissing);
+    assert!(server.files().is_empty(), "{:?}", server.files());
+
+    // With one, the vault travels sealed under it alone.
+    a.service
+        .set_passphrase(Some(&SecretString::new(PASSPHRASE)))
+        .expect("saved");
+    expect_uploaded(a.service.sync());
+    let text = remote_text(&server);
+    assert!(text.contains("\"vault\""), "{text}");
+    assert!(!text.contains(PASSPHRASE), "{text}");
+
+    // A new device with the same passphrase restores everything.
+    let b = Machine::new("passphrase-b", Platform::Linux);
+    connect_passwordless(&b, &server);
+    b.update_config(|config| config.sync_secrets = true);
+    b.service
+        .set_passphrase(Some(&SecretString::new(PASSPHRASE)))
+        .expect("saved");
+    expect_pulled(b.service.sync());
+    assert_eq!(
+        secret_of(&open_vault(&b), credential).as_deref(),
+        Some(VAULT_SECRET)
+    );
+
+    // A wrong passphrase adopts nothing and overwrites nothing.
+    let c = Machine::new("passphrase-c", Platform::Linux);
+    connect_passwordless(&c, &server);
+    c.update_config(|config| config.sync_secrets = true);
+    c.service
+        .set_passphrase(Some(&SecretString::new("not the passphrase")))
+        .expect("saved");
+    let before = server.file(REMOTE_PATH).expect("the cloud file");
+    assert!(matches!(
+        c.service.sync().unwrap_err(),
+        SyncError::Vault(VaultStoreError::Sealed)
+    ));
+    assert!(!vault_store(&c).exists(), "no empty vault was written here");
+    assert_eq!(server.file(REMOTE_PATH).expect("the cloud file"), before);
+}
+
+#[test]
+fn changes_to_different_records_merge_and_one_record_changed_on_both_sides_conflicts() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let first = CredentialId::new();
+    let second = CredentialId::new();
+    let (a, b) = synced_vault_pair("merge-vault", &server, |content| {
+        content
+            .insert_credential(credential_named(first, "First login", 1, VAULT_SECRET))
+            .expect("inserts");
+        content
+            .insert_credential(credential_named(second, "Second login", 1, VAULT_SECRET))
+            .expect("inserts");
+    });
+
+    // Different records changed on both sides: both changes survive (R6).
+    replace_credential(&a, first, |record| {
+        credential_at(&record, 2, "device-a", VAULT_SECRET_2)
+    });
+    expect_uploaded(a.service.sync());
+    replace_credential(&b, second, |record| {
+        credential_at(&record, 2, "device-b", VAULT_SECRET_3)
+    });
+    expect_merged(b.service.sync());
+    assert_eq!(
+        secret_of(&open_vault(&b), first).as_deref(),
+        Some(VAULT_SECRET_2)
+    );
+    assert_eq!(
+        secret_of(&open_vault(&b), second).as_deref(),
+        Some(VAULT_SECRET_3)
+    );
+    expect_pulled(a.service.sync());
+    assert_eq!(
+        secret_of(&open_vault(&a), first).as_deref(),
+        Some(VAULT_SECRET_2)
+    );
+    assert_eq!(
+        secret_of(&open_vault(&a), second).as_deref(),
+        Some(VAULT_SECRET_3)
+    );
+    expect_up_to_date(a.service.sync());
+    expect_up_to_date(b.service.sync());
+
+    // The same record changed on both sides: a conflict with both sides
+    // described, never a quiet last-write-wins.
+    replace_credential(&a, first, |record| {
+        credential_at(&record, 9, "device-a", "the-a-edit")
+    });
+    expect_uploaded(a.service.sync());
+    replace_credential(&b, first, |record| {
+        credential_at(&record, 9, "device-b", "the-b-edit")
+    });
+    let conflicts = expect_vault_conflict(b.service.sync(), 1);
+    match &conflicts[0] {
+        VaultConflict::Record {
+            kind: VaultRecordKind::Credential,
+            id,
+            name,
+            local,
+            remote,
+        } => {
+            assert_eq!(*id, first.to_string());
+            assert_eq!(name, "First login");
+            assert_eq!(local.device_id, "device-b");
+            assert_eq!(local.counter, 9);
+            // The cloud's version was stamped by the merging device (the
+            // global counter of the write), above the edit it carried.
+            assert!(remote.counter >= 9, "{:?}", remote);
+            assert_ne!(remote.device_id, local.device_id);
+            assert!(!local.deleted && !remote.deleted);
+        }
+        other => panic!("a record conflict, got {other:?}"),
+    }
+    assert_eq!(
+        secret_of(&open_vault(&b), first).as_deref(),
+        Some("the-b-edit"),
+        "nothing was applied while the conflict stands"
+    );
+    assert_eq!(
+        secret_of(&open_vault(&a), first).as_deref(),
+        Some("the-a-edit")
+    );
+
+    // Cancelling keeps the conflict and both sides.
+    expect_vault_conflict(b.service.resolve_vault(&[]), 1);
+    assert_eq!(
+        secret_of(&open_vault(&b), first).as_deref(),
+        Some("the-b-edit")
+    );
+
+    // A choice settles it; the chosen record applies to both sides. The cloud
+    // already held it, so applying it here is the whole of the write.
+    expect_pulled(
+        b.service
+            .resolve_vault(&[choice_for_record(first, VaultChoiceSide::Remote)]),
+    );
+    assert_eq!(
+        secret_of(&open_vault(&b), first).as_deref(),
+        Some("the-a-edit")
+    );
+    expect_up_to_date(b.service.sync());
+    expect_up_to_date(a.service.sync());
+    assert_eq!(
+        secret_of(&open_vault(&a), first).as_deref(),
+        Some("the-a-edit")
+    );
+}
+
+#[test]
+fn deleting_here_against_changing_there_is_a_conflict_not_a_resurrection() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let credential = CredentialId::new();
+    let (a, b) = synced_vault_pair("vault-delete", &server, |content| {
+        content
+            .insert_credential(credential_named(credential, "Prod login", 1, VAULT_SECRET))
+            .expect("inserts");
+    });
+
+    // A deletes, B edits the same record.
+    let mut deleted = open_vault(&a);
+    assert!(deleted.remove_credential(credential).expect("tombstone"));
+    save_vault(&a, &deleted);
+    expect_uploaded(a.service.sync());
+    replace_credential(&b, credential, |record| {
+        credential_at(&record, 4, "device-b", "the-b-edit")
+    });
+
+    let conflicts = expect_vault_conflict(b.service.sync(), 1);
+    match &conflicts[0] {
+        VaultConflict::Record { local, remote, .. } => {
+            assert!(!local.deleted, "this side changed the record");
+            assert!(remote.deleted, "the other side deleted it");
+        }
+        other => panic!("a record conflict, got {other:?}"),
+    }
+    // The record is neither silently deleted nor silently resurrected.
+    assert_eq!(
+        secret_of(&open_vault(&b), credential).as_deref(),
+        Some("the-b-edit")
+    );
+
+    // The user keeps the change: the record lives on both sides.
+    expect_merged(
+        b.service
+            .resolve_vault(&[choice_for_record(credential, VaultChoiceSide::Local)]),
+    );
+    assert_eq!(
+        secret_of(&open_vault(&b), credential).as_deref(),
+        Some("the-b-edit")
+    );
+    expect_pulled(a.service.sync());
+    assert_eq!(
+        secret_of(&open_vault(&a), credential).as_deref(),
+        Some("the-b-edit")
+    );
+
+    // A later deletion by one side travels to the other as a fact (R8: a
+    // revoked trust or a deleted record reaches the other side).
+    let mut deleted_again = open_vault(&a);
+    assert!(
+        deleted_again
+            .remove_credential(credential)
+            .expect("tombstone")
+    );
+    save_vault(&a, &deleted_again);
+    expect_uploaded(a.service.sync());
+    expect_pulled(b.service.sync());
+    let vault = open_vault(&b);
+    let record = vault.credential(credential).expect("the tombstone");
+    assert!(
+        record.meta().deleted().is_some(),
+        "deleted, not resurrected"
+    );
+    assert!(record.secret().is_none());
+}
+
+#[test]
+fn a_conflicted_vault_is_applied_all_at_once_or_not_at_all() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let first = CredentialId::new();
+    let second = CredentialId::new();
+    let (a, b) = synced_vault_pair("vault-atomic", &server, |content| {
+        content
+            .insert_credential(credential_named(first, "First login", 1, VAULT_SECRET))
+            .expect("inserts");
+        content
+            .insert_credential(credential_named(second, "Second login", 1, VAULT_SECRET))
+            .expect("inserts");
+    });
+
+    // A conflict exists, and a mergeable record waits behind it.
+    replace_credential(&a, first, |record| {
+        credential_at(&record, 2, "device-a", "the-a-edit")
+    });
+    expect_uploaded(a.service.sync());
+    replace_credential(&b, first, |record| {
+        credential_at(&record, 2, "device-b", "the-b-edit")
+    });
+    replace_credential(&b, second, |record| {
+        credential_at(&record, 5, "device-b", "the-b-second")
+    });
+    let files = data_files(&b.root);
+    let remote_before = server.file(REMOTE_PATH).expect("the cloud file");
+    expect_vault_conflict(b.service.sync(), 1);
+    assert_eq!(
+        data_files(&b.root),
+        files,
+        "no part of the vault was applied while the conflict stands"
+    );
+    assert_eq!(
+        server.file(REMOTE_PATH).expect("the cloud file"),
+        remote_before
+    );
+
+    // A refused upload during the resolution changes nothing either.
+    server.set_read_only(true);
+    assert!(
+        b.service
+            .resolve_vault(&[choice_for_record(first, VaultChoiceSide::Local)])
+            .is_err()
+    );
+    assert_eq!(data_files(&b.root), files);
+    server.set_read_only(false);
+
+    // Once decided, everything applies together.
+    expect_merged(
+        b.service
+            .resolve_vault(&[choice_for_record(first, VaultChoiceSide::Local)]),
+    );
+    assert_eq!(
+        secret_of(&open_vault(&b), first).as_deref(),
+        Some("the-b-edit")
+    );
+    assert_eq!(
+        secret_of(&open_vault(&b), second).as_deref(),
+        Some("the-b-second")
+    );
+    expect_pulled(a.service.sync());
+    assert_eq!(
+        secret_of(&open_vault(&a), second).as_deref(),
+        Some("the-b-second")
+    );
+}
+
+#[test]
+fn an_abnormally_rolled_back_cloud_vault_stops_automatic_sync() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let credential = CredentialId::new();
+    let (a, b) = synced_vault_pair("vault-rollback", &server, |content| {
+        content
+            .insert_credential(credential_named(credential, "Prod login", 1, VAULT_SECRET))
+            .expect("inserts");
+    });
+    // An older but once-valid cloud file, kept aside.
+    let older = server.file(REMOTE_PATH).expect("the first upload");
+
+    replace_credential(&a, credential, |record| {
+        credential_at(&record, 2, "device-a", VAULT_SECRET_2)
+    });
+    expect_uploaded(a.service.sync());
+    expect_pulled(b.service.sync());
+    assert_eq!(
+        secret_of(&open_vault(&b), credential).as_deref(),
+        Some(VAULT_SECRET_2)
+    );
+
+    // The cloud is replaced by the older ciphertext: an abnormal rollback
+    // (R6). The machine has a baseline and refuses to apply or overwrite.
+    server.put_file(REMOTE_PATH, &older);
+    let files = data_files(&b.root);
+    assert!(matches!(
+        b.service.sync().unwrap_err(),
+        SyncError::Rollback { .. }
+    ));
+    assert!(matches!(
+        b.service.pull().unwrap_err(),
+        SyncError::Rollback { .. }
+    ));
+    assert_eq!(data_files(&b.root), files, "nothing was rolled back here");
+    assert_eq!(server.file(REMOTE_PATH).expect("the cloud file"), older);
+
+    // The user may still choose this machine's data explicitly.
+    expect_uploaded(b.service.resolve(Resolution::UseLocal));
+    expect_pulled(a.service.sync());
+    assert_eq!(
+        secret_of(&open_vault(&a), credential).as_deref(),
+        Some(VAULT_SECRET_2)
+    );
+    expect_up_to_date(b.service.sync());
+}
+
+#[test]
+fn trust_travels_in_ciphertext_and_changed_identities_conflict_with_full_fingerprints() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let old_key = identity_key(1);
+    let new_key_on_a = identity_key(2);
+    let new_key_on_b = identity_key(3);
+    let trust_with = |key: &shellune_storage::HostKey| {
+        let mut trust = shellune_storage::HostTrust::new();
+        trust
+            .accept("web.example", 22, key, 1_700_000_000)
+            .expect("accepted");
+        trust
+    };
+    let (a, b) = synced_vault_pair("vault-trust", &server, |content| {
+        content.set_trust(trust_with(&old_key));
+    });
+
+    // The same identity needs no second asking on the other machine (R8).
+    assert_eq!(
+        open_vault(&b)
+            .trust()
+            .entry("web.example", 22)
+            .map(|e| e.fingerprint()),
+        Some(old_key.fingerprint.as_str())
+    );
+
+    // Both sides accept different identities for the same server.
+    let mut a_vault = open_vault(&a);
+    a_vault.set_trust(trust_with(&new_key_on_a));
+    save_vault(&a, &a_vault);
+    expect_uploaded(a.service.sync());
+    let mut b_vault = open_vault(&b);
+    b_vault.set_trust(trust_with(&new_key_on_b));
+    save_vault(&b, &b_vault);
+
+    let conflicts = expect_vault_conflict(b.service.sync(), 1);
+    match &conflicts[0] {
+        VaultConflict::Trust {
+            host,
+            port,
+            local,
+            remote,
+            remote_source_platform,
+            ..
+        } => {
+            assert_eq!((host.as_str(), *port), ("web.example", 22));
+            assert_eq!(
+                local.as_ref().map(|identity| identity.fingerprint.as_str()),
+                Some(new_key_on_b.fingerprint.as_str()),
+                "both complete fingerprints are shown"
+            );
+            assert_eq!(
+                remote
+                    .as_ref()
+                    .map(|identity| identity.fingerprint.as_str()),
+                Some(new_key_on_a.fingerprint.as_str())
+            );
+            assert_eq!(*remote_source_platform, "linux");
+        }
+        other => panic!("a trust conflict, got {other:?}"),
+    }
+    // Neither identity was replaced while the conflict stands.
+    assert_eq!(
+        open_vault(&b)
+            .trust()
+            .entry("web.example", 22)
+            .map(|e| e.fingerprint()),
+        Some(new_key_on_b.fingerprint.as_str())
+    );
+
+    // Cancelling keeps both; a choice settles it without any retry overriding
+    // the local trust.
+    expect_vault_conflict(b.service.resolve_vault(&[]), 1);
+    // The cloud already holds the chosen identity: applying it is enough.
+    expect_pulled(b.service.resolve_vault(&[VaultChoice {
+        key: VaultChoiceKey::Trust {
+            host: "web.example".to_owned(),
+            port: 22,
+        },
+        side: VaultChoiceSide::Remote,
+    }]));
+    assert_eq!(
+        open_vault(&b)
+            .trust()
+            .entry("web.example", 22)
+            .map(|e| e.fingerprint()),
+        Some(new_key_on_a.fingerprint.as_str())
+    );
+    expect_up_to_date(b.service.sync());
+    // The cloud was never rewritten by the choice — it already held the
+    // identity — so the other machine has nothing left to do.
+    expect_up_to_date(a.service.sync());
+
+    // A revocation against a change is the same conflict (R8).
+    let mut revoked = open_vault(&b);
+    let mut trust = revoked.trust().clone();
+    assert!(trust.forget("web.example", 22), "the trust was there");
+    revoked.set_trust(trust);
+    save_vault(&b, &revoked);
+    let mut changed = open_vault(&a);
+    changed.set_trust(trust_with(&new_key_on_b));
+    save_vault(&a, &changed);
+    expect_uploaded(a.service.sync());
+    let conflicts = expect_vault_conflict(b.service.sync(), 1);
+    match &conflicts[0] {
+        VaultConflict::Trust { local, remote, .. } => {
+            assert!(local.is_none(), "this side revoked the trust");
+            assert!(remote.is_some(), "the other side changed it");
+        }
+        other => panic!("a trust conflict, got {other:?}"),
+    }
+}
+
+/// One presented identity, distinct by its seed.
+fn identity_key(seed: u8) -> shellune_storage::HostKey {
+    shellune_storage::HostKey::new(
+        "ssh-ed25519",
+        shellune_core::sha256_fingerprint(&[seed; 32]).expect("fingerprint"),
+        format!("ssh-ed25519 AAAAidentity-{seed}"),
+    )
+    .expect("identity")
+}
+
+#[test]
+fn a_tampered_cloud_vault_is_refused_whole_and_nothing_changes() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let credential = CredentialId::new();
+    let (_a, b) = synced_vault_pair("vault-tamper", &server, |content| {
+        content
+            .insert_credential(credential_named(credential, "Prod login", 1, VAULT_SECRET))
+            .expect("inserts");
+    });
+
+    // The cloud's vault block is changed without knowing the secret: the
+    // authentication tag must refuse it, whole (R8).
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&server.file(REMOTE_PATH).expect("the cloud file")).expect("json");
+    let ciphertext = document["vault"]["ciphertext"]
+        .as_str()
+        .expect("the sealed body")
+        .to_owned();
+    let mut bytes: Vec<u8> = ciphertext.into_bytes();
+    bytes.swap(0, 1);
+    document["vault"]["ciphertext"] =
+        serde_json::Value::String(String::from_utf8(bytes).expect("still base64 text"));
+    let tampered = serde_json::to_vec(&document).expect("json");
+    server.put_file(REMOTE_PATH, &tampered);
+
+    let files = data_files(&b.root);
+    assert!(matches!(b.service.sync().unwrap_err(), SyncError::Vault(_)));
+    assert_eq!(data_files(&b.root), files, "nothing was applied here");
+    assert_eq!(
+        server.file(REMOTE_PATH).expect("the cloud file"),
+        tampered,
+        "the tampered file was not overwritten either"
+    );
+}
+
+#[test]
+fn an_empty_cloud_vault_never_overwrites_local_records() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let credential = CredentialId::new();
+    let (_a, b) = synced_vault_pair("vault-empty", &server, |content| {
+        content
+            .insert_credential(credential_named(credential, "Prod login", 1, VAULT_SECRET))
+            .expect("inserts");
+    });
+
+    // The cloud is replaced by a valid, empty vault — an old client that
+    // overwrote the file, or a rollback to before anything existed. A machine
+    // with records and a baseline applies none of it and overwrites nothing.
+    let cipher = VaultCipher::seal(
+        &VaultContent::new(),
+        None,
+        &[KeySource::Passphrase {
+            purpose: PassphrasePurpose::WebDavPassword,
+            value: SecretString::new(DAV_PASSWORD),
+        }],
+        cheap_kdf(),
+    )
+    .expect("seals");
+    let mut options = ExportOptions::new(Platform::Linux);
+    options.kdf = cheap_kdf();
+    let document = ShelluneData::export(
+        &LocalState::default(),
+        &options.with_vault(cipher),
+        &*b.secrets,
+        None,
+    )
+    .expect("exports")
+    .document;
+    let empty = document.to_json().expect("json");
+    server.put_file(REMOTE_PATH, &empty);
+
+    let files = data_files(&b.root);
+    assert!(matches!(
+        b.service.sync().unwrap_err(),
+        SyncError::Rollback { .. } | SyncError::Vault(_)
+    ));
+    assert_eq!(
+        data_files(&b.root),
+        files,
+        "an empty remote vault is not a valid overwrite"
+    );
+    assert_eq!(server.file(REMOTE_PATH).expect("the cloud file"), empty);
+    assert_eq!(
+        secret_of(&open_vault(&b), credential).as_deref(),
+        Some(VAULT_SECRET),
+        "the local records stand"
+    );
+}
+
+#[test]
+fn a_version_1_document_still_carrying_passwords_is_not_replaced_quietly() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    // A legacy machine puts a version 1 document with sealed passwords up.
+    let legacy = Machine::new("vault-legacy", Platform::Linux);
+    legacy.connect(&server);
+    legacy.update_config(|config| config.sync_secrets = true);
+    legacy
+        .service
+        .set_passphrase(Some(&SecretString::new(PASSPHRASE)))
+        .expect("saved");
+    let mut web_id = None;
+    legacy.edit(|state| {
+        let mut web = HostConfig::new("web", "10.0.0.5", 22, "deploy").expect("host");
+        web.set_auth(Some(AuthMethodKind::Password));
+        web.set_remember_secret(true);
+        web_id = Some(web.id());
+        state.hosts.insert(web).expect("inserted");
+    });
+    let web_id = web_id.expect("web");
+    legacy
+        .secrets
+        .save(web_id, &SecretString::new(HOST_PASSWORD))
+        .expect("saved");
+    expect_uploaded(legacy.service.sync());
+    assert!(remote_text(&server).contains("\"secrets\""));
+
+    // A machine with a vault meets it: replacing the document would drop those
+    // passwords from the cloud, so the user decides instead of the sync (R9).
+    let modern = Machine::new("vault-modern", Platform::Linux);
+    modern.connect(&server);
+    modern.update_config(|config| config.sync_secrets = true);
+    create_vault(&modern, |content| {
+        content
+            .insert_credential(credential_named(
+                CredentialId::new(),
+                "Modern login",
+                1,
+                VAULT_SECRET,
+            ))
+            .expect("inserts");
+    });
+    let files = data_files(&modern.root);
+    let remote_before = server.file(REMOTE_PATH).expect("the cloud file");
+    let report = expect_conflict(modern.service.sync());
+    assert!(
+        report.vault.is_empty(),
+        "a document conflict, not vault items"
+    );
+    assert_eq!(data_files(&modern.root), files);
+    assert_eq!(
+        server.file(REMOTE_PATH).expect("the cloud file"),
+        remote_before
+    );
+}
+
+#[test]
+fn turning_vault_sync_off_never_deletes_the_clouds_ciphertext() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let credential = CredentialId::new();
+    let (a, b) = synced_vault_pair("vault-off", &server, |content| {
+        content
+            .insert_credential(credential_named(credential, "Prod login", 1, VAULT_SECRET))
+            .expect("inserts");
+    });
+    assert!(remote_text(&server).contains("\"vault\""));
+
+    // A turns the vault off and changes its records: the upload keeps the
+    // cloud's ciphertext untouched (R5: deleting it is a separate, explicit
+    // choice of the user, never a side effect).
+    a.update_config(|config| config.sync_secrets = false);
+    a.edit(|state| {
+        add_host(state, "while-off");
+    });
+    expect_uploaded(a.service.sync());
+    let text = remote_text(&server);
+    assert!(text.contains("\"vault\""), "{text}");
+    assert_eq!(remote_document(&server).version(), 2);
+    assert!(!text.contains(VAULT_SECRET));
+
+    // The other machine still sees the vault and its own records.
+    expect_pulled(b.service.sync());
+    a.edit(|state| {
+        add_host(state, "more");
+    });
+    expect_uploaded(a.service.sync());
+    expect_pulled(b.service.sync());
+    assert!(b.host_names().contains(&"more".to_owned()));
+    expect_up_to_date(b.service.sync());
 }

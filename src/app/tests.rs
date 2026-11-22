@@ -35090,20 +35090,25 @@ async fn a_damaged_or_newer_backup_is_refused_and_nothing_is_written(cx: &mut Te
         r#"{"format":"shellune-data","version":1,"created_unix":1,"#,
         r#""source_platform":"linux","source_app_version":"0.4.7"}"#
     );
+    let future = shellune_storage::PORTABLE_VAULT_VERSION + 1;
     let cases = [
         (
             "not-json.json",
-            "{ this is not json",
-            copy::ENGLISH_BACKUP.error_not_backup,
+            "{ this is not json".to_string(),
+            copy::ENGLISH_BACKUP.error_not_backup.to_string(),
         ),
         (
             "newer.json",
-            r#"{"format":"shellune-data","version":2}"#,
-            "format 2",
+            format!(r#"{{"format":"shellune-data","version":{future}}}"#),
+            format!("format {future}"),
         ),
-        ("damaged.json", damaged, copy::ENGLISH_BACKUP.error_corrupt),
+        (
+            "damaged.json",
+            damaged.to_string(),
+            copy::ENGLISH_BACKUP.error_corrupt.to_string(),
+        ),
     ];
-    for (name, content, expected) in cases {
+    for (name, content, expected) in &cases {
         let path = dir.path().join(name);
         std::fs::write(&path, content).expect("the test writes the file");
         read_backup(&view, cx, &path);

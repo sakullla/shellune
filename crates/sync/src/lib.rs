@@ -33,10 +33,12 @@ mod tests;
 
 pub use config::{
     CONFIG_FILE_NAME, ConfigError, DEFAULT_REMOTE_DIR, LastResult, STATE_FILE_NAME, SyncConfig,
-    SyncConfigStore, SyncState, SyncStateStore,
+    SyncConfigStore, SyncState, SyncStateStore, VaultBaseline, VaultRecordBase,
 };
 pub use engine::{
-    ConflictReport, PullReport, Resolution, SyncError, SyncOutcome, SyncService, UploadReport,
+    ConflictReport, PullReport, Resolution, SyncError, SyncOutcome, SyncService, TrustIdentity,
+    UploadReport, VaultChoice, VaultChoiceKey, VaultChoiceSide, VaultConflict, VaultRecordKind,
+    VaultRecordSide, VaultRestored,
 };
 pub use webdav::{
     Download, Precondition, REMOTE_FILE_NAME, RemoteFile, WebDavClient, WebDavError,

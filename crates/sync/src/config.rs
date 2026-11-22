@@ -7,9 +7,11 @@
 //! never in a file. The state remembers what both sides held at the last
 //! successful sync, which is what tells a local change from a remote one.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use shellune_core::{CredentialId, KeyId};
 
 /// The settings file in the data directory.
 pub const CONFIG_FILE_NAME: &str = "sync.json";
@@ -34,7 +36,14 @@ pub struct SyncConfig {
     pub remote_dir: String,
     /// Whether changes are uploaded and the cloud is checked without asking.
     pub auto: bool,
-    /// Whether the saved passwords travel too, sealed under the sync passphrase.
+    /// Whether the secrets travel too. The field keeps its name for the files
+    /// already on machines; its meaning is the vault: with an encrypted vault on
+    /// this machine or in the cloud, the document becomes a version 2 one whose
+    /// vault block carries the managed keys, the shared passwords and the
+    /// accepted server identities, unsealed by the WebDAV password or, on an
+    /// account without one, by the sync passphrase (R5). Without a vault
+    /// anywhere, this stays the version 1 sealed-password arrangement under the
+    /// sync passphrase.
     pub sync_secrets: bool,
 }
 
@@ -243,6 +252,27 @@ pub struct SyncState {
     /// choice to sync passwords is a local change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_secrets_hash: Option<String>,
+    /// The identity of this machine as a writer of vault records (ADR-5): the
+    /// device name stamped into the record version every merge writes. Drawn once
+    /// and kept, so two syncs of one machine never look like two devices.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// The fingerprint of the public part of this machine's encrypted vault as it
+    /// was after the last successful sync; `None` when no vault travelled or the
+    /// vault did not travel then. A record, tombstone or trust change is a local
+    /// change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_vault_hash: Option<String>,
+    /// The fingerprint of the public part of the vault the cloud document carried
+    /// after the last successful sync; `None` when it carried none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_remote_vault_hash: Option<String>,
+    /// The record-version baseline of the encrypted vault at the last successful
+    /// sync (ADR-5): what tells "only this machine changed the record" from "both
+    /// did", and what the global counter of an abnormally rolled-back cloud is
+    /// compared against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vault: Option<VaultBaseline>,
     /// How the last attempt ended.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_result: Option<LastResult>,
@@ -266,6 +296,40 @@ impl SyncState {
     pub fn has_conflict(&self) -> bool {
         self.last_result == Some(LastResult::Conflict)
     }
+}
+
+/// One vault record as the last successful sync saw it: which version it carried
+/// and whether it was already a tombstone. A deletion keeps the version it had,
+/// so the liveness beside the version is what tells a deletion from a stasis.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultRecordBase {
+    /// How many changes the record had had.
+    pub counter: u64,
+    /// Which device wrote that version.
+    pub device_id: String,
+    /// Whether the record was already deleted at the last sync.
+    pub deleted: bool,
+}
+
+/// The common baseline of the last successful vault sync (ADR-5): the version of
+/// every record both sides held, the global counter of the whole vault and the
+/// accepted server identities. It holds public metadata only — names,
+/// algorithms, fingerprints — never a secret; the passwords themselves never
+/// leave the ciphertext.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VaultBaseline {
+    /// The identity of the vault the records belong to.
+    pub vault_id: String,
+    /// The highest record version counter of that state; a cloud vault below it
+    /// is an abnormal rollback.
+    pub global_counter: u64,
+    /// Every managed key, live and deleted.
+    pub keys: BTreeMap<KeyId, VaultRecordBase>,
+    /// Every shared credential, live and deleted.
+    pub credentials: BTreeMap<CredentialId, VaultRecordBase>,
+    /// Every accepted server identity, as `host:port` to fingerprint.
+    pub trust: BTreeMap<String, String>,
 }
 
 /// `sync-state.json` in one data directory.
@@ -410,11 +474,41 @@ mod tests {
             }),
             last_time_unix: Some(5),
             last_success_unix: Some(4),
+            ..SyncState::default()
         };
         store.save(&state).expect("saved");
         assert_eq!(store.load(), state);
         assert!(state.knows("https://dav/x/shellune-data.json"));
         assert!(!state.knows("https://other/shellune-data.json"));
+
+        // The vault baseline travels in the same file, and a state an older
+        // build wrote simply has none of it.
+        let mut with_vault = state.clone();
+        with_vault.device_id = Some("device-a".to_owned());
+        with_vault.vault = Some(VaultBaseline {
+            vault_id: "0123456789abcdef".to_owned(),
+            global_counter: 7,
+            keys: BTreeMap::from([(
+                KeyId::new(),
+                VaultRecordBase {
+                    counter: 7,
+                    device_id: "device-a".to_owned(),
+                    deleted: false,
+                },
+            )]),
+            credentials: BTreeMap::from([(
+                CredentialId::new(),
+                VaultRecordBase {
+                    counter: 3,
+                    device_id: "device-b".to_owned(),
+                    deleted: true,
+                },
+            )]),
+            trust: BTreeMap::from([("web:22".to_owned(), "SHA256:old".to_owned())]),
+        });
+        store.save(&with_vault).expect("saved");
+        assert_eq!(store.load(), with_vault);
+        assert!(state.vault.is_none(), "the older state keeps its shape");
         // A state an older build wrote has no fingerprint without recents.
         std::fs::write(
             store.path(),
