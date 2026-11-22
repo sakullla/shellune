@@ -150,6 +150,8 @@ pub enum SortKey {
     Name,
     /// By the size the server reported.
     Size,
+    /// By when the entry last changed.
+    Modified,
 }
 
 /// How one column orders its listing: a key and a direction.
@@ -195,9 +197,11 @@ impl FileSort {
                 descending: !self.descending,
             }
         } else {
+            // A time is asked for to find what changed last, so it starts newest first;
+            // a name or a size starts at the small end.
             Self {
                 key,
-                descending: false,
+                descending: key == SortKey::Modified,
             }
         }
     }
@@ -1131,6 +1135,19 @@ fn compare_entries(left: &DirEntry, right: &DirEntry, sort: FileSort) -> Orderin
             (None, Some(_)) => Ordering::Greater,
             (None, None) => Ordering::Equal,
         },
+        // As with a size, an entry without a time stays at the end either way.
+        SortKey::Modified => match (left.modified(), right.modified()) {
+            (Some(one), Some(other)) => {
+                if sort.descending {
+                    other.cmp(&one)
+                } else {
+                    one.cmp(&other)
+                }
+            }
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        },
     };
     by.then_with(|| left.name().to_lowercase().cmp(&right.name().to_lowercase()))
 }
@@ -1610,11 +1627,16 @@ fn list_directory(path: &Path) -> Result<Vec<shellune_core::DirEntry>, BrowseFai
         let name = item.file_name();
         let name = name.to_string_lossy();
         let kind = entry_kind(item.path().as_path());
+        let meta = item.metadata().ok();
         let size = (kind == FileKind::File)
-            .then(|| item.metadata().ok().map(|meta| meta.len()))
+            .then(|| meta.as_ref().map(std::fs::Metadata::len))
             .flatten();
+        let modified = meta
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs());
         if let Some(entry) = shellune_core::DirEntry::new(name.as_ref(), kind, size) {
-            entries.push(entry);
+            entries.push(entry.with_modified(modified));
         }
     }
     Ok(entries)
@@ -2260,6 +2282,49 @@ mod tests {
 
     use super::*;
     use shellune_core::DirEntry;
+
+    fn stamped(name: &str, kind: FileKind, modified: Option<u64>) -> DirEntry {
+        DirEntry::new(name, kind, Some(1))
+            .expect("a valid name")
+            .with_modified(modified)
+    }
+
+    #[test]
+    fn a_press_on_the_modified_header_starts_with_the_newest() {
+        let sort = FileSort::name().pressed(SortKey::Modified);
+        assert_eq!(sort.key(), SortKey::Modified);
+        assert!(
+            sort.descending(),
+            "what changed last is what a reader looks for"
+        );
+        assert!(
+            !sort.pressed(SortKey::Modified).descending(),
+            "a second press reverses it"
+        );
+        assert!(
+            !sort.pressed(SortKey::Size).descending(),
+            "a size still starts with the smallest"
+        );
+    }
+
+    #[test]
+    fn the_modified_order_keeps_folders_first_and_unknown_times_last() {
+        let mut rows = [
+            stamped("old.txt", FileKind::File, Some(100)),
+            stamped("unknown.txt", FileKind::File, None),
+            stamped("new.txt", FileKind::File, Some(300)),
+            stamped("dir", FileKind::Directory, Some(1)),
+        ];
+        let newest = FileSort::name().pressed(SortKey::Modified);
+        rows.sort_by(|left, right| compare_entries(left, right, newest));
+        let names: Vec<&str> = rows.iter().map(DirEntry::name).collect();
+        assert_eq!(names, ["dir", "new.txt", "old.txt", "unknown.txt"]);
+
+        let oldest = newest.pressed(SortKey::Modified);
+        rows.sort_by(|left, right| compare_entries(left, right, oldest));
+        let names: Vec<&str> = rows.iter().map(DirEntry::name).collect();
+        assert_eq!(names, ["dir", "old.txt", "new.txt", "unknown.txt"]);
+    }
 
     /// What a scripted connection holds.
     #[derive(Default)]

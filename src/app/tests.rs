@@ -2249,6 +2249,9 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             files_local_exists,
             files_local_unavailable,
             files_local_root,
+            files_sort_modified_new,
+            files_sort_modified_old,
+            files_item_count,
             transfers_resume,
             transfers_restart,
             transfers_resume_from,
@@ -11874,13 +11877,16 @@ async fn a_session_that_ends_takes_its_file_view_and_the_polling_with_it(cx: &mu
 }
 
 #[gpui::test]
-async fn a_deep_path_is_readable_instead_of_being_cut_off(cx: &mut TestAppContext) {
+async fn a_deep_path_stays_on_one_line_and_folds_its_middle(cx: &mut TestAppContext) {
     let (view, cx) = remote_view(cx);
     let id = live_remote(cx, &view);
     let answers = open_files(cx, &view, id);
     let short = bounds_of(cx, "files.path");
 
-    let deep = format!("/home/deploy/{}/inner", "a-long-directory-name".repeat(5));
+    let deep = format!(
+        "/home/deploy/{}/releases/inner",
+        "a-long-directory-name".repeat(5)
+    );
     click(cx, "files.refresh");
     answers.reply(2, &deep, &[("inner", shellune_core::FileKind::Directory)]);
     pump_files(cx, &view);
@@ -11890,9 +11896,22 @@ async fn a_deep_path_is_readable_instead_of_being_cut_off(cx: &mut TestAppContex
         "the path stays inside the panel"
     );
     assert!(
-        long.size.height > short.size.height,
-        "a deep path takes more lines instead of losing its end: {short:?} vs {long:?}"
+        (long.size.height - short.size.height).abs() <= px(1.0),
+        "a deep path keeps to one line instead of pushing the listing down: \
+         {short:?} vs {long:?}"
     );
+    assert!(
+        cx.debug_bounds("files.crumb.more").is_some(),
+        "the ancestors between the root and the nearest folders fold into one stop"
+    );
+    // The root and the two folders nearest the current one stay drawn: "/", then
+    // "releases" and "inner" at positions 4 and 5 of the six segments.
+    for selector in ["files.crumb.0", "files.crumb.4", "files.crumb.5"] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} stays on the line"
+        );
+    }
 }
 
 #[gpui::test]
@@ -24164,8 +24183,9 @@ async fn a_deep_path_is_drawn_inside_its_column_at_the_large_text(cx: &mut TestA
         Zoom::Comfortable
     );
 
-    // The path is one segment per folder, and every segment stays inside the column:
-    // wrapping decides where a long path goes, never a clip at the edge (R6, R8).
+    // The path keeps one segment per folder it shows, and every segment stays inside
+    // the column: folding decides what a long path shows, never a clip at the edge
+    // (R6, R8).
     let panel = bounds_of(cx, "files.panel");
     let mut seen = 0;
     for selector in [
@@ -24187,8 +24207,8 @@ async fn a_deep_path_is_drawn_inside_its_column_at_the_large_text(cx: &mut TestA
         );
     }
     assert!(
-        seen >= 5,
-        "the deep path is drawn as its own segments, not one clipped label: {seen}"
+        seen >= 3,
+        "the deep path keeps its root and nearest folders as their own segments: {seen}"
     );
     // Each segment is bounded, so one long folder name cannot take the whole column and
     // the segments after it still get room at the largest text size.

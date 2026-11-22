@@ -479,6 +479,7 @@ async fn read_directory(
                     _ => metadata.size,
                 };
                 DirEntry::new(name, kind, size)
+                    .map(|entry| entry.with_modified(metadata.mtime.map(u64::from)))
             })
             .collect(),
         Err(error) => {

@@ -633,10 +633,16 @@ pub struct Strings {
     pub files_sort_size_asc: &'static str,
     /// Tooltip of the size header while the column is sorted by size, largest first.
     pub files_sort_size_desc: &'static str,
+    /// Tooltip of the modified header while the column is sorted newest first.
+    pub files_sort_modified_new: &'static str,
+    /// Tooltip of the modified header while the column is sorted oldest first.
+    pub files_sort_modified_old: &'static str,
     /// Placeholder of the field that filters one column's names.
     pub files_filter_placeholder: &'static str,
     /// How many names the filter lets through, out of how many the listing holds.
     pub files_filter_count: &'static str,
+    /// How many names the listing holds, while no filter narrows it.
+    pub files_item_count: &'static str,
     /// Button that clears the filter of one column.
     pub files_filter_clear: &'static str,
     /// Said instead of the listing when the filter matches no name.
@@ -1482,8 +1488,11 @@ pub static ENGLISH: Strings = Strings {
     files_sort_desc: "Sorted by name, Z to A; press to reverse",
     files_sort_size_asc: "Sorted by size, smallest first; press to reverse",
     files_sort_size_desc: "Sorted by size, largest first; press to reverse",
+    files_sort_modified_new: "Sorted by modified time, newest first; press to reverse",
+    files_sort_modified_old: "Sorted by modified time, oldest first; press to reverse",
     files_filter_placeholder: "Filter names",
     files_filter_count: "{shown} of {total} names",
+    files_item_count: "{total} items",
     files_filter_clear: "Clear filter",
     files_filter_none: "No name in this folder matches the filter.",
     files_marked_count: "{count} selected",
@@ -2044,8 +2053,11 @@ pub static CHINESE: Strings = Strings {
     files_sort_desc: "按名称排序，Z→A；再次点击反向",
     files_sort_size_asc: "按大小排序，从小到大；再次点击反向",
     files_sort_size_desc: "按大小排序，从大到小；再次点击反向",
+    files_sort_modified_new: "按修改时间排序，最新的在前；再次点击反向",
+    files_sort_modified_old: "按修改时间排序，最早的在前；再次点击反向",
     files_filter_placeholder: "筛选名称",
     files_filter_count: "{shown}/{total} 项",
+    files_item_count: "{total} 项",
     files_filter_clear: "清除筛选",
     files_filter_none: "该目录没有名称符合筛选条件。",
     files_marked_count: "已选 {count} 项",
@@ -2690,11 +2702,10 @@ pub struct UxStrings {
     pub files_name: &'static str,
     /// Size
     pub files_size: &'static str,
+    /// Modified
+    pub files_modified: &'static str,
     /// This computer
     pub files_this_computer: &'static str,
-    /// Double-click a folder to open it. Drag a file to the other side to copy it.
-    /// Folder
-    pub files_folder: &'static str,
     /// Ports
     pub session_forwards: &'static str,
     pub custom_shell_title: &'static str,
@@ -3514,8 +3525,8 @@ impl UxStrings {
             self.fwd_more,
             self.files_name,
             self.files_size,
+            self.files_modified,
             self.files_this_computer,
-            self.files_folder,
             self.session_forwards,
             self.custom_shell_title,
             self.drop_upload_failed,
@@ -4006,8 +4017,8 @@ included",
     fwd_more: "Duplicate",
     files_name: "Name",
     files_size: "Size",
+    files_modified: "Modified",
     files_this_computer: "This computer",
-    files_folder: "Folder",
     session_forwards: "Ports",
     custom_shell_title: "Open a program",
     drop_upload_failed: "Could not upload to the server:",
@@ -4493,8 +4504,8 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     fwd_more: "复制一份",
     files_name: "名称",
     files_size: "大小",
+    files_modified: "修改时间",
     files_this_computer: "本机",
-    files_folder: "文件夹",
     session_forwards: "端口转发",
     custom_shell_title: "打开程序",
     drop_upload_failed: "无法上传到服务器：",

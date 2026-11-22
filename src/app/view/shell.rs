@@ -1736,8 +1736,11 @@ impl ShelluneView {
                         .flex()
                         .flex_col()
                         .flex_none()
-                        .w_full()
-                        .max_w(metrics.scale(CONNECTION_CARD_MAX_WIDTH))
+                        // A definite width, capped by the page: a card only as
+                        // wide as "full, at most N" was measured before its footer's
+                        // buttons wrapped, and they hung below its edge.
+                        .w(metrics.scale(CONNECTION_CARD_MAX_WIDTH))
+                        .max_w_full()
                         .rounded(px(radius::XLARGE))
                         .bg(theme::swatch(palette::SURFACE))
                         .border_1()

@@ -66,6 +66,7 @@ pub struct DirEntry {
     name: String,
     kind: FileKind,
     size: Option<u64>,
+    modified: Option<u64>,
 }
 
 impl DirEntry {
@@ -81,7 +82,26 @@ impl DirEntry {
         if !is_single_name(&name) {
             return None;
         }
-        Some(Self { name, kind, size })
+        Some(Self {
+            name,
+            kind,
+            size,
+            modified: None,
+        })
+    }
+
+    /// The entry with the time it was last modified, in seconds since the Unix epoch,
+    /// when the server or the file system reported one.
+    #[must_use]
+    pub fn with_modified(mut self, modified: Option<u64>) -> Self {
+        self.modified = modified;
+        self
+    }
+
+    /// When the entry was last modified, in seconds since the Unix epoch.
+    #[must_use]
+    pub fn modified(&self) -> Option<u64> {
+        self.modified
     }
 
     /// The name the server reported, unchanged.

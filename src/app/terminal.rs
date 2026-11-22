@@ -5373,7 +5373,9 @@ impl TerminalPane {
         }
         let offset = self.core.display_offset();
         let history = self.core.history();
-        if history == 0 || (offset == 0 && !self.scrollbar_drag) {
+        // Drawn whenever there is history, at the bottom too: a bar that appeared only
+        // after scrolling never told anyone there was anything above to scroll to.
+        if history == 0 {
             return None;
         }
         let rows = self.grid.rows.max(1);

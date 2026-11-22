@@ -407,6 +407,14 @@ pub const DOCK_MIN_WIDTH: f32 = (FILES_PANEL_WIDTH * 2.0 + 120.0) * 2.0 + 40.0;
 /// segment keeps the others on the same row and leaves the full path in the segment's
 /// tooltip, so a deep directory is readable instead of being cut off at the edge (R6).
 const CRUMB_ROOM: f32 = 240.0;
+
+/// A path with at most this many segments is drawn whole; a deeper one folds the
+/// ancestors between its root and the folders nearest the current one.
+const CRUMBS_SHOWN_WHOLE: usize = 4;
+
+/// How many segments at the end of a folded path stay drawn, the current folder
+/// included.
+const CRUMBS_KEPT_NEAR: usize = 2;
 /// Viewport height at or below which the single-column file view compresses chrome
 /// padding and caps the transfer strip tighter so the directory list keeps room.
 const FILES_SHORT_VIEWPORT_HEIGHT: f32 = 560.0;
@@ -420,6 +428,13 @@ const FILES_LOADING_ROWS: usize = 3;
 
 /// The width of a file listing's size column, before text scale.
 const FILES_SIZE_WIDTH: f32 = 80.0;
+
+/// The width of a file listing's modified column, before text scale.
+const FILES_MODIFIED_WIDTH: f32 = 96.0;
+
+/// The narrowest one column of the file view is when it still has room for the
+/// modified time beside the names, before text scale.
+const FILES_MODIFIED_MIN_COLUMN: f32 = 560.0;
 
 /// The narrowest the words of a column's batch bar get before its actions wrap under
 /// them, before text scale.
@@ -13855,6 +13870,18 @@ impl ShelluneView {
         self.files_area_width() >= self.metrics().scale(FILES_PANEL_WIDTH * 2.0 + 120.0)
     }
 
+    /// Whether one column is wide enough for the modified time: names come first,
+    /// and a narrow column keeps its room for them.
+    fn files_modified_shown(&self) -> bool {
+        let area = self.files_area_width();
+        let column = if self.files_side_by_side() {
+            area * 0.5
+        } else {
+            area
+        };
+        column >= self.metrics().scale(FILES_MODIFIED_MIN_COLUMN)
+    }
+
     fn files_show(&mut self, id: SessionId, source: FileSource, cx: &mut Context<Self>) {
         self.files.show(id, source);
         cx.notify();
@@ -15623,8 +15650,10 @@ impl ShelluneView {
             .browser_in(id, source)
             .and_then(|browser| browser.path())
             .is_some_and(|path| path != "/");
+        // The rows are the list's children after the parent row; the column header
+        // stands above the list and is not one of them.
         self.files_list_scroll(source)
-            .scroll_to_item(1 + usize::from(has_parent) + next);
+            .scroll_to_item(usize::from(has_parent) + next);
         cx.notify();
     }
 
@@ -16018,16 +16047,18 @@ impl ShelluneView {
 
         // The path, as breadcrumbs that each go back up to that folder: quiet words on
         // the page rather than a field, the current folder in the primary ink (ADR-7).
+        //
+        // One line, always. A deep path keeps its root and the folders nearest the
+        // current one, and the ancestors between them fold into "…", which opens the
+        // path to edit; every segment is bounded and ends in an ellipsis, and carries
+        // its full path in a tooltip. A path that wrapped - one long folder name broken
+        // over two lines - pushed the listing down and read as two paths (R6, R8).
         let crumbs = path.as_deref().map(path_crumbs).unwrap_or_default();
         let mut crumb_row = div()
             .flex()
             .flex_none()
             .items_center()
-            // The path wraps rather than losing its end, which is what a reader of a deep
-            // directory needs; each segment is bounded and shrinking, so no single name
-            // can claim the whole column, and every segment carries its full path in a
-            // tooltip (R6, R8).
-            .flex_wrap()
+            .min_w_0()
             .overflow_hidden()
             .gap(metrics.scale(spacing::HALF))
             .debug_selector({
@@ -16040,7 +16071,32 @@ impl ShelluneView {
                 theme::swatch(palette::TEXT_MUTED),
             ));
         let last = crumbs.len().saturating_sub(1);
+        let folded = if crumbs.len() > CRUMBS_SHOWN_WHOLE {
+            1..crumbs.len() - CRUMBS_KEPT_NEAR
+        } else {
+            0..0
+        };
         for (index, crumb) in crumbs.iter().enumerate() {
+            if folded.contains(&index) {
+                if index == folded.start {
+                    let more_id = files_element_id(source, "crumb.more");
+                    let hidden = crumbs[folded.clone()]
+                        .last()
+                        .map(|crumb| crumb.path.clone())
+                        .unwrap_or_default();
+                    crumb_row = crumb_row.child(components::crumb_separator(metrics)).child(
+                        components::crumb(false, metrics)
+                            .id(more_id.clone())
+                            .debug_selector(move || more_id.to_string())
+                            .tooltip(components::tooltip(SharedString::from(hidden)))
+                            .on_click(cx.listener(move |view, _event, _window, cx| {
+                                view.files_ask_goto(id, source, cx);
+                            }))
+                            .child("…"),
+                    );
+                }
+                continue;
+            }
             let crumb_path = crumb.path.clone();
             let label = if index == 0 && source == FileSource::Local {
                 strings.files_local_root.to_owned()
@@ -16051,10 +16107,6 @@ impl ShelluneView {
             if index > 0 {
                 crumb_row = crumb_row.child(components::crumb_separator(metrics));
             }
-            // One segment of a long path is bounded, and carries the whole path it
-            // leads to in its tooltip: a deep folder at 200% text otherwise pushes the
-            // rest of the breadcrumbs out of the column (R6, R8). The row wraps, so
-            // every ancestor stays reachable and none of them is cut to nothing.
             let crumb_tooltip = if index == last {
                 shown_path.clone()
             } else {
@@ -16065,17 +16117,18 @@ impl ShelluneView {
                     .id(crumb_id.clone())
                     .debug_selector(move || crumb_id.to_string())
                     .max_w(metrics.scale(CRUMB_ROOM))
+                    // The current folder gives way first when the line is short; the
+                    // ancestors keep their bounded room.
+                    .when(index == last, |crumb| crumb.flex_shrink())
                     .tooltip(components::tooltip(SharedString::from(crumb_tooltip)))
                     .on_click(cx.listener(move |view, _event, _window, cx| {
                         view.files_go(id, source, &crumb_path, cx);
                     }))
-                    // The name itself wraps inside its bounded box: a long folder is
-                    // read in full, not shortened to an ellipsis.
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .whitespace_normal()
+                            .truncate()
                             .child(SharedString::from(label)),
                     ),
             );
@@ -16141,7 +16194,10 @@ impl ShelluneView {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_h_0()
+                    // The listing gives way to the path and the filter, down to two
+                    // rows; a window shorter than that turns the whole column instead
+                    // of squeezing the rows out of sight (R4).
+                    .min_h(metrics.list_row_height() * 2.0)
                     .overflow_y_scroll()
                     // Page Up/Down turns the entries themselves while they are taller
                     // than the box that holds them (R4).
@@ -16155,8 +16211,7 @@ impl ShelluneView {
                     .on_mouse_down(
                         gpui::MouseButton::Right,
                         self.files_blank_menu_listener(id, source, cx),
-                    )
-                    .child(self.files_list_header(id, source, cx));
+                    );
                 if path.as_deref().is_some_and(|path| path != "/") {
                     list = list.child(self.files_parent_row(id, source, cx));
                 }
@@ -16242,6 +16297,8 @@ impl ShelluneView {
                     .min_h_0()
                     .gap(metrics.scale(spacing::HAIRLINE))
                     .child(self.files_filter_row(id, source, cx))
+                    // The column header stays above the rows it sorts while they turn.
+                    .child(self.files_list_header(id, source, cx))
                     .child(list)
                     .into_any_element()
             }
@@ -16313,14 +16370,18 @@ impl ShelluneView {
             )
             .child(header);
         // Under the toolbar, the column's content on the page's own padding: the path,
-        // what is asked or marked, and the listing. It keeps the height of what cannot
-        // shrink (no `min_h_0`): a failed read taller than the slice makes the column
-        // turn, while a listing still fills the rest and scrolls in its own box (R4).
+        // what is asked or marked, and the listing. A failed read keeps the height of
+        // what cannot shrink, so a card taller than the slice makes the column turn
+        // (R4). A listing may shrink: it then fills the rest and scrolls in its own box,
+        // and the path, the filter and the column header stay where they are - without
+        // it, a long folder turned the whole column and its header scrolled away.
+        let listing = matches!(state, BrowseState::Ready(_));
         let mut content = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
+            .when(listing, |content| content.min_h_0())
             .gap(metrics.scale(if compact {
                 spacing::HAIRLINE
             } else {
@@ -16367,10 +16428,21 @@ impl ShelluneView {
             );
         }
         content = content.child(body);
+        // The listing's bar only while a listing is what the box holds: the handle
+        // keeps the last listing's numbers while the next one loads.
+        if listing {
+            content = content.child(crate::app::scrollbar::bar(
+                files_element_id(source, "list.scrollbar"),
+                self.files_list_scroll(source).clone(),
+            ));
+        }
         if let Some(report) = self.files_report(id, source) {
             content = content.child(report);
         }
-        panel.child(content)
+        panel.child(content).child(crate::app::scrollbar::bar(
+            files_element_id(source, "panel.scrollbar"),
+            self.files_panel_scroll(source).clone(),
+        ))
     }
 
     /// Clears finished transfers across all sessions or for one session, updating the
@@ -17605,6 +17677,9 @@ impl ShelluneView {
             .text_color(theme::swatch(palette::TEXT_MUTED))
             .child(div().flex_none().w(metrics.hit_target()))
             .child(self.files_sort_cell(id, source, SortKey::Name, cx))
+            .when(self.files_modified_shown(), |header| {
+                header.child(self.files_sort_cell(id, source, SortKey::Modified, cx))
+            })
             .child(self.files_sort_cell(id, source, SortKey::Size, cx))
             .child(div().flex_none().w(files_actions_width(metrics, source)))
     }
@@ -17627,6 +17702,7 @@ impl ShelluneView {
         let label = match key {
             SortKey::Name => ux.files_name,
             SortKey::Size => ux.files_size,
+            SortKey::Modified => ux.files_modified,
         };
         let arrow = match (sort.key() == key, sort.descending()) {
             (true, false) => " ↑",
@@ -17638,6 +17714,10 @@ impl ShelluneView {
             (SortKey::Name, false) => strings.files_sort_asc,
             (SortKey::Size, true) => strings.files_sort_size_desc,
             (SortKey::Size, false) => strings.files_sort_size_asc,
+            // A press on the modified header starts newest first.
+            (SortKey::Modified, true) => strings.files_sort_modified_new,
+            (SortKey::Modified, false) if sort.key() == key => strings.files_sort_modified_old,
+            (SortKey::Modified, false) => strings.files_sort_modified_new,
         };
         let prefix = match source {
             FileSource::Remote => "files",
@@ -17646,6 +17726,7 @@ impl ShelluneView {
         let key_name = match key {
             SortKey::Name => "name",
             SortKey::Size => "size",
+            SortKey::Modified => "modified",
         };
         let cell_id = format!("{prefix}.sort.{key_name}");
         let arrow_id = format!("{prefix}.sort.arrow.{key_name}");
@@ -17659,8 +17740,15 @@ impl ShelluneView {
             .rounded(px(radius::SMALL))
             .cursor_pointer()
             .when(key == SortKey::Name, |cell| cell.flex_1().min_w_0())
+            // Numbers line up on their last digit, so the size and its header are
+            // right-aligned; the time reads from the left like a word.
             .when(key == SortKey::Size, |cell| {
-                cell.flex_none().w(metrics.scale(FILES_SIZE_WIDTH))
+                cell.flex_none()
+                    .w(metrics.scale(FILES_SIZE_WIDTH))
+                    .justify_end()
+            })
+            .when(key == SortKey::Modified, |cell| {
+                cell.flex_none().w(metrics.scale(FILES_MODIFIED_WIDTH))
             })
             .hover(move |style| style.bg(hover))
             .tooltip(components::tooltip(SharedString::from(tip)))
@@ -17702,10 +17790,16 @@ impl ShelluneView {
             row = row.child(div().flex().flex_1().min_w_0().child(field.clone()));
         }
         if let Some((shown, total)) = self.files.counts(id, source) {
-            let count = copy::fill(
-                strings.files_filter_count,
-                &[("shown", &shown.to_string()), ("total", &total.to_string())],
-            );
+            // "24 of 24" says a filter is narrowing nothing; until one is typed, the
+            // count is just how many entries the folder holds.
+            let count = if filter.trim().is_empty() {
+                copy::fill(strings.files_item_count, &[("total", &total.to_string())])
+            } else {
+                copy::fill(
+                    strings.files_filter_count,
+                    &[("shown", &shown.to_string()), ("total", &total.to_string())],
+                )
+            };
             row = row.child(
                 div()
                     .flex_none()
@@ -17920,11 +18014,26 @@ impl ShelluneView {
         };
         let name_selector = format!("{prefix}.name.{index}");
         let entry_selector = format!("{prefix}.entry.{index}");
+        // A folder's size cell stays empty: the folder icon and the weight already say
+        // what it is, and "Folder" on every such row was a column of the same word.
         let size_text = match size {
             Some(bytes) if !openable => human_size(bytes),
-            _ if openable => ux.files_folder.to_owned(),
+            _ if openable => String::new(),
             _ => kind_label(kind, strings).to_owned(),
         };
+        let modified_text = entry
+            .modified()
+            .map(|then| {
+                copy::relative_time(
+                    then,
+                    crate::app::remote::now_unix(),
+                    self.workspace.locale(),
+                )
+            })
+            .unwrap_or_default();
+        // A dotfile is listed like any other entry, but quieter: in a home directory
+        // they are most of the rows and rarely what a reader came for.
+        let hidden = name.starts_with('.');
         let mut entry_row = div()
             .id(SharedString::from(entry_selector.clone()))
             .debug_selector(move || entry_selector.clone())
@@ -17948,14 +18057,31 @@ impl ShelluneView {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .text_color(theme::swatch(if hidden {
+                        palette::TEXT_SECONDARY
+                    } else {
+                        palette::TEXT_PRIMARY
+                    }))
                     .when(openable, |name| name.font_weight(FontWeight::MEDIUM))
                     .debug_selector(move || name_selector.clone())
                     .child(SharedString::from(name.to_owned())),
             )
+            .when(self.files_modified_shown(), |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .w(metrics.scale(FILES_MODIFIED_WIDTH))
+                        .truncate()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .child(SharedString::from(modified_text)),
+                )
+            })
             .child(
                 div()
+                    .flex()
                     .flex_none()
+                    .justify_end()
                     .w(metrics.scale(FILES_SIZE_WIDTH))
                     .truncate()
                     .text_size(metrics.caption_size())
