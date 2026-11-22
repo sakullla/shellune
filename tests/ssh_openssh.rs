@@ -21,6 +21,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use shellune_core::{AuthMethod, SecretString, TerminalMode};
+use shellune_ssh::keys::{self, ManagedKeyError, ManagedKeyKind};
 use shellune_ssh::testserver::{Harness, KEY_PASSPHRASE};
 use shellune_ssh::{
     ConnectError, ConnectRequest, KnownHostKey, PtySize, RemoteEvent, RemoteSession,
@@ -564,6 +565,163 @@ fn every_supported_authentication_method_reaches_the_same_server() {
         }
         other => panic!("the agent attempt must end in a real answer, got {other:?}"),
     }
+}
+
+/// A managed key's whole journey against a real sshd: a file key is imported into
+/// memory and authenticates after its file is moved away, an encrypted copy opens
+/// only with its passphrase, and a key the application generated itself is
+/// authorized from its public material and signs in from memory alone.
+#[test]
+fn a_managed_key_signs_in_from_memory_after_its_file_is_moved_away() {
+    if skip("managed keys against a real server") {
+        return;
+    }
+    // A server of its own, because this test moves that server's key file.
+    static OWN: OnceLock<Result<Mutex<Harness>, fixture::Unavailable>> = OnceLock::new();
+    let server = OWN.get_or_init(|| fixture::server("managed").map(Mutex::new));
+    let server = match server {
+        Ok(server) => server,
+        Err(reason) => panic!("the managed-key server could not be started: {reason}"),
+    };
+    let server = server.lock().unwrap_or_else(|error| error.into_inner());
+    let fingerprint = server.host_key_fingerprint();
+
+    // The password still works on this server, so what follows is about the keys.
+    let mut password = connect(&server, password(&server), trusted(&fingerprint));
+    assert!(
+        matches!(wait_for_outcome(&mut password), RemoteEvent::Connected),
+        "the documented password must connect"
+    );
+    password.close();
+
+    // Import the server's own client key from the file's text: parse it, check it
+    // against ssh-keygen's own fingerprint, and keep only the PEM in memory.
+    let pem_text = std::fs::read_to_string(server.client_key()).expect("the client key is read");
+    let imported = keys::import_private_key(&SecretString::new(pem_text.clone()), None)
+        .expect("the client key imports");
+    let public = keys::public_data(&imported).expect("public material");
+    let printed = server_printed_fingerprint(&server, server.client_key());
+    assert_eq!(
+        public.fingerprint, printed,
+        "the import must carry the fingerprint ssh-keygen printed for this key"
+    );
+
+    // The original file is moved away, so nothing that follows can read it.
+    let moved = server.client_key().with_extension("moved-away");
+    server
+        .as_root(&format!(
+            "mv '{}' '{}'",
+            server.client_key().display(),
+            moved.display()
+        ))
+        .expect("the key file is moved");
+    assert!(
+        !server.client_key().exists(),
+        "the original key file is really gone"
+    );
+    let mut without_file = connect(
+        &server,
+        AuthMethod::key_file(server.client_key().to_string_lossy().into_owned(), None),
+        trusted(&fingerprint),
+    );
+    match wait_for_outcome(&mut without_file) {
+        RemoteEvent::Failed(error) => assert!(
+            matches!(error, ConnectError::KeyUnreadable { .. }),
+            "a moved key file must be reported unreadable, got {error}"
+        ),
+        other => panic!("a key file that is gone must not connect, got {other:?}"),
+    }
+    without_file.close();
+
+    // The managed key still signs in: it lives in memory, not in the file.
+    let mut managed = connect(
+        &server,
+        AuthMethod::managed_key(SecretString::new(pem_text)),
+        trusted(&fingerprint),
+    );
+    assert!(
+        matches!(wait_for_outcome(&mut managed), RemoteEvent::Connected),
+        "the key in memory must connect after its file was moved away"
+    );
+    managed
+        .write(b"echo managed-after-move\n")
+        .expect("input reaches the remote shell");
+    let output = wait_for_output(&mut managed, "managed-after-move");
+    assert!(!output.is_empty());
+    managed.close();
+
+    // The passphrase-protected copy of the same key: a wrong passphrase is
+    // refused before any connection, the right one unlocks the one-time PEM.
+    let encrypted_text =
+        std::fs::read_to_string(server.client_key_encrypted()).expect("the encrypted copy is read");
+    let wrong = keys::import_private_key(
+        &SecretString::new(encrypted_text.clone()),
+        Some(&SecretString::new("not-the-passphrase")),
+    )
+    .expect_err("the wrong passphrase cannot decrypt");
+    assert_eq!(wrong, ManagedKeyError::PassphraseRejected);
+    assert!(
+        !wrong.to_string().contains("not-the-passphrase"),
+        "an error must never repeat the passphrase: {wrong}"
+    );
+    let unlocked = keys::import_private_key(
+        &SecretString::new(encrypted_text),
+        Some(&SecretString::new(KEY_PASSPHRASE)),
+    )
+    .expect("the right passphrase unlocks the copy");
+    let one_time = keys::export_private_key(&unlocked, None).expect("a one-time PEM");
+    let mut from_encrypted = connect(
+        &server,
+        AuthMethod::managed_key(one_time),
+        trusted(&fingerprint),
+    );
+    assert!(
+        matches!(
+            wait_for_outcome(&mut from_encrypted),
+            RemoteEvent::Connected
+        ),
+        "the unlocked copy must connect from memory"
+    );
+    from_encrypted.close();
+
+    // A key the application generated: the server learns it from the public
+    // material alone, and the private half never becomes a file.
+    let generated = keys::generate(ManagedKeyKind::Ed25519).expect("an Ed25519 generates");
+    let generated_public = keys::public_data(&generated).expect("public material");
+    server
+        .as_user(&format!(
+            "printf '%s\\n' '{}' >> \"$HOME/.ssh/authorized_keys\"",
+            generated_public.authorized_key
+        ))
+        .expect("the generated key is authorized");
+    let generated_pem = keys::export_private_key(&generated, None).expect("a plain export");
+    let mut from_generated = connect(
+        &server,
+        AuthMethod::managed_key(generated_pem),
+        trusted(&fingerprint),
+    );
+    match wait_for_outcome(&mut from_generated) {
+        RemoteEvent::Connected => {
+            from_generated
+                .write(b"echo generated-in-memory\n")
+                .expect("input reaches the remote shell");
+            wait_for_output(&mut from_generated, "generated-in-memory");
+        }
+        other => panic!("the generated key must connect, got {other:?}"),
+    }
+    from_generated.close();
+}
+
+/// The fingerprint ssh-keygen itself prints for a key file the server owns.
+fn server_printed_fingerprint(server: &Harness, key: std::path::PathBuf) -> String {
+    let output = server
+        .as_root(&format!("ssh-keygen -lf '{}'", key.display()))
+        .expect("ssh-keygen reads the key");
+    output
+        .split_whitespace()
+        .find(|field| field.starts_with("SHA256:"))
+        .expect("ssh-keygen printed a fingerprint")
+        .to_owned()
 }
 
 #[test]

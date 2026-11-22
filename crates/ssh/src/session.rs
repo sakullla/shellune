@@ -39,6 +39,7 @@ use crate::auth::load_private_key;
 use crate::error::ConnectError;
 use crate::forwarding::{self, ForwardLink};
 use crate::hostkey::{HostKeyPrompt, KnownHostKey, PresentedKey};
+use crate::keys::{self, ManagedKeyError};
 use crate::sftp::{self, ChannelFailure, FileLink};
 use crate::transfer::{self, TransferLink};
 use crate::x11::{self, X11Gate, X11Notice, X11Status};
@@ -1144,14 +1145,15 @@ impl Material {
                 let client = agent::connect(kind).await?;
                 Ok(Self::Agent { kind, client })
             }
-            // A managed key authenticates from memory the unlocked vault hands
-            // over; that transport-side support arrives with the vault work, so
-            // until then the attempt fails here instead of pretending a file was
-            // named. No entry point can build this method yet.
-            AuthMethod::ManagedKey { .. } => Err(ConnectError::KeyInvalid {
-                path: "<managed key>".to_owned(),
-                reason: "signing in with an application key is not supported yet".to_owned(),
-            }),
+            // A managed key arrives as a one-time PEM from the unlocked vault and
+            // is parsed right here, in memory: no temporary file is written and
+            // none is needed, because the parsed key is the very type this
+            // transport signs with.
+            AuthMethod::ManagedKey { private_key } => {
+                let key =
+                    keys::import_private_key(&private_key, None).map_err(managed_key_error)?;
+                Ok(Self::Key(Arc::new(key)))
+            }
             AuthMethod::Auto {
                 agent: kind,
                 keys,
@@ -1178,6 +1180,30 @@ impl Material {
         }
     }
 }
+
+/// What a managed key's refusal is called in the session's own vocabulary.
+///
+/// A managed key has no path, so the key errors carry a label instead - and the
+/// label names where the key lives rather than a file that does not exist.
+fn managed_key_error(error: ManagedKeyError) -> ConnectError {
+    match error {
+        ManagedKeyError::EncryptedWithoutPassphrase => ConnectError::KeyEncrypted {
+            path: MANAGED_KEY_LABEL.to_owned(),
+        },
+        ManagedKeyError::PassphraseRejected => ConnectError::KeyDecryptFailed {
+            path: MANAGED_KEY_LABEL.to_owned(),
+        },
+        // The remaining refusals are about the text itself; the reasons come
+        // from the parser and never contain key material.
+        other => ConnectError::KeyInvalid {
+            path: MANAGED_KEY_LABEL.to_owned(),
+            reason: other.to_string(),
+        },
+    }
+}
+
+/// Stands in the path field of a key error for a key that has no file.
+const MANAGED_KEY_LABEL: &str = "<application key>";
 
 /// Tries the one authentication method the attempt chose.
 pub(crate) async fn authenticate<H: client::Handler>(

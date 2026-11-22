@@ -3,7 +3,7 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use russh::{Channel, ChannelId, Disconnect, server};
-use shellune_core::{AuthMethod, ConnectionDefaults, HostConfig};
+use shellune_core::{AuthMethod, ConnectionDefaults, HostConfig, SecretString};
 
 use crate::{
     ChainEvent, ChainRequest, ChainSession, ConnectRequest, HopAuth, KnownHostKey, PtySize,
@@ -241,6 +241,196 @@ fn an_unresponsive_peer_reports_keepalive_timeout() {
             "{error}"
         );
     });
+}
+
+/// A peer that takes no password and one public key only, which is what a
+/// managed key has to prove itself against: a session that connects signed with
+/// exactly that key, from memory, and nothing else.
+struct KeyPeer {
+    expected: russh::keys::PublicKey,
+}
+
+impl server::Handler for KeyPeer {
+    type Error = russh::Error;
+
+    async fn auth_password(&mut self, _: &str, _: &str) -> Result<server::Auth, Self::Error> {
+        Ok(server::Auth::reject())
+    }
+
+    async fn auth_publickey(
+        &mut self,
+        _: &str,
+        key: &russh::keys::PublicKey,
+    ) -> Result<server::Auth, Self::Error> {
+        Ok(if *key == self.expected {
+            server::Auth::Accept
+        } else {
+            server::Auth::reject()
+        })
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        channel: Channel<server::Msg>,
+        reply: server::ChannelOpenHandle,
+        _: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        drop(channel);
+        Ok(())
+    }
+
+    async fn pty_request(
+        &mut self,
+        channel: ChannelId,
+        _: &str,
+        _: u32,
+        _: u32,
+        _: u32,
+        _: u32,
+        _: &[(russh::Pty, u32)],
+        session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_success(channel)
+    }
+
+    async fn shell_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_success(channel)
+    }
+
+    async fn data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        session.data(channel, data.to_vec())
+    }
+}
+
+#[test]
+fn a_managed_key_authenticates_from_memory_and_nothing_else_does() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let key = crate::keys::generate(crate::keys::ManagedKeyKind::Ed25519).expect("a key generates");
+    let public = crate::keys::public_data(&key).expect("public material");
+    // The PEM a session is handed: the whole private key, in memory, with no
+    // file behind it.
+    let pem = crate::keys::export_private_key(&key, None).expect("a plain export");
+    let config = Arc::new(server::Config {
+        keys: vec![key.clone()],
+        ..Default::default()
+    });
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let expected = key.public_key().clone();
+    let handle = runtime.handle().clone();
+    let task = runtime.spawn(async move {
+        loop {
+            let Ok((socket, _)) = listener.accept().await else {
+                break;
+            };
+            let config = config.clone();
+            let expected = expected.clone();
+            handle.spawn(async move {
+                let running = server::run_stream(
+                    config,
+                    socket,
+                    KeyPeer {
+                        expected: expected.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+                let _ = running.await;
+            });
+        }
+    });
+    let connect = |auth: AuthMethod| {
+        RemoteSession::connect(ConnectRequest::new(
+            "127.0.0.1",
+            port,
+            "vault-user",
+            auth,
+            PtySize::default(),
+            KnownHostKey::Trusted {
+                fingerprint: public.fingerprint.clone(),
+            },
+        ))
+    };
+    fn wait(session: &mut RemoteSession, predicate: impl Fn(&RemoteEvent) -> bool) -> RemoteEvent {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            for event in session.drain() {
+                if predicate(&event) {
+                    return event;
+                }
+            }
+            assert!(Instant::now() < deadline, "SSH event did not arrive");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // The managed key itself: parsed in memory, accepted, and the shell answers.
+    let mut session = connect(AuthMethod::managed_key(pem));
+    wait(&mut session, |event| {
+        matches!(event, RemoteEvent::Connected)
+    });
+    session.write(b"hello-from-memory").unwrap();
+    wait(&mut session, |event| {
+        matches!(
+            &event,
+            RemoteEvent::Data(data) if data == b"hello-from-memory"
+        )
+    });
+    session.close();
+
+    // A different managed key is refused by the server, which is the proof the
+    // first connection really authenticated with its key.
+    let other =
+        crate::keys::generate(crate::keys::ManagedKeyKind::Ed25519).expect("another key generates");
+    let other_pem = crate::keys::export_private_key(&other, None).expect("a plain export");
+    let mut refused = connect(AuthMethod::managed_key(other_pem));
+    match wait(&mut refused, |event| {
+        matches!(event, RemoteEvent::Failed(_))
+    }) {
+        RemoteEvent::Failed(error) => assert_eq!(error, crate::error::ConnectError::AuthRejected),
+        other => panic!("a key the server does not know must be rejected, got {other:?}"),
+    }
+    refused.close();
+
+    // Text that is not a key fails before the network is blamed, and the error
+    // repeats none of what was handed over.
+    let mut garbage = connect(AuthMethod::managed_key(SecretString::new(
+        "certainly not a private key",
+    )));
+    match wait(&mut garbage, |event| {
+        matches!(event, RemoteEvent::Failed(_))
+    }) {
+        RemoteEvent::Failed(error) => {
+            assert!(
+                matches!(error, crate::error::ConnectError::KeyInvalid { .. }),
+                "not a key is a key problem, got {error}"
+            );
+            assert!(
+                !error.to_string().contains("certainly not a private key"),
+                "an error must never repeat what was handed over: {error}"
+            );
+        }
+        other => panic!("not a key must fail the attempt, got {other:?}"),
+    }
+    garbage.close();
+
+    task.abort();
 }
 
 #[test]

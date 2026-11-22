@@ -45,26 +45,27 @@ pub fn load_private_key(
             reason: error.to_string(),
         }
     })?);
-    let key =
-        PrivateKey::from_openssh(pem.as_bytes()).map_err(|error| ConnectError::KeyInvalid {
-            path: chosen.to_owned(),
-            reason: error.to_string(),
-        })?;
+    // The parsing and decrypting are shared with the managed keys of the vault
+    // (crate::keys); this function adds only the reading of a file, which is
+    // what makes it the one place a key file is opened.
+    crate::keys::parse_private_key(pem.as_str(), passphrase)
+        .map_err(|error| key_error(chosen, error))
+}
 
-    if !key.is_encrypted() {
-        // An unencrypted key is usable whatever was typed for the passphrase: asking
-        // for one it does not need is not a failure.
-        return Ok(key);
+/// Names a parsed key file's refusal the way a session reports it.
+fn key_error(path: &str, error: crate::keys::ManagedKeyError) -> ConnectError {
+    match error {
+        crate::keys::ManagedKeyError::EncryptedWithoutPassphrase => ConnectError::KeyEncrypted {
+            path: path.to_owned(),
+        },
+        crate::keys::ManagedKeyError::PassphraseRejected => ConnectError::KeyDecryptFailed {
+            path: path.to_owned(),
+        },
+        other => ConnectError::KeyInvalid {
+            path: path.to_owned(),
+            reason: other.to_string(),
+        },
     }
-    let Some(secret) = passphrase else {
-        return Err(ConnectError::KeyEncrypted {
-            path: chosen.to_owned(),
-        });
-    };
-    key.decrypt(secret.expose())
-        .map_err(|_| ConnectError::KeyDecryptFailed {
-            path: chosen.to_owned(),
-        })
 }
 
 #[cfg(test)]

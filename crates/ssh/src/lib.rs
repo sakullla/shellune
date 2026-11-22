@@ -8,6 +8,9 @@
 //!
 //! * [hostkey] turns a presented key into the algorithm and SHA-256 fingerprint the
 //!   user compares;
+//! * [keys] imports, generates and exports the OpenSSH keys the application vault
+//!   keeps, and reports the public material and fingerprint a duplicate check or an
+//!   `authorized_keys` line needs;
 //! * [auth] reads a private key file, decrypting it when a passphrase was given;
 //! * [agent] reaches SSH_AUTH_SOCK, the Windows OpenSSH pipe or Pageant;
 //! * [session] runs one direct attempt and the remote shell;
@@ -33,6 +36,7 @@ pub mod error;
 pub mod forwarding;
 pub mod hostkey;
 mod input;
+pub mod keys;
 mod output;
 pub mod platform;
 mod scp;
@@ -57,6 +61,7 @@ pub use chain::{ChainEvent, ChainRequest, ChainSession, HopAuth};
 pub use error::{ChainFailure, ConnectError, HopLocation};
 pub use forwarding::{ForwardCommand, ForwardEvent, ForwardFailure, ForwardLink, ForwardSpec};
 pub use hostkey::{HostKeyPrompt, KnownHostKey, PresentedKey};
+pub use keys::{ManagedKeyError, ManagedKeyKind, ManagedKeyPublic};
 pub use session::{
     CONNECT_TIMEOUT, ConnectRequest, PtySize, RemoteEvent, RemoteSession, TERM_VALUE, TrustAnswer,
 };

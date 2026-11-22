@@ -13,6 +13,22 @@ russh-sftp = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 shellune-core = { path = "../core" }
+# Managed OpenSSH keys (R1): parsing, generating, exporting and fingerprinting
+# Ed25519, ECDSA and RSA keys. Pinned to the exact release russh re-exports as
+# `russh::keys::ssh_key`, so a key parsed here is the same crate instance russh
+# authenticates with and no copy of it is ever made between the two.
+ssh-key = { version = "=0.7.0-rc.11", features = [
+    "ecdsa",
+    "ed25519",
+    "encryption",
+    "getrandom",
+    "p256",
+    "p384",
+    "p521",
+    "rand_core",
+    "rsa",
+    "std",
+] }
 tokio = { workspace = true }
 # The per-session X11 cookie is a random value; the UUID generator is the same
 # cryptographically secure source the rest of the workspace already uses.
@@ -24,6 +40,3 @@ zeroize = { workspace = true }
 # a session whose events are scripted. It is behind a feature so a release build of
 # the application carries none of it.
 test-support = []
-
-[dev-dependencies]
-ssh-key = { version = "0.7.0-rc.11", features = ["ed25519"] }
