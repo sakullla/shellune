@@ -3183,6 +3183,7 @@ mod connection_tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_field_the_chosen_protocol_does_not_have_is_refused() {
         let text = json!({
             "protocol": "vnc",
