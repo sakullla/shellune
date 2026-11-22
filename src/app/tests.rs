@@ -18013,16 +18013,19 @@ async fn the_jump_picker_scrolls_its_list_and_stays_clear_of_the_proxy_field(
     assert_eq!(jump_picker_state(&view, cx).map(|state| state.2), Some(24));
 
     // The mark is walked past the rows on show and the list follows it.
-    let list = bounds_of(cx, "hosts.jump.options");
     for _ in 0..12 {
         cx.simulate_keystrokes("down");
     }
     cx.run_until_parked();
     assert_eq!(jump_picker_state(&view, cx).map(|state| state.1), Some(12));
+    // Both edges are read from the same frame, and a pixel is allowed for rounding:
+    // the row and the list are snapped to the pixel grid separately, and a row that
+    // had not followed the mark would be off by a whole row, not by one pixel.
+    let list = bounds_of(cx, "hosts.jump.options");
     let marked = bounds_of(cx, "hosts.jump.option.12");
     assert!(
-        marked.origin.y >= list.origin.y - px(0.5)
-            && marked.origin.y + marked.size.height <= list.origin.y + list.size.height + px(0.5),
+        marked.origin.y >= list.origin.y - px(1.0)
+            && marked.origin.y + marked.size.height <= list.origin.y + list.size.height + px(1.0),
         "the marked row {marked:?} is scrolled into the list {list:?}"
     );
 
