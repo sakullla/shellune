@@ -146,8 +146,8 @@ struct ConnectionRowView {
     /// Whether the window is wide enough for the copy tool, as for a host row, so both
     /// kinds of row keep their columns at the same x.
     show_duplicate: bool,
-    /// Whether the window is wide enough for the tag and time columns.
-    show_meta: bool,
+    /// Which of the tag and time columns the list draws (see [`MetaColumns`]).
+    show_meta: MetaColumns,
     /// Whether any SSH host is currently selected, showing the SSH-only multi-select boundary.
     selecting: bool,
 }
@@ -181,17 +181,36 @@ struct HostRowView {
     cursor: bool,
     /// Whether the row has room for the duplicate tool beside edit and delete.
     show_duplicate: bool,
-    /// Whether the window is wide enough for the tag and time columns.
-    show_meta: bool,
+    /// Which of the tag and time columns the list draws (see [`MetaColumns`]).
+    show_meta: MetaColumns,
     /// Whether any host is picked, which keeps every checkbox in view: once a
     /// selection has started, picking the next host must not need a hover first.
     selecting: bool,
     /// Whether the host is marked as a favourite (R1).
     favorite: bool,
+    /// Whether the row names its protocol. Only a list that also holds RDP, VNC or
+    /// serial records needs "SSH" said: in a list of SSH hosts the same tag on every
+    /// row is noise beside the names.
+    protocol_tag: bool,
     /// The chip and its tooltip when the private key file the host names is not on this
     /// computer: a record that came from another machine keeps its path and says so,
     /// rather than failing only once a connection is tried (R9).
     key_missing: Option<(SharedString, SharedString)>,
+}
+
+/// Which of a row's quiet columns the list draws.
+///
+/// A column is drawn in every row or in none, so the tags and times of the rows that
+/// have them line up. It is left out of the whole list when the window is too narrow
+/// for it, or when no row in the list has anything to put in it: a book without groups
+/// or a fresh import should give that room to the names rather than to two empty
+/// columns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MetaColumns {
+    /// The group-tag column.
+    tag: bool,
+    /// The last-connected column.
+    time: bool,
 }
 
 impl ShelluneView {
@@ -1348,7 +1367,7 @@ impl ShelluneView {
         let title = div()
             .flex()
             .flex_none()
-            .items_baseline()
+            .items_center()
             .gap(metrics.scale(spacing::TIGHT))
             .max_w(metrics.scale(TITLE_MAX_WIDTH))
             .min_w_0()
@@ -1363,10 +1382,17 @@ impl ShelluneView {
                     .child(components::line_text(self.home_title())),
             )
             .child(
+                // A quiet pill beside the title: next to a 16px title a bare 13px
+                // number read as a subscript, and baseline alignment could not hold
+                // once the title began to truncate.
                 div()
                     .flex_none()
-                    .text_size(metrics.label_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .px(metrics.scale(spacing::NARROW))
+                    .rounded(px(radius::SMALL))
+                    .bg(theme::swatch(palette::SURFACE_SELECTED))
+                    .text_size(metrics.caption_size())
+                    .font_weight(metrics.medium_weight())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
                     .debug_selector(|| "header.count".to_owned())
                     .child(components::line_text(count)),
             );
@@ -2221,9 +2247,10 @@ impl ShelluneView {
                         selected: self.hosts.selected().contains(host.id),
                         cursor: cursor == Some(host.id),
                         show_duplicate,
-                        show_meta,
+                        show_meta: MetaColumns::default(),
                         selecting: !self.hosts.selected().is_empty(),
                         favorite: self.book.is_favorite(host.id),
+                        protocol_tag: false,
                         key_missing: saved
                             .identity_file()
                             .filter(|path| self.key_presence.missing(path))
@@ -2257,11 +2284,36 @@ impl ShelluneView {
                         cursor: cursor == Some(row.id),
                         favorite: self.book.is_favorite(row.id),
                         show_duplicate,
-                        show_meta,
+                        show_meta: MetaColumns::default(),
                         selecting: !self.hosts.selected().is_empty(),
                     }));
                     connections += 1;
                 }
+            }
+        }
+        // The columns are decided for the whole list, not per row, so every row that
+        // draws one draws it at the same x.
+        let columns = MetaColumns {
+            tag: rows.iter().any(|row| match row {
+                SnapshotRow::Host(host) => host.group.is_some(),
+                SnapshotRow::Connection(connection) => connection.group.is_some(),
+                SnapshotRow::Direct(_) => false,
+            }),
+            time: rows
+                .iter()
+                .any(|row| matches!(row, SnapshotRow::Host(host) if host.last.is_some())),
+        };
+        let mixed = rows
+            .iter()
+            .any(|row| matches!(row, SnapshotRow::Connection(_)));
+        for row in &mut rows {
+            match row {
+                SnapshotRow::Host(host) => {
+                    host.show_meta = columns;
+                    host.protocol_tag = mixed;
+                }
+                SnapshotRow::Connection(connection) => connection.show_meta = columns,
+                SnapshotRow::Direct(_) => {}
             }
         }
         Rc::new(rows)
@@ -2632,7 +2684,7 @@ fn row_text(
 fn row_meta(
     number: usize,
     prefix: &'static str,
-    show_meta: bool,
+    show_meta: MetaColumns,
     group: Option<SharedString>,
     last: Option<(SharedString, SharedString)>,
     open: bool,
@@ -2680,7 +2732,8 @@ fn row_meta(
         .flex_none()
         .items_center()
         .gap(metrics.scale(spacing::TIGHT))
-        .when(show_meta, |meta| meta.child(tag_column).child(time_column))
+        .when(show_meta.tag, |meta| meta.child(tag_column))
+        .when(show_meta.time, |meta| meta.child(time_column))
         .child(if open {
             dot.id(SharedString::from(format!("{prefix}.state.{number}")))
                 .debug_selector(move || format!("{prefix}.state.{number}"))
@@ -2807,10 +2860,12 @@ fn host_row_element(
             .items_center()
             .gap(metrics.scale(spacing::HALF))
             .min_w_0()
-            .child(
-                components::tag(ProtocolKind::Ssh.label(), metrics)
-                    .debug_selector(move || format!("hosts.protocol.badge.{number}")),
-            );
+            .when(host.protocol_tag, |badges| {
+                badges.child(
+                    components::tag(ProtocolKind::Ssh.label(), metrics)
+                        .debug_selector(move || format!("hosts.protocol.badge.{number}")),
+                )
+            });
         if let Some((label, tip)) = host.key_missing.clone() {
             badges = badges.child(
                 div()

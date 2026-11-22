@@ -133,6 +133,8 @@ pub struct Strings {
     pub unavailable_notice: &'static str,
     /// Suffix for a count of hosts.
     pub count_hosts: &'static str,
+    /// Suffix for a count of exactly one host.
+    pub count_host_one: &'static str,
     /// Fallback name for a local session without a chosen shell.
     pub local_shell_fallback: &'static str,
     /// Button that reveals the free-text shell path field.
@@ -252,6 +254,8 @@ pub struct Strings {
     pub import_outcome_review: &'static str,
     /// Label for hosts that are not imported because their path cannot be trusted.
     pub import_outcome_blocked: &'static str,
+    /// Label for hosts whose name a saved host already has, so importing skips them.
+    pub import_outcome_saved: &'static str,
     /// Note on a host that will not be imported.
     pub import_not_offered: &'static str,
     /// Label introducing directives this build does not apply.
@@ -264,6 +268,8 @@ pub struct Strings {
     pub import_unmatched_proxy_label: &'static str,
     /// Shown when the file holds no host that could be imported.
     pub import_nothing: &'static str,
+    /// Shown when every host the file could import is already saved.
+    pub import_all_saved: &'static str,
     /// Button that saves the hosts the preview offers.
     pub import_apply: &'static str,
     /// Prefix of the message left after an import.
@@ -1223,7 +1229,8 @@ pub static ENGLISH: Strings = Strings {
     next_step: "Next step",
     primary_hosts: "New host",
     unavailable_notice: "This action is not available in this build, so nothing was started.",
-    count_hosts: "host",
+    count_hosts: "hosts",
+    count_host_one: "host",
     local_shell_fallback: "System shell",
     shell_custom_button: "Custom path",
     shell_custom_placeholder: "Program name or full path, then Enter",
@@ -1285,12 +1292,14 @@ pub static ENGLISH: Strings = Strings {
     import_outcome_ready: "Importable",
     import_outcome_review: "Needs review",
     import_outcome_blocked: "Blocked",
+    import_outcome_saved: "Already saved",
     import_not_offered: "not imported",
     import_ignored_label: "Not applied",
     import_include_label: "Included files were not read",
     import_match_label: "Match blocks were not evaluated",
     import_unmatched_proxy_label: "Proxy or forwarding rules no host here matches",
     import_nothing: "No host in this file can be imported as a direct connection yet.",
+    import_all_saved: "Every host in this file is already saved.",
     import_apply: "Import hosts",
     import_applied: "Imported",
     import_review_count: "need review",
@@ -1786,6 +1795,7 @@ pub static CHINESE: Strings = Strings {
     primary_hosts: "新建主机",
     unavailable_notice: "当前版本没有实现这个操作，因此没有启动任何任务。",
     count_hosts: "台主机",
+    count_host_one: "台主机",
     local_shell_fallback: "系统 Shell",
     shell_custom_button: "自定义路径",
     shell_custom_placeholder: "输入程序名或完整路径后按回车",
@@ -1844,12 +1854,14 @@ pub static CHINESE: Strings = Strings {
     import_outcome_ready: "可直接导入",
     import_outcome_review: "需要复核",
     import_outcome_blocked: "已阻止",
+    import_outcome_saved: "已保存",
     import_not_offered: "不导入",
     import_ignored_label: "未应用的指令",
     import_include_label: "没有读取被包含的文件",
     import_match_label: "没有评估 Match 条件块",
     import_unmatched_proxy_label: "没有匹配到任何主机的代理或转发规则",
     import_nothing: "这个文件里还没有可以直接导入的主机。",
+    import_all_saved: "这个文件里的主机都已保存。",
     import_apply: "导入主机",
     import_applied: "已导入",
     import_review_count: "需复核",

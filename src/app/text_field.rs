@@ -1434,7 +1434,7 @@ impl Element for LineElement {
         let (shown, color) = if empty {
             (
                 field.placeholder.to_string(),
-                theme::swatch(palette::TEXT_MUTED).into(),
+                theme::swatch(palette::TEXT_PLACEHOLDER).into(),
             )
         } else {
             (field.display_text(), style.color)

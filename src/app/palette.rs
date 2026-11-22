@@ -221,6 +221,49 @@ fn score(entry: &Entry, words: &[String]) -> Option<u32> {
     Some(total)
 }
 
+/// Where the words of `query` were found in `text`, as merged byte ranges, so the
+/// palette can draw why an entry matched.
+///
+/// Each word is looked for case-insensitively, first at the start of a part of the
+/// text ("web" in "prod-web-01"), then anywhere in it; a word that only matched as a
+/// scattered subsequence marks nothing, since marking single letters across a title
+/// reads as noise rather than as an answer. The ranges always fall on character
+/// boundaries, whatever script the text is in.
+#[must_use]
+pub fn highlights(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let same = |a: char, b: char| a == b || a.to_lowercase().eq(b.to_lowercase());
+    let found_at = |start: usize, word: &[char]| {
+        start + word.len() <= chars.len()
+            && word
+                .iter()
+                .zip(&chars[start..])
+                .all(|(wanted, (_, letter))| same(*wanted, *letter))
+    };
+    let byte_end = |end: usize| chars.get(end).map_or(text.len(), |(byte, _)| *byte);
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for word in query.split_whitespace() {
+        let word: Vec<char> = word.chars().collect();
+        let at_part = (0..chars.len()).find(|&start| {
+            (start == 0 || !chars[start - 1].1.is_alphanumeric()) && found_at(start, &word)
+        });
+        if let Some(start) =
+            at_part.or_else(|| (0..chars.len()).find(|&start| found_at(start, &word)))
+        {
+            ranges.push(chars[start].0..byte_end(start + word.len()));
+        }
+    }
+    ranges.sort_by_key(|range| range.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
 /// Whether the letters of `needle` appear in `haystack` in the same order.
 fn is_subsequence(needle: &str, haystack: &str) -> bool {
     let mut letters = haystack.chars();
@@ -254,6 +297,29 @@ mod tests {
             icon: Icon::Terminal,
             current: false,
         }
+    }
+
+    #[test]
+    fn a_match_is_marked_where_each_word_was_found() {
+        assert_eq!(highlights("prod-web-01", "web"), vec![5..8]);
+        assert_eq!(highlights("Prod-Web-01", "WEB"), vec![5..8], "any case");
+        // A part's start wins over an earlier match inside a word.
+        assert_eq!(highlights("webweb web", "web"), vec![0..3]);
+        assert_eq!(highlights("database db", "db"), vec![9..11]);
+        // Several words, merged where they touch, in text order.
+        assert_eq!(
+            highlights("deploy@10.20.1.11", "10 deploy"),
+            vec![0..6, 7..9]
+        );
+        assert_eq!(highlights("staging", "sta ging"), vec![0..7]);
+        // A word that is not there, or only a subsequence, marks nothing.
+        assert!(highlights("bastion", "bsn").is_empty());
+        assert!(highlights("bastion", "").is_empty());
+        // Ranges fall on character boundaries in any script.
+        let text = "新建本地终端";
+        let ranges = highlights(text, "本地");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&text[ranges[0].clone()], "本地");
     }
 
     #[test]

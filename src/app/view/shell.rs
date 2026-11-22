@@ -1872,6 +1872,7 @@ impl ShelluneView {
             .pb(metrics.scale(spacing::LOOSE))
             .child(self.import_panel(cx))
             .into_any_element();
+        let footer = self.import_actions(cx);
         Some(self.modal(
             window,
             "hosts.import.dialog",
@@ -1880,7 +1881,7 @@ impl ShelluneView {
                 header,
                 subtitle,
                 body,
-                footer: None,
+                footer: Some(footer),
             },
         ))
     }

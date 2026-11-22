@@ -2204,6 +2204,24 @@ pub fn line_text(text: impl Into<SharedString>) -> StyledText {
     element
 }
 
+/// [`line_text`] with the given byte ranges drawn in the accent at medium weight: the
+/// part of a search result the query matched, so a list of answers says why each one
+/// is there (the command palette).
+///
+/// The ranges must fall on character boundaries, which is what
+/// [`crate::app::palette::highlights`] returns.
+pub fn highlighted_text(
+    text: impl Into<SharedString>,
+    ranges: Vec<std::ops::Range<usize>>,
+) -> StyledText {
+    let style = gpui::HighlightStyle {
+        color: Some(theme::swatch(palette::ACCENT).into()),
+        font_weight: Some(gpui::FontWeight::SEMIBOLD),
+        ..Default::default()
+    };
+    line_text(text).with_highlights(ranges.into_iter().map(|range| (range, style)))
+}
+
 /// The lines [`line_text`] shaped, as the tests read them back.
 #[cfg(test)]
 pub mod drawn {

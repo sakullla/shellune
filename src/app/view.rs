@@ -8088,11 +8088,20 @@ impl ShelluneView {
         if self.import.is_open() {
             return;
         }
-        let path = match shellune_storage::default_config_path() {
+        let default = shellune_storage::default_config_path();
+        let path = match &default {
             Some(path) => path.display().to_string(),
             None => shellune_storage::DEFAULT_CONFIG_TEXT.to_owned(),
         };
         self.open_import_at(path, cx);
+        // The usual file is already named in the field; when it is there, reading it
+        // straight away saves the press on "Preview" that every first import needed.
+        // Reading is all a preview does - nothing is saved until "Import" - and a file
+        // that is not there leaves the dialog waiting for a path, as before. The tests
+        // never read the machine's own SSH configuration.
+        if cfg!(not(test)) && default.is_some_and(|path| path.is_file()) {
+            self.preview_import(cx);
+        }
     }
 
     /// Opens the import panel on a named file, through the same path a click takes.
@@ -11731,9 +11740,18 @@ impl ShelluneView {
         card = card.child(search_row);
         let total = rows.len();
         let mut drawn = 0usize;
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .border_t_1()
+            .border_color(theme::swatch(palette::BORDER));
         for (index, host) in rows.into_iter().take(crate::app::hosts::IMPORT_ROW_LIMIT) {
-            card = card.child(self.import_row(index, host));
+            list = list.child(self.import_row(index, host));
             drawn += 1;
+        }
+        if drawn > 0 {
+            card = card.child(list);
         }
         if total > drawn {
             card = card.child(
@@ -11748,38 +11766,72 @@ impl ShelluneView {
             );
         }
 
-        let mut actions = div()
-            .flex()
-            .items_center()
-            .gap(metrics.scale(spacing::TIGHT))
-            .mt(metrics.scale(spacing::HAIRLINE));
+        card
+    }
 
-        let offered = preview.importable_count();
-        if offered > 0 {
-            actions = actions.child(self.text_button(
-                SharedString::from("hosts.import.apply"),
-                SharedString::from(format!("{} · {offered}", strings.import_apply)),
-                Variant::Primary,
-                cx,
-                |view, cx| view.apply_import(cx),
-            ));
-        } else {
-            actions = actions.child(
-                div()
-                    .debug_selector(|| "hosts.import.nothing".to_owned())
-                    .text_size(metrics.label_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(strings.import_nothing),
-            );
-        }
-
-        card.child(actions.child(self.text_button(
+    /// The fixed row of actions under the import preview (R4).
+    ///
+    /// It is the dialog's footer rather than the end of the list: a file with a dozen
+    /// hosts pushed "Import" below the fold, and the one action the preview exists for
+    /// should never need a scroll to be found. Before a preview there is nothing to
+    /// apply, so the row only offers the way out.
+    pub(super) fn import_actions(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let cancel = self.text_button(
             SharedString::from("hosts.import.close"),
             strings.host_cancel,
-            Variant::Secondary,
+            Variant::Ghost,
             cx,
             |view, cx| view.close_import(cx),
-        )))
+        );
+        let mut actions = components::modal_footer(metrics);
+        let preview = self
+            .import
+            .preview()
+            .filter(|_| self.import.error().is_none() || self.import.keeps_preview());
+        if let Some(preview) = preview {
+            // The count on the button is what the plan writes, not what the file
+            // offers: a host whose name is already saved is skipped on apply, so
+            // counting it promised an import that would not happen.
+            let plan = preview.plan(&self.book);
+            let offered = plan.len();
+            if offered > 0 || !plan.forwards().is_empty() {
+                let label = if offered > 0 {
+                    SharedString::from(format!("{} · {offered}", strings.import_apply))
+                } else {
+                    // Every host is saved but the file still has forwarding rules for
+                    // them; applying writes the rules the saved hosts are missing.
+                    SharedString::from(strings.import_apply)
+                };
+                actions = actions.child(cancel).child(self.text_button(
+                    SharedString::from("hosts.import.apply"),
+                    label,
+                    Variant::Primary,
+                    cx,
+                    |view, cx| view.apply_import(cx),
+                ));
+            } else {
+                let reason = if preview.importable_count() > 0 {
+                    strings.import_all_saved
+                } else {
+                    strings.import_nothing
+                };
+                actions = actions.child(
+                    div()
+                        .debug_selector(|| "hosts.import.nothing".to_owned())
+                        .text_size(metrics.label_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .child(reason),
+                );
+                // The reason reads first and the way out stays at the trailing edge,
+                // where every other dialog keeps its buttons.
+                actions = actions.child(cancel);
+            }
+        } else {
+            actions = actions.child(cancel);
+        }
+        actions
     }
 
     /// What the file could not contribute, stated before anything is applied.
@@ -11791,7 +11843,25 @@ impl ShelluneView {
             .hosts()
             .iter()
             .filter(|host| host.outcome() == ImportOutcome::Ready && host.is_importable())
+            .filter(|host| !self.import_already_saved(host))
             .count();
+        let saved = preview
+            .hosts()
+            .iter()
+            .filter(|host| self.import_already_saved(host))
+            .count();
+        let mut counts = format!(
+            "{} {} · {} {} · {} {}",
+            strings.import_outcome_ready,
+            ready,
+            strings.import_outcome_review,
+            preview.review_count(),
+            strings.import_outcome_blocked,
+            preview.blocked_count()
+        );
+        if saved > 0 {
+            counts.push_str(&format!(" · {} {saved}", strings.import_outcome_saved));
+        }
 
         let mut block = div()
             .flex()
@@ -11805,18 +11875,7 @@ impl ShelluneView {
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .child(strings.import_limits_title),
             )
-            .child(caption_line(
-                format!(
-                    "{} {} · {} {} · {} {}",
-                    strings.import_outcome_ready,
-                    ready,
-                    strings.import_outcome_review,
-                    preview.review_count(),
-                    strings.import_outcome_blocked,
-                    preview.blocked_count()
-                ),
-                metrics,
-            ));
+            .child(caption_line(counts, metrics));
 
         if !limits.ignored().is_empty() {
             let keywords: Vec<String> = limits
@@ -11870,6 +11929,21 @@ impl ShelluneView {
         block
     }
 
+    /// Whether a host the file could import already has a saved host of its name.
+    ///
+    /// The same case-insensitive comparison the import plan skips by, so the row and
+    /// the apply agree.
+    fn import_already_saved(&self, host: &ImportedHost) -> bool {
+        if !host.is_importable() {
+            return false;
+        }
+        let alias = host.alias().to_lowercase();
+        self.book
+            .hosts()
+            .iter()
+            .any(|saved| saved.name().to_lowercase() == alias)
+    }
+
     /// One host the file describes, with the outcome and every reason behind it.
     fn import_row(&self, index: usize, host: &ImportedHost) -> Div {
         let metrics = self.metrics();
@@ -11879,12 +11953,22 @@ impl ShelluneView {
             ImportOutcome::NeedsReview => (Tone::Warning, strings.import_outcome_review),
             ImportOutcome::Blocked => (Tone::Danger, strings.import_outcome_blocked),
         };
-        let chip = if host.is_importable() {
+        // A host the book already has by name is skipped on apply, so the row says
+        // so before anything is applied instead of promising an import.
+        let saved = self.import_already_saved(host);
+        let (tone, label) = if saved {
+            (Tone::Neutral, strings.import_outcome_saved)
+        } else {
+            (tone, label)
+        };
+        let chip = if host.is_importable() || saved {
             SharedString::from(label)
         } else {
             SharedString::from(format!("{label} · {}", strings.import_not_offered))
         };
 
+        // A row is a line of a list, not a card: a file of a dozen hosts drawn as a
+        // dozen framed boxes was a wall of borders around two lines of text each.
         let mut row = div()
             .flex()
             .flex_col()
@@ -11892,9 +11976,7 @@ impl ShelluneView {
             .w_full()
             .px(metrics.scale(spacing::SNUG))
             .py(metrics.scale(spacing::TIGHT))
-            .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::CHROME))
-            .border_1()
+            .border_b_1()
             .border_color(theme::swatch(palette::BORDER))
             .debug_selector(move || format!("hosts.import.row.{index}"))
             .child(
@@ -11909,7 +11991,6 @@ impl ShelluneView {
                             .items_center()
                             .gap(metrics.scale(spacing::TIGHT))
                             .min_w_0()
-                            .child(components::status_dot(tone, metrics))
                             .child(components::stacked(
                                 host.alias().to_owned(),
                                 host.summary(),

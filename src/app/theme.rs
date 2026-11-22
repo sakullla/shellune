@@ -182,9 +182,12 @@ pub mod dark {
     pub const BORDER_STRONG: u32 = 0x373a40;
     pub const SEGMENT_TRACK: u32 = 0x13151a;
     pub const SEGMENT_THUMB: u32 = 0x2a2f3a;
-    pub const TEXT_PRIMARY: u32 = 0xd9dee6;
-    pub const TEXT_SECONDARY: u32 = 0xb6bcc4;
+    pub const TEXT_PRIMARY: u32 = 0xeceef2;
+    pub const TEXT_SECONDARY: u32 = 0xc3c8cf;
     pub const TEXT_MUTED: u32 = 0xa8aeb6;
+    /// The hint inside an empty field: a step below muted, so a hint is never read as
+    /// a value that was typed.
+    pub const TEXT_PLACEHOLDER: u32 = 0x7c818a;
     pub const ACCENT: u32 = 0x82b0ff;
     pub const ACCENT_HOVER: u32 = 0x94bcff;
     pub const ACCENT_PRESSED: u32 = 0x70a3fa;
@@ -252,9 +255,10 @@ pub mod light {
     pub const BORDER_STRONG: u32 = 0xced0d3;
     pub const SEGMENT_TRACK: u32 = 0xe6e8ec;
     pub const SEGMENT_THUMB: u32 = 0xffffff;
-    pub const TEXT_PRIMARY: u32 = 0x1f2328;
-    pub const TEXT_SECONDARY: u32 = 0x4e545c;
-    pub const TEXT_MUTED: u32 = 0x595f67;
+    pub const TEXT_PRIMARY: u32 = 0x16191d;
+    pub const TEXT_SECONDARY: u32 = 0x3f454d;
+    pub const TEXT_MUTED: u32 = 0x5d636b;
+    pub const TEXT_PLACEHOLDER: u32 = 0x7f858d;
     pub const ACCENT: u32 = 0x2359c8;
     pub const ACCENT_HOVER: u32 = 0x1d4db5;
     pub const ACCENT_PRESSED: u32 = 0x17419e;
@@ -369,6 +373,10 @@ pub mod palette {
         /// Muted text: hints, counts and the status bar. It keeps the body floor on the
         /// pressed surface too, not just on the resting ones.
         TEXT_MUTED;
+        /// The hint an empty field shows in place of its value. It is deliberately a
+        /// step below [`TEXT_MUTED`] so a hint ("root", "22") is never mistaken for a
+        /// value the user typed; it keeps the graphic floor on every resting layer.
+        TEXT_PLACEHOLDER;
         /// The selected destination and the primary action.
         ACCENT;
         /// A solid primary button under the pointer.
@@ -2097,6 +2105,27 @@ mod tests {
     }
 
     #[test]
+    fn a_placeholder_is_legible_yet_never_reads_as_a_typed_value() {
+        // A hint sits in an empty field on a resting layer. It keeps the graphic floor
+        // there, and it is a clear step below muted text, so "root" or "22" written as
+        // a hint cannot be taken for a value the user entered.
+        for (layer_name, layer) in LAYERS {
+            assert_floor(
+                &format!("placeholder on {layer_name}"),
+                palette::TEXT_PLACEHOLDER,
+                layer,
+                GRAPHIC,
+            );
+            let (muted_dark, muted_light) = contrast::both(palette::TEXT_MUTED, layer);
+            let (hint_dark, hint_light) = contrast::both(palette::TEXT_PLACEHOLDER, layer);
+            assert!(
+                muted_dark / hint_dark >= 1.4 && muted_light / hint_light >= 1.4,
+                "the placeholder on {layer_name} is too close to muted text"
+            );
+        }
+    }
+
+    #[test]
     fn every_status_reads_on_its_own_tint_and_every_fill_carries_its_text() {
         for (name, text, fill) in [
             ("positive", palette::POSITIVE, palette::POSITIVE_TINT),
@@ -2355,6 +2384,7 @@ mod tests {
                 ("text primary", palette::TEXT_PRIMARY),
                 ("text secondary", palette::TEXT_SECONDARY),
                 ("text muted", palette::TEXT_MUTED),
+                ("text placeholder", palette::TEXT_PLACEHOLDER),
                 ("disabled surface", palette::DISABLED_SURFACE),
                 ("disabled text", palette::DISABLED_TEXT),
                 ("loading track", palette::LOADING_TRACK),

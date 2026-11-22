@@ -194,6 +194,9 @@ impl ShelluneView {
         let field = cx.new(|cx| {
             let mut field = TextField::new(placeholder, cx);
             field.set_clearable(true, cx);
+            // The palette is the frame: a boxed field inside the boxed popover drew
+            // two edges and two fills around one line of input.
+            field.set_bare(true, cx);
             field
         });
         cx.observe(&field, |view, field, cx| {
@@ -894,9 +897,12 @@ impl ShelluneView {
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .p(metrics.scale(spacing::TIGHT + 2.0))
+                    .gap(metrics.scale(spacing::SNUG))
+                    .h(metrics.large_control_height())
+                    .px(metrics.scale(spacing::BASE))
+                    .text_size(metrics.emphasis_size())
                     .child(icons::icon(
                         Icon::Search,
                         metrics.icon_size(),
@@ -905,6 +911,8 @@ impl ShelluneView {
                     .child(
                         div()
                             .flex_1()
+                            .h_full()
+                            .min_w_0()
                             .debug_selector(|| "palette.field".to_owned())
                             .child(field),
                     ),
@@ -965,6 +973,16 @@ impl ShelluneView {
         let strings = self.strings();
         let command = entry.command;
         let accent = matches!(entry.group, Group::Sessions | Group::Shells | Group::Hosts);
+        // What the search matched is drawn in the accent, so a list of answers says
+        // why each one is there. Without a search nothing is marked.
+        let (title_marks, detail_marks) = if searching {
+            (
+                crate::app::palette::highlights(&entry.title, &self.palette_query),
+                crate::app::palette::highlights(&entry.detail, &self.palette_query),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         div()
             .id(("palette.item", index))
             .debug_selector(move || format!("palette.item.{index}"))
@@ -1026,7 +1044,10 @@ impl ShelluneView {
                             .truncate()
                             .text_color(theme::swatch(colors::TEXT_PRIMARY))
                             .when(selected, |title| title.font_weight(FontWeight::MEDIUM))
-                            .child(SharedString::from(entry.title.clone())),
+                            .child(components::highlighted_text(
+                                entry.title.clone(),
+                                title_marks,
+                            )),
                     )
                     .child(
                         div()
@@ -1035,7 +1056,10 @@ impl ShelluneView {
                             .truncate()
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(colors::TEXT_MUTED))
-                            .child(SharedString::from(entry.detail.clone())),
+                            .child(components::highlighted_text(
+                                entry.detail.clone(),
+                                detail_marks,
+                            )),
                     ),
             )
             .when(entry.current, |row| {

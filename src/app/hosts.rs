@@ -2601,13 +2601,20 @@ pub fn import_message(
     skipped: usize,
     withheld: &[(String, String)],
 ) -> (String, bool) {
-    let mut message = format!(
-        "{} {imported} {} · {} {review} · {} {skipped}",
-        strings.import_applied,
-        strings.count_hosts,
-        strings.import_review_count,
-        strings.import_skipped
-    );
+    // A count that is zero says nothing worth reading: "need review 0 · skipped 0"
+    // after a clean import is noise in front of the one number that matters.
+    let noun = if imported == 1 {
+        strings.count_host_one
+    } else {
+        strings.count_hosts
+    };
+    let mut message = format!("{} {imported} {noun}", strings.import_applied);
+    if review > 0 {
+        message.push_str(&format!(" · {} {review}", strings.import_review_count));
+    }
+    if skipped > 0 {
+        message.push_str(&format!(" · {} {skipped}", strings.import_skipped));
+    }
     if withheld.is_empty() {
         return (message, false);
     }
@@ -5483,6 +5490,12 @@ mod tests {
         assert!(!chinese_failed);
         assert!(chinese.contains("已导入"), "{chinese}");
         assert!(chinese.contains("需复核"), "{chinese}");
+
+        let (clean, clean_failed) = import_message(&ENGLISH, 8, 0, 0, &[]);
+        assert!(!clean_failed);
+        assert_eq!(clean, "Imported 8 hosts", "zero counts are left out");
+        let (one, _) = import_message(&ENGLISH, 1, 0, 2, &[]);
+        assert_eq!(one, "Imported 1 host · skipped 2");
 
         let withheld = vec![(
             "through-bastion".to_owned(),

@@ -2150,6 +2150,7 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             unavailable_notice,
             shell_custom_hint,
             count_hosts,
+            count_host_one,
             local_shell_fallback,
             shell_custom_button,
             shell_custom_placeholder,
@@ -2207,6 +2208,8 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             import_include_label,
             import_match_label,
             import_nothing,
+            import_all_saved,
+            import_outcome_saved,
             import_apply,
             import_applied,
             import_review_count,
@@ -7660,6 +7663,65 @@ async fn a_group_place_lists_its_hosts_each_under_its_own_identity(cx: &mut Test
     assert!(cx.debug_bounds("hosts.row.0").is_some());
     assert!(cx.debug_bounds("hosts.row.1").is_some());
     assert!(cx.debug_bounds("hosts.tag.0").is_some());
+}
+
+#[gpui::test]
+async fn a_host_already_saved_is_not_offered_again_by_the_import_preview(cx: &mut TestAppContext) {
+    let dir = TempDir::new("import-already-saved");
+    let config = dir.path().join("config");
+    std::fs::write(
+        &config,
+        "Host web\n    HostName web.example.org\n    User deploy\n",
+    )
+    .expect("the test writes the configuration");
+    let (view, cx) = hosts_view(cx, dir.store());
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.open_import_for_test(&config.display().to_string(), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "hosts.import.preview");
+    assert!(
+        cx.debug_bounds("hosts.import.apply").is_some(),
+        "a new host is offered"
+    );
+    click(cx, "hosts.import.apply");
+    cx.update(|_window, app| {
+        assert_eq!(view.read(app).book().hosts().len(), 1);
+    });
+
+    // The same file again: its only host is now saved, so the preview must say so
+    // instead of offering an import that the apply would skip.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.open_import_for_test(&config.display().to_string(), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "hosts.import.preview");
+    assert!(cx.debug_bounds("hosts.import.row.0").is_some());
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        let preview = view
+            .import_state()
+            .preview()
+            .expect("the same file previews again");
+        assert_eq!(
+            preview.importable_count(),
+            1,
+            "the file still describes the host"
+        );
+        assert!(
+            preview.plan(view.book()).is_empty(),
+            "the apply would write nothing, so the footer must not offer it"
+        );
+    });
+    assert!(
+        cx.debug_bounds("hosts.import.nothing").is_some(),
+        "the footer says why there is nothing to import"
+    );
 }
 
 #[gpui::test]

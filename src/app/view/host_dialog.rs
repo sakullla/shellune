@@ -1548,8 +1548,12 @@ impl ShelluneView {
         let strings = self.strings();
         let mut choices = components::segmented(metrics);
         for protocol in ProtocolKind::ALL {
+            // The track spans the form, so its four choices share it equally rather
+            // than bunching at its left end beside an empty groove.
             choices = choices.child(
                 components::segment(protocol.label(), protocol == current, metrics)
+                    .flex_1()
+                    .justify_center()
                     .id(SharedString::from(format!(
                         "connection.protocol.{}",
                         protocol.wire_name()
