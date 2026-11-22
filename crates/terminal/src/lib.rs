@@ -20,6 +20,7 @@
 
 pub mod blocks;
 pub mod core;
+pub mod highlight;
 pub mod input;
 pub mod metrics;
 pub mod mouse;

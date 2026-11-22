@@ -1,0 +1,160 @@
+//! Colours for the parts of plain output a reader looks for.
+//!
+//! A server's banner, a log tail or a `ping` says where something is and whether it
+//! went wrong in plain text: an address, a link, an "error". Other SSH clients colour
+//! those; a terminal that draws them in the same ink as everything else makes the
+//! reader find them by reading every line.
+//!
+//! Only text the program left in the default foreground is touched: a program that
+//! coloured its own output keeps its colours, and the alternate screen (an editor, a
+//! pager, `htop`) is never recoloured - its layout is the program's. The colours are
+//! the palette's own slots, so the light theme maps them like any other ANSI colour.
+
+use std::ops::Range;
+use std::sync::LazyLock;
+
+use alacritty_terminal::vte::ansi::Rgb;
+use regex::Regex;
+
+use crate::palette::ANSI;
+
+/// What a highlighted span is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// An IPv4 or IPv6 address, with a port or a prefix length when one follows.
+    Address,
+    /// An `http`, `https`, `ssh` or `ftp` link.
+    Link,
+    /// A word that says something failed.
+    Failure,
+    /// A word that says something needs a look.
+    Warning,
+}
+
+impl Kind {
+    /// The palette slot the span is drawn in.
+    #[must_use]
+    pub fn colour(self) -> Rgb {
+        match self {
+            Self::Address => ANSI[6],
+            Self::Link => ANSI[4],
+            Self::Failure => ANSI[1],
+            Self::Warning => ANSI[3],
+        }
+    }
+}
+
+static PATTERNS: LazyLock<[(Kind, Regex); 4]> = LazyLock::new(|| {
+    let compile = |pattern: &str| Regex::new(pattern).expect("a valid highlight pattern");
+    [
+        (
+            Kind::Link,
+            compile(r#"\b(?:https?|ssh|ftp)://[^\s<>"'`]+[^\s<>"'`.,;:!?)\]}]"#),
+        ),
+        (
+            Kind::Address,
+            compile(concat!(
+                // IPv4, each octet 0-255, with an optional :port or /prefix.
+                r"\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)",
+                r"(?::\d{1,5}|/\d{1,2})?\b",
+                // IPv6 written in full or with "::" - never a clock: a time has at
+                // most two colons and no hex letters.
+                r"|(?:\b[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){7}\b)",
+                r"|(?:\b(?:[0-9A-Fa-f]{1,4}:){1,7}:(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?(?:/\d{1,3})?)",
+                r"|(?:::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})(?:/\d{1,3})?\b)",
+            )),
+        ),
+        (
+            Kind::Failure,
+            compile(r"(?i)\b(?:error|errors|failed|failure|fatal|denied|refused|panic)\b"),
+        ),
+        (
+            Kind::Warning,
+            compile(r"(?i)\b(?:warning|warn|deprecated)\b"),
+        ),
+    ]
+});
+
+/// The highlighted spans of one line, as byte ranges, in order and without overlap.
+///
+/// A link wins over the address inside it, and an earlier span over a later one that
+/// starts inside it.
+#[must_use]
+pub fn spans(line: &str) -> Vec<(Range<usize>, Kind)> {
+    let mut found: Vec<(Range<usize>, Kind)> = Vec::new();
+    for (kind, pattern) in PATTERNS.iter() {
+        for hit in pattern.find_iter(line) {
+            let range = hit.range();
+            if found
+                .iter()
+                .any(|(taken, _)| taken.start < range.end && range.start < taken.end)
+            {
+                continue;
+            }
+            found.push((range, *kind));
+        }
+    }
+    found.sort_by_key(|(range, _)| range.start);
+    found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kinds(line: &str) -> Vec<(&str, Kind)> {
+        spans(line)
+            .into_iter()
+            .map(|(range, kind)| (&line[range], kind))
+            .collect()
+    }
+
+    #[test]
+    fn an_address_in_a_login_banner_is_found() {
+        assert_eq!(
+            kinds("Last login: Sun Nov 22 12:32:11 2026 from 103.100.176.124"),
+            [("103.100.176.124", Kind::Address)],
+            "the clock is not an address"
+        );
+    }
+
+    #[test]
+    fn ports_prefixes_and_ipv6_belong_to_the_address() {
+        assert_eq!(
+            kinds("listen 0.0.0.0:22 and 10.0.0.0/8"),
+            [("0.0.0.0:22", Kind::Address), ("10.0.0.0/8", Kind::Address)]
+        );
+        assert_eq!(
+            kinds("inet6 fe80::1c2b:3aff:fe4d:5e6f/64 scope link"),
+            [("fe80::1c2b:3aff:fe4d:5e6f/64", Kind::Address)]
+        );
+        assert_eq!(kinds("ping ::1"), [("::1", Kind::Address)]);
+    }
+
+    #[test]
+    fn a_version_or_an_out_of_range_octet_is_not_an_address() {
+        assert!(kinds("kernel 6.12.74 build 1.2.3").is_empty());
+        assert!(kinds("999.1.1.1").is_empty());
+    }
+
+    #[test]
+    fn a_link_keeps_its_address_and_drops_trailing_punctuation() {
+        assert_eq!(
+            kinds("see https://10.0.0.5:8443/status."),
+            [("https://10.0.0.5:8443/status", Kind::Link)]
+        );
+    }
+
+    #[test]
+    fn failures_and_warnings_are_whole_words() {
+        assert_eq!(
+            kinds("Error: connection refused; warning: retrying"),
+            [
+                ("Error", Kind::Failure),
+                ("refused", Kind::Failure),
+                ("warning", Kind::Warning)
+            ]
+        );
+        assert!(kinds("errorless terror warnings_off").is_empty());
+    }
+}

@@ -35,6 +35,7 @@ pub mod hosts;
 pub mod icons;
 pub mod keymap;
 pub mod layout;
+pub mod monogram;
 pub mod nav;
 pub mod palette;
 pub mod product;

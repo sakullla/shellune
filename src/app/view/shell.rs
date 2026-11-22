@@ -1783,7 +1783,15 @@ impl ShelluneView {
         // a chip here said "connecting" a second time beside the progress that says it.
         let in_flight = panel.status().is_busy() || panel.status().is_asking();
         let (header, subtitle) = self.modal_header_lead(
-            Some(host_avatar(host.name(), false, metrics)),
+            Some(host_avatar(
+                host.name(),
+                &self
+                    .monograms()
+                    .remove(&host.id())
+                    .unwrap_or_else(|| crate::app::monogram::initials(host.name())),
+                false,
+                metrics,
+            )),
             format!("{} {}", ux.connect_title, host.name()),
             // While an attempt runs, its first step names the address; saying it under
             // the title too was the same line twice.

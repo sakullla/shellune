@@ -2242,6 +2242,12 @@ impl TerminalPane {
         self.write_input(text.as_bytes(), cx);
     }
 
+    /// Turns the colouring of addresses, links and failures in plain output on or off.
+    pub fn set_highlight(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.core.set_highlight(on);
+        cx.notify();
+    }
+
     /// Takes the shortcuts in force, so the toolbar describes the keys the window
     /// really answers (R5).
     pub fn set_shortcuts(&mut self, shortcuts: TerminalShortcuts, cx: &mut Context<Self>) {

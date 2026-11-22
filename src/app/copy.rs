@@ -2509,6 +2509,10 @@ pub struct UxStrings {
     pub settings_notices: &'static str,
     /// Bell reminder
     pub settings_bell_notice: &'static str,
+    /// Label of the switch that colours addresses, links and failures in output
+    pub settings_highlight: &'static str,
+    /// What that switch does
+    pub settings_highlight_hint: &'static str,
     /// Marks the tab; the bell byte still reaches the program
     pub settings_bell_notice_hint: &'static str,
     /// Command-end reminder
@@ -3431,6 +3435,8 @@ impl UxStrings {
             self.settings_motion_hint,
             self.settings_notices,
             self.settings_bell_notice,
+            self.settings_highlight,
+            self.settings_highlight_hint,
             self.settings_bell_notice_hint,
             self.settings_finished_notice,
             self.settings_finished_notice_hint,
@@ -3921,6 +3927,8 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     settings_motion_hint: "Reduced skips short fades; the system's reduce-motion setting does too",
     settings_notices: "Background notices",
     settings_bell_notice: "Bell",
+    settings_highlight: "Highlight output",
+    settings_highlight_hint: "Colours IP addresses, links and words like error and warning in plain output; a program's own colours and full-screen programs are left as they are",
     settings_bell_notice_hint: "Marks the tab of a shell that rang while you were elsewhere; the bell byte still reaches the program",
     settings_finished_notice: "Command ended",
     settings_finished_notice_hint: "Marks the tab only when the shell itself reports the end; a shell without integration never marks one",
@@ -4412,6 +4420,8 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     settings_motion_hint: "“减少”会跳过短暂的淡入效果；系统开启减少动态效果时同样跳过",
     settings_notices: "后台提醒",
     settings_bell_notice: "响铃",
+    settings_highlight: "高亮输出内容",
+    settings_highlight_hint: "为普通输出中的 IP 地址、链接以及 error、warning 等字样着色；程序自己设置的颜色和全屏程序（如 vim、htop）保持不变",
     settings_bell_notice_hint: "你在别处时响铃的 Shell，其标签会被标记；响铃字节仍照常送到程序",
     settings_finished_notice: "命令结束",
     settings_finished_notice_hint: "只有 Shell 自己报告命令结束时才标记标签；没有 Shell 集成不会产生该标记",

@@ -989,6 +989,8 @@ pub struct ShelluneView {
     theme_choice: theme::ThemeChoice,
     /// The terminal's palette: the window's, or always dark or light.
     terminal_scheme: theme::TerminalScheme,
+    /// Whether terminals colour addresses, links and failures in plain output.
+    highlight_output: bool,
     /// The global keepalive and timeout numbers (R20).
     ///
     /// `None` until the user changes one, so a preferences file written by this build
@@ -2953,6 +2955,7 @@ impl ShelluneView {
             desktop_starts: 0,
             theme_choice: theme::ThemeChoice::default(),
             terminal_scheme: theme::TerminalScheme::default(),
+            highlight_output: true,
             connection_choice: None,
             connection_draft,
             connection_fields: ConnectionFields {
@@ -3092,6 +3095,9 @@ impl ShelluneView {
         // written before the block existed leaves them at the documented default.
         self.connection_choice = saved.connection;
         self.sync_connection_draft(cx);
+        if let Some(on) = saved.highlight_output {
+            self.highlight_output = on;
+        }
         if let Some(bell) = saved.bell_notice {
             self.workspace.set_attention(AttentionKind::Bell, bell);
         }
@@ -3157,6 +3163,7 @@ impl ShelluneView {
             // Both reminders are written even when they are on, so a file says what the
             // user chose rather than leaving the next start to assume (R7).
             bell_notice: Some(self.workspace.attention_settings().bell),
+            highlight_output: Some(self.highlight_output),
             command_notice: Some(self.workspace.attention_settings().finished),
             // The connection numbers are chosen on the connection page (R20). A page the
             // user never changed writes nothing, so this build's defaults are not frozen
@@ -4890,7 +4897,11 @@ impl ShelluneView {
         // The pane's toolbar names the shortcuts in force, so a rebound action is
         // described by the key the window really answers (R5).
         let shortcuts = terminal::TerminalShortcuts::of(&self.keymap);
-        pane.update(cx, |pane, cx| pane.set_shortcuts(shortcuts, cx));
+        let highlight = self.highlight_output;
+        pane.update(cx, |pane, cx| {
+            pane.set_shortcuts(shortcuts, cx);
+            pane.set_highlight(highlight, cx);
+        });
         self.panes.push(OpenPane {
             tag,
             content: PaneContent::Terminal(pane),
@@ -13416,6 +13427,43 @@ impl ShelluneView {
     }
 
     /// The content under the top bar: the settings, a terminal, or the hosts home.
+    /// Whether terminals colour addresses, links and failures in plain output.
+    pub(super) fn highlight_output(&self) -> bool {
+        self.highlight_output
+    }
+
+    /// Turns output highlighting on or off in every open terminal and remembers it.
+    pub(super) fn set_highlight_output(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.highlight_output == on {
+            return;
+        }
+        self.highlight_output = on;
+        for pane in self.panes.iter().filter_map(|open| open.content.terminal()) {
+            pane.update(cx, |pane, cx| pane.set_highlight(on, cx));
+        }
+        if self.persist_preferences() {
+            self.note_data_changed(cx);
+        }
+        cx.notify();
+    }
+
+    /// The monogram of every saved record, in the order they were saved: hosts first,
+    /// then the desktop and serial connections (see [`crate::app::monogram`]).
+    pub(super) fn monograms(&self) -> std::collections::HashMap<HostId, String> {
+        crate::app::monogram::assign(
+            self.book
+                .hosts()
+                .iter()
+                .map(|host| (host.id(), host.name()))
+                .chain(
+                    self.book
+                        .connections()
+                        .iter()
+                        .map(|record| (record.id(), record.name())),
+                ),
+        )
+    }
+
     /// Whether the window is showing the home page (the hosts list).
     ///
     /// That is not the same as "the destination is Hosts": with no terminal to show,
@@ -21362,29 +21410,7 @@ fn brand_mark(size: gpui::Pixels, _metrics: Metrics) -> Div {
 /// words read as their first two initials (`Design workstation` → `DW`), and a
 /// single word as its first letter.
 pub(crate) fn host_initials(name: &str) -> String {
-    let parts: Vec<&str> = name
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|part| !part.is_empty())
-        .collect();
-    let Some(first) = parts.first().and_then(|part| part.chars().next()) else {
-        return "#".to_owned();
-    };
-    let mut initials: String = first.to_uppercase().collect();
-    // The number a name ends in, read from its last part: a part of its own
-    // (`build-01`) or the tail of a word (`web3`).
-    let last = parts.last().copied().unwrap_or_default();
-    let trailing_digit = last
-        .chars()
-        .rev()
-        .take_while(char::is_ascii_digit)
-        .next()
-        .filter(|_| parts.len() > 1 || last.chars().count() > 1);
-    if let Some(digit) = trailing_digit {
-        initials.push(digit);
-    } else if let Some(second) = parts.get(1).and_then(|part| part.chars().next()) {
-        initials.extend(second.to_uppercase());
-    }
-    initials
+    crate::app::monogram::initials(name)
 }
 
 /// Rebases `path` when ancestor `from` is renamed to `to`.
@@ -21404,21 +21430,19 @@ fn rebase_group_path(path: &GroupPath, from: &GroupPath, to: &GroupPath) -> Opti
     GroupPath::parse(&joined).ok()
 }
 
-/// A rounded square with the initials of a host, so a list is scanned by name shape.
+/// A rounded square with the letters of a host, so a list is scanned by shape and
+/// colour before it is read.
 ///
-/// A host that was really reached before is tinted in the positive tone, the same
-/// rule the recent view uses for its dot; every other host is drawn in the accent.
-fn host_avatar(name: &str, reached: bool, metrics: Metrics) -> Div {
-    let initials = host_initials(name);
+/// The letters are the record's monogram, chosen against every saved record so two
+/// rows rarely share them; the colour is a hash of the whole name, so two that do
+/// still differ. A host that was really reached before is tinted in the positive tone,
+/// the same rule the recent view uses for its dot.
+fn host_avatar(name: &str, monogram: &str, reached: bool, metrics: Metrics) -> Div {
     let (background, text) = if reached {
         (palette::POSITIVE_TINT, palette::POSITIVE)
     } else {
-        // A stable hue per name, so a list is told apart by colour before it is read.
         let hues = palette::AVATARS;
-        let seed = name.bytes().fold(0usize, |hash, byte| {
-            hash.wrapping_mul(31).wrapping_add(usize::from(byte))
-        });
-        hues[seed % hues.len()]
+        hues[crate::app::monogram::colour_index(name, hues.len())]
     };
     div()
         .flex()
@@ -21431,7 +21455,7 @@ fn host_avatar(name: &str, reached: bool, metrics: Metrics) -> Div {
         .text_size(metrics.label_size())
         .font_weight(FontWeight::BOLD)
         .text_color(theme::swatch(text))
-        .child(SharedString::from(initials))
+        .child(SharedString::from(monogram.to_owned()))
 }
 
 /// A muted line of explanation under a row or a heading.

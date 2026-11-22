@@ -143,6 +143,10 @@ pub struct Preferences {
     /// Whether a bell in a background tab marks it (R7). Absent means on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bell_notice: Option<bool>,
+    /// Whether the terminal colours addresses, links and failures in plain output.
+    /// Absent means on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub highlight_output: Option<bool>,
     /// Whether a command end the shell reported in a background tab marks it (R7).
     /// Absent means on.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -270,6 +274,7 @@ mod tests {
                 linux: Vec::new(),
             }),
             bell_notice: Some(false),
+            highlight_output: Some(false),
             command_notice: Some(true),
             connection: Some(ConnectionDefaults::new(45, 4, 12).expect("valid defaults")),
             auto_check_updates: Some(false),

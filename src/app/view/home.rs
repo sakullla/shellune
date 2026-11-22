@@ -92,6 +92,10 @@ const TITLE_MAX_WIDTH: f32 = 240.0;
 /// How wide the toolbar's menus are, before zoom.
 const MENU_WIDTH: f32 = 232.0;
 
+/// The width of the filter panel: the five protocols on one line at the default text
+/// size.
+const FILTER_PANEL_WIDTH: f32 = 380.0;
+
 /// A menu of the home page: the toolbar's two and a group's own.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum HomeMenu {
@@ -132,6 +136,8 @@ struct ConnectionRowView {
     /// The row's number among the connection rows, for its selector.
     number: usize,
     name: SharedString,
+    /// The letters its tile is drawn with (see [`crate::app::monogram`]).
+    monogram: SharedString,
     /// The protocol, as the tag beside the name says it.
     protocol: SharedString,
     target: SharedString,
@@ -163,6 +169,8 @@ struct HostRowView {
     number: usize,
     /// The display name.
     name: SharedString,
+    /// The letters its tile is drawn with (see [`crate::app::monogram`]).
+    monogram: SharedString,
     /// What a connection would dial.
     target: SharedString,
     /// The group the host is in, when it is in one and the row has room for it.
@@ -1527,80 +1535,88 @@ impl ShelluneView {
         };
         let (card, position) = match menu {
             HomeMenu::Filter => {
-                let mut card = components::menu_card("hosts.filter.menu", metrics)
-                    .w(metrics.scale(MENU_WIDTH))
-                    .child(components::menu_section(ux.hosts_protocol_label, metrics));
+                // Three questions, one line each: which protocol, which state, which
+                // order. A segmented row answers each with every choice in view, so
+                // the panel is four lines high instead of a column of thirteen that
+                // covered the list, and it stays open while the answers are combined -
+                // the list behind it narrows with every press.
+                let row = |label: &'static str, control: Div| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(metrics.scale(spacing::HALF))
+                        .child(
+                            div()
+                                .text_size(metrics.caption_size())
+                                .font_weight(metrics.medium_weight())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .child(label),
+                        )
+                        .child(control)
+                };
+                let mut protocols = components::segmented(metrics);
                 for protocol in HostProtocolFilter::ALL {
                     let chosen = self.hosts.filter().protocol() == protocol;
-                    card = card.child(
-                        components::menu_entry(
-                            protocol.label(ux),
-                            protocol.debug_selector(),
-                            None,
-                            true,
-                            false,
-                            metrics,
-                        )
-                        .children(chosen.then(|| menu_check(metrics)))
-                        .on_click(cx.listener(
-                            move |this, _event, _window, cx| {
+                    protocols = protocols.child(
+                        components::segment(protocol.label(ux), chosen, metrics)
+                            .id(protocol.debug_selector())
+                            .debug_selector(move || protocol.debug_selector().to_owned())
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
                                 this.hosts.set_protocol_filter(protocol);
                                 this.hosts_cursor = None;
-                                this.close_home_menu(cx);
-                            },
-                        )),
+                                cx.notify();
+                            })),
                     );
                 }
-                card = card
-                    .child(components::menu_divider(metrics))
-                    .child(components::menu_section(ux.hosts_status_label, metrics));
+                let mut statuses = components::segmented(metrics);
                 for status in HostStatusFilter::ALL {
                     let chosen = self.hosts.filter().status() == status;
-                    card = card.child(
-                        components::menu_entry(
-                            status.label(ux),
-                            status.debug_selector(),
-                            None,
-                            true,
-                            false,
-                            metrics,
-                        )
-                        .children(chosen.then(|| menu_check(metrics)))
-                        .on_click(cx.listener(
-                            move |this, _event, _window, cx| {
+                    statuses = statuses.child(
+                        components::segment(status.label(ux), chosen, metrics)
+                            .id(status.debug_selector())
+                            .debug_selector(move || status.debug_selector().to_owned())
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
                                 this.hosts.set_status_filter(status);
                                 this.hosts_cursor = None;
-                                this.close_home_menu(cx);
-                            },
-                        )),
+                                cx.notify();
+                            })),
                     );
                 }
+                let mut card = components::menu_card("hosts.filter.menu", metrics)
+                    .w(metrics.scale(FILTER_PANEL_WIDTH))
+                    .max_w(viewport.width - metrics.scale(spacing::BASE * 2.0))
+                    .gap(metrics.scale(spacing::SNUG))
+                    .p(metrics.scale(spacing::SNUG))
+                    .child(row(ux.hosts_protocol_label, protocols))
+                    .child(row(ux.hosts_status_label, statuses));
+                // The recent view is ordered by when, so it offers no other order.
                 if self.hosts.section() != HomeSection::Recent {
-                    card = card
-                        .child(components::menu_divider(metrics))
-                        .child(components::menu_section(ux.home_sort_label, metrics));
+                    let mut sorts = components::segmented(metrics);
                     for sort in HostSort::ALL {
                         let chosen = self.hosts.sort() == sort;
-                        card = card.child(
-                            components::menu_entry(
-                                sort.label(ux),
-                                sort.debug_selector(),
-                                None,
-                                true,
-                                false,
-                                metrics,
-                            )
-                            .children(chosen.then(|| menu_check(metrics)))
-                            .on_click(cx.listener(
-                                move |this, _event, _window, cx| {
+                        sorts = sorts.child(
+                            components::segment(sort.label(ux), chosen, metrics)
+                                .id(sort.debug_selector())
+                                .debug_selector(move || sort.debug_selector().to_owned())
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
                                     this.hosts.set_sort(sort);
-                                    this.close_home_menu(cx);
-                                },
-                            )),
+                                    cx.notify();
+                                })),
                         );
                     }
+                    card = card.child(row(ux.home_sort_label, sorts));
                 }
-                (card, below(self.home_filter_anchor.get()))
+                // Hung from the button's right edge, so a toolbar on the window's right
+                // keeps the panel inside the window.
+                let anchor = self.home_filter_anchor.get();
+                let width = metrics
+                    .scale(FILTER_PANEL_WIDTH)
+                    .min(viewport.width - metrics.scale(spacing::BASE * 2.0));
+                let position = gpui::point(
+                    (anchor.right() - width).max(metrics.scale(spacing::BASE)),
+                    anchor.bottom() + metrics.scale(spacing::HAIRLINE),
+                );
+                (card, position)
             }
             HomeMenu::More => {
                 let mut card = components::menu_card("hosts.more.menu", metrics)
@@ -2195,6 +2211,15 @@ impl ShelluneView {
                 enter: cursor.is_none(),
             }));
         }
+        let monograms = self.monograms();
+        let monogram = |id: HostId, name: &str| {
+            SharedString::from(
+                monograms
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| crate::app::monogram::initials(name)),
+            )
+        };
         let mut hosts = 0usize;
         let mut connections = 0usize;
         for row in list.rows() {
@@ -2209,6 +2234,7 @@ impl ShelluneView {
                         id: host.id,
                         number: hosts,
                         name: SharedString::from(saved.name().to_owned()),
+                        monogram: monogram(host.id, saved.name()),
                         target: SharedString::from(saved.target()),
                         group: show_meta
                             .then(|| saved.group_text().map(SharedString::from))
@@ -2260,6 +2286,7 @@ impl ShelluneView {
                         id: row.id,
                         number: connections,
                         name: SharedString::from(saved.name().to_owned()),
+                        monogram: monogram(row.id, saved.name()),
                         protocol: SharedString::from(saved.protocol().label()),
                         target: SharedString::from(saved.target()),
                         group: show_meta
@@ -2777,15 +2804,6 @@ fn group_tree_row_element(
         )
 }
 
-/// The check that marks the current choice of a menu.
-fn menu_check(metrics: Metrics) -> gpui::Svg {
-    icons::icon(
-        Icon::Check,
-        metrics.small_icon_size(),
-        theme::swatch(palette::ACCENT),
-    )
-}
-
 /// The "connect to …" row on top of a search that reads as an address: one press, or
 /// Enter in the search, dials it without saving it (ADR-3).
 fn direct_row_element(
@@ -3026,7 +3044,12 @@ fn host_row_element(
     // mark it, and a box there made it look picked - so picking hosts costs the list no column of empty
     // boxes.
     let picking = selected || host.selecting;
-    let avatar = super::host_avatar(host.name.as_ref(), selected, metrics);
+    let avatar = super::host_avatar(
+        host.name.as_ref(),
+        host.monogram.as_ref(),
+        selected,
+        metrics,
+    );
     let leading = div()
         .relative()
         .flex_none()
@@ -3300,7 +3323,12 @@ fn connection_row_element(
                     slot.opacity(0.45)
                         .tooltip(components::tooltip(ux.hosts_selection_ssh_only))
                 })
-                .child(super::host_avatar(connection.name.as_ref(), false, metrics)),
+                .child(super::host_avatar(
+                    connection.name.as_ref(),
+                    connection.monogram.as_ref(),
+                    false,
+                    metrics,
+                )),
         )
         .child(row_text(
             connection.name.clone(),

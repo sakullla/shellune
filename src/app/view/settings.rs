@@ -89,6 +89,7 @@ pub(crate) enum Item {
     Scheme,
     FontSize,
     DefaultShell,
+    Highlight,
     Policy,
     BellNotice,
     FinishedNotice,
@@ -104,7 +105,12 @@ pub(crate) enum Item {
 
 /// The items of every category, in the order the navigation lists them.
 const APPEARANCE: [Item; 4] = [Item::Theme, Item::Language, Item::TextSize, Item::Motion];
-const TERMINAL: [Item; 3] = [Item::Scheme, Item::FontSize, Item::DefaultShell];
+const TERMINAL: [Item; 4] = [
+    Item::Scheme,
+    Item::FontSize,
+    Item::DefaultShell,
+    Item::Highlight,
+];
 const CONNECTION: [Item; 1] = [Item::Policy];
 const NOTICES: [Item; 2] = [Item::BellNotice, Item::FinishedNotice];
 const KEYS: [Item; 1] = [Item::Shortcuts];
@@ -201,7 +207,9 @@ impl Item {
     pub(super) fn category(self) -> Category {
         match self {
             Self::Theme | Self::Language | Self::TextSize | Self::Motion => Category::Appearance,
-            Self::Scheme | Self::FontSize | Self::DefaultShell => Category::Terminal,
+            Self::Scheme | Self::FontSize | Self::DefaultShell | Self::Highlight => {
+                Category::Terminal
+            }
             Self::Policy => Category::Connection,
             Self::BellNotice | Self::FinishedNotice => Category::Notices,
             Self::Shortcuts => Category::Keys,
@@ -232,6 +240,7 @@ impl Item {
             Self::Scheme => "scheme",
             Self::FontSize => "font-size",
             Self::DefaultShell => "default-shell",
+            Self::Highlight => "highlight",
             Self::Policy => "policy",
             Self::BellNotice => "bell-notice",
             Self::FinishedNotice => "finished-notice",
@@ -257,6 +266,7 @@ impl Item {
             Self::Scheme => ux.settings_scheme,
             Self::FontSize => ux.settings_font_size,
             Self::DefaultShell => ux.settings_default_shell,
+            Self::Highlight => ux.settings_highlight,
             Self::Policy => ux.settings_connection_policy,
             Self::BellNotice => ux.settings_bell_notice,
             Self::FinishedNotice => ux.settings_finished_notice,
@@ -282,6 +292,7 @@ impl Item {
             Self::Scheme => ux.settings_scheme_hint,
             Self::FontSize => ux.settings_font_size_hint,
             Self::DefaultShell => ux.settings_default_shell_hint,
+            Self::Highlight => ux.settings_highlight_hint,
             Self::Policy => ux.settings_connection_hint,
             Self::BellNotice => ux.settings_bell_notice_hint,
             Self::FinishedNotice => ux.settings_finished_notice_hint,
@@ -951,6 +962,17 @@ impl ShelluneView {
                 label,
                 ux.settings_default_shell_hint,
                 self.settings_shell_control(cx),
+            ),
+            Item::Highlight => self.settings_row(
+                "highlight",
+                label,
+                ux.settings_highlight_hint,
+                div().child(self.switch_control(
+                    "settings.highlight",
+                    self.highlight_output(),
+                    cx,
+                    |view, on, cx| view.set_highlight_output(on, cx),
+                )),
             ),
             Item::BellNotice => self.settings_row(
                 "bell-notice",

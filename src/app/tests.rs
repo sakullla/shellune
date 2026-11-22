@@ -24820,21 +24820,21 @@ async fn the_filter_menu_narrows_by_status_and_orders_the_list(cx: &mut TestAppC
     click(cx, "hosts.status.connected");
     assert!(
         cx.debug_bounds("hosts.nomatch").is_some(),
-        "the menu's status narrows the list"
+        "the panel's status narrows the list"
     );
     assert!(
-        !cx.update(|_window, app| view.read(app).home_menu_open()),
-        "choosing closes the menu"
+        cx.update(|_window, app| view.read(app).home_menu_open()),
+        "the panel stays open, so the answers can be combined"
     );
 
-    click(cx, "hosts.filter");
     click(cx, "hosts.status.any");
-    click(cx, "hosts.filter");
     click(cx, "hosts.sort.name");
     assert_eq!(
         cx.update(|_window, app| view.read(app).hosts_state().sort()),
         crate::app::hosts::HostSort::Name
     );
+    // The funnel closes the panel again; the chips above the list are then pressable.
+    click(cx, "hosts.filter");
     assert!(
         cx.debug_bounds("hosts.filter.sort").is_some(),
         "an order other than the saved one is named above the list"
@@ -41801,6 +41801,7 @@ async fn r9_r10_hundreds_of_groups_search_bounded_rendering_scroll_and_focus_mig
         crate::app::hosts::HostProtocolFilter::Ssh.debug_selector(),
     );
     cx.run_until_parked();
+    click(cx, "hosts.filter");
     cx.update(|_window, app| {
         view.update(app, |view, cx| {
             view.search_groups("no-such-group-xyz", cx);
@@ -41869,6 +41870,7 @@ async fn r11_r12_protocol_filter_connected_status_and_multi_protocol_form_group_
         cx.update(|_window, app| view.read(app).hosts_state().filter().protocol()),
         HostProtocolFilter::Rdp
     );
+    click(cx, "hosts.filter");
     assert!(
         cx.debug_bounds("hosts.filter.protocol").is_some(),
         "active protocol filter renders a clearable chip"

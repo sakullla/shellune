@@ -402,6 +402,9 @@ pub struct TerminalCore {
     completion_echo: CompletionEcho,
     /// Classic, or command blocks when the shell actually reports them.
     presentation: TerminalMode,
+    /// Whether plain output has its addresses, links and failures coloured
+    /// (see [`crate::highlight`]).
+    highlight: bool,
     /// Lines dropped from the front of history, so anchors survive a full scrollback.
     ///
     /// A shrink of `history_size` is one way lines leave. A full ring also rotates
@@ -438,6 +441,7 @@ impl TerminalCore {
             blocks: BlockBook::new(),
             completion_echo: CompletionEcho::Ready,
             presentation: TerminalMode::Classic,
+            highlight: true,
             lines_dropped: 0,
             last_history: 0,
             scrollback,
@@ -688,6 +692,10 @@ impl TerminalCore {
         let display_offset = content.display_offset;
         let selection = content.selection;
         let mut rows = vec![RenderedRow::default(); self.grid.rows];
+        // Which cells the program left in the default ink: only those may be
+        // highlighted, so a program's own colours always win.
+        let mut plain: Vec<Vec<bool>> = vec![Vec::new(); self.grid.rows];
+        let highlight = self.highlight && !content.mode.contains(TermMode::ALT_SCREEN);
 
         for indexed in content.display_iter {
             let point = indexed.point;
@@ -704,6 +712,16 @@ impl TerminalCore {
                 continue;
             }
 
+            if highlight && let Some(flags) = plain.get_mut(viewport.line) {
+                flags.push(
+                    matches!(
+                        cell.fg,
+                        alacritty_terminal::vte::ansi::Color::Named(
+                            alacritty_terminal::vte::ansi::NamedColor::Foreground
+                        )
+                    ) && !cell.flags.contains(Flags::INVERSE),
+                );
+            }
             let mut foreground = palette::resolve(cell.fg, content.colors);
             let mut background = palette::resolve(cell.bg, content.colors);
             if cell.flags.contains(Flags::INVERSE) {
@@ -754,6 +772,12 @@ impl TerminalCore {
             });
         }
 
+        if highlight {
+            for (row, plain) in rows.iter_mut().zip(&plain) {
+                highlight_row(row, plain);
+            }
+        }
+
         let cursor = point_to_viewport(display_offset, content.cursor.point)
             // A cursor that is scrolled out of the viewport is not drawn: reporting
             // it anyway would put it at a row the grid does not have.
@@ -772,6 +796,11 @@ impl TerminalCore {
             history: self.term.grid().history_size(),
             mode: content.mode,
         }
+    }
+
+    /// Turns the colouring of addresses, links and failures in plain output on or off.
+    pub fn set_highlight(&mut self, on: bool) {
+        self.highlight = on;
     }
 
     /// Chooses classic or command-block presentation.
@@ -1508,6 +1537,35 @@ fn merge_effects(into: &mut TerminalEffects, next: TerminalEffects) {
     into.commands_finished += next.commands_finished;
 }
 
+/// Colours the highlighted spans of one drawn row, in the cells left in default ink.
+fn highlight_row(row: &mut RenderedRow, plain: &[bool]) {
+    if !plain.iter().any(|plain| *plain) {
+        return;
+    }
+    // The row's text, and for each byte the cell it came from.
+    let mut line = String::new();
+    let mut owner: Vec<usize> = Vec::new();
+    for (index, cell) in row.cells.iter().enumerate() {
+        line.push_str(&cell.text);
+        owner.extend(std::iter::repeat_n(index, cell.text.len()));
+    }
+    for (range, kind) in crate::highlight::spans(&line) {
+        let colour = kind.colour();
+        let first = owner.get(range.start).copied();
+        let last = owner.get(range.end.saturating_sub(1)).copied();
+        let (Some(first), Some(last)) = (first, last) else {
+            continue;
+        };
+        // A span the program coloured even in part is the program's.
+        if !(first..=last).all(|index| plain.get(index).copied().unwrap_or(false)) {
+            continue;
+        }
+        for cell in &mut row.cells[first..=last] {
+            cell.foreground = colour;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1515,6 +1573,66 @@ mod tests {
 
     fn core() -> TerminalCore {
         TerminalCore::new(40, 10, 100)
+    }
+
+    /// The foreground of each drawn cell of row 0 whose text is in `word`.
+    fn colours_of(core: &TerminalCore, word: &str) -> Vec<Rgb> {
+        let snapshot = core.snapshot();
+        let row = &snapshot.rows[0];
+        let line: String = row.cells.iter().map(|cell| cell.text.as_str()).collect();
+        let start = line.find(word).expect("the word is on the row");
+        row.cells[start..start + word.len()]
+            .iter()
+            .map(|cell| cell.foreground)
+            .collect()
+    }
+
+    #[test]
+    fn an_address_in_plain_output_is_drawn_in_the_address_colour() {
+        let mut core = core();
+        core.feed(b"from 10.0.0.5 ok");
+        assert!(
+            colours_of(&core, "10.0.0.5")
+                .iter()
+                .all(|colour| *colour == crate::highlight::Kind::Address.colour())
+        );
+        assert!(
+            colours_of(&core, "from")
+                .iter()
+                .all(|colour| *colour == palette::FOREGROUND),
+            "the words around it keep the default ink"
+        );
+    }
+
+    #[test]
+    fn a_program_that_coloured_its_own_output_keeps_its_colours() {
+        let mut core = core();
+        core.feed(b"\x1b[32m10.0.0.5\x1b[0m");
+        assert!(
+            colours_of(&core, "10.0.0.5")
+                .iter()
+                .all(|colour| *colour == palette::ANSI[2])
+        );
+    }
+
+    #[test]
+    fn highlighting_can_be_turned_off_and_skips_the_alternate_screen() {
+        let mut core = core();
+        core.set_highlight(false);
+        core.feed(b"10.0.0.5");
+        assert!(
+            colours_of(&core, "10.0.0.5")
+                .iter()
+                .all(|colour| *colour == palette::FOREGROUND)
+        );
+        let mut full_screen = self::core();
+        full_screen.feed(b"\x1b[?1049h10.0.0.5");
+        assert!(
+            colours_of(&full_screen, "10.0.0.5")
+                .iter()
+                .all(|colour| *colour == palette::FOREGROUND),
+            "an editor's or a pager's screen is the program's"
+        );
     }
 
     #[test]

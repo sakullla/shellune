@@ -223,20 +223,24 @@ pub mod dark {
     pub const SHADOW: u32 = 0x000000;
     /// The terminal's selection: the accent 32% over the terminal's background.
     pub const SELECTION: u32 = 0x364763;
-    /// Eight avatar pairs (tint, initials): periwinkle, sky, teal, jade, moss, sand,
-    /// clay and rose. They are built in OKLCH at one lightness and one chroma with the
-    /// hues spread evenly, so each host keeps a colour of its own that is told apart at
+    /// Twelve avatar pairs (tint, letters), a hue every 30 degrees around the wheel.
+    /// They are built in OKLCH at one lightness and one chroma with the hues spread
+    /// evenly, so each host keeps a colour of its own that is told apart at
     /// a glance and none of them is louder than the rest. The earlier greys-with-a-hint
     /// all read as the same slate.
-    pub const AVATARS: [(u32, u32); 8] = [
+    pub const AVATARS: [(u32, u32); 12] = [
         (0x28354e, 0xbcd4fe),
         (0x193a4a, 0xa1dcfc),
-        (0x0f3d3f, 0x96e2e6),
-        (0x1c3d2e, 0xa6e3c4),
-        (0x2e3a1f, 0xc4dda8),
-        (0x413316, 0xeacf9a),
-        (0x4b2d22, 0xffc3ae),
-        (0x472b3b, 0xf8bfde),
+        (0x103c41, 0x96e1ea),
+        (0x143d36, 0x9be3d4),
+        (0x203d2a, 0xace2bd),
+        (0x2d3a1f, 0xc2dda9),
+        (0x3b3617, 0xded49b),
+        (0x443217, 0xf0cc9c),
+        (0x492e1e, 0xfcc5a7),
+        (0x4b2b29, 0xfec1bb),
+        (0x492b37, 0xfcbfd5),
+        (0x402d45, 0xe9c3f2),
     ];
     pub const TAB_ACCENTS: [u32; 6] = [0x9cbcd8, 0xb9aecb, 0x8fc6cf, 0xaec79a, 0xd3bc9c, 0xd4a8ae];
 }
@@ -297,16 +301,20 @@ pub mod light {
     pub const SHADOW: u32 = 0x000000;
     /// The terminal's selection: the accent 22% over the light terminal's background.
     pub const SELECTION: u32 = 0xc8d5ef;
-    /// The same eight hues as the dark avatars, as pale tints with deep initials.
-    pub const AVATARS: [(u32, u32); 8] = [
+    /// The same twelve hues as the dark avatars, as pale tints with deep letters.
+    pub const AVATARS: [(u32, u32); 12] = [
         (0xe3edff, 0x2e5091),
         (0xdaf1fe, 0x025a7b),
-        (0xd7f3f5, 0x065e62),
-        (0xdcf4e7, 0x046242),
-        (0xe7f1dc, 0x405e00),
-        (0xf6ecd7, 0x6a4d03),
-        (0xffe7df, 0x85371a),
-        (0xfde5f1, 0x7d3461),
+        (0xd7f3f6, 0x005e66),
+        (0xd8f4ed, 0x036054),
+        (0xdef3e4, 0x046337),
+        (0xe6f1dc, 0x3d5e06),
+        (0xf1eed7, 0x5e5301),
+        (0xf9ead7, 0x6f4a04),
+        (0xfee8db, 0x833b02),
+        (0xfee7e4, 0x873431),
+        (0xfee5ee, 0x813356),
+        (0xf6e7fa, 0x6e3a79),
     ];
     pub const TAB_ACCENTS: [u32; 6] = [0x2f5f86, 0x5d4a80, 0x1a6b74, 0x51662f, 0x8a5a20, 0x8b4450];
 
@@ -467,10 +475,10 @@ pub mod palette {
     ///
     /// An avatar says which host this is, so it must not compete with the accent that
     /// says which host is current, nor with the status colours.
-    pub const AVATARS: [(Token, Token); 8] = {
-        let mut pairs = [(CANVAS, CANVAS); 8];
+    pub const AVATARS: [(Token, Token); 12] = {
+        let mut pairs = [(CANVAS, CANVAS); 12];
         let mut index = 0;
-        while index < 8 {
+        while index < 12 {
             pairs[index] = (
                 Token::new(dark::AVATARS[index].0, light::AVATARS[index].0),
                 Token::new(dark::AVATARS[index].1, light::AVATARS[index].1),
