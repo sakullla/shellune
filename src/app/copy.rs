@@ -3291,6 +3291,14 @@ pub struct UxStrings {
     pub home_quick_temporary_hint: &'static str,
     /// Keycap beside the result Enter opens
     pub home_quick_enter: &'static str,
+    /// Tooltip of the keycap on the search's first match: what Enter does there
+    pub home_enter_first_hint: &'static str,
+    /// Label of the strip of recently reached hosts above the whole list
+    pub home_recent_strip: &'static str,
+    /// Tooltip of one host in that strip: connect, with when it was last reached
+    pub home_recent_strip_hint: &'static str,
+    /// The strip's link to the full recent view
+    pub home_recent_strip_all: &'static str,
     /// The home page's menu of local terminals
     pub home_local_button: &'static str,
     /// Heading of the serial connections in that menu
@@ -3851,6 +3859,10 @@ impl UxStrings {
             self.home_quick_temporary,
             self.home_quick_temporary_hint,
             self.home_quick_enter,
+            self.home_enter_first_hint,
+            self.home_recent_strip,
+            self.home_recent_strip_hint,
+            self.home_recent_strip_all,
             self.home_local_button,
             self.home_serial_section,
             self.home_serial_new,
@@ -4350,6 +4362,10 @@ included",
     home_quick_temporary: "Connect to {target}",
     home_quick_temporary_hint: "Not saved · opens the sign-in",
     home_quick_enter: "Enter",
+    home_enter_first_hint: "Enter connects to this host · ↑↓ to choose another",
+    home_recent_strip: "Recent",
+    home_recent_strip_hint: "Connect to {target} · {when}",
+    home_recent_strip_all: "View all",
     home_local_button: "Local terminal",
     home_serial_section: "Serial",
     home_serial_new: "New serial connection",
@@ -4844,6 +4860,10 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     home_quick_temporary: "连接到 {target}",
     home_quick_temporary_hint: "不保存 · 打开登录",
     home_quick_enter: "回车",
+    home_enter_first_hint: "按回车连接这台主机 · ↑↓ 选择其他主机",
+    home_recent_strip: "最近",
+    home_recent_strip_hint: "连接到 {target} · {when}",
+    home_recent_strip_all: "查看全部",
     home_local_button: "本地终端",
     home_serial_section: "串口",
     home_serial_new: "新建串口连接",

@@ -917,6 +917,25 @@ pub fn compact_button(label: impl Into<SharedString>, variant: Variant, metrics:
     button_sized(label, variant, ButtonSize::Compact, metrics)
 }
 
+/// The labelled main action at the end of a list row, such as a host's "Connect".
+///
+/// A long list of rows that all end in the same framed button reads as a column of
+/// borders, and the one row the eye is on is lost in it. So the action rests as quiet
+/// words - still in view, still a target - and takes the secondary frame when its row
+/// is pointed at, or at once when `emphasized`: the keyboard's row, or the row Enter
+/// would open.
+pub fn row_action_button(
+    label: impl Into<SharedString>,
+    emphasized: bool,
+    metrics: Metrics,
+) -> Div {
+    if emphasized {
+        return compact_button(label, Variant::Secondary, metrics);
+    }
+    let framed = button_face(Variant::Secondary, ControlState::Resting);
+    compact_button(label, Variant::Ghost, metrics).group_hover(ROW_GROUP, hover_style(framed))
+}
+
 /// A square button that holds a short glyph such as "A+" or "×".
 pub fn icon_button(glyph: impl Into<SharedString>, metrics: Metrics) -> Div {
     let size = metrics.hit_target();

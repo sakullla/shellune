@@ -27244,6 +27244,119 @@ async fn enter_in_the_host_search_connects_the_first_match_and_only_while_search
 }
 
 #[gpui::test]
+async fn the_search_marks_the_row_enter_opens_and_the_first_down_moves_past_it(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("search-enter-mark");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("web-a", "10.0.0.5", 22, "deploy", None),
+            stored_host("web-b", "10.0.0.6", 22, "deploy", None),
+            stored_host("db", "10.0.0.9", 22, "postgres", None),
+        ],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    assert!(
+        cx.debug_bounds("hosts.enter.0").is_none(),
+        "with nothing typed, Enter opens nothing and no row says it does"
+    );
+
+    type_into(cx, "hosts.search", "web");
+    assert!(
+        cx.debug_bounds("hosts.enter.0").is_some(),
+        "the first match carries the Enter keycap"
+    );
+    assert!(cx.debug_bounds("hosts.enter.1").is_none());
+
+    // The marked row is already the one Enter means, so Down chooses the next.
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        let cursor = view.hosts_cursor().expect("Down chose a row");
+        assert_eq!(
+            view.book().host(cursor).map(|host| host.name().to_owned()),
+            Some("web-b".to_owned())
+        );
+    });
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).home_strip_and_enter_for_test().1),
+        None,
+        "once the arrows chose a row, the keycap leaves the first match"
+    );
+
+    // An address is not a phrase: the "connect to …" row is what Enter means.
+    clear_field(cx, "hosts.search", 3);
+    type_into(cx, "hosts.search", "root@web");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).home_strip_and_enter_for_test().1),
+        None
+    );
+}
+
+#[gpui::test]
+async fn the_recent_strip_reconnects_from_the_whole_list_and_steps_aside_while_searching(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("recent-strip");
+    let hosts: Vec<HostConfig> = (0..8)
+        .map(|index| stored_host(&format!("node-{index}"), "10.0.0.5", 22, "deploy", None))
+        .collect();
+    let mut book = seed(&dir.store(), hosts);
+    let reached = book.hosts()[5].id();
+    book.record_connection(reached, 1_700_000_000)
+        .expect("the host is saved");
+    dir.store().save(&book).expect("the book saves");
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    assert!(
+        cx.debug_bounds("hosts.recent.chip.0").is_some(),
+        "the whole list names the host reached last above its rows"
+    );
+    assert!(cx.debug_bounds("hosts.recent.chip.1").is_none());
+
+    type_into(cx, "hosts.search", "node");
+    assert!(
+        !cx.update(|_window, app| view.read(app).home_strip_and_enter_for_test().0),
+        "a search is already the way to a host: the strip steps aside"
+    );
+    clear_field(cx, "hosts.search", 4);
+
+    click(cx, "hosts.recent.chip.0");
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        let state = view
+            .read(app)
+            .remote_state()
+            .expect("the chip opened the connection");
+        assert_eq!(state.host().name(), "node-5");
+    });
+}
+
+#[gpui::test]
+async fn a_short_book_has_no_recent_strip(cx: &mut TestAppContext) {
+    let dir = TempDir::new("recent-strip-short");
+    let mut book = seed(
+        &dir.store(),
+        vec![
+            stored_host("web", "10.0.0.5", 22, "deploy", None),
+            stored_host("db", "10.0.0.9", 22, "postgres", None),
+        ],
+    );
+    let reached = book.hosts()[0].id();
+    book.record_connection(reached, 1_700_000_000)
+        .expect("the host is saved");
+    dir.store().save(&book).expect("the book saves");
+    let (_view, cx) = hosts_view_with_trust(cx, &dir);
+    assert!(
+        cx.debug_bounds("hosts.recent.strip").is_none(),
+        "every row of a short book is in view already"
+    );
+}
+
+#[gpui::test]
 async fn a_double_click_on_a_host_row_connects_and_a_single_click_does_not(
     cx: &mut TestAppContext,
 ) {
@@ -40373,7 +40486,7 @@ async fn non_ssh_dialog_save_and_connect_starts_rdp_vnc_and_serial_sessions(
 }
 
 #[test]
-fn home_row_connect_buttons_are_secondary_while_new_host_is_primary() {
+fn home_row_connect_buttons_are_quiet_row_actions_while_new_host_is_primary() {
     let source = include_str!("view/home.rs");
     let new_pos = source
         .find(".id(\"hosts.new\")")
@@ -40384,31 +40497,35 @@ fn home_row_connect_buttons_are_secondary_while_new_host_is_primary() {
         "hosts.new must remain Variant::Primary"
     );
 
-    let host_connect_pos = source
-        .find("format!(\"hosts.connect.{number}\")")
-        .expect("hosts.connect.{number} button in home.rs");
-    let host_connect_window = &source[host_connect_pos.saturating_sub(200)..host_connect_pos];
+    // A row's Connect is the shared row action: quiet words at rest, the secondary
+    // frame on the pointed or keyboard row, and never the page's one primary button.
+    for (selector, reach) in [
+        ("format!(\"hosts.connect.{number}\")", 200),
+        ("\"hosts.connection.connect.{number}\"", 220),
+    ] {
+        let pos = source
+            .find(selector)
+            .unwrap_or_else(|| panic!("{selector} button in home.rs"));
+        let window = &source[pos.saturating_sub(reach)..pos];
+        assert!(
+            window.contains("components::row_action_button("),
+            "{selector} must be drawn with components::row_action_button"
+        );
+        assert!(
+            !window.contains("Variant::Primary"),
+            "{selector} must not use Variant::Primary"
+        );
+    }
+    let components = include_str!("components.rs");
+    let action = components
+        .find("pub fn row_action_button(")
+        .expect("row_action_button in components.rs");
+    let body = &components[action..action + 700];
     assert!(
-        host_connect_window.contains("Variant::Secondary"),
-        "hosts.connect.{{n}} must use Variant::Secondary"
+        body.contains("Variant::Secondary") && body.contains("Variant::Ghost"),
+        "row_action_button rests as a ghost and is framed as a secondary button"
     );
-    assert!(
-        !host_connect_window.contains("Variant::Primary"),
-        "hosts.connect.{{n}} must not use Variant::Primary"
-    );
-
-    let conn_connect_pos = source
-        .find("\"hosts.connection.connect.{number}\"")
-        .expect("hosts.connection.connect.{number} button in home.rs");
-    let conn_connect_window = &source[conn_connect_pos.saturating_sub(220)..conn_connect_pos];
-    assert!(
-        conn_connect_window.contains("Variant::Secondary"),
-        "hosts.connection.connect.{{n}} must use Variant::Secondary"
-    );
-    assert!(
-        !conn_connect_window.contains("Variant::Primary"),
-        "hosts.connection.connect.{{n}} must not use Variant::Primary"
-    );
+    assert!(!body.contains("Variant::Primary"));
 }
 
 #[gpui::test]

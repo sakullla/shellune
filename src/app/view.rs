@@ -3712,8 +3712,12 @@ impl ShelluneView {
             }
             next - 1
         } else {
+            // The search's first match already carries Enter, so the first Down moves
+            // on from it rather than choosing the row that is already marked.
+            let marked_first = current.is_none() && self.first_searched_host().is_some();
             match current {
                 Some(pos) => (pos as isize + delta).clamp(0, rows.len() as isize - 1) as usize,
+                None if delta >= 0 && marked_first => 1.min(rows.len() - 1),
                 None if delta >= 0 => 0,
                 None => rows.len() - 1,
             }
@@ -7084,17 +7088,13 @@ impl ShelluneView {
     /// The host a search would open: the first one of the list as it is drawn, while a
     /// phrase is typed.
     pub(super) fn first_searched_host(&self) -> Option<HostId> {
-        if self.hosts.search().trim().is_empty() {
-            return None;
-        }
+        // The same list and the same rule the rows are drawn with, so the row marked
+        // with the Enter keycap is the one Enter opens - a desktop or serial session
+        // counts as connected here exactly as it does under the status filter.
         let list = self
             .hosts
-            .list(&self.book, &self.groups, &|id| self.host_is_open(id));
-        list.rows().iter().find_map(|row| match row {
-            crate::app::hosts::HostListRow::Host(host) => Some(host.id),
-            crate::app::hosts::HostListRow::Connection(conn) => Some(conn.id),
-            crate::app::hosts::HostListRow::Group(_) => None,
-        })
+            .list(&self.book, &self.groups, &|id| self.record_is_open(id));
+        self.home_enter_target(&list)
     }
 
     // -----------------------------------------------------------------------

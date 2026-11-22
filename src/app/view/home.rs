@@ -92,6 +92,29 @@ const TITLE_MAX_WIDTH: f32 = 240.0;
 /// How wide the toolbar's menus are, before zoom.
 const MENU_WIDTH: f32 = 232.0;
 
+/// How many records the book holds before the recent strip is drawn: fewer than about
+/// a screen of rows are all in view already, and the strip would only repeat them.
+const RECENT_STRIP_MIN_RECORDS: usize = 8;
+
+/// The window height below which the recent strip gives its line back to the list.
+const RECENT_STRIP_MIN_HEIGHT: f32 = 520.0;
+
+/// The most hosts the recent strip names.
+const RECENT_STRIP_MAX: usize = 6;
+
+/// The widest one host of the recent strip is drawn, before zoom; a longer name ends in
+/// an ellipsis inside it.
+const RECENT_CHIP_WIDTH: f32 = 168.0;
+
+/// The edge of the small letter tile inside a recent chip, before zoom.
+const RECENT_CHIP_TILE: f32 = 20.0;
+
+/// The letters inside that tile, before zoom: half its edge, as a host avatar's are.
+const RECENT_CHIP_TILE_TEXT: f32 = RECENT_CHIP_TILE * 0.5;
+
+/// The room the strip's label and its "View all" take, before zoom.
+const RECENT_STRIP_FRAME_WIDTH: f32 = 180.0;
+
 /// The width of the filter panel: the five protocols on one line at the default text
 /// size.
 const FILTER_PANEL_WIDTH: f32 = 380.0;
@@ -146,6 +169,9 @@ struct ConnectionRowView {
     open: bool,
     /// Whether the keyboard cursor is on this row.
     cursor: bool,
+    /// Whether Enter in the search opens this row: it is the search's first match and
+    /// the arrows have not chosen another (see [`ShelluneView::home_enter_target`]).
+    enter: bool,
     /// Whether the record is marked as a favourite (R1).
     favorite: bool,
     /// Whether the window is wide enough for the copy tool, as for a host row, so both
@@ -188,6 +214,8 @@ struct HostRowView {
     selected: bool,
     /// Whether the keyboard cursor is on this row.
     cursor: bool,
+    /// Whether Enter in the search opens this row (see [`ConnectionRowView::enter`]).
+    enter: bool,
     /// Whether the row has room for the duplicate tool beside edit and delete.
     show_duplicate: bool,
     /// Which of the tag and time columns the list draws (see [`MetaColumns`]).
@@ -294,6 +322,27 @@ impl ShelluneView {
     /// the empty state offers the same connection as its action instead.
     pub(super) fn home_direct_row(&self, list: &HostList) -> Option<QuickTarget> {
         self.home_direct_target().filter(|_| !list.is_empty())
+    }
+
+    /// The record Enter in the search would open while no row is chosen: the first match
+    /// of a typed phrase. It is drawn as such - the keyboard's fill and an Enter keycap -
+    /// so the fastest way to a server is never a guess about which one it reaches.
+    ///
+    /// None while the search is empty (Enter there dials nothing), while it reads as an
+    /// address (the "connect to …" row is what Enter means then), and once the arrows
+    /// have chosen a row.
+    pub(super) fn home_enter_target(&self, list: &HostList) -> Option<HostId> {
+        if self.hosts.search().trim().is_empty()
+            || self.active_hosts_cursor().is_some()
+            || self.home_direct_row(list).is_some()
+        {
+            return None;
+        }
+        list.rows().iter().find_map(|row| match row {
+            HostListRow::Host(host) => self.book.host(host.id).map(|_| host.id),
+            HostListRow::Connection(row) => self.book.connection(row.id).map(|_| row.id),
+            HostListRow::Group(_) => None,
+        })
     }
 
     /// Whether the "connect to …" row is on screen now, for a key that has no list.
@@ -1346,7 +1395,9 @@ impl ShelluneView {
         if !self.hosts.selected().is_empty() {
             body = body.child(self.hosts_selection_strip(list, cx));
         }
-        body = body.child(self.hosts_body(list, cx));
+        body = body
+            .children(self.home_recent_strip(list, cx))
+            .child(self.hosts_body(list, cx));
 
         div()
             .id("home.scroll")
@@ -1784,6 +1835,168 @@ impl ShelluneView {
         )
     }
 
+    /// The hosts reached last, one press from a reconnect, above the whole list.
+    ///
+    /// Most days start with the server of yesterday, and in a list long enough to
+    /// scroll it is rarely on top. The strip names the few reached last, newest first;
+    /// a press connects, the tooltip says where and when, and "View all" is the recent
+    /// view. It is a shortcut and never the only way: the same hosts are rows below.
+    ///
+    /// It is drawn only where it saves a search or a scroll: the whole list, nothing
+    /// typed or filtered, nothing picked, a book longer than one screen of rows, and a
+    /// window tall enough to give a line to it. As many hosts as fit on that one line
+    /// are named, so a chip is never cut in half.
+    fn home_recent_strip(&self, list: &HostList, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.home_recent_strip_applies(list) {
+            return None;
+        }
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let recent = self.book.recent_hosts();
+        // The room beside the sidebar, the page's padding, the label and "View all".
+        let sidebar = if self.home_sidebar_folded() {
+            SIDEBAR_FOLDED_WIDTH
+        } else {
+            SIDEBAR_WIDTH
+        };
+        let room = self.viewport_width
+            - metrics.scale(sidebar + spacing::SNUG * 2.0 + RECENT_STRIP_FRAME_WIDTH);
+        let fits = (room / metrics.scale(RECENT_CHIP_WIDTH + spacing::TIGHT)).floor();
+        let shown = (fits.max(1.0) as usize).min(RECENT_STRIP_MAX);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let monograms = self.monograms();
+        let hues = palette::AVATARS;
+        let mut strip = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .min_w_0()
+            .overflow_hidden()
+            .debug_selector(|| "hosts.recent.strip".to_owned())
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(metrics.scale(spacing::HALF))
+                    .pl(metrics.scale(spacing::HALF))
+                    .text_size(metrics.caption_size())
+                    .font_weight(metrics.medium_weight())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(icons::icon(
+                        Icon::Clock,
+                        metrics.small_icon_size(),
+                        theme::swatch(palette::TEXT_MUTED),
+                    ))
+                    .child(ux.home_recent_strip),
+            );
+        for (number, entry) in recent.iter().take(shown).enumerate() {
+            let id = entry.host.id();
+            let name = entry.host.name().to_owned();
+            let letters = monograms
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| crate::app::monogram::initials(&name));
+            let (tile, ink) = hues[crate::app::monogram::colour_index(&name, hues.len())];
+            let when = copy::relative_time(entry.last_connected_unix, now, copy::Locale::current());
+            let tip = copy::fill(
+                ux.home_recent_strip_hint,
+                &[("target", &entry.host.target()), ("when", &when)],
+            );
+            let open = self.host_is_open(id);
+            let hover = theme::swatch(palette::SURFACE_HOVER);
+            strip = strip.child(
+                div()
+                    .id(SharedString::from(format!("hosts.recent.chip.{number}")))
+                    .debug_selector(move || format!("hosts.recent.chip.{number}"))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(metrics.scale(spacing::NARROW))
+                    .max_w(metrics.scale(RECENT_CHIP_WIDTH))
+                    .min_w_0()
+                    .h(metrics.compact_control_height())
+                    .pl(metrics.scale(spacing::HALF))
+                    .pr(metrics.scale(spacing::TIGHT))
+                    .rounded(px(radius::MEDIUM))
+                    .border_1()
+                    .border_color(theme::swatch(palette::BORDER))
+                    .bg(theme::swatch(palette::SURFACE))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .tooltip(components::tooltip(tip))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .size(metrics.scale(RECENT_CHIP_TILE))
+                            .rounded(px(radius::SMALL))
+                            .bg(theme::swatch(tile))
+                            .text_size(metrics.scale(RECENT_CHIP_TILE_TEXT))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::swatch(ink))
+                            .child(SharedString::from(letters)),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(metrics.label_size())
+                            .font_weight(metrics.medium_weight())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(components::line_text(name)),
+                    )
+                    .when(open, |chip| {
+                        chip.child(components::status_dot(Tone::Positive, metrics))
+                    })
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.connect_saved_host(id, cx);
+                    })),
+            );
+        }
+        Some(
+            strip.child(
+                components::compact_button(ux.home_recent_strip_all, Variant::Ghost, metrics)
+                    .id("hosts.recent.strip.all")
+                    .debug_selector(|| "hosts.recent.strip.all".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.show_home_section(HomeSection::Recent, cx);
+                    })),
+            ),
+        )
+    }
+
+    /// Whether the recent strip is drawn over this list (see [`Self::home_recent_strip`]).
+    fn home_recent_strip_applies(&self, list: &HostList) -> bool {
+        let filtered = self.hosts.filter().status() != HostStatusFilter::Any
+            || self.hosts.filter().protocol() != HostProtocolFilter::All;
+        self.hosts.section() == HomeSection::All
+            && self.hosts.search().trim().is_empty()
+            && !filtered
+            && self.hosts.selected().is_empty()
+            && list.total() >= RECENT_STRIP_MIN_RECORDS
+            && self.viewport_height >= self.metrics().scale(RECENT_STRIP_MIN_HEIGHT)
+            && !self.book.recent_hosts().is_empty()
+    }
+
+    /// Whether the recent strip is on the page now, and which record Enter in the search
+    /// opens: the frame keeps a selector it once drew, so a test asks the view instead.
+    #[cfg(test)]
+    pub fn home_strip_and_enter_for_test(&self) -> (bool, Option<HostId>) {
+        let list = self
+            .hosts
+            .list(&self.book, &self.groups, &|id| self.record_is_open(id));
+        (
+            self.home_recent_strip_applies(&list),
+            self.home_enter_target(&list),
+        )
+    }
+
     /// What the selection holds, what it covers, and what can be done with it.
     fn hosts_selection_strip(&self, list: &HostList, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
@@ -2200,6 +2413,7 @@ impl ShelluneView {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
         let cursor = self.active_hosts_cursor();
+        let enter = self.home_enter_target(list);
         let show_duplicate = self.viewport_width >= metrics.scale(ROW_DUPLICATE_MIN_WIDTH);
         let show_meta = self.viewport_width >= metrics.scale(ROW_META_MIN_WIDTH);
         let mut rows = Vec::with_capacity(list.len() + 1);
@@ -2263,6 +2477,7 @@ impl ShelluneView {
                         }),
                         selected: self.hosts.selected().contains(host.id),
                         cursor: cursor == Some(host.id),
+                        enter: enter == Some(host.id),
                         show_duplicate,
                         show_meta: MetaColumns::default(),
                         selecting: !self.hosts.selected().is_empty(),
@@ -2299,6 +2514,7 @@ impl ShelluneView {
                             .flatten(),
                         open: self.connection_is_open(row.id),
                         cursor: cursor == Some(row.id),
+                        enter: enter == Some(row.id),
                         favorite: self.book.is_favorite(row.id),
                         show_duplicate,
                         show_meta: MetaColumns::default(),
@@ -2979,18 +3195,39 @@ fn row_tools() -> Div {
 
 /// The secondary tools give way before the name does. Connect and More stay visible
 /// beside them, so a row's main action and its complete menu never depend on hover.
-fn row_tools_slot(tools: Div, cursor: bool) -> Div {
+///
+/// `keycap` is drawn over the slot while the tools are hidden, at its right edge: the
+/// Enter keycap of the search's first match takes the room the tools keep anyway, so it
+/// moves no column of its row. The pointer brings the tools back over it.
+fn row_tools_slot(tools: Div, cursor: bool, keycap: Option<Stateful<Div>>) -> Div {
+    let tools = div()
+        .flex()
+        .justify_end()
+        .min_w_0()
+        .when(!cursor, |slot| {
+            slot.opacity(0.0)
+                .group_hover(components::ROW_GROUP, |style| style.opacity(1.0))
+        })
+        .child(tools);
     div()
+        .relative()
         .flex()
         .flex_shrink()
         .justify_end()
         .min_w_0()
         .overflow_hidden()
-        .when(!cursor, |slot| {
-            slot.opacity(0.0)
-                .group_hover(components::ROW_GROUP, |style| style.opacity(1.0))
-        })
         .child(tools)
+        .children(keycap.filter(|_| !cursor).map(|keycap| {
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right_0()
+                .flex()
+                .items_center()
+                .group_hover(components::ROW_GROUP, |style| style.opacity(0.0))
+                .child(keycap)
+        }))
 }
 
 /// The always-visible entry to every command a saved record offers.
@@ -3038,7 +3275,7 @@ fn host_row_element(
     let delete = weak.clone();
     let open_row = weak.clone();
     let menu_row = weak.clone();
-    let state = if cursor {
+    let state = if cursor || host.enter {
         ControlState::Selected
     } else {
         ControlState::Resting
@@ -3149,7 +3386,7 @@ fn host_row_element(
                 }),
         );
     let connect_button =
-        components::compact_button(strings.remote_connect, Variant::Secondary, metrics)
+        components::row_action_button(strings.remote_connect, cursor || host.enter, metrics)
             .id(SharedString::from(format!("hosts.connect.{number}")))
             .debug_selector(move || format!("hosts.connect.{number}"))
             .tooltip(components::tooltip(ux.hosts_connect_hint))
@@ -3207,7 +3444,12 @@ fn host_row_element(
             weak,
             metrics,
         ))
-        .child(row_tools_slot(tools, cursor))
+        .child(row_tools_slot(
+            tools,
+            cursor,
+            host.enter
+                .then(|| enter_keycap(format!("hosts.enter.{number}"), metrics, ux)),
+        ))
         .child(connect_button)
         .child(record_more_button(
             format!("hosts.more.{number}"),
@@ -3241,7 +3483,7 @@ fn connection_row_element(
     let menu_row = weak.clone();
     let copy = weak.clone();
     let delete = weak.clone();
-    let state = if cursor {
+    let state = if cursor || connection.enter {
         ControlState::Selected
     } else {
         ControlState::Resting
@@ -3289,7 +3531,7 @@ fn connection_row_element(
                 }),
         );
     let connect_button =
-        components::compact_button(strings.remote_connect, Variant::Secondary, metrics)
+        components::row_action_button(strings.remote_connect, cursor || connection.enter, metrics)
             .id(SharedString::from(format!(
                 "hosts.connection.connect.{number}"
             )))
@@ -3363,7 +3605,13 @@ fn connection_row_element(
             weak,
             metrics,
         ))
-        .child(row_tools_slot(tools, cursor))
+        .child(row_tools_slot(
+            tools,
+            cursor,
+            connection
+                .enter
+                .then(|| enter_keycap(format!("hosts.connection.enter.{number}"), metrics, ux)),
+        ))
         .child(connect_button)
         .child(record_more_button(
             format!("hosts.connection.more.{number}"),
@@ -3371,6 +3619,16 @@ fn connection_row_element(
             weak,
             metrics,
         ))
+}
+
+/// The keycap a row shows while Enter in the search opens it, named by its tooltip.
+fn enter_keycap(selector: String, metrics: Metrics, ux: &'static UxStrings) -> Stateful<Div> {
+    div()
+        .id(SharedString::from(selector.clone()))
+        .debug_selector(move || selector.clone())
+        .flex_none()
+        .tooltip(components::tooltip(ux.home_enter_first_hint))
+        .child(components::kbd(ux.home_quick_enter, metrics))
 }
 
 /// The edge of a row's favourite star target, before zoom.
