@@ -27,6 +27,7 @@ mod session;
 mod shell;
 mod snippet;
 mod task;
+mod vault;
 mod workspace;
 
 pub use auth::{AuthMethod, AuthMethodKind};
@@ -64,7 +65,7 @@ pub use host::{
     ProtocolKind, RdpCertificatePolicy, RdpConfig, SerialConfig, SerialFlow, SerialParity,
     SerialStopBits, VncConfig, VncSecurity, X11Forwarding, connection_jump_fault, jump_faults,
 };
-pub use ids::{ForwardId, HostId, PaneId, SessionId, TabId, TransferId};
+pub use ids::{CredentialId, ForwardId, HostId, KeyId, PaneId, SessionId, TabId, TransferId};
 pub use session::{
     Capability, EventTag, Session, SessionCapabilities, SessionFailure, SessionKind, SessionState,
     SessionTransitionError,
@@ -78,6 +79,10 @@ pub use task::{
     OverwriteChoice, PARTIAL_PREFIX, PartialRecord, ResumeHint, ResumeRefusal, Transfer,
     TransferDirection, TransferEvent, TransferFailure, TransferProtocol, TransferQueue,
     TransferState, TransferUpdate, TransferUpdateError, partial_path,
+};
+pub use vault::{
+    CredentialMeta, KeyRotation, ManagedKeyMeta, VaultCatalog, VaultError, VaultRecordVersion,
+    VaultTombstone,
 };
 pub use workspace::{
     MAX_TAB_NAME_CHARS, PaneNode, PaneTarget, PanelConfig, PanelSection, PendingConnection,

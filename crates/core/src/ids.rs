@@ -82,6 +82,16 @@ define_id! {
     PaneId
 }
 
+define_id! {
+    /// Identifies a managed SSH key, independently of any device-local key path.
+    KeyId
+}
+
+define_id! {
+    /// Identifies a connection credential that may be shared by several hosts.
+    CredentialId
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

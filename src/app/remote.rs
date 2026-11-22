@@ -40,6 +40,12 @@ pub enum MethodChoice {
     EncryptedKeyFile,
     /// A key the system agent holds.
     Agent,
+    /// A key the application vault holds.
+    ///
+    /// Not offered by the chooser yet: the vault and its settings arrive with the
+    /// security work, and until a host record carries the method there is no way
+    /// to select it.
+    ManagedKey,
 }
 
 impl MethodChoice {
@@ -61,6 +67,9 @@ impl MethodChoice {
             Self::KeyFile => strings.auth_key,
             Self::EncryptedKeyFile => strings.auth_key_passphrase,
             Self::Agent => strings.auth_agent,
+            // No entry can select this choice yet, so no localized string exists
+            // for it; the domain label stands in until the chooser offers it.
+            Self::ManagedKey => AuthMethodKind::ManagedKey.label(),
         }
     }
 
@@ -73,6 +82,7 @@ impl MethodChoice {
             Self::KeyFile => strings.auth_key_hint,
             Self::EncryptedKeyFile => strings.auth_key_passphrase_hint,
             Self::Agent => strings.auth_agent_hint,
+            Self::ManagedKey => AuthMethodKind::ManagedKey.label(),
         }
     }
 
@@ -85,6 +95,7 @@ impl MethodChoice {
             Self::KeyFile => "remote.method.key",
             Self::EncryptedKeyFile => "remote.method.key-passphrase",
             Self::Agent => "remote.method.agent",
+            Self::ManagedKey => "remote.method.managed-key",
         }
     }
 
@@ -123,6 +134,7 @@ impl MethodChoice {
             shellune_core::AuthMethodKind::KeyFile => Self::KeyFile,
             shellune_core::AuthMethodKind::EncryptedKeyFile => Self::EncryptedKeyFile,
             shellune_core::AuthMethodKind::Agent => Self::Agent,
+            shellune_core::AuthMethodKind::ManagedKey => Self::ManagedKey,
         }
     }
 
@@ -135,6 +147,7 @@ impl MethodChoice {
             Self::KeyFile => shellune_core::AuthMethodKind::KeyFile,
             Self::EncryptedKeyFile => shellune_core::AuthMethodKind::EncryptedKeyFile,
             Self::Agent => shellune_core::AuthMethodKind::Agent,
+            Self::ManagedKey => shellune_core::AuthMethodKind::ManagedKey,
         }
     }
 
@@ -578,6 +591,12 @@ impl RemotePanel {
                 AuthMethod::key_file(self.key_path.trim().to_owned(), passphrase)
             }
             MethodChoice::Agent => AuthMethod::agent(default_agent()),
+            // Nothing can select this choice yet (it is not in `ALL`), and the
+            // body it would need is the vault's to hand over, not the form's:
+            // the vault wiring fills this in when it lands.
+            MethodChoice::ManagedKey => {
+                return Err("an application key needs the vault to be unlocked first".to_owned());
+            }
         };
         self.form_error = None;
         Ok(auth)
@@ -702,6 +721,10 @@ pub fn stored_auth(host: &HostConfig, secret: Option<&SecretString>) -> Option<A
                 ))
             }
         }
+        // An application key's body is the unlocked vault's to hand over, not
+        // something a host record can carry; until that wiring exists the form
+        // has nothing complete to offer and asks instead.
+        AuthMethodKind::ManagedKey => None,
     }
 }
 

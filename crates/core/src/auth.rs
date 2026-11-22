@@ -26,16 +26,19 @@ pub enum AuthMethodKind {
     EncryptedKeyFile,
     /// A key held by the system's SSH agent.
     Agent,
+    /// A private key held by the application vault.
+    ManagedKey,
 }
 
 impl AuthMethodKind {
     /// Every kind, in the order a chooser shows them.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Auto,
         Self::Password,
         Self::KeyFile,
         Self::EncryptedKeyFile,
         Self::Agent,
+        Self::ManagedKey,
     ];
 
     /// Label used in the chooser and in log lines.
@@ -47,6 +50,7 @@ impl AuthMethodKind {
             Self::KeyFile => "Key file",
             Self::EncryptedKeyFile => "Key file with passphrase",
             Self::Agent => "System agent",
+            Self::ManagedKey => "Application key",
         }
     }
 
@@ -92,6 +96,11 @@ pub enum AuthMethod {
         /// Which agent is used, so an unavailable one can be named.
         kind: AgentKind,
     },
+    /// A managed private key decrypted in memory for this attempt only.
+    ManagedKey {
+        /// OpenSSH private key contents. They are never persisted in this model.
+        private_key: SecretString,
+    },
     /// Everything this computer can offer, tried in order until one is accepted: the
     /// agent's keys, then each key file that opens without a passphrase, then the
     /// password when one was given. Nothing missing is an error by itself; only a
@@ -130,6 +139,12 @@ impl AuthMethod {
         Self::Agent { kind }
     }
 
+    /// A managed key attempt using private key contents already held in memory.
+    #[must_use]
+    pub fn managed_key(private_key: SecretString) -> Self {
+        Self::ManagedKey { private_key }
+    }
+
     /// Which kind of method this is.
     #[must_use]
     pub fn kind(&self) -> AuthMethodKind {
@@ -140,6 +155,7 @@ impl AuthMethod {
                 None => AuthMethodKind::KeyFile,
             },
             Self::Agent { .. } => AuthMethodKind::Agent,
+            Self::ManagedKey { .. } => AuthMethodKind::ManagedKey,
             Self::Auto { .. } => AuthMethodKind::Auto,
         }
     }
@@ -149,7 +165,10 @@ impl AuthMethod {
     pub fn key_path(&self) -> Option<&str> {
         match self {
             Self::KeyFile { path, .. } => Some(path),
-            Self::Password { .. } | Self::Agent { .. } | Self::Auto { .. } => None,
+            Self::Password { .. }
+            | Self::Agent { .. }
+            | Self::ManagedKey { .. }
+            | Self::Auto { .. } => None,
         }
     }
 
@@ -159,7 +178,19 @@ impl AuthMethod {
         match self {
             Self::Agent { kind } => Some(*kind),
             Self::Auto { agent, .. } => *agent,
-            Self::Password { .. } | Self::KeyFile { .. } => None,
+            Self::Password { .. } | Self::KeyFile { .. } | Self::ManagedKey { .. } => None,
+        }
+    }
+
+    /// The managed private key contents, when this attempt uses one.
+    #[must_use]
+    pub fn private_key(&self) -> Option<&SecretString> {
+        match self {
+            Self::ManagedKey { private_key } => Some(private_key),
+            Self::Password { .. }
+            | Self::KeyFile { .. }
+            | Self::Agent { .. }
+            | Self::Auto { .. } => None,
         }
     }
 }
@@ -206,7 +237,7 @@ mod tests {
             .iter()
             .map(|kind| kind.label())
             .collect();
-        assert_eq!(labels.len(), 5);
+        assert_eq!(labels.len(), 6);
         let mut sorted = labels.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -219,5 +250,20 @@ mod tests {
             !AuthMethodKind::Auto.needs_password() && !AuthMethodKind::Auto.needs_key_path(),
             "automatic sign-in asks for nothing up front"
         );
+    }
+
+    #[test]
+    fn a_managed_key_carries_its_body_for_one_attempt_only() {
+        let key = AuthMethod::managed_key(SecretString::new("-----BEGIN OPENSSH PRIVATE KEY-----"));
+        assert_eq!(key.kind(), AuthMethodKind::ManagedKey);
+        assert_eq!(key.kind().label(), "Application key");
+        assert!(key.private_key().is_some(), "the body reaches the attempt");
+        assert_eq!(key.key_path(), None, "an application key names no file");
+        assert_eq!(key.agent_kind(), None);
+        assert!(
+            !key.kind().needs_key_path() && !key.kind().needs_password(),
+            "the vault is asked at connect time, not typed here"
+        );
+        assert!(!format!("{key:?}").contains("OPENSSH PRIVATE KEY"));
     }
 }

@@ -1144,6 +1144,14 @@ impl Material {
                 let client = agent::connect(kind).await?;
                 Ok(Self::Agent { kind, client })
             }
+            // A managed key authenticates from memory the unlocked vault hands
+            // over; that transport-side support arrives with the vault work, so
+            // until then the attempt fails here instead of pretending a file was
+            // named. No entry point can build this method yet.
+            AuthMethod::ManagedKey { .. } => Err(ConnectError::KeyInvalid {
+                path: "<managed key>".to_owned(),
+                reason: "signing in with an application key is not supported yet".to_owned(),
+            }),
             AuthMethod::Auto {
                 agent: kind,
                 keys,

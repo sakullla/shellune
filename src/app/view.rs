@@ -8963,6 +8963,9 @@ impl ShelluneView {
                 panel.set_passphrase(passphrase);
             }
             MethodChoice::Agent => {}
+            // No quick form can choose an application key yet; there is nothing
+            // to prefill until the vault wiring lands.
+            MethodChoice::ManagedKey => {}
         }
         self.chain = Some(ChainDraft::single(host.clone()));
         self.pending_ephemeral = Some(host);
@@ -10510,7 +10513,11 @@ impl ShelluneView {
                 panel.password().is_empty()
             }
             remote::MethodChoice::EncryptedKeyFile => panel.passphrase().is_empty(),
-            remote::MethodChoice::KeyFile | remote::MethodChoice::Agent => false,
+            // An application key reads no field the form could refill, and no
+            // panel can be on that choice until the vault wiring lands.
+            remote::MethodChoice::KeyFile
+            | remote::MethodChoice::Agent
+            | remote::MethodChoice::ManagedKey => false,
         };
         if !empty {
             return;
@@ -21355,6 +21362,8 @@ fn quick_method_selector(choice: MethodChoice) -> &'static str {
         MethodChoice::KeyFile => "quick.method.key",
         MethodChoice::EncryptedKeyFile => "quick.method.key-passphrase",
         MethodChoice::Agent => "quick.method.agent",
+        // Not selectable from the quick form until the vault wiring lands.
+        MethodChoice::ManagedKey => "quick.method.managed-key",
     }
 }
 

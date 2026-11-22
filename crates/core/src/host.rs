@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::connection::{ConnectionDefaults, ConnectionPolicy, HostConnection};
 use crate::group::GroupPath;
-use crate::ids::HostId;
+use crate::ids::{CredentialId, HostId, KeyId};
 use crate::session::SessionCapabilities;
 use crate::task::TransferProtocol;
 
@@ -173,6 +173,22 @@ pub struct HostConfig {
     /// keeps asking at connect time as it always did.
     #[serde(skip_serializing_if = "Option::is_none")]
     auth: Option<AuthMethodKind>,
+    /// The managed key this host signs in with, when the chosen method is the
+    /// application key.
+    ///
+    /// A stable identifier and nothing else: the key's public metadata lives in
+    /// the vault catalog and its body never leaves the encrypted vault, so a host
+    /// record has no key material to leak. Absent on records written before the
+    /// vault existed, which keeps an older file byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_key_id: Option<KeyId>,
+    /// The shared credential this host signs in with, when its method reads one.
+    ///
+    /// Like a jump, this is a reference and not a copy: every host that names the
+    /// same credential shares one record, so editing the credential reaches all of
+    /// them at once. Absent on records written before the vault existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_id: Option<CredentialId>,
     /// Whether the password or key passphrase of this host is kept in the system
     /// credential store.
     ///
@@ -250,6 +266,12 @@ struct HostConfigWire {
     /// Absent in files written before the sign-in choice was stored.
     #[serde(default)]
     auth: Option<AuthMethodKind>,
+    /// Absent in files written before the vault existed.
+    #[serde(default)]
+    managed_key_id: Option<KeyId>,
+    /// Absent in files written before the vault existed.
+    #[serde(default)]
+    credential_id: Option<CredentialId>,
     #[serde(default)]
     remember_secret: bool,
     #[serde(default)]
@@ -303,6 +325,8 @@ impl TryFrom<HostConfigWire> for HostConfig {
             group,
             identity_file: normalize_identity_file(wire.identity_file),
             auth: wire.auth,
+            managed_key_id: wire.managed_key_id,
+            credential_id: wire.credential_id,
             remember_secret: wire.remember_secret,
             startup_command: normalize_command(wire.startup_command),
             jumps: wire.jumps,
@@ -370,6 +394,8 @@ impl HostConfig {
             group_path: None,
             identity_file: None,
             auth: None,
+            managed_key_id: None,
+            credential_id: None,
             remember_secret: false,
             startup_command: None,
             jumps: Vec::new(),
@@ -475,6 +501,23 @@ impl HostConfig {
     #[must_use]
     pub fn auth(&self) -> Option<AuthMethodKind> {
         self.auth
+    }
+
+    /// The managed key this host signs in with, when its method is the
+    /// application key.
+    ///
+    /// A reference into the vault catalog; resolving it against the records this
+    /// device holds is the caller's job, which is what keeps a deleted key a
+    /// reportable dangling reference instead of a silent sign-in failure.
+    #[must_use]
+    pub fn managed_key_id(&self) -> Option<KeyId> {
+        self.managed_key_id
+    }
+
+    /// The shared credential this host signs in with, when its method reads one.
+    #[must_use]
+    pub fn credential_id(&self) -> Option<CredentialId> {
+        self.credential_id
     }
 
     /// Whether this host's password or passphrase is kept in the system credential
@@ -644,6 +687,31 @@ impl HostConfig {
         if !auth.is_some_and(|kind| kind.needs_password() || kind.needs_passphrase()) {
             self.remember_secret = false;
         }
+        // A vault reference only means something to the method that reads it: an
+        // application key with no method to use it, or a shared credential with no
+        // method that reads one, would be a secret reference nothing can honor, so
+        // switching the method drops what the new method cannot use.
+        if !auth.is_some_and(|kind| kind == AuthMethodKind::ManagedKey) {
+            self.managed_key_id = None;
+        }
+        if !auth.is_some_and(|kind| kind.needs_password()) {
+            self.credential_id = None;
+        }
+    }
+
+    /// Assigns or clears the managed key this host signs in with.
+    ///
+    /// Only the identifier is kept; the key body is the vault's to guard.
+    pub fn set_managed_key_id(&mut self, id: Option<KeyId>) {
+        self.managed_key_id = id;
+    }
+
+    /// Assigns or clears the shared credential this host signs in with.
+    ///
+    /// Only the identifier is kept, which is what makes the credential shared:
+    /// every host naming the same id sees the one record.
+    pub fn set_credential_id(&mut self, id: Option<CredentialId>) {
+        self.credential_id = id;
     }
 
     /// Records whether the secret of this host is in the system credential store.
@@ -2729,6 +2797,8 @@ mod sign_in_tests {
         let json = serde_json::to_string(&host).expect("serializes");
         for field in [
             "auth",
+            "managed_key_id",
+            "credential_id",
             "remember_secret",
             "startup_command",
             "jumps",
@@ -2743,6 +2813,22 @@ mod sign_in_tests {
         }
         let back: HostConfig = serde_json::from_str(&json).expect("reads");
         assert_eq!(back, host);
+    }
+
+    #[test]
+    fn a_record_saved_before_the_vault_still_reads() {
+        // Exactly the fields a build without a vault wrote; reading it must give
+        // the same host it always gave, with no vault references to resolve.
+        let old = format!(
+            "{{\"id\":\"{}\",\"name\":\"web\",\"address\":\"10.0.0.5\",\"port\":22,\
+             \"user\":\"deploy\",\"group\":null,\"remember_secret\":false,\
+             \"startup_command\":null,\"jumps\":[],\"proxy_command\":null}}",
+            HostId::new()
+        );
+        let back: HostConfig = serde_json::from_str(&old).expect("an old record reads");
+        assert_eq!(back.managed_key_id(), None);
+        assert_eq!(back.credential_id(), None);
+        assert_eq!(back.auth(), None);
     }
 
     #[test]
