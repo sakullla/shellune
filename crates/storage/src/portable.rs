@@ -14,8 +14,14 @@
 //!   its own section; the sections of the other platforms are carried over from
 //!   the document it started from, so a Windows key path survives a round trip
 //!   through a Linux machine.
-//! * `secrets` — optional: the saved passwords, sealed under a passphrase (see
-//!   [`KdfParams`]). Without it the file holds no password at all.
+//! * `secrets` — optional in a version 1 document: the saved passwords, sealed
+//!   under a passphrase (see [`KdfParams`]). Without it the file holds no
+//!   password at all.
+//! * `vault` — optional in a version 2 document: the whole encrypted vault
+//!   ([`VaultCipher`]), which carries the managed key bodies, the shared
+//!   passwords, their metadata and the accepted server identities, and
+//!   replaces the version 1 password block. A version 2 document never holds
+//!   both.
 //!
 //! The workspace, the batch tasks and runs, the audit log and the sync settings
 //! are machine state and are never part of the document.
@@ -47,6 +53,7 @@ use crate::preferences::{KeymapEntry, Preferences, PreferencesStore};
 use crate::snippets::SnippetStore;
 use crate::store::{HostStore, data_directory, write_atomic_file};
 use crate::trust::{HostTrust, TrustStore};
+use crate::vault::VaultCipher;
 
 pub use apply::{
     ApplyMode, ApplyOutcome, ApplyPlan, Change, PlatformFallback, PlatformField, TrustConflict,
@@ -60,8 +67,20 @@ use crypto::SecretBlock;
 /// The value of the `format` field: what tells this document from any other JSON.
 pub const PORTABLE_FORMAT: &str = "shellune-data";
 
-/// The document version this build writes and the newest it reads.
+/// The document version this build writes when it carries no vault.
+///
+/// A document of this version is what every earlier build already reads and
+/// writes, which is why it stays the default for data without a vault.
 pub const PORTABLE_VERSION: u32 = 1;
+
+/// The document version that carries the encrypted vault, and the newest this
+/// build reads (ADR-2).
+///
+/// A version 2 document holds no version 1 password block and no plaintext
+/// `known_hosts`: the secrets and the accepted server identities live in the
+/// [`VaultCipher`] instead. An older build refuses it by the version check it
+/// already has, so an old client cannot downgrade or silently drop the vault.
+pub const PORTABLE_VAULT_VERSION: u32 = 2;
 
 /// Keys that mean a credential. The preference and platform parts are read
 /// leniently (a newer build may add a choice), so they are searched for these
@@ -422,6 +441,9 @@ pub struct ShelluneData {
     platforms: BTreeMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     secrets: Option<SecretBlock>,
+    /// The encrypted vault, only of a version 2 document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vault: Option<VaultCipher>,
 }
 
 /// How a document is exported.
@@ -438,6 +460,8 @@ pub struct ExportOptions {
     pub created_unix: u64,
     /// The application version written into the document.
     pub app_version: String,
+    /// The encrypted vault, which makes the document a version 2 one.
+    vault: Option<VaultCipher>,
 }
 
 impl ExportOptions {
@@ -450,14 +474,36 @@ impl ExportOptions {
             kdf: KdfParams::default(),
             created_unix: now_unix(),
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            vault: None,
         }
     }
 
     /// The same options, sealing the saved passwords under `passphrase`.
+    ///
+    /// This is the version 1 password block, so it and the vault are mutually
+    /// exclusive: taking this clears the vault.
     #[must_use]
     pub fn with_passphrase(mut self, passphrase: SecretString) -> Self {
         self.passphrase = Some(passphrase);
+        self.vault = None;
         self
+    }
+
+    /// The same options, carrying the encrypted vault as a version 2 document
+    /// instead of the version 1 password block and the plaintext trust records
+    /// (R9). A version 2 document never holds both secrets sections, so taking
+    /// this clears the passphrase.
+    #[must_use]
+    pub fn with_vault(mut self, vault: VaultCipher) -> Self {
+        self.passphrase = None;
+        self.vault = Some(vault);
+        self
+    }
+
+    /// The encrypted vault the document would carry, when it would.
+    #[must_use]
+    pub fn vault(&self) -> Option<&VaultCipher> {
+        self.vault.as_ref()
     }
 }
 
@@ -480,7 +526,8 @@ impl ShelluneData {
     /// `base`, when given, is the document this one replaces (the copy in the
     /// cloud): the sections of the other platforms are carried over from it
     /// unchanged. Its sealed passwords are not: a new block is sealed when
-    /// `options.passphrase` is set, and none is written otherwise.
+    /// `options.passphrase` is set, and none is written otherwise. Its vault is
+    /// carried over the same way — only what `options.vault` names travels.
     ///
     /// The credential store is only read when a passphrase is given, and only for
     /// the records that remember a password.
@@ -496,6 +543,10 @@ impl ShelluneData {
         base: Option<&ShelluneData>,
     ) -> Result<ExportOutcome, PortableError> {
         let platform = options.platform;
+        // A vault-carrying document is a version 2 one: it writes no version 1
+        // password block and no plaintext trust records, and an old build
+        // refuses it by the version check instead of dropping them.
+        let carries_vault = options.vault.is_some();
         let section = PlatformData::from_local(local, platform);
         let mut platforms = base.map(|base| base.platforms.clone()).unwrap_or_default();
         platforms.insert(
@@ -508,7 +559,11 @@ impl ShelluneData {
         let mut outcome = ExportOutcome {
             document: Self {
                 format: PORTABLE_FORMAT.to_owned(),
-                version: PORTABLE_VERSION,
+                version: if carries_vault {
+                    PORTABLE_VAULT_VERSION
+                } else {
+                    PORTABLE_VERSION
+                },
                 created_unix: options.created_unix,
                 source_platform: platform.as_str().to_owned(),
                 source_app_version: options.app_version.clone(),
@@ -521,11 +576,19 @@ impl ShelluneData {
                     groups: local.groups.clone(),
                     forwards: local.forwards.clone(),
                     snippets: local.snippets.clone(),
-                    known_hosts: local.known_hosts.clone(),
+                    // From version 2 on the accepted identities are the
+                    // vault's to guard, so the shared plaintext part stops
+                    // carrying a second authority (ADR-6).
+                    known_hosts: if carries_vault {
+                        HostTrust::new()
+                    } else {
+                        local.known_hosts.clone()
+                    },
                     preferences: SharedPreferences::from_preferences(&local.preferences),
                 },
                 platforms,
                 secrets: None,
+                vault: options.vault.clone(),
             },
             secrets_included: Vec::new(),
             secrets_unreadable: Vec::new(),
@@ -533,6 +596,14 @@ impl ShelluneData {
         };
 
         if let Some(passphrase) = &options.passphrase {
+            if carries_vault {
+                // The builders keep the two apart; the fields are public, so
+                // the refusal is spelled out for a caller that sets both.
+                return Err(PortableError::Encrypt {
+                    reason: "a version 2 document carries the vault; the version 1 password block cannot travel with it"
+                        .to_owned(),
+                });
+            }
             if passphrase.expose().trim().is_empty() {
                 return Err(PortableError::EmptyPassphrase);
             }
@@ -585,15 +656,32 @@ impl ShelluneData {
             .ok_or_else(|| PortableError::Corrupt {
                 reason: "the format version is missing or not a whole number".to_owned(),
             })?;
-        if version > PORTABLE_VERSION {
+        if version > PORTABLE_VAULT_VERSION {
             return Err(PortableError::UnsupportedVersion {
                 found: version,
-                supported: PORTABLE_VERSION,
+                supported: PORTABLE_VAULT_VERSION,
             });
         }
         if version == 0 {
             return Err(PortableError::Corrupt {
                 reason: "format version 0 was never written by Shellune".to_owned(),
+            });
+        }
+        // The two secrets sections belong to their own versions: a document
+        // claiming both is neither format, and reading it would guess which
+        // secrets to trust.
+        if version >= PORTABLE_VAULT_VERSION && object.get("secrets").is_some() {
+            return Err(PortableError::Corrupt {
+                reason: format!(
+                    "a version {version} document cannot carry the version 1 saved passwords"
+                ),
+            });
+        }
+        if version < PORTABLE_VAULT_VERSION && object.get("vault").is_some() {
+            return Err(PortableError::Corrupt {
+                reason: format!(
+                    "the encrypted vault only travels with format {PORTABLE_VAULT_VERSION}, not with {version}"
+                ),
             });
         }
         // The inner documents carry their own versions; a newer one is named as
@@ -746,6 +834,18 @@ impl ShelluneData {
     #[must_use]
     pub fn has_secrets(&self) -> bool {
         self.secrets.is_some()
+    }
+
+    /// Whether the document carries the encrypted vault.
+    #[must_use]
+    pub fn has_vault(&self) -> bool {
+        self.vault.is_some()
+    }
+
+    /// The encrypted vault the document carries, when it carries one.
+    #[must_use]
+    pub fn vault(&self) -> Option<&VaultCipher> {
+        self.vault.as_ref()
     }
 
     /// The key-derivation cost of the sealed passwords, when there are any.
@@ -908,6 +1008,24 @@ impl ShelluneData {
         }
         if let Some(block) = &self.secrets {
             block.validate()?;
+        }
+        // The reader already refuses the mix in a file; a document built in
+        // memory is held to the same rule before it can be written.
+        if self.version >= PORTABLE_VAULT_VERSION && self.secrets.is_some() {
+            return Err(format!(
+                "a version {} document cannot carry the version 1 saved passwords",
+                self.version
+            ));
+        }
+        if self.version < PORTABLE_VAULT_VERSION && self.vault.is_some() {
+            return Err(format!(
+                "the encrypted vault only travels with format {PORTABLE_VAULT_VERSION}"
+            ));
+        }
+        if let Some(cipher) = &self.vault {
+            cipher
+                .validate()
+                .map_err(|reason| format!("the encrypted vault is not valid: {reason}"))?;
         }
         Ok(())
     }

@@ -12,9 +12,10 @@ use shellune_core::{
 };
 use shellune_storage::{
     ApplyMode, ApplyPlan, ExportOptions, GroupStore, HostBook, HostKey, HostStore, HostTrust,
-    KdfParams, KeymapEntry, KeymapPreferences, LocalData, LocalState, MemorySecrets, Platform,
-    PlatformField, PortableError, Preferences, PreferencesStore, SNAPSHOT_LIMIT, SecretStore,
-    ShelluneData, TrustConflict, merge_recent_connections,
+    KdfParams, KeymapEntry, KeymapPreferences, LocalData, LocalState, MemorySecrets,
+    PORTABLE_VAULT_VERSION, PORTABLE_VERSION, Platform, PlatformField, PortableError, Preferences,
+    PreferencesStore, SNAPSHOT_LIMIT, SecretStore, ShelluneData, TrustConflict, VaultCipher,
+    VaultContent, VaultCredentialRecord, merge_recent_connections,
 };
 
 const PASSWORD: &str = "correct-horse-battery-staple";
@@ -718,13 +719,13 @@ fn damaged_foreign_and_newer_files_are_refused_and_change_nothing() {
     ));
 
     let mut newer = good.clone();
-    newer["version"] = serde_json::json!(2);
+    newer["version"] = serde_json::json!(3);
     newer["something_new"] = serde_json::json!(true);
     assert_eq!(
         ShelluneData::from_json(&serde_json::to_vec(&newer).expect("json")).expect_err("refused"),
         PortableError::UnsupportedVersion {
-            found: 2,
-            supported: 1
+            found: 3,
+            supported: PORTABLE_VAULT_VERSION
         }
     );
     let mut newer_hosts = good.clone();
@@ -1524,4 +1525,112 @@ fn a_plan_is_not_applied_over_data_saved_after_it() {
         .expect("applied");
     assert_eq!(data.load().expect("loads").snippets.len(), 2);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_version_two_document_carries_the_vault_and_not_the_old_secrets() {
+    let fixture = windows_machine();
+    let sync_passphrase = SecretString::new("the one sync passphrase");
+
+    // A sealed vault with one shared password and the trust records that
+    // travel with it from version 2 on.
+    let mut vault = VaultContent::new();
+    vault
+        .insert_credential(VaultCredentialRecord::new(
+            shellune_core::CredentialMeta::new(
+                shellune_core::CredentialId::new(),
+                "Prod login",
+                Some("deploy".to_owned()),
+                shellune_core::VaultRecordVersion::new(1, "device-a"),
+            ),
+            SecretString::new("hunter2"),
+        ))
+        .expect("inserts");
+    let mut trust = HostTrust::new();
+    trust
+        .accept("10.0.0.5", 22, &trust_key(9), 1_700_000_000)
+        .expect("trusted");
+    vault.set_trust(trust);
+    let cipher = VaultCipher::export_copy(&vault, &sync_passphrase, cheap_kdf()).expect("sealed");
+
+    let mut vault_options = options(Platform::Windows).with_vault(cipher);
+    let outcome = ShelluneData::export(&fixture.state, &vault_options, &MemorySecrets::new(), None)
+        .expect("exported");
+    let document = outcome.document;
+    assert_eq!(document.version(), PORTABLE_VAULT_VERSION);
+    assert!(
+        document.version() > PORTABLE_VERSION,
+        "an older build refuses the document by the version check it already has"
+    );
+    assert!(document.has_vault());
+    assert!(
+        !document.has_secrets(),
+        "a version 2 document writes no version 1 password block"
+    );
+    assert!(
+        document.shared().known_hosts().is_empty(),
+        "the accepted identities are the vault's to guard from version 2 on"
+    );
+    assert_eq!(outcome.secrets_included.len(), 0);
+
+    // The document round-trips as bytes, and the bytes hold no secret.
+    let bytes = document.to_json().expect("json");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(!text.contains("hunter2"), "{text}");
+    assert!(!text.contains("webdav"), "{text}");
+    let back = ShelluneData::from_json(&bytes).expect("reads");
+    let opened = back
+        .vault()
+        .expect("the vault travels")
+        .open(&shellune_storage::KeySource::Passphrase {
+            purpose: shellune_storage::PassphrasePurpose::SyncPassphrase,
+            value: sync_passphrase.clone(),
+        })
+        .expect("the sync passphrase opens it");
+    assert_eq!(opened.credentials().count(), 1);
+    assert_eq!(opened.trust().entries().len(), 1);
+    let wrong =
+        back.vault()
+            .expect("the vault travels")
+            .open(&shellune_storage::KeySource::Passphrase {
+                purpose: shellune_storage::PassphrasePurpose::SyncPassphrase,
+                value: SecretString::new("not the passphrase"),
+            });
+    assert!(
+        matches!(wrong, Err(shellune_storage::VaultStoreError::Sealed)),
+        "a wrong passphrase does not open the travelling vault"
+    );
+
+    // Neither secrets section may travel with the other's version.
+    let mut mixed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    mixed["secrets"] = serde_json::json!({});
+    assert!(matches!(
+        ShelluneData::from_json(&serde_json::to_vec(&mixed).expect("json")),
+        Err(PortableError::Corrupt { .. })
+    ));
+    let plain = ShelluneData::export(
+        &fixture.state,
+        &options(Platform::Windows),
+        &MemorySecrets::new(),
+        None,
+    )
+    .expect("exported")
+    .document;
+    let mut v1_with_vault: serde_json::Value =
+        serde_json::from_slice(&plain.to_json().expect("json")).expect("json");
+    v1_with_vault["vault"] = serde_json::json!({});
+    assert!(matches!(
+        ShelluneData::from_json(&serde_json::to_vec(&v1_with_vault).expect("json")),
+        Err(PortableError::Corrupt { .. })
+    ));
+
+    // A caller that asks for both secrets sections is refused rather than
+    // given a document that silently drops one of them.
+    let cipher = VaultCipher::export_copy(&vault, &sync_passphrase, cheap_kdf()).expect("sealed");
+    vault_options = options(Platform::Windows).with_vault(cipher);
+    vault_options.passphrase = Some(SecretString::new(PASSPHRASE));
+    assert!(matches!(
+        ShelluneData::export(&fixture.state, &vault_options, &MemorySecrets::new(), None),
+        Err(PortableError::Encrypt { .. })
+    ));
 }

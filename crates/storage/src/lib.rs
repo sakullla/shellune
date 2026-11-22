@@ -29,7 +29,14 @@
 //!   shared records, one section per platform for what differs between machines,
 //!   and optionally the saved passwords sealed under a passphrase. Applying one is
 //!   previewed as an `ApplyPlan`, snapshots the data files first and puts them back
-//!   when a write fails.
+//!   when a write fails. A version 2 document may instead carry the encrypted
+//!   vault (see `VaultStore`), which replaces the version 1 password block and
+//!   moves the accepted server identities into the ciphertext.
+//! * `VaultStore` — the encrypted vault (`vault.json`): managed key bodies,
+//!   shared passwords, their public metadata, the host references that use them
+//!   and the accepted server identities, sealed as one AES-256-GCM ciphertext
+//!   under a random data key that every unseal secret — this machine's own, the
+//!   WebDAV password, the sync passphrase — can unwrap (R2, R9).
 //!
 //! Loading is strict (a damaged or newer file is reported, never guessed at) and
 //! saving is atomic (a temporary file in the same directory is flushed and then
@@ -37,8 +44,10 @@
 //! Reading a snapshot or a rule file does not start a process, a connection or a
 //! listener.
 //!
-//! Secrets are deliberately absent from the model. A password field is rejected
-//! rather than loaded, and its value is not copied into the error.
+//! Secrets are deliberately absent from the host model. A password field is
+//! rejected rather than loaded, and its value is not copied into the error. The
+//! one place secrets live at rest is the encrypted vault and the sealed block
+//! of a portable document, both of which hold them only as ciphertext.
 //!
 //! [`HostConfig`]: shellune_core::HostConfig
 
@@ -56,6 +65,7 @@ mod snippets;
 mod ssh_config;
 mod store;
 mod trust;
+mod vault;
 mod workspace;
 
 pub use audit::{CONFIG_KEYS, LOG_FIELDS, StoreEvent};
@@ -76,10 +86,10 @@ pub use group::{
 pub use platforms::{FILE_NAME as PLATFORMS_FILE_NAME, PlatformStore};
 pub use portable::{
     ApplyMode, ApplyOutcome, ApplyPlan, Change, ExportOptions, ExportOutcome, HostOverlay,
-    KdfParams, LocalData, LocalState, PORTABLE_FORMAT, PORTABLE_VERSION, Platform, PlatformData,
-    PlatformFallback, PlatformField, PortableError, Rebased, SNAPSHOT_DIRECTORY, SNAPSHOT_LIMIT,
-    SecretBundle, SharedData, SharedPreferences, ShelluneData, Snapshot, SnapshotStore, Touched,
-    TrustConflict, merge_recent_connections, rebase_state,
+    KdfParams, LocalData, LocalState, PORTABLE_FORMAT, PORTABLE_VAULT_VERSION, PORTABLE_VERSION,
+    Platform, PlatformData, PlatformFallback, PlatformField, PortableError, Rebased,
+    SNAPSHOT_DIRECTORY, SNAPSHOT_LIMIT, SecretBundle, SharedData, SharedPreferences, ShelluneData,
+    Snapshot, SnapshotStore, Touched, TrustConflict, merge_recent_connections, rebase_state,
 };
 pub use preferences::{
     FILE_NAME as PREFERENCES_FILE_NAME, KeymapEntry, KeymapPreferences, Preferences,
@@ -95,5 +105,10 @@ pub use store::{FILE_NAME, HostStore};
 pub use trust::{
     HostKey, HostTrust, TRUST_FILE_NAME, TRUST_FORMAT_VERSION, TrustEntry, TrustError, TrustStore,
     TrustVerdict, is_sha256_fingerprint,
+};
+pub use vault::{
+    HostReference, KeySource, MigrationReport, PassphrasePurpose, UnsealSource, VAULT_FILE_NAME,
+    VAULT_FORMAT, VAULT_FORMAT_VERSION, VaultCipher, VaultContent, VaultCredentialRecord,
+    VaultKeyRecord, VaultStore, VaultStoreError, WrapRecord,
 };
 pub use workspace::{FILE_NAME as WORKSPACE_FILE_NAME, WorkspaceStore};
