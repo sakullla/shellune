@@ -24,7 +24,7 @@ use gpui::{
     AnyElement, Context, Div, IntoElement, Pixels, Point, SharedString, Stateful, WeakEntity,
     Window, div, px, uniform_list,
 };
-use shellune_core::{GroupPath, HostId, ProtocolKind, SessionKind, SessionState};
+use shellune_core::{GroupPath, HostId, SessionKind, SessionState};
 
 use super::shell::ModalContent;
 use crate::app::components::{self, ControlState, Variant};
@@ -188,10 +188,6 @@ struct HostRowView {
     selecting: bool,
     /// Whether the host is marked as a favourite (R1).
     favorite: bool,
-    /// Whether the row names its protocol. Only a list that also holds RDP, VNC or
-    /// serial records needs "SSH" said: in a list of SSH hosts the same tag on every
-    /// row is noise beside the names.
-    protocol_tag: bool,
     /// The chip and its tooltip when the private key file the host names is not on this
     /// computer: a record that came from another machine keeps its path and says so,
     /// rather than failing only once a connection is tried (R9).
@@ -752,6 +748,7 @@ impl ShelluneView {
             let focused_path = self.focused_group_path.clone();
             let drawn = self.group_rows_drawn.clone();
             let row_height = metrics.control_height() + metrics.scale(spacing::HALF);
+            let reserve_chevron = rows_rc.iter().any(|row| row.has_children);
             let vlist = uniform_list("hosts.groups.list", count, move |range, _window, _cx| {
                 drawn.set(drawn.get().max(range.len()));
                 let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
@@ -764,7 +761,10 @@ impl ShelluneView {
                             index,
                             &section_clone,
                             is_focused,
-                            row_height,
+                            GroupRowLayout {
+                                height: row_height,
+                                reserve_chevron,
+                            },
                             &weak,
                             metrics,
                         )
@@ -784,12 +784,17 @@ impl ShelluneView {
                 .id("hosts.groups.scroll")
                 .debug_selector(|| "hosts.groups".to_owned())
                 .track_focus(&self.group_list_focus)
+                .relative()
                 .flex()
                 .flex_col()
                 .flex_1()
                 .min_h_0()
                 .w_full()
                 .child(vlist)
+                .child(crate::app::scrollbar::for_list(
+                    "hosts.groups.scrollbar",
+                    &self.group_scroll,
+                ))
         };
 
         div()
@@ -2161,7 +2166,7 @@ impl ShelluneView {
         } else {
             px(0.0)
         };
-        uniform_list("hosts.rows", rows.len(), move |range, _window, _cx| {
+        let list = uniform_list("hosts.rows", rows.len(), move |range, _window, _cx| {
             drawn.set(drawn.get().max(range.len()));
             let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
             for row in &rows[range] {
@@ -2184,8 +2189,22 @@ impl ShelluneView {
         .flex_1()
         .min_h(min_list_height)
         .min_w_0()
-        .debug_selector(|| "hosts.rows".to_owned())
-        .into_any_element()
+        .debug_selector(|| "hosts.rows".to_owned());
+        // The bar is a sibling drawn over the list's right edge, so it reads the
+        // offsets the list wrote this frame and adds no column of its own.
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(min_list_height)
+            .min_w_0()
+            .child(list)
+            .child(crate::app::scrollbar::for_list(
+                "hosts.rows.scrollbar",
+                &self.hosts_scroll,
+            ))
+            .into_any_element()
     }
 
     /// Reads every row of the list once, for the frame about to be drawn.
@@ -2250,7 +2269,6 @@ impl ShelluneView {
                         show_meta: MetaColumns::default(),
                         selecting: !self.hosts.selected().is_empty(),
                         favorite: self.book.is_favorite(host.id),
-                        protocol_tag: false,
                         key_missing: saved
                             .identity_file()
                             .filter(|path| self.key_presence.missing(path))
@@ -2293,25 +2311,25 @@ impl ShelluneView {
         }
         // The columns are decided for the whole list, not per row, so every row that
         // draws one draws it at the same x.
+        // A group column says something only when the rows differ in it: a list
+        // narrowed to one group (the sidebar's choice) would repeat that choice on
+        // every row and squeeze the names for it.
+        let mut groups = rows.iter().filter_map(|row| match row {
+            SnapshotRow::Host(host) => Some(host.group.as_ref()),
+            SnapshotRow::Connection(connection) => Some(connection.group.as_ref()),
+            SnapshotRow::Direct(_) => None,
+        });
+        let first = groups.next().flatten();
         let columns = MetaColumns {
-            tag: rows.iter().any(|row| match row {
-                SnapshotRow::Host(host) => host.group.is_some(),
-                SnapshotRow::Connection(connection) => connection.group.is_some(),
-                SnapshotRow::Direct(_) => false,
-            }),
+            tag: first.is_some_and(|first| groups.any(|group| group != Some(first)))
+                || (first.is_none() && groups.any(|group| group.is_some())),
             time: rows
                 .iter()
                 .any(|row| matches!(row, SnapshotRow::Host(host) if host.last.is_some())),
         };
-        let mixed = rows
-            .iter()
-            .any(|row| matches!(row, SnapshotRow::Connection(_)));
         for row in &mut rows {
             match row {
-                SnapshotRow::Host(host) => {
-                    host.show_meta = columns;
-                    host.protocol_tag = mixed;
-                }
+                SnapshotRow::Host(host) => host.show_meta = columns,
                 SnapshotRow::Connection(connection) => connection.show_meta = columns,
                 SnapshotRow::Direct(_) => {}
             }
@@ -2468,15 +2486,27 @@ impl ShelluneView {
 ///
 /// Carries no per-row `FocusHandle`: focus lives on the single container `group_list_focus`
 /// and is drawn via `is_focused`, keeping focus handles `O(1)` at any tree size.
+/// What every row of the sidebar's group list shares.
+#[derive(Clone, Copy)]
+struct GroupRowLayout {
+    height: Pixels,
+    /// Whether a leaf keeps the chevron's column because some row has one.
+    reserve_chevron: bool,
+}
+
 fn group_tree_row_element(
     group: &SidebarGroupRow,
     number: usize,
     section: &HomeSection,
     is_focused: bool,
-    row_height: Pixels,
+    layout: GroupRowLayout,
     weak: &WeakEntity<ShelluneView>,
     metrics: Metrics,
 ) -> Stateful<Div> {
+    let GroupRowLayout {
+        height: row_height,
+        reserve_chevron,
+    } = layout;
     let path = group.path.clone();
     let chosen = matches!(section, HomeSection::Group(shown) if *shown == path);
     let label = if group.show_full_path {
@@ -2526,11 +2556,19 @@ fn group_tree_row_element(
                 });
             })
             .into_any_element()
+            .into()
+    } else if reserve_chevron {
+        // A leaf beside a branch keeps the chevron's column, so the folders of one
+        // level line up; a list with no branch at all reserves nothing and its folders
+        // sit on the same edge as the entries above them.
+        Some(
+            div()
+                .flex_none()
+                .size(metrics.scale(CHEVRON_SIZE))
+                .into_any_element(),
+        )
     } else {
-        div()
-            .flex_none()
-            .size(metrics.scale(CHEVRON_SIZE))
-            .into_any_element()
+        None
     };
     div()
         .id(SharedString::from(format!("hosts.tree.{number}")))
@@ -2543,16 +2581,35 @@ fn group_tree_row_element(
         .h(row_height)
         .w_full()
         .min_w_0()
+        .relative()
         .pl(metrics.scale(GROUP_INDENT * group.depth as f32))
         .border_1()
         .border_color(if is_focused { ring } else { theme::clear() })
         .rounded(px(radius::MEDIUM))
-        .child(toggle)
+        .children(toggle)
         .child(
-            components::sidebar_item(Icon::Folder, label, Some(group.hosts), chosen, metrics)
-                .flex_1(),
+            components::sidebar_item_in(
+                Icon::Folder,
+                label,
+                Some(group.hosts),
+                chosen,
+                Some(GROUP_ROW),
+                metrics,
+            )
+            .flex_1(),
         )
-        .child(more)
+        // The action takes the count's place while the row is pointed at, so the
+        // counts share the edge the entries above them use.
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right(metrics.scale(spacing::HALF))
+                .flex()
+                .items_center()
+                .child(more),
+        )
         .on_click(move |_event, window, cx| {
             let _ = pick_weak.update(cx, |this, cx| {
                 this.focus_group_row(&pick_path, window, cx);
@@ -2859,13 +2916,7 @@ fn host_row_element(
             .flex()
             .items_center()
             .gap(metrics.scale(spacing::HALF))
-            .min_w_0()
-            .when(host.protocol_tag, |badges| {
-                badges.child(
-                    components::tag(ProtocolKind::Ssh.label(), metrics)
-                        .debug_selector(move || format!("hosts.protocol.badge.{number}")),
-                )
-            });
+            .min_w_0();
         if let Some((label, tip)) = host.key_missing.clone() {
             badges = badges.child(
                 div()

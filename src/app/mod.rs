@@ -40,6 +40,7 @@ pub mod palette;
 pub mod product;
 pub mod remote;
 /// The serial sessions a saved device opens, and the port list behind them (R17, R21).
+pub mod scrollbar;
 pub mod serial;
 pub mod snippets;
 pub mod terminal;

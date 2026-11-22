@@ -6708,6 +6708,73 @@ async fn a_host_inherits_switches_off_or_overrides_the_keepalive(cx: &mut TestAp
     );
 }
 #[gpui::test]
+async fn the_group_field_opens_a_dropdown_that_narrows_picks_and_puts_itself_away(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("group-dropdown");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("web", "10.0.0.1", 22, "root", Some("Production")),
+            stored_host("db", "10.0.0.2", 22, "root", Some("Staging")),
+            stored_host("lab", "10.0.0.3", 22, "root", Some("Lab")),
+        ],
+    );
+    let (view, cx) = hosts_view(cx, dir.store());
+    let open = |cx: &mut VisualTestContext| {
+        cx.update(|window, app| view.read(app).group_picker_open(window, app))
+    };
+    let group_text = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .hosts_state()
+                .draft()
+                .map(|draft| draft.text(crate::app::hosts::HostField::Group).to_owned())
+                .unwrap_or_default()
+        })
+    };
+
+    click(cx, "hosts.new");
+    assert!(!open(cx), "the dropdown waits for the group field");
+
+    click(cx, "hosts.field.group");
+    assert!(open(cx), "focusing the group field offers the saved groups");
+    assert!(
+        cx.debug_bounds("hosts.group.pick.2").is_some(),
+        "all three are listed"
+    );
+
+    // Typing narrows: "stag" leaves Staging and the offer to make "stag" a new group.
+    cx.simulate_input("stag");
+    cx.run_until_parked();
+    assert!(open(cx));
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(group_text(cx), "Staging", "Enter picks the best match");
+    assert!(!open(cx), "a pick puts the dropdown away");
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().is_editing()),
+        "Enter on the open dropdown picked; it did not save the form"
+    );
+
+    // Typing opens it again, and Escape closes the dropdown but not the dialog.
+    cx.simulate_input("/x");
+    cx.run_until_parked();
+    assert!(open(cx), "typing brings the dropdown back");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!open(cx), "Escape puts the dropdown away");
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().is_editing()),
+        "the dialog stays, with what was typed"
+    );
+    assert_eq!(group_text(cx), "Staging/x");
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert!(open(cx), "Down opens it again");
+}
+
+#[gpui::test]
 async fn a_new_host_is_created_through_the_form_and_reaches_the_file(cx: &mut TestAppContext) {
     let dir = TempDir::new("create");
     let (view, cx) = hosts_view(cx, dir.store());

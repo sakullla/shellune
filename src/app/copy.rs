@@ -2956,8 +2956,8 @@ pub struct UxStrings {
     pub hosts_group_search_clear: &'static str,
     /// Multi-select scope boundary note: batch & move apply to SSH hosts only
     pub hosts_selection_ssh_only: &'static str,
-    /// Group selector empty match hint in host/connection form
-    pub hosts_group_picker_empty: &'static str,
+    /// Group selector row that keeps a typed path that no saved group has
+    pub hosts_group_picker_create: &'static str,
     /// Validation: port is not a number
     pub validation_port_not_number: &'static str,
     /// Validation: port out of range
@@ -3662,7 +3662,7 @@ impl UxStrings {
             self.hosts_group_no_match,
             self.hosts_group_search_clear,
             self.hosts_selection_ssh_only,
-            self.hosts_group_picker_empty,
+            self.hosts_group_picker_create,
             self.validation_port_not_number,
             self.validation_port_range,
             self.validation_address_port_conflict,
@@ -4154,7 +4154,7 @@ included",
     hosts_group_no_match: "No matching groups",
     hosts_group_search_clear: "Clear",
     hosts_selection_ssh_only: "SSH hosts only",
-    hosts_group_picker_empty: "No matching group; save will create this path",
+    hosts_group_picker_create: "New group “{name}”",
     validation_port_not_number: "{text} is not a port number; use 1-65535",
     validation_port_range: "{raw} is outside the valid range 1-65535",
     validation_address_port_conflict: "The address names port {typed} but the port field says {field}; keep one of them",
@@ -4641,7 +4641,7 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     hosts_group_no_match: "没有匹配的分组",
     hosts_group_search_clear: "清除",
     hosts_selection_ssh_only: "仅限 SSH 主机",
-    hosts_group_picker_empty: "没有匹配的分组，保存时将按输入路径创建",
+    hosts_group_picker_create: "新建分组“{name}”",
     validation_port_not_number: "{text} 不是有效端口号，请填写 1-65535",
     validation_port_range: "{raw} 超出有效端口范围 1-65535",
     validation_address_port_conflict: "地址中指定了端口 {typed}，但端口栏为 {field}，请只保留一个",

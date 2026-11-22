@@ -609,6 +609,9 @@ pub struct ShelluneView {
     group_picker_highlight: usize,
     /// Scroll handle for the host/connection form's searchable group picker (R12).
     group_picker_scroll: gpui::ScrollHandle,
+    /// Whether the group dropdown was put away (Escape, or a pick) since the group
+    /// field's text last changed; typing or pressing Down opens it again.
+    group_picker_closed: bool,
     /// Keyboard stops for the Home sidebar's fixed places: All, Favorites, Recent, Local.
     sidebar_place_focus: [FocusHandle; 4],
     /// The host or connection row whose right-click menu is open, and where the pointer opened it.
@@ -2774,6 +2777,7 @@ impl ShelluneView {
             focused_group_path: None,
             group_picker_highlight: 0,
             group_picker_scroll: gpui::ScrollHandle::new(),
+            group_picker_closed: false,
             sidebar_place_focus: [
                 cx.focus_handle().tab_stop(true),
                 cx.focus_handle().tab_stop(true),
@@ -4282,6 +4286,12 @@ impl ShelluneView {
     #[must_use]
     pub fn snippet_panel(&self) -> &SnippetsPanel {
         &self.snippet_panel
+    }
+
+    /// Whether the host form's group dropdown is on screen.
+    #[cfg(test)]
+    pub fn group_picker_open(&self, window: &Window, cx: &gpui::App) -> bool {
+        self.group_picker_shown(window, cx)
     }
 
     /// The import panel and what the last read of a configuration file showed.
@@ -7135,6 +7145,14 @@ impl ShelluneView {
         cx.observe(&entity, move |view, text_field, cx| {
             let text = text_field.read(cx).text().to_owned();
             let mut split = false;
+            if field == HostField::Group
+                && view
+                    .hosts
+                    .draft()
+                    .is_some_and(|draft| draft.text(HostField::Group) != text)
+            {
+                view.reopen_group_picker();
+            }
             if let Some(draft) = view.hosts.draft_mut() {
                 draft.set_text(field, text);
                 // `root@10.0.0.12:2222` pasted into the address is three fields at once.
@@ -7744,6 +7762,14 @@ impl ShelluneView {
         });
         cx.observe(&entity, move |view, text_field, cx| {
             let text = text_field.read(cx).text().to_owned();
+            if field == ConnectionFormField::Group
+                && view
+                    .hosts
+                    .protocol_draft()
+                    .is_some_and(|draft| draft.text(ConnectionFormField::Group) != text)
+            {
+                view.reopen_group_picker();
+            }
             if let Some(draft) = view.hosts.protocol_draft_mut() {
                 draft.set_text(field, text);
             }
@@ -12721,6 +12747,13 @@ impl ShelluneView {
         // list and leaves the form where it was (ADR-7).
         if self.forward_host_picker_shown() {
             self.close_forward_host_picker(window, cx);
+            return true;
+        }
+        // The group dropdown floats under the Group field: Escape puts it away and
+        // leaves the dialog and what was typed (R12).
+        if self.group_picker_shown(window, cx) {
+            self.group_picker_closed = true;
+            cx.notify();
             return true;
         }
         if self.host_fields.is_some() {

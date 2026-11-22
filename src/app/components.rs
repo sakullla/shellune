@@ -2488,18 +2488,34 @@ pub fn modal_with(
         .w(width)
         .max_h(max_height)
         .child(header)
+        // A body taller than the window scrolls, and its bar says so: a dialog that
+        // only scrolled by wheel hid the fields below the fold from a mouse without one.
         .child(
             div()
-                .id(SharedString::from(format!("{id}.body")))
-                .debug_selector(move || format!("{id}.body"))
+                .relative()
                 .flex()
                 .flex_col()
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scroll()
-                .when_some(scroll, |body, handle| body.track_scroll(&handle))
-                .children(subtitle)
-                .child(body),
+                .child(
+                    div()
+                        .id(SharedString::from(format!("{id}.body")))
+                        .debug_selector(move || format!("{id}.body"))
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .when_some(scroll.clone(), |body, handle| body.track_scroll(&handle))
+                        .children(subtitle)
+                        .child(body),
+                )
+                .children(scroll.map(|handle| {
+                    crate::app::scrollbar::bar(
+                        SharedString::from(format!("{id}.scrollbar")),
+                        handle,
+                    )
+                })),
         )
         .children(footer.map(|footer| footer.flex_none()));
     let backdrop = div()
@@ -3210,6 +3226,22 @@ pub fn sidebar_item(
     selected: bool,
     metrics: Metrics,
 ) -> Div {
+    sidebar_item_in(icon, label, count, selected, None, metrics)
+}
+
+/// A sidebar entry whose count gives way while the named group is pointed at.
+///
+/// A row with an action of its own (a group's "more") floats that action over the
+/// count instead of reserving a column for it, so every count in the sidebar stays on
+/// one edge whether or not its row has an action.
+pub fn sidebar_item_in(
+    icon: Icon,
+    label: impl Into<SharedString>,
+    count: Option<usize>,
+    selected: bool,
+    yields_to: Option<&'static str>,
+    metrics: Metrics,
+) -> Div {
     let (fill, ink) = if selected {
         (Some(palette::SURFACE_SELECTED), palette::TEXT_PRIMARY)
     } else {
@@ -3247,6 +3279,9 @@ pub fn sidebar_item(
                 .flex_none()
                 .text_size(metrics.caption_size())
                 .text_color(theme::swatch(palette::TEXT_MUTED))
+                .when_some(yields_to, |count, group| {
+                    count.group_hover(group, |style| style.invisible())
+                })
                 .child(SharedString::from(count.to_string()))
         }))
 }

@@ -15,8 +15,8 @@ use gpui::{
     Window, canvas, div, px,
 };
 use shellune_core::{
-    AuthMethodKind, HostId, ProtocolKind, RdpCertificatePolicy, SerialFlow, SerialParity,
-    SerialStopBits, TransferProtocol, VncSecurity, X11Forwarding,
+    AuthMethodKind, GroupPath, HostId, ProtocolKind, RdpCertificatePolicy, SerialFlow,
+    SerialParity, SerialStopBits, TransferProtocol, VncSecurity, X11Forwarding,
 };
 
 use super::shell::{ModalBehaviour, ModalContent};
@@ -55,6 +55,14 @@ const JUMP_NAME_MAX_WIDTH: f32 = 200.0;
 
 /// The least width of one override number of the host form.
 const CONNECTION_FIELD_MIN_WIDTH: f32 = 120.0;
+
+/// One row of the group dropdown.
+enum GroupChoice {
+    /// A group that is saved or that a saved record names.
+    Saved(GroupPath),
+    /// The typed path, which saving creates.
+    New(String),
+}
 
 /// The jump host picker of the host dialog, while it is open (R3).
 ///
@@ -584,6 +592,19 @@ impl ShelluneView {
         label: Option<&'static str>,
         grow: f32,
     ) -> Div {
+        self.dialog_field_with(fields, field, label, grow, None)
+    }
+
+    /// A field of the host form with something that floats under its input - the
+    /// group field's dropdown.
+    fn dialog_field_with(
+        &self,
+        fields: &HostFields,
+        field: HostField,
+        label: Option<&'static str>,
+        grow: f32,
+        attached: Option<gpui::AnyElement>,
+    ) -> Div {
         let metrics = self.metrics();
         let label = label.unwrap_or_else(|| field.label(self.strings()));
         // The port, a short field beside wide ones, keeps a short floor; the others
@@ -600,11 +621,13 @@ impl ShelluneView {
             )
             .child(
                 div()
+                    .relative()
                     .flex()
                     .w_full()
                     .min_w_0()
                     .debug_selector(move || field.debug_selector().to_owned())
-                    .child(fields.get(field).clone()),
+                    .child(fields.get(field).clone())
+                    .children(attached),
             );
         let problem = self
             .hosts
@@ -1067,59 +1090,99 @@ impl ShelluneView {
         column
     }
 
-    /// Real-time filtered, scrollable group selector for SSH and non-SSH forms (R12).
+    /// Opens the group dropdown again after it was put away.
+    pub(super) fn reopen_group_picker(&mut self) {
+        self.group_picker_closed = false;
+        self.group_picker_highlight = 0;
+        self.group_picker_scroll.scroll_to_item(0);
+    }
+
+    /// Whether the group dropdown is on screen in either form.
+    pub(super) fn group_picker_shown(&self, window: &Window, cx: &App) -> bool {
+        !self.group_picker_closed
+            && [true, false].into_iter().any(|for_ssh| {
+                self.group_field_focused(for_ssh, window, cx)
+                    && !self
+                        .group_choices(&self.group_field_text(for_ssh))
+                        .is_empty()
+            })
+    }
+
+    /// Whether the open form's Group field holds the keyboard.
+    fn group_field_focused(&self, for_ssh: bool, window: &Window, cx: &App) -> bool {
+        if for_ssh {
+            self.host_fields
+                .as_ref()
+                .is_some_and(|f| f.group.read(cx).focus_handle().is_focused(window))
+        } else {
+            self.protocol_fields
+                .as_ref()
+                .and_then(|f| f.get(ConnectionFormField::Group))
+                .is_some_and(|f| f.read(cx).focus_handle().is_focused(window))
+        }
+    }
+
+    /// The text of the open form's Group field.
+    fn group_field_text(&self, for_ssh: bool) -> String {
+        if for_ssh {
+            self.hosts
+                .draft()
+                .map(|d| d.text(HostField::Group).to_owned())
+                .unwrap_or_default()
+        } else {
+            self.hosts
+                .protocol_draft()
+                .map(|d| d.text(ConnectionFormField::Group).to_owned())
+                .unwrap_or_default()
+        }
+    }
+
+    /// What the group dropdown offers for what was typed (R12).
+    fn group_choices(&self, current: &str) -> Vec<GroupChoice> {
+        let typed = current.trim();
+        let paths = crate::app::hosts::filtered_group_paths(&self.book, &self.groups, typed);
+        let exact = paths
+            .iter()
+            .any(|path| path.to_canonical().eq_ignore_ascii_case(typed));
+        let mut choices: Vec<GroupChoice> = paths.into_iter().map(GroupChoice::Saved).collect();
+        // A path nobody saved yet is still a valid answer: the save creates it. The
+        // row says so, instead of a list that only ever shows what already exists.
+        if !typed.is_empty() && !exact && GroupPath::parse(typed).is_ok() {
+            choices.push(GroupChoice::New(typed.to_owned()));
+        }
+        choices
+    }
+
+    /// The group dropdown under the form's Group field, while that field is focused
+    /// (R12).
     ///
-    /// Replaces the old 8-chip cap so hundreds of saved groups remain searchable and
-    /// selectable by pointer or keyboard while still allowing any custom new path.
-    fn group_suggestions_row(
+    /// It is a combo box, not a list beside the form: it opens under the field being
+    /// typed in, floats over what follows instead of pushing it down, narrows and
+    /// ranks the saved groups by every word typed, marks why each one matched, counts
+    /// what each group holds, and offers the typed path as a new group when none has
+    /// it. Up and Down move, Enter picks, Escape puts it away; a click picks too.
+    fn group_dropdown(
         &self,
-        current: &str,
         prefix: &'static str,
         for_ssh: bool,
+        window: &Window,
         cx: &mut Context<Self>,
-    ) -> Option<Div> {
-        let all_paths = crate::app::hosts::drawn_paths(&self.book, &self.groups);
-        if all_paths.is_empty() {
+    ) -> Option<gpui::AnyElement> {
+        if self.group_picker_closed || !self.group_field_focused(for_ssh, window, cx) {
+            return None;
+        }
+        let current = self.group_field_text(for_ssh);
+        let choices = self.group_choices(&current);
+        if choices.is_empty() {
             return None;
         }
         let metrics = self.metrics();
         let ux = copy::ux();
-        let current_trimmed = current.trim();
-        let filtered =
-            crate::app::hosts::filtered_group_paths(&self.book, &self.groups, current_trimmed);
+        let typed = current.trim().to_owned();
         let row_height = metrics.compact_control_height();
-        let highlighted = if filtered.is_empty() {
-            None
-        } else {
-            Some(self.group_picker_highlight.min(filtered.len() - 1))
-        };
-
-        let mut container = div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .min_w_0()
-            .p(metrics.scale(spacing::HAIRLINE))
-            .rounded(px(radius::MEDIUM))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .bg(theme::swatch(palette::CHROME))
-            .debug_selector(move || format!("{prefix}.group.suggestions"));
-
-        if filtered.is_empty() {
-            container = container.child(
-                div()
-                    .px(metrics.scale(spacing::TIGHT))
-                    .py(metrics.scale(spacing::HALF))
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .debug_selector(move || format!("{prefix}.group.suggestions.empty"))
-                    .child(ux.hosts_group_picker_empty),
-            );
-            return Some(container);
-        }
-
+        let highlighted = self.group_picker_highlight.min(choices.len() - 1);
         let hover = theme::swatch(palette::SURFACE_HOVER);
+
         let mut list = div()
             .id(SharedString::from(format!(
                 "{prefix}.group.suggestions.scroll"
@@ -1128,21 +1191,50 @@ impl ShelluneView {
             .flex_col()
             .gap(px(components::HAIRLINE_WIDTH))
             .w_full()
-            .min_w_0()
+            .p(metrics.scale(spacing::HAIRLINE))
             .max_h(
                 row_height * GROUP_PICKER_ROWS
-                    + px(components::HAIRLINE_WIDTH) * (GROUP_PICKER_ROWS - 1.0),
+                    + px(components::HAIRLINE_WIDTH) * (GROUP_PICKER_ROWS - 1.0)
+                    + metrics.scale(spacing::HAIRLINE) * 2.0,
             )
             .overflow_y_scroll()
             .track_scroll(&self.group_picker_scroll);
 
-        for (index, path) in filtered.into_iter().enumerate() {
-            let text = path.to_canonical();
-            let chosen = current_trimmed == text;
-            let active = highlighted == Some(index);
-            let pick_text = text.clone();
+        for (index, choice) in choices.into_iter().enumerate() {
+            let active = index == highlighted;
             let id = format!("{prefix}.group.pick.{index}");
             let selector = id.clone();
+            let (icon, label, count, chosen, value) = match &choice {
+                GroupChoice::Saved(path) => {
+                    let text = path.to_canonical();
+                    let chosen = text == typed;
+                    (
+                        Icon::Folder,
+                        text.clone(),
+                        Some(crate::app::hosts::records_under(&self.book, path)),
+                        chosen,
+                        text,
+                    )
+                }
+                GroupChoice::New(text) => (
+                    Icon::Plus,
+                    copy::fill(ux.hosts_group_picker_create, &[("name", text)]),
+                    None,
+                    false,
+                    text.clone(),
+                ),
+            };
+            let marks = match &choice {
+                GroupChoice::Saved(_) if !typed.is_empty() => {
+                    crate::app::palette::highlights(&label, &typed)
+                }
+                _ => Vec::new(),
+            };
+            let ink = if matches!(choice, GroupChoice::New(_)) {
+                palette::ACCENT
+            } else {
+                palette::TEXT_PRIMARY
+            };
             list = list.child(
                 div()
                     .id(SharedString::from(id))
@@ -1155,16 +1247,14 @@ impl ShelluneView {
                     .px(metrics.scale(spacing::TIGHT))
                     .rounded(px(radius::SMALL))
                     .cursor_pointer()
-                    .when(chosen || active, |row| {
+                    .when(active, |row| {
                         row.bg(theme::swatch(palette::SURFACE_SELECTED))
                     })
-                    .when(!chosen && !active, |row| {
-                        row.hover(move |style| style.bg(hover))
-                    })
+                    .when(!active, |row| row.hover(move |style| style.bg(hover)))
                     .child(icons::icon(
-                        Icon::Folder,
+                        icon,
                         metrics.small_icon_size(),
-                        theme::swatch(if chosen {
+                        theme::swatch(if chosen || matches!(choice, GroupChoice::New(_)) {
                             palette::ACCENT
                         } else {
                             palette::TEXT_MUTED
@@ -1175,10 +1265,17 @@ impl ShelluneView {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .child(SharedString::from(text)),
+                            .text_size(metrics.label_size())
+                            .text_color(theme::swatch(ink))
+                            .child(components::highlighted_text(label, marks)),
                     )
+                    .children(count.map(|count| {
+                        div()
+                            .flex_none()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(SharedString::from(count.to_string()))
+                    }))
                     .when(chosen, |row| {
                         row.child(icons::icon(
                             Icon::Check,
@@ -1186,17 +1283,55 @@ impl ShelluneView {
                             theme::swatch(palette::ACCENT),
                         ))
                     })
+                    // The press is taken before the field loses the keyboard, so the
+                    // pick lands and the caret stays where the person was typing.
+                    .on_mouse_down(gpui::MouseButton::Left, |_event, window, cx| {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    })
                     .on_click(cx.listener(move |this, _event, _window, cx| {
-                        let next = if chosen {
-                            String::new()
-                        } else {
-                            pick_text.clone()
-                        };
-                        this.apply_dialog_group_text(for_ssh, next, cx);
+                        this.pick_dialog_group(for_ssh, value.clone(), cx);
                     })),
             );
         }
-        Some(container.child(list))
+
+        let panel = components::popover_surface()
+            .occlude()
+            .flex()
+            .flex_col()
+            .w_full()
+            .overflow_hidden()
+            .debug_selector(move || format!("{prefix}.group.suggestions"))
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .child(list)
+                    .child(crate::app::scrollbar::bar(
+                        SharedString::from(format!("{prefix}.group.suggestions.bar")),
+                        self.group_picker_scroll.clone(),
+                    )),
+            );
+        Some(
+            gpui::deferred(
+                div()
+                    .absolute()
+                    .top_full()
+                    .left_0()
+                    .right_0()
+                    .mt(metrics.scale(spacing::HALF))
+                    .child(panel),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
+    /// Puts a picked group into the field and closes the dropdown.
+    fn pick_dialog_group(&mut self, for_ssh: bool, value: String, cx: &mut Context<Self>) {
+        self.apply_dialog_group_text(for_ssh, value, cx);
+        self.group_picker_closed = true;
+        cx.notify();
     }
 
     /// Writes `next` into the open SSH or non-SSH dialog's Group field and draft.
@@ -1224,7 +1359,7 @@ impl ShelluneView {
         cx.notify();
     }
 
-    /// Handles Up/Down/Enter keyboard selection when the dialog's Group field is focused (R12).
+    /// Handles Up/Down/Enter while the dialog's Group field is focused (R12).
     fn handle_group_picker_key(
         &mut self,
         for_ssh: bool,
@@ -1232,40 +1367,24 @@ impl ShelluneView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if event.keystroke.modifiers.number_of_modifiers() != 0 {
+        if event.keystroke.modifiers.number_of_modifiers() != 0
+            || !self.group_field_focused(for_ssh, window, cx)
+        {
             return false;
         }
-        let group_focused = if for_ssh {
-            self.host_fields
-                .as_ref()
-                .is_some_and(|f| f.group.read(cx).focus_handle().is_focused(window))
-        } else {
-            self.protocol_fields
-                .as_ref()
-                .and_then(|f| f.get(ConnectionFormField::Group))
-                .is_some_and(|f| f.read(cx).focus_handle().is_focused(window))
-        };
-        if !group_focused {
+        let current = self.group_field_text(for_ssh);
+        let choices = self.group_choices(&current);
+        if choices.is_empty() {
             return false;
         }
-        let current = if for_ssh {
-            self.hosts
-                .draft()
-                .map(|d| d.text(HostField::Group).to_owned())
-                .unwrap_or_default()
-        } else {
-            self.hosts
-                .protocol_draft()
-                .map(|d| d.text(ConnectionFormField::Group).to_owned())
-                .unwrap_or_default()
-        };
-        let candidates =
-            crate::app::hosts::filtered_group_paths(&self.book, &self.groups, &current);
-        if candidates.is_empty() {
-            return false;
-        }
-        let last = candidates.len() - 1;
+        let last = choices.len() - 1;
+        let open = !self.group_picker_closed;
         match event.keystroke.key.as_str() {
+            "down" if !open => {
+                self.reopen_group_picker();
+                cx.notify();
+                true
+            }
             "down" => {
                 self.group_picker_highlight = (self.group_picker_highlight + 1).min(last);
                 self.group_picker_scroll
@@ -1273,7 +1392,7 @@ impl ShelluneView {
                 cx.notify();
                 true
             }
-            "up" => {
+            "up" if open => {
                 self.group_picker_highlight =
                     self.group_picker_highlight.saturating_sub(1).min(last);
                 self.group_picker_scroll
@@ -1281,14 +1400,15 @@ impl ShelluneView {
                 cx.notify();
                 true
             }
-            "enter" if !current.trim().is_empty() => {
-                let picked = candidates[self.group_picker_highlight.min(last)].to_canonical();
-                if current.trim() != picked {
-                    self.apply_dialog_group_text(for_ssh, picked, cx);
-                    true
-                } else {
-                    false
-                }
+            // Enter on an open dropdown picks; on a closed one it is the form's own
+            // Enter, which saves.
+            "enter" if open => {
+                let value = match &choices[self.group_picker_highlight.min(last)] {
+                    GroupChoice::Saved(path) => path.to_canonical(),
+                    GroupChoice::New(text) => text.clone(),
+                };
+                self.pick_dialog_group(for_ssh, value, cx);
+                true
             }
             _ => false,
         }
@@ -1375,18 +1495,13 @@ impl ShelluneView {
                             Some(ux.host_name_optional),
                             0.5,
                         ),
-                        self.dialog_field(
+                        self.dialog_field_with(
                             fields,
                             HostField::Group,
                             Some(ux.host_group_optional),
                             0.5,
+                            self.group_dropdown("hosts", true, window, cx),
                         ),
-                    ))
-                    .children(self.group_suggestions_row(
-                        draft.text(HostField::Group),
-                        "hosts",
-                        true,
-                        cx,
                     )),
             )
             .child(
@@ -1588,6 +1703,17 @@ impl ShelluneView {
         grow: f32,
         label: Option<&'static str>,
     ) -> Div {
+        self.protocol_field_with(field, grow, label, None)
+    }
+
+    /// A field of a protocol form with something that floats under its input.
+    fn protocol_field_with(
+        &self,
+        field: ConnectionFormField,
+        grow: f32,
+        label: Option<&'static str>,
+        attached: Option<gpui::AnyElement>,
+    ) -> Div {
         let metrics = self.metrics();
         let label = label.unwrap_or_else(|| field.label(self.strings()));
         let entity = self
@@ -1608,11 +1734,13 @@ impl ShelluneView {
         if let Some(entity) = entity {
             cell = cell.child(
                 div()
+                    .relative()
                     .flex()
                     .w_full()
                     .min_w_0()
                     .debug_selector(move || field.debug_selector().to_owned())
-                    .child(entity),
+                    .child(entity)
+                    .children(attached),
             );
         }
         // A refusal is shown under the field that produced it, and only once the form
@@ -2022,25 +2150,19 @@ impl ShelluneView {
                     ));
                 }
                 ConnectionFormField::Name => {
-                    basic = basic
-                        .child(line(
-                            self.protocol_field_sized(
-                                ConnectionFormField::Name,
-                                0.5,
-                                Some(ux.host_name_optional),
-                            ),
-                            self.protocol_field_sized(
-                                ConnectionFormField::Group,
-                                0.5,
-                                Some(ux.host_group_optional),
-                            ),
-                        ))
-                        .children(self.group_suggestions_row(
-                            draft.text(ConnectionFormField::Group),
-                            "connection",
-                            false,
-                            cx,
-                        ));
+                    basic = basic.child(line(
+                        self.protocol_field_sized(
+                            ConnectionFormField::Name,
+                            0.5,
+                            Some(ux.host_name_optional),
+                        ),
+                        self.protocol_field_with(
+                            ConnectionFormField::Group,
+                            0.5,
+                            Some(ux.host_group_optional),
+                            self.group_dropdown("connection", false, window, cx),
+                        ),
+                    ));
                 }
                 ConnectionFormField::Group => {}
             }

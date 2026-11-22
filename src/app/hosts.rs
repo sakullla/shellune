@@ -3372,10 +3372,58 @@ pub(crate) fn filtered_group_paths(
     if query.is_empty() {
         return paths;
     }
-    paths
+    // Every word must appear; the closest matches come first - the path itself, then
+    // a path that starts with what was typed, then one with a part that does - and
+    // the saved order breaks ties, so a long list narrows to what was meant.
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let mut ranked: Vec<(u8, GroupPath)> = paths
         .into_iter()
-        .filter(|path| path.to_canonical().to_lowercase().contains(&query))
-        .collect()
+        .filter_map(|path| {
+            let text = path.to_canonical().to_lowercase();
+            if !words.iter().all(|word| text.contains(word)) {
+                return None;
+            }
+            let rank = if text == query {
+                0
+            } else if text.starts_with(&query) {
+                1
+            } else if path
+                .segments()
+                .iter()
+                .any(|part| part.to_lowercase().starts_with(words[0]))
+            {
+                2
+            } else {
+                3
+            };
+            Some((rank, path))
+        })
+        .collect();
+    ranked.sort_by_key(|(rank, _)| *rank);
+    ranked.into_iter().map(|(_, path)| path).collect()
+}
+
+/// How many saved records sit in one group or anywhere inside it.
+#[must_use]
+pub(crate) fn records_under(book: &HostBook, path: &GroupPath) -> usize {
+    let hosts = book
+        .hosts()
+        .iter()
+        .filter(|host| {
+            host.group_path()
+                .is_some_and(|group| group.starts_with(path))
+        })
+        .count();
+    let connections = book
+        .connections()
+        .iter()
+        .filter(|record| {
+            record
+                .group_path()
+                .is_some_and(|group| group.starts_with(path))
+        })
+        .count();
+    hosts + connections
 }
 
 /// The paths directly inside one parent, in order.
@@ -5996,6 +6044,17 @@ mod tests {
         assert!(
             all.len() > 250,
             "all saved paths returned without 8-item cap"
+        );
+        let ranked = filtered_group_paths(&book, &groups, "region0");
+        assert!(
+            ranked[0].to_canonical() == "Region00",
+            "a path that starts with the words comes before one that only holds them: {:?}",
+            ranked.first()
+        );
+        let both = filtered_group_paths(&book, &groups, "region09 service249");
+        assert!(
+            both.iter().all(|p| p.to_canonical().contains("Service249")),
+            "every word narrows the list"
         );
         let narrowed = filtered_group_paths(&book, &groups, "service24");
         assert!(
