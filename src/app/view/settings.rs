@@ -402,22 +402,6 @@ impl ShelluneView {
                 .debug_selector(|| "settings.tail".to_owned()),
         );
 
-        // The sections scroll as one page; the bar sits on the page's own right edge
-        // so it reads as the page's, not the window's.
-        let sections = div()
-            .relative()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .w_full()
-            .min_w_0()
-            .min_h_0()
-            .max_w(metrics.scale(SECTIONS_MAX_WIDTH))
-            .child(sections)
-            .child(crate::app::scrollbar::bar(
-                "settings.scrollbar",
-                self.settings_scroll.clone(),
-            ));
         let body = if folded {
             div()
                 .flex()
@@ -452,6 +436,12 @@ impl ShelluneView {
                 )
                 .child(sections)
         };
+        // The sections scroll as one page; the bar sits on the page's own right edge
+        // so it reads as the page's, not the window's.
+        let body = body.child(crate::app::scrollbar::bar(
+            "settings.scrollbar",
+            self.settings_scroll.clone(),
+        ));
         let page = div()
             .flex()
             .flex_col()

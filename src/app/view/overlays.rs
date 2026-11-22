@@ -918,19 +918,11 @@ impl ShelluneView {
                     ),
             )
             .child(components::form_rule())
-            .child(
-                div()
-                    .relative()
-                    .flex()
-                    .flex_col()
-                    .min_h_0()
-                    .flex_shrink()
-                    .child(list)
-                    .child(crate::app::scrollbar::bar(
-                        "palette.scrollbar",
-                        self.palette_scroll.clone(),
-                    )),
-            )
+            .child(list)
+            .child(crate::app::scrollbar::bar(
+                "palette.scrollbar",
+                self.palette_scroll.clone(),
+            ))
             .child(
                 div()
                     .flex()

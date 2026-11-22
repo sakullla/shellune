@@ -13,9 +13,11 @@
 //! - It reuses the ink the terminal's scrollback thumb uses, so every scrollbar in the
 //!   window reads as the same control.
 //!
-//! The element must be a later sibling of the scrolling container inside a `relative`
-//! parent: siblings are prepainted in order, so the handle holds this frame's numbers
-//! by the time the bar measures itself.
+//! The bar measures its track from the handle's own bounds, not from where it is laid
+//! out: it takes no room and needs no wrapper, so adding it never moves the layout it
+//! is added to. It must come after the scrolling container in the tree - elements are
+//! prepainted in order, so the handle holds this frame's numbers by the time the bar
+//! measures itself.
 
 use gpui::{
     App, Bounds, CursorStyle, DispatchPhase, ElementId, Hitbox, HitboxBehavior, IntoElement,
@@ -108,11 +110,16 @@ pub fn bar(id: impl Into<ElementId>, handle: ScrollHandle) -> impl IntoElement {
     let id = id.into();
     let paint_handle = handle.clone();
     canvas(
-        move |bounds, window: &mut Window, cx: &mut App| {
+        move |_bounds, window: &mut Window, cx: &mut App| {
             let state = window.use_keyed_state(id, cx, |_, _| BarState::default());
-            let geometry = Geometry::measure(&handle, bounds);
+            let viewport = handle.bounds();
+            let track = Bounds::new(
+                point(viewport.right() - px(TRACK_WIDTH), viewport.top()),
+                size(px(TRACK_WIDTH), viewport.size.height),
+            );
+            let geometry = Geometry::measure(&handle, track);
             let hitbox = geometry
-                .map(|_| window.insert_hitbox(bounds, HitboxBehavior::BlockMouseExceptScroll));
+                .map(|_| window.insert_hitbox(track, HitboxBehavior::BlockMouseExceptScroll));
             (state, geometry, hitbox)
         },
         move |_bounds,
@@ -231,9 +238,9 @@ pub fn bar(id: impl Into<ElementId>, handle: ScrollHandle) -> impl IntoElement {
     )
     .absolute()
     .top_0()
-    .right_0()
-    .bottom_0()
-    .w(px(TRACK_WIDTH))
+    .left_0()
+    .w(Pixels::ZERO)
+    .h(Pixels::ZERO)
 }
 
 #[cfg(test)]

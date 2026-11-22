@@ -2488,36 +2488,25 @@ pub fn modal_with(
         .w(width)
         .max_h(max_height)
         .child(header)
-        // A body taller than the window scrolls, and its bar says so: a dialog that
-        // only scrolled by wheel hid the fields below the fold from a mouse without one.
         .child(
             div()
-                .relative()
+                .id(SharedString::from(format!("{id}.body")))
+                .debug_selector(move || format!("{id}.body"))
                 .flex()
                 .flex_col()
                 .flex_1()
                 .min_h_0()
-                .child(
-                    div()
-                        .id(SharedString::from(format!("{id}.body")))
-                        .debug_selector(move || format!("{id}.body"))
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .when_some(scroll.clone(), |body, handle| body.track_scroll(&handle))
-                        .children(subtitle)
-                        .child(body),
-                )
-                .children(scroll.map(|handle| {
-                    crate::app::scrollbar::bar(
-                        SharedString::from(format!("{id}.scrollbar")),
-                        handle,
-                    )
-                })),
+                .overflow_y_scroll()
+                .when_some(scroll.clone(), |body, handle| body.track_scroll(&handle))
+                .children(subtitle)
+                .child(body),
         )
-        .children(footer.map(|footer| footer.flex_none()));
+        .children(footer.map(|footer| footer.flex_none()))
+        // A body taller than the window scrolls, and its bar says so: a dialog that
+        // only scrolled by wheel hid the fields below the fold from a mouse without one.
+        .children(scroll.map(|handle| {
+            crate::app::scrollbar::bar(SharedString::from(format!("{id}.scrollbar")), handle)
+        }));
     let backdrop = div()
         .id(SharedString::from(format!("{id}.backdrop")))
         .debug_selector(move || format!("{id}.backdrop"))

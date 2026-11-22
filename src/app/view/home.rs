@@ -784,7 +784,6 @@ impl ShelluneView {
                 .id("hosts.groups.scroll")
                 .debug_selector(|| "hosts.groups".to_owned())
                 .track_focus(&self.group_list_focus)
-                .relative()
                 .flex()
                 .flex_col()
                 .flex_1()
@@ -1892,7 +1891,13 @@ impl ShelluneView {
         if rows.is_empty() {
             body.child(self.hosts_empty_list(cx))
         } else {
+            // The bar comes after the list, so it reads the offsets the list wrote
+            // this frame; it draws over the list's right edge and takes no room.
             body.child(self.hosts_virtual_list(rows, cx))
+                .child(crate::app::scrollbar::for_list(
+                    "hosts.rows.scrollbar",
+                    &self.hosts_scroll,
+                ))
         }
     }
 
@@ -2166,7 +2171,7 @@ impl ShelluneView {
         } else {
             px(0.0)
         };
-        let list = uniform_list("hosts.rows", rows.len(), move |range, _window, _cx| {
+        uniform_list("hosts.rows", rows.len(), move |range, _window, _cx| {
             drawn.set(drawn.get().max(range.len()));
             let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
             for row in &rows[range] {
@@ -2189,22 +2194,8 @@ impl ShelluneView {
         .flex_1()
         .min_h(min_list_height)
         .min_w_0()
-        .debug_selector(|| "hosts.rows".to_owned());
-        // The bar is a sibling drawn over the list's right edge, so it reads the
-        // offsets the list wrote this frame and adds no column of its own.
-        div()
-            .relative()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h(min_list_height)
-            .min_w_0()
-            .child(list)
-            .child(crate::app::scrollbar::for_list(
-                "hosts.rows.scrollbar",
-                &self.hosts_scroll,
-            ))
-            .into_any_element()
+        .debug_selector(|| "hosts.rows".to_owned())
+        .into_any_element()
     }
 
     /// Reads every row of the list once, for the frame about to be drawn.
