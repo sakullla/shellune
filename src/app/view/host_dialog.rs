@@ -691,6 +691,21 @@ impl ShelluneView {
                             .is_some_and(|draft| draft.auth().needs_key_path());
                         if !(kind == AuthMethodKind::KeyFile && already_key) {
                             this.set_host_auth(kind, cx);
+                            // The vault's method starts on a key the host can
+                            // really sign in with, not on a nameless choice that
+                            // could never dial (R1, ADR-7).
+                            if kind == AuthMethodKind::ManagedKey
+                                && let Some(draft) = this.hosts.draft_mut()
+                                && draft.managed_key_id().is_none()
+                                && let Some(first) = this.security.content().and_then(|vault| {
+                                    vault
+                                        .keys()
+                                        .find(|record| record.meta().is_live())
+                                        .map(|record| record.meta().id())
+                                })
+                            {
+                                draft.set_managed_key(Some(first));
+                            }
                         }
                     })),
             );
@@ -709,6 +724,180 @@ impl ShelluneView {
                         .child(MethodChoice::from_kind(auth).hint(strings)),
                 ),
         );
+
+        // The vault's method names the key the host signs in with: a picker of
+        // the keys the vault holds, each with the fingerprint a person checks
+        // (R1, ADR-7). An empty vault says so, instead of a chooser with
+        // nothing in it.
+        if auth == AuthMethodKind::ManagedKey {
+            let security = copy::security_for(self.workspace.locale());
+            let chosen = draft.managed_key_id();
+            let mut picker = div()
+                .flex()
+                .flex_col()
+                .gap(metrics.scale(spacing::HAIRLINE))
+                .debug_selector(|| "hosts.auth.managed.picker".to_owned())
+                .child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .child(security.host_key_pick),
+                );
+            let mut keys = self
+                .security
+                .content()
+                .map(|vault| {
+                    vault
+                        .keys()
+                        .filter(|record| record.meta().is_live())
+                        .map(|record| record.meta().clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            keys.sort_by(|a, b| a.name().cmp(b.name()));
+            if keys.is_empty() {
+                picker = picker.child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                        .debug_selector(|| "hosts.auth.managed.none".to_owned())
+                        .child(security.method_none),
+                );
+            }
+            for (index, meta) in keys.iter().enumerate() {
+                let id = meta.id();
+                let selected = chosen == Some(id);
+                let label = format!("{} · {}", meta.name(), meta.fingerprint());
+                let selector = format!("hosts.auth.managed.key.{index}");
+                let reserved = components::compact_label_reserved_width(&label, metrics);
+                picker = picker.child(
+                    components::compact_button(
+                        SharedString::from(label.clone()),
+                        if selected {
+                            components::Variant::Primary
+                        } else {
+                            components::Variant::Secondary
+                        },
+                        metrics,
+                    )
+                    .min_w(reserved)
+                    .max_w_full()
+                    .flex_shrink()
+                    .whitespace_normal()
+                    .h(gpui::auto())
+                    .min_h(metrics.compact_control_height())
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector({
+                        let selector = selector.clone();
+                        move || selector.clone()
+                    })
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        if let Some(draft) = this.hosts.draft_mut() {
+                            draft.set_managed_key(Some(id));
+                        }
+                        cx.notify();
+                    })),
+                );
+            }
+            column = column.child(picker);
+        }
+
+        // A password sign-in may name a shared credential of the vault instead
+        // of a password of its own: the record's password is the one every host
+        // that names it uses, and it is edited in one place (R1).
+        if auth == AuthMethodKind::Password {
+            let security = copy::security_for(self.workspace.locale());
+            let chosen = draft.credential_id();
+            let mut shared = self
+                .security
+                .content()
+                .map(|vault| {
+                    vault
+                        .credentials()
+                        .filter(|record| record.meta().is_live())
+                        .map(|record| record.meta().clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            shared.sort_by(|a, b| a.name().cmp(b.name()));
+            if !shared.is_empty() {
+                let mut picker = div()
+                    .flex()
+                    .flex_col()
+                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .debug_selector(|| "hosts.auth.credential.picker".to_owned())
+                    .child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(security.host_credential_pick),
+                    );
+                for (index, meta) in shared.iter().enumerate() {
+                    let id = meta.id();
+                    let selected = chosen == Some(id);
+                    let label = match meta.user() {
+                        Some(user) => format!("{} · {}", meta.name(), user),
+                        None => meta.name().to_owned(),
+                    };
+                    let selector = format!("hosts.auth.credential.{index}");
+                    let reserved = components::compact_label_reserved_width(&label, metrics);
+                    picker = picker.child(
+                        components::compact_button(
+                            SharedString::from(label.clone()),
+                            if selected {
+                                components::Variant::Primary
+                            } else {
+                                components::Variant::Secondary
+                            },
+                            metrics,
+                        )
+                        .min_w(reserved)
+                        .max_w_full()
+                        .flex_shrink()
+                        .whitespace_normal()
+                        .h(gpui::auto())
+                        .min_h(metrics.compact_control_height())
+                        .id(SharedString::from(selector.clone()))
+                        .debug_selector({
+                            let selector = selector.clone();
+                            move || selector.clone()
+                        })
+                        .on_click(cx.listener(
+                            move |this, _event, _window, cx| {
+                                if let Some(draft) = this.hosts.draft_mut() {
+                                    // Choosing a record again goes back to a typed
+                                    // password, which is the other way this method
+                                    // signs in.
+                                    let next = (draft.credential_id() != Some(id)).then_some(id);
+                                    draft.set_credential(next);
+                                }
+                                cx.notify();
+                            },
+                        )),
+                    );
+                }
+                if chosen.is_some() {
+                    picker = picker.child(
+                        components::compact_button(
+                            security.host_credential_clear,
+                            components::Variant::Ghost,
+                            metrics,
+                        )
+                        .id("hosts.auth.credential.clear")
+                        .debug_selector(|| "hosts.auth.credential.clear".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                if let Some(draft) = this.hosts.draft_mut() {
+                                    draft.set_credential(None);
+                                }
+                                cx.notify();
+                            },
+                        )),
+                    );
+                }
+                column = column.child(picker);
+            }
+        }
 
         if auth.needs_key_path() {
             let has_passphrase = auth.needs_passphrase();

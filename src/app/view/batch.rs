@@ -256,11 +256,15 @@ impl ShelluneView {
     /// interactive connection does. Nothing here dials: the runner does, one host at a
     /// time, and only after this returns.
     pub(super) fn confirm_batch(&mut self, cx: &mut Context<Self>) {
+        // The run signs in the way a single connection would: a target that
+        // names a managed key or a shared password of the vault resolves its
+        // body from the same unlocked copy the window holds (R1).
         let routes = crate::app::batch::StoredRoutes::new(
             &self.book,
             &self.trust_book,
             self.secrets.clone(),
-        );
+        )
+        .with_vault(self.security.content().cloned());
         let factory: std::sync::Arc<dyn shellune_ssh::batch::TransportFactory> =
             std::sync::Arc::new(shellune_ssh::batch::SshTransports::new(
                 std::sync::Arc::new(routes),

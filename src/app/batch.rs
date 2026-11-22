@@ -2122,6 +2122,10 @@ pub struct StoredRoutes {
     hosts: Vec<HostConfig>,
     trust: HostTrust,
     secrets: Arc<dyn SecretStore>,
+    /// The unlocked vault the run started with, when the window had one: a
+    /// target that signs in with a managed key or a shared password resolves
+    /// its body from there, exactly as a single connection does (R1).
+    vault: Option<shellune_storage::VaultContent>,
 }
 
 impl StoredRoutes {
@@ -2132,7 +2136,15 @@ impl StoredRoutes {
             hosts: book.hosts().to_vec(),
             trust: trust.clone(),
             secrets,
+            vault: None,
         }
+    }
+
+    /// The same routes, with the vault the run may sign in from.
+    #[must_use]
+    pub fn with_vault(mut self, vault: Option<shellune_storage::VaultContent>) -> Self {
+        self.vault = vault;
+        self
     }
 
     fn host(&self, id: HostId) -> Result<HostConfig, String> {
@@ -2144,6 +2156,15 @@ impl StoredRoutes {
     }
 
     fn secret(&self, host: &HostConfig) -> Option<shellune_core::SecretString> {
+        if let Some(credential) = host.credential_id()
+            && let Some(body) = self
+                .vault
+                .as_ref()
+                .and_then(|vault| vault.credential(credential))
+                .and_then(|record| record.secret())
+        {
+            return Some(body.clone());
+        }
         if !host.remembers_secret() {
             return None;
         }
@@ -2152,7 +2173,7 @@ impl StoredRoutes {
 
     fn auth(&self, host: &HostConfig) -> Result<shellune_core::AuthMethod, String> {
         let secret = self.secret(host);
-        remote::stored_auth(host, secret.as_ref()).ok_or_else(|| {
+        remote::stored_auth(host, secret.as_ref(), self.vault.as_ref()).ok_or_else(|| {
             copy::fill(
                 copy::ux().batch_reason_no_credential,
                 &[("host", host.name())],

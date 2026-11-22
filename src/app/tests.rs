@@ -41940,3 +41940,779 @@ async fn r11_r12_protocol_filter_connected_status_and_multi_protocol_form_group_
         "clicking a filtered group suggestion fills the group field"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The vault's keys and passwords in the settings (R1, ADR-7)
+// ---------------------------------------------------------------------------
+
+/// A window with the settings' keys-and-passwords page open, over a scratch
+/// data directory whose credential store is in memory.
+fn security_view<'a>(
+    cx: &'a mut TestAppContext,
+    dir: &TempDir,
+) -> (Entity<ShelluneView>, &'a mut VisualTestContext) {
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Settings);
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
+    });
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    click(cx, "settings.category.security");
+    click(cx, "settings.item.keys-and-passwords");
+    (view, cx)
+}
+
+/// Generates one Ed25519 key through the page's own dialog, and returns its
+/// identity, name and fingerprint.
+fn generate_key_on_page(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+    name: &str,
+) -> (shellune_core::KeyId, String, String) {
+    click(cx, "security.action.generate");
+    type_into(cx, "security.dialog.name", name);
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    let keys = cx.update(|_window, app| view.read(app).security_keys_for_test());
+    keys.first().cloned().unwrap_or_else(|| {
+        panic!(
+            "the key was generated; notice: {:?}",
+            cx.update(|_window, app| view.read(app).security_notice_for_test())
+        )
+    })
+}
+
+/// The whole life of one key: generated, listed, renamed without a new
+/// fingerprint, and deleted - each step visible on the page.
+#[gpui::test]
+async fn the_keys_page_generates_edits_and_deletes_a_key(cx: &mut TestAppContext) {
+    let dir = TempDir::new("security-keys");
+    let (view, cx) = security_view(cx, &dir);
+    assert!(
+        cx.debug_bounds("security.keys.empty").is_some(),
+        "a vault without keys says so instead of an empty list"
+    );
+
+    let (id, _, fingerprint) = generate_key_on_page(&view, cx, "Deploy");
+    assert!(
+        cx.debug_bounds("security.key.0").is_some(),
+        "the generated key is listed"
+    );
+    assert!(
+        dir.path().join(shellune_storage::VAULT_FILE_NAME).exists(),
+        "the vault was written to its own file"
+    );
+
+    // Renaming changes no key material: the fingerprint is the proof.
+    click(cx, "security.key.0");
+    assert!(
+        cx.debug_bounds("security.detail.key").is_some(),
+        "the detail card of the key is drawn"
+    );
+    click(cx, "security.detail.action.0");
+    clear_field(cx, "security.dialog.name", "Deploy".len());
+    type_into(cx, "security.dialog.name", "Deploy renamed");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    let keys = cx.update(|_window, app| view.read(app).security_keys_for_test());
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].0, id, "editing keeps the record's identity");
+    assert_eq!(keys[0].1, "Deploy renamed");
+    assert_eq!(
+        keys[0].2, fingerprint,
+        "renaming changes neither the key nor its fingerprint"
+    );
+
+    // Deleting a key nothing uses needs no host list, and it really goes.
+    click(cx, "security.key.0");
+    click(cx, "security.detail.action.3");
+    assert!(
+        cx.debug_bounds("security.dialog.delete-key").is_some(),
+        "the delete question opens"
+    );
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).security_keys_for_test())
+            .is_empty(),
+        "the key is gone after the confirmed delete"
+    );
+}
+
+/// An OpenSSH RSA key of 1024 bits, made with `ssh-keygen -b 1024`, and the
+/// fingerprint it printed:
+///
+///   ssh-keygen -lf -> 1024 SHA256:tKeBBCOkTL0EC46A7YAIChgLuhsf4ONkPgGF85U6uF4
+///
+/// A throwaway key with no secret worth anything, kept for the one thing it
+/// proves: the import refuses an RSA key below the 2048-bit floor, naming the
+/// size it refused (R1).
+const WEAK_RSA_PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAlwAAAAdzc2gtcn
+NhAAAAAwEAAQAAAIEAxQHuglcIYzamlXjNax/xPemWeeAwgs7cyKCMwPh5Dmh1YFcM6DuD
+zyAyr80Vli1MX4ZeEqObveKuRfq2OM3DTix3NF8f3z78TSjwBEE1Cv0XQhkkCqkJ5mXOLl
+oOoa31PfZQSima/1zqpkRPVrJbduxGZgila5d5TYaIxXGYGzcAAAIIGgs/UxoLP1MAAAAH
+c3NoLXJzYQAAAIEAxQHuglcIYzamlXjNax/xPemWeeAwgs7cyKCMwPh5Dmh1YFcM6DuDzy
+Ayr80Vli1MX4ZeEqObveKuRfq2OM3DTix3NF8f3z78TSjwBEE1Cv0XQhkkCqkJ5mXOLloO
+oa31PfZQSima/1zqpkRPVrJbduxGZgila5d5TYaIxXGYGzcAAAADAQABAAAAgC8QDxJECF
+TrMVBz017L+q13p+Llk7EsCcJD2Fwg/4pZmfCx2vt/fDV206T7sTR3Dc+kIcUCIKp0BH3j
+LrTTMtyGix+D0OmlTvW8z9UdSFYv8o9hd7pKRNwxysEDOCz1VQ+UgT5HcA5FACc5Mh2lxY
+YFrcmNsdIzbfelL5sA2vrBAAAAQCzMwbr3bYn1M+vC6BfA34+ARbOqhhurtzI/+RMJ9627
+yIOmBiQWPwCuGCtMoonAimy1+2pnKE75BLPeWuFdV14AAABBAOrTxGZkrxDWryYlvJOuM2
+rYymzZuqeqjhPIqGMsEgRQ32KhFZlHtR4nL1akIdUH37MvPlizmDTIXdMUAx9KkoMAAABB
+ANbFOABPs60Gbx5M7h5UKTGPtocndHgp/6bOJM3KW6PacgrXUblMAIPbugNcm2xiLf9XAQ
+ppY9jxYGjnvXlRZj0AAAANd2Vlay10ZXN0LWtleQECAwQFBg==
+-----END OPENSSH PRIVATE KEY-----";
+
+/// Importing the same public key twice names the record that already holds it
+/// instead of making a second one, and an RSA key below the floor this build
+/// keeps is refused with its size named (R1).
+#[gpui::test]
+async fn importing_a_key_twice_names_the_record_that_already_holds_it(cx: &mut TestAppContext) {
+    let dir = TempDir::new("security-import");
+    let (view, cx) = security_view(cx, &dir);
+
+    // The RSA floor first: a real 1024-bit key parses, and the import still
+    // refuses it, because signing with it is not something this build does.
+    click(cx, "security.action.import");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_fill_import_for_test(WEAK_RSA_PEM, "", "Too weak", cx)
+        })
+    });
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    let refusal = cx.update(|_window, app| view.read(app).security_dialog_refusal_for_test());
+    assert!(
+        refusal
+            .as_deref()
+            .is_some_and(|reason| reason.contains("1024")),
+        "the refusal names the size it refused: {refusal:?}"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).security_keys_for_test())
+            .is_empty(),
+        "a key below the floor leaves no record behind"
+    );
+    click(cx, "security.dialog.cancel");
+    cx.run_until_parked();
+
+    // A real key, generated the way the SSH layer does: the import path sees
+    // exactly what a pasted file would give it.
+    let key = shellune_ssh::keys::generate(shellune_ssh::keys::ManagedKeyKind::Ed25519)
+        .expect("an Ed25519 generates");
+    let pem =
+        shellune_ssh::keys::export_private_key(&key, None).expect("a plain export for the paste");
+
+    for name in ["Laptop", "Laptop again"] {
+        click(cx, "security.action.import");
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| {
+                view.security_fill_import_for_test(pem.expose(), "", name, cx)
+            })
+        });
+        click(cx, "security.dialog.submit");
+        cx.run_until_parked();
+    }
+
+    let keys = cx.update(|_window, app| view.read(app).security_keys_for_test());
+    assert_eq!(keys.len(), 1, "the same public key is one record, not two");
+    let refusal = cx.update(|_window, app| view.read(app).security_dialog_refusal_for_test());
+    let refusal = refusal.expect("the second import was refused in the dialog");
+    assert!(
+        refusal.contains("Laptop") && !refusal.contains("Laptop again"),
+        "the refusal names the record that holds the key: {refusal}"
+    );
+    // The refusal left the fields as they were, so a correction is typed into
+    // them rather than a fresh dialog.
+    click(cx, "security.dialog.cancel");
+    cx.run_until_parked();
+}
+
+/// A shared password is edited in one place and reaches both hosts that use
+/// it; an independent copy changes on its own from the moment it is made.
+#[gpui::test]
+async fn a_shared_password_is_edited_in_one_place_and_a_copy_changes_alone(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("security-shared");
+    let (view, cx) = security_view(cx, &dir);
+
+    // One shared password, generated rather than typed.
+    click(cx, "security.action.new-password");
+    type_into(cx, "security.dialog.name", "Prod login");
+    type_into(cx, "security.dialog.user", "deploy");
+    click(cx, "security.dialog.generate.password");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    let (credential, _) = cx
+        .update(|_window, app| view.read(app).security_credentials_for_test())
+        .first()
+        .cloned()
+        .expect("the shared password was created");
+    let first_password = cx
+        .update(|_window, app| {
+            view.read(app)
+                .security_credential_password_for_test(credential)
+        })
+        .expect("the record holds a password");
+    assert!(first_password.len() >= 8, "a generated password has length");
+
+    // Two hosts that both use it, each bound through the host editor.
+    for name in ["web", "db"] {
+        click(cx, "nav.hosts");
+        click(cx, "hosts.new");
+        type_into(cx, "hosts.field.name", name);
+        type_into(cx, "hosts.field.address", "127.0.0.1");
+        clear_field(cx, "hosts.field.port", 2);
+        type_into(cx, "hosts.field.port", "1");
+        type_into(cx, "hosts.field.user", "deploy");
+        click(cx, "hosts.auth.remote.method.password");
+        click(cx, "hosts.auth.credential.0");
+        click(cx, "hosts.save");
+        cx.run_until_parked();
+    }
+    let hosts = cx.update(|_window, app| {
+        view.read(app)
+            .book()
+            .hosts()
+            .iter()
+            .map(|host| (host.id(), host.credential_id()))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(hosts.len(), 2);
+    for (_, referenced) in &hosts {
+        assert_eq!(
+            *referenced,
+            Some(credential),
+            "both hosts name the one record"
+        );
+    }
+
+    // Editing the shared record reaches every host that references it.
+    let edit_shared = |cx: &mut VisualTestContext, password: &str| {
+        click(cx, "nav.settings");
+        click(cx, "settings.item.keys-and-passwords");
+        click(cx, "security.credential.0");
+        click(cx, "security.detail.action.0");
+        clear_field(cx, "security.dialog.secret", 0);
+        type_into(cx, "security.dialog.secret", password);
+        click(cx, "security.dialog.submit");
+        cx.run_until_parked();
+    };
+    edit_shared(cx, "second-shared-value");
+    let both = cx.update(|_window, app| {
+        let view = view.read(app);
+        let vault = view
+            .security_content_clone_for_test()
+            .expect("the vault is unlocked");
+        view.book()
+            .hosts()
+            .iter()
+            .map(|host| {
+                crate::app::remote::stored_auth(host, None, Some(&vault)).map(|auth| match auth {
+                    shellune_core::AuthMethod::Password { password } => {
+                        password.expose().to_owned()
+                    }
+                    _ => unreachable!("a shared password builds a password attempt"),
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        both,
+        vec![
+            Some("second-shared-value".to_owned()),
+            Some("second-shared-value".to_owned())
+        ],
+        "editing the shared record is the reality for both hosts at once"
+    );
+
+    // An independent copy starts as the same value and then changes alone.
+    click(cx, "security.credential.0");
+    click(cx, "security.detail.action.1");
+    cx.run_until_parked();
+    let copies = cx.update(|_window, app| view.read(app).security_credentials_for_test());
+    assert_eq!(copies.len(), 2, "the copy exists beside the original");
+    let copy = copies
+        .iter()
+        .find(|(id, _)| *id != credential)
+        .map(|(id, _)| *id)
+        .expect("the copy has its own identity");
+    assert_eq!(
+        cx.update(|_window, app| { view.read(app).security_credential_password_for_test(copy) }),
+        Some("second-shared-value".to_owned()),
+        "the copy starts from the value the original had"
+    );
+    edit_shared(cx, "third-shared-value");
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .security_credential_password_for_test(credential)
+        }),
+        Some("third-shared-value".to_owned())
+    );
+    assert_eq!(
+        cx.update(|_window, app| { view.read(app).security_credential_password_for_test(copy) }),
+        Some("second-shared-value".to_owned()),
+        "the independent copy keeps its own value when the original moves on"
+    );
+}
+
+/// A rotation moves the chosen connections onto a newly generated key, keeps
+/// the old key until the user decides otherwise, and shows the public key that
+/// has to be deployed (R1).
+#[gpui::test]
+async fn rotating_a_key_moves_its_connections_and_keeps_the_old_key(cx: &mut TestAppContext) {
+    let dir = TempDir::new("security-rotate");
+    let (view, cx) = security_view(cx, &dir);
+    let (previous, _, _) = generate_key_on_page(&view, cx, "Deploy");
+
+    // One host bound to it through the host editor's own picker.
+    click(cx, "nav.hosts");
+    click(cx, "hosts.new");
+    type_into(cx, "hosts.field.name", "box");
+    type_into(cx, "hosts.field.address", "127.0.0.1");
+    clear_field(cx, "hosts.field.port", 2);
+    type_into(cx, "hosts.field.port", "1");
+    type_into(cx, "hosts.field.user", "ada");
+    click(cx, "hosts.auth.remote.method.managed-key");
+    assert!(
+        cx.debug_bounds("hosts.auth.managed.key.0").is_some(),
+        "the key picker offers the vault's key"
+    );
+    click(cx, "hosts.auth.managed.key.0");
+    click(cx, "hosts.save");
+    cx.run_until_parked();
+
+    // A refused rotation changes nothing: unchecking the only connection and
+    // submitting leaves the dialog open with the reason.
+    click(cx, "nav.settings");
+    click(cx, "settings.item.keys-and-passwords");
+    click(cx, "security.key.0");
+    click(cx, "security.detail.action.1");
+    click(cx, "security.dialog.rotate.host.box");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    let refusal = cx.update(|_window, app| view.read(app).security_dialog_refusal_for_test());
+    assert!(
+        refusal.is_some_and(|reason| !reason.is_empty()),
+        "a rotation with no connection chosen is refused"
+    );
+    click(cx, "security.dialog.cancel");
+    cx.run_until_parked();
+    let bound = cx.update(|_window, app| {
+        view.read(app)
+            .book()
+            .hosts()
+            .first()
+            .and_then(|host| host.managed_key_id())
+    });
+    assert_eq!(
+        bound,
+        Some(previous),
+        "the cancelled rotation moved nothing"
+    );
+
+    // The real rotation moves the host, keeps the old key and shows the public
+    // key that has to be deployed.
+    click(cx, "security.key.0");
+    click(cx, "security.detail.action.1");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    let keys = cx.update(|_window, app| view.read(app).security_keys_for_test());
+    assert_eq!(keys.len(), 2, "the new key exists beside the kept old one");
+    let new = keys
+        .iter()
+        .find(|(id, _, _)| *id != previous)
+        .cloned()
+        .expect("the new key has its own identity");
+    let first_new = new.0;
+    let bound = cx.update(|_window, app| {
+        view.read(app)
+            .book()
+            .hosts()
+            .first()
+            .and_then(|host| host.managed_key_id())
+    });
+    assert_eq!(bound, Some(new.0), "the connection moved to the new key");
+    assert!(
+        cx.debug_bounds("security.rotation.result").is_some(),
+        "the new public key is shown for deploying"
+    );
+
+    // Retiring on the next rotation deletes the old key once nothing uses it.
+    click(cx, "security.rotation.dismiss");
+    // The rows follow their names, so "Deploy 2" - the key the host uses now -
+    // is the second row.
+    click(cx, "security.key.1");
+    click(cx, "security.detail.action.1");
+    click(cx, "security.dialog.rotate.retire");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    let keys = cx.update(|_window, app| view.read(app).security_keys_for_test());
+    assert!(
+        keys.iter().all(|(id, _, _)| *id != first_new),
+        "the key the rotation retired is gone; deleting it was the rotation's own choice"
+    );
+    assert!(
+        keys.iter().any(|(id, _, _)| *id == previous),
+        "the first key is still there, kept by its own rotation's choice"
+    );
+}
+
+/// Deleting a key its connections still use shows those connections first, and
+/// a cancel changes nothing (R1).
+#[gpui::test]
+async fn deleting_a_referenced_key_shows_the_connections_and_needs_the_confirmation(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("security-delete");
+    let (view, cx) = security_view(cx, &dir);
+    generate_key_on_page(&view, cx, "Deploy");
+
+    click(cx, "nav.hosts");
+    click(cx, "hosts.new");
+    type_into(cx, "hosts.field.name", "box");
+    type_into(cx, "hosts.field.address", "127.0.0.1");
+    clear_field(cx, "hosts.field.port", 2);
+    type_into(cx, "hosts.field.port", "1");
+    type_into(cx, "hosts.field.user", "ada");
+    click(cx, "hosts.auth.remote.method.managed-key");
+    click(cx, "hosts.auth.managed.key.0");
+    click(cx, "hosts.save");
+    cx.run_until_parked();
+
+    click(cx, "nav.settings");
+    click(cx, "settings.item.keys-and-passwords");
+    click(cx, "security.key.0");
+    click(cx, "security.detail.action.3");
+    let dialog = bounds_of(cx, "security.dialog.delete-key");
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    assert!(
+        dialog.size.width > px(0.0) && dialog.size.width <= viewport.width,
+        "the delete question is drawn"
+    );
+    // The question names the connection that would lose its sign-in, which is
+    // what the confirmation is about. Cancel changes nothing.
+    click(cx, "security.dialog.cancel");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_keys_for_test())
+            .len(),
+        1,
+        "a cancelled delete keeps the key"
+    );
+
+    // The confirmed delete clears the binding, so nothing is left that looks
+    // usable and points at nothing.
+    click(cx, "security.key.0");
+    click(cx, "security.detail.action.3");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).security_keys_for_test())
+            .is_empty(),
+        "the confirmed delete removed the key"
+    );
+    let host = cx
+        .update(|_window, app| view.read(app).book().hosts().first().cloned())
+        .expect("the host itself is untouched");
+    assert_eq!(host.managed_key_id(), None, "no dangling binding is left");
+    assert_eq!(host.auth(), None, "the host asks for a sign-in again");
+}
+
+/// A host that names an application key connects from the unlocked vault's
+/// one-time body, while the file-key and agent ways it always had still work.
+#[gpui::test]
+async fn connecting_with_an_application_key_builds_the_attempt_from_the_vault(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("security-connect");
+    let (view, cx) = security_view(cx, &dir);
+    let (key, _, _) = generate_key_on_page(&view, cx, "Deploy");
+
+    click(cx, "nav.hosts");
+    click(cx, "hosts.new");
+    type_into(cx, "hosts.field.name", "box");
+    type_into(cx, "hosts.field.address", "127.0.0.1");
+    clear_field(cx, "hosts.field.port", 2);
+    type_into(cx, "hosts.field.port", "1");
+    type_into(cx, "hosts.field.user", "ada");
+    click(cx, "hosts.auth.remote.method.managed-key");
+    click(cx, "hosts.auth.managed.key.0");
+    click(cx, "hosts.save");
+    cx.run_until_parked();
+
+    // The credentials a dial would use come from the vault, with the exact
+    // one-time body the attempt signs with.
+    let (host, body, auth) = cx.update(|_window, app| {
+        let view = view.read(app);
+        let host = view.book().hosts().first().cloned().expect("the host");
+        let body = view.security_key_body_for_test(key).expect("the body");
+        let vault = view.security_content_clone_for_test().expect("unlocked");
+        let auth = crate::app::remote::stored_auth(&host, None, Some(&vault))
+            .expect("the vault completes the attempt");
+        (host, body, auth)
+    });
+    match &auth {
+        shellune_core::AuthMethod::ManagedKey { private_key } => {
+            assert_eq!(
+                private_key.expose(),
+                body,
+                "the attempt receives the vault's one-time body"
+            );
+        }
+        other => panic!("an application key host builds a managed attempt, got {other:?}"),
+    }
+
+    // One click dials instead of asking: the form has nothing left to collect.
+    click(cx, "hosts.connect.0");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .remote_state()
+                .is_some_and(|panel| panel.status().is_busy())
+        }),
+        "the attempt started, so the vault supplied everything"
+    );
+    // The form this attempt left behind is on the vault's method: the chooser
+    // offers it beside the four that existed before it, and the panel started
+    // on the one the host named.
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .remote_state()
+                .map(crate::app::remote::RemotePanel::method)
+        }),
+        Some(MethodChoice::ManagedKey),
+        "the connection form opens on the vault's method"
+    );
+
+    // The ways that existed before the vault still resolve as they always did.
+    let (file_key, agent) = cx.update(|_window, app| {
+        let view = view.read(app);
+        let mut file_host = view.book().hosts().first().cloned().unwrap();
+        file_host.set_auth(Some(shellune_core::AuthMethodKind::KeyFile));
+        file_host.set_identity_file(Some("/keys/id_ed25519".to_owned()));
+        file_host.set_managed_key_id(None);
+        let mut agent_host = file_host.clone();
+        agent_host.set_identity_file(None::<&str>);
+        agent_host.set_auth(Some(shellune_core::AuthMethodKind::Agent));
+        let vault = view.security_content_clone_for_test();
+        (
+            crate::app::remote::stored_auth(&file_host, None, vault.as_ref()).is_some(),
+            crate::app::remote::stored_auth(&agent_host, None, vault.as_ref()).is_some(),
+        )
+    });
+    assert!(
+        file_key && agent,
+        "a key file and the system agent still complete their attempts"
+    );
+    assert_eq!(host.auth(), Some(shellune_core::AuthMethodKind::ManagedKey));
+}
+
+/// The host editor binds an application key and a shared password through its
+/// own pickers, and the record it saves carries only stable identifiers.
+#[gpui::test]
+async fn the_host_dialog_picks_an_application_key_and_a_shared_password(cx: &mut TestAppContext) {
+    let dir = TempDir::new("security-dialog");
+    let (view, cx) = security_view(cx, &dir);
+    let (key, _, _) = generate_key_on_page(&view, cx, "Deploy");
+
+    click(cx, "security.action.new-password");
+    type_into(cx, "security.dialog.name", "Prod login");
+    click(cx, "security.dialog.generate.password");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    let (credential, _) = cx
+        .update(|_window, app| view.read(app).security_credentials_for_test())
+        .first()
+        .cloned()
+        .expect("the shared password exists");
+
+    // A new host on the vault's key.
+    click(cx, "nav.hosts");
+    click(cx, "hosts.new");
+    type_into(cx, "hosts.field.name", "box");
+    type_into(cx, "hosts.field.address", "127.0.0.1");
+    clear_field(cx, "hosts.field.port", 2);
+    type_into(cx, "hosts.field.port", "1");
+    type_into(cx, "hosts.field.user", "ada");
+    click(cx, "hosts.auth.remote.method.managed-key");
+    click(cx, "hosts.save");
+    cx.run_until_parked();
+    let host = cx
+        .update(|_window, app| view.read(app).book().hosts().first().cloned())
+        .expect("the host saved");
+    assert_eq!(host.auth(), Some(shellune_core::AuthMethodKind::ManagedKey));
+    assert_eq!(host.managed_key_id(), Some(key));
+    assert!(
+        !host.remembers_secret(),
+        "a vault key asks the system store for nothing"
+    );
+
+    // The same host, moved onto the shared password of the vault.
+    click(cx, "hosts.edit.0");
+    click(cx, "hosts.auth.remote.method.password");
+    assert!(
+        cx.debug_bounds("hosts.auth.credential.0").is_some(),
+        "the shared passwords of the vault are offered beside a typed one"
+    );
+    click(cx, "hosts.auth.credential.0");
+    click(cx, "hosts.save");
+    cx.run_until_parked();
+    let host = cx
+        .update(|_window, app| view.read(app).book().hosts().first().cloned())
+        .expect("the host saved");
+    assert_eq!(host.auth(), Some(shellune_core::AuthMethodKind::Password));
+    assert_eq!(host.credential_id(), Some(credential));
+    assert_eq!(
+        host.managed_key_id(),
+        None,
+        "the key reference went with the method"
+    );
+    assert!(
+        !host.remembers_secret(),
+        "a shared password is not also kept in the system store"
+    );
+}
+
+/// An export asks for a passphrase of its own, or for a second, explicit
+/// acceptance of a plain file; the file it writes opens again with the
+/// passphrase it was given (R1).
+#[gpui::test]
+async fn exporting_a_private_key_needs_its_own_passphrase_or_a_plain_risk_yes(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("security-export");
+    let (view, cx) = security_view(cx, &dir);
+    let (key, _, _) = generate_key_on_page(&view, cx, "Deploy");
+
+    click(cx, "security.key.0");
+    click(cx, "security.detail.action.2");
+
+    // Without a passphrase typed twice, or without the second yes to a plain
+    // file, the dialog refuses and nothing is written.
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    let refusal = cx.update(|_window, app| view.read(app).security_dialog_refusal_for_test());
+    assert!(
+        refusal.is_some(),
+        "an export without a passphrase is refused"
+    );
+    click(cx, "security.dialog.export.plain");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    let refusal = cx.update(|_window, app| view.read(app).security_dialog_refusal_for_test());
+    assert_eq!(
+        refusal.as_deref(),
+        Some(copy::ENGLISH_SECURITY.export_plain_risk),
+        "a plain export without its second yes is refused"
+    );
+    click(cx, "security.dialog.cancel");
+    cx.run_until_parked();
+
+    // The encrypted export this build writes opens again with the passphrase
+    // it was given and no other.
+    let target = dir.path().join("exported-key");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_export_to(
+                key,
+                target.clone(),
+                Some(shellune_core::SecretString::new("export-passphrase")),
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+    let written = std::fs::read_to_string(&target).expect("the export was written");
+    assert!(written.contains("BEGIN OPENSSH PRIVATE KEY"));
+    let reopened =
+        shellune_ssh::keys::import_private_key(&shellune_core::SecretString::new(written), None)
+            .expect_err("an encrypted export needs its passphrase");
+    assert_eq!(
+        reopened,
+        shellune_ssh::keys::ManagedKeyError::EncryptedWithoutPassphrase
+    );
+    shellune_ssh::keys::import_private_key(
+        &shellune_core::SecretString::new(std::fs::read_to_string(&target).unwrap()),
+        Some(&shellune_core::SecretString::new("export-passphrase")),
+    )
+    .expect("the export opens with the passphrase it was given");
+}
+
+/// While a vault job runs, the window keeps drawing and says so; the record
+/// appears only when the job is really finished.
+#[gpui::test]
+async fn a_vault_job_draws_the_busy_line_and_keeps_the_window_responding(cx: &mut TestAppContext) {
+    let dir = TempDir::new("security-busy");
+    let (view, cx) = security_view(cx, &dir);
+
+    // The finish of the job is held the way the sync panel's tests hold one,
+    // so the busy state a real job leaves on screen for its duration is a
+    // thing this test can see.
+    cx.update(|_window, app| {
+        view.update(app, |view, _cx| view.security_hold_finish_for_test(true))
+    });
+    click(cx, "security.action.generate");
+    type_into(cx, "security.dialog.name", "Deploy");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+
+    assert!(
+        cx.update(|_window, app| view.read(app).security_busy_for_test()),
+        "the job is in flight"
+    );
+    let busy = bounds_of(cx, "security.busy");
+    let page = bounds_of(cx, "security.page");
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    assert!(busy.size.height > px(0.0), "the busy line is drawn");
+    assert!(
+        page.size.width > px(0.0) && page.size.width <= viewport.width,
+        "the page itself kept drawing while the job ran"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).security_keys_for_test())
+            .is_empty(),
+        "the record is not there before the job finishes"
+    );
+
+    // Letting the job finish lands the key, and the busy line leaves.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.security_release_finish_for_test(cx))
+    });
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).security_busy_for_test()));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_keys_for_test())
+            .len(),
+        1,
+        "the key appears once the job is finished"
+    );
+}
+
+/// The generated password follows the chosen classes and length, and never
+/// leaves the classes the user did not choose.
+#[gpui::test]
+async fn generated_passwords_use_the_chosen_classes_and_length(cx: &mut TestAppContext) {
+    let _ = cx;
+    let digits_only =
+        crate::app::view::security::generate_password_for_test(12, false, true, false);
+    assert_eq!(digits_only.len(), 12);
+    assert!(
+        digits_only.chars().all(|ch| ch.is_ascii_digit()),
+        "a digits-only password holds digits only: {digits_only}"
+    );
+    let with_symbols =
+        crate::app::view::security::generate_password_for_test(200, true, true, true);
+    assert_eq!(with_symbols.len(), 200);
+    assert!(with_symbols.chars().any(|ch| !ch.is_alphanumeric()));
+    let letters = crate::app::view::security::generate_password_for_test(64, true, false, false);
+    assert!(letters.chars().all(|ch| ch.is_ascii_alphabetic()));
+}

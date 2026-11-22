@@ -1530,6 +1530,18 @@ fn show_settings_item(
     Ok(())
 }
 
+/// Opens the keys-and-passwords page with fixture records in the page's own
+/// in-memory vault: the shot shows the lists, not a vault that exists.
+fn show_settings_security(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_settings_item(view, window, cx, Item::KeysAndPassword)?;
+    view.capture_security_records(2, 2);
+    Ok(())
+}
+
 /// Opens the shortcut page.
 fn show_settings_keys(
     view: &mut ShelluneView,
@@ -1961,6 +1973,15 @@ fn terminal_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
                 "the terminal does not show {needle:?}, so its grid did not receive the fixture"
             ));
         }
+    }
+    Ok(())
+}
+
+/// The keys-and-passwords page arrived with its rows drawn.
+fn settings_security_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    settings_page_is_on(view, ("security", "keys-and-passwords"))?;
+    if view.security_keys_count_for_capture() < 2 {
+        return Err("the fixture keys are not in the page's lists".to_owned());
     }
     Ok(())
 }
@@ -3672,6 +3693,21 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: seed_connection_defaults,
         install: show_settings_connection,
         ready: settings_connection_custom_ready,
+    },
+    Scenario {
+        id: "settings-security",
+        title: "设置 · 安全：密钥与密码",
+        category: Category::Settings,
+        fixture: "no vault file; the page's in-memory vault holds two fixture keys and two \
+                  fixture passwords, public metadata only, nothing on disk",
+        evidence: "shows the actions, the search and the two lists with their chips and \
+                   connection counts; the secrets stay hidden, the fixture records never \
+                   existed on disk, and every button's behaviour is proved by the GPUI \
+                   tests, not by this frame",
+        start: || page(Destination::Settings),
+        prepare: nothing,
+        install: show_settings_security,
+        ready: settings_security_ready,
     },
     Scenario {
         id: "settings-keys",

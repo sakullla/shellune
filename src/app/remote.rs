@@ -42,20 +42,24 @@ pub enum MethodChoice {
     Agent,
     /// A key the application vault holds.
     ///
-    /// Not offered by the chooser yet: the vault and its settings arrive with the
-    /// security work, and until a host record carries the method there is no way
-    /// to select it.
+    /// The body is never typed into the form: the window hands the panel a
+    /// one-time PEM from the unlocked vault right before the attempt starts, which
+    /// is why this variant needs no field of its own.
     ManagedKey,
 }
 
 impl MethodChoice {
     /// Every method, in the order the chooser shows them.
-    pub const ALL: [Self; 5] = [
+    ///
+    /// The application key comes last, after the four ways that existed before the
+    /// vault (ADR-7): the order a reader met them in stays the order they are in.
+    pub const ALL: [Self; 6] = [
         Self::Auto,
         Self::Password,
         Self::KeyFile,
         Self::EncryptedKeyFile,
         Self::Agent,
+        Self::ManagedKey,
     ];
 
     /// Label of the method, in the current language.
@@ -67,9 +71,9 @@ impl MethodChoice {
             Self::KeyFile => strings.auth_key,
             Self::EncryptedKeyFile => strings.auth_key_passphrase,
             Self::Agent => strings.auth_agent,
-            // No entry can select this choice yet, so no localized string exists
-            // for it; the domain label stands in until the chooser offers it.
-            Self::ManagedKey => AuthMethodKind::ManagedKey.label(),
+            Self::ManagedKey => {
+                crate::app::copy::security_for(crate::app::copy::Locale::current()).method_label
+            }
         }
     }
 
@@ -82,7 +86,9 @@ impl MethodChoice {
             Self::KeyFile => strings.auth_key_hint,
             Self::EncryptedKeyFile => strings.auth_key_passphrase_hint,
             Self::Agent => strings.auth_agent_hint,
-            Self::ManagedKey => AuthMethodKind::ManagedKey.label(),
+            Self::ManagedKey => {
+                crate::app::copy::security_for(crate::app::copy::Locale::current()).method_hint
+            }
         }
     }
 
@@ -361,6 +367,12 @@ pub struct RemotePanel {
     password: String,
     key_path: String,
     passphrase: String,
+    /// The one-time private key body the vault handed this panel for its next
+    /// attempt, when the method is the vault's.
+    ///
+    /// It waits here for the single [`Self::take_auth`] that starts the attempt and
+    /// is moved into the [AuthMethod] then; nothing typed or pasted can reach it.
+    managed_key: Option<SecretString>,
     status: RemoteStatus,
     form_error: Option<String>,
     /// Names the hop this form is collecting credentials for, when it is not obvious.
@@ -397,6 +409,7 @@ impl RemotePanel {
             password: String::new(),
             key_path,
             passphrase: String::new(),
+            managed_key: None,
             status: RemoteStatus::Idle,
             form_error: None,
             hop_label: None,
@@ -550,7 +563,17 @@ impl RemotePanel {
     pub fn clear_secrets(&mut self) {
         self.password.clear();
         self.passphrase.clear();
+        self.managed_key = None;
         self.form_error = None;
+    }
+
+    /// Hands the panel the one-time private key body of its next attempt.
+    ///
+    /// Only the window calls this, from the unlocked vault, immediately before the
+    /// attempt starts; the body is consumed by the one [`Self::take_auth`] that
+    /// follows and never outlives a second attempt.
+    pub fn supply_managed_key(&mut self, private_key: SecretString) {
+        self.managed_key = Some(private_key);
     }
 
     /// The credentials of one attempt, built from what is on screen.
@@ -591,12 +614,19 @@ impl RemotePanel {
                 AuthMethod::key_file(self.key_path.trim().to_owned(), passphrase)
             }
             MethodChoice::Agent => AuthMethod::agent(default_agent()),
-            // Nothing can select this choice yet (it is not in `ALL`), and the
-            // body it would need is the vault's to hand over, not the form's:
-            // the vault wiring fills this in when it lands.
-            MethodChoice::ManagedKey => {
-                return Err("an application key needs the vault to be unlocked first".to_owned());
-            }
+            // The body is the vault's to hand over, not something typed here: the
+            // window supplies it right before this call, and a body that never
+            // arrived means the vault could not hand the key over.
+            MethodChoice::ManagedKey => match self.managed_key.take() {
+                Some(private_key) => AuthMethod::managed_key(private_key),
+                None => {
+                    return Err(
+                        crate::app::copy::security_for(crate::app::copy::Locale::current())
+                            .managed_missing
+                            .to_owned(),
+                    );
+                }
+            },
         };
         self.form_error = None;
         Ok(auth)
@@ -688,10 +718,16 @@ pub fn now_unix() -> u64 {
 /// Credentials a saved host can supply without asking, when they are already complete.
 ///
 /// Agent and a key path need nothing typed. A password or passphrase is complete only
-/// when `secret` holds it. Anything missing returns `None` so the form can ask for
-/// that hop alone.
+/// when `secret` holds it. A host that names a vault record — a managed key, or a
+/// shared credential — is complete when `vault` holds that record's unlocked body,
+/// which is read for this one attempt and never copied anywhere else. Anything
+/// missing returns `None` so the form can ask for that hop alone.
 #[must_use]
-pub fn stored_auth(host: &HostConfig, secret: Option<&SecretString>) -> Option<AuthMethod> {
+pub fn stored_auth(
+    host: &HostConfig,
+    secret: Option<&SecretString>,
+    vault: Option<&shellune_storage::VaultContent>,
+) -> Option<AuthMethod> {
     match host.auth()? {
         // Nothing is ever missing: the automatic method asks the computer, and a
         // remembered password is only the last thing it tries.
@@ -706,6 +742,16 @@ pub fn stored_auth(host: &HostConfig, secret: Option<&SecretString>) -> Option<A
             (!path.is_empty()).then(|| AuthMethod::key_file(path.to_owned(), None))
         }
         AuthMethodKind::Password => {
+            // A shared credential of the vault wins over the system store: the
+            // host names the record, and the record's password is what every host
+            // that names it uses.
+            if let Some(credential) = host.credential_id()
+                && let Some(body) = vault
+                    .and_then(|vault| vault.credential(credential))
+                    .and_then(|record| record.secret())
+            {
+                return Some(AuthMethod::password(body.expose()));
+            }
             let text = secret?.expose();
             (!text.is_empty()).then(|| AuthMethod::password(text.to_owned()))
         }
@@ -722,9 +768,15 @@ pub fn stored_auth(host: &HostConfig, secret: Option<&SecretString>) -> Option<A
             }
         }
         // An application key's body is the unlocked vault's to hand over, not
-        // something a host record can carry; until that wiring exists the form
-        // has nothing complete to offer and asks instead.
-        AuthMethodKind::ManagedKey => None,
+        // something a host record can carry: complete exactly when the vault is
+        // open and still holds the key the host names.
+        AuthMethodKind::ManagedKey => {
+            let key = host.managed_key_id()?;
+            let body = vault
+                .and_then(|vault| vault.key(key))
+                .and_then(|record| record.private_key())?;
+            Some(AuthMethod::managed_key(SecretString::new(body.expose())))
+        }
     }
 }
 
@@ -1135,7 +1187,7 @@ mod tests {
             .iter()
             .map(|method| method.label(&ENGLISH))
             .collect();
-        assert_eq!(labels.len(), 5);
+        assert_eq!(labels.len(), 6);
         let mut sorted = labels.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -1149,11 +1201,143 @@ mod tests {
         assert!(MethodChoice::KeyFile.needs_key_path());
         assert!(MethodChoice::EncryptedKeyFile.needs_passphrase());
         assert!(!MethodChoice::Agent.needs_key_path());
+        assert!(!MethodChoice::ManagedKey.needs_key_path());
+        assert!(!MethodChoice::ManagedKey.takes_password());
         assert_eq!(
             MethodChoice::Agent.label(&CHINESE),
             CHINESE.auth_agent,
             "the method names are translated"
         );
+        // The vault's method is a chooser entry now, so its words come from the
+        // same translated table as the rest of the page rather than the domain
+        // crate's English label.
+        assert_eq!(
+            MethodChoice::ManagedKey.label(&ENGLISH),
+            crate::app::copy::ENGLISH_SECURITY.method_label
+        );
+    }
+
+    #[test]
+    fn a_managed_key_attempt_takes_the_bodies_the_vault_handed_over() {
+        let mut panel = RemotePanel::new(&host());
+        panel.select_method(MethodChoice::ManagedKey);
+
+        // Without a body handed over, the form refuses in words the reader has,
+        // and the refusal is not a connection failure.
+        let refusal = panel
+            .take_auth(&ENGLISH)
+            .expect_err("no body was handed to the panel");
+        assert!(!refusal.contains("OPENSSH PRIVATE KEY"));
+        assert!(
+            panel.form_error().is_none(),
+            "a form refusal, not a failure"
+        );
+
+        // With the one-time body, the attempt carries exactly that body and the
+        // panel keeps no copy of it.
+        panel.supply_managed_key(SecretString::new(
+            "-----BEGIN OPENSSH PRIVATE KEY-----one-time",
+        ));
+        let auth = panel.take_auth(&ENGLISH).expect("the body builds a method");
+        assert_eq!(auth.kind(), AuthMethodKind::ManagedKey);
+        assert_eq!(
+            auth.private_key().map(|body| body.expose()),
+            Some("-----BEGIN OPENSSH PRIVATE KEY-----one-time")
+        );
+        assert!(
+            !format!("{auth:?}").contains("one-time"),
+            "the body never appears in formatted output"
+        );
+        // The body was handed over once: a second attempt has nothing left, which
+        // is what makes it a one-time body rather than a stored one.
+        assert!(
+            panel.take_auth(&ENGLISH).is_err(),
+            "the one-time body does not survive the attempt it was handed over for"
+        );
+    }
+
+    #[test]
+    fn a_saved_host_signs_in_with_the_body_the_unlocked_vault_holds() {
+        let mut saved = host();
+        saved.set_auth(Some(AuthMethodKind::ManagedKey));
+        let key_id = shellune_core::KeyId::new();
+        saved.set_managed_key_id(Some(key_id));
+
+        // A locked vault, or one without the key the host names, leaves the form
+        // asking.
+        assert!(stored_auth(&saved, None, None).is_none());
+        let without_the_key = shellune_storage::VaultContent::new();
+        assert!(stored_auth(&saved, None, Some(&without_the_key)).is_none());
+
+        // A record that is live hands its body over for this attempt.
+        let mut vault = shellune_storage::VaultContent::new();
+        vault
+            .insert_key(shellune_storage::VaultKeyRecord::new(
+                key_meta(key_id),
+                SecretString::new("-----BEGIN OPENSSH PRIVATE KEY-----stored"),
+            ))
+            .expect("inserts");
+        let auth = stored_auth(&saved, None, Some(&vault))
+            .expect("the unlocked vault completes the attempt");
+        assert_eq!(auth.kind(), AuthMethodKind::ManagedKey);
+        assert_eq!(
+            auth.private_key().map(|body| body.expose()),
+            Some("-----BEGIN OPENSSH PRIVATE KEY-----stored")
+        );
+
+        // A shared credential of the vault wins over an empty typed secret, and a
+        // host without one falls back to the system store's secret as before.
+        let mut shared = host();
+        shared.set_auth(Some(AuthMethodKind::Password));
+        let credential_id = shellune_core::CredentialId::new();
+        shared.set_credential_id(Some(credential_id));
+        let mut with_credential = vault;
+        with_credential
+            .insert_credential(shellune_storage::VaultCredentialRecord::new(
+                credential_meta(credential_id),
+                SecretString::new("vault-shared-password"),
+            ))
+            .expect("inserts");
+        let auth = stored_auth(&shared, None, Some(&with_credential))
+            .expect("the shared credential completes the attempt");
+        assert_eq!(
+            auth.private_key().map(SecretString::expose),
+            None,
+            "a password attempt carries no key body"
+        );
+        // A host that keeps no vault reference behaves exactly as before the
+        // vault existed: nothing without a secret, complete with the remembered
+        // one.
+        let mut plain = host();
+        plain.set_auth(Some(AuthMethodKind::Password));
+        assert!(stored_auth(&plain, None, Some(&with_credential)).is_none());
+        assert!(
+            stored_auth(&plain, Some(&SecretString::new("typed")), None).is_some(),
+            "the system store's secret still completes a password attempt"
+        );
+    }
+
+    /// A live key record of the vault, for the tests above.
+    fn key_meta(id: shellune_core::KeyId) -> shellune_core::ManagedKeyMeta {
+        shellune_core::ManagedKeyMeta::new(
+            id,
+            "Deploy key",
+            "ssh-ed25519",
+            "ssh-ed25519 AAAAdeploy deploy@laptop",
+            "SHA256:deploykeyfingerprint",
+            Some("deploy@laptop".to_owned()),
+            shellune_core::VaultRecordVersion::new(1, "device-a"),
+        )
+    }
+
+    /// A live credential record of the vault, for the tests above.
+    fn credential_meta(id: shellune_core::CredentialId) -> shellune_core::CredentialMeta {
+        shellune_core::CredentialMeta::new(
+            id,
+            "Prod login",
+            Some("deploy".to_owned()),
+            shellune_core::VaultRecordVersion::new(1, "device-a"),
+        )
     }
 
     #[test]

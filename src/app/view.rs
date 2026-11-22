@@ -97,6 +97,7 @@ mod home;
 mod host_dialog;
 mod overlays;
 mod panes;
+pub(crate) mod security;
 mod sessions;
 pub(crate) mod settings;
 mod shell;
@@ -864,6 +865,10 @@ pub struct ShelluneView {
     /// Where remembered passwords and passphrases are kept: the system credential store,
     /// or memory in tests.
     secrets: std::sync::Arc<dyn SecretStore>,
+    /// The settings' keys-and-passwords page and the unlocked vault it keeps
+    /// (R1, ADR-7): every managed key and shared password the window can reach
+    /// lives behind it, and a connection asks it for one body at a time.
+    security: security::SecurityPage,
     /// The command palette's search field, present only while the palette is open.
     palette: Option<Entity<TextField>>,
     /// What the palette's field held when the list was last ranked.
@@ -2609,6 +2614,10 @@ impl ShelluneView {
     /// The work a window starts once every store is loaded, whichever way it was read.
     fn begin_work(&mut self, cx: &mut Context<Self>) {
         self.attach_batch_store();
+        // The vault of this machine is opened once here, so a connection that
+        // signs in with a managed key or a shared password finds it unlocked
+        // without the settings page ever being visited (R1, ADR-7).
+        self.vault_warm(cx);
         // A run the last exit cut off is marked interrupted once, here, and nothing is
         // replayed: the summary and the log say what it had finished, and a retry is
         // the user's own decision from the history (R13).
@@ -2850,6 +2859,7 @@ impl ShelluneView {
             trust_book: HostTrust::new(),
             trust_error: None,
             secrets,
+            security: security::SecurityPage::new(cx),
             files: FileViews::new(),
             transfers: TransferViews::new(),
             forwards: ForwardCenter::new(),
@@ -8963,8 +8973,9 @@ impl ShelluneView {
                 panel.set_passphrase(passphrase);
             }
             MethodChoice::Agent => {}
-            // No quick form can choose an application key yet; there is nothing
-            // to prefill until the vault wiring lands.
+            // The quick form offers no application key: a host that does not
+            // exist yet cannot name a vault record, so the choice is made in
+            // the host editor or the security page (ADR-7).
             MethodChoice::ManagedKey => {}
         }
         self.chain = Some(ChainDraft::single(host.clone()));
@@ -9174,6 +9185,18 @@ impl ShelluneView {
         {
             return true;
         }
+        // A vault sign-in needs no typed field: the unlocked vault hands the
+        // panel the one-time body the attempt will sign with, and the panel
+        // consumes it with the attempt (R1, ADR-1).
+        if self
+            .remote
+            .as_ref()
+            .is_some_and(|panel| panel.method() == remote::MethodChoice::ManagedKey)
+            && !self.supply_managed_body(&host)
+        {
+            cx.notify();
+            return false;
+        }
         let strings = self.workspace.strings();
         let auth = match self.remote.as_mut().map(|panel| panel.take_auth(strings)) {
             Some(Ok(auth)) => auth,
@@ -9234,11 +9257,57 @@ impl ShelluneView {
         }
     }
 
+    /// Hands the open panel the one-time private key body of a vault sign-in.
+    ///
+    /// Returns false when the vault cannot hand the key over - locked, or the
+    /// record is gone - and says so in the form, which is the one place a
+    /// connection answers from.
+    fn supply_managed_body(&mut self, host: &HostConfig) -> bool {
+        let body = host.managed_key_id().and_then(|key| {
+            self.security
+                .content()
+                .and_then(|vault| vault.key(key))
+                .and_then(|record| record.private_key())
+                .cloned()
+        });
+        match body {
+            Some(body) => {
+                if let Some(panel) = self.remote.as_mut() {
+                    panel.supply_managed_key(body);
+                }
+                true
+            }
+            None => {
+                if let Some(panel) = self.remote.as_mut() {
+                    panel.set_form_error(
+                        crate::app::copy::security_for(self.workspace.locale())
+                            .managed_missing
+                            .to_owned(),
+                    );
+                }
+                false
+            }
+        }
+    }
+
     /// The remembered secret, or an error when the store cannot be read.
+    ///
+    /// A host that names a shared credential of the vault reads the password
+    /// from there, which is the one place a shared password lives; the system
+    /// store is only asked for the secrets it has always kept.
     fn saved_secret(
         &self,
         host: &HostConfig,
     ) -> Result<Option<shellune_core::SecretString>, String> {
+        if let Some(credential) = host.credential_id()
+            && let Some(body) = self
+                .security
+                .content()
+                .and_then(|vault| vault.credential(credential))
+                .and_then(|record| record.secret())
+        {
+            return Ok(Some(body.clone()));
+        }
         if !host.remembers_secret() {
             return Ok(None);
         }
@@ -9258,7 +9327,7 @@ impl ShelluneView {
         secret: Option<&shellune_core::SecretString>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if remote::stored_auth(host, secret).is_none() {
+        if remote::stored_auth(host, secret, self.security.content()).is_none() {
             return false;
         }
         let shown = self
@@ -9285,13 +9354,20 @@ impl ShelluneView {
         }
         let known = remote::known_host_key(&self.trust_book, host);
         let auth = if shown {
+            // The vault's sign-in needs its one-time body handed to the panel
+            // before the form can build the attempt's credentials.
+            if host.auth() == Some(shellune_core::AuthMethodKind::ManagedKey)
+                && !self.supply_managed_body(host)
+            {
+                return false;
+            }
             let strings = self.workspace.strings();
             match self.remote.as_mut().map(|panel| panel.take_auth(strings)) {
                 Some(Ok(auth)) => auth,
                 _ => return false,
             }
         } else {
-            match remote::stored_auth(host, secret) {
+            match remote::stored_auth(host, secret, self.security.content()) {
                 Some(auth) => auth,
                 None => return false,
             }
@@ -10513,8 +10589,8 @@ impl ShelluneView {
                 panel.password().is_empty()
             }
             remote::MethodChoice::EncryptedKeyFile => panel.passphrase().is_empty(),
-            // An application key reads no field the form could refill, and no
-            // panel can be on that choice until the vault wiring lands.
+            // An application key reads no field the form could refill: its
+            // body comes from the vault at the moment the attempt starts.
             remote::MethodChoice::KeyFile
             | remote::MethodChoice::Agent
             | remote::MethodChoice::ManagedKey => false,
@@ -10966,7 +11042,13 @@ impl ShelluneView {
             );
         let method = self.quick_method;
         let mut methods = components::segmented(metrics);
-        for choice in MethodChoice::ALL {
+        // The quick form describes a host that does not exist yet, so the vault
+        // has no record for it to name: the application key is chosen in the
+        // host editor or the security page, where a key can be picked (ADR-7).
+        for choice in MethodChoice::ALL
+            .into_iter()
+            .filter(|choice| *choice != MethodChoice::ManagedKey)
+        {
             let selected = choice == method;
             let selector = quick_method_selector(choice);
             methods = methods.child(
@@ -11514,6 +11596,24 @@ impl ShelluneView {
         }
         form = form.child(div().flex().child(methods));
         form = form.child(caption_line(method.hint(strings).to_owned(), metrics));
+
+        // The vault's method names the key that will sign: the reader checks a
+        // name and a fingerprint, not a path they would have to trust (R1).
+        if method == MethodChoice::ManagedKey {
+            let security = crate::app::copy::security_for(self.workspace.locale());
+            let named = panel
+                .host()
+                .managed_key_id()
+                .and_then(|key| self.security.content().and_then(|vault| vault.key(key)))
+                .map(|entry| format!("{} · {}", entry.meta().name(), entry.meta().fingerprint()));
+            let line = match named {
+                Some(named) => copy::fill(security.managed_chosen, &[("name", &named)]),
+                None => security.method_none.to_owned(),
+            };
+            form = form.child(
+                caption_line(line, metrics).debug_selector(|| "remote.managed.key".to_owned()),
+            );
+        }
 
         if method.takes_password() {
             form = form.child(self.remote_field(
@@ -20755,6 +20855,7 @@ impl Render for ShelluneView {
             self.host_delete_overlay(window, cx),
             self.host_batch_delete_overlay(window, cx),
             self.backup_overlay(window, cx),
+            self.security_overlay(window, cx),
             self.sync_overlay(window, cx),
             self.update_overlay(window, cx),
             self.custom_shell_overlay(window, cx),

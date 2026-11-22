@@ -22,9 +22,9 @@
 use std::collections::BTreeSet;
 
 use shellune_core::{
-    AuthMethodKind, ConnectionDefaults, ConnectionRecord, ConnectionValueError,
+    AuthMethodKind, ConnectionDefaults, ConnectionRecord, ConnectionValueError, CredentialId,
     DEFAULT_KEEPALIVE_INTERVAL_SECS, GroupBook, GroupPath, HostConfig, HostConnection, HostId,
-    MAX_CONNECT_TIMEOUT_SECS, MAX_KEEPALIVE_INTERVAL_SECS, MAX_KEEPALIVE_MAX_MISSES, Port,
+    KeyId, MAX_CONNECT_TIMEOUT_SECS, MAX_KEEPALIVE_INTERVAL_SECS, MAX_KEEPALIVE_MAX_MISSES, Port,
     ProtocolKind, RdpCertificatePolicy, RdpConfig, SerialConfig, SerialFlow, SerialParity,
     SerialStopBits, TransferProtocol, VncConfig, VncSecurity, X11Forwarding,
 };
@@ -745,6 +745,17 @@ pub struct HostDraft {
     identity: String,
     /// How the host signs in.
     auth: AuthMethodKind,
+    /// The vault key the host signs in with, when the method is the vault's.
+    ///
+    /// Kept as the stable identifier only: the key body stays in the vault and is
+    /// read for one attempt at a time. A method change that cannot read it drops
+    /// the reference, exactly as the host record does.
+    managed_key: Option<KeyId>,
+    /// The shared vault credential the host signs in with, when it uses one.
+    ///
+    /// A credential here wins over a typed or remembered password: the host names
+    /// the record, and every host that names it shares the one password.
+    credential: Option<CredentialId>,
     /// Whether the password or passphrase is kept in the system credential store.
     remember: bool,
     /// Whether the store already holds one for this host, so an empty field keeps it.
@@ -789,6 +800,8 @@ impl HostDraft {
             // A new host signs in the way most servers expect without being told: the
             // agent, the usual keys, then a password if one is typed.
             auth: AuthMethodKind::Auto,
+            managed_key: None,
+            credential: None,
             remember: true,
             has_saved_secret: false,
             secret: String::new(),
@@ -827,6 +840,10 @@ impl HostDraft {
             } else {
                 AuthMethodKind::Password
             }),
+            // A host that names a vault record keeps naming it: the reference is
+            // the stable part, not the secret behind it.
+            managed_key: host.managed_key_id(),
+            credential: host.credential_id(),
             remember: host.remembers_secret() || host.auth().is_none(),
             has_saved_secret: host.remembers_secret(),
             secret: String::new(),
@@ -896,6 +913,54 @@ impl HostDraft {
     pub fn set_auth(&mut self, auth: AuthMethodKind) -> bool {
         let changed = self.auth != auth;
         self.auth = auth;
+        if changed {
+            // The same clearing rule the host record itself applies: a method that
+            // cannot read a reference does not keep it (ADR-1).
+            if auth != AuthMethodKind::ManagedKey {
+                self.managed_key = None;
+            }
+            if auth != AuthMethodKind::Password {
+                self.credential = None;
+            }
+        }
+        changed
+    }
+
+    /// The vault key this host signs in with, when the method is the vault's.
+    #[must_use]
+    pub fn managed_key_id(&self) -> Option<KeyId> {
+        (self.auth == AuthMethodKind::ManagedKey)
+            .then_some(self.managed_key)
+            .flatten()
+    }
+
+    /// Chooses the vault key this host signs in with. Ignored for any method but
+    /// the vault's, so a stale choice cannot survive a method change.
+    pub fn set_managed_key(&mut self, id: Option<KeyId>) -> bool {
+        if self.auth != AuthMethodKind::ManagedKey {
+            return false;
+        }
+        let changed = self.managed_key != id;
+        self.managed_key = id;
+        changed
+    }
+
+    /// The shared vault credential this host signs in with, when it uses one.
+    #[must_use]
+    pub fn credential_id(&self) -> Option<CredentialId> {
+        (self.auth == AuthMethodKind::Password)
+            .then_some(self.credential)
+            .flatten()
+    }
+
+    /// Chooses the shared vault credential this host signs in with. Ignored for
+    /// any method but the password one.
+    pub fn set_credential(&mut self, id: Option<CredentialId>) -> bool {
+        if self.auth != AuthMethodKind::Password {
+            return false;
+        }
+        let changed = self.credential != id;
+        self.credential = id;
         changed
     }
 
@@ -916,9 +981,13 @@ impl HostDraft {
     }
 
     /// Whether the chosen method reads a password or a passphrase.
+    ///
+    /// A shared credential of the vault is not a gap in the form: the vault holds
+    /// the password, so nothing is asked for and nothing is remembered in the
+    /// system store.
     #[must_use]
     pub fn needs_secret(&self) -> bool {
-        self.auth.needs_password()
+        (self.auth.needs_password() && self.credential.is_none())
             || self.auth.needs_passphrase()
             || self.auth == AuthMethodKind::Auto
     }
@@ -1275,7 +1344,15 @@ impl HostDraft {
 
     /// Writes the sign-in choice and the startup command into a record.
     fn apply_sign_in(&self, host: &mut HostConfig) {
+        // The references are written after the method: `set_auth` clears the ones
+        // the method cannot read, and only a method that can read one gets it back.
         host.set_auth(Some(self.auth));
+        if self.auth == AuthMethodKind::ManagedKey {
+            host.set_managed_key_id(self.managed_key);
+        }
+        if self.auth == AuthMethodKind::Password {
+            host.set_credential_id(self.credential);
+        }
         host.set_remember_secret(self.keeps_secret());
         host.set_startup_command(Some(self.startup.clone()));
     }

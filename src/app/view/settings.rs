@@ -67,6 +67,9 @@ pub(super) enum Category {
     Terminal,
     /// The policy every connection is dialled with.
     Connection,
+    /// The keys and passwords of the vault, and (later) its trust and lock
+    /// pages (R1, ADR-7).
+    Security,
     /// The two background reminders.
     Notices,
     /// The action catalogue and the keys in force.
@@ -92,6 +95,7 @@ pub(crate) enum Item {
     DefaultShell,
     Highlight,
     Policy,
+    KeysAndPassword,
     BellNotice,
     FinishedNotice,
     Shortcuts,
@@ -119,6 +123,7 @@ const TERMINAL: [Item; 4] = [
     Item::Highlight,
 ];
 const CONNECTION: [Item; 1] = [Item::Policy];
+const SECURITY: [Item; 1] = [Item::KeysAndPassword];
 const NOTICES: [Item; 2] = [Item::BellNotice, Item::FinishedNotice];
 const KEYS: [Item; 1] = [Item::Shortcuts];
 const DATA: [Item; 4] = [
@@ -132,10 +137,11 @@ const ABOUT: [Item; 2] = [Item::Version, Item::Update];
 
 impl Category {
     /// Every category, in the order the navigation lists them.
-    pub(super) const ALL: [Self; 8] = [
+    pub(super) const ALL: [Self; 9] = [
         Self::Appearance,
         Self::Terminal,
         Self::Connection,
+        Self::Security,
         Self::Notices,
         Self::Keys,
         Self::Data,
@@ -149,6 +155,7 @@ impl Category {
             Self::Appearance => "appearance",
             Self::Terminal => "terminal",
             Self::Connection => "connection",
+            Self::Security => "security",
             Self::Notices => "notices",
             Self::Keys => "keys",
             Self::Data => "data",
@@ -163,6 +170,7 @@ impl Category {
             Self::Appearance => Icon::Sun,
             Self::Terminal => Icon::Terminal,
             Self::Connection => Icon::Plug,
+            Self::Security => Icon::Lock,
             Self::Notices => Icon::Clock,
             Self::Keys => Icon::Key,
             Self::Data => Icon::Folder,
@@ -185,6 +193,7 @@ impl Category {
             Self::Appearance => &APPEARANCE,
             Self::Terminal => &TERMINAL,
             Self::Connection => &CONNECTION,
+            Self::Security => &SECURITY,
             Self::Notices => &NOTICES,
             Self::Keys => &KEYS,
             Self::Data => &DATA,
@@ -200,6 +209,7 @@ impl Category {
             Self::Appearance => ux.settings_appearance,
             Self::Terminal => ux.settings_terminal,
             Self::Connection => ux.settings_connection,
+            Self::Security => copy::security_for(locale).settings_category,
             Self::Notices => ux.settings_notices,
             Self::Keys => ux.settings_keys,
             Self::Data => ux.settings_data,
@@ -220,6 +230,7 @@ impl Item {
                 Category::Terminal
             }
             Self::Policy => Category::Connection,
+            Self::KeysAndPassword => Category::Security,
             Self::BellNotice | Self::FinishedNotice => Category::Notices,
             Self::Shortcuts => Category::Keys,
             Self::HostsFile | Self::Import | Self::ExportBackup | Self::ImportBackup => {
@@ -235,7 +246,7 @@ impl Item {
     pub(super) fn own_page(self) -> bool {
         matches!(
             self,
-            Self::Shortcuts | Self::Policy | Self::Sync | Self::Update
+            Self::Shortcuts | Self::Policy | Self::Sync | Self::Update | Self::KeysAndPassword
         )
     }
 
@@ -252,6 +263,7 @@ impl Item {
             Self::DefaultShell => "default-shell",
             Self::Highlight => "highlight",
             Self::Policy => "policy",
+            Self::KeysAndPassword => "keys-and-passwords",
             Self::BellNotice => "bell-notice",
             Self::FinishedNotice => "finished-notice",
             Self::Shortcuts => "keys",
@@ -279,6 +291,7 @@ impl Item {
             Self::DefaultShell => ux.settings_default_shell,
             Self::Highlight => ux.settings_highlight,
             Self::Policy => ux.settings_connection_policy,
+            Self::KeysAndPassword => copy::security_for(locale).settings_item,
             Self::BellNotice => ux.settings_bell_notice,
             Self::FinishedNotice => ux.settings_finished_notice,
             Self::Shortcuts => ux.settings_keys,
@@ -306,6 +319,7 @@ impl Item {
             Self::DefaultShell => ux.settings_default_shell_hint,
             Self::Highlight => ux.settings_highlight_hint,
             Self::Policy => ux.settings_connection_hint,
+            Self::KeysAndPassword => copy::security_for(locale).settings_hint,
             Self::BellNotice => ux.settings_bell_notice_hint,
             Self::FinishedNotice => ux.settings_finished_notice_hint,
             Self::Shortcuts => ux.settings_keys_hint,
@@ -328,7 +342,7 @@ impl Item {
 /// page rather than to the keymap: it narrows what is listed and changes no binding.
 pub(super) struct SettingsNav {
     category: Category,
-    item: [usize; 8],
+    item: [usize; 9],
     scope: Option<keymap::Context>,
     /// Whether the category column has the keyboard.
     ///
@@ -343,7 +357,7 @@ impl SettingsNav {
     pub(super) fn new() -> Self {
         Self {
             category: Category::Appearance,
-            item: [0; 8],
+            item: [0; 9],
             scope: None,
             nav_focus: false,
         }
@@ -892,6 +906,7 @@ impl ShelluneView {
         match item {
             Item::Shortcuts => self.settings_keys_page(cx),
             Item::Policy => self.settings_connection_page(cx),
+            Item::KeysAndPassword => self.security_page(cx),
             Item::Sync => self.sync_settings_page(cx),
             Item::Update => self.update_settings_page(cx),
             _ => self.settings_item_row(item, cx),
@@ -1063,6 +1078,7 @@ impl ShelluneView {
             // These have a page of their own, and a page is never built as one row.
             Item::Shortcuts
             | Item::Policy
+            | Item::KeysAndPassword
             | Item::Sync
             | Item::Update
             | Item::HostsFile

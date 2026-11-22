@@ -5703,6 +5703,282 @@ pub fn startup_for(locale: Locale) -> &'static StartupStrings {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Keys and passwords of the vault (R1, ADR-7)
+// ---------------------------------------------------------------------------
+
+/// Declares [`SecurityStrings`] and its two tables from one list, so a phrase cannot
+/// be added in one language and forgotten in the other.
+macro_rules! security_strings {
+    ($($(#[doc = $doc:literal])* $field:ident: $en:literal, $zh:literal;)*) => {
+        /// Strings of the settings' "keys and passwords" page and its dialogs.
+        pub struct SecurityStrings {
+            $($(#[doc = $doc])* pub $field: &'static str,)*
+        }
+
+        impl SecurityStrings {
+            /// Every string of the table, in declaration order, for the completeness
+            /// test.
+            #[must_use]
+            #[cfg_attr(not(test), allow(dead_code))]
+            pub fn all(&self) -> Vec<&'static str> {
+                vec![$(self.$field),*]
+            }
+        }
+
+        /// The security strings in English.
+        pub static ENGLISH_SECURITY: SecurityStrings = SecurityStrings { $($field: $en,)* };
+        /// The security strings in Chinese.
+        pub static CHINESE_SECURITY: SecurityStrings = SecurityStrings { $($field: $zh,)* };
+    };
+}
+
+security_strings! {
+    /// Settings category: keys, passwords and (later) trust and biometrics
+    settings_category: "Security", "安全";
+    /// The one page of the category this build draws
+    settings_item: "Keys & passwords", "密钥与密码";
+    /// Under the page's name
+    settings_hint: "The SSH keys and connection passwords this app keeps in its own vault",
+        "管理应用自身保险库保存的 SSH 密钥与连接密码";
+    /// Sign-in method chooser entry
+    method_label: "Application key", "应用密钥";
+    /// Under the chooser entry
+    method_hint: "Signs in with a private key kept in this app's vault; no key file is read",
+        "使用应用保险库中的私钥登录，不再读取密钥文件";
+    /// The connection form, when the method is chosen and the vault holds no key yet
+    method_none: "The vault holds no application key yet. Import or generate one in Settings.",
+        "保险库中还没有应用密钥，请先在设置中导入或生成。";
+    /// The connection form, when the key the host names cannot be handed over
+    managed_missing: "The vault cannot hand this key over. Open the keys page and check the vault.",
+        "保险库无法提供这把密钥，请到密钥页检查保险库。";
+    /// The connection form, naming the key that will sign
+    managed_chosen: "Signing in with: {name}", "登录密钥：{name}";
+    /// Search field placeholder of the page
+    search_placeholder: "Search by name, user, algorithm, fingerprint or host",
+        "按名称、用户名、算法、指纹或主机搜索";
+    /// Section heading
+    keys_title: "SSH keys", "SSH 密钥";
+    /// Section heading
+    credentials_title: "Passwords", "密码";
+    /// No key is in the vault
+    empty_keys: "No key is in the vault yet.", "保险库中还没有密钥。";
+    /// No password is in the vault
+    empty_credentials: "No password is in the vault yet.", "保险库中还没有密码。";
+    /// Nothing matches the search
+    no_match: "No record matches the search.", "没有匹配的记录。";
+    /// Chip of a key row
+    kind_key: "SSH key", "SSH 密钥";
+    /// Chip of a password row
+    kind_credential: "Password", "密码";
+    /// How many connections reference a record
+    hosts_count: "{count} connections", "{count} 个连接";
+    /// A record no connection references
+    not_referenced: "Not used by a connection", "未被连接使用";
+    /// Created caption
+    created: "Created {date}", "创建于 {date}";
+    /// Changed caption
+    changed: "Changed {date}", "修改于 {date}";
+    /// Button: import a private key
+    import_key: "Import key…", "导入密钥…";
+    /// Button: generate a key
+    generate_key: "Generate key…", "生成密钥…";
+    /// Button: new shared password
+    new_password: "New password…", "新建密码…";
+    /// Dialog button
+    cancel: "Cancel", "取消";
+    /// Dialog button
+    save: "Save", "保存";
+    /// Dialog button
+    close: "Close", "关闭";
+    /// Detail button
+    edit: "Edit", "编辑";
+    /// The copy control of one value a person copies elsewhere
+    copy_value: "Copy", "复制";
+    /// Detail button of a referenced record, per host
+    unbind: "Unbind", "解绑";
+    /// Detail button: a copy of a shared password with its own identity
+    duplicate: "Independent copy", "独立副本";
+    /// Detail button
+    delete: "Delete", "删除";
+    /// Detail button
+    rotate: "Rotate…", "轮换…";
+    /// Password reveal toggle
+    show: "Show", "显示";
+    /// Password hide toggle
+    hide: "Hide", "隐藏";
+    /// Detail label
+    label_algorithm: "Algorithm", "算法";
+    /// Detail label
+    label_fingerprint: "Fingerprint", "指纹";
+    /// Detail label
+    label_public_key: "Public key (authorized_keys)", "公钥（authorized_keys）";
+    /// Detail label
+    label_comment: "Comment", "注释";
+    /// Detail label
+    label_user: "User", "用户名";
+    /// Detail label
+    label_password: "Password", "密码";
+    /// Detail heading: the connections that reference this record
+    referenced_by: "Used by", "使用的连接";
+    /// Under the lists: the rule about secrets
+    secrets_hidden: "Secrets stay hidden by default; show or copy one at a time.",
+        "秘密默认不展示，可按需单独显示或复制。";
+    /// Page line while a vault task runs on the background executor
+    busy: "Working…", "处理中…";
+    /// Notice prefix when the vault could not be opened or written
+    vault_failed: "The vault could not be opened", "无法打开保险库";
+    /// Notice prefix when a write was refused
+    vault_refused: "The vault refused the change", "保险库拒绝了本次修改";
+    /// Import dialog title
+    import_title: "Import a private key", "导入私钥";
+    /// Import dialog intro
+    import_intro: "The key is re-protected by this app's vault. The original file is not changed, moved or read again.",
+        "密钥导入后由应用保险库重新保护。原文件不会被修改、移动或再次读取。";
+    /// Import field
+    import_pem: "OpenSSH private key text", "OpenSSH 私钥内容";
+    /// Import field
+    import_passphrase: "Key passphrase, when it has one", "密钥口令（如有）";
+    /// Import field
+    import_name: "Name", "名称";
+    /// Import refusal: nothing typed
+    import_missing: "Paste the private key text and give it a name.", "请粘贴私钥内容并填写名称。";
+    /// Import refusal: same public key again, naming the record that holds it
+    import_duplicate: "A key with this public key is already in the vault: {name}",
+        "保险库中已有相同公钥的密钥：{name}";
+    /// Import refusal: RSA below the floor this build accepts
+    import_rsa_weak: "An RSA key of {bits} bits is too weak to import; 2048 is the least this build accepts.",
+        "{bits} 位的 RSA 密钥过弱，不予导入；本应用最低接受 2048 位。";
+    /// Import notice: allowed, but weaker than what this build generates
+    import_rsa_small: "The RSA key is {bits} bits, below the 3072 this build generates; replacing it is worth planning.",
+        "这把 RSA 密钥为 {bits} 位，低于本应用生成密钥的 3072 位，建议计划更换。";
+    /// Generate dialog title
+    generate_title: "Generate a key", "生成密钥";
+    /// Generate field
+    generate_name: "Name", "名称";
+    /// Generate field
+    generate_comment: "Comment (optional)", "注释（可选）";
+    /// Refusal: no name
+    name_required: "A name is required.", "名称不能为空。";
+    /// Edit key dialog title
+    edit_key_title: "Edit key details", "编辑密钥信息";
+    /// Edit key dialog note
+    edit_key_note: "Renaming changes neither the key material nor its fingerprint.",
+        "重命名不会改变密钥本体和指纹。";
+    /// Export dialog title
+    export_title: "Export private key", "导出私钥";
+    /// Export dialog intro
+    export_intro: "The export passphrase protects this one file and is never saved. It is not the WebDAV password and not a sync passphrase.",
+        "导出口令只保护这一个文件，不会被保存。它不是 WebDAV 密码，也不是同步口令。";
+    /// Export field
+    export_passphrase: "Export passphrase", "导出口令";
+    /// Export field
+    export_confirm: "Confirm passphrase", "确认口令";
+    /// Export checkbox: no passphrase at all
+    export_plain: "Export without a passphrase (plain text)", "不加口令导出（明文）";
+    /// The risk sentence a plain export shows
+    export_plain_risk: "A plain export holds the private key unencrypted. Anyone who can read the file can use the key.",
+        "明文导出的私钥不含加密。任何能读到该文件的人都可以使用这把密钥。";
+    /// The second, explicit confirmation of a plain export
+    export_plain_confirm: "I understand the risk and want a plain file", "我理解风险，确认导出明文";
+    /// Export refusal: passphrase missing or mismatching
+    export_passphrase_required: "Type the export passphrase the same way twice.", "请输入两次一致的导出口令。";
+    /// Export refusal: the two differ
+    export_mismatch: "The two passphrases are not the same", "两次输入的口令不一致";
+    /// Export primary button
+    export_choose: "Choose where to save…", "选择保存位置…";
+    /// Export finished
+    export_done: "Private key exported", "私钥已导出";
+    /// Where the export went
+    export_done_path: "Saved to {path}", "已保存到 {path}";
+    /// Export failed
+    export_failed: "The private key could not be exported", "私钥导出失败";
+    /// Rotate dialog title
+    rotate_title: "Rotate a key", "轮换密钥";
+    /// Rotate dialog intro
+    rotate_intro: "The chosen connections move to a newly generated key. Deploy the new public key on the servers yourself; this app does not change any server.",
+        "所选连接将迁移到新生成的密钥。新公钥需要你自行部署到服务器，此操作不会改动任何服务器。";
+    /// Rotate field
+    rotate_new_name: "New key name", "新密钥名称";
+    /// Rotate heading
+    rotate_hosts: "Connections to move", "要迁移的连接";
+    /// Rotate checkbox
+    rotate_retire: "Delete the old key once nothing uses it", "旧密钥不再被使用后删除";
+    /// Under the unchecked retire box
+    rotate_keep_hint: "The old key is kept until you delete it yourself.", "旧密钥会保留，直到你自行删除。";
+    /// Rotate refusal
+    rotate_none: "Choose at least one connection to move.", "请至少选择一个要迁移的连接。";
+    /// Rotate finished
+    rotate_done: "{count} connections moved to the new key", "{count} 个连接已迁移到新密钥";
+    /// Rotate result heading
+    rotate_public: "New public key - deploy it on the servers", "新公钥——请部署到服务器";
+    /// Delete key dialog title
+    delete_key_title: "Delete a key", "删除密钥";
+    /// Delete key dialog: the connections that will lose their sign-in
+    delete_affected: "These connections sign in with it and will have to choose a way again:",
+        "以下连接正在使用它，删除后需要重新选择登录方式：";
+    /// Delete password dialog title
+    delete_credential_title: "Delete a password", "删除密码";
+    /// Delete finished (a key)
+    delete_key_done: "Key deleted", "密钥已删除";
+    /// Delete finished (a password)
+    delete_credential_done: "Password deleted", "密码已删除";
+    /// A record no connection references
+    delete_none_affected: "No connection uses it.", "没有连接使用它。";
+    /// New password dialog title
+    new_credential_title: "New password", "新建密码";
+    /// Field
+    credential_name: "Name", "名称";
+    /// Field
+    credential_user: "User (optional)", "用户名（可选）";
+    /// Field
+    credential_password: "Password", "密码";
+    /// Button: fill the field with a generated value
+    generate_password: "Generate", "生成";
+    /// Charset checkbox
+    charset_letters: "Letters a-z A-Z", "字母 a-z A-Z";
+    /// Charset checkbox
+    charset_digits: "Digits 0-9", "数字 0-9";
+    /// Charset checkbox
+    charset_symbols: "Symbols", "符号";
+    /// Length field label
+    password_length: "Length", "长度";
+    /// Refusal: neither typed nor generated
+    password_missing: "Type a password or generate one.", "请输入或生成密码。";
+    /// Edit password dialog title
+    edit_credential_title: "Edit password", "编辑密码";
+    /// Edit password field: empty keeps the current value
+    edit_credential_password: "New password (empty keeps the current one)", "新密码（留空保持不变）";
+    /// A saved password edit reached every referencing connection
+    credential_edited: "Saved. Every connection that shares this password now uses the new value.",
+        "已保存。共享此密码的所有连接即使用新值。";
+    /// A password record was created
+    credential_created: "Password saved", "密码已保存";
+    /// An independent copy was created
+    credential_duplicated: "Independent copy created; it changes on its own from here on.",
+        "已创建独立副本，此后它单独变化。";
+    /// One host was unbound
+    unbind_done: "Unbound from {host}", "已解除与 {host} 的绑定";
+    /// A key record was saved (create, generate or metadata edit)
+    key_saved: "Key saved", "密钥已保存";
+    /// Hint under the host editor's key picker
+    host_key_pick: "The key this host signs in with", "此主机使用的登录密钥";
+    /// Hint under the host editor's shared-password picker
+    host_credential_pick: "Use a password from the vault instead of typing one",
+        "使用保险库中的共享密码，不再手动输入";
+    /// Host editor: stop using a vault password
+    host_credential_clear: "Type a password instead", "改为手动输入密码";
+}
+
+/// The security strings of one language.
+#[must_use]
+pub fn security_for(locale: Locale) -> &'static SecurityStrings {
+    match locale {
+        Locale::English => &ENGLISH_SECURITY,
+        Locale::Chinese => &CHINESE_SECURITY,
+    }
+}
+
 /// Why a shortcut command cannot be saved, in a language.
 ///
 /// The domain crate words its refusals in English so they stay language-neutral; the
@@ -5858,6 +6134,20 @@ mod ux_tests {
                 "{date}",
                 "{reason}",
             ] {
+                assert_eq!(en.contains(name), zh.contains(name), "{en} / {zh}: {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn both_security_tables_are_complete_and_translated() {
+        let english = ENGLISH_SECURITY.all();
+        let chinese = CHINESE_SECURITY.all();
+        assert_eq!(english.len(), chinese.len());
+        for (en, zh) in english.iter().zip(chinese.iter()) {
+            assert!(!en.trim().is_empty() && !zh.trim().is_empty());
+            assert_ne!(en, zh, "{en} is not translated");
+            for name in ["{name}", "{count}", "{path}", "{host}", "{bits}", "{date}"] {
                 assert_eq!(en.contains(name), zh.contains(name), "{en} / {zh}: {name}");
             }
         }
