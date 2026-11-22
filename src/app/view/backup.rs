@@ -32,6 +32,7 @@ use shellune_storage::{
 };
 
 use super::ShelluneView;
+use super::security::SecurityPending;
 use super::shell::ModalContent;
 use crate::app::components::{self, Variant};
 use crate::app::copy::{self, BackupStrings};
@@ -483,6 +484,22 @@ impl ShelluneView {
         if refused {
             return;
         }
+        // A backup that carries the whole vault is every secret leaving the
+        // machine at once, so it goes through the same always-verify gate a
+        // private-key export does - whatever the policy, and before the file
+        // chooser opens, so a cancelled or refused verification leaves no
+        // file behind (R3, R9, P1-1). The grant is one passage: the resumed
+        // chooser does not ask for the pass it just got.
+        let carries_vault = self.backup.as_ref().is_some_and(
+            |dialog| matches!(dialog, BackupDialog::Export(dialog) if dialog.include_vault),
+        );
+        if carries_vault
+            && !self.security.operation_granted
+            && self.security_begin_always(vec![SecurityPending::BackupVaultExport], cx)
+        {
+            return;
+        }
+        self.security.operation_granted = false;
         if let Some(BackupDialog::Export(dialog)) = self.backup.as_mut() {
             dialog.choosing = true;
         }

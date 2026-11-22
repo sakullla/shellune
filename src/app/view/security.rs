@@ -32,9 +32,9 @@ use shellune_core::{
 use shellune_ssh::keys as keys_api;
 use shellune_storage::{
     AppSecret, BiometricAuthenticator, BiometricCapability, BiometricError, HostKey, HostReference,
-    KdfParams, LockPolicy, PassphrasePurpose, SecretStore, SecuritySettings, SecurityStore,
-    SystemAuthenticator, TrustEntry, UnsealSource, VaultContent, VaultCredentialRecord,
-    VaultKeyRecord, VaultStore, VaultStoreError, VerificationPrompt,
+    KdfParams, LocalOnlyFallback, LockPolicy, PassphrasePurpose, SecretStore, SecuritySettings,
+    SecurityStore, SystemAuthenticator, TrustEntry, UnsealSource, VaultContent,
+    VaultCredentialRecord, VaultKeyRecord, VaultStore, VaultStoreError, VerificationPrompt,
 };
 
 use super::ShelluneView;
@@ -194,6 +194,9 @@ pub(crate) enum SecurityPending {
     Desktop(shellune_core::SessionId),
     /// Write the private-key export the open dialog has chosen a path for.
     ExportKey,
+    /// Start the backup export whose vault checkbox is on, after its fresh
+    /// verification (the whole vault would otherwise leave the machine).
+    BackupVaultExport,
     /// Turn the biometric switch on, after one fresh verification.
     EnableBiometric,
     /// Turn the biometric switch off, after one fresh verification.
@@ -219,14 +222,30 @@ impl VaultLock {
         }
     }
 
-    /// Whether the user turned biometric unlocking on for this machine and
-    /// chose a policy that re-locks. Everything the lock does - the start-up
-    /// lock, the idle timer, the per-operation gate - hangs off this one
-    /// answer, because without it there is no system prompt to ask and the
-    /// local unseal secret of the OS credential store is the whole protection
-    /// (R3: nobody is forced to set a password for daily local use).
+    /// Whether the user turned biometric unlocking on for this machine,
+    /// chose a policy that re-locks, and the system still offers a
+    /// verification to ask for. Everything the lock does - the start-up lock,
+    /// the idle timer, the per-operation gate - hangs off this one answer.
+    ///
+    /// The capability is part of it on purpose (P1-2): a machine whose system
+    /// has nothing this app can call - the sensor vanished, the service is
+    /// gone - must never start locked behind a prompt that cannot be raised;
+    /// the unlocked session is the whole protection it has (R3, R4, and
+    /// `LocalOnlyFallback` in the storage layer). The query is silent, so
+    /// asking it here never surprises anyone.
     fn engaged(&self) -> bool {
-        self.settings.biometric_unlock == Some(true) && !self.settings.policy.is_disabled()
+        self.settings.biometric_unlock == Some(true)
+            && !self.settings.policy.is_disabled()
+            && self.authenticator.capability().can_verify_user()
+    }
+
+    /// Whether the biometric switch is on in the shape that has no system
+    /// verification behind it: enabled on the unlocked session after an
+    /// explicit risk confirmation, and never auto-locked by start-up or idle
+    /// (`LocalOnlyFallback::UnlockedSessionWithConfirmation`, R4).
+    fn session_only(&self) -> bool {
+        self.settings.biometric_unlock == Some(true)
+            && !self.authenticator.capability().can_verify_user()
     }
 
     /// Whether every sensitive operation verifies afresh, however long the
@@ -377,6 +396,11 @@ pub(crate) enum SecurityDialog {
         /// The server port.
         port: u16,
     },
+    /// The explicit risk confirmation behind enabling the biometric switch on
+    /// a machine whose system offers no verification this app can call: the
+    /// unlocked session is then the whole protection, and the page says so in
+    /// exactly those words (R4, `LocalOnlyFallback`).
+    BiometricRisk,
 }
 
 impl SecurityPage {
@@ -1125,13 +1149,16 @@ impl ShelluneView {
             "",
             div().debug_selector(|| "security.lock.status".to_owned()),
         );
+        // "Lock now" is only offered where something can unlock it again: a
+        // machine whose system has no verification to ask would turn the
+        // button into a one-way door (R4, P1-2).
         let action = if lock.locked && !lock.verifying {
             Some((
                 "security.lock.unlock",
                 strings.lock_unlock,
                 Variant::Primary,
             ))
-        } else if lock.verifying {
+        } else if lock.verifying || !lock.engaged() {
             None
         } else {
             Some(("security.lock.now", strings.lock_now, Variant::Secondary))
@@ -2586,6 +2613,9 @@ impl ShelluneView {
             DialogSnapshot::DeleteTrust { host, port } => {
                 self.security_forget_trust(&host, port, cx);
             }
+            DialogSnapshot::BiometricRisk => {
+                self.security_enable_session_only(cx);
+            }
         }
     }
 
@@ -2732,10 +2762,14 @@ impl ShelluneView {
         // A private key leaving the vault is one of the operations that always
         // verify anew, whatever the policy: the gate runs before the file
         // chooser opens, so a cancelled verification leaves no file behind
-        // (R3).
-        if self.security_begin_always(vec![SecurityPending::ExportKey], cx) {
+        // (R3). The grant is one passage - the resumed chooser does not ask
+        // for the pass it just got.
+        if !self.security.operation_granted
+            && self.security_begin_always(vec![SecurityPending::ExportKey], cx)
+        {
             return;
         }
+        self.security.operation_granted = false;
         // The two refusals an export can make before a file is ever chosen: no
         // passphrase typed twice, or a plain export without its second, explicit
         // acceptance of the risk.
@@ -3477,30 +3511,59 @@ impl ShelluneView {
             return;
         }
         if !on {
-            // Turning the protection off proves first that it is the owner
-            // asking, in either mode (R3).
-            if self.security_begin_always(vec![SecurityPending::DisableBiometric], cx) {
+            // The session-only shape has no prompt to ask: turning it off is
+            // the unlocked session's own decision, and demanding a
+            // verification nothing can answer were the same lock-out in the
+            // other direction (R4, P1-2).
+            if !self.security.lock.session_only()
+                && self.security_begin_always(vec![SecurityPending::DisableBiometric], cx)
+            {
                 return;
             }
             self.security_set_biometric(false, cx);
             return;
         }
-        // Turning it on verifies once with whatever the system offers. A
-        // machine with nothing to call enables on the unlocked session alone -
-        // the system user is the whole protection it has, and the page's
-        // wording already promises no more than that (R4).
+        // Turning it on asks the system first, the way the storage layer's
+        // fallback model says (R4): a system that can verify gets one fresh
+        // verification, and a system with nothing to call gets the unlocked
+        // session behind an explicit risk confirmation - never a silent
+        // enable, and never a lock there is no way out of (P1-2).
         let capability = self.security.lock.authenticator.capability();
-        if !capability.can_verify_user() {
-            self.security_set_biometric(true, cx);
-            return;
+        match LocalOnlyFallback::for_capability(capability) {
+            LocalOnlyFallback::SystemUserVerification => {
+                self.security.lock.pending = vec![SecurityPending::EnableBiometric];
+                self.security_verify(cx);
+            }
+            LocalOnlyFallback::UnlockedSessionWithConfirmation => {
+                if self.security.dialog.is_some() {
+                    return;
+                }
+                self.security.dialog = Some(SecurityDialog::BiometricRisk);
+                cx.notify();
+            }
         }
-        self.security.lock.pending = vec![SecurityPending::EnableBiometric];
-        self.security_verify(cx);
     }
 
-    /// Chooses the lock policy on the page. The "every sensitive operation"
-    /// choice is the stronger one; both keep the vault usable the moment the
-    /// policy allows it.
+    /// Enables the biometric switch in the shape a machine without any system
+    /// verification can have: the unlocked session plus the user's explicit
+    /// acceptance, recorded in this device's own file. The lock never
+    /// auto-locks in this shape - there is nothing to unlock it with (R4,
+    /// `LocalOnlyFallback::UnlockedSessionWithConfirmation`).
+    pub(super) fn security_enable_session_only(&mut self, cx: &mut Context<Self>) {
+        self.security.dialog = None;
+        self.security.lock.settings.biometric_unlock = Some(true);
+        let store = SecurityStore::at(self.store.root());
+        if let Err(error) = store.save(&self.security.lock.settings) {
+            self.security_set_notice(
+                Tone::Danger,
+                format!("{}: {error}", self.security_strings().vault_failed),
+                cx,
+            );
+            return;
+        }
+        self.security.lock.problem = None;
+        cx.notify();
+    }
     pub(super) fn security_set_lock_policy(&mut self, every: bool, cx: &mut Context<Self>) {
         self.security.lock.settings.policy = if every {
             LockPolicy::EverySensitiveOperation
@@ -3592,8 +3655,16 @@ impl ShelluneView {
                     self.start_desktop_session(session, cx);
                 }
                 SecurityPending::ExportKey => {
+                    // One passage of the export gate, already paid for: the
+                    // chooser opens without asking again (R3).
+                    self.security.operation_granted = true;
                     self.security_touch(cx);
                     self.security_choose_export(cx);
+                }
+                SecurityPending::BackupVaultExport => {
+                    self.security.operation_granted = true;
+                    self.security_touch(cx);
+                    self.choose_backup_export_path(cx);
                 }
                 SecurityPending::EnableBiometric => {
                     self.security_set_biometric(true, cx);
@@ -4052,6 +4123,29 @@ impl ShelluneView {
                     footer,
                 )
             }
+            SecurityDialog::BiometricRisk => {
+                let metrics = self.metrics();
+                let body = self
+                    .security_dialog_body("security.dialog.biometric-risk", cx)
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .debug_selector(|| "security.dialog.biometric-risk.body".to_owned())
+                            .child(strings.biometric_risk_body),
+                    );
+                let footer = self.security_dialog_footer(strings.biometric_risk_confirm, cx);
+                (
+                    strings.biometric_risk_title.to_owned(),
+                    None,
+                    Icon::Lock,
+                    body,
+                    footer,
+                )
+            }
         };
 
         let (header, subtitle) = self.modal_header(
@@ -4407,6 +4501,14 @@ impl ShelluneView {
         self.security.lock.locked
     }
 
+    /// Re-runs the start-up decision about the lock, as a relaunch would, so
+    /// a test can change the verifier first and watch what a machine like
+    /// that would really do (R3, R4).
+    pub fn security_relaunch_for_test(&mut self, cx: &mut Context<Self>) {
+        self.security.lock.locked = false;
+        self.vault_warm(cx);
+    }
+
     /// The biometric switch as it stands on this device.
     pub fn security_biometric_for_test(&self) -> bool {
         self.security.lock.settings.biometric_unlock == Some(true)
@@ -4538,6 +4640,7 @@ enum DialogSnapshot {
         host: String,
         port: u16,
     },
+    BiometricRisk,
 }
 
 /// Reads the open dialog's fields into owned values.
@@ -4617,6 +4720,7 @@ fn security_dialog_snapshot(dialog: Option<&SecurityDialog>, cx: &App) -> Option
             host: host.clone(),
             port: *port,
         },
+        SecurityDialog::BiometricRisk => DialogSnapshot::BiometricRisk,
     })
 }
 

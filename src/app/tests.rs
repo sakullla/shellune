@@ -43900,13 +43900,36 @@ async fn a_locked_vault_defers_automatic_sync_until_the_unlock(cx: &mut TestAppC
 
     // A change made behind the lock (the vault file itself) is still only
     // synced once the unlock frees the automatic job.
+    click(cx, "settings.category.security");
+    click(cx, "settings.item.keys-and-passwords");
+    click(cx, "security.action.new-password");
+    type_into(cx, "security.dialog.name", "Behind the lock");
+    type_into(cx, "security.dialog.secret", "another-secret-value");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    assert_eq!(
+        put_count(&server),
+        uploaded,
+        "the change made behind the lock was not sent either"
+    );
+
+    // The unlock opens the vault and lets the waiting automatic job through:
+    // the change really travels now.
     cx.update(|_window, app| view.update(app, |view, cx| view.security_unlock_for_test(cx)));
     cx.run_until_parked();
     assert!(
-        cx.update(|_window, app| view.read(app).security_credentials_for_test())
-            .is_empty()
-            || !cx.update(|_window, app| view.read(app).security_locked_for_test()),
+        !cx.update(|_window, app| view.read(app).security_locked_for_test()),
         "the unlock opened the vault"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_credentials_for_test())
+            .len(),
+        2,
+        "the opened vault holds the seeded record and the one made behind the lock"
+    );
+    assert!(
+        put_count(&server) > uploaded,
+        "the unlock let the waiting automatic sync really run"
     );
 }
 
@@ -43950,4 +43973,160 @@ async fn vault_conflicts_are_answered_one_by_one(cx: &mut TestAppContext) {
         !sync_conflict_open(&view, cx),
         "the answered choices leave the question"
     );
+}
+
+/// A backup that carries the whole vault goes through the same always-verify
+/// gate a private-key export does: while the vault is locked, or under the
+/// every-operation policy, a cancelled or refused verification leaves no file
+/// behind (R3, R9, P1-1).
+#[gpui::test]
+async fn a_vault_backup_export_refuses_to_leave_a_locked_vault(cx: &mut TestAppContext) {
+    let dir = TempDir::new("backup-gate");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    let authenticator = Arc::new(
+        shellune_storage::ScriptedAuthenticator::new(
+            shellune_storage::BiometricCapability::Biometrics,
+        )
+        .script([Err(shellune_storage::BiometricError::Cancelled)]),
+    );
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_set_authenticator_for_test(authenticator.clone());
+            view.security_enable_lock_for_test(shellune_storage::LockPolicy::UnlockVault, 15, cx);
+        })
+    });
+
+    // The vault checkbox is ticked and the passphrase typed; the cancelled
+    // verification stops everything before a file is ever asked for.
+    click(cx, "settings.category.data");
+    click(cx, "settings.backup.export");
+    click(cx, "backup.export.vault");
+    type_into(
+        cx,
+        "backup.export.vault.passphrase",
+        "correct horse battery",
+    );
+    type_into(cx, "backup.export.vault.confirm", "correct horse battery");
+    click(cx, "backup.export.save");
+    cx.run_until_parked();
+    assert!(
+        !cx.did_prompt_for_new_path(),
+        "a cancelled verification asks for no file"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).export_report_for_test())
+            .is_none(),
+        "and no export happened"
+    );
+
+    // The every-operation policy asks afresh even with the vault open: a
+    // cancelled prompt leaves no file there either.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_lock_settings_for_test(
+                shellune_storage::LockPolicy::EverySensitiveOperation,
+                cx,
+            );
+        })
+    });
+    click(cx, "backup.export.save");
+    cx.run_until_parked();
+    assert!(
+        !cx.did_prompt_for_new_path(),
+        "the every-operation policy gates the vault export too"
+    );
+    let _ = view;
+}
+
+/// A machine whose system offers no verification this app can call enables
+/// the biometric switch only behind an explicit risk confirmation, never
+/// auto-locks, stays reachable after a restart, and can be turned off again -
+/// the storage layer's unlocked-session fallback, not a lock-out (R4, P1-2).
+#[gpui::test]
+async fn a_machine_without_verification_enables_a_session_only_lock(cx: &mut TestAppContext) {
+    let dir = TempDir::new("lock-session-only");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    let authenticator = Arc::new(shellune_storage::ScriptedAuthenticator::new(
+        shellune_storage::BiometricCapability::Unavailable,
+    ));
+
+    // The switch asks the system first; with nothing to call, the question
+    // becomes the explicit risk confirmation.
+    cx.update(|_window, app| {
+        view.update(app, |view, _cx| {
+            view.security_set_authenticator_for_test(authenticator.clone())
+        })
+    });
+    click(cx, "settings.category.security");
+    click(cx, "settings.item.lock");
+    click(cx, "security.lock.biometric");
+    assert!(
+        cx.debug_bounds("security.dialog.biometric-risk").is_some(),
+        "enabling without a verifier asks for the risk confirmation"
+    );
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).security_biometric_for_test()),
+        "the confirmed risk turns the switch on"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_locked_for_test()),
+        "the session-only shape never locks the vault"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_credentials_for_test())
+            .len(),
+        1,
+        "the vault stays readable"
+    );
+    assert_eq!(
+        authenticator.verify_calls(),
+        0,
+        "no verification was ever claimed from a system with none"
+    );
+
+    // A relaunch on the same machine keeps the vault reachable: the start-up
+    // decision asks the capability too, not only the saved switch.
+    drop(view);
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_set_authenticator_for_test(authenticator.clone());
+            view.security_relaunch_for_test(cx);
+        })
+    });
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_locked_for_test()),
+        "a machine with nothing to ask does not start locked"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_credentials_for_test())
+            .len(),
+        1,
+        "the vault opened the plain way"
+    );
+
+    // The switch turns off without a prompt nothing could answer.
+    click(cx, "settings.category.security");
+    click(cx, "settings.item.lock");
+    click(cx, "security.lock.biometric");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_biometric_for_test()),
+        "the session-only shape turns off on the unlocked session's own say-so"
+    );
+    assert_eq!(
+        authenticator.verify_calls(),
+        0,
+        "turning it off demanded no verification either"
+    );
+    let saved = shellune_storage::SecurityStore::at(dir.path()).load();
+    assert_eq!(saved.biometric_unlock, Some(false));
+    let _ = view;
 }

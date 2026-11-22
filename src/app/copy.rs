@@ -6141,6 +6141,14 @@ security_strings! {
     /// Re-enabling biometrics after it was reset needs a fresh verification
     lock_reenable_note: "Turning biometrics back on asks the system to verify you once.",
         "重新开启生物识别会请求系统验证一次。";
+    /// Risk dialog: enabling on a machine with no system verification
+    biometric_risk_title: "No system verification on this device",
+        "此设备没有可用的系统验证";
+    /// Risk dialog body: what the unlocked-session shape is and is not
+    biometric_risk_body: "This device offers no verification this app can call, so the protection is the unlocked session itself: anyone using this device can open the vault. It is not biometric strength. The vault is never locked automatically in this shape, and the choice can be turned off at any time.",
+        "此设备没有可供应用调用的系统验证，因此保护仅来自已解锁的用户会话：使用此设备的任何人都可以打开保险库。这不等同于生物识别强度。此形态下保险库不会自动锁定，且可随时关闭。";
+    /// Risk dialog confirm button
+    biometric_risk_confirm: "Turn on anyway", "仍然开启";
 }
 
 /// The security strings of one language.
