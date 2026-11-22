@@ -111,6 +111,9 @@ pub enum ChainEvent {
         /// Off, enabling, ready or failed.
         status: X11Status,
     },
+    /// The operating system the target said it runs, when the request asked (see
+    /// [`ChainRequest::with_platform_probe`]).
+    Platform(String),
     /// The attempt failed, or a live chain stopped.
     Failed(ChainFailure),
 }
@@ -135,6 +138,8 @@ pub struct ChainRequest {
     open_shell: bool,
     /// How this attempt forwards X11, chosen for this connection (R11).
     x11: X11Forwarding,
+    /// Whether the target is asked which system it runs once its shell is up.
+    probe_platform: bool,
 }
 
 impl ChainRequest {
@@ -149,7 +154,16 @@ impl ChainRequest {
             policy: ConnectionPolicy::default(),
             open_shell: true,
             x11: X11Forwarding::Off,
+            probe_platform: false,
         }
+    }
+
+    /// The same chain, asking the target which operating system it runs once its
+    /// shell is up; the answer arrives as [`ChainEvent::Platform`].
+    #[must_use]
+    pub fn with_platform_probe(mut self, on: bool) -> Self {
+        self.probe_platform = on;
+        self
     }
 
     /// The same chain, asking the target for X11 forwarding.
@@ -253,6 +267,7 @@ impl ChainSession {
             size,
             policy: request.policy,
             open_shell: request.open_shell,
+            probe_platform: request.probe_platform,
             x11: x11_gate,
         };
 
@@ -734,6 +749,8 @@ struct Attempt {
     /// Keepalive and deadline every hop of this attempt uses (R20).
     policy: ConnectionPolicy,
     open_shell: bool,
+    /// Whether the target is asked which system it runs.
+    probe_platform: bool,
     /// The target's X11 forwarding, shared with its handler.
     x11: Arc<X11Gate>,
 }
@@ -1415,6 +1432,16 @@ async fn drive_shell(
         forwards.shutdown(handle).await;
         return Err(ChainFailure::Cancelled {
             hop: Some(Box::new(location)),
+        });
+    }
+    // Which system the target runs, asked on a channel of its own once its shell is
+    // up, so the question never reaches the terminal.
+    if attempt.probe_platform && shell.is_some() {
+        let (open, events) = (open_commands.clone(), events.clone());
+        tokio::spawn(async move {
+            if let Some(platform) = crate::platform::probe(open).await {
+                let _ = events.send(ChainEvent::Platform(platform.to_owned()));
+            }
         });
     }
     tokio::spawn(sftp::serve(files, open_commands.clone()));

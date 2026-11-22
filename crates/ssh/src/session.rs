@@ -201,6 +201,9 @@ pub struct ConnectRequest {
     /// Off unless the caller says otherwise: an attempt that never asked for a
     /// display channel is what every session did before X11 forwarding existed.
     x11: X11Forwarding,
+    /// Whether the connection asks the server which system it runs, once the shell is
+    /// up (see [`crate::platform`]).
+    probe_platform: bool,
 }
 
 impl ConnectRequest {
@@ -224,6 +227,7 @@ impl ConnectRequest {
             policy: ConnectionPolicy::default(),
             open_shell: true,
             x11: X11Forwarding::Off,
+            probe_platform: false,
         }
     }
 
@@ -244,6 +248,14 @@ impl ConnectRequest {
     #[must_use]
     pub fn with_x11(mut self, mode: X11Forwarding) -> Self {
         self.x11 = mode;
+        self
+    }
+
+    /// The same request, asking the server which operating system it runs once the
+    /// shell is up; the answer arrives as [`RemoteEvent::Platform`].
+    #[must_use]
+    pub fn with_platform_probe(mut self, on: bool) -> Self {
+        self.probe_platform = on;
         self
     }
 
@@ -294,6 +306,10 @@ pub enum RemoteEvent {
     /// A failure here is a status, not a session failure: the shell keeps working
     /// without a forwarded display.
     X11(X11Status),
+    /// The operating system the server runs, as one of [`crate::platform::KNOWN`]'s
+    /// identifiers, when the request asked for it and the server said (see
+    /// [`ConnectRequest::with_platform_probe`]).
+    Platform(String),
     /// The attempt failed, or a live session stopped.
     Failed(ConnectError),
 }
@@ -665,6 +681,7 @@ async fn connect_and_shell(
     } = channels;
     let target = request.target();
     let open_shell = request.open_shell;
+    let request_probe = request.probe_platform;
     let x11_mode = request.x11;
     let material = Material::resolve(request.auth).await?;
 
@@ -800,6 +817,16 @@ async fn connect_and_shell(
     };
 
     let _ = events.send(RemoteEvent::Connected);
+    // Which system the server runs, asked on a channel of its own once the shell is
+    // up, so the question never reaches the terminal and never delays it.
+    if request_probe && shell.is_some() {
+        let (open, events) = (open_commands.clone(), events.clone());
+        tokio::spawn(async move {
+            if let Some(platform) = crate::platform::probe(open).await {
+                let _ = events.send(RemoteEvent::Platform(platform.to_owned()));
+            }
+        });
+    }
 
     // The file browser works on this same authenticated connection: its task asks
     // the loop below for an SFTP channel and then runs on its own, so reading a

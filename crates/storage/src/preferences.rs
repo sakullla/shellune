@@ -147,6 +147,10 @@ pub struct Preferences {
     /// Absent means on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub highlight_output: Option<bool>,
+    /// Whether a host's tile shows the operating system it was last seen running,
+    /// which also decides whether a connection asks the server. Absent means on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os_icons: Option<bool>,
     /// Whether a command end the shell reported in a background tab marks it (R7).
     /// Absent means on.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -275,6 +279,7 @@ mod tests {
             }),
             bell_notice: Some(false),
             highlight_output: Some(false),
+            os_icons: Some(false),
             command_notice: Some(true),
             connection: Some(ConnectionDefaults::new(45, 4, 12).expect("valid defaults")),
             auto_check_updates: Some(false),

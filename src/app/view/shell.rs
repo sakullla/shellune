@@ -1015,9 +1015,13 @@ impl ShelluneView {
             metrics.compact_control_height()
         };
         let new_shell = self.keymap.label("shell.new");
+        // One control: the press opens the launcher - the shells, the saved hosts and
+        // a typed address in one searchable list - and Enter there opens the default
+        // shell, so a new local tab is still one press and a key away. The shortcut
+        // opens the default shell directly.
         let tooltip = match new_shell {
-            Some(shortcut) => format!("{} ({shortcut})", ux.new_tab),
-            None => ux.new_tab.to_owned(),
+            Some(shortcut) => format!("{} · {} {shortcut}", ux.new_tab_menu, ux.new_tab),
+            None => ux.new_tab_menu.to_owned(),
         };
         let control = div()
             .relative()
@@ -1028,43 +1032,23 @@ impl ShelluneView {
             .child(
                 components::icon_only_button(Icon::Plus, metrics)
                     .size(size)
-                    .rounded_l(px(radius::MEDIUM))
-                    .rounded_r(px(if compact { radius::MEDIUM } else { 0.0 }))
+                    .rounded(px(radius::MEDIUM))
+                    .when(open, |button| {
+                        button.bg(theme::swatch(palette::SURFACE_SELECTED))
+                    })
                     .id("header.primary")
                     .debug_selector(|| "header.primary".to_owned())
-                    .tooltip(components::tooltip(SharedString::from(tooltip)))
+                    .when(!open, |button| {
+                        button.tooltip(components::tooltip(SharedString::from(tooltip)))
+                    })
                     .on_click(cx.listener(|this, _event, window, cx| {
-                        this.new_local_shell(window, cx);
+                        if this.shell_menu_open && !this.shell_menu_home {
+                            this.close_shell_menu(cx);
+                        } else {
+                            this.open_launcher(window, cx);
+                        }
                     })),
-            )
-            .when(!compact, |control| {
-                control.child(components::divider_vertical(metrics)).child(
-                    components::icon_only_button(Icon::ChevronDown, metrics)
-                        // Its own width, but never narrower than a pointer target (R4).
-                        .w(metrics.hit_target())
-                        .h(size)
-                        .rounded_r(px(radius::MEDIUM))
-                        .rounded_l(px(0.0))
-                        .when(open, |button| {
-                            button.bg(theme::swatch(palette::SURFACE_SELECTED))
-                        })
-                        .id("shell.menu")
-                        .debug_selector(|| "shell.menu".to_owned())
-                        .when(!open, |button| {
-                            button.tooltip(components::tooltip(ux.new_tab_menu))
-                        })
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.tab_menu = None;
-                            this.session_more = None;
-                            this.session_menu = None;
-                            this.host_menu = None;
-                            // The header's menu, wherever the home page's one was.
-                            this.shell_menu_open = !(this.shell_menu_open && !this.shell_menu_home);
-                            this.shell_menu_home = false;
-                            cx.notify();
-                        })),
-                )
-            });
+            );
         // Records where the control is drawn, for the menu that hangs from it.
         let anchor = self.shell_menu_anchor.clone();
         control.child(
@@ -1789,6 +1773,7 @@ impl ShelluneView {
                     .monograms()
                     .remove(&host.id())
                     .unwrap_or_else(|| crate::app::monogram::initials(host.name())),
+                self.host_platform(host.id()),
                 false,
                 metrics,
             )),

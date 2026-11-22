@@ -420,6 +420,9 @@ impl AssetSource for Assets {
                 "../../assets/icons/shellune.png"
             ))));
         }
+        if let Some(document) = crate::app::os_icons::svg(path) {
+            return Ok(Some(Cow::Owned(document.into_bytes())));
+        }
         Ok(Icon::from_path(path).map(|icon| Cow::Owned(icon.svg_source().into_bytes())))
     }
 
@@ -428,6 +431,7 @@ impl AssetSource for Assets {
             .into_iter()
             .map(Icon::path)
             .chain(std::iter::once(APP_ICON))
+            .chain(crate::app::os_icons::all())
             .filter(|candidate| candidate.starts_with(path))
             .map(SharedString::from)
             .collect())

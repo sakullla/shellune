@@ -264,6 +264,15 @@ impl TransferViews {
         removed
     }
 
+    /// Removes one finished task and its pace samples; a live task is kept.
+    pub fn remove_finished(&mut self, id: TransferId) -> bool {
+        let removed = self.queue.remove_finished(id);
+        if removed {
+            self.paces.remove(&id);
+        }
+        removed
+    }
+
     /// Removes every finished task of one session and drops their stale pace samples.
     pub fn clear_finished_for_session(&mut self, session: SessionId) -> usize {
         let removed = self.queue.clear_finished_for_session(session);

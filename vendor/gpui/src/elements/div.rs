@@ -1485,6 +1485,9 @@ pub struct Interactivity {
     pub hovered: Option<bool>,
     pub(crate) tooltip_id: Option<TooltipId>,
     pub(crate) content_size: Size<Pixels>,
+    /// How far this element's content can scroll, as measured in its last prepaint
+    /// (Shellune patch: scroll chaining).
+    pub(crate) scroll_max: std::cell::Cell<Size<Pixels>>,
     pub(crate) key_context: Option<KeyContext>,
     pub(crate) focusable: bool,
     pub(crate) tracked_focus_handle: Option<FocusHandle>,
@@ -1762,6 +1765,7 @@ impl Interactivity {
                 scroll_handle_state.max_offset = scroll_max;
                 scroll_handle_state.bounds = bounds;
             }
+            self.scroll_max.set(scroll_max);
 
             *scroll_offset
         } else {
@@ -2414,6 +2418,7 @@ impl Interactivity {
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
+            let scroll_max = self.scroll_max.get();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
@@ -2443,10 +2448,19 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
-                    scroll_offset.y += delta_y;
-                    scroll_offset.x += delta_x;
-                    if *scroll_offset != old_scroll_offset {
+                    // Shellune patch: scroll chaining. The innermost container that can
+                    // still move in the wheel's direction takes the whole delta and the
+                    // event stops there; one already at its end lets the containers
+                    // behind it scroll instead. Without this, a list inside a scrolling
+                    // dialog turned the list and the dialog together.
+                    let next = point(
+                        (scroll_offset.x + delta_x).clamp(-scroll_max.width, Pixels::ZERO),
+                        (scroll_offset.y + delta_y).clamp(-scroll_max.height, Pixels::ZERO),
+                    );
+                    if next != old_scroll_offset {
+                        *scroll_offset = next;
                         cx.notify(current_view);
+                        cx.stop_propagation();
                     }
                 }
             });

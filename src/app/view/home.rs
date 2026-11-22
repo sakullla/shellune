@@ -171,6 +171,8 @@ struct HostRowView {
     name: SharedString,
     /// The letters its tile is drawn with (see [`crate::app::monogram`]).
     monogram: SharedString,
+    /// The operating system its tile shows instead, when it is known and shown.
+    platform: Option<SharedString>,
     /// What a connection would dial.
     target: SharedString,
     /// The group the host is in, when it is in one and the row has room for it.
@@ -2235,6 +2237,9 @@ impl ShelluneView {
                         number: hosts,
                         name: SharedString::from(saved.name().to_owned()),
                         monogram: monogram(host.id, saved.name()),
+                        platform: self
+                            .host_platform(host.id)
+                            .map(|id| SharedString::from(id.to_owned())),
                         target: SharedString::from(saved.target()),
                         group: show_meta
                             .then(|| saved.group_text().map(SharedString::from))
@@ -3047,6 +3052,7 @@ fn host_row_element(
     let avatar = super::host_avatar(
         host.name.as_ref(),
         host.monogram.as_ref(),
+        host.platform.as_ref().map(SharedString::as_ref),
         selected,
         metrics,
     );
@@ -3326,6 +3332,7 @@ fn connection_row_element(
                 .child(super::host_avatar(
                     connection.name.as_ref(),
                     connection.monogram.as_ref(),
+                    None,
                     false,
                     metrics,
                 )),

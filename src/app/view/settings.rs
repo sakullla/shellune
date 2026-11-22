@@ -86,6 +86,7 @@ pub(crate) enum Item {
     Language,
     TextSize,
     Motion,
+    OsIcons,
     Scheme,
     FontSize,
     DefaultShell,
@@ -104,7 +105,13 @@ pub(crate) enum Item {
 }
 
 /// The items of every category, in the order the navigation lists them.
-const APPEARANCE: [Item; 4] = [Item::Theme, Item::Language, Item::TextSize, Item::Motion];
+const APPEARANCE: [Item; 5] = [
+    Item::Theme,
+    Item::Language,
+    Item::TextSize,
+    Item::Motion,
+    Item::OsIcons,
+];
 const TERMINAL: [Item; 4] = [
     Item::Scheme,
     Item::FontSize,
@@ -206,7 +213,9 @@ impl Item {
     /// The category this item belongs to.
     pub(super) fn category(self) -> Category {
         match self {
-            Self::Theme | Self::Language | Self::TextSize | Self::Motion => Category::Appearance,
+            Self::Theme | Self::Language | Self::TextSize | Self::Motion | Self::OsIcons => {
+                Category::Appearance
+            }
             Self::Scheme | Self::FontSize | Self::DefaultShell | Self::Highlight => {
                 Category::Terminal
             }
@@ -237,6 +246,7 @@ impl Item {
             Self::Language => "language",
             Self::TextSize => "text-size",
             Self::Motion => "motion",
+            Self::OsIcons => "os-icons",
             Self::Scheme => "scheme",
             Self::FontSize => "font-size",
             Self::DefaultShell => "default-shell",
@@ -263,6 +273,7 @@ impl Item {
             Self::Language => ux.settings_language,
             Self::TextSize => ux.settings_text_size,
             Self::Motion => ux.settings_motion,
+            Self::OsIcons => ux.settings_os_icons,
             Self::Scheme => ux.settings_scheme,
             Self::FontSize => ux.settings_font_size,
             Self::DefaultShell => ux.settings_default_shell,
@@ -289,6 +300,7 @@ impl Item {
             Self::Language => ux.settings_language_hint,
             Self::TextSize => ux.settings_text_size_hint,
             Self::Motion => ux.settings_motion_hint,
+            Self::OsIcons => ux.settings_os_icons_hint,
             Self::Scheme => ux.settings_scheme_hint,
             Self::FontSize => ux.settings_font_size_hint,
             Self::DefaultShell => ux.settings_default_shell_hint,
@@ -962,6 +974,17 @@ impl ShelluneView {
                 label,
                 ux.settings_default_shell_hint,
                 self.settings_shell_control(cx),
+            ),
+            Item::OsIcons => self.settings_row(
+                "os-icons",
+                label,
+                ux.settings_os_icons_hint,
+                div().child(self.switch_control(
+                    "settings.os_icons",
+                    self.os_icons(),
+                    cx,
+                    |view, on, cx| view.set_os_icons(on, cx),
+                )),
             ),
             Item::Highlight => self.settings_row(
                 "highlight",

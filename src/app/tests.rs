@@ -1999,9 +1999,7 @@ async fn a_host_file_that_cannot_be_read_stays_failed_when_it_is_retried(cx: &mu
         "the failure has to be visible where the hosts would be"
     );
 
-    let bounds = bounds_of(cx, "header.primary");
-    let center = bounds.center();
-    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    new_default_shell(cx);
     cx.run_until_parked();
 
     cx.update(|_window, app| {
@@ -5540,9 +5538,7 @@ async fn a_shell_that_does_not_exist_shows_the_reason_and_keeps_no_session(
     cx.simulate_resize(design_window());
     cx.run_until_parked();
 
-    let bounds = bounds_of(cx, "header.primary");
-    let center = bounds.center();
-    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    new_default_shell(cx);
     cx.run_until_parked();
 
     cx.update(|_window, app| {
@@ -5709,7 +5705,7 @@ async fn a_custom_shell_that_starts_owns_the_keyboard(cx: &mut TestAppContext) {
         !cx.update(|_window, app| view.read(app).shell_menu_open()),
         "the menu closed once its path became a session"
     );
-    let bounds = bounds_of(cx, "shell.menu");
+    let bounds = bounds_of(cx, "header.primary");
     let center = bounds.center();
     cx.simulate_click(point(center.x, center.y), Modifiers::default());
     cx.run_until_parked();
@@ -5739,9 +5735,7 @@ async fn a_custom_shell_that_fails_keeps_its_text_while_another_terminal_is_open
         return;
     }
 
-    let bounds = bounds_of(cx, "header.primary");
-    let center = bounds.center();
-    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    new_default_shell(cx);
     cx.run_until_parked();
     assert!(
         cx.update(|_window, app| view.read(app).pane().is_some()),
@@ -5750,7 +5744,7 @@ async fn a_custom_shell_that_fails_keeps_its_text_while_another_terminal_is_open
 
     // With a terminal on screen the shell choices live in the header's menu, and
     // the custom path opens as a dialog.
-    let bounds = bounds_of(cx, "shell.menu");
+    let bounds = bounds_of(cx, "header.primary");
     let center = bounds.center();
     cx.simulate_click(point(center.x, center.y), Modifiers::default());
     cx.run_until_parked();
@@ -5831,14 +5825,14 @@ async fn a_shell_picked_from_the_menu_opens_another_tab_and_closes_the_menu(
     cx.run_until_parked();
     assert!(!cx.update(|_window, app| view.read(app).shell_menu_open()));
 
-    click(cx, "header.primary");
+    new_default_shell(cx);
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().local_sessions().count()),
         1,
         "the main button opened the first shell"
     );
 
-    click(cx, "shell.menu");
+    click(cx, "header.primary");
     assert!(
         cx.debug_bounds("shell.choice.0").is_some(),
         "the menu lists the shells"
@@ -5868,9 +5862,7 @@ async fn a_real_shell_starts_from_the_header_action(cx: &mut TestAppContext) {
         return;
     }
 
-    let bounds = bounds_of(cx, "header.primary");
-    let center = bounds.center();
-    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    new_default_shell(cx);
     cx.run_until_parked();
 
     let pane = cx
@@ -5958,9 +5950,7 @@ async fn a_ctrl_c_reaches_the_default_shell_that_is_running_a_command(cx: &mut T
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
     cx.run_until_parked();
-    let bounds = bounds_of(cx, "header.primary");
-    let center = bounds.center();
-    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    new_default_shell(cx);
     cx.run_until_parked();
     let pane = cx
         .update(|_window, app| view.read(app).pane().cloned())
@@ -6064,9 +6054,7 @@ async fn escape_reaches_the_program_running_in_the_terminal(cx: &mut TestAppCont
     cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
     cx.simulate_resize(design_window());
     cx.run_until_parked();
-    let bounds = bounds_of(cx, "header.primary");
-    let center = bounds.center();
-    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    new_default_shell(cx);
     cx.run_until_parked();
     let pane = cx
         .update(|_window, app| view.read(app).pane().cloned())
@@ -6130,9 +6118,7 @@ async fn ctrl_l_reaches_the_program_running_in_the_terminal(cx: &mut TestAppCont
     cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
     cx.simulate_resize(design_window());
     cx.run_until_parked();
-    let bounds = bounds_of(cx, "header.primary");
-    let center = bounds.center();
-    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    new_default_shell(cx);
     cx.run_until_parked();
     let pane = cx
         .update(|_window, app| view.read(app).pane().cloned())
@@ -6231,9 +6217,7 @@ async fn a_real_shell_that_exits_stops_being_listed_as_connected(cx: &mut TestAp
         return;
     }
 
-    let bounds = bounds_of(cx, "header.primary");
-    let center = bounds.center();
-    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    new_default_shell(cx);
     cx.run_until_parked();
     let pane = cx
         .update(|_window, app| view.read(app).pane().cloned())
@@ -6370,6 +6354,14 @@ fn go(cx: &mut VisualTestContext, action: impl gpui::Action) {
 }
 
 /// Clicks the centre of a rendered element.
+/// Opens the default shell the way a person does from the header: "+" opens the
+/// launcher, and Enter in its search opens the default shell.
+fn new_default_shell(cx: &mut VisualTestContext) {
+    click(cx, "header.primary");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+}
+
 fn click(cx: &mut VisualTestContext, selector: &'static str) {
     let bounds = bounds_of(cx, selector);
     let center = bounds.center();
@@ -8895,9 +8887,7 @@ fn start_local_session(
     if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
         return None;
     }
-    let bounds = bounds_of(cx, "header.primary");
-    let center = bounds.center();
-    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    new_default_shell(cx);
     cx.run_until_parked();
     cx.update(|_window, app| view.read(app).active_session())
 }
@@ -14356,7 +14346,7 @@ async fn a_resumed_transfer_keeps_its_partial_when_the_connection_ends_and_a_lat
         "the list must not name a partial file this attempt never created: {detail}"
     );
     assert!(
-        detail.contains("1024"),
+        detail.contains("1.0 KB"),
         "the frozen checkpoint is still shown: {detail}"
     );
 
@@ -14385,7 +14375,7 @@ async fn a_resumed_transfer_keeps_its_partial_when_the_connection_ends_and_a_lat
         .update(|_window, app| view.read(app).transfer_detail_for_test(task))
         .expect("the task is listed");
     assert!(
-        detail.contains("4096"),
+        detail.contains("4.0 KB"),
         "the later flushed offset replaces the stale checkpoint: {detail}"
     );
     assert!(detail.contains(&flushed.partial), "{detail}");
@@ -14641,7 +14631,7 @@ async fn resume_carries_the_checkpoint_and_transfer_again_drops_it(cx: &mut Test
         .update(|_window, app| view.read(app).transfer_detail_for_test(task))
         .expect("the cancelled task is listed");
     assert!(
-        detail.contains("2048"),
+        detail.contains("2.0 KB"),
         "the confirmed offset is shown as a checkpoint, not as a finished file: {detail}"
     );
     assert!(!cx.update(|_window, app| view.read(app).transfer_tasks()[0].state().is_success()),);
@@ -15280,8 +15270,8 @@ fn two_shells(cx: &mut TestAppContext) -> Option<(Entity<ShelluneView>, &mut Vis
     if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
         return None;
     }
-    click(cx, "header.primary");
-    click(cx, "header.primary");
+    new_default_shell(cx);
+    new_default_shell(cx);
     assert_eq!(
         cx.update(|_window, app| view.read(app).open_tabs().len()),
         2
@@ -15598,7 +15588,7 @@ async fn closing_a_mixed_tab_from_the_menu_drops_its_pending_pane(cx: &mut TestA
 
     // Close others and close right share the same removal. A waiting pane on a
     // tab that is not the one under the pointer must go with that tab.
-    click(cx, "header.primary");
+    new_default_shell(cx);
     cx.update(|window, app| {
         view.update(app, |view, cx| {
             view.split_pending_for_test(
@@ -15622,8 +15612,8 @@ async fn closing_a_mixed_tab_from_the_menu_drops_its_pending_pane(cx: &mut TestA
         assert_eq!(view.open_tabs(), vec![kept]);
     });
 
-    click(cx, "header.primary");
-    click(cx, "header.primary");
+    new_default_shell(cx);
+    new_default_shell(cx);
     cx.update(|window, app| {
         view.update(app, |view, cx| {
             view.split_pending_for_test(
@@ -16445,7 +16435,7 @@ async fn the_tab_name_dialog_and_the_tab_list_fit_the_smallest_window_at_large_t
         if cx.update(|_window, app| view.read(app).tab_list_control_shown_for_test()) {
             break;
         }
-        click(cx, "header.primary");
+        new_default_shell(cx);
         cx.run_until_parked();
     }
 
@@ -16563,7 +16553,7 @@ async fn the_tab_identity_rows_stay_inside_their_cards_and_are_reached_by_scroll
         if cx.update(|_window, app| view.read(app).tab_list_control_shown_for_test()) {
             break;
         }
-        click(cx, "header.primary");
+        new_default_shell(cx);
         cx.run_until_parked();
     }
 
@@ -16790,7 +16780,7 @@ async fn a_failed_local_adopt_keeps_the_pending_pane(cx: &mut TestAppContext) {
     if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
         return;
     }
-    click(cx, "header.primary");
+    new_default_shell(cx);
     let neighbor = cx.update(|_window, app| {
         view.read(app)
             .active_session()
@@ -17314,7 +17304,7 @@ async fn a_quick_connection_does_not_write_a_host_until_asked(cx: &mut TestAppCo
     cx.simulate_resize(design_window());
     cx.run_until_parked();
 
-    click(cx, "shell.menu");
+    click(cx, "header.primary");
     click(cx, "menu.quick");
     assert!(cx.debug_bounds("quick.panel").is_some());
     type_into(cx, "quick.address", "127.0.0.1");
@@ -17358,7 +17348,7 @@ async fn a_quick_connection_can_be_saved_as_a_host_afterwards(cx: &mut TestAppCo
     cx.simulate_resize(design_window());
     cx.run_until_parked();
 
-    click(cx, "shell.menu");
+    click(cx, "header.primary");
     click(cx, "menu.quick");
     type_into(cx, "quick.address", "203.0.113.10");
     type_into(cx, "quick.user", "ada");
@@ -17434,7 +17424,7 @@ async fn quick_connect_names_the_field_when_input_is_rejected(cx: &mut TestAppCo
     cx.simulate_resize(design_window());
     cx.run_until_parked();
 
-    click(cx, "shell.menu");
+    click(cx, "header.primary");
     click(cx, "menu.quick");
     type_into(cx, "quick.address", "example.com");
     type_into(cx, "quick.user", "ada");
@@ -17565,7 +17555,7 @@ async fn quick_connect_dials_with_a_key_before_saving(cx: &mut TestAppContext) {
     cx.simulate_resize(design_window());
     cx.run_until_parked();
 
-    click(cx, "shell.menu");
+    click(cx, "header.primary");
     click(cx, "menu.quick");
     assert!(cx.debug_bounds("quick.method.password").is_some());
     assert!(cx.debug_bounds("quick.method.key").is_some());
@@ -17658,7 +17648,7 @@ async fn saving_a_quick_host_shows_a_write_failure_on_the_session_bar(cx: &mut T
     cx.simulate_resize(design_window());
     cx.run_until_parked();
 
-    click(cx, "shell.menu");
+    click(cx, "header.primary");
     click(cx, "menu.quick");
     type_into(cx, "quick.address", "203.0.113.20");
     type_into(cx, "quick.user", "ada");
@@ -18669,7 +18659,7 @@ async fn nested_splits_keep_input_and_resize_on_the_active_pane(cx: &mut TestApp
     if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
         return;
     }
-    click(cx, "header.primary");
+    new_default_shell(cx);
     cx.update(|window, app| {
         view.update(app, |view, cx| {
             view.split_active_for_test(SplitAxis::LeftRight, window, cx);
@@ -18981,7 +18971,7 @@ async fn a_named_tinted_tab_is_written_and_comes_back_waiting(cx: &mut TestAppCo
     if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
         return;
     }
-    click(cx, "header.primary");
+    new_default_shell(cx);
     let session = cx
         .update(|_window, app| view.read(app).active_session())
         .expect("the shell opened a tab");
@@ -19461,7 +19451,7 @@ async fn a_narrow_split_keeps_its_pane_heads_buttons_inside_the_pane(cx: &mut Te
     if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
         return;
     }
-    click(cx, "header.primary");
+    new_default_shell(cx);
     cx.update(|window, app| {
         view.update(app, |view, cx| {
             view.split_active_for_test(SplitAxis::LeftRight, window, cx);
@@ -19501,7 +19491,7 @@ async fn a_single_pane_has_no_frame_and_a_split_marks_each_pane(cx: &mut TestApp
     if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
         return;
     }
-    click(cx, "header.primary");
+    new_default_shell(cx);
     assert!(
         cx.debug_bounds("pane.close").is_none(),
         "a lone pane is the session: no pane header repeats it"
@@ -19716,7 +19706,7 @@ async fn a_press_on_the_caption_does_not_take_the_keyboard(cx: &mut TestAppConte
     if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
         return;
     }
-    click(cx, "header.primary");
+    new_default_shell(cx);
     let pane = cx
         .update(|_window, app| view.read(app).pane().cloned())
         .expect("a terminal is open");
@@ -19948,8 +19938,8 @@ async fn the_new_tab_menu_hangs_from_its_control(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
     cx.run_until_parked();
-    let control = bounds_of(cx, "shell.menu");
-    click(cx, "shell.menu");
+    let control = bounds_of(cx, "header.primary");
+    click(cx, "header.primary");
     let menu = bounds_of(cx, "shell.picker");
     assert!(
         menu.top() >= control.bottom() && menu.top() - control.bottom() < px(16.0),
@@ -20393,9 +20383,8 @@ async fn icon_controls_keep_a_24_by_24_pointer_target_at_the_smallest_text_size(
         "settings.font.less",
         "settings.font.more",
         "palette.open",
-        // The header's split "new shell / pick a shell" control: the chevron is a
-        // target of its own, not a 18px drawing.
-        "shell.menu",
+        // The header's "+" opens the launcher; it is a target, not an 18px drawing.
+        "header.primary",
     ] {
         assert_pointer_target(cx, selector);
     }
@@ -21471,7 +21460,7 @@ fn split_tab(
     if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
         return None;
     }
-    click(cx, "header.primary");
+    new_default_shell(cx);
     cx.update(|window, app| {
         view.update(app, |view, cx| {
             view.split_active_for_test(SplitAxis::LeftRight, window, cx);
@@ -21560,7 +21549,7 @@ async fn a_marked_split_tab_is_cleared_when_it_is_looked_at(cx: &mut TestAppCont
         return;
     };
     // A second tab takes the screen, so the first one is now in the background.
-    click(cx, "header.primary");
+    new_default_shell(cx);
     let other = cx
         .update(|_window, app| view.read(app).active_session())
         .filter(|id| *id != unfocused && *id != focused)
@@ -21660,7 +21649,7 @@ async fn a_marked_tab_keeps_its_marks_and_close_button_inside_itself(cx: &mut Te
     // Enough tabs that the strip cannot give any of them more than its minimum: the
     // state in which a tab's own content used to be squeezed outward.
     for _ in 0..6 {
-        click(cx, "header.primary");
+        new_default_shell(cx);
     }
     let tabs = cx.update(|_window, app| view.read(app).open_tabs());
     assert_eq!(
@@ -22094,7 +22083,7 @@ async fn twenty_tabs_scroll_and_leave_the_window_buttons_reachable(cx: &mut Test
         return;
     };
     for _ in 0..18 {
-        click(cx, "header.primary");
+        new_default_shell(cx);
     }
     let tabs = cx.update(|_window, app| view.read(app).open_tabs());
     assert_eq!(tabs.len(), 20, "twenty tabs are open");
@@ -33088,7 +33077,7 @@ async fn quick_connect_splits_user_host_port_on_tab_and_submits_on_enter(cx: &mu
     cx.simulate_resize(design_window());
     cx.run_until_parked();
 
-    click(cx, "shell.menu");
+    click(cx, "header.primary");
     click(cx, "menu.quick");
     assert!(cx.debug_bounds("quick.panel").is_some());
     type_into(cx, "quick.address", "deploy@127.0.0.1:2222");
@@ -33130,7 +33119,7 @@ async fn quick_connect_splits_user_host_port_on_tab_and_submits_on_enter(cx: &mu
 
     // Pressing Enter inside a Quick Connect field also starts the attempt directly.
     click(cx, "nav.hosts");
-    click(cx, "shell.menu");
+    click(cx, "header.primary");
     click(cx, "menu.quick");
     type_into(cx, "quick.address", "ops@127.0.0.1:1");
     cx.simulate_keystrokes("tab tab tab");
@@ -37929,7 +37918,7 @@ fn an_ended_shell_card_reaches_its_step(cx: &mut TestAppContext, split: Option<S
         cx.update(|_window, app| view.update(app, |view, cx| view.cycle_motion(cx)));
         cx.run_until_parked();
     }
-    click(cx, "header.primary");
+    new_default_shell(cx);
     if let Some(axis) = split {
         cx.update(|window, app| {
             view.update(app, |view, cx| view.split_active_for_test(axis, window, cx));
@@ -38049,7 +38038,7 @@ fn split_local_shell(
         cx.update(|_window, app| view.update(app, |view, cx| view.cycle_motion(cx)));
         cx.run_until_parked();
     }
-    click(cx, "header.primary");
+    new_default_shell(cx);
     cx.update(|window, app| {
         view.update(app, |view, cx| view.split_active_for_test(axis, window, cx));
     });
@@ -39523,7 +39512,7 @@ async fn the_tabs_are_pills_in_the_middle_of_the_head(cx: &mut TestAppContext) {
     if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
         return;
     }
-    click(cx, "header.primary");
+    new_default_shell(cx);
     let tab = bounds_of(cx, "session.tab.0");
     assert!(
         (tab.center().y - home.center().y).abs() <= px(0.5)

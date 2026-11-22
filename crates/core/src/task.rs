@@ -728,7 +728,9 @@ impl Transfer {
     /// still carries a hint, so no resume entry can appear for it.
     #[must_use]
     pub fn resume_hint(&self) -> Option<&ResumeHint> {
-        if !self.protocol.resumes() {
+        // A completed task has nothing left to resume; the checkpoint it passed on the
+        // way is history, and offering "resume" on it read as an unfinished copy.
+        if !self.protocol.resumes() || matches!(self.state, TransferState::Completed { .. }) {
             return None;
         }
         self.state.resume().or(self.checkpoint.as_ref())
@@ -1299,6 +1301,14 @@ impl TransferQueue {
         self.transfers
             .retain(|transfer| !transfer.state().is_finished());
         before - self.transfers.len()
+    }
+
+    /// Removes one finished task; a task still running or waiting is kept.
+    pub fn remove_finished(&mut self, id: TransferId) -> bool {
+        let before = self.transfers.len();
+        self.transfers
+            .retain(|transfer| transfer.id() != id || !transfer.state().is_finished());
+        before != self.transfers.len()
     }
 
     /// Removes every finished task belonging to one session, leaving active tasks and

@@ -351,6 +351,9 @@ pub enum SourceEvent {
     /// Not output: it says whether a remote program can reach this machine's
     /// display, and is reported to the window the pane belongs to.
     X11(X11Status),
+    /// Which operating system the server said it runs; the window keeps it for the
+    /// host's tile.
+    Platform(String),
 }
 
 /// Parse adjacent reads together; control events keep their position in the stream.
@@ -391,6 +394,7 @@ impl SourceEvent {
             // two owners, so it is ignored rather than drawn as output.
             RemoteEvent::HostKeyPrompt(_) | RemoteEvent::Connected => None,
             RemoteEvent::X11(status) => Some(Self::X11(status)),
+            RemoteEvent::Platform(platform) => Some(Self::Platform(platform)),
             RemoteEvent::Failed(error) => Some(Self::Lost(error.to_string())),
         }
     }
@@ -470,6 +474,7 @@ impl PaneSource {
                     // session_failure would turn a disconnect into "the server".
                     ChainEvent::Failed(failure) => Some(SourceEvent::Lost(failure.to_string())),
                     ChainEvent::X11 { status, .. } => Some(SourceEvent::X11(status)),
+                    ChainEvent::Platform(platform) => Some(SourceEvent::Platform(platform)),
                     ChainEvent::HopStarted(_)
                     | ChainEvent::HostKeyPrompt { .. }
                     | ChainEvent::ProxyConfirmation { .. }
@@ -566,9 +571,32 @@ pub enum PaneRequest {
     /// An image was pasted into a remote terminal: the server cannot read this
     /// computer's clipboard, so save it, upload it, then type where it went.
     PasteImage(gpui::Image),
+    /// The server said which operating system it runs.
+    Platform(String),
 }
 
 impl gpui::EventEmitter<PaneRequest> for TerminalPane {}
+
+/// How long the cursor stays lit, and then dark, in one blink.
+const CURSOR_BLINK: Duration = Duration::from_millis(530);
+
+/// The focused cursor's blink.
+///
+/// A blinking cursor is how a terminal says "the keys land here" at a glance among
+/// several panes and windows. It blinks only while the pane holds the keyboard, stays
+/// lit while the user types or the program writes - a cursor that vanishes mid-word
+/// is hard to follow - and does not blink at all under reduced motion.
+#[derive(Default)]
+struct CursorBlink {
+    /// Whether the cursor is in the dark half of its blink.
+    dark: bool,
+    /// Whether the timer that drives the blink is running.
+    running: bool,
+    /// Whether the pane held the keyboard when it was last drawn.
+    focused: bool,
+    /// Until when the cursor stays lit after a key or new output.
+    lit_until: Option<std::time::Instant>,
+}
 
 /// The background notices one terminal produced, without a trace of its text (R7).
 ///
@@ -662,6 +690,8 @@ pub struct TerminalPane {
     autoscrolling: bool,
     /// Whether the pointer is dragging the scrollback scrollbar track.
     scrollbar_drag: bool,
+    /// Where the focused cursor is in its blink.
+    cursor_blink: CursorBlink,
     /// The button a program is being told is held, while it asked for the mouse.
     mouse_held: Option<TerminalMouseButton>,
     /// The cell the last motion report named, so moving inside one cell does not
@@ -885,6 +915,7 @@ impl TerminalPane {
             drag: None,
             autoscrolling: false,
             scrollbar_drag: false,
+            cursor_blink: CursorBlink::default(),
             mouse_held: None,
             last_report_cell: None,
             menu: None,
@@ -963,6 +994,7 @@ impl TerminalPane {
             drag: None,
             autoscrolling: false,
             scrollbar_drag: false,
+            cursor_blink: CursorBlink::default(),
             mouse_held: None,
             last_report_cell: None,
             menu: None,
@@ -1040,6 +1072,7 @@ impl TerminalPane {
             drag: None,
             autoscrolling: false,
             scrollbar_drag: false,
+            cursor_blink: CursorBlink::default(),
             mouse_held: None,
             last_report_cell: None,
             menu: None,
@@ -1201,6 +1234,7 @@ impl TerminalPane {
             drag: None,
             autoscrolling: false,
             scrollbar_drag: false,
+            cursor_blink: CursorBlink::default(),
             mouse_held: None,
             last_report_cell: None,
             menu: None,
@@ -1399,6 +1433,7 @@ impl TerminalPane {
             drag: None,
             autoscrolling: false,
             scrollbar_drag: false,
+            cursor_blink: CursorBlink::default(),
             mouse_held: None,
             last_report_cell: None,
             menu: None,
@@ -1781,6 +1816,7 @@ impl TerminalPane {
         let changed = !events.is_empty();
         for event in coalesce_output(events) {
             if let SourceEvent::Data(bytes) = event {
+                self.wake_cursor();
                 let effects = self.core.feed(&bytes);
                 self.apply_effects(effects, cx);
                 self.output_search_pending = true;
@@ -1833,6 +1869,10 @@ impl TerminalPane {
                 // A display that failed does not end the session: the shell keeps
                 // working and the status is news for the session bar (R11).
                 self.x11 = Some(status);
+                self.state.accepts_input()
+            }
+            SourceEvent::Platform(platform) => {
+                cx.emit(PaneRequest::Platform(platform));
                 self.state.accepts_input()
             }
         }
@@ -1993,6 +2033,7 @@ impl TerminalPane {
         if bytes.is_empty() || !self.state.accepts_input() {
             return;
         }
+        self.wake_cursor();
         self.reveal_input(cx);
         self.write_user(bytes, cx);
     }
@@ -4476,6 +4517,53 @@ impl TerminalPane {
     /// before: a character from a fallback face (a frame line, an icon, a CJK
     /// character) is drawn in its cell and cannot push the rest of the row off its
     /// columns.
+    /// Lights the cursor and keeps it lit for one blink: it was just typed at or
+    /// written past.
+    fn wake_cursor(&mut self) {
+        self.cursor_blink.dark = false;
+        self.cursor_blink.lit_until = Some(std::time::Instant::now() + CURSOR_BLINK);
+    }
+
+    /// Starts the blink while the pane holds the keyboard; the timer stops on its own
+    /// once the pane loses it.
+    fn drive_cursor_blink(&mut self, focused: bool, cx: &mut Context<Self>) {
+        self.cursor_blink.focused = focused;
+        if !focused {
+            self.cursor_blink.dark = false;
+            return;
+        }
+        if self.cursor_blink.running || !theme::motion_allowed() {
+            return;
+        }
+        self.cursor_blink.running = true;
+        cx.spawn(async move |pane, cx| {
+            loop {
+                cx.background_executor().timer(CURSOR_BLINK).await;
+                let keep = pane
+                    .update(cx, |pane, cx| {
+                        let blink = &mut pane.cursor_blink;
+                        if !blink.focused || !theme::motion_allowed() {
+                            blink.running = false;
+                            blink.dark = false;
+                            cx.notify();
+                            return false;
+                        }
+                        let held = blink
+                            .lit_until
+                            .is_some_and(|until| std::time::Instant::now() < until);
+                        blink.dark = !held && !blink.dark;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     fn row(&self, index: usize, snapshot: &Snapshot, focused: bool) -> gpui::Div {
         let cell = self.cell.sanitized();
         let (width, height) = (cell.width, cell.height);
@@ -4491,9 +4579,12 @@ impl TerminalPane {
         };
         let canvas_color = color_of(palette::BACKGROUND);
         let cursor_color = color_of(palette::CURSOR);
-        let cursor = snapshot
-            .cursor
-            .filter(|cursor| cursor.row == index && cursor.shape != CursorShape::Hidden);
+        // In the dark half of its blink the focused cursor is not drawn, and the
+        // character under a block cursor takes its own colours again.
+        let blink_dark = focused && self.cursor_blink.dark;
+        let cursor = snapshot.cursor.filter(|cursor| {
+            cursor.row == index && cursor.shape != CursorShape::Hidden && !blink_dark
+        });
         // A focused block cursor is solid, and the character under it is drawn in
         // the canvas colour so it stays legible.
         let solid_cursor = cursor
@@ -6123,6 +6214,8 @@ impl Render for TerminalPane {
         // The advance width comes from the font the window actually resolved, so
         // the grid matches what is drawn even when the platform substitutes a face.
         let _ = self.measure_cell(window);
+        let focused = self.focus.is_focused(window);
+        self.drive_cursor_blink(focused, cx);
 
         let show_blocks =
             !self.alternate_screen() && (self.search_open || self.core.shows_command_blocks());

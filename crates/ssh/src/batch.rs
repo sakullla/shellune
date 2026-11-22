@@ -1276,7 +1276,8 @@ impl SshHostTransport {
                             RemoteEvent::Failed(error) => return Err(error.to_string()),
                             RemoteEvent::Data(_)
                             | RemoteEvent::Exited { .. }
-                            | RemoteEvent::X11(_) => {}
+                            | RemoteEvent::X11(_)
+                            | RemoteEvent::Platform(_) => {}
                         }
                     }
                 }
@@ -1330,7 +1331,8 @@ impl SshHostTransport {
                             | ChainEvent::HopReady(_)
                             | ChainEvent::Data(_)
                             | ChainEvent::Exited { .. }
-                            | ChainEvent::X11 { .. } => {}
+                            | ChainEvent::X11 { .. }
+                            | ChainEvent::Platform(_) => {}
                         }
                     }
                 }

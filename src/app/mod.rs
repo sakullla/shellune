@@ -37,6 +37,7 @@ pub mod keymap;
 pub mod layout;
 pub mod monogram;
 pub mod nav;
+pub mod os_icons;
 pub mod palette;
 pub mod product;
 pub mod remote;

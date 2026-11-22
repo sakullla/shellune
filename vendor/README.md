@@ -15,6 +15,7 @@ re-run the check each one names before accepting the upgrade.
 | Initial window background | `src/platform.rs`, `src/platform/windows/window.rs` | a light window does not open on a black flash |
 | Clipboard images and mixed items | `src/platform.rs`, `src/platform/windows/{clipboard,dib}.rs`, `src/platform/windows.rs`, `src/platform/linux/x11/{client,clipboard}.rs`, `src/platform/linux/wayland/clipboard.rs`, `src/platform/mac/platform.rs` | remote-desktop clipboard: screenshots and text-plus-image copies; macOS and Windows expose the pasteboard change count so an unchanged image need not be read again |
 | Truncated text measure cache | `src/elements/text.rs` | a truncated line draws its "…" instead of a cut letter |
+| Scroll chaining | `src/elements/div.rs` | the innermost scroll container that can still move takes the wheel and stops it; one at its end passes it on, so a list inside a scrolling dialog no longer turns both |
 
 ### Frame readback
 
@@ -211,3 +212,14 @@ no protocol library license text beside Shellune's `LICENSE`.
 
 `ring`, the crypto backend of the SSH and TLS stacks, is the only dependency that
 compiles C of its own; it does so inside its own build script, from sources it ships.
+
+### Scroll chaining
+
+The released crate applies a wheel event to every scroll container under the
+pointer: a host list inside a scrolling dialog moved together with the dialog. The
+patch keeps each container's maximum scroll from its last prepaint
+(`Interactivity::scroll_max`) and, in `paint_scroll_listener`, clamps the new offset
+first: when it changes, the event is consumed (`stop_propagation`); when the
+container is already at its end, the event reaches the containers behind it. Check
+after re-applying: a host picker in the port-forwarding dialog scrolls without moving
+the dialog, and keeps scrolling the dialog once the picker reaches its end.

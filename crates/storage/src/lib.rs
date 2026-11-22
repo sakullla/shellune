@@ -49,6 +49,7 @@ mod credentials;
 mod error;
 mod forwarding;
 mod group;
+mod platforms;
 mod portable;
 mod preferences;
 mod snippets;
@@ -72,6 +73,7 @@ pub use forwarding::{FILE_NAME as FORWARD_FILE_NAME, ForwardStore};
 pub use group::{
     FILE_NAME as GROUP_FILE_NAME, GroupDeletion, GroupError, GroupService, GroupStore, GroupUpdate,
 };
+pub use platforms::{FILE_NAME as PLATFORMS_FILE_NAME, PlatformStore};
 pub use portable::{
     ApplyMode, ApplyOutcome, ApplyPlan, Change, ExportOptions, ExportOutcome, HostOverlay,
     KdfParams, LocalData, LocalState, PORTABLE_FORMAT, PORTABLE_VERSION, Platform, PlatformData,

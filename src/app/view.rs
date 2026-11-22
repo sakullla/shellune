@@ -527,6 +527,10 @@ pub struct ShelluneView {
     /// The menu is how another shell is started while a terminal fills the panel; the
     /// empty destination shows the same choices as tiles instead.
     shell_menu_open: bool,
+    /// The search of the new-tab launcher, while the header's menu is open.
+    launcher_field: Option<Entity<TextField>>,
+    /// What that search holds.
+    launcher_query: String,
     /// The file view's right-click menu, while open.
     files_menu: Option<files_menu::FilesMenu>,
     /// Short messages in the corner, oldest first.
@@ -991,6 +995,11 @@ pub struct ShelluneView {
     terminal_scheme: theme::TerminalScheme,
     /// Whether terminals colour addresses, links and failures in plain output.
     highlight_output: bool,
+    /// Whether host tiles show their operating system, and connections ask for it.
+    os_icons: bool,
+    /// The operating system each saved host was last seen running (see
+    /// `shellune_storage::PlatformStore`).
+    platforms: std::collections::BTreeMap<HostId, String>,
     /// The global keepalive and timeout numbers (R20).
     ///
     /// `None` until the user changes one, so a preferences file written by this build
@@ -2757,6 +2766,8 @@ impl ShelluneView {
             shell_path,
             custom_shell_open: false,
             shell_menu_open: false,
+            launcher_field: None,
+            launcher_query: String::new(),
             files_menu: None,
             toasts: Vec::new(),
             next_toast: 0,
@@ -2956,6 +2967,8 @@ impl ShelluneView {
             theme_choice: theme::ThemeChoice::default(),
             terminal_scheme: theme::TerminalScheme::default(),
             highlight_output: true,
+            os_icons: true,
+            platforms: std::collections::BTreeMap::new(),
             connection_choice: None,
             connection_draft,
             connection_fields: ConnectionFields {
@@ -3098,6 +3111,9 @@ impl ShelluneView {
         if let Some(on) = saved.highlight_output {
             self.highlight_output = on;
         }
+        if let Some(on) = saved.os_icons {
+            self.os_icons = on;
+        }
         if let Some(bell) = saved.bell_notice {
             self.workspace.set_attention(AttentionKind::Bell, bell);
         }
@@ -3164,6 +3180,7 @@ impl ShelluneView {
             // user chose rather than leaving the next start to assume (R7).
             bell_notice: Some(self.workspace.attention_settings().bell),
             highlight_output: Some(self.highlight_output),
+            os_icons: Some(self.os_icons),
             command_notice: Some(self.workspace.attention_settings().finished),
             // The connection numbers are chosen on the connection page (R20). A page the
             // user never changed writes nothing, so this build's defaults are not frozen
@@ -5361,6 +5378,16 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) {
         let locals: Vec<String> = match request {
+            terminal::PaneRequest::Platform(platform) => {
+                if let Some(SessionKind::Remote { host }) = self
+                    .workspace
+                    .session(id)
+                    .map(|session| session.kind().clone())
+                {
+                    self.record_platform(host, platform, cx);
+                }
+                return;
+            }
             terminal::PaneRequest::UploadFiles(paths) => paths
                 .iter()
                 .filter(|path| path.is_file())
@@ -7351,6 +7378,7 @@ impl ShelluneView {
         match read {
             Ok(book) => {
                 self.book = book;
+                self.platforms = shellune_storage::PlatformStore::at(self.store.root()).load();
                 self.hosts.clear_message();
                 let items = self.book.hosts().to_vec();
                 self.workspace.replace_hosts(SectionStatus::Ready, items);
@@ -9416,7 +9444,7 @@ impl ShelluneView {
             // again.
             panel.forget_x11_acceptance();
         }
-        request = request.with_x11(x11);
+        request = request.with_x11(x11).with_platform_probe(self.os_icons);
         let ephemeral = self
             .pending_ephemeral
             .take()
@@ -9589,6 +9617,10 @@ impl ShelluneView {
                     }
                 }
                 LinkEvent::Connected => connected = true,
+                LinkEvent::Platform(platform) => {
+                    let host = self.attempts[index].target.id();
+                    self.record_platform(host, platform, cx);
+                }
                 LinkEvent::FailedRemote(error) => {
                     if connected {
                         pending.push(SourceEvent::Lost(error.to_string()));
@@ -13012,15 +13044,71 @@ impl ShelluneView {
         let section = |label: &'static str| components::menu_section(label, metrics);
         let divider = || components::menu_divider(metrics);
 
+        let launcher = !self.shell_menu_home;
+        let items = if launcher {
+            self.launcher_items()
+        } else {
+            Vec::new()
+        };
+        let searching = launcher && !self.launcher_query.trim().is_empty();
         let mut menu = components::menu_card("shell.picker", metrics)
             .id("shell.picker.scroll")
-            .w(metrics.scale(SHELL_PICKER_WIDTH))
+            .w(metrics.scale(if launcher {
+                LAUNCHER_WIDTH
+            } else {
+                SHELL_PICKER_WIDTH
+            }))
             .max_h(
                 (viewport.height - metrics.header_height() - metrics.scale(spacing::LOOSE))
                     .max(metrics.scale(components::MENU_MIN_WIDTH)),
             )
-            .overflow_y_scroll()
-            .child(section(ux.home_local_section));
+            .overflow_y_scroll();
+        // The launcher's search stands over everything it narrows; an address typed in
+        // full is the first thing offered under it.
+        if launcher && let Some(field) = self.launcher_field.clone() {
+            menu = menu.child(
+                div()
+                    .flex_none()
+                    .p(metrics.scale(spacing::HAIRLINE))
+                    .debug_selector(|| "launcher.search".to_owned())
+                    .child(field),
+            );
+            for item in &items {
+                if let LaunchItem::Address(target) = item {
+                    let target = target.clone();
+                    menu = menu.child(
+                        self.menu_item(
+                            Icon::Plug,
+                            true,
+                            copy::fill(ux.launcher_connect, &[("target", &target.label())]),
+                            Some(ux.home_quick_temporary_hint.to_owned()),
+                            false,
+                        )
+                        .id("launcher.address")
+                        .debug_selector(|| "launcher.address".to_owned())
+                        .on_click(cx.listener(
+                            move |this, _event, window, cx| {
+                                this.launch_item(LaunchItem::Address(target.clone()), window, cx);
+                            },
+                        )),
+                    );
+                }
+            }
+        }
+        let shown_shells: Vec<usize> = if launcher {
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    LaunchItem::Shell(index) => Some(*index),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            (0..self.workspace.shells().len()).collect()
+        };
+        if !searching || !shown_shells.is_empty() {
+            menu = menu.child(section(ux.home_local_section));
+        }
 
         if self.workspace.shells().is_empty() {
             menu = menu.child(
@@ -13033,6 +13121,9 @@ impl ShelluneView {
             );
         }
         for (index, shell) in self.workspace.shells().iter().enumerate() {
+            if !shown_shells.contains(&index) {
+                continue;
+            }
             let selected = index == self.workspace.shell_choice();
             menu = menu.child(
                 self.menu_item(
@@ -13048,6 +13139,45 @@ impl ShelluneView {
                     this.launch_choice(index, window, cx);
                 })),
             );
+        }
+        // The saved hosts, the ones reached most recently first: a new tab is as often
+        // a server as it is this computer.
+        if launcher {
+            let hosts: Vec<HostId> = items
+                .iter()
+                .filter_map(|item| match item {
+                    LaunchItem::Host(id) => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            if !hosts.is_empty() {
+                menu = menu.child(divider()).child(section(ux.home_hosts_section));
+            }
+            for (index, id) in hosts.into_iter().enumerate() {
+                let Some(host) = self.book.host(id) else {
+                    continue;
+                };
+                menu = menu.child(
+                    self.menu_item(
+                        Icon::Server,
+                        false,
+                        host.name().to_owned(),
+                        Some(host.target()),
+                        false,
+                    )
+                    .id(("launcher.host", index))
+                    .debug_selector(move || format!("launcher.host.{index}"))
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.launch_item(LaunchItem::Host(id), window, cx);
+                    })),
+                );
+            }
+            if searching {
+                // A search keeps to what it found; the other ways to open a tab come
+                // back with an empty search.
+                return Some(self.shell_menu_layer(menu, anchor, viewport, cx));
+            }
+            menu = menu.child(divider());
         }
         menu = menu
             .child(
@@ -13111,7 +13241,7 @@ impl ShelluneView {
             );
         } else {
             menu = menu
-                .child(section(ux.home_hosts_section))
+                .when(!launcher, |menu| menu.child(section(ux.home_hosts_section)))
                 .child(
                     self.menu_item(
                         Icon::Plug,
@@ -13160,51 +13290,61 @@ impl ShelluneView {
                 );
         }
 
-        Some(
-            overlay_layer().child(
-                div()
-                    .relative()
-                    .w(viewport.width)
-                    .h(viewport.height)
-                    .child(
-                        div()
-                            .id("shell.menu.backdrop")
-                            .absolute()
-                            .inset_0()
-                            .occlude()
-                            .on_any_mouse_down(cx.listener(|this, _event, _window, cx| {
-                                this.close_shell_menu(cx);
-                            })),
-                    )
-                    .child(
-                        // The home page's entry sits at the sidebar's foot, so its
-                        // menu opens beside it and grows upwards; the header's hangs
-                        // under its control.
-                        gpui::anchored()
-                            .anchor(if self.shell_menu_home {
-                                gpui::Corner::BottomLeft
-                            } else {
-                                gpui::Corner::TopLeft
-                            })
-                            .position(if self.shell_menu_home {
-                                gpui::point(
-                                    anchor.right() + metrics.scale(spacing::HAIRLINE),
-                                    anchor.bottom(),
-                                )
-                            } else {
-                                gpui::point(
-                                    anchor.left(),
-                                    anchor.bottom() + metrics.scale(spacing::NARROW),
-                                )
-                            })
-                            .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
-                            .child(
-                                div()
-                                    .occlude()
-                                    .child(components::menu_enter(menu, "shell.picker.enter")),
-                            ),
-                    ),
-            ),
+        Some(self.shell_menu_layer(menu, anchor, viewport, cx))
+    }
+
+    /// The layer the shell menu or the launcher is laid in, hung from its control.
+    fn shell_menu_layer(
+        &self,
+        menu: Stateful<Div>,
+        anchor: gpui::Bounds<gpui::Pixels>,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let metrics = self.metrics();
+        overlay_layer().child(
+            div()
+                .relative()
+                .w(viewport.width)
+                .h(viewport.height)
+                .child(
+                    div()
+                        .id("shell.menu.backdrop")
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .on_any_mouse_down(cx.listener(|this, _event, _window, cx| {
+                            this.close_shell_menu(cx);
+                        })),
+                )
+                .child(
+                    // The home page's entry sits at the sidebar's foot, so its
+                    // menu opens beside it and grows upwards; the header's hangs
+                    // under its control.
+                    gpui::anchored()
+                        .anchor(if self.shell_menu_home {
+                            gpui::Corner::BottomLeft
+                        } else {
+                            gpui::Corner::TopLeft
+                        })
+                        .position(if self.shell_menu_home {
+                            gpui::point(
+                                anchor.right() + metrics.scale(spacing::HAIRLINE),
+                                anchor.bottom(),
+                            )
+                        } else {
+                            gpui::point(
+                                anchor.left(),
+                                anchor.bottom() + metrics.scale(spacing::NARROW),
+                            )
+                        })
+                        .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
+                        .child(
+                            div()
+                                .occlude()
+                                .child(components::menu_enter(menu, "shell.picker.enter")),
+                        ),
+                ),
         )
     }
 
@@ -13293,6 +13433,114 @@ impl ShelluneView {
     }
 
     /// Closes the shell menu, and with it the path field inside it.
+    /// Opens the new-tab launcher under the header's "+" with the keyboard in its search.
+    pub(super) fn open_launcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab_menu = None;
+        self.session_more = None;
+        self.session_menu = None;
+        self.host_menu = None;
+        self.shell_menu_home = false;
+        self.shell_menu_open = true;
+        self.launcher_query.clear();
+        let field = cx.new(|cx| {
+            let mut field = TextField::new(copy::ux().launcher_placeholder, cx);
+            field.set_clearable(true, cx);
+            field
+        });
+        cx.observe(&field, |view, field, cx| {
+            let text = field.read(cx).text().to_owned();
+            if view.launcher_query != text {
+                view.launcher_query = text;
+                cx.notify();
+            }
+        })
+        .detach();
+        let submit = cx.entity().downgrade();
+        field.update(cx, |field, _cx| {
+            field.on_submit(move |_text, window, app| {
+                let submit = submit.clone();
+                window.defer(app, move |window, app| {
+                    let _ = submit.update(app, |view, cx| view.launch_first(window, cx));
+                });
+                false
+            });
+        });
+        self.remember_focus(window, cx);
+        window.focus(field.read(cx).focus_handle());
+        self.launcher_field = Some(field);
+        cx.notify();
+    }
+
+    /// What the launcher offers for its search, best first.
+    ///
+    /// Empty, it is every shell and then the saved hosts, the ones reached most
+    /// recently first. A search narrows both by every word it holds, and an address
+    /// typed in full is offered first, to connect without saving it.
+    fn launcher_items(&self) -> Vec<LaunchItem> {
+        let query = self.launcher_query.trim().to_lowercase();
+        let words: Vec<&str> = query.split_whitespace().collect();
+        let matches = |text: &str| {
+            let text = text.to_lowercase();
+            words.iter().all(|word| text.contains(word))
+        };
+        let mut items = Vec::new();
+        if let Some(target) = crate::app::hosts::parse_quick_target(&self.launcher_query) {
+            items.push(LaunchItem::Address(target));
+        }
+        for (index, shell) in self.workspace.shells().iter().enumerate() {
+            if words.is_empty() || matches(shell.name()) || matches(shell.program()) {
+                items.push(LaunchItem::Shell(index));
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        let recent = self
+            .book
+            .recent_hosts()
+            .into_iter()
+            .map(|recent| recent.host.id());
+        let all = self.book.hosts().iter().map(HostConfig::id);
+        for id in recent.chain(all) {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(host) = self.book.host(id) else {
+                continue;
+            };
+            if words.is_empty() || matches(host.name()) || matches(&host.target()) {
+                items.push(LaunchItem::Host(id));
+            }
+        }
+        items
+    }
+
+    /// Enter in the launcher: the default shell when nothing is typed, otherwise the
+    /// first thing the search offers.
+    fn launch_first(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.shell_menu_open || self.shell_menu_home {
+            return;
+        }
+        let item = if self.launcher_query.trim().is_empty() {
+            Some(LaunchItem::Shell(self.workspace.shell_choice()))
+        } else {
+            self.launcher_items().into_iter().next()
+        };
+        if let Some(item) = item {
+            self.launch_item(item, window, cx);
+        }
+    }
+
+    /// Opens one thing the launcher offered, and closes the launcher.
+    fn launch_item(&mut self, item: LaunchItem, window: &mut Window, cx: &mut Context<Self>) {
+        self.shell_menu_open = false;
+        self.launcher_field = None;
+        match item {
+            LaunchItem::Shell(index) => self.launch_choice(index, window, cx),
+            LaunchItem::Host(id) => self.connect_saved_host(id, cx),
+            LaunchItem::Address(target) => self.connect_quick_target(&target, window, cx),
+        }
+        cx.notify();
+    }
+
     fn close_shell_menu(&mut self, cx: &mut Context<Self>) {
         if self.shell_menu_open {
             self.shell_menu_open = false;
@@ -13427,6 +13675,54 @@ impl ShelluneView {
     }
 
     /// The content under the top bar: the settings, a terminal, or the hosts home.
+    /// Keeps the operating system a saved host said it runs, for its tile.
+    ///
+    /// The cache is written only when the answer changed, so a reconnect to the same
+    /// server writes nothing; a host that is not saved (a quick connection) is not
+    /// remembered.
+    fn record_platform(&mut self, host: HostId, platform: String, cx: &mut Context<Self>) {
+        if self.book.host(host).is_none()
+            || self
+                .platforms
+                .get(&host)
+                .is_some_and(|known| *known == platform)
+        {
+            return;
+        }
+        self.platforms.insert(host, platform);
+        // Hosts that are no longer saved are dropped on the way, so the cache never
+        // grows past the book.
+        self.platforms.retain(|id, _| self.book.host(*id).is_some());
+        if !self.data_writes_held() {
+            let _ = shellune_storage::PlatformStore::at(self.store.root()).save(&self.platforms);
+        }
+        cx.notify();
+    }
+
+    /// Whether host tiles show their operating system.
+    pub(super) fn os_icons(&self) -> bool {
+        self.os_icons
+    }
+
+    /// Turns the operating-system tiles on or off and remembers it.
+    pub(super) fn set_os_icons(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.os_icons == on {
+            return;
+        }
+        self.os_icons = on;
+        if self.persist_preferences() {
+            self.note_data_changed(cx);
+        }
+        cx.notify();
+    }
+
+    /// The system a host's tile shows, when the tiles show systems at all.
+    pub(super) fn host_platform(&self, host: HostId) -> Option<&str> {
+        self.os_icons
+            .then(|| self.platforms.get(&host).map(String::as_str))
+            .flatten()
+    }
+
     /// Whether terminals colour addresses, links and failures in plain output.
     pub(super) fn highlight_output(&self) -> bool {
         self.highlight_output
@@ -16593,6 +16889,7 @@ impl ShelluneView {
             .for_session(id)
             .filter(|task| task.is_active())
             .count();
+        let total = self.transfers.for_session(id).count();
         let clearable = self.transfers.has_finished_for_session(id)
             || self
                 .transfer_problem
@@ -16629,8 +16926,10 @@ impl ShelluneView {
                             .child(SharedString::from(strings.transfers_heading)),
                     )
                     .child(
+                        // How many tasks the strip lists; while any runs, the badge is
+                        // the running count in the accent instead.
                         components::badge(
-                            active,
+                            if active > 0 { active } else { total },
                             if active > 0 {
                                 Tone::Accent
                             } else {
@@ -16901,15 +17200,19 @@ impl ShelluneView {
             shellune_core::TransferState::Failed { failure, .. } => {
                 format!("{state_label} · {}", self.transfer_failure_text(failure))
             }
+            shellune_core::TransferState::Completed { bytes } => {
+                format!("{state_label} · {}", human_size(*bytes))
+            }
             _ => state_label.to_owned(),
         };
         if let Some(residue) = task.state().residue() {
             detail.push_str(&format!(" · {}: {residue}", strings.transfers_residue));
         }
         if let Some(hint) = task.resume_hint() {
-            detail.push_str(&format!(
-                " · {} {}",
-                strings.transfers_resume_from, hint.offset
+            detail.push_str(" · ");
+            detail.push_str(&copy::fill(
+                strings.transfers_resume_from,
+                &[("size", &human_size(hint.offset))],
             ));
         }
         detail
@@ -17046,8 +17349,12 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let metrics = self.metrics();
+        let strings = self.strings();
         let tone = Tone::for_transfer_state(task.state());
         let detail = self.transfer_detail(task);
+        let id = task.id();
+        let finished = task.state().is_finished();
+        let completed = matches!(task.state(), shellune_core::TransferState::Completed { .. });
         let mut actions = div()
             .flex()
             .flex_none()
@@ -17055,11 +17362,54 @@ impl ShelluneView {
             .flex_wrap()
             .gap(metrics.scale(spacing::HAIRLINE));
         actions = self.transfer_actions(actions, "transfers", index, task, false, cx);
-        // Reason and Retry come before the path. At 720×480 and 200% text the strip
-        // cannot hold a wrapped path and still show the failure, and the path is the
-        // part a reader can scroll to (R4).
-        // One task is one row of the strip's list: the panel's face with a hairline,
-        // so a row reads as one object on the chrome it lies on (ADR-7).
+        // A finished download is a file on this computer: one press shows it in the
+        // system's file manager, which is the next thing a person does with it.
+        if completed && task.direction() == shellune_core::TransferDirection::Download {
+            let path = std::path::PathBuf::from(task.destination());
+            actions = actions.child(self.row_icon_button(
+                SharedString::from(format!("transfers.reveal.{index}")),
+                Icon::FolderOpen,
+                strings.transfers_reveal,
+                false,
+                cx,
+                move |_view, cx| cx.reveal_path(&path),
+            ));
+        }
+        // A finished row leaves on its own, without clearing the others.
+        if finished {
+            actions = actions.child(self.row_icon_button(
+                SharedString::from(format!("transfers.remove.{index}")),
+                Icon::Close,
+                strings.transfers_remove,
+                false,
+                cx,
+                move |view, cx| {
+                    if view.transfers.remove_finished(id) {
+                        view.sync_transfer_section();
+                        cx.notify();
+                    }
+                },
+            ));
+        }
+        let (arrow, from, to) = match task.direction() {
+            shellune_core::TransferDirection::Download => (
+                Icon::Download,
+                format!("{}:{}", self.transfer_host_label(task), task.source()),
+                task.destination().to_owned(),
+            ),
+            shellune_core::TransferDirection::Upload => (
+                Icon::Upload,
+                task.source().to_owned(),
+                format!("{}:{}", self.transfer_host_label(task), task.destination()),
+            ),
+        };
+        let name = crate::app::transfers::file_name(task.source())
+            .unwrap_or(task.source())
+            .to_owned();
+        // One task, two lines: what and how far on the first - the direction, the
+        // file's own name, the state and the actions it allows - and where from and
+        // where to on the second, quiet and cut to one line with the whole route in
+        // its tooltip. The protocol is named only when it is not the usual SFTP.
         div()
             .id(("transfers.row", index))
             .debug_selector(move || format!("transfers.row.{index}"))
@@ -17067,75 +17417,64 @@ impl ShelluneView {
             .flex_col()
             .flex_none()
             .gap(metrics.scale(spacing::HALF))
-            .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::SURFACE))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
             .px(metrics.scale(spacing::TIGHT))
             .py(metrics.scale(spacing::NARROW))
+            .rounded(px(radius::MEDIUM))
+            .hover(|style| style.bg(theme::swatch(palette::SURFACE_HOVER)))
             .text_size(metrics.caption_size())
-            // The state and the actions it allows share one line: the button sits
-            // beside what it acts on instead of on a line of its own under the bar. In a
-            // narrow strip the actions wrap onto a line of their own rather than squeezing
-            // the words into a column of two words a line, and that line is the first
-            // one: a long reason under them is what the strip's share cuts, not the next
-            // step (R4).
             .child(
                 div()
                     .flex()
-                    .flex_wrap_reverse()
+                    .flex_wrap()
                     .items_center()
                     .gap(metrics.scale(spacing::TIGHT))
                     .min_w_0()
+                    .child(icons::icon(arrow, metrics.small_icon_size(), tone.text()))
                     .child(
                         div()
                             .flex_1()
                             .min_w(metrics.scale(FILES_SELECTION_WORDS_MIN))
-                            .whitespace_normal()
-                            .text_color(tone.text())
-                            .debug_selector(move || format!("transfers.state.{index}"))
-                            .child(SharedString::from(detail)),
+                            .truncate()
+                            .text_size(metrics.label_size())
+                            .font_weight(metrics.medium_weight())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .debug_selector(move || format!("transfers.name.{index}"))
+                            .child(SharedString::from(name)),
+                    )
+                    .when(
+                        task.protocol() != shellune_core::TransferProtocol::Sftp,
+                        |row| {
+                            row.child(
+                                components::tag(task.protocol().label(), metrics)
+                                    .debug_selector(move || format!("transfers.protocol.{index}")),
+                            )
+                        },
                     )
                     .child(actions),
+            )
+            // The state has the row's whole width under the name: a failure's reason
+            // wraps there instead of squeezing beside the buttons.
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .pl(metrics.small_icon_size() + metrics.scale(spacing::TIGHT))
+                    .text_color(tone.text())
+                    .debug_selector(move || format!("transfers.state.{index}"))
+                    .child(SharedString::from(detail)),
             )
             .children(self.transfer_progress_bar(index, task))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(metrics.scale(spacing::HAIRLINE))
-                    .min_w_0()
-                    .child(components::status_dot(tone, metrics))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .whitespace_normal()
-                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .debug_selector(move || format!("transfers.name.{index}"))
-                            .child(SharedString::from(format!(
-                                "{} · {} · {} → {}",
-                                self.direction_label(task.direction()),
-                                self.transfer_host_label(task),
-                                task.source(),
-                                task.destination()
-                            ))),
-                    )
-                    .child(
-                        // Which protocol moved these bytes: a task copied with SCP must
-                        // not be read as one that used the SFTP subsystem, and the other
-                        // way round.
-                        components::chip(
-                            SharedString::from(format!(
-                                "{} {}",
-                                self.strings().transfers_protocol_label,
-                                task.protocol().label()
-                            )),
-                            Tone::Neutral,
-                            metrics,
-                        )
-                        .debug_selector(move || format!("transfers.protocol.{index}")),
-                    ),
+                    .id(("transfers.route", index))
+                    .truncate()
+                    .pl(metrics.small_icon_size() + metrics.scale(spacing::TIGHT))
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .tooltip(components::tooltip(SharedString::from(format!(
+                        "{from} → {to}"
+                    ))))
+                    .child(SharedString::from(format!("{from} → {to}"))),
             )
     }
 
@@ -20752,6 +21091,20 @@ const RAIL_PAGE_MIN_WIDTH: f32 = 280.0;
 /// The width of the local shell picker, before zoom.
 const SHELL_PICKER_WIDTH: f32 = 320.0;
 
+/// The width of the header's launcher, which names hosts with their addresses.
+const LAUNCHER_WIDTH: f32 = 440.0;
+
+/// One thing the new-tab launcher can open.
+#[derive(Clone, Debug)]
+enum LaunchItem {
+    /// One of the detected shells.
+    Shell(usize),
+    /// A saved host.
+    Host(HostId),
+    /// An address typed into the search, connected to without saving it.
+    Address(crate::app::hosts::QuickTarget),
+}
+
 /// The height of one entry of the local shell picker, before zoom.
 const SHELL_ENTRY_HEIGHT: f32 = 34.0;
 
@@ -21437,14 +21790,20 @@ fn rebase_group_path(path: &GroupPath, from: &GroupPath, to: &GroupPath) -> Opti
 /// rows rarely share them; the colour is a hash of the whole name, so two that do
 /// still differ. A host that was really reached before is tinted in the positive tone,
 /// the same rule the recent view uses for its dot.
-fn host_avatar(name: &str, monogram: &str, reached: bool, metrics: Metrics) -> Div {
+fn host_avatar(
+    name: &str,
+    monogram: &str,
+    platform: Option<&str>,
+    reached: bool,
+    metrics: Metrics,
+) -> Div {
     let (background, text) = if reached {
         (palette::POSITIVE_TINT, palette::POSITIVE)
     } else {
         let hues = palette::AVATARS;
         hues[crate::app::monogram::colour_index(name, hues.len())]
     };
-    div()
+    let tile = div()
         .flex()
         .flex_none()
         .items_center()
@@ -21454,8 +21813,25 @@ fn host_avatar(name: &str, monogram: &str, reached: bool, metrics: Metrics) -> D
         .bg(theme::swatch(background))
         .text_size(metrics.label_size())
         .font_weight(FontWeight::BOLD)
-        .text_color(theme::swatch(text))
-        .child(SharedString::from(monogram.to_owned()))
+        .text_color(theme::swatch(text));
+    // A server that said which system it runs shows that system's mark in its own
+    // colour; one that has not yet shows its letters. The colour stays the name's, so
+    // two Debian hosts are still two different tiles.
+    let mark = metrics.scale(HOST_AVATAR_SIZE * 0.5);
+    match platform {
+        Some(id) if let Some(asset) = crate::app::os_icons::path(id) => {
+            tile.debug_selector(move || format!("host.os.{id}")).child(
+                gpui::svg()
+                    .path(asset)
+                    .size(mark)
+                    .text_color(theme::swatch(text)),
+            )
+        }
+        Some("windows") => tile
+            .debug_selector(|| "host.os.windows".to_owned())
+            .child(icons::icon(Icon::Monitor, mark, theme::swatch(text))),
+        _ => tile.child(SharedString::from(monogram.to_owned())),
+    }
 }
 
 /// A muted line of explanation under a row or a heading.

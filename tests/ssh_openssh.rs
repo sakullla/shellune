@@ -87,7 +87,10 @@ fn wait_for_outcome(session: &mut RemoteSession) -> RemoteEvent {
                 }
                 // A session without X11 forwarding reports no display status; one
                 // that used it has its own test file.
-                RemoteEvent::Data(_) | RemoteEvent::Exited { .. } | RemoteEvent::X11(_) => {}
+                RemoteEvent::Data(_)
+                | RemoteEvent::Exited { .. }
+                | RemoteEvent::X11(_)
+                | RemoteEvent::Platform(_) => {}
             }
         }
         if Instant::now() > deadline {

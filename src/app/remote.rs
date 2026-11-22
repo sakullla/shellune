@@ -943,6 +943,8 @@ pub enum LinkEvent {
     },
     /// A chain failed. The display text names the hop.
     FailedChain(ChainFailure),
+    /// The operating system the target said it runs.
+    Platform(String),
 }
 
 /// The transport behind one attempt.
@@ -987,6 +989,7 @@ impl AttemptLink {
                     },
                     RemoteEvent::Data(bytes) => LinkEvent::Data(bytes),
                     RemoteEvent::Exited { code } => LinkEvent::Exited { code },
+                    RemoteEvent::Platform(platform) => LinkEvent::Platform(platform),
                     RemoteEvent::Failed(error) => LinkEvent::FailedRemote(error),
                 })
                 .collect(),
@@ -1013,6 +1016,7 @@ impl AttemptLink {
                     ChainEvent::Data(bytes) => Some(LinkEvent::Data(bytes)),
                     ChainEvent::Exited { code } => Some(LinkEvent::Exited { code }),
                     ChainEvent::Failed(failure) => Some(LinkEvent::FailedChain(failure)),
+                    ChainEvent::Platform(platform) => Some(LinkEvent::Platform(platform)),
                 })
                 .collect(),
         }

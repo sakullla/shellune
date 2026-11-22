@@ -34,6 +34,7 @@ pub mod forwarding;
 pub mod hostkey;
 mod input;
 mod output;
+pub mod platform;
 mod scp;
 pub mod session;
 pub mod sftp;

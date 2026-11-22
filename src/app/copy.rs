@@ -743,8 +743,6 @@ pub struct Strings {
     /// The full path an upload lands at, said only when it differs from the typed
     /// directory; `{path}` is that path.
     pub transfers_lands_at: &'static str,
-    /// Word before the protocol of one transfer in the list.
-    pub transfers_protocol_label: &'static str,
     /// Why directory browsing failing does not stop a copy over SCP.
     pub files_sftp_scp_hint: &'static str,
     /// Question asked before a session with running transfers is closed.
@@ -759,6 +757,10 @@ pub struct Strings {
     pub transfers_restart: &'static str,
     /// Word before a confirmed offset that can be resumed.
     pub transfers_resume_from: &'static str,
+    /// Button that shows a downloaded file in the system's file manager.
+    pub transfers_reveal: &'static str,
+    /// Button that removes one finished transfer from the list.
+    pub transfers_remove: &'static str,
     /// Resume refused because the source changed.
     pub transfers_resume_source: &'static str,
     /// Resume refused because the partial file could not be checked.
@@ -1542,14 +1544,15 @@ pub static ENGLISH: Strings = Strings {
     transfers_remote_directory: "Remote directory",
     transfers_remote_path: "Remote path",
     transfers_lands_at: "Saves to {path}",
-    transfers_protocol_label: "Protocol",
     files_sftp_scp_hint: "Listing and managing a directory need SFTP. Copying a file still works with SCP: open Upload and type a remote directory (for example ~), or open Download and type the remote file (for example ~/report.txt), then choose SCP.",
     transfers_close_question: "Closing this session cancels its transfers",
     transfers_close_cancel: "Keep the session open",
     transfers_close_confirm: "Close and cancel",
     transfers_resume: "Resume",
     transfers_restart: "Transfer again",
-    transfers_resume_from: "Confirmed offset",
+    transfers_resume_from: "can resume from {size}",
+    transfers_reveal: "Show in folder",
+    transfers_remove: "Remove from list",
     transfers_resume_source: "The source changed, so the partial file was not resumed.",
     transfers_resume_unverifiable: "The partial file could not be checked, so it was not resumed.",
     transfers_resume_unsupported: "This target cannot resume, so the transfer did not continue.",
@@ -2107,14 +2110,15 @@ pub static CHINESE: Strings = Strings {
     transfers_remote_directory: "远端目录",
     transfers_remote_path: "远端路径",
     transfers_lands_at: "将保存到 {path}",
-    transfers_protocol_label: "协议",
     files_sftp_scp_hint: "目录列表与管理需要 SFTP。复制文件仍可用 SCP：打开“上传”并填写远端目录（例如 ~），或打开“下载”并填写远端文件（例如 ~/报告.txt），再选择 SCP。",
     transfers_close_question: "关闭这个会话会取消它的传输",
     transfers_close_cancel: "保持会话打开",
     transfers_close_confirm: "关闭并取消",
     transfers_resume: "续传",
     transfers_restart: "重新传输",
-    transfers_resume_from: "已确认偏移",
+    transfers_resume_from: "可从 {size} 处续传",
+    transfers_reveal: "在文件夹中显示",
+    transfers_remove: "从列表移除",
     transfers_resume_source: "源已变化，没有从部分文件续传。",
     transfers_resume_unverifiable: "无法校验部分文件，因此没有续传。",
     transfers_resume_unsupported: "目标不支持续传，因此没有继续。",
@@ -2469,6 +2473,10 @@ pub struct UxStrings {
     pub new_tab: &'static str,
     /// More ways to open a tab
     pub new_tab_menu: &'static str,
+    /// Placeholder of the new-tab launcher's search
+    pub launcher_placeholder: &'static str,
+    /// Launcher row that connects to a typed address without saving it
+    pub launcher_connect: &'static str,
     /// Search hosts and commands
     pub search: &'static str,
     /// This computer
@@ -2511,6 +2519,10 @@ pub struct UxStrings {
     pub settings_bell_notice: &'static str,
     /// Label of the switch that colours addresses, links and failures in output
     pub settings_highlight: &'static str,
+    /// Label of the switch that shows each host's operating system on its tile
+    pub settings_os_icons: &'static str,
+    /// What that switch does
+    pub settings_os_icons_hint: &'static str,
     /// What that switch does
     pub settings_highlight_hint: &'static str,
     /// Marks the tab; the bell byte still reaches the program
@@ -3415,6 +3427,8 @@ impl UxStrings {
             self.settings_summary,
             self.new_tab,
             self.new_tab_menu,
+            self.launcher_placeholder,
+            self.launcher_connect,
             self.search,
             self.home_local_section,
             self.home_local_hint,
@@ -3436,6 +3450,8 @@ impl UxStrings {
             self.settings_notices,
             self.settings_bell_notice,
             self.settings_highlight,
+            self.settings_os_icons,
+            self.settings_os_icons_hint,
             self.settings_highlight_hint,
             self.settings_bell_notice_hint,
             self.settings_finished_notice,
@@ -3906,7 +3922,9 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     settings_title: "Settings",
     settings_summary: "Appearance, terminal, shortcuts and data",
     new_tab: "New tab",
-    new_tab_menu: "More ways to open a tab",
+    new_tab_menu: "New tab: a shell or a host",
+    launcher_placeholder: "Search shells and hosts, or type user@host:port",
+    launcher_connect: "Connect to {target}",
     search: "Search hosts and commands",
     home_local_section: "This computer",
     home_local_hint: "Opens in a new tab",
@@ -3928,6 +3946,8 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     settings_notices: "Background notices",
     settings_bell_notice: "Bell",
     settings_highlight: "Highlight output",
+    settings_os_icons: "Operating system icons",
+    settings_os_icons_hint: "Shows the system a host runs on its tile, read from the server when you connect; turned off, the tiles show letters and servers are not asked",
     settings_highlight_hint: "Colours IP addresses, links and words like error and warning in plain output; a program's own colours and full-screen programs are left as they are",
     settings_bell_notice_hint: "Marks the tab of a shell that rang while you were elsewhere; the bell byte still reaches the program",
     settings_finished_notice: "Command ended",
@@ -4399,7 +4419,9 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     settings_title: "设置",
     settings_summary: "外观、终端、快捷键与数据",
     new_tab: "新建标签",
-    new_tab_menu: "更多打开方式",
+    new_tab_menu: "新建标签：Shell 或主机",
+    launcher_placeholder: "搜索 Shell 和主机，或输入 user@host:port",
+    launcher_connect: "连接 {target}",
     search: "搜索主机与命令",
     home_local_section: "本机",
     home_local_hint: "在新标签中打开",
@@ -4421,6 +4443,8 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     settings_notices: "后台提醒",
     settings_bell_notice: "响铃",
     settings_highlight: "高亮输出内容",
+    settings_os_icons: "操作系统图标",
+    settings_os_icons_hint: "在主机图标上显示它运行的操作系统，连接时向服务器读取；关闭后图标显示字母，也不再向服务器读取",
     settings_highlight_hint: "为普通输出中的 IP 地址、链接以及 error、warning 等字样着色；程序自己设置的颜色和全屏程序（如 vim、htop）保持不变",
     settings_bell_notice_hint: "你在别处时响铃的 Shell，其标签会被标记；响铃字节仍照常送到程序",
     settings_finished_notice: "命令结束",
