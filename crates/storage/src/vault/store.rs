@@ -333,11 +333,21 @@ impl VaultStore {
         // A local secret this machine lacks is created before anything else,
         // so a later failure has something to undo and nothing depends on a
         // store entry that was never written.
+        //
+        // One machine has one local secret, so a caller that names it twice
+        // names it once: two wraps of the same secret would double the local
+        // entry in the file, and the reader refuses a vault that does — which
+        // would make this build unable to open the very file it wrote. The
+        // passphrases are not deduped: several wraps of one purpose are a
+        // legitimate state the reader accepts.
         let mut created_local_secret = false;
+        let mut local_source_seen = false;
         let mut key_sources = Vec::with_capacity(sources.len());
         for source in sources {
             match source {
+                UnsealSource::LocalMachine if local_source_seen => {}
                 UnsealSource::LocalMachine => {
+                    local_source_seen = true;
                     let (key_source, created) = self.local_key_source(secrets)?;
                     created_local_secret |= created;
                     key_sources.push(key_source);
@@ -357,16 +367,17 @@ impl VaultStore {
             }
         }
 
-        let cipher = VaultCipher::seal(content, vault_id.as_deref(), &key_sources, kdf)?;
+        // Sealing sits inside the rollback on purpose: if it fails after this
+        // save created a local unseal secret, the entry would be a secret for
+        // a ciphertext that was never written, so it is removed again.
         let outcome = (|| {
+            let cipher = VaultCipher::seal(content, vault_id.as_deref(), &key_sources, kdf)?;
             if let Some(bytes) = &previous_bytes {
                 self.snapshot_previous(bytes)?;
             }
             self.write(&cipher)
         })();
         if outcome.is_err() && created_local_secret {
-            // The file was not replaced, so the entry this save added would be
-            // a secret for a ciphertext that does not exist.
             let _ = secrets.forget_app(AppSecret::VaultLocalUnseal);
         }
         outcome
@@ -521,6 +532,13 @@ impl VaultStore {
     }
 
     fn write(&self, cipher: &VaultCipher) -> Result<(), VaultStoreError> {
+        // The last gate before the file: nothing this build refuses to read
+        // back may be written, because a vault that cannot be opened by its
+        // own writer is locked for good — later saves keep the last good file
+        // and refuse to overwrite what they cannot read.
+        cipher
+            .validate()
+            .map_err(|reason| VaultStoreError::Invalid { reason })?;
         let file = VaultFile {
             format: VAULT_FORMAT.to_owned(),
             version: VAULT_FORMAT_VERSION,

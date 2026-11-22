@@ -205,11 +205,12 @@ impl VaultCipher {
     ///
     /// # Errors
     ///
-    /// Returns [`VaultStoreError::Invalid`] without sources,
-    /// [`VaultStoreError::EmptySecret`] for a blank passphrase, and
-    /// [`VaultStoreError::RandomSource`] or [`VaultStoreError::Encrypt`] when
-    /// the system random source or the cipher fails. Nothing is written by
-    /// this function, so no failure leaves anything behind.
+    /// Returns [`VaultStoreError::Invalid`] without sources or with the local
+    /// unseal secret named twice, [`VaultStoreError::EmptySecret`] for a blank
+    /// passphrase, and [`VaultStoreError::RandomSource`] or
+    /// [`VaultStoreError::Encrypt`] when the system random source or the
+    /// cipher fails. Nothing is written by this function, so no failure leaves
+    /// anything behind.
     pub fn seal(
         content: &VaultContent,
         vault_id: Option<&str>,
@@ -219,6 +220,21 @@ impl VaultCipher {
         if sources.is_empty() {
             return Err(VaultStoreError::Invalid {
                 reason: "a vault must be sealed for at least one way to unseal it".to_owned(),
+            });
+        }
+        // One machine has one local secret, so one wrap: a second wrap of it
+        // would be a file the reader refuses, and a caller handing the same
+        // source twice is told so here rather than locked out later.
+        // Passphrase wraps are not limited — several of one purpose are a
+        // legitimate state.
+        if sources
+            .iter()
+            .filter(|source| matches!(source, KeySource::LocalMachine(_)))
+            .count()
+            > 1
+        {
+            return Err(VaultStoreError::Invalid {
+                reason: "the local unseal secret cannot seal the vault twice".to_owned(),
             });
         }
         let kdf = checked_kdf(kdf)?;

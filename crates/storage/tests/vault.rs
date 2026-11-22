@@ -16,7 +16,7 @@ use shellune_storage::{
     AppSecret, HostKey, HostReference, HostTrust, KdfParams, KeySource, MemorySecrets,
     PassphrasePurpose, Platform, SNAPSHOT_DIRECTORY, SecretStore, ShelluneData, UnsealSource,
     VAULT_FILE_NAME, VaultCipher, VaultContent, VaultCredentialRecord, VaultKeyRecord, VaultStore,
-    VaultStoreError,
+    VaultStoreError, WrapRecord,
 };
 
 const WEBDAV_PASSWORD: &str = "the webdav account password";
@@ -868,5 +868,105 @@ fn a_vault_file_of_another_kind_of_document_is_named_as_such() {
         store.read_cipher(),
         Err(VaultStoreError::Corrupt { .. })
     ));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_duplicated_local_source_seals_once_and_never_locks_the_vault() {
+    let root = scratch("duplicate-local");
+    let store = VaultStore::at(&root);
+    let secrets = MemorySecrets::new();
+    let (vault, hosts) = content();
+
+    // One machine has one local secret: naming it twice names it once, and
+    // the file stays one this build reads back. A vault that carried the
+    // local secret twice would be refused by its own reader, and a later save
+    // would keep the unusable file for good — a vault locked by its writer.
+    store
+        .save(
+            &vault,
+            &hosts,
+            &[UnsealSource::LocalMachine, UnsealSource::LocalMachine],
+            cheap_kdf(),
+            &secrets,
+        )
+        .expect("saved");
+    let cipher = store.read_cipher().expect("reads").expect("present");
+    assert_eq!(
+        cipher
+            .wraps()
+            .iter()
+            .filter(|wrap| matches!(wrap, WrapRecord::Local { .. }))
+            .count(),
+        1,
+        "the local secret is named once"
+    );
+    store
+        .open(&UnsealSource::LocalMachine, &secrets)
+        .expect("this build opens the file it wrote");
+    store
+        .save(
+            &vault,
+            &hosts,
+            &[UnsealSource::LocalMachine, UnsealSource::LocalMachine],
+            cheap_kdf(),
+            &secrets,
+        )
+        .expect("a later save is not locked out by an unreadable file");
+    assert!(
+        store.read_cipher().expect("reads").is_some(),
+        "the vault survives its own re-save"
+    );
+
+    // A caller of the seal itself is refused outright rather than given a
+    // self-locked ciphertext.
+    let local = KeySource::LocalMachine(
+        secrets
+            .load_app(AppSecret::VaultLocalUnseal)
+            .expect("the store works")
+            .expect("the entry exists"),
+    );
+    assert!(matches!(
+        VaultCipher::seal(&vault, None, &[local.clone(), local], cheap_kdf(),),
+        Err(VaultStoreError::Invalid { .. })
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_unusable_stored_local_secret_fails_the_save_and_writes_nothing() {
+    let root = scratch("unusable-local");
+    let store = VaultStore::at(&root);
+    let (vault, hosts) = content();
+    let secrets = MemorySecrets::new();
+    // Not the entry this build writes, so the save cannot use it — and must
+    // not "clean it up" either: an entry this save did not create is not this
+    // save's to delete.
+    secrets
+        .save_app(
+            AppSecret::VaultLocalUnseal,
+            &SecretString::new("not base64"),
+        )
+        .expect("stored");
+
+    assert!(matches!(
+        store.save(
+            &vault,
+            &hosts,
+            &[UnsealSource::LocalMachine],
+            cheap_kdf(),
+            &secrets
+        ),
+        Err(VaultStoreError::Invalid { .. })
+    ));
+    assert!(!store.exists(), "no vault file was written");
+    assert_eq!(
+        secrets
+            .load_app(AppSecret::VaultLocalUnseal)
+            .expect("the store works")
+            .map(|secret| secret.expose().to_owned()),
+        Some("not base64".to_owned()),
+        "the pre-existing entry is left to its owner"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

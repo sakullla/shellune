@@ -207,17 +207,36 @@ impl VaultContent {
     ///
     /// # Errors
     ///
-    /// Returns [`VaultStoreError::Encode`] or [`VaultStoreError::Corrupt`] in
-    /// the impossible case the metadata cannot be written as a tombstone; the
-    /// record is then left exactly as it was.
+    /// Returns [`VaultStoreError::Corrupt`] in the impossible case the
+    /// metadata cannot be written as a tombstone, or the tombstone does not
+    /// survive its own round trip — which would silently resurrect the deleted
+    /// key, so the deletion is refused instead. The record is then left
+    /// exactly as it was.
     pub fn remove_key(&mut self, id: KeyId) -> Result<bool, VaultStoreError> {
         match self.keys.remove(&id) {
             Some(record) if record.meta().is_live() => {
-                let meta = tombstoned(&record.meta, record.meta.version())?;
-                // The body was dropped with the record; a tombstone holds none.
-                self.keys
-                    .insert(id, VaultKeyRecord::new(meta, SecretString::new("")));
-                Ok(true)
+                match tombstoned(&record.meta, record.meta.version()) {
+                    Ok(meta) if meta.deleted().is_some() => {
+                        // The body was dropped with the record; a tombstone
+                        // holds none.
+                        self.keys
+                            .insert(id, VaultKeyRecord::new(meta, SecretString::new("")));
+                        Ok(true)
+                    }
+                    outcome => {
+                        // A deletion that could not be recorded is no
+                        // deletion: the record goes back untouched.
+                        self.keys.insert(id, record);
+                        Err(match outcome {
+                            Ok(_) => VaultStoreError::Corrupt {
+                                reason: format!(
+                                    "the tombstone of managed key {id} did not survive its round trip; the deletion was not written"
+                                ),
+                            },
+                            Err(error) => error,
+                        })
+                    }
+                }
             }
             // A tombstone is a record, not an absence: deleting it again is no
             // change, and it stays.
@@ -298,16 +317,34 @@ impl VaultContent {
     ///
     /// # Errors
     ///
-    /// Returns [`VaultStoreError::Encode`] or [`VaultStoreError::Corrupt`] in
-    /// the impossible case the metadata cannot be written as a tombstone; the
-    /// record is then left exactly as it was.
+    /// Returns [`VaultStoreError::Corrupt`] in the impossible case the
+    /// metadata cannot be written as a tombstone, or the tombstone does not
+    /// survive its own round trip — which would silently resurrect the deleted
+    /// password, so the deletion is refused instead. The record is then left
+    /// exactly as it was.
     pub fn remove_credential(&mut self, id: CredentialId) -> Result<bool, VaultStoreError> {
         match self.credentials.remove(&id) {
             Some(record) if record.meta().is_live() => {
-                let meta = tombstoned(&record.meta, record.meta.version())?;
-                self.credentials
-                    .insert(id, VaultCredentialRecord::new(meta, SecretString::new("")));
-                Ok(true)
+                match tombstoned(&record.meta, record.meta.version()) {
+                    Ok(meta) if meta.deleted().is_some() => {
+                        self.credentials
+                            .insert(id, VaultCredentialRecord::new(meta, SecretString::new("")));
+                        Ok(true)
+                    }
+                    outcome => {
+                        // A deletion that could not be recorded is no
+                        // deletion: the record goes back untouched.
+                        self.credentials.insert(id, record);
+                        Err(match outcome {
+                            Ok(_) => VaultStoreError::Corrupt {
+                                reason: format!(
+                                    "the tombstone of shared credential {id} did not survive its round trip; the deletion was not written"
+                                ),
+                            },
+                            Err(error) => error,
+                        })
+                    }
+                }
             }
             Some(record) => {
                 self.credentials.insert(id, record);
@@ -423,6 +460,9 @@ impl VaultContent {
 /// The core model keeps the field private so a host can never grow one by
 /// accident; storage, which owns deletions, writes it the same way the sealed
 /// file does and reads it back, which is the one path the model itself offers.
+/// The caller checks the round trip actually carries the tombstone: if the
+/// core model ever renamed the field, this would silently resurrect every
+/// deleted secret, so the postcondition is verified instead of assumed.
 fn tombstoned<T>(meta: &T, version: &VaultRecordVersion) -> Result<T, VaultStoreError>
 where
     T: Serialize + DeserializeOwned,
@@ -470,9 +510,16 @@ struct WireCredential {
 }
 
 /// Serializes the content into the bytes that will be sealed. The bytes are
-/// returned zeroing, so the plaintext leaves no copy behind once it is used.
+/// returned zeroing, and the secret copies the wire body holds are wiped on
+/// every path — success and failure alike — so the plaintext leaves no copy
+/// behind once it is used.
+///
+/// The wiping is explicit rather than a `Drop` on [`WireBody`], because the
+/// reading side moves the secret strings out of the body and into
+/// [`SecretString`] values (which wipe themselves); a `Drop` impl would
+/// forbid exactly those moves.
 pub(super) fn encode(content: &VaultContent) -> Result<Zeroizing<Vec<u8>>, VaultStoreError> {
-    let wire = WireBody {
+    let mut wire = WireBody {
         keys: content
             .keys
             .values()
@@ -502,7 +549,14 @@ pub(super) fn encode(content: &VaultContent) -> Result<Zeroizing<Vec<u8>>, Vault
         references: content.references.clone(),
         trust: content.trust.clone(),
     };
-    serde_json::to_vec(&wire)
+    let outcome = serde_json::to_vec(&wire);
+    for key in &mut wire.keys {
+        key.private_key.zeroize();
+    }
+    for credential in &mut wire.credentials {
+        credential.secret.zeroize();
+    }
+    outcome
         .map(Zeroizing::new)
         .map_err(|error| VaultStoreError::Encode {
             reason: error.to_string(),
