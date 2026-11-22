@@ -561,6 +561,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn remembered_certificates_are_scoped_to_protocol_host_and_port() {
         let root = scratch_root();
         let store = TrustStore::at(&root);

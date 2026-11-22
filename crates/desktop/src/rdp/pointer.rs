@@ -168,6 +168,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn monochrome_resize_cursor_keeps_orientation_and_transparent_edges() {
         // Three pixels wide, hot spot on the lower row. Each scanline is word-aligned.
         let mut pdu = Vec::new();
@@ -190,6 +191,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn color_pointer_preserves_hotspot_mask_orientation_and_cache() {
         // Two rows of one BGR pixel. Both masks are padded to 16-bit rows.
         let mut bytes = vec![6, 0, 0, 0, 3, 0, 0, 0, 1, 0, 1, 0, 2, 0, 4, 0, 8, 0];

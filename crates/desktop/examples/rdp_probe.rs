@@ -179,7 +179,7 @@ fn main() {
                 println!("clipboard entries={}", entries.len());
             }
             Ok(Event::Notice { notice }) => println!("notice {notice:?}"),
-            Ok(Event::Pointer(_)) | Err(_) => {}
+            Ok(Event::Pointer(_) | Event::FrameResize { .. }) | Err(_) => {}
         }
     }
     let _ = client.cancel();

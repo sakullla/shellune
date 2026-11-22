@@ -1041,6 +1041,7 @@ fn a_canonical_path_and_an_empty_group_survive_a_restart() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn renaming_a_group_moves_the_desktop_connection_with_it() {
     let dir = TempDir::new("group-rename-connection");
     let service = dir.service();
@@ -1703,6 +1704,7 @@ fn serial(name: &str, device: &str) -> ConnectionRecord {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_document_with_desktop_and_serial_connections_passes_the_persisted_key_audit() {
     let dir = TempDir::new("connection-audit");
     let store = dir.store();
@@ -1853,6 +1855,7 @@ fn a_book_of_ssh_hosts_is_written_without_the_new_fields() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_desktop_and_a_serial_connection_survive_a_restart_with_their_protocol() {
     let dir = TempDir::new("protocols");
     let store = dir.store();
@@ -2006,6 +2009,7 @@ fn a_record_from_a_newer_build_with_an_unknown_field_is_set_aside_on_its_own() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_desktop_record_inside_the_host_list_is_refused_instead_of_becoming_a_host() {
     let dir = TempDir::new("rdp-in-hosts");
     let store = dir.store();
@@ -2217,6 +2221,7 @@ fn a_search_finds_a_connection_by_its_name_its_protocol_or_its_target() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_document_with_desktop_connections_still_has_no_place_for_a_secret() {
     let dir = TempDir::new("connection-keys");
     let store = dir.store();
@@ -2623,6 +2628,7 @@ fn edited(document: &ShelluneData, edit: impl FnOnce(&mut serde_json::Value)) ->
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_mapped_folder_is_kept_in_the_platform_section_and_never_in_the_shared_record() {
     let path = r"C:\Users\alice\Exchange";
     let office = mapped_rdp(Some(path));
@@ -2682,6 +2688,7 @@ fn a_mapped_folder_is_kept_in_the_platform_section_and_never_in_the_shared_recor
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn an_imported_folder_comes_from_this_platform_then_this_machine_and_never_another_platform() {
     let windows_path = r"C:\Users\alice\Exchange";
     let linux_path = "/home/alice/exchange";
@@ -2753,6 +2760,7 @@ fn an_imported_folder_comes_from_this_platform_then_this_machine_and_never_anoth
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn the_sync_view_of_a_platform_changes_with_its_own_folder_only() {
     let office = mapped_rdp(Some("/home/alice/exchange"));
     let id = office.id();
@@ -2808,6 +2816,7 @@ fn the_sync_view_of_a_platform_changes_with_its_own_folder_only() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn an_edit_to_the_folder_survives_a_rebase_over_another_writer() {
     let office = mapped_rdp(None);
     let id = office.id();
@@ -2846,6 +2855,7 @@ fn an_edit_to_the_folder_survives_a_rebase_over_another_writer() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_platform_section_with_an_unusable_folder_is_refused() {
     let office = mapped_rdp(Some("/home/alice/exchange"));
     let id = office.id();

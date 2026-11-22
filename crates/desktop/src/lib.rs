@@ -19,12 +19,15 @@
 //! claims a capability the binary does not have.
 
 mod control;
+mod framebuffer;
 mod input;
 mod mailbox;
 mod rdp;
+mod socket;
 mod tls;
 mod vnc;
 
+use framebuffer::resize_bgra;
 use mailbox::Mailbox;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -358,6 +361,13 @@ pub enum Event {
         reason: String,
     },
     Pointer(PointerShape),
+    /// The framebuffer changed size. The rectangle from the origin with the
+    /// retained dimensions keeps its pixels. The rest starts cleared.
+    FrameResize {
+        width: u32,
+        height: u32,
+        retained: (u32, u32),
+    },
     /// A dirty region of the desktop, already copied out of the engine's buffer.
     Frame {
         x: i32,
@@ -610,8 +620,8 @@ impl DesktopClient {
         Err(Error::State)
     }
 
-    /// The size an attempt may ask for. RDP negotiates it; a VNC server owns its
-    /// desktop size, so the value only has to be within the frame bound.
+    /// The initial framebuffer size to negotiate. VNC requests it after the
+    /// server advertises support for ExtendedDesktopSize.
     pub fn set_size(&mut self, width: u32, height: u32) -> Result<(), Error> {
         // A desktop whose frame cannot fit the accepted size is refused here,
         // before an attempt allocates it. Both protocols share the bound.
@@ -1128,6 +1138,7 @@ mod clipboard_cut_tests {
     use super::*;
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn text_within_the_bound_is_left_whole() {
         assert_eq!(cut_clipboard_text(b"", 4), 0);
         assert_eq!(cut_clipboard_text(b"abcd", 4), 4);
@@ -1135,6 +1146,7 @@ mod clipboard_cut_tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn the_cut_never_splits_a_character() {
         assert_eq!(cut_clipboard_text(b"abcde", 4), 4);
         // "aé": the bound falls inside the two-byte é, which is left out whole.

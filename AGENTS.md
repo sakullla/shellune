@@ -23,7 +23,7 @@ Use four-space indentation and rustfmt. Use `snake_case` for modules and functio
 
 Keep unit tests beside the implementation in `#[cfg(test)]` modules. Use the GPUI test harness for window interactions. Place integration tests in `tests/` or the owning crate’s `tests/` directory. Name files by feature, such as `tests/ssh_forwarding.rs`, and test functions by expected behavior, such as `a_blank_name_falls_back_to_the_program`.
 
-Run `cargo test -p shellune-core` for focused model changes. CI runs `cargo test --workspace --all-features -- --include-ignored` with `SHELLUNE_REQUIRE_NATIVE=1` on Windows, macOS, and Linux.
+Run `cargo test -p shellune-core` for focused model changes. CI runs `cargo test --workspace --all-features` on Windows, macOS, and Linux. RDP and VNC tests are opt-in. Use `cargo test -p shellune-desktop -- --ignored` for the protocol suite, or `cargo test --test rdp_vnc -- --ignored --nocapture` for configured real endpoints.
 
 ## Commits and Pull Requests
 

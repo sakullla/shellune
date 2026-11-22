@@ -16,6 +16,21 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 /// A decoded TLS stream over S; reads and writes go through the connection.
 pub(crate) type SecureStream<S> = StreamOwned<ClientConnection, S>;
 
+/// During a live session, yield to keyboard and pointer input between socket
+/// reads even when a TLS record arrives continuously in small fragments.
+pub(crate) fn read_update<S: Read + Write>(
+    stream: &mut SecureStream<S>,
+    buffer: &mut [u8],
+) -> io::Result<usize> {
+    match stream.conn.reader().read(buffer) {
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            stream.conn.complete_io(&mut stream.sock)?;
+            stream.conn.reader().read(buffer)
+        }
+        result => result,
+    }
+}
+
 /// The verifier reports a refusal with this text, so a session can tell a rejected
 /// certificate from a broken handshake.
 pub(crate) const CERTIFICATE_REJECTED: &str = "certificate rejected";

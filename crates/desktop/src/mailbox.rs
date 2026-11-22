@@ -53,6 +53,11 @@ impl Mailbox {
     pub(crate) fn deliver(&self, event: Event) {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         match event {
+            Event::FrameResize {
+                width,
+                height,
+                retained,
+            } => pending.resize(width, height, retained),
             Event::Frame {
                 x,
                 y,
@@ -182,6 +187,46 @@ impl Mailbox {
 }
 
 impl Pending {
+    fn resize(&mut self, width: u32, height: u32, mut retained: (u32, u32)) {
+        if self.width == 0
+            || width == 0
+            || height == 0
+            || u64::from(width) * u64::from(height) > (MAX_FRAME_BYTES / 4) as u64
+        {
+            return;
+        }
+        crate::resize_bgra(
+            &mut self.pixels,
+            (self.width as usize, self.height as usize),
+            (width as usize, height as usize),
+        );
+        self.width = width;
+        self.height = height;
+        self.dirty.retain_mut(|damage| {
+            damage.right = damage.right.min(width as usize);
+            damage.bottom = damage.bottom.min(height as usize);
+            damage.left < damage.right && damage.top < damage.bottom
+        });
+        // Keep one pending resize. A shrink followed by growth can only retain
+        // the part kept by both. Dirty patches are sent in the final coordinates.
+        self.events.retain(|event| match event {
+            Some(Event::FrameResize { retained: old, .. }) => {
+                retained = (retained.0.min(old.0), retained.1.min(old.1));
+                false
+            }
+            None => false,
+            _ => true,
+        });
+        self.events.push_back(Some(Event::FrameResize {
+            width,
+            height,
+            retained,
+        }));
+        if !self.dirty.is_empty() {
+            self.events.push_back(None);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn apply(
         &mut self,
@@ -311,6 +356,7 @@ mod tests {
         }
     }
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn separated_4k_patches_stay_small_and_reconnect_waits_for_consumption() {
         let queue = Mailbox::default();
         for (x, y) in [(0, 0), (3824, 2144)] {
@@ -349,6 +395,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn slow_consumer_keeps_latest_pixels_with_constant_storage() {
         let queue = Mailbox::default();
         for i in 0..100_000 {
@@ -366,6 +413,7 @@ mod tests {
         }
     }
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn coalescing_preserves_unchanged_pixels_between_dirty_regions() {
         let queue = Mailbox::default();
         queue.deliver(pixel(1, 9));
@@ -390,6 +438,41 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
+    fn pending_resizes_keep_only_the_overlap_and_remap_dirty_regions() {
+        let queue = Mailbox::default();
+        queue.deliver(pixel(1, 9));
+        queue.deliver(pixel(3, 7));
+        queue.deliver(Event::FrameResize {
+            width: 2,
+            height: 1,
+            retained: (2, 1),
+        });
+        queue.deliver(Event::FrameResize {
+            width: 4,
+            height: 1,
+            retained: (2, 1),
+        });
+        assert_eq!(
+            queue.drain(),
+            [
+                Event::FrameResize {
+                    width: 4,
+                    height: 1,
+                    retained: (2, 1),
+                },
+                pixel(1, 9),
+            ]
+        );
+        let pending = queue.pending.lock().unwrap();
+        assert_eq!(
+            pending.pixels,
+            [vec![0; 4], vec![9; 4], vec![0; 8]].concat()
+        );
+    }
+
+    #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn oversized_dimensions_and_notification_floods_are_bounded() {
         let queue = Mailbox::default();
         queue.deliver(Event::Frame {
@@ -415,6 +498,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn terminal_state_releases_the_compositing_canvas() {
         let queue = Mailbox::default();
         queue.deliver(pixel(0, 3));

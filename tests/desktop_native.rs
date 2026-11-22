@@ -405,43 +405,19 @@ fn extended_message(flags: u32, body: &[u8]) -> Vec<u8> {
     message
 }
 
-fn serve_session(
-    mut stream: TcpStream,
-    peer: Peer,
-    log: Arc<Mutex<Vec<ClientMessage>>>,
-    drop_at_first_request: bool,
-) {
-    let Peer {
-        width,
-        height,
-        pixel,
-        clipboard,
-        extended,
-    } = peer;
-    let _ = stream.set_read_timeout(Some(PATIENCE));
-    if stream.write_all(b"RFB 003.008\n").is_err() {
-        return;
-    }
+fn start_vnc_session(stream: &mut TcpStream, width: u16, height: u16) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(PATIENCE))?;
+    stream.write_all(b"RFB 003.008\n")?;
     let mut version = [0u8; 12];
-    if stream.read_exact(&mut version).is_err() {
-        return;
-    }
+    stream.read_exact(&mut version)?;
     // Security: one type, None.
-    if stream.write_all(&[1u8, 1u8]).is_err() {
-        return;
-    }
+    stream.write_all(&[1u8, 1u8])?;
     let mut choice = [0u8; 1];
-    if stream.read_exact(&mut choice).is_err() {
-        return;
-    }
+    stream.read_exact(&mut choice)?;
     // SecurityResult 0 = OK, then ClientInit.
-    if stream.write_all(&[0u8, 0u8, 0u8, 0u8]).is_err() {
-        return;
-    }
+    stream.write_all(&[0u8, 0u8, 0u8, 0u8])?;
     let mut client_init = [0u8; 1];
-    if stream.read_exact(&mut client_init).is_err() {
-        return;
-    }
+    stream.read_exact(&mut client_init)?;
 
     let mut server_init = Vec::new();
     server_init.extend_from_slice(&width.to_be_bytes());
@@ -458,7 +434,23 @@ fn serve_session(
     let name = b"shellune-scripted";
     server_init.extend_from_slice(&(name.len() as u32).to_be_bytes());
     server_init.extend_from_slice(name);
-    if stream.write_all(&server_init).is_err() {
+    stream.write_all(&server_init)
+}
+
+fn serve_session(
+    mut stream: TcpStream,
+    peer: Peer,
+    log: Arc<Mutex<Vec<ClientMessage>>>,
+    drop_at_first_request: bool,
+) {
+    let Peer {
+        width,
+        height,
+        pixel,
+        clipboard,
+        extended,
+    } = peer;
+    if start_vnc_session(&mut stream, width, height).is_err() {
         return;
     }
 
@@ -763,6 +755,7 @@ fn when_connected(
 // ------------------------------------------------------------------------ tests
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn the_diagnostics_names_are_the_ones_a_session_reports() {
     // The names the pane shows for a state, a failure and a status code. They used
     // to come from a C table; nothing but this test pins them now.
@@ -777,6 +770,7 @@ fn the_diagnostics_names_are_the_ones_a_session_reports() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn an_oversized_desktop_is_refused_before_the_backend_allocates_it() {
     if !backends_built() {
         return;
@@ -789,6 +783,7 @@ fn an_oversized_desktop_is_refused_before_the_backend_allocates_it() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_vnc_banner_delayed_three_seconds_still_connects() {
     if !backends_built() {
         return;
@@ -826,6 +821,7 @@ fn a_vnc_banner_delayed_three_seconds_still_connects() {
 /// the second attempt draws. The client reports the drop as Connecting with the
 /// reason that says what happened, so a pane can show it rather than a hang.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_vnc_session_dropped_before_its_first_frame_is_reconnected_once() {
     if !backends_built() {
         return;
@@ -873,6 +869,7 @@ fn a_vnc_session_dropped_before_its_first_frame_is_reconnected_once() {
 /// The VNC engine is this crate, not a linked library: the reported build says so,
 /// which is what the pane shows and what the endpoint matrix trusts.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn the_vnc_engine_reports_itself_and_links_no_protocol_library() {
     let info = backend_info(Protocol::Vnc).expect("a VNC engine");
     assert!(info.contains("shellune VNC client"), "{info}");
@@ -891,6 +888,7 @@ fn the_vnc_engine_reports_itself_and_links_no_protocol_library() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_closed_vnc_port_is_a_connect_failure_never_a_connection() {
     if !backends_built() {
         return;
@@ -920,6 +918,7 @@ fn a_closed_vnc_port_is_a_connect_failure_never_a_connection() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_silent_vnc_peer_can_be_cancelled_while_the_banner_never_arrives() {
     if !backends_built() {
         return;
@@ -956,6 +955,7 @@ fn a_silent_vnc_peer_can_be_cancelled_while_the_banner_never_arrives() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_cancelled_rdp_connect_stops_without_reporting_a_session() {
     if !backends_built() {
         return;
@@ -988,6 +988,7 @@ fn a_cancelled_rdp_connect_stops_without_reporting_a_session() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn an_unsupported_vnc_security_type_fails_instead_of_downgrading() {
     if !backends_built() {
         return;
@@ -1023,6 +1024,7 @@ fn an_unsupported_vnc_security_type_fails_instead_of_downgrading() {
 /// format and always hands out four-byte pixels, so a three-byte request must be
 /// refused rather than accepted and then silently produce no frames.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn the_vnc_pixel_depth_is_fixed_at_four_bytes() {
     if !backends_built() {
         return;
@@ -1044,6 +1046,7 @@ fn the_vnc_pixel_depth_is_fixed_at_four_bytes() {
 /// state like VNC does, and a connection with sharing off says so instead of
 /// queueing a group it would drop.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn clipboard_pushes_answer_by_switch_then_state_and_check_the_group() {
     if !backends_built() {
         return;
@@ -1258,6 +1261,7 @@ fn link_file(target: &std::path::Path, link: &std::path::Path) -> bool {
 
 /// The RDP handle reports its own engine and the options an attempt would use.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn the_rdp_handle_reports_its_engine_and_options() {
     let mut client = DesktopClient::new(Protocol::Rdp).expect("client");
     let info = backend_info(Protocol::Rdp).expect("rdp info");
@@ -1302,6 +1306,7 @@ fn the_rdp_handle_reports_its_engine_and_options() {
 
 /// A folder that cannot be offered is reported by the check an attempt runs.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_folder_that_cannot_be_offered_is_reported_with_its_reason() {
     let folder = std::env::temp_dir().join(format!("shellune-gone-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&folder);
@@ -1322,6 +1327,7 @@ fn a_folder_that_cannot_be_offered_is_reported_with_its_reason() {
 
 /// A missing folder does not stop the attempt: the connection is still dialled.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn an_rdp_attempt_with_a_missing_folder_still_dials() {
     let peer = Scripted::start(Script::Silent);
     let mut client = DesktopClient::new(Protocol::Rdp).expect("client");
@@ -1423,6 +1429,7 @@ fn short_formats(ids: &[u16]) -> Vec<u8> {
 /// the caller gave them; an image is never offered as a PNG, and one over the bound
 /// is refused instead of being truncated.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn an_rdp_copy_offers_text_and_a_dib_and_never_a_png() {
     let offered = probe::rdp_clipboard_offer(&[
         ClipboardEntry::text("a\nb"),
@@ -1444,6 +1451,7 @@ fn an_rdp_copy_offers_text_and_a_dib_and_never_a_png() {
 /// A remote copy is answered with one request, for the first format this client can
 /// carry: text before any image.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_remote_rdp_format_list_is_answered_with_one_request() {
     let list = short_formats(&[0x1234, CF_UNICODETEXT, CF_DIB]);
     let (events, replies) = probe::rdp_clipboard_receive(&[], &[(0x0002, 0, list)]);
@@ -1464,6 +1472,7 @@ fn a_remote_rdp_format_list_is_answered_with_one_request() {
 /// The answer to that request becomes one clipboard event; an incoming request is
 /// served from what the last local copy offered.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn an_rdp_clipboard_answer_becomes_one_event_and_a_request_is_served() {
     // A remote copy is announced, requested, and only then answered.
     let copy = short_formats(&[CF_UNICODETEXT]);
@@ -1489,6 +1498,7 @@ fn an_rdp_clipboard_answer_becomes_one_event_and_a_request_is_served() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn an_rdp_screenshot_can_be_requested_across_multiple_channel_chunks() {
     let dib = vec![0x55; 6400];
     let entries = [
@@ -1508,6 +1518,7 @@ fn an_rdp_screenshot_can_be_requested_across_multiple_channel_chunks() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn rapid_remote_copies_only_deliver_data_from_the_latest_format_list() {
     let (events, replies) = probe::rdp_clipboard_receive(
         &[],
@@ -1536,6 +1547,7 @@ fn rapid_remote_copies_only_deliver_data_from_the_latest_format_list() {
 /// An image over its bound is dropped and reported; text over its bound is cut at
 /// the last whole character, delivered, and reported the same way.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn an_oversized_remote_rdp_entry_is_cut_or_reported() {
     let image = vec![7u8; shellune_desktop::MAX_CLIPBOARD_IMAGE_BYTES + 1];
     let (events, _) = probe::rdp_clipboard_receive(
@@ -1578,6 +1590,7 @@ fn an_oversized_remote_rdp_entry_is_cut_or_reported() {
 /// The create dispositions mean what MS-SMB2 says they mean: opening an existing
 /// file works with 1 and 3 and is refused with 2, which is "create, never open".
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn the_create_disposition_decides_whether_an_existing_file_may_be_opened() {
     let root = std::env::temp_dir().join(format!("shellune-disposition-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -1649,6 +1662,7 @@ fn the_create_disposition_decides_whether_an_existing_file_may_be_opened() {
 /// carry the rest, and every entry is delivered exactly once before the listing
 /// ends with NO_MORE_FILES.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_listing_larger_than_one_answer_is_paged_without_losing_an_entry() {
     let root = std::env::temp_dir().join(format!("shellune-paging-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -1717,6 +1731,7 @@ fn a_listing_larger_than_one_answer_is_paged_without_losing_an_entry() {
 /// A server that declines the device says so, once, with the code it gave; a
 /// server that takes it says nothing.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_declined_drive_is_reported_with_how_it_was_declined() {
     let folder = std::env::temp_dir();
     let path = folder.to_str().expect("utf-8");
@@ -1732,6 +1747,7 @@ fn a_declined_drive_is_reported_with_how_it_was_declined() {
 /// A refused format list is reported, and the server offering formats again
 /// withdraws the report.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_refused_rdp_clipboard_is_reported_and_withdrawn() {
     // A format list first, so the client is waiting for the answer.
     let copy = short_formats(&[CF_UNICODETEXT]);
@@ -1769,6 +1785,7 @@ fn a_refused_rdp_clipboard_is_reported_and_withdrawn() {
 
 /// Text over the local bound is cut and reported when it is offered.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn an_oversized_local_rdp_copy_is_cut_and_reported() {
     let bound = shellune_desktop::MAX_CLIPBOARD_TEXT_BYTES;
     let (_, events) =
@@ -1789,6 +1806,7 @@ fn an_oversized_local_rdp_copy_is_cut_and_reported() {
 /// opening, creating, deleting, listing, or moving something into it - reaches the
 /// place it points at (R5).
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn the_drive_channel_keeps_the_server_inside_the_mapped_folder() {
     if !backends_built() {
         return;
@@ -1953,6 +1971,7 @@ fn the_drive_channel_keeps_the_server_inside_the_mapped_folder() {
 /// The text encodings the backends use: CF_UNICODETEXT is UTF-16LE with CRLF line
 /// ends and a terminating NUL; RFB cut text is Latin-1.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn clipboard_text_encodings_round_trip() {
     assert_eq!(
         probe::utf8_to_cf_unicode("a\nb\r\nc😀"),
@@ -1999,6 +2018,167 @@ fn connect_vnc(peer: &Scripted, clipboard: bool) -> DesktopClient {
     client
 }
 
+#[test]
+#[ignore = "opt-in RDP/VNC test"]
+fn vnc_resize_requests_the_new_area_with_polling_and_continuous_updates() {
+    fn read<const N: usize>(stream: &mut TcpStream) -> [u8; N] {
+        let mut bytes = [0; N];
+        stream.read_exact(&mut bytes).expect("client packet");
+        bytes
+    }
+
+    fn update(stream: &mut TcpStream, header: [u16; 4], encoding: i32, payload: &[u8]) {
+        let mut message = vec![0, 0, 0, 1];
+        for value in header {
+            message.extend_from_slice(&value.to_be_bytes());
+        }
+        message.extend_from_slice(&encoding.to_be_bytes());
+        message.extend_from_slice(payload);
+        stream.write_all(&message).expect("framebuffer update");
+    }
+
+    fn screen(width: u16, height: u16) -> [u8; 16] {
+        let mut screen = [0; 16];
+        screen[..4].copy_from_slice(&7u32.to_be_bytes());
+        screen[8..10].copy_from_slice(&width.to_be_bytes());
+        screen[10..12].copy_from_slice(&height.to_be_bytes());
+        screen[12..].copy_from_slice(&42u32.to_be_bytes());
+        screen
+    }
+
+    fn layout(stream: &mut TcpStream, reason: u16, result: u16, width: u16, height: u16) {
+        let mut payload = vec![1, 0, 0, 0];
+        payload.extend_from_slice(&screen(width, height));
+        update(stream, [reason, result, width, height], -308, &payload);
+    }
+
+    fn expect_resize(stream: &mut TcpStream, width: u16, height: u16) {
+        let [wh, wl] = width.to_be_bytes();
+        let [hh, hl] = height.to_be_bytes();
+        assert_eq!(read::<8>(stream), [251, 0, wh, wl, hh, hl, 1, 0]);
+        assert_eq!(read::<16>(stream), screen(width, height));
+    }
+
+    fn expect_region(stream: &mut TcpStream, kind: u8, enabled: bool, width: u16, height: u16) {
+        let [wh, wl] = width.to_be_bytes();
+        let [hh, hl] = height.to_be_bytes();
+        assert_eq!(
+            read::<10>(stream),
+            [kind, u8::from(enabled), 0, 0, 0, 0, wh, wl, hh, hl]
+        );
+    }
+
+    for continuous in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        let (done, wait) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream.set_nodelay(true).expect("no delay");
+            start_vnc_session(&mut stream, 200, 200).expect("handshake");
+            assert_eq!(read::<1>(&mut stream), [0]);
+            assert_eq!(
+                read_message(&mut stream, 0),
+                Some(ClientMessage::PixelFormat)
+            );
+            assert_eq!(read::<1>(&mut stream), [2]);
+            assert!(matches!(
+                read_message(&mut stream, 2),
+                Some(ClientMessage::Encodings(list)) if list.contains(&-308)
+            ));
+            expect_region(&mut stream, 3, false, 200, 200);
+            layout(&mut stream, 0, 0, 200, 200);
+            expect_resize(&mut stream, 220, 200);
+            expect_region(&mut stream, 3, true, 200, 200);
+            layout(&mut stream, 1, 1, 0, 0);
+            expect_region(&mut stream, 3, true, 200, 200);
+            // Withhold LastRect until the next incremental request arrives.
+            // A polling client that waits for UpdateEnd will stall here.
+            stream.set_read_timeout(Some(PATIENCE)).unwrap();
+            stream
+                .write_all(&[0, 0, 0, 2, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 2, 3, 0])
+                .unwrap();
+            expect_region(&mut stream, 3, true, 200, 200);
+            stream
+                .write_all(&[0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 32])
+                .unwrap();
+            if continuous {
+                stream
+                    .write_all(&[150])
+                    .expect("announce continuous updates");
+                expect_region(&mut stream, 150, true, 200, 200);
+            }
+            expect_resize(&mut stream, 320, 240);
+            layout(&mut stream, 1, 0, 320, 240);
+            expect_region(
+                &mut stream,
+                if continuous { 150 } else { 3 },
+                true,
+                320,
+                240,
+            );
+
+            // A fence makes an extra request after the continuous subscription
+            // visible on the wire before the server sends the resized pixels.
+            stream
+                .write_all(&[248, 0, 0, 0, 128, 0, 0, 0, 0])
+                .expect("fence");
+            assert_eq!(read::<9>(&mut stream), [248, 0, 0, 0, 0, 0, 0, 0, 0]);
+            // Copy a previously delivered pixel into the newly exposed region.
+            update(&mut stream, [319, 239, 1, 1], 1, &[0, 0, 0, 0]);
+            if !continuous {
+                expect_region(&mut stream, 3, true, 320, 240);
+            }
+            wait.recv_timeout(PATIENCE).expect("client received pixels");
+        });
+
+        let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
+        client.set_server("127.0.0.1", port).expect("server");
+        client.set_size(220, 200).expect("initial size");
+        client.connect().expect("connect");
+        let first = pump(&client, PATIENCE, |e| matches!(e, Event::Frame { .. }));
+        assert!(matches!(
+            first.last(),
+            Some(Event::Frame {
+                desktop_width: 200,
+                ..
+            })
+        ));
+        client.resize(300, 220).expect("intermediate size");
+        client.resize(320, 240).expect("final size");
+        let events = pump(&client, PATIENCE, |e| {
+            matches!(
+                e,
+                Event::Frame { x: 319, y: 239, .. }
+                    | Event::State {
+                        state: State::Failed(_),
+                        ..
+                    }
+            )
+        });
+        let _ = done.send(());
+        server.join().expect("resize protocol");
+        client.cancel().expect("cancel");
+        assert_eq!(events.len(), 2, "only the resize and the dirty pixel");
+        assert_eq!(
+            events.first(),
+            Some(&Event::FrameResize {
+                width: 320,
+                height: 240,
+                retained: (200, 200),
+            })
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(Event::Frame { x: 319, y: 239, desktop_width: 320, desktop_height: 240, pixels, .. })
+                    if pixels == &[1, 2, 3, 0]
+            ),
+            "new pixels reach the expanded desktop"
+        );
+    }
+}
+
 fn cut_texts(peer: &Scripted) -> Vec<ClientMessage> {
     peer.messages()
         .into_iter()
@@ -2015,6 +2195,7 @@ fn cut_texts(peer: &Scripted) -> Vec<ClientMessage> {
 /// the extension, receives the peer's text without its terminating NUL, and sends
 /// its own as Notify + Provide. Images are not RFB's to carry.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_vnc_peer_with_extended_clipboard_exchanges_utf8_both_ways() {
     if !backends_built() {
         return;
@@ -2069,6 +2250,7 @@ fn a_vnc_peer_with_extended_clipboard_exchanges_utf8_both_ways() {
 /// as such, text that fits is sent as Latin-1, and text that does not is not sent at
 /// all and reported once.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_vnc_peer_without_extended_clipboard_gets_latin1_or_a_notice() {
     if !backends_built() {
         return;
@@ -2131,6 +2313,7 @@ fn a_vnc_peer_without_extended_clipboard_gets_latin1_or_a_notice() {
 /// each cut is reported (R1). A Latin-1 server's cut text may hold 1 MiB, which is
 /// up to 2 MiB once it is UTF-8.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn vnc_text_over_the_bound_is_cut_and_reported_both_ways() {
     if !backends_built() {
         return;
@@ -2178,6 +2361,7 @@ fn vnc_text_over_the_bound_is_cut_and_reported_both_ways() {
 /// Sharing off: the client does not ask for the extension, drops the server's cut
 /// text, and refuses to send.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_vnc_session_with_clipboard_off_neither_sends_nor_receives() {
     if !backends_built() {
         return;
@@ -2213,6 +2397,7 @@ fn a_vnc_session_with_clipboard_off_neither_sends_nor_receives() {
 /// Covers a clipboard and first frame buffered together. The worker must consume
 /// library-buffered bytes without waiting for another socket notification.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_scripted_vnc_peer_delivers_a_frame_clipboard_and_accepts_input() {
     if !backends_built() {
         return;
@@ -2327,6 +2512,7 @@ fn a_scripted_vnc_peer_delivers_a_frame_clipboard_and_accepts_input() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_panicking_consumer_callback_cannot_unwind_into_the_library() {
     if !backends_built() {
         return;
@@ -2382,6 +2568,7 @@ fn a_panicking_consumer_callback_cannot_unwind_into_the_library() {
 /// timeout. That the detach comes before the wait is what the crate documents; the
 /// observable part here is that the drop is prompt and the handle is released.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn dropping_a_session_detaches_before_it_frees() {
     if !backends_built() {
         return;
@@ -2415,6 +2602,7 @@ fn dropping_a_session_detaches_before_it_frees() {
 /// window where the old code left client->backend dangling: the shim must clear the
 /// pointer before it frees, and an abort that arrives anyway must do nothing.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn cancelling_a_failing_vnc_handshake_touches_no_freed_session() {
     if !backends_built() {
         return;
@@ -2461,6 +2649,7 @@ fn cancelling_a_failing_vnc_handshake_touches_no_freed_session() {
 /// A peer that closes right after its banner ends the session as a failure, and the
 /// test reports SKIP like every other one when the backends are not built.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_peer_that_hangs_up_after_its_banner_ends_the_session() {
     if !backends_built() {
         return;

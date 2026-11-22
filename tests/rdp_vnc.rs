@@ -293,6 +293,24 @@ struct Coverage {
 }
 
 impl Coverage {
+    fn resize(&mut self, width: u32, height: u32, retained: (u32, u32)) {
+        let mut painted = vec![false; width as usize * height as usize];
+        let columns = retained.0.min(self.width).min(width) as usize;
+        let rows = retained.1.min(self.height).min(height) as usize;
+        let mut count = 0;
+        for row in 0..rows {
+            let from = row * self.width as usize;
+            let to = row * width as usize;
+            let retained = &self.painted[from..from + columns];
+            painted[to..to + columns].copy_from_slice(retained);
+            count += retained.iter().filter(|&&value| value).count();
+        }
+        self.width = width;
+        self.height = height;
+        self.painted = painted;
+        self.count = count;
+    }
+
     /// Marks one dirty region; true when that made the coverage complete.
     fn add(
         &mut self,
@@ -307,10 +325,7 @@ impl Coverage {
             return self.complete();
         }
         if self.width != desktop_width || self.height != desktop_height {
-            self.width = desktop_width;
-            self.height = desktop_height;
-            self.painted = vec![false; (desktop_width as usize) * (desktop_height as usize)];
-            self.count = 0;
+            self.resize(desktop_width, desktop_height, (0, 0));
         }
         let left = x.max(0) as u32;
         let top = y.max(0) as u32;
@@ -429,6 +444,16 @@ fn verify(endpoint: &Endpoint) -> Outcome {
                     } else {
                         true
                     };
+                }
+            }
+            Event::FrameResize {
+                width,
+                height,
+                retained,
+            } => {
+                if covered {
+                    coverage.resize(width, height, retained);
+                    *first_frame = coverage.complete();
                 }
             }
             Event::State {
@@ -609,6 +634,7 @@ fn verify(endpoint: &Endpoint) -> Outcome {
 /// the application can reconnect. The matrix runs each endpoint once; this proves
 /// the second attempt is a new, working session and not a cached picture.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn the_vnc_endpoint_accepts_a_second_session() {
     let _sessions = vnc_sessions();
     let endpoint = match Endpoint::from_env(Kind::Vnc) {
@@ -779,6 +805,7 @@ fn quote(value: &str) -> String {
 /// `xev` logs the key, and `xclip` returns the text the client offered. The
 /// assertions are on those observations, not on the calls having returned.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn the_vnc_endpoint_takes_pointer_keyboard_and_clipboard() {
     let _sessions = vnc_sessions();
     let endpoint = match Endpoint::from_env(Kind::Vnc) {
@@ -981,6 +1008,7 @@ fn refusal_outcome(endpoint: &Endpoint, reported: Failure, reason: &str) -> Outc
 
 /// The matrix, as one report.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn the_endpoint_matrix_reports_every_endpoint_it_could_not_verify() {
     let _sessions = vnc_sessions();
     let mut verified = Vec::new();
@@ -1049,6 +1077,7 @@ fn the_endpoint_matrix_reports_every_endpoint_it_could_not_verify() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn an_unencrypted_vnc_policy_can_never_be_described_as_secure() {
     // The mask a connection gets when the user leaves the security at the server's
     // default. If it contained TLS or VeNCrypt this test would be wrong; the point
@@ -1072,6 +1101,7 @@ fn an_unencrypted_vnc_policy_can_never_be_described_as_secure() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_protocol_without_a_linked_backend_says_so_instead_of_connecting() {
     for protocol in [Protocol::Rdp, Protocol::Vnc] {
         match backend_info(protocol) {

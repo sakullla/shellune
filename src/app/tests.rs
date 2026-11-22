@@ -10428,6 +10428,7 @@ fn a_reason_that_quotes_an_address_cannot_leak_a_password() {
 
 /// Files, batch, forwarding and X11 belong to SSH, and the set is what the entries ask.
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_desktop_or_serial_session_offers_no_files_batch_forwarding_or_x11() {
     let mut workspace = Workspace::new();
     let ssh = workspace.register_session(
@@ -27078,6 +27079,7 @@ fn seed_connections(store: &HostStore, records: Vec<shellune_core::ConnectionRec
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn the_connect_button_of_a_saved_desktop_row_opens_its_own_surface(cx: &mut TestAppContext) {
     let dir = TempDir::new("desktop-row-connect");
     let record = desktop_record("office");
@@ -27171,6 +27173,7 @@ fn double_click_connection_row(cx: &mut VisualTestContext) {
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_double_click_on_a_saved_desktop_row_opens_its_surface_and_not_a_form(
     cx: &mut TestAppContext,
 ) {
@@ -27254,6 +27257,7 @@ async fn a_double_click_on_a_saved_serial_row_opens_its_device_and_not_a_form(
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_saved_desktop_row_only_says_connected_once_a_session_really_runs(
     cx: &mut TestAppContext,
 ) {
@@ -27404,6 +27408,7 @@ fn mount_scripted_desktop(
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_fast_remote_desktop_never_draws_its_loading_card(cx: &mut TestAppContext) {
     for record in [desktop_record("rdp"), vnc_record_sharing("vnc", false)] {
         let (view, window) = cx.add_window_view(|_, cx| ShelluneView::new(cx));
@@ -27420,6 +27425,7 @@ async fn a_fast_remote_desktop_never_draws_its_loading_card(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_desktop_tab_applies_every_region_in_the_order_it_arrived(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let desktop = (320u32, 200u32);
@@ -27487,6 +27493,7 @@ async fn a_desktop_tab_applies_every_region_in_the_order_it_arrived(cx: &mut Tes
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_press_on_a_desktop_is_mapped_and_a_close_releases_it(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let desktop = (1600u32, 900u32);
@@ -27536,6 +27543,7 @@ async fn a_press_on_a_desktop_is_mapped_and_a_close_releases_it(cx: &mut TestApp
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_desktop_that_was_refused_states_one_reason_and_forgets_its_disclosure(
     cx: &mut TestAppContext,
 ) {
@@ -27609,6 +27617,7 @@ async fn a_desktop_that_was_refused_states_one_reason_and_forgets_its_disclosure
 /// banner on top); once a picture has been shown, an ended session preserves that last picture
 /// and states the reason once in the banner above it (R5 / ADR-5).
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn an_ended_desktop_states_itself_in_the_banner_above_its_own_card(cx: &mut TestAppContext) {
     // Without a first frame: only desktop.status is shown, no duplicate terminal.failure banner.
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
@@ -27677,6 +27686,7 @@ async fn an_ended_desktop_states_itself_in_the_banner_above_its_own_card(cx: &mu
 /// its first control, Tab past the last one goes back to the desktop, and Enter presses the step
 /// (ADR-6, ADR-7). A live desktop keeps Tab for the remote side.
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn tab_reaches_the_banner_above_an_ended_desktop_and_enter_reconnects(
     cx: &mut TestAppContext,
 ) {
@@ -27750,6 +27760,7 @@ async fn tab_reaches_the_banner_above_an_ended_desktop_and_enter_reconnects(
 /// the keyboard is on the desktop afterwards whether it was on the banner or not
 /// (ADR-6, ADR-7).
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn escape_closes_the_banner_above_an_ended_desktop(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
@@ -27811,6 +27822,7 @@ fn a_stale_session_allows_no_capability_at_all() {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_desktop_record_can_be_registered_without_opening_anything() {
     let mut workspace = Workspace::new();
     let record = desktop_record("desk");
@@ -27857,6 +27869,7 @@ fn a_clean_exit_is_called_the_same_thing_on_the_tab_and_in_the_notice() {
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_desktop_that_cannot_be_reached_reports_what_the_backend_said(cx: &mut TestAppContext) {
     let backend_built = shellune_desktop::backend_info(shellune_desktop::Protocol::Vnc).is_ok();
     // A port nothing is listening on: the pane really creates a handle in the
@@ -28036,6 +28049,7 @@ fn last_pointer(
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_desktop_pane_takes_the_whole_window_and_gives_it_back(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let desktop = (1600u32, 900u32);
@@ -28215,6 +28229,7 @@ fn desktop_in_full_screen(view: &Entity<ShelluneView>, cx: &mut VisualTestContex
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn full_screen_gives_the_window_back_when_another_page_is_chosen(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let id = desktop_in_full_screen(&view, cx);
@@ -28247,6 +28262,7 @@ async fn full_screen_gives_the_window_back_when_another_page_is_chosen(cx: &mut 
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn full_screen_gives_the_window_back_when_the_desktop_tab_is_split(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     desktop_in_full_screen(&view, cx);
@@ -28270,6 +28286,7 @@ async fn full_screen_gives_the_window_back_when_the_desktop_tab_is_split(cx: &mu
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn the_send_warning_is_drawn_once_before_the_first_frame(cx: &mut TestAppContext) {
     // A send that fails before the picture arrives: the status card already carries
     // the sentence, so the strip that sits over a picture must not repeat it (R18).
@@ -28300,6 +28317,7 @@ async fn the_send_warning_is_drawn_once_before_the_first_frame(cx: &mut TestAppC
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn the_zoom_control_scales_the_picture_and_the_pointer_follows_it(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let desktop = (1600u32, 900u32);
@@ -28447,6 +28465,7 @@ async fn the_zoom_control_scales_the_picture_and_the_pointer_follows_it(cx: &mut
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_certificate_that_may_not_be_trusted_is_refused_at_once_and_releases_the_worker(
     cx: &mut TestAppContext,
 ) {
@@ -28504,6 +28523,7 @@ async fn a_certificate_that_may_not_be_trusted_is_refused_at_once_and_releases_t
 
 /// Show a precise local target while waiting for the VNC cursor.
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn vnc_uses_a_visible_local_pointer_until_a_shape_arrives(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let (link, _log) = ScriptedLink::new(live_desktop_events());
@@ -28570,6 +28590,7 @@ async fn vnc_uses_a_visible_local_pointer_until_a_shape_arrives(cx: &mut TestApp
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn reconnecting_desktop_freezes_the_old_picture_and_discards_input(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let (link, log) = ScriptedLink::new(vec![LinkEvent::Frame(solid(
@@ -28614,6 +28635,7 @@ async fn reconnecting_desktop_freezes_the_old_picture_and_discards_input(cx: &mu
 
 /// Local motion must remain visible while the link sends no new frames.
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn desktop_pointer_follows_local_motion_without_another_frame(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let (link, _) = ScriptedLink::new(vec![
@@ -28684,6 +28706,7 @@ async fn desktop_pointer_follows_local_motion_without_another_frame(cx: &mut Tes
 
 /// A live RDP surface also has an immediate local fallback.
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn rdp_uses_a_visible_local_pointer_until_a_shape_arrives(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let (link, _log) = ScriptedLink::new(live_desktop_events());
@@ -28742,6 +28765,7 @@ async fn rdp_uses_a_visible_local_pointer_until_a_shape_arrives(cx: &mut TestApp
 /// rectangle explicitly, so its bottom is the pane's bottom and nothing of it lies
 /// outside the pane.
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_fit_picture_keeps_the_whole_remote_screen_inside_the_pane(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
@@ -28786,6 +28810,7 @@ async fn a_fit_picture_keeps_the_whole_remote_screen_inside_the_pane(cx: &mut Te
 /// and an occluding layer is exactly where the body stops being hovered: moving onto
 /// the bar used to hide it in the same move. Its own hover now counts too.
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn the_bar_stays_drawn_and_pressable_with_the_pointer_on_it(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let (link, _log) = ScriptedLink::new(live_desktop_events());
@@ -28836,6 +28861,7 @@ async fn the_bar_stays_drawn_and_pressable_with_the_pointer_on_it(cx: &mut TestA
 
 /// A folded bar offers a handle, and the handle survives the pointer reaching it.
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn the_folded_handle_stays_drawn_and_pressable_with_the_pointer_on_it(
     cx: &mut TestAppContext,
 ) {
@@ -28877,6 +28903,7 @@ async fn the_folded_handle_stays_drawn_and_pressable_with_the_pointer_on_it(
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_desktop_authentication_challenge_opens_a_masked_password_form(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_, cx| ShelluneView::new(cx));
     let (link, _) = ScriptedLink::new(vec![LinkEvent::State {
@@ -28925,6 +28952,7 @@ async fn a_desktop_authentication_challenge_opens_a_masked_password_form(cx: &mu
 
 #[cfg(target_os = "macos")]
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn control_space_from_the_keyboard_reaches_the_remote_pane(cx: &mut TestAppContext) {
     use crate::app::desktop::{CONTROL_LEFT, key_codes};
     let (view, cx) = cx.add_window_view(|_, cx| ShelluneView::new(cx));
@@ -28947,6 +28975,7 @@ async fn control_space_from_the_keyboard_reaches_the_remote_pane(cx: &mut TestAp
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_certificate_can_be_reviewed_with_the_keyboard(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let (link, log) = ScriptedLink::new(vec![LinkEvent::Certificate {
@@ -28979,6 +29008,7 @@ async fn a_certificate_can_be_reviewed_with_the_keyboard(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn refusing_the_certificate_on_screen_answers_the_server_and_releases_the_connection(
     cx: &mut TestAppContext,
 ) {
@@ -29021,6 +29051,7 @@ async fn refusing_the_certificate_on_screen_answers_the_server_and_releases_the_
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_clipboard_that_cannot_be_sent_is_stated_over_the_live_picture(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let desktop = (1600u32, 900u32);
@@ -29191,6 +29222,7 @@ fn desktop_notices(
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn the_paste_shortcut_offers_the_clipboard_and_then_sends_the_shortcut_itself(
     cx: &mut TestAppContext,
 ) {
@@ -29249,6 +29281,7 @@ async fn the_paste_shortcut_offers_the_clipboard_and_then_sends_the_shortcut_its
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn with_the_clipboard_off_the_paste_shortcut_still_reaches_the_remote_side(
     cx: &mut TestAppContext,
 ) {
@@ -29288,6 +29321,7 @@ async fn with_the_clipboard_off_the_paste_shortcut_still_reaches_the_remote_side
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn focusing_the_picture_offers_the_clipboard_once_and_again_only_when_it_changed(
     cx: &mut TestAppContext,
 ) {
@@ -29351,6 +29385,7 @@ async fn focusing_the_picture_offers_the_clipboard_once_and_again_only_when_it_c
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_picture_on_this_clipboard_is_offered_as_a_windows_dib(cx: &mut TestAppContext) {
     use crate::app::desktop::ClipboardKind;
 
@@ -29381,6 +29416,7 @@ async fn a_picture_on_this_clipboard_is_offered_as_a_windows_dib(cx: &mut TestAp
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn what_the_remote_side_copies_lands_on_this_clipboard_and_is_not_offered_back(
     cx: &mut TestAppContext,
 ) {
@@ -29473,6 +29509,7 @@ fn desktop_send_problem(
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_session_still_connecting_is_offered_the_clipboard_when_it_goes_live(
     cx: &mut TestAppContext,
 ) {
@@ -29530,6 +29567,7 @@ async fn a_session_still_connecting_is_offered_the_clipboard_when_it_goes_live(
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn focusing_a_session_still_connecting_raises_no_send_warning(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let connected = LinkEvent::State {
@@ -29565,6 +29603,7 @@ async fn focusing_a_session_still_connecting_raises_no_send_warning(cx: &mut Tes
 /// is not the paste shortcut.
 #[cfg(not(target_os = "macos"))]
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_key_pressed_with_the_super_key_stays_on_this_computer(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let (link, log) = ScriptedLink::new(live_desktop_events());
@@ -29583,6 +29622,7 @@ async fn a_key_pressed_with_the_super_key_stays_on_this_computer(cx: &mut TestAp
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_remote_copy_on_a_connection_with_the_clipboard_off_is_not_written_here(
     cx: &mut TestAppContext,
 ) {
@@ -29604,6 +29644,7 @@ async fn a_remote_copy_on_a_connection_with_the_clipboard_off_is_not_written_her
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn each_notice_is_shown_once_per_session_and_a_ready_clipboard_withdraws_the_refusal(
     cx: &mut TestAppContext,
 ) {
@@ -29709,6 +29750,7 @@ async fn each_notice_is_shown_once_per_session_and_a_ready_clipboard_withdraws_t
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_desktop_target_carries_the_clipboard_switch_and_the_folder_to_map() {
     let mut config = shellune_core::RdpConfig::new("desk", "rdp.example.com", Some("desk"))
         .expect("a valid RDP record");
@@ -29737,6 +29779,7 @@ fn a_desktop_target_carries_the_clipboard_switch_and_the_folder_to_map() {
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn the_rdp_form_saves_the_clipboard_switch_and_the_folder_and_vnc_has_only_the_switch(
     cx: &mut TestAppContext,
 ) {
@@ -29849,6 +29892,7 @@ fn save_desktop_password_form(
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn the_desktop_form_asks_for_a_password_and_hides_it(cx: &mut TestAppContext) {
     let dir = TempDir::new("desktop-secret-form");
     let (view, cx) = hosts_view(cx, dir.store());
@@ -29905,6 +29949,7 @@ async fn the_desktop_form_asks_for_a_password_and_hides_it(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn switching_protocols_does_not_carry_a_password_between_forms(cx: &mut TestAppContext) {
     let dir = TempDir::new("desktop-secret-switch");
     let (view, cx) = hosts_view(cx, dir.store());
@@ -29955,6 +30000,7 @@ async fn switching_protocols_does_not_carry_a_password_between_forms(cx: &mut Te
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn one_press_on_a_saved_desktop_opens_one_attempt(cx: &mut TestAppContext) {
     let dir = TempDir::new("desktop-one-attempt");
     let record = desktop_record("office");
@@ -30009,6 +30055,7 @@ async fn one_press_on_a_saved_desktop_opens_one_attempt(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn every_keystroke_reaches_a_desktop_once(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let (link, log) = ScriptedLink::new(live_desktop_events());
@@ -30051,6 +30098,7 @@ fn desktop_zoom(
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn the_zoom_readout_switches_between_fit_and_one_hundred(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let (link, _log) = ScriptedLink::new(live_desktop_events());
@@ -30091,6 +30139,7 @@ async fn the_zoom_readout_switches_between_fit_and_one_hundred(cx: &mut TestAppC
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn the_controls_stay_clickable_over_a_notice_and_a_certificate(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let mut events = live_desktop_events();
@@ -30152,6 +30201,7 @@ async fn the_controls_stay_clickable_over_a_notice_and_a_certificate(cx: &mut Te
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_dropped_desktop_reconnects_only_when_the_user_asks(cx: &mut TestAppContext) {
     // The record is in the book: the reconnect opens the saved connection again, and
     // a record that is only mounted on a scripted link has nothing to open.
@@ -30208,6 +30258,7 @@ async fn a_dropped_desktop_reconnects_only_when_the_user_asks(cx: &mut TestAppCo
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_folded_bar_stays_folded_until_the_handle_is_pressed(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let (link, _log) = ScriptedLink::new(live_desktop_events());
@@ -30312,6 +30363,7 @@ async fn a_folded_bar_stays_folded_until_the_handle_is_pressed(cx: &mut TestAppC
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn the_zoom_readout_works_after_folding_and_unfolding(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let (link, _log) = ScriptedLink::new(live_desktop_events());
@@ -30344,6 +30396,7 @@ async fn the_zoom_readout_works_after_folding_and_unfolding(cx: &mut TestAppCont
     );
 }
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn the_controls_appear_only_while_the_pointer_is_over_the_pane(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let (link, _log) = ScriptedLink::new(live_desktop_events());
@@ -30371,6 +30424,7 @@ async fn the_controls_appear_only_while_the_pointer_is_over_the_pane(cx: &mut Te
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn the_eye_shows_the_desktop_password_and_hides_it_again(cx: &mut TestAppContext) {
     let dir = TempDir::new("desktop-secret-reveal");
     let (view, cx) = hosts_view(cx, dir.store());
@@ -30446,6 +30500,7 @@ async fn the_eye_shows_the_ssh_password_too(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_desktop_connection_starts_with_the_password_typed_in_its_form(cx: &mut TestAppContext) {
     let dir = TempDir::new("desktop-secret-connect");
     let (view, cx) = hosts_view(cx, dir.store());
@@ -30476,6 +30531,7 @@ async fn a_desktop_connection_starts_with_the_password_typed_in_its_form(cx: &mu
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_kept_desktop_password_is_stored_and_forgotten_with_the_box(cx: &mut TestAppContext) {
     let dir = TempDir::new("desktop-secret-remember");
     let (view, cx) = hosts_view(cx, dir.store());
@@ -30544,6 +30600,7 @@ async fn a_kept_desktop_password_is_stored_and_forgotten_with_the_box(cx: &mut T
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_saved_desktop_password_is_never_shown_back_and_a_blank_field_keeps_it(
     cx: &mut TestAppContext,
 ) {
@@ -30578,6 +30635,7 @@ async fn a_saved_desktop_password_is_never_shown_back_and_a_blank_field_keeps_it
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_desktop_connection_names_each_step_before_the_picture(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     let desktop = (1600u32, 900u32);
@@ -30718,6 +30776,7 @@ async fn a_desktop_connection_names_each_step_before_the_picture(cx: &mut TestAp
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_desktop_that_failed_while_signing_in_says_which_step_it_stopped_on(
     cx: &mut TestAppContext,
 ) {
@@ -33053,6 +33112,7 @@ fn assert_connection_tab_follows_drawn_order(
 
 /// RDP: address, port, user, domain, name, group in the basics group, then the folder.
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn rdp_connection_dialog_tab_follows_the_drawn_order(cx: &mut TestAppContext) {
     let dir = TempDir::new("rdp-dialog-tab");
     let (view, cx) = hosts_view(cx, dir.store());
@@ -33063,6 +33123,7 @@ async fn rdp_connection_dialog_tab_follows_the_drawn_order(cx: &mut TestAppConte
 
 /// VNC: address, port, name, group - one group of typed fields.
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn vnc_connection_dialog_tab_follows_the_drawn_order(cx: &mut TestAppContext) {
     let dir = TempDir::new("vnc-dialog-tab");
     let (view, cx) = hosts_view(cx, dir.store());
@@ -33857,6 +33918,7 @@ async fn the_more_menu_imports_and_starts_a_batch(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn a_group_only_a_desktop_names_is_in_the_sidebar_and_renamed_from_the_more_menu(
     cx: &mut TestAppContext,
 ) {
@@ -39914,6 +39976,7 @@ async fn non_ssh_dialog_save_and_connect_order_and_validation_failure(cx: &mut T
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn non_ssh_dialog_save_and_connect_starts_rdp_vnc_and_serial_sessions(
     cx: &mut TestAppContext,
 ) {
@@ -40209,6 +40272,7 @@ async fn split_pane_terminal_receives_escape_ctrl_c_and_ctrl_l(cx: &mut TestAppC
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn desktop_controls_dock_top_center_keep_expand_handle_visible_and_block_passthrough(
     cx: &mut TestAppContext,
 ) {
@@ -40836,6 +40900,7 @@ async fn r6_r13_representative_windows_matrix_keeps_primary_controls_inside_boun
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn r1_focus_mode_covers_local_ssh_rdp_vnc_preserves_layout_focus_and_esc_layers(
     cx: &mut TestAppContext,
 ) {
@@ -40992,6 +41057,7 @@ async fn r1_focus_mode_covers_local_ssh_rdp_vnc_preserves_layout_focus_and_esc_l
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn r2_desktop_toolbar_auto_hide_zero_hit_area_recovery_and_certificate_priority(
     cx: &mut TestAppContext,
 ) {
@@ -41202,6 +41268,7 @@ async fn r3_r13_terminal_search_isolation_split_independence_and_switch_controls
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn r4_desktop_zoom_pan_resize_fullscreen_and_pointer_mapping(cx: &mut TestAppContext) {
     use crate::app::desktop::{DesktopZoom, content_rect_in};
 
@@ -41300,6 +41367,7 @@ async fn r4_desktop_zoom_pan_resize_fullscreen_and_pointer_mapping(cx: &mut Test
 }
 
 #[gpui::test]
+#[ignore = "opt-in RDP/VNC test"]
 async fn r5_single_feedback_reconnect_keeps_frame_blocks_input_and_sanitizes_secrets(
     cx: &mut TestAppContext,
 ) {

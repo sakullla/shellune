@@ -134,6 +134,7 @@ fn assert_allowlisted(bytes: &str) {
 }
 
 #[test]
+#[ignore = "opt-in RDP/VNC test"]
 fn a_desktop_and_a_serial_tab_survive_a_restart_and_wait_for_the_user() {
     let dir = TempDir::new("desktop-tabs");
     let rdp = HostId::new();

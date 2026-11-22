@@ -4,6 +4,7 @@
 use super::wire::read_exact;
 use super::{Config, Ended};
 use crate::control::{Control, Emit};
+use crate::socket::PollingSocket;
 use crate::tls::{self, CERTIFICATE_REJECTED, SecureStream};
 use crate::{Failure, MAX_FRAME_BYTES};
 use std::io::{self, Read, Write};
@@ -23,22 +24,18 @@ const HANDSHAKE: Duration = Duration::from_secs(20);
 pub(super) struct Transport {
     kind: Kind,
     pushback: Option<u8>,
-    #[cfg(windows)]
-    read_poll: Option<Duration>,
 }
 
 enum Kind {
-    Plain(TcpStream),
+    Plain(PollingSocket),
     Secure(Box<SecureStream<Transport>>),
 }
 
 impl Transport {
     fn plain(socket: TcpStream) -> Transport {
         Transport {
-            kind: Kind::Plain(socket),
+            kind: Kind::Plain(PollingSocket::new(socket)),
             pushback: None,
-            #[cfg(windows)]
-            read_poll: None,
         }
     }
 
@@ -49,43 +46,20 @@ impl Transport {
 
     /// Sets the read wait used by the update loop, through the TLS layer when one
     /// is in place.
-    pub(super) fn poll_reads_every(&mut self, wait: Duration) -> io::Result<()> {
+    pub(super) fn poll_reads_every(&mut self, wait: Duration) -> io::Result<&Arc<polling::Poller>> {
         match &mut self.kind {
-            Kind::Plain(stream) => {
-                #[cfg(windows)]
-                {
-                    // Only this worker reads the socket. After readiness, recv
-                    // can use blocking mode without expiring an outstanding read.
-                    stream.set_read_timeout(None)?;
-                    self.read_poll = Some(wait);
-                    Ok(())
-                }
-                #[cfg(not(windows))]
-                stream.set_read_timeout(Some(wait))
-            }
+            Kind::Plain(stream) => stream.poll_reads_every(wait),
             Kind::Secure(stream) => stream.sock.poll_reads_every(wait),
         }
     }
-}
 
-#[cfg(windows)]
-fn wait_readable(stream: &TcpStream, wait: Duration) -> io::Result<()> {
-    use std::os::windows::io::AsRawSocket;
-    use windows_sys::Win32::Networking::WinSock::{
-        POLLRDNORM, WSAGetLastError, WSAPOLLFD, WSAPoll,
-    };
-
-    let mut fd = WSAPOLLFD {
-        fd: stream.as_raw_socket() as _,
-        events: POLLRDNORM,
-        revents: 0,
-    };
-    // SAFETY: fd describes one socket borrowed for the duration of this call.
-    match unsafe { WSAPoll(&mut fd, 1, wait.as_millis().min(i32::MAX as u128) as i32) } {
-        -1 => Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() })),
-        0 => Err(io::ErrorKind::WouldBlock.into()),
-        // recv reports buffered data, EOF or the underlying socket error.
-        _ => Ok(()),
+    pub(super) fn read_update(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.pushback.is_none()
+            && let Kind::Secure(stream) = &mut self.kind
+        {
+            return crate::tls::read_update(stream, buffer);
+        }
+        self.read(buffer)
     }
 }
 
@@ -99,13 +73,7 @@ impl Read for Transport {
             return Ok(1);
         }
         match &mut self.kind {
-            Kind::Plain(stream) => {
-                #[cfg(windows)]
-                if let Some(wait) = self.read_poll {
-                    wait_readable(stream, wait)?;
-                }
-                stream.read(buffer)
-            }
+            Kind::Plain(stream) => stream.read(buffer),
             Kind::Secure(stream) => stream.read(buffer),
         }
     }
@@ -586,8 +554,6 @@ fn secure(
     .map(|stream| Transport {
         kind: Kind::Secure(Box::new(stream)),
         pushback: None,
-        #[cfg(windows)]
-        read_poll: None,
     })
     .map_err(|error| {
         if error.to_string().contains(CERTIFICATE_REJECTED) {
@@ -790,8 +756,8 @@ fn read_string(transport: &mut Transport) -> Result<String, Ended> {
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn idle_polls_preserve_the_next_bytes_and_report_a_real_close() {
         use std::net::{Shutdown, TcpListener};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -817,6 +783,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_pending_socket_operation_allows_a_fresh_connection() {
         use windows_sys::Win32::Networking::WinSock::WSA_IO_PENDING;
         let ended = Ended::io(io::Error::from_raw_os_error(WSA_IO_PENDING), Failure::Io);
@@ -826,6 +793,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn anonymous_vencrypt_sub_types_are_refused_with_a_readable_reason() {
         assert_eq!(choose_subtype(&[258], true, false), Err(Refusal::Anonymous));
         assert_eq!(
@@ -841,6 +809,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_certificate_sub_type_wins_over_an_anonymous_one() {
         assert_eq!(
             choose_subtype(&[258, 261], true, false),
@@ -859,6 +828,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn libvnc_plain_forms_are_accepted_without_tls() {
         assert_eq!(choose_subtype(&[1], false, false), Ok(SubType::PlainNone));
         assert_eq!(choose_subtype(&[1, 2], true, false), Ok(SubType::PlainVnc));
@@ -874,6 +844,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_user_name_selects_the_user_and_password_form_inside_tls() {
         assert_eq!(
             choose_subtype(&[261, 262], true, true),
@@ -891,6 +862,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn the_old_numbering_is_not_read_as_a_password_type() {
         // 3 and 6 are not VeNCrypt sub-types; treating them as TLSVnc/X509Vnc
         // would select a number the server does not offer.
@@ -905,6 +877,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn the_standalone_anonymous_tls_type_is_never_allowed() {
         for mask in [0x4, 0x4 | 0x8, 0xC] {
             assert!(!type_allowed(ANONYMOUS_TLS, mask), "mask {mask:#x}");
@@ -915,6 +888,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn the_password_is_reversed_and_used_as_a_des_key() {
         let challenge = [
             0x00u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,

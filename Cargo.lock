@@ -6525,6 +6525,8 @@ dependencies = [
  "flate2",
  "hmac 0.12.1",
  "md-5 0.10.6",
+ "polling",
+ "rustix 1.1.6",
  "rustls",
  "rustls-platform-verifier",
  "sha2 0.10.9",

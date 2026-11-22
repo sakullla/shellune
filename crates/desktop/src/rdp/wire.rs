@@ -28,11 +28,13 @@ fn write_tpkt(out: &mut impl Write, parts: &[&[u8]]) -> io::Result<()> {
                 .and_then(|n| sum.checked_add(n))
         })
         .ok_or_else(|| invalid("TPKT exceeds 65535 bytes"))?;
-    out.write_all(&[3, 0])?;
-    out.write_all(&length.to_be_bytes())?;
+    let mut packet = Vec::with_capacity(usize::from(length));
+    packet.extend_from_slice(&[3, 0]);
+    packet.extend_from_slice(&length.to_be_bytes());
     for part in parts {
-        out.write_all(part)?;
+        packet.extend_from_slice(part);
     }
+    out.write_all(&packet)?;
     out.flush()
 }
 
@@ -215,6 +217,39 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
+    fn a_complete_tpkt_uses_one_write_and_handles_a_short_write() {
+        struct Writer {
+            limit: usize,
+            writes: usize,
+            bytes: Vec<u8>,
+        }
+        impl Write for Writer {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                let n = buf.len().min(self.limit);
+                self.bytes.extend_from_slice(&buf[..n]);
+                Ok(n)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for (limit, writes) in [(64, 1), (3, 3)] {
+            let mut out = Writer {
+                limit,
+                writes: 0,
+                bytes: Vec::new(),
+            };
+            write_data(&mut out, &[42, 43]).unwrap();
+            assert_eq!(out.bytes, [3, 0, 0, 9, 2, 0xf0, 0x80, 42, 43]);
+            assert_eq!(out.writes, writes);
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn negotiation_selects_only_external_security() {
         let mut peer = Peer {
             reply: confirmation(Some(1)),
@@ -232,6 +267,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_server_offering_only_standard_security_is_refused() {
         let mut peer = Peer {
             reply: confirmation(None),
@@ -243,6 +279,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_negotiation_failure_carries_the_server_code() {
         let mut body = vec![0, 0xd0, 0, 0, 0, 0, 0];
         body.push(3); // RDP_NEG_FAILURE

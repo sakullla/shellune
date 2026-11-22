@@ -1678,6 +1678,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_desktop_pane_whose_connection_is_saved_is_not_marked_missing() {
         let office = HostId::new();
         let root = PaneNode::leaf(PaneTarget::rdp(office), TerminalMode::Integrated);

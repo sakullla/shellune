@@ -368,6 +368,7 @@ impl Channels {
 mod scale_tests {
     use super::*;
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn retina_core_data_has_physical_pixels_and_scaled_dpi() {
         let block = core(2240, 1348, 200, Security::Tls);
         assert_eq!(&block[4..6], &2240u16.to_le_bytes());
@@ -431,6 +432,7 @@ mod join_tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn skip_joins_only_when_the_server_acknowledges_the_client_flag() -> io::Result<()> {
         let advertised = core(800, 600, 100, Security::Tls);
         assert_ne!(

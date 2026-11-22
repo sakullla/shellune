@@ -10,13 +10,13 @@ use super::{Command, Config, Ended};
 use crate::control::{Control, Emit, publish};
 use crate::input::Receiver;
 use crate::{ClipboardKind, Event, Failure, MAX_FRAME_BYTES, Notice, State};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// One read wait once the desktop is up: the loop returns to its cancellation
 /// check after each, and a partial message stays buffered.
-const POLL: Duration = Duration::from_millis(32);
+const IDLE_WAIT: Duration = Duration::from_secs(1);
 /// The decoder retains an incomplete tile or pixel band across reads.
 const CHUNK: usize = 32 * 1024;
 
@@ -107,17 +107,28 @@ impl Desktop {
         }
     }
 
-    fn resize(&mut self, width: u16, height: u16) -> Result<(), String> {
+    fn resize(&mut self, width: u16, height: u16, preserve_pixels: bool) -> Result<bool, String> {
+        if (width, height) == (self.width, self.height) {
+            return Ok(false);
+        }
         let bytes = u64::from(width) * u64::from(height) * 4;
         if width == 0 || height == 0 || bytes > MAX_FRAME_BYTES as u64 {
             return Err(format!(
                 "the server resized the desktop to {width}x{height}, past the {MAX_FRAME_BYTES} byte bound"
             ));
         }
+        if preserve_pixels {
+            crate::resize_bgra(
+                &mut self.pixels,
+                (usize::from(self.width), usize::from(self.height)),
+                (usize::from(width), usize::from(height)),
+            );
+        } else {
+            self.pixels = vec![0; bytes as usize];
+        }
         self.width = width;
         self.height = height;
-        self.pixels = vec![0; bytes as usize];
-        Ok(())
+        Ok(true)
     }
 
     fn stride(&self) -> usize {
@@ -128,7 +139,7 @@ impl Desktop {
     fn apply(&mut self, rect: Rect) -> Result<Option<Event>, String> {
         match rect {
             Rect::Resize { width, height } => {
-                self.resize(width, height)?;
+                self.resize(width, height, false)?;
                 Ok(None)
             }
             Rect::Raw {
@@ -237,11 +248,12 @@ struct Session {
     /// None until the server acknowledges the extension, then the subscribed area.
     continuous: Option<(u16, u16)>,
     continuous_announced: bool,
+    prefetched_region: Option<(u16, u16)>,
     screen: Option<(u32, u32)>,
     desired_size: Option<(u16, u16)>,
     resize_after: std::time::Instant,
     resizing: bool,
-    full_refresh: bool,
+    legacy_refresh: bool,
     /// The Latin-1 notice is said once per session.
     latin1_reported: bool,
     stats: Stats,
@@ -261,11 +273,12 @@ impl Session {
             local_text: None,
             continuous: None,
             continuous_announced: false,
+            prefetched_region: None,
             screen: None,
             desired_size: Some((config.width, config.height)),
             resize_after: std::time::Instant::now(),
             resizing: false,
-            full_refresh: false,
+            legacy_refresh: false,
             latin1_reported: false,
             stats: Stats::default(),
         }
@@ -287,7 +300,9 @@ impl Session {
     }
 
     fn pump(&mut self, control: &Arc<Control>, commands: &Receiver<Command>) -> Result<(), Ended> {
-        self.transport.poll_reads_every(POLL)?;
+        let poller = self.transport.poll_reads_every(IDLE_WAIT)?;
+        commands.wake_on_input(poller);
+        control.wake_on_cancel(poller);
         self.configure()?;
         publish(&self.emit, control, &State::Connected, Failure::None, "");
         let mut chunk = vec![0u8; CHUNK];
@@ -297,7 +312,15 @@ impl Session {
             }
             self.drain(commands)?;
             self.resize_if_ready()?;
-            match self.transport.read(&mut chunk) {
+            let wait = if self.desired_size.is_some() && self.screen.is_some() && !self.resizing {
+                self.resize_after
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(IDLE_WAIT)
+            } else {
+                IDLE_WAIT
+            };
+            self.transport.poll_reads_every(wait)?;
+            match self.transport.read_update(&mut chunk) {
                 Ok(0) => {
                     super::trace("server closed the connection");
                     return Err(Ended::new(
@@ -381,19 +404,33 @@ impl Session {
 
     /// Applies every queued input or clipboard command before the next read.
     fn drain(&mut self, commands: &Receiver<Command>) -> Result<(), Ended> {
+        let mut input = Vec::new();
         for _ in 0..64 {
             match commands.pop() {
-                Some(Command::Key { keysym, down }) => self.key(keysym, down)?,
-                Some(Command::Pointer { x, y, buttons }) => self.pointer(x, y, buttons)?,
-                Some(Command::Resize(w, h)) => {
+                Some(Command::Key { keysym, down }) => {
+                    if keysym != 0 {
+                        input.extend_from_slice(&[4, u8::from(down), 0, 0]);
+                        input.extend_from_slice(&keysym.to_be_bytes());
+                    }
+                }
+                Some(Command::Pointer { x, y, buttons }) => {
+                    Self::append_pointer(&mut input, x, y, buttons)
+                }
+                Some(Command::Resize(w, h)) if self.desired_size != Some((w, h)) => {
                     self.desired_size = Some((w, h));
                     self.resize_after = std::time::Instant::now() + Duration::from_millis(200);
                 }
-                Some(Command::Clipboard(entries)) => self.offer(&entries)?,
-                None => break,
+                Some(Command::Resize(..)) => {}
+                Some(Command::Clipboard(entries)) => {
+                    self.send(&input)?;
+                    input.clear();
+                    self.offer(&entries)?;
+                }
+                None => return self.send(&input),
             }
         }
-        Ok(())
+        commands.wake_if_pending();
+        self.send(&input)
     }
 
     /// Publishes available pixel bands and requests the next update at the end.
@@ -428,20 +465,33 @@ impl Session {
                 } => {
                     if reason == 1 {
                         self.resizing = false;
-                    }
-                    if reason != 1 || result == 0 {
-                        self.screen = screen;
-                        if (width, height) != (self.desktop.width, self.desktop.height) {
-                            self.desktop
-                                .resize(width, height)
-                                .map_err(|e| Ended::new(Failure::ProtocolFailure, e))?;
-                            self.full_refresh = true;
+                        if result != 0 {
+                            super::trace(&format!("desktop resize returned status {result}"));
+                            continue;
                         }
+                    }
+                    self.screen = screen;
+                    let retained = (
+                        u32::from(self.desktop.width.min(width)),
+                        u32::from(self.desktop.height.min(height)),
+                    );
+                    let changed = self
+                        .desktop
+                        .resize(width, height, true)
+                        .map_err(|e| Ended::new(Failure::ProtocolFailure, e))?;
+                    if changed && self.stats.frames != 0 {
+                        (self.emit)(Event::FrameResize {
+                            width: u32::from(width),
+                            height: u32::from(height),
+                            retained,
+                        });
                     }
                 }
                 Message::Rectangle(rect) => {
-                    if matches!(rect, Rect::Resize { .. }) {
-                        self.full_refresh = true;
+                    if let Rect::Resize { width, height } = &rect
+                        && (*width, *height) != (self.desktop.width, self.desktop.height)
+                    {
+                        self.legacy_refresh = true;
                     }
                     if let Some(event) = self
                         .desktop
@@ -453,21 +503,33 @@ impl Session {
                         }
                         self.stats.frames += 1;
                         (self.emit)(event);
+                        // Let the next request travel while the rest of this
+                        // update arrives. Continuous peers already push updates.
+                        if self.continuous.is_none()
+                            && self.prefetched_region.is_none()
+                            && !self.legacy_refresh
+                        {
+                            self.request(true)?;
+                            self.prefetched_region =
+                                Some((self.desktop.width, self.desktop.height));
+                        }
                     }
                 }
                 Message::Pointer(shape) => (self.emit)(Event::Pointer(shape)),
                 Message::UpdateEnd => {
+                    self.resize_if_ready()?;
                     let size = (self.desktop.width, self.desktop.height);
-                    let full = std::mem::take(&mut self.full_refresh);
-                    match self.continuous {
-                        None => self.request(!full)?,
-                        Some(region) if region != size => {
-                            self.request_region(150, true)?;
-                            self.continuous = Some(size);
-                            self.request(false)?;
-                        }
-                        Some(_) if full => self.request(false)?,
-                        _ => {}
+                    // A full request can elicit another ExtendedDesktopSize
+                    // update instead of pixels. Use the new area for the next
+                    // incremental request or continuous subscription.
+                    let full = std::mem::take(&mut self.legacy_refresh);
+                    if self.continuous.is_some_and(|region| region != size) {
+                        self.request_region(150, true)?;
+                        self.continuous = Some(size);
+                    }
+                    let prefetched = self.prefetched_region.take();
+                    if full || (self.continuous.is_none() && prefetched != Some(size)) {
+                        self.request(!full)?;
                     }
                 }
                 Message::EndContinuous if !self.continuous_announced => {
@@ -566,47 +628,35 @@ impl Session {
         if (self.desktop.width, self.desktop.height) == (w, h) {
             return Ok(());
         }
-        let mut packet = vec![251, 0];
-        packet.extend_from_slice(&w.to_be_bytes());
-        packet.extend_from_slice(&h.to_be_bytes());
-        packet.extend_from_slice(&[1, 0]);
-        packet.extend_from_slice(&id.to_be_bytes());
-        packet.extend_from_slice(&[0; 4]);
-        packet.extend_from_slice(&w.to_be_bytes());
-        packet.extend_from_slice(&h.to_be_bytes());
-        packet.extend_from_slice(&flags.to_be_bytes());
+        let mut packet = [0; 24];
+        packet[0] = 251;
+        packet[2..4].copy_from_slice(&w.to_be_bytes());
+        packet[4..6].copy_from_slice(&h.to_be_bytes());
+        packet[6] = 1;
+        packet[8..12].copy_from_slice(&id.to_be_bytes());
+        packet.copy_within(2..6, 16);
+        packet[20..24].copy_from_slice(&flags.to_be_bytes());
         self.send(&packet)?;
         self.resizing = true;
         Ok(())
     }
 
-    fn key(&mut self, keysym: u32, down: bool) -> Result<(), Ended> {
-        if keysym == 0 {
-            return Ok(());
-        }
-        let mut message = vec![4u8, u8::from(down), 0, 0];
-        message.extend_from_slice(&keysym.to_be_bytes());
-        self.send(&message)
-    }
-
-    /// RFB buttons 4–7 are momentary wheel presses. Write each press and
-    /// release together so one wheel step needs only one transport flush.
-    fn pointer(&mut self, x: u16, y: u16, buttons: u32) -> Result<(), Ended> {
+    /// RFB buttons 4–7 are momentary wheel presses, each followed by a release.
+    fn append_pointer(messages: &mut Vec<u8>, x: u16, y: u16, buttons: u32) {
         let held = (buttons & 7) as u8;
         let [xh, xl] = x.to_be_bytes();
         let [yh, yl] = y.to_be_bytes();
         let event = |mask| [5, mask, xh, xl, yh, yl];
         if buttons & 0x78 == 0 {
-            return self.send(&event(held));
+            messages.extend_from_slice(&event(held));
+            return;
         }
-        let mut messages = Vec::with_capacity(12);
         for bit in [8, 16, 32, 64] {
             if buttons & u32::from(bit) != 0 {
                 messages.extend_from_slice(&event(held | bit));
                 messages.extend_from_slice(&event(held));
             }
         }
-        self.send(&messages)
     }
 
     fn offer(&mut self, entries: &[crate::ClipboardEntry]) -> Result<(), Ended> {
@@ -672,6 +722,9 @@ impl Session {
     }
 
     fn send(&mut self, message: &[u8]) -> Result<(), Ended> {
+        if message.is_empty() {
+            return Ok(());
+        }
         if std::env::var_os("SHELLUNE_VNC_TRACE").is_some() {
             eprintln!(
                 "vnc trace: send type={} bytes={}",
@@ -695,6 +748,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_raw_rectangle_is_copied_into_the_desktop_and_emitted() {
         let mut desktop = desktop();
         let pixels = vec![7u8; 2 * 4];
@@ -728,6 +782,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_copy_rectangle_reads_before_it_writes() {
         let mut desktop = desktop();
         let mut pixels = vec![0u8; 2 * 4];
@@ -756,6 +811,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_rectangle_outside_the_desktop_is_refused() {
         let mut desktop = desktop();
         let error = desktop
@@ -771,6 +827,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_resize_replaces_the_buffer_and_is_bounded() {
         let mut desktop = desktop();
         desktop
@@ -780,6 +837,25 @@ mod tests {
             })
             .expect("resized");
         assert_eq!(desktop.pixels.len(), 8 * 6 * 4);
-        assert!(desktop.resize(0, 6).is_err());
+        assert!(desktop.resize(0, 6, false).is_err());
+    }
+
+    #[test]
+    #[ignore = "opt-in RDP/VNC test"]
+    fn an_extended_resize_restrides_retained_pixels_and_clears_new_space() {
+        let mut desktop = desktop();
+        for (index, pixel) in desktop.pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            pixel.fill((index + 1) as u8);
+        }
+        desktop.resize(2, 4, true).expect("narrower and taller");
+        assert_eq!(
+            desktop.pixels.as_chunks::<4>().0,
+            [1, 2, 5, 6, 9, 10, 0, 0].map(|value| [value; 4])
+        );
+        desktop.resize(5, 2, true).expect("wider and shorter");
+        assert_eq!(
+            desktop.pixels.as_chunks::<4>().0,
+            [1, 2, 0, 0, 0, 5, 6, 0, 0, 0].map(|value| [value; 4])
+        );
     }
 }

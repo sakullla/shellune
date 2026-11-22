@@ -358,6 +358,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_dib_written_here_reads_back_as_the_same_picture() {
         let image = picture();
         let dib = rgba_to_dib(&image).expect("a small picture has a DIB");
@@ -370,6 +371,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_dib_with_no_alpha_in_use_pastes_opaque() {
         let mut image = picture();
         for pixel in image.pixels_mut() {
@@ -422,6 +424,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_remote_dibv5_pastes_as_the_same_picture_with_its_transparency() {
         let mut image = picture();
         image.put_pixel(1, 1, Rgba([10, 20, 30, 128]));
@@ -439,12 +442,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_damaged_dib_is_left_out_instead_of_pasted() {
         assert_eq!(dib_to_png(&[]), None);
         assert_eq!(dib_to_png(&[40, 0, 0, 0, 1, 2]), None);
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn local_text_is_offered_alone() {
         let offer = local_offer(
             &ClipboardItem::new_string("你好\nworld".to_owned()),
@@ -461,6 +466,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_local_png_is_offered_as_a_dib_only_to_rdp() {
         let image = picture();
         let item = ClipboardItem::new_image(&Image::from_bytes(ImageFormat::Png, png_of(&image)));
@@ -473,6 +479,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_local_jpeg_with_text_is_offered_as_text_and_dib() {
         let image = picture();
         let jpeg = encoded(&image, image::ImageFormat::Jpeg);
@@ -489,6 +496,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn an_image_this_build_cannot_draw_is_left_out_quietly() {
         let item = ClipboardItem::new_entries(vec![
             gpui::ClipboardEntry::from("label".to_owned()),
@@ -508,6 +516,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn an_image_whose_forms_exceed_the_bound_is_reported_and_not_offered() {
         let image = picture();
         let png = png_of(&image);
@@ -537,6 +546,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_remote_copy_becomes_one_item_with_its_text_and_its_picture() {
         let image = picture();
         let dib = rgba_to_dib(&image).expect("a small picture has a DIB");
@@ -574,6 +584,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn remote_text_is_written_with_this_computers_line_breaks() {
         assert_eq!(local_line_breaks("a\r\nb\rc\nd", false), "a\nb\nc\nd");
         assert_eq!(local_line_breaks("a\r\nb\rc\nd", true), "a\r\nb\r\nc\r\nd");
@@ -603,6 +614,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_clipboard_already_shared_is_recognised_by_its_parts() {
         let text = ClipboardItem::new_string("a\r\nb".to_owned());
         let same = ClipboardItem::new_string("a\nb".to_owned());

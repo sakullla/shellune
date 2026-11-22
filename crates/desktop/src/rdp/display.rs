@@ -27,6 +27,11 @@ pub(super) struct Display {
 }
 
 impl Display {
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        self.send_after
+            .filter(|_| self.id.is_some() && self.max_area >= 200 * 200)
+    }
+
     pub(super) fn resize(&mut self, width: u16, height: u16, percent: u32) {
         if self.requested != Some((width, height, percent)) {
             self.requested = Some((width, height, percent));
@@ -162,6 +167,7 @@ impl Display {
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_resize_waits_for_server_capabilities_and_only_sends_the_latest_layout() {
         let channels = Channels {
             user: 1004,

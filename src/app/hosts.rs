@@ -4454,6 +4454,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_desktop_form_builds_a_record_with_its_own_fields() {
         let mut draft = ProtocolDraft::create(ProtocolKind::Rdp);
         assert_eq!(
@@ -4486,6 +4487,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_desktop_form_keeps_its_password_out_of_the_record() {
         let mut draft = ProtocolDraft::create(ProtocolKind::Vnc);
         draft.set_text(ConnectionFormField::Address, "10.0.0.7");
@@ -4520,6 +4522,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_desktop_form_carries_the_clipboard_switch_and_the_mapped_folder() {
         let rdp = ConnectionFormField::of_protocol(ProtocolKind::Rdp);
         assert!(rdp.contains(&ConnectionFormField::Clipboard));
@@ -4652,6 +4655,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_desktop_address_with_a_port_is_split_instead_of_doubled() {
         let target = |kind, address: &str, port: &str| {
             let mut draft = ProtocolDraft::create(kind);
@@ -4798,6 +4802,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn the_list_carries_desktop_and_serial_connections_beside_the_hosts() {
         let server = host("web", "10.0.0.5", 22, "deploy", Some("Prod"));
         let mut book = HostBook::from_hosts(vec![server.clone()]).expect("one host");

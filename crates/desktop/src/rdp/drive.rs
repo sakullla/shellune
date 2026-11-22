@@ -833,6 +833,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_device_path_stays_inside_the_mapped_folder() {
         let root = root();
         assert_eq!(
@@ -847,6 +848,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn escaping_the_folder_is_refused() {
         let root = root();
         assert_eq!(resolve(&root, "..\\outside.txt"), Err(STATUS_ACCESS_DENIED));

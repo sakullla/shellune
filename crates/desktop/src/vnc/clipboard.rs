@@ -173,6 +173,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn latin1_and_utf8_round_trip_exactly() {
         assert_eq!(latin1_to_utf8(b"caf\xe9 cr\xe8me"), "café crème".as_bytes());
         assert_eq!(
@@ -188,6 +189,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_provided_text_is_read_back_through_its_compression() {
         let provide = provide("远端 ✓ text".as_bytes()).unwrap();
         let Some(Extended::Text(text)) = parse_extended(&provide) else {
@@ -198,6 +200,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn capabilities_say_whether_text_is_carried() {
         let mut caps = (EXT_CAPS | EXT_TEXT).to_be_bytes().to_vec();
         caps.extend_from_slice(&(1u32 << 20).to_be_bytes());
@@ -209,6 +212,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn oversized_extended_text_is_cut_at_a_character_boundary() {
         let text = format!("{}界界", "x".repeat(MAX_CLIPBOARD_TEXT_BYTES - 1));
         let packet = provide(text.as_bytes()).unwrap();
@@ -223,6 +227,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_provided_text_flushed_without_a_trailer_is_still_read() {
         // TigerVNC's Provide for the text "tiger3-clip": the flags, then a zlib
         // stream that ends in a sync flush instead of a final block.

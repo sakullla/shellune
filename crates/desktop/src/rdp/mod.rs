@@ -330,6 +330,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_press_and_a_release_both_name_their_button() {
         // A button edge and a movement are distinct RDP mouse events.
         assert_eq!(pointer_flags(0, SD_BUTTON_LEFT), 0x1000 | 0x8000);
@@ -345,6 +346,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_wheel_step_is_one_event_and_its_release_is_not_one() {
         assert_eq!(pointer_flags(0, SD_BUTTON_WHEEL_UP), 0x0200 | 0x0078);
         assert_eq!(

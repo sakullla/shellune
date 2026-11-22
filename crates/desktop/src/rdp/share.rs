@@ -258,6 +258,8 @@ impl Share {
         if self.refresh_rects {
             self.refresh(ch, &mut batch)?;
         }
+        // Report keyboard toggle state in the same outbound flight.
+        self.inputs(ch, &mut batch, &[[0; 4]])?;
         out.write_all(&batch)?;
         out.flush()
     }
@@ -305,16 +307,26 @@ impl Share {
         self.send_control(ch, out, 7, &p)
     }
 
-    pub(super) fn input(
+    /// TS_INPUT_PDU_DATA holds a sequence of timestamped slow-path events.
+    pub(super) fn inputs(
         &self,
         ch: &Channels,
         out: &mut impl Write,
-        kind: u16,
-        flags: u16,
-        a: u16,
-        b: u16,
+        events: &[[u16; 4]],
     ) -> io::Result<()> {
-        self.send_data(ch, out, 28, &words(&[1, 0, 0, 0, kind, flags, a, b]))
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut body = Vec::with_capacity(4 + events.len() * 12);
+        body.extend_from_slice(&(events.len() as u16).to_le_bytes());
+        body.extend_from_slice(&[0; 2]);
+        for event in events {
+            body.extend_from_slice(&[0; 4]); // eventTime is ignored by the server
+            for field in event {
+                body.extend_from_slice(&field.to_le_bytes());
+            }
+        }
+        self.send_data(ch, out, 28, &body)
     }
 
     pub(super) fn data<'a>(&self, bytes: &'a [u8]) -> io::Result<(u8, &'a [u8])> {
@@ -338,6 +350,44 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
+    fn queued_input_edges_share_one_pdu_in_wire_order() -> io::Result<()> {
+        let ch = Channels {
+            user: 1004,
+            global: 1003,
+            dynamic: None,
+            clipboard: None,
+            drive: None,
+        };
+        let share = Share::pending(800, 600);
+        let events = [[4, 0, 30, 0], [0x8001, 0x0800, 40, 50], [4, 0x8000, 30, 0]];
+        let mut sent = Vec::new();
+        share.inputs(&ch, &mut sent, &[])?;
+        assert!(sent.is_empty());
+        share.inputs(&ch, &mut sent, &events)?;
+        let mut bytes = sent.as_slice();
+        let packet = super::super::wire::read_data(&mut bytes)?;
+        assert!(bytes.is_empty());
+        let mut mcs = Packet(&packet);
+        mcs.take(6)?;
+        let len = mcs.per_length()?;
+        let header = control(&mut Packet(mcs.take(len)?))?;
+        let (kind, body) = share.data(header.body)?;
+        assert_eq!(kind, 28);
+        let mut input = Packet(body);
+        assert_eq!(input.le16()?, 3);
+        input.take(2)?;
+        for event in events {
+            input.take(4)?;
+            for field in event {
+                assert_eq!(input.le16()?, field);
+            }
+        }
+        input.finish()
+    }
+
+    #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn confirm_active_advertises_the_required_bitmap_and_order_flags() -> io::Result<()> {
         let channels = Channels {
             dynamic: None,

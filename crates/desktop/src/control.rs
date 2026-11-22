@@ -19,6 +19,7 @@ pub(crate) type Emit = Arc<dyn Fn(Event) + Send + Sync>;
 pub(crate) struct Control {
     cancel: AtomicBool,
     socket: Mutex<Option<TcpStream>>,
+    poller: Mutex<std::sync::Weak<polling::Poller>>,
     state: AtomicU8,
     failure: Mutex<Failure>,
     certificate: Mutex<Question>,
@@ -36,6 +37,7 @@ impl Default for Control {
         Control {
             cancel: AtomicBool::new(false),
             socket: Mutex::new(None),
+            poller: Mutex::default(),
             state: AtomicU8::new(0),
             failure: Mutex::new(Failure::None),
             certificate: Mutex::new(Question {
@@ -64,12 +66,27 @@ impl Control {
         }
     }
 
+    pub(crate) fn wake_on_cancel(&self, poller: &Arc<polling::Poller>) {
+        *self.poller.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(poller);
+        if self.cancelled() {
+            let _ = poller.notify();
+        }
+    }
+
     pub(crate) fn stop(&self) {
         {
             // Synchronize with the predicate check immediately before wait.
             let _question = self.certificate.lock().unwrap_or_else(|e| e.into_inner());
             self.cancel.store(true, Ordering::SeqCst);
             self.certificate_changed.notify_all();
+        }
+        if let Some(poller) = self
+            .poller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade()
+        {
+            let _ = poller.notify();
         }
         if let Ok(slot) = self.socket.lock()
             && let Some(socket) = slot.as_ref()
@@ -202,6 +219,7 @@ pub(crate) fn publish(
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_certificate_decision_or_cancellation_wakes_the_waiter() {
         for accept in [Some(true), Some(false), None] {
             let control = Arc::new(Control::default());

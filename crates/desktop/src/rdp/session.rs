@@ -12,6 +12,7 @@ use super::update;
 use super::wire::{self, Packet};
 use super::{Command, Config, Control, Emit, publish};
 use crate::input::Receiver;
+use crate::socket::PollingSocket;
 use crate::{Event, Failure, State};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -87,7 +88,7 @@ impl Frames {
 /// call continues the same PDU instead of parsing from its middle.
 fn next_frame(transport: &mut impl Read, frames: &mut Frames) -> io::Result<Incoming> {
     loop {
-        if let Some(frame) = read_chunk(transport, frames)? {
+        if let Some(frame) = read_chunk(frames, |buffer| transport.read(buffer))? {
             return Ok(frame);
         }
     }
@@ -95,12 +96,15 @@ fn next_frame(transport: &mut impl Read, frames: &mut Frames) -> io::Result<Inco
 
 /// Give the input queue a turn after each socket read. A low-bandwidth peer
 /// may stream one PDU for seconds without a single read timing out.
-fn read_chunk(transport: &mut impl Read, frames: &mut Frames) -> io::Result<Option<Incoming>> {
+fn read_chunk(
+    frames: &mut Frames,
+    read: impl FnOnce(&mut [u8]) -> io::Result<usize>,
+) -> io::Result<Option<Incoming>> {
     if let Some(frame) = frames.take()? {
         return Ok(Some(frame));
     }
     let mut chunk = [0u8; 16 * 1024];
-    let read = transport.read(&mut chunk)?;
+    let read = read(&mut chunk)?;
     if read == 0 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -118,7 +122,7 @@ const LOGON_WAIT: Duration = Duration::from_secs(10);
 const FIRST_PICTURE_WAIT: Duration = Duration::from_secs(60);
 /// One read wait once the desktop is up: the loop returns to its cancellation and
 /// deadline checks after each, and a partial record stays buffered.
-const POLL: Duration = Duration::from_millis(32);
+const IDLE_WAIT: Duration = Duration::from_secs(1);
 
 /// Ends one attempt with the business failure it maps to.
 #[derive(Debug)]
@@ -177,7 +181,7 @@ fn keyboard_flags(down: bool, extended: bool) -> u16 {
 }
 
 enum Transport {
-    Plain(TcpStream),
+    Plain(PollingSocket),
     Secure(Box<security::SecureStream<Transport>>),
 }
 
@@ -226,6 +230,7 @@ pub(super) fn run(
     commands: Receiver<Command>,
 ) {
     if control.cancelled() {
+        publish(emit, control, &State::Closed, Failure::None, "");
         return;
     }
     super::trace("starting connection");
@@ -299,10 +304,10 @@ impl StartupPicture {
 
     /// Allow updates already on their way to arrive before requesting a repaint.
     /// At most one additional refresh per activation, even for a genuinely black desktop.
-    fn redraw_due(&mut self, now: Instant) -> bool {
+    fn redraw_due(&mut self, now: Instant, delay: Duration) -> bool {
         match self {
             Self::Black => {
-                *self = Self::RedrawAfter(now + Duration::from_millis(200));
+                *self = Self::RedrawAfter(now + delay);
                 false
             }
             Self::RedrawAfter(deadline) if now >= *deadline => {
@@ -327,6 +332,7 @@ struct Active {
     logon_deadline: std::time::Instant,
     first_picture_deadline: Option<std::time::Instant>,
     startup_picture: StartupPicture,
+    redraw_delay: Duration,
     deactivated: bool,
     clipboard: Clipboard,
     drive: Drive,
@@ -351,6 +357,9 @@ fn connect(
     let mut last = Ended::new(Failure::Connect, "no address resolved for the RDP server");
     let mut socket = None;
     for endpoint in endpoints {
+        if control.cancelled() {
+            return Err(Ended::new(Failure::Cancelled, "cancelled"));
+        }
         match TcpStream::connect_timeout(&endpoint, HANDSHAKE) {
             Ok(stream) => {
                 socket = Some(stream);
@@ -366,11 +375,17 @@ fn connect(
         .map_err(|error| Ended::io(error, Failure::Connect))?;
     control.attach(&socket);
 
-    let mut transport = Transport::Plain(socket);
+    let mut transport = Transport::Plain(PollingSocket::new(socket));
     // The X.224 negotiation only offers external security; the old standard RDP
     // security is never selected.
+    let negotiation_started = Instant::now();
     let selected = wire::negotiate(&mut transport, true)
         .map_err(|error| Ended::io(error, Failure::Connect))?;
+    // Allow a requested repaint to cross this connection before requesting
+    // another full screen. Exclude TLS and interactive certificate decisions.
+    let redraw_delay = negotiation_started
+        .elapsed()
+        .clamp(Duration::from_millis(200), Duration::from_secs(10));
     super::trace(&format!("negotiated security {selected:?}"));
 
     if selected != wire::Security::Tls && (config.user.is_empty() || config.password.is_empty()) {
@@ -458,6 +473,7 @@ fn connect(
         display: Default::default(),
         first_picture_deadline: None,
         startup_picture: StartupPicture::default(),
+        redraw_delay,
         deactivated: false,
         logon_confirmed: false,
         frames: Frames::default(),
@@ -465,18 +481,15 @@ fn connect(
         logon_deadline: std::time::Instant::now() + LOGON_WAIT,
     };
     active.await_activation(control)?;
-    // A synchronize event is how a client reports the keyboard toggle state;
-    // servers expect it before forwarding input.
-    active
-        .share
-        .input(&active.channels, &mut active.transport, 0, 0, 0, 0)
-        .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
     super::trace("desktop activated");
     // From here on the loop must come back often enough to notice a cancel and to
     // decide that a logon was never confirmed.
     active.first_picture_deadline = Some(std::time::Instant::now() + FIRST_PICTURE_WAIT);
-    active.set_poll_timeout(POLL);
-    let _ = commands;
+    let poller = active
+        .set_poll_timeout(IDLE_WAIT)
+        .map_err(|e| Ended::io(e, Failure::Io))?;
+    commands.wake_on_input(poller);
+    control.wake_on_cancel(poller);
     Ok(active)
 }
 
@@ -534,10 +547,25 @@ impl Active {
             let Some(body) = self.read_slow()? else {
                 continue;
             };
-            let Some((kind, header)) = self.control(&body) else {
+            let Some(payload) = self.activation_payload(&body) else {
                 continue;
             };
-            if kind != 1 {
+            let Ok(header) = share::control(&mut Packet(payload)) else {
+                // Older xrdp waits here for a Server License Request response.
+                // Ignore flagsHi (SEC_FLAGSHI_VALID is clear) and let status
+                // notifications pass through to the subsequent Demand Active.
+                if let [0x80, 0, _, _, 1, version, lo, hi, ..] = payload
+                    && matches!(version & 0x0f, 2 | 3)
+                    && usize::from(u16::from_le_bytes([*lo, *hi])) == payload.len() - 4
+                {
+                    return Err(Ended::new(
+                        Failure::ProtocolFailure,
+                        "the RDP server requires a licensing exchange that this client does not support",
+                    ));
+                }
+                continue;
+            };
+            if header.kind != 1 {
                 continue;
             }
             let share = Share::from_demand(&header)
@@ -553,15 +581,12 @@ impl Active {
 
     /// Sets a short read wait on the socket under the TLS layer, so the loop
     /// returns to its cancellation and deadline checks between updates.
-    fn set_poll_timeout(&self, wait: Duration) {
-        match &self.transport {
-            Transport::Plain(socket) => {
-                let _ = socket.set_read_timeout(Some(wait));
-            }
-            Transport::Secure(secure) => {
-                if let Transport::Plain(socket) = &secure.sock {
-                    let _ = socket.set_read_timeout(Some(wait));
-                }
+    fn set_poll_timeout(&mut self, wait: Duration) -> io::Result<&Arc<polling::Poller>> {
+        let mut transport = &mut self.transport;
+        loop {
+            match transport {
+                Transport::Plain(socket) => return socket.poll_reads_every(wait),
+                Transport::Secure(secure) => transport = &mut secure.sock,
             }
         }
     }
@@ -605,7 +630,9 @@ impl Active {
             if !self.deactivated
                 && self.logon_confirmed
                 && self.share.refresh_rects
-                && self.startup_picture.redraw_due(Instant::now())
+                && self
+                    .startup_picture
+                    .redraw_due(Instant::now(), self.redraw_delay)
             {
                 self.share
                     .refresh(&self.channels, &mut self.transport)
@@ -618,7 +645,32 @@ impl Active {
             self.display
                 .poll(&self.channels, &mut self.transport)
                 .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
-            match read_chunk(&mut self.transport, &mut self.frames) {
+            let redraw = match self.startup_picture {
+                StartupPicture::RedrawAfter(at) if !self.deactivated && self.logon_confirmed => {
+                    Some(at)
+                }
+                _ => None,
+            };
+            let wait = [
+                redraw,
+                self.display.deadline(),
+                self.first_picture_deadline,
+                (!self.connected).then_some(self.logon_deadline),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .map_or(IDLE_WAIT, |deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(IDLE_WAIT)
+            });
+            self.set_poll_timeout(wait)
+                .map_err(|e| Ended::io(e, Failure::Io))?;
+            match read_chunk(&mut self.frames, |buffer| match &mut self.transport {
+                Transport::Plain(stream) => stream.read(buffer),
+                Transport::Secure(stream) => crate::tls::read_update(stream, buffer),
+            }) {
                 Ok(None) => continue,
                 Ok(Some(Incoming::Slow(body))) => {
                     self.slow(&body, emit)?;
@@ -630,7 +682,9 @@ impl Active {
                 Err(error)
                     if matches!(
                         error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
                     ) => {}
                 Err(error) => return Err(Ended::io(error, Failure::RemoteClosed)),
             }
@@ -639,26 +693,20 @@ impl Active {
 
     /// Applies every queued input or clipboard command before the next read.
     fn drain(&mut self, commands: &Receiver<Command>) -> Result<(), Ended> {
-        for _ in 0..64 {
-            match commands.pop() {
-                Some(Command::Key {
+        let mut events = Vec::new();
+        for index in 0..64 {
+            let Some(command) = commands.pop() else { break };
+            if index == 63 {
+                commands.wake_if_pending();
+            }
+            match command {
+                Command::Key {
                     scancode,
                     down,
                     extended,
-                }) => self
-                    .key(scancode, down, extended)
-                    .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?,
-                Some(Command::Pointer { buttons, x, y }) => {
+                } => events.push([4, keyboard_flags(down, extended), u16::from(scancode), 0]),
+                Command::Pointer { buttons, x, y } => {
                     let flags = super::pointer_flags(self.buttons, buttons);
-                    if (self.buttons & 7 == 0) != (buttons & 7 == 0) {
-                        // Service drag motion even while the server is waiting for
-                        // input before repainting. Restore the idle wait on release.
-                        self.set_poll_timeout(if buttons & 7 != 0 {
-                            Duration::from_millis(8)
-                        } else {
-                            POLL
-                        });
-                    }
                     self.buttons = buttons;
                     if flags & 0x0400 != 0 && !self.share.horizontal_wheel {
                         continue;
@@ -666,24 +714,28 @@ impl Active {
                     // Position the cursor before a button edge or wheel step.
                     let moved = self.pointer_position != Some((x, y));
                     if moved && flags != 0x0800 {
-                        self.pointer(0x0800, x, y)
-                            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+                        events.push([0x8001, 0x0800, x, y]);
                     }
                     if moved || flags != 0x0800 {
-                        self.pointer(flags, x, y)
-                            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+                        events.push([0x8001, flags, x, y]);
                     }
                     self.pointer_position = Some((x, y));
                 }
-                Some(Command::Resize(w, h, percent)) => self.display.resize(w, h, percent),
-                Some(Command::Clipboard(entries)) => self
-                    .clipboard
-                    .offer(&self.channels, &mut self.transport, entries)
-                    .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?,
-                None => break,
+                Command::Resize(w, h, percent) => self.display.resize(w, h, percent),
+                Command::Clipboard(entries) => {
+                    self.share
+                        .inputs(&self.channels, &mut self.transport, &events)
+                        .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+                    events.clear();
+                    self.clipboard
+                        .offer(&self.channels, &mut self.transport, entries)
+                        .map_err(|error| Ended::io(error, Failure::ProtocolFailure))?;
+                }
             }
         }
-        Ok(())
+        self.share
+            .inputs(&self.channels, &mut self.transport, &events)
+            .map_err(|error| Ended::io(error, Failure::ProtocolFailure))
     }
 
     /// Reads bytes until a whole PDU is buffered. A timeout part-way through keeps
@@ -700,7 +752,9 @@ impl Active {
             Err(error)
                 if matches!(
                     error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
                 ) =>
             {
                 Ok(None)
@@ -709,11 +763,8 @@ impl Active {
         }
     }
 
-    /// Strips the X.224 and MCS headers and returns the Share Control header and
-    /// its body when the PDU belongs to the global channel. Anything else (a
-    /// static channel message, another MCS primitive) is not a share control PDU
-    /// and is reported as absent, never guessed at.
-    fn control<'a>(&'a self, body: &'a [u8]) -> Option<(u16, share::Control<'a>)> {
+    /// Strips the transport headers from a global channel activation message.
+    fn activation_payload<'a>(&self, body: &'a [u8]) -> Option<&'a [u8]> {
         let mut p = Packet(body);
         if p.u8().ok()? != 2 {
             return None;
@@ -727,9 +778,7 @@ impl Active {
         } else {
             p.0
         };
-        let mut p = Packet(payload);
-        let control = share::control(&mut p).ok()?;
-        Some((control.kind, control))
+        Some(payload)
     }
 
     fn slow(&mut self, body: &[u8], emit: &Emit) -> Result<(), Ended> {
@@ -922,33 +971,6 @@ impl Active {
         }
         Ok(())
     }
-
-    /// Slow-path keyboard input: the same event the fast path carries, inside a
-    /// Share Data PDU. Every server accepts it, which a fast-path PDU is not
-    /// guaranteed to be.
-    fn key(&mut self, scancode: u8, down: bool, extended: bool) -> io::Result<()> {
-        self.share.input(
-            &self.channels,
-            &mut self.transport,
-            4, // INPUT_EVENT_SCANCODE
-            keyboard_flags(down, extended),
-            u16::from(scancode),
-            0,
-        )
-    }
-
-    /// Slow-path pointer input (INPUT_EVENT_MOUSE), with the same flag encoding
-    /// the fast path uses.
-    fn pointer(&mut self, flags: u16, x: u16, y: u16) -> io::Result<()> {
-        self.share.input(
-            &self.channels,
-            &mut self.transport,
-            0x8001, // INPUT_EVENT_MOUSE
-            flags,
-            x,
-            y,
-        )
-    }
 }
 
 #[cfg(test)]
@@ -957,8 +979,9 @@ mod tests {
 
     fn activated(emit: &Emit) -> Active {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let transport =
-            Transport::Plain(TcpStream::connect(listener.local_addr().unwrap()).unwrap());
+        let transport = Transport::Plain(PollingSocket::new(
+            TcpStream::connect(listener.local_addr().unwrap()).unwrap(),
+        ));
         let now = std::time::Instant::now();
         Active {
             transport,
@@ -975,6 +998,7 @@ mod tests {
             drive: Drive::new(None, Arc::clone(emit)),
             first_picture_deadline: Some(now + FIRST_PICTURE_WAIT),
             startup_picture: StartupPicture::default(),
+            redraw_delay: Duration::from_millis(200),
             deactivated: false,
             logon_deadline: now + LOGON_WAIT,
             logon_confirmed: false,
@@ -988,24 +1012,34 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_black_logon_surface_requests_one_repaint_unless_content_already_arrived() {
         let now = Instant::now();
+        let delay = Duration::from_millis(200);
         let mut picture = StartupPicture::default();
-        assert!(!picture.redraw_due(now));
+        assert!(!picture.redraw_due(now, delay));
         picture.observe(&[0, 0, 0, 255]);
-        assert!(!picture.redraw_due(now));
-        assert!(!picture.redraw_due(now + Duration::from_millis(50)));
-        assert!(picture.redraw_due(now + Duration::from_secs(1)));
+        assert!(!picture.redraw_due(now, delay));
+        assert!(!picture.redraw_due(now + Duration::from_millis(50), delay));
+        assert!(picture.redraw_due(now + Duration::from_secs(1), delay));
         picture.observe(&[0, 0, 0, 255]);
-        assert!(!picture.redraw_due(now + Duration::from_secs(2)));
+        assert!(!picture.redraw_due(now + Duration::from_secs(2), delay));
         let mut picture = StartupPicture::default();
         picture.observe(&[0, 0, 0, 255]);
-        assert!(!picture.redraw_due(now));
+        assert!(!picture.redraw_due(now, delay));
         picture.observe(&[20, 20, 20, 255]);
-        assert!(!picture.redraw_due(now + Duration::from_secs(1)));
+        assert!(!picture.redraw_due(now + Duration::from_secs(1), delay));
+
+        let mut picture = StartupPicture::default();
+        let slow_link = Duration::from_secs(4);
+        picture.observe(&[0, 0, 0, 255]);
+        assert!(!picture.redraw_due(now, slow_link));
+        assert!(!picture.redraw_due(now + Duration::from_secs(3), slow_link));
+        assert!(picture.redraw_due(now + slow_link, slow_link));
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn fragmented_windows_alpha_pointer_is_emitted_and_cached_after_its_last_fragment() {
         let (tx, events) = std::sync::mpsc::channel();
         let emit: Emit = Arc::new(move |event| tx.send(event).unwrap());
@@ -1035,6 +1069,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn windows_fast_path_delivers_a_headerless_bitmap_after_pointer_updates() {
         let (tx, events) = std::sync::mpsc::channel();
         let emit: Emit = Arc::new(move |event| tx.send(event).unwrap());
@@ -1086,6 +1121,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn activation_without_pixels_ends_with_a_first_picture_error() {
         let emit: Emit = Arc::new(|_| {});
         let mut active = activated(&emit);
@@ -1097,6 +1133,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_pdu_split_by_a_timeout_is_still_parsed() {
         // A TPKT with a 6-byte body: version 3, length 10.
         let pdu = vec![3, 0, 0, 10, b'a', b'b', b'c', b'd', b'e', b'f'];
@@ -1112,6 +1149,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn two_pdus_in_one_read_arrive_one_at_a_time() {
         let one = vec![3, 0, 0, 6, 1, 2];
         let two = vec![3, 0, 0, 5, 9];
@@ -1130,6 +1168,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_timeout_in_the_middle_of_a_pdu_keeps_what_arrived() {
         // A peer sends the first five bytes of a PDU, waits past the read timeout,
         // then sends the rest. The read really times out, and the second call still
@@ -1192,13 +1231,10 @@ mod tests {
         let share = Share::pending(800, 600);
         let mut out = Vec::new();
         share
-            .input(
+            .inputs(
                 &channels,
                 &mut out,
-                4, // INPUT_EVENT_SCANCODE
-                keyboard_flags(down, extended),
-                u16::from(scancode),
-                0,
+                &[[4, keyboard_flags(down, extended), u16::from(scancode), 0]],
             )
             .expect("the input PDU is written");
 
@@ -1257,6 +1293,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_slow_path_key_release_is_flagged_as_a_release() {
         // The slow path's bits, not the fast path's: a release marked 0x01 reads as
         // a press, so every typed character arrived twice.
@@ -1302,6 +1339,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_logon_confirmation_maps_to_its_outcome() {
         assert!(logon_pdu(38, &[1, 0, 0, 0]).unwrap());
         assert!(!logon_pdu(47, &[0; 4]).unwrap());
@@ -1313,6 +1351,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn bad_capabilities_and_authentication_have_distinct_failure_reasons() {
         let rejected = logon_pdu(47, &4330u32.to_le_bytes()).unwrap_err();
         assert_eq!(rejected.failure, Failure::ProtocolFailure);

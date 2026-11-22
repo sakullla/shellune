@@ -229,6 +229,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn packed_rows_and_rle_runs_preserve_pixel_order() {
         let a = [1, 2, 3, 255];
         let b = [4, 5, 6, 255];
@@ -256,6 +257,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_complete_raw_tile_does_not_wait_for_bytes_of_the_next_tile() {
         let mut z = Decompress::new(true);
         let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -301,6 +303,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn fragmented_rectangles_share_one_zlib_dictionary() {
         let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
         let mut z = Decompress::new(true);

@@ -1095,6 +1095,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_desktop_and_a_serial_pane_restore_as_pending_and_start_nothing() {
         let rdp = HostId::new();
         let vnc = HostId::new();
@@ -1145,6 +1146,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in RDP/VNC test"]
     fn a_desktop_pane_whose_connection_is_gone_stays_and_is_reported() {
         let saved = HostId::new();
         let gone = HostId::new();

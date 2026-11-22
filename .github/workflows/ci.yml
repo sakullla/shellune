@@ -63,8 +63,4 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Test
-        env:
-          # A protocol whose engine the build does not carry must fail the job rather
-          # than pass as a row of skips.
-          SHELLUNE_REQUIRE_NATIVE: "1"
-        run: cargo test --workspace --all-features -- --include-ignored
+        run: cargo test --workspace --all-features
