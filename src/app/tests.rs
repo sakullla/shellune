@@ -42766,37 +42766,40 @@ async fn generated_passwords_use_the_chosen_classes_and_length(cx: &mut TestAppC
     assert!(letters.chars().all(|ch| ch.is_ascii_alphabetic()));
 }
 
-/// A desktop connection offers no vault binding it could not honour.
+/// A desktop connection binds a shared password of the vault, and the binding
+/// is one the connection really honours.
 ///
-/// The RDP and VNC forms have no sign-in section and no vault pickers: their
-/// records cannot name a managed key or a shared credential, so no binding can
-/// exist that looks usable on screen and fails at the connection (R1). The
-/// pickers belong to the SSH form, and switching a new record to a desktop
-/// protocol takes them away with the whole section. Giving desktop records a
-/// place in the shared credential layer needs the record model itself to carry
-/// the reference - reported as an API need, not papered over here.
+/// A desktop sign-in is a password, so the RDP and VNC forms offer the vault's
+/// shared passwords beside the typed field, and a bound record dials with the
+/// record's password at the moment it starts. What still does not exist is a
+/// binding that only looks usable: the SSH form's own pickers stay with the
+/// SSH form, and clearing the choice returns the form to a typed password
+/// (R1).
 #[gpui::test]
-async fn a_desktop_connection_offers_no_vault_binding_it_cannot_honour(cx: &mut TestAppContext) {
-    let dir = TempDir::new("security-desktop-pin");
+async fn a_desktop_connection_binds_a_vault_password_and_dials_with_it(cx: &mut TestAppContext) {
+    let dir = TempDir::new("security-desktop-bind");
     let (view, cx) = security_view(cx, &dir);
 
-    // A shared password exists, so a picker would have something to offer if
-    // the desktop form offered one at all.
+    // One shared password, generated rather than typed.
     click(cx, "security.action.new-password");
     type_into(cx, "security.dialog.name", "Prod login");
     click(cx, "security.dialog.generate.password");
     click(cx, "security.dialog.submit");
     cx.run_until_parked();
-    assert_eq!(
-        cx.update(|_window, app| view.read(app).security_credentials_for_test())
-            .len(),
-        1
-    );
+    let (credential, _) = cx
+        .update(|_window, app| view.read(app).security_credentials_for_test())
+        .first()
+        .cloned()
+        .expect("the shared password was created");
+    let password = cx
+        .update(|_window, app| {
+            view.read(app)
+                .security_credential_password_for_test(credential)
+        })
+        .expect("the record holds a password");
 
-    // A new desktop record: the form it opens is the protocol form, and no
-    // vault picker of the SSH form's is ever drawn - the vault holds a shared
-    // password to offer, and the desktop form offers nothing of it, because a
-    // desktop record has no field to keep the reference in.
+    // The RDP form offers the vault's shared passwords; the SSH form's own
+    // pickers are not drawn on the protocol form.
     click(cx, "nav.hosts");
     click(cx, "hosts.new");
     click(cx, "connection.protocol.rdp");
@@ -42811,31 +42814,427 @@ async fn a_desktop_connection_offers_no_vault_binding_it_cannot_honour(cx: &mut 
         "a desktop record is edited by the protocol form, which has no sign-in section"
     );
     assert!(
-        cx.debug_bounds("hosts.auth.credential.0").is_none(),
-        "the desktop form draws no shared-password picker although the vault holds one"
+        cx.debug_bounds("connection.auth.credential.0").is_some(),
+        "a password sign-in offers the vault's shared password"
     );
-    assert!(cx.debug_bounds("hosts.auth.managed.picker").is_none());
-    type_into(cx, "connection.field.address", "10.0.0.9");
+    assert!(
+        cx.debug_bounds("hosts.auth.credential.0").is_none()
+            && cx.debug_bounds("hosts.auth.managed.picker").is_none(),
+        "the SSH form's pickers stay with the SSH form"
+    );
+
+    // Choosing the record takes the typed field away: the vault holds the
+    // password, so there is nothing to type and nothing to keep in the system
+    // store. The form model is what the render follows, and the clear button
+    // is drawn only for a chosen record.
+    click(cx, "connection.auth.credential.0");
+    assert!(
+        cx.debug_bounds("connection.auth.credential.clear")
+            .is_some(),
+        "a chosen record shows the way back to a typed password"
+    );
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .hosts_state()
+                .protocol_draft()
+                .map(|draft| (draft.credential_id(), draft.needs_secret()))
+        }),
+        Some((Some(credential), false)),
+        "a bound connection has no password of its own to type or keep"
+    );
+    type_into(cx, "connection.field.address", "127.0.0.1");
+    clear_field(cx, "connection.field.port", 4);
+    type_into(cx, "connection.field.port", "1");
     click(cx, "connection.save");
     cx.run_until_parked();
+    let record = cx
+        .update(|_window, app| view.read(app).book().connections().last().cloned())
+        .expect("the connection was saved");
+    assert_eq!(
+        record.credential_id(),
+        Some(credential),
+        "the record names the one shared password"
+    );
+    assert!(
+        !record.remembers_secret(),
+        "the vault holds the password; the system store is not asked to"
+    );
+    let id = record.id();
 
-    // Editing the saved desktop record stays the same way: no sign-in section
-    // and no vault picker appears for it either. A desktop row's edit control
-    // is the row's own, not the SSH row's.
+    // The start reads the password from the vault: the form had nothing typed
+    // and nothing was kept anywhere else.
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.connect_saved_connection(id, cx));
+    });
+    cx.run_until_parked();
+    let session = cx
+        .update(|_window, app| view.read(app).open_tabs().last().copied())
+        .expect("the connection opened a tab");
+    cx.update(|_window, app| {
+        let pane = view
+            .read(app)
+            .desktop_of(session)
+            .expect("the desktop surface is mounted")
+            .read(app);
+        assert_eq!(
+            pane.started_password(),
+            Some(Some(password.as_str())),
+            "the attempt dials with the shared password of the vault"
+        );
+    });
+
+    // The file names the reference and never the password.
+    let file = std::fs::read_to_string(dir.path().join(shellune_storage::FILE_NAME))
+        .expect("the connection file was written");
+    assert!(file.contains("credential_id"), "{file}");
+    assert!(!file.contains(&password), "no secret reaches the file");
+
+    // Clearing the choice returns the form to a typed password.
+    click(cx, "nav.hosts");
     click(cx, "hosts.connection.edit.0");
     assert!(
-        cx.update(|_window, app| {
-            let view = view.read(app);
-            (
-                view.hosts_state().is_editing_connection(),
-                view.hosts_state().is_editing(),
-            )
-        }) == (true, false),
-        "an edited desktop record keeps the protocol form"
+        cx.debug_bounds("connection.auth.credential.clear")
+            .is_some(),
+        "a bound edit offers the way back to a typed password"
     );
-    assert!(cx.debug_bounds("hosts.auth.managed.picker").is_none());
-    click(cx, "connection.cancel");
+    click(cx, "connection.auth.credential.clear");
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .hosts_state()
+                .protocol_draft()
+                .map(|draft| (draft.credential_id(), draft.needs_secret()))
+        }),
+        Some((None, true)),
+        "clearing the choice returns the form to a typed password"
+    );
+    click(cx, "connection.save");
     cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .book()
+                .connection(id)
+                .and_then(|record| record.credential_id())
+        }),
+        None,
+        "saving the cleared form unbinds the record"
+    );
+}
+
+/// A shared password reaches every desktop connection that names it, and an
+/// independent copy changes on its own from the moment it is made (R1).
+#[gpui::test]
+async fn a_shared_password_edited_in_one_place_reaches_the_desktop_connections(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("security-desktop-shared");
+    let (view, cx) = security_view(cx, &dir);
+
+    click(cx, "security.action.new-password");
+    type_into(cx, "security.dialog.name", "Prod login");
+    click(cx, "security.dialog.generate.password");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    let (credential, _) = cx
+        .update(|_window, app| view.read(app).security_credentials_for_test())
+        .first()
+        .cloned()
+        .expect("the shared password was created");
+
+    // One RDP and one VNC connection, each bound through its own form: two
+    // protocols, one shared record.
+    for protocol in ["connection.protocol.rdp", "connection.protocol.vnc"] {
+        click(cx, "nav.hosts");
+        click(cx, "hosts.new");
+        click(cx, protocol);
+        click(cx, "connection.auth.credential.0");
+        type_into(cx, "connection.field.address", "127.0.0.1");
+        clear_field(cx, "connection.field.port", 4);
+        type_into(cx, "connection.field.port", "1");
+        click(cx, "connection.save");
+        cx.run_until_parked();
+    }
+    let bound = cx.update(|_window, app| {
+        view.read(app)
+            .book()
+            .connections()
+            .iter()
+            .map(|record| (record.id(), record.credential_id()))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(bound.len(), 2, "both connections were saved");
+    for (id, referenced) in &bound {
+        assert_eq!(
+            *referenced,
+            Some(credential),
+            "the connection {id} names the one shared record"
+        );
+    }
+
+    // Editing the shared record is the reality of both connections at once:
+    // each next start reads the new value.
+    let edit_shared = |cx: &mut VisualTestContext, password: &str| {
+        click(cx, "nav.settings");
+        click(cx, "settings.item.keys-and-passwords");
+        click(cx, "security.credential.0");
+        click(cx, "security.detail.action.0");
+        clear_field(cx, "security.dialog.secret", 0);
+        type_into(cx, "security.dialog.secret", password);
+        click(cx, "security.dialog.submit");
+        cx.run_until_parked();
+    };
+    edit_shared(cx, "second-shared-value");
+    for (id, _) in &bound {
+        cx.update(|_window, cx| {
+            view.update(cx, |view, cx| view.connect_saved_connection(*id, cx));
+        });
+        cx.run_until_parked();
+        let session = cx
+            .update(|_window, app| view.read(app).open_tabs().last().copied())
+            .expect("the connection opened a tab");
+        cx.update(|_window, app| {
+            let pane = view
+                .read(app)
+                .desktop_of(session)
+                .expect("the desktop surface is mounted")
+                .read(app);
+            assert_eq!(
+                pane.started_password(),
+                Some(Some("second-shared-value")),
+                "the start of this connection reads the edited shared password"
+            );
+        });
+    }
+
+    // An independent copy keeps its own value: the original's connections move
+    // with the original alone.
+    click(cx, "nav.settings");
+    click(cx, "settings.item.keys-and-passwords");
+    click(cx, "security.credential.0");
+    click(cx, "security.detail.action.1");
+    cx.run_until_parked();
+    let copies = cx.update(|_window, app| view.read(app).security_credentials_for_test());
+    let copy = copies
+        .iter()
+        .find(|(id, _)| *id != credential)
+        .map(|(id, _)| *id)
+        .expect("the copy has its own identity");
+    assert_eq!(
+        cx.update(|_window, app| { view.read(app).security_credential_password_for_test(copy) }),
+        Some("second-shared-value".to_owned()),
+        "the copy starts from the value the original had"
+    );
+    edit_shared(cx, "third-shared-value");
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .security_credential_password_for_test(credential)
+        }),
+        Some("third-shared-value".to_owned())
+    );
+    assert_eq!(
+        cx.update(|_window, app| { view.read(app).security_credential_password_for_test(copy) }),
+        Some("second-shared-value".to_owned()),
+        "the independent copy keeps its own value when the original moves on"
+    );
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.connect_saved_connection(bound[0].0, cx));
+    });
+    cx.run_until_parked();
+    let session = cx
+        .update(|_window, app| view.read(app).open_tabs().last().copied())
+        .expect("the connection opened a tab");
+    cx.update(|_window, app| {
+        let pane = view
+            .read(app)
+            .desktop_of(session)
+            .expect("the desktop surface is mounted")
+            .read(app);
+        assert_eq!(
+            pane.started_password(),
+            Some(Some("third-shared-value")),
+            "the connection still follows the record it names"
+        );
+    });
+}
+
+/// A desktop connection whose shared password the vault cannot hand over says
+/// so, instead of dialling with nothing and letting the server report a
+/// refusal that means less (R1).
+#[gpui::test]
+async fn a_desktop_connection_whose_shared_password_is_unreachable_says_so(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("security-desktop-unreachable");
+    // A record that names a credential no vault of this machine holds: the
+    // shape a deleted record leaves behind, and what a locked vault reads as.
+    let credential = shellune_core::CredentialId::new();
+    let mut rdp =
+        shellune_core::RdpConfig::new("office", "127.0.0.1", Some("desk")).expect("a valid record");
+    rdp.set_port(1).expect("a closed port");
+    rdp.set_credential_id(Some(credential));
+    seed_connections(
+        &dir.store(),
+        vec![shellune_core::ConnectionRecord::Rdp(rdp)],
+    );
+    let (view, cx) = hosts_view(cx, dir.store());
+
+    let id = cx
+        .update(|_window, app| {
+            view.read(app)
+                .book()
+                .connections()
+                .first()
+                .map(shellune_core::ConnectionRecord::id)
+        })
+        .expect("the record was loaded");
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.connect_saved_connection(id, cx));
+    });
+    cx.run_until_parked();
+
+    // The session is refused with the localized reason, and no attempt was
+    // dialled behind it.
+    let session = cx
+        .update(|_window, app| view.read(app).open_tabs().last().copied())
+        .expect("the attempt was recorded");
+    let state = cx.update(|_window, app| {
+        view.read(app)
+            .workspace()
+            .session(session)
+            .map(|session| session.state().clone())
+    });
+    match state {
+        Some(shellune_core::SessionState::Failed(
+            shellune_core::SessionFailure::ReconnectUnavailable { reason },
+        )) => {
+            assert!(
+                reason.contains("vault cannot hand this password over"),
+                "the refusal names the vault, not the server: {reason}"
+            );
+        }
+        other => panic!("the start was refused where the user can read it: {other:?}"),
+    }
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).desktop_start_count_for_test()),
+        0,
+        "nothing was dialled with a password the record never chose"
+    );
+}
+
+/// A desktop record written before desktop connections joined the vault still
+/// loads, unbound, and can be bound once it has a place to keep the reference
+/// (R1).
+#[gpui::test]
+async fn a_desktop_record_written_before_vault_binding_still_loads(cx: &mut TestAppContext) {
+    let dir = TempDir::new("security-desktop-old-record");
+
+    // Exactly the connection file a build without the reference field wrote:
+    // an RDP record with no credential to name.
+    let id = shellune_core::HostId::new();
+    let book = serde_json::json!({
+        "version": 1,
+        "hosts": [],
+        "connections": [{
+            "protocol": "rdp",
+            "id": id,
+            "name": "office",
+            "address": "10.0.0.9",
+            "port": 3389,
+            "user": "alice"
+        }],
+        "recents": [],
+        "favorites": []
+    });
+    std::fs::write(
+        dir.path().join(shellune_storage::FILE_NAME),
+        serde_json::to_string(&book).expect("the old book serializes"),
+    )
+    .expect("the old book was written");
+
+    let (view, cx) = security_view(cx, &dir);
+    let record = cx
+        .update(|_window, app| view.read(app).book().connection(id))
+        .expect("the old record still loads");
+    assert_eq!(record.credential_id(), None, "it loads with nothing bound");
+
+    // A shared password exists, and the edit form of the old record offers it:
+    // a record from before the vault is not locked out of it.
+    click(cx, "security.action.new-password");
+    type_into(cx, "security.dialog.name", "Prod login");
+    click(cx, "security.dialog.generate.password");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    let (credential, _) = cx
+        .update(|_window, app| view.read(app).security_credentials_for_test())
+        .first()
+        .cloned()
+        .expect("the shared password was created");
+    click(cx, "nav.hosts");
+    click(cx, "hosts.connection.edit.0");
+    assert!(
+        cx.debug_bounds("connection.auth.credential.0").is_some(),
+        "the old record's form offers the vault's shared password"
+    );
+    click(cx, "connection.auth.credential.0");
+    click(cx, "connection.save");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .book()
+                .connection(id)
+                .and_then(|record| record.credential_id())
+        }),
+        Some(credential),
+        "the old record can be bound like any other"
+    );
+
+    // Deleting the shared record clears the binding, so nothing is left that
+    // looks usable and points at a record the vault no longer holds: the next
+    // start signs in with no password rather than the deleted one.
+    click(cx, "nav.settings");
+    click(cx, "settings.item.keys-and-passwords");
+    click(cx, "security.credential.0");
+    click(cx, "security.detail.action.2");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).security_credentials_for_test())
+            .is_empty(),
+        "the shared password was deleted"
+    );
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .book()
+                .connection(id)
+                .and_then(|record| record.credential_id())
+        }),
+        None,
+        "the record the deletion unbound names nothing"
+    );
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.connect_saved_connection(id, cx));
+    });
+    cx.run_until_parked();
+    let session = cx
+        .update(|_window, app| view.read(app).open_tabs().last().copied())
+        .expect("the connection opened a tab");
+    cx.update(|_window, app| {
+        let pane = view
+            .read(app)
+            .desktop_of(session)
+            .expect("the desktop surface is mounted")
+            .read(app);
+        assert_eq!(
+            pane.started_password(),
+            Some(None),
+            "the unbound record starts with no password, not the deleted one"
+        );
+    });
 }
 
 /// An edit made while a vault job runs is kept when the job lands: the job's

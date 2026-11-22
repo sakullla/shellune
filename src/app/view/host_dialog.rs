@@ -2032,34 +2032,137 @@ impl ShelluneView {
                 }
                 ConnectionFormField::Domain => {}
                 ConnectionFormField::Secret => {
-                    // The password a RDP or VNC server asks for, typed here because the
-                    // record has nowhere to keep it and the attempt starts after the
-                    // form closes. The box decides whether it is kept in the store.
-                    let remembered = draft.remember();
-                    basic = basic.child(
-                        self.protocol_field_sized(ConnectionFormField::Secret, 1.0, None)
-                            .child(
-                                checkbox(
-                                    "connection.field.remember",
-                                    strings.host_remember_password,
-                                    remembered,
-                                    metrics,
-                                )
-                                .tooltip(components::tooltip(strings.host_remember_note))
-                                .on_click(cx.listener(
-                                    move |this, _event, _window, cx| {
-                                        let next = this
-                                            .hosts
-                                            .protocol_draft()
-                                            .is_some_and(|draft| !draft.remember());
-                                        if let Some(draft) = this.hosts.protocol_draft_mut() {
-                                            draft.set_remember(next);
-                                        }
-                                        cx.notify();
-                                    },
-                                )),
-                            ),
-                    );
+                    // A desktop sign-in is a password. The user may type one, or name
+                    // a shared credential of the vault the way the host form's
+                    // password method does: the record keeps the reference, and every
+                    // connection that names it shares the one password (R1). A chosen
+                    // credential takes the typed field and its box away - the vault
+                    // holds the password, so there is nothing to type and nothing to
+                    // keep in the system store.
+                    let security = copy::security_for(self.workspace.locale());
+                    let chosen = draft.credential_id();
+                    let mut shared = self
+                        .security
+                        .content()
+                        .map(|vault| {
+                            vault
+                                .credentials()
+                                .filter(|record| record.meta().is_live())
+                                .map(|record| record.meta().clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    shared.sort_by(|a, b| a.name().cmp(b.name()));
+                    let mut picker = div()
+                        .flex()
+                        .flex_col()
+                        .gap(metrics.scale(spacing::HAIRLINE))
+                        .debug_selector(|| "connection.auth.credential.picker".to_owned());
+                    if draft.needs_secret() {
+                        // The password a RDP or VNC server asks for, typed here
+                        // because the record has nowhere to keep it and the attempt
+                        // starts after the form closes. The box decides whether it is
+                        // kept in the store.
+                        let remembered = draft.remember();
+                        basic = basic.child(
+                            self.protocol_field_sized(ConnectionFormField::Secret, 1.0, None)
+                                .child(
+                                    checkbox(
+                                        "connection.field.remember",
+                                        strings.host_remember_password,
+                                        remembered,
+                                        metrics,
+                                    )
+                                    .tooltip(components::tooltip(strings.host_remember_note))
+                                    .on_click(cx.listener(
+                                        move |this, _event, _window, cx| {
+                                            let next = this
+                                                .hosts
+                                                .protocol_draft()
+                                                .is_some_and(|draft| !draft.remember());
+                                            if let Some(draft) = this.hosts.protocol_draft_mut() {
+                                                draft.set_remember(next);
+                                            }
+                                            cx.notify();
+                                        },
+                                    )),
+                                ),
+                        );
+                        if shared.is_empty() {
+                            continue;
+                        }
+                        picker = picker.child(
+                            div()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .child(security.host_credential_pick),
+                        );
+                    }
+                    for (index, meta) in shared.iter().enumerate() {
+                        let id = meta.id();
+                        let selected = chosen == Some(id);
+                        let label = match meta.user() {
+                            Some(user) => format!("{} · {}", meta.name(), user),
+                            None => meta.name().to_owned(),
+                        };
+                        let selector = format!("connection.auth.credential.{index}");
+                        let reserved = components::compact_label_reserved_width(&label, metrics);
+                        picker = picker.child(
+                            components::compact_button(
+                                SharedString::from(label),
+                                if selected {
+                                    components::Variant::Primary
+                                } else {
+                                    components::Variant::Secondary
+                                },
+                                metrics,
+                            )
+                            .min_w(reserved)
+                            .max_w_full()
+                            .flex_shrink()
+                            .whitespace_normal()
+                            .h(gpui::auto())
+                            .min_h(metrics.compact_control_height())
+                            .id(SharedString::from(selector.clone()))
+                            .debug_selector({
+                                let selector = selector.clone();
+                                move || selector.clone()
+                            })
+                            .on_click(cx.listener(
+                                move |this, _event, _window, cx| {
+                                    if let Some(draft) = this.hosts.protocol_draft_mut() {
+                                        // Choosing a record again goes back to a
+                                        // typed password, which is the other way a
+                                        // desktop connection signs in.
+                                        let next =
+                                            (draft.credential_id() != Some(id)).then_some(id);
+                                        draft.set_credential(next);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        );
+                    }
+                    if chosen.is_some() {
+                        picker = picker.child(
+                            components::compact_button(
+                                security.host_credential_clear,
+                                components::Variant::Ghost,
+                                metrics,
+                            )
+                            .id("connection.auth.credential.clear")
+                            .debug_selector(|| "connection.auth.credential.clear".to_owned())
+                            .on_click(cx.listener(
+                                |this, _event, _window, cx| {
+                                    if let Some(draft) = this.hosts.protocol_draft_mut() {
+                                        draft.set_credential(None);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        );
+                    }
+                    basic = basic.child(picker);
                 }
                 ConnectionFormField::Certificate => {
                     let mut choices = components::segmented(metrics);

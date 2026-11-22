@@ -5752,6 +5752,10 @@ security_strings! {
     /// The connection form, when the key the host names cannot be handed over
     managed_missing: "The vault cannot hand this key over. Open the keys page and check the vault.",
         "保险库无法提供这把密钥，请到密钥页检查保险库。";
+    /// A desktop connection start, when the shared password it names cannot be
+    /// handed over - the vault is locked, or the record is gone
+    credential_unavailable: "The vault cannot hand this password over. Open the keys page and check the vault.",
+        "保险库无法提供这个密码，请到密钥页检查保险库。";
     /// The connection form, naming the key that will sign
     managed_chosen: "Signing in with: {name}", "登录密钥：{name}";
     /// Search field placeholder of the page

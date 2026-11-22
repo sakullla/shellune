@@ -67,8 +67,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use shellune_core::{
-    CredentialId, CredentialMeta, HostConfig, HostId, KeyId, ManagedKeyMeta, SecretString,
-    VaultRecordVersion,
+    CredentialId, CredentialMeta, HostId, KeyId, ManagedKeyMeta, SecretString, VaultRecordVersion,
 };
 use shellune_storage::{
     AppSecret, ApplyMode, ApplyOutcome, ApplyPlan, Change, ExportOptions, HostReference, KdfParams,
@@ -1431,13 +1430,15 @@ impl SyncService {
                 device_id,
             } => {
                 let mut content = write.content.clone();
-                let hosts = ssh_hosts(final_state);
-                content.set_references(&HostReference::snapshot(&hosts));
-                // The whole reference set is validated against the host book
-                // the apply ends with, as one set, before anything is written
-                // anywhere: a binding that cannot hold fails the whole vault
-                // (R8), and a half vault is never applied.
-                content.validate_for(&hosts).map_err(SyncError::Vault)?;
+                let records = connection_book(final_state);
+                content.set_references(&HostReference::snapshot_records(&records));
+                // The whole reference set is validated against the connection
+                // book the apply ends with, as one set, before anything is
+                // written anywhere: a binding that cannot hold fails the whole
+                // vault (R8), and a half vault is never applied.
+                content
+                    .validate_for_records(&records)
+                    .map_err(SyncError::Vault)?;
                 let cipher = self.seal_vault(&content, Some(&write.vault_id), source)?;
                 options = options.with_vault(cipher);
                 save = Some((content.clone(), source.unseal_source()));
@@ -1466,9 +1467,9 @@ impl SyncService {
         if let Some((content, unseal)) = save {
             let end = applied.as_ref().map_or(local, |applied| &applied.state);
             VaultStore::at(self.data.root())
-                .save(
+                .save_records(
                     &content,
-                    &ssh_hosts(end),
+                    &connection_book(end),
                     &[UnsealSource::LocalMachine, unseal],
                     self.kdf,
                     &*self.secrets,
@@ -1529,9 +1530,11 @@ impl SyncService {
             .plan(local, self.platform, ApplyMode::Replace, None)
             .map_err(SyncError::RemoteDocument)?;
         let mut content = content.clone();
-        let hosts = ssh_hosts(plan.result());
-        content.set_references(&HostReference::snapshot(&hosts));
-        content.validate_for(&hosts).map_err(SyncError::Vault)?;
+        let records = connection_book(plan.result());
+        content.set_references(&HostReference::snapshot_records(&records));
+        content
+            .validate_for_records(&records)
+            .map_err(SyncError::Vault)?;
         let applied = match plan.apply(&self.data, &*self.secrets, reason) {
             Err(PortableError::Changed) => return Ok(Step::Retry),
             other => other.map_err(SyncError::Local)?,
@@ -1540,9 +1543,9 @@ impl SyncService {
             // The local file gets this machine's own wrap beside the travelling
             // one; a first adoption creates the local unseal entry on the way.
             VaultStore::at(self.data.root())
-                .save(
+                .save_records(
                     &content,
-                    &ssh_hosts(&applied.state),
+                    &connection_book(&applied.state),
                     &[UnsealSource::LocalMachine, source.unseal_source()],
                     self.kdf,
                     &*self.secrets,
@@ -2581,8 +2584,9 @@ impl RecordView for VaultCredentialRecord {
 
 /// The fingerprint of the public part of a vault: the metadata of every record
 /// (version and tombstone included) and the accepted server identities. No
-/// secret, and no host-reference mirror: references are a function of the host
-/// book, which [`VaultContent::validate_for`] checks as a whole at every write.
+/// secret, and no host-reference mirror: references are a function of the
+/// connection book, which [`VaultContent::validate_for_records`] checks as a
+/// whole at every write.
 fn vault_fingerprint(content: &VaultContent) -> String {
     // The metadata serializes with its name, timestamps, version and possible
     // tombstone; the canonical form of the whole set is the fingerprint.
@@ -3279,18 +3283,16 @@ fn new_device_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
-/// The SSH host records of a state: the hosts a vault's reference mirror is
-/// the mirror of.
-fn ssh_hosts(state: &LocalState) -> Vec<HostConfig> {
-    state
-        .hosts
-        .records()
-        .iter()
-        .filter_map(|record| match record {
-            shellune_core::ConnectionRecord::Ssh(host) => Some(host.clone()),
-            _ => None,
-        })
-        .collect()
+/// The whole connection book of a state — the SSH hosts and the connections of
+/// every other protocol — which a vault's reference mirror is the mirror of.
+///
+/// The mirror covers desktop connections too: a record that names a shared
+/// credential is a reference the vault's own save checks, so a sync that
+/// rebuilt the mirror from the SSH hosts alone would write a vault that
+/// forgets the desktop bindings until the next local save rebuilt them
+/// (ADR-1).
+fn connection_book(state: &LocalState) -> Vec<shellune_core::ConnectionRecord> {
+    state.hosts.records()
 }
 
 #[cfg(test)]

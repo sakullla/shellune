@@ -283,17 +283,40 @@ impl VaultStore {
     }
 
     /// Saves `content` as a new ciphertext sealed for every source, all or
-    /// nothing.
+    /// nothing, validated against a book of SSH hosts alone.
     ///
-    /// The content is validated against the whole host book first — the core
-    /// catalog checks, the sign-in-method rule and the reference snapshot —
-    /// so no write can leave a host pointing at nothing. When a vault already
-    /// exists, its identity is kept (the wraps stay bound to their vault) and
-    /// its ciphertext is copied aside as an encrypted snapshot before the new
-    /// file replaces it. A local secret this machine does not have yet is
-    /// stored in the system credential store *before* the file is written and
-    /// removed again when the write fails, so no failure leaves a vault no
-    /// secret can open, or an orphan entry in the store.
+    /// The book a build without desktop references kept; the whole-book save is
+    /// [`Self::save_records`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::save_records`].
+    pub fn save(
+        &self,
+        content: &VaultContent,
+        hosts: &[HostConfig],
+        sources: &[UnsealSource],
+        kdf: KdfParams,
+        secrets: &dyn SecretStore,
+    ) -> Result<(), VaultStoreError> {
+        let records: Vec<ConnectionRecord> =
+            hosts.iter().cloned().map(ConnectionRecord::Ssh).collect();
+        self.save_records(content, &records, sources, kdf, secrets)
+    }
+
+    /// Saves `content` as a new ciphertext sealed for every source, all or
+    /// nothing, validated against a whole connection book.
+    ///
+    /// The content is validated against every record the book holds first — the
+    /// core catalog checks over the SSH hosts, the sign-in-method rule, the
+    /// desktop references and the reference snapshot — so no write can leave a
+    /// record pointing at nothing. When a vault already exists, its identity is
+    /// kept (the wraps stay bound to their vault) and its ciphertext is copied
+    /// aside as an encrypted snapshot before the new file replaces it. A local
+    /// secret this machine does not have yet is stored in the system credential
+    /// store *before* the file is written and removed again when the write
+    /// fails, so no failure leaves a vault no secret can open, or an orphan
+    /// entry in the store.
     ///
     /// The sources name every wrap the new ciphertext will have; a source the
     /// old file needed but the caller does not name is dropped, which is how a
@@ -302,16 +325,16 @@ impl VaultStore {
     ///
     /// # Errors
     ///
-    /// Returns [`VaultStoreError::Invalid`] for content the host book
+    /// Returns [`VaultStoreError::Invalid`] for content the connection book
     /// contradicts, [`VaultStoreError::EmptySecret`] for a blank passphrase,
     /// and [`VaultStoreError::Corrupt`] or [`VaultStoreError::UnsupportedVersion`]
     /// when an existing file cannot be read — the last good file is never
     /// overwritten by a save that could not read it — and the snapshot, system
     /// store and write failures. In every case the previous file is intact.
-    pub fn save(
+    pub fn save_records(
         &self,
         content: &VaultContent,
-        hosts: &[HostConfig],
+        records: &[ConnectionRecord],
         sources: &[UnsealSource],
         kdf: KdfParams,
         secrets: &dyn SecretStore,
@@ -324,7 +347,7 @@ impl VaultStore {
         for source in sources {
             source.check_not_empty()?;
         }
-        content.validate_for(hosts)?;
+        content.validate_for_records(records)?;
 
         let previous = self.read_previous()?;
         let vault_id = previous.as_ref().map(|(id, _, _)| id.clone());

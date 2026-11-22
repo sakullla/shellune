@@ -21,8 +21,8 @@ use std::time::SystemTime;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use shellune_core::{
-    AuthMethodKind, CredentialId, CredentialMeta, HostConfig, HostId, KeyId, ManagedKeyMeta,
-    SecretString, VaultCatalog, VaultRecordVersion, VaultTombstone,
+    AuthMethodKind, ConnectionRecord, CredentialId, CredentialMeta, HostConfig, HostId, KeyId,
+    ManagedKeyMeta, SecretString, VaultCatalog, VaultRecordVersion, VaultTombstone,
 };
 use zeroize::Zeroize as _;
 use zeroize::Zeroizing;
@@ -113,13 +113,54 @@ impl HostReference {
         }
     }
 
+    /// The references one connection record holds today, whatever its protocol.
+    ///
+    /// An SSH record answers as its host. A desktop record names at most a shared
+    /// credential — RDP and VNC sign in with a password and have no managed key of
+    /// their own — and a serial port names nothing, which the snapshot filters out
+    /// as a reference that says nothing.
+    #[must_use]
+    pub fn of_connection(record: &ConnectionRecord) -> Self {
+        match record {
+            ConnectionRecord::Ssh(host) => Self::of(host),
+            ConnectionRecord::Rdp(config) => Self {
+                host: config.id(),
+                managed_key_id: None,
+                credential_id: config.credential_id(),
+            },
+            ConnectionRecord::Vnc(config) => Self {
+                host: config.id(),
+                managed_key_id: None,
+                credential_id: config.credential_id(),
+            },
+            ConnectionRecord::Serial(config) => Self {
+                host: config.id(),
+                managed_key_id: None,
+                credential_id: None,
+            },
+        }
+    }
+
     /// The reference snapshot of a whole host book: every host that names a
     /// vault record, in a fixed order, without duplicates.
     #[must_use]
     pub fn snapshot(hosts: &[HostConfig]) -> Vec<Self> {
-        let mut references: Vec<Self> = hosts
+        let records: Vec<ConnectionRecord> =
+            hosts.iter().cloned().map(ConnectionRecord::Ssh).collect();
+        Self::snapshot_records(&records)
+    }
+
+    /// The reference snapshot of a whole connection book: every record of every
+    /// protocol that names a vault record, in a fixed order, without duplicates.
+    ///
+    /// The SSH hosts and the other connections are one book to the vault, so this
+    /// is the snapshot a whole application state saves against; [`Self::snapshot`]
+    /// answers the same question for a book this build once kept to SSH alone.
+    #[must_use]
+    pub fn snapshot_records(records: &[ConnectionRecord]) -> Vec<Self> {
+        let mut references: Vec<Self> = records
             .iter()
-            .map(Self::of)
+            .map(Self::of_connection)
             .filter(|reference| {
                 reference.managed_key_id.is_some() || reference.credential_id.is_some()
             })
@@ -424,26 +465,71 @@ impl VaultContent {
     /// Returns [`VaultStoreError::Invalid`] naming the first problem; nothing
     /// is written.
     pub fn validate_for(&self, hosts: &[HostConfig]) -> Result<(), VaultStoreError> {
+        let records: Vec<ConnectionRecord> =
+            hosts.iter().cloned().map(ConnectionRecord::Ssh).collect();
+        self.validate_for_records(&records)
+    }
+
+    /// Checks the content against a whole connection book before it is written.
+    ///
+    /// The same contract [`Self::validate_for`] keeps for hosts, said over every
+    /// protocol: the SSH records run the catalog checks and the sign-in-method
+    /// rule, a desktop record may name only a shared credential the vault holds
+    /// live — a reference to a record that is gone or deleted is a binding that
+    /// cannot hold, and is refused — and the reference snapshot has to be the
+    /// snapshot of exactly these records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultStoreError::Invalid`] naming the first problem; nothing
+    /// is written.
+    pub fn validate_for_records(
+        &self,
+        records: &[ConnectionRecord],
+    ) -> Result<(), VaultStoreError> {
         let invalid = |reason: String| VaultStoreError::Invalid { reason };
         let catalog = self.catalog()?;
+        let hosts: Vec<HostConfig> = records
+            .iter()
+            .filter_map(|record| match record {
+                ConnectionRecord::Ssh(host) => Some(host.clone()),
+                _ => None,
+            })
+            .collect();
         catalog
-            .validate_references(hosts)
+            .validate_references(&hosts)
             .map_err(|error| invalid(error.to_string()))?;
-        for host in hosts {
-            if host.managed_key_id().is_some() && host.auth() != Some(AuthMethodKind::ManagedKey) {
-                return Err(invalid(format!(
-                    "the host {} keeps a managed key reference without the sign-in method that reads it",
-                    host.id()
-                )));
-            }
-            if host.credential_id().is_some() && host.auth() != Some(AuthMethodKind::Password) {
-                return Err(invalid(format!(
-                    "the host {} keeps a shared credential reference without the sign-in method that reads it",
-                    host.id()
-                )));
+        for record in records {
+            match record {
+                ConnectionRecord::Ssh(host) => {
+                    if host.managed_key_id().is_some()
+                        && host.auth() != Some(AuthMethodKind::ManagedKey)
+                    {
+                        return Err(invalid(format!(
+                            "the host {} keeps a managed key reference without the sign-in method that reads it",
+                            host.id()
+                        )));
+                    }
+                    if host.credential_id().is_some()
+                        && host.auth() != Some(AuthMethodKind::Password)
+                    {
+                        return Err(invalid(format!(
+                            "the host {} keeps a shared credential reference without the sign-in method that reads it",
+                            host.id()
+                        )));
+                    }
+                }
+                ConnectionRecord::Rdp(config) => {
+                    self.credential_is_held(config.credential_id(), config.id())?;
+                }
+                ConnectionRecord::Vnc(config) => {
+                    self.credential_is_held(config.credential_id(), config.id())?;
+                }
+                // A serial port signs in with nothing, so it can name nothing.
+                ConnectionRecord::Serial(_) => {}
             }
         }
-        let expected = HostReference::snapshot(hosts);
+        let expected = HostReference::snapshot_records(records);
         if self.references != expected {
             return Err(invalid(
                 "the host references saved in the vault are not the references of this host book"
@@ -452,6 +538,35 @@ impl VaultContent {
         }
         self.trust.validate().map_err(invalid)?;
         Ok(())
+    }
+
+    /// Whether a desktop connection's credential reference resolves to a live
+    /// record of this content.
+    ///
+    /// The core catalog speaks the host record's shape, so the desktop half of
+    /// the same rule is checked here, against the records the content itself
+    /// holds — which is what the catalog would say over them.
+    fn credential_is_held(
+        &self,
+        credential: Option<CredentialId>,
+        connection: HostId,
+    ) -> Result<(), VaultStoreError> {
+        let Some(credential) = credential else {
+            return Ok(());
+        };
+        match self.credentials.get(&credential) {
+            None => Err(VaultStoreError::Invalid {
+                reason: format!(
+                    "the connection {connection} names shared credential {credential} the vault does not hold"
+                ),
+            }),
+            Some(record) if !record.meta().is_live() => Err(VaultStoreError::Invalid {
+                reason: format!(
+                    "the connection {connection} names shared credential {credential} that was deleted"
+                ),
+            }),
+            Some(_) => Ok(()),
+        }
     }
 }
 
@@ -609,7 +724,7 @@ pub(super) fn decode(bytes: &mut [u8]) -> Result<VaultContent, VaultStoreError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shellune_core::VaultRecordVersion;
+    use shellune_core::{RdpConfig, SerialConfig, VaultRecordVersion, VncConfig};
 
     fn key(id: KeyId, fingerprint: &str) -> ManagedKeyMeta {
         ManagedKeyMeta::new(
@@ -735,6 +850,114 @@ mod tests {
                 Err(reason) if reason.contains("fingerprint")
             ),
             "two records of one public key cannot sit in one catalog"
+        );
+    }
+
+    #[test]
+    fn a_desktop_connection_joins_the_reference_snapshot_of_the_whole_book() {
+        let credential_id = CredentialId::new();
+        let mut bound =
+            RdpConfig::new("office", "10.0.0.9", Some("alice")).expect("a valid record");
+        bound.set_credential_id(Some(credential_id));
+        let mut vnc = VncConfig::new("wall", "10.0.0.7").expect("a valid record");
+        vnc.set_credential_id(Some(credential_id));
+        let serial = SerialConfig::new("console", "COM3").expect("a valid record");
+        let records = vec![
+            ConnectionRecord::Rdp(bound),
+            ConnectionRecord::Vnc(vnc),
+            ConnectionRecord::Serial(serial),
+        ];
+
+        let snapshot = HostReference::snapshot_records(&records);
+        assert_eq!(
+            snapshot.len(),
+            2,
+            "two desktop records name the one credential, a serial port names nothing"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .all(|reference| reference.credential_id() == Some(credential_id)
+                    && reference.managed_key_id().is_none()),
+            "a desktop reference carries the credential and no key: {snapshot:?}"
+        );
+
+        // The snapshot is the whole book's: SSH hosts and desktop connections in
+        // one fixed order, as the vault saves against one state.
+        let mut host = host("Build");
+        host.set_auth(Some(AuthMethodKind::Password));
+        host.set_credential_id(Some(credential_id));
+        let mut all = vec![ConnectionRecord::Ssh(host)];
+        all.extend(records);
+        assert_eq!(
+            HostReference::snapshot_records(&all).len(),
+            3,
+            "every record that names a record of the vault is in the one snapshot"
+        );
+    }
+
+    #[test]
+    fn a_dangling_desktop_reference_is_refused_and_a_live_one_is_not() {
+        let credential_id = CredentialId::new();
+        let mut content = VaultContent::new();
+        content
+            .insert_credential(VaultCredentialRecord::new(
+                credential(credential_id),
+                SecretString::new("hunter2"),
+            ))
+            .expect("inserts");
+        let mut bound = RdpConfig::new("office", "10.0.0.9", None::<String>).expect("valid");
+        bound.set_credential_id(Some(credential_id));
+        let mut vnc_bound = VncConfig::new("wall", "10.0.0.7").expect("valid");
+        vnc_bound.set_credential_id(Some(credential_id));
+        let records = vec![
+            ConnectionRecord::Rdp(bound.clone()),
+            ConnectionRecord::Vnc(vnc_bound),
+        ];
+        content.set_references(&HostReference::snapshot_records(&records));
+        content
+            .validate_for_records(&records)
+            .expect("a live credential the vault holds is a binding that holds");
+
+        // A record that names a credential the vault never held is refused.
+        let mut dangling = bound.clone();
+        dangling.set_credential_id(Some(CredentialId::new()));
+        let dangling_records = vec![ConnectionRecord::Rdp(dangling)];
+        let mut refused = content.clone();
+        refused.set_references(&HostReference::snapshot_records(&dangling_records));
+        assert!(
+            matches!(
+                refused.validate_for_records(&dangling_records),
+                Err(VaultStoreError::Invalid { .. })
+            ),
+            "a reference to a record the vault does not hold is refused"
+        );
+
+        // The mirror still has to describe exactly the book offered: a desktop
+        // record that left the book leaves the snapshot too.
+        let mut stale = content.clone();
+        stale.set_references(&HostReference::snapshot_records(&records));
+        assert!(
+            matches!(
+                stale.validate_for_records(&records[..1]),
+                Err(VaultStoreError::Invalid { .. })
+            ),
+            "a mirror of a longer book is not the mirror of this one"
+        );
+
+        // A deleted credential is as dangling: the tombstone keeps the record but
+        // the binding cannot honour it.
+        content
+            .remove_credential(credential_id)
+            .expect("serializes");
+        let mut tombstoned = content;
+        tombstoned.set_references(&HostReference::snapshot_records(&records));
+        assert!(
+            matches!(
+                tombstoned.validate_for_records(&records),
+                Err(VaultStoreError::Invalid { .. })
+            ),
+            "a reference to a deleted credential is refused"
         );
     }
 

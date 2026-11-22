@@ -25,8 +25,8 @@ use gpui::{
     Window, div, px,
 };
 use shellune_core::{
-    CredentialId, CredentialMeta, HostConfig, HostId, KeyId, ManagedKeyMeta, SecretString,
-    VaultRecordVersion,
+    ConnectionRecord, CredentialId, CredentialMeta, HostConfig, HostId, KeyId, ManagedKeyMeta,
+    SecretString, VaultRecordVersion,
 };
 use shellune_ssh::keys as keys_api;
 use shellune_storage::{
@@ -100,10 +100,11 @@ pub(crate) struct SecurityPage {
     /// The new public key a finished rotation asks the user to deploy, drawn
     /// until it is dismissed.
     rotation_public_key: Option<String>,
-    /// The host book as it was when the running job started, kept so the
-    /// job's reference changes can be replayed onto the book as it stands when
-    /// the job ends, instead of overwriting edits made meanwhile.
-    job_book: Option<Vec<HostConfig>>,
+    /// The connection book as it was when the running job started - SSH hosts
+    /// and desktop connections alike - kept so the job's reference changes can
+    /// be replayed onto the book as it stands when the job ends, instead of
+    /// overwriting edits made meanwhile.
+    job_book: Option<Vec<ConnectionRecord>>,
     /// The scroll handle of the open dialog's body.
     dialog_scroll: ScrollHandle,
     /// This window's name as a writer of vault records, drawn once per run.
@@ -333,36 +334,48 @@ pub(crate) enum SecurityReport {
 
 /// How one edit wants the vault written.
 enum SecurityChange {
-    /// Save the vault. `hosts` holds only the records the edit itself changed,
-    /// in their after state: they are merged onto the host book the job saw
-    /// for the save, and replayed onto the book as it stands when the job ends,
-    /// so an edit made meanwhile is kept rather than quietly reverted.
+    /// Save the vault. `records` holds only the records the edit itself
+    /// changed, in their after state - an SSH host wrapped as its connection
+    /// record, a desktop record as itself: they are merged onto the connection
+    /// book the job saw for the save, and replayed onto the book as it stands
+    /// when the job ends, so an edit made meanwhile is kept rather than
+    /// quietly reverted.
     Save {
         /// What the job did.
         report: SecurityReport,
-        /// The changed host records, after the edit.
-        hosts: Vec<HostConfig>,
+        /// The changed records, after the edit.
+        records: Vec<ConnectionRecord>,
     },
     /// Nothing is written; the report is all the page needs.
     ReadOnly(SecurityReport),
 }
 
 /// One edit to apply to the opened vault, run off the UI thread.
-type SecurityEdit =
-    Box<dyn FnOnce(&mut VaultContent, &[HostConfig]) -> Result<SecurityChange, String> + Send>;
+///
+/// The host book and the connections of the other protocols arrive as the two
+/// lists the book keeps them in: an edit that unbinds or deletes has to see
+/// every record that can name a vault record, whatever its protocol.
+type SecurityEdit = Box<
+    dyn FnOnce(
+            &mut VaultContent,
+            &[HostConfig],
+            &[ConnectionRecord],
+        ) -> Result<SecurityChange, String>
+        + Send,
+>;
 
 /// The whole outcome of one background vault job.
 enum SecurityResult {
-    /// The vault was saved; the hosts are the records to write into the book.
+    /// The vault was saved; the records are the book the job saved against.
     Applied {
         /// The content that was saved, as the new in-memory mirror.
         content: VaultContent,
         /// The content as it was before, for the rollback when the host file
         /// cannot be written.
         previous: Box<VaultContent>,
-        /// The whole host book as the job saved it against.
-        hosts: Vec<HostConfig>,
-        /// Which hosts the edit changed, by identity.
+        /// The whole connection book as the job saved it against.
+        records: Vec<ConnectionRecord>,
+        /// Which records the edit changed, by identity.
         changed: Vec<HostId>,
         /// What the job did.
         report: SecurityReport,
@@ -774,7 +787,7 @@ impl ShelluneView {
                 if !meta.is_live() {
                     continue;
                 }
-                let referencing = self.referencing_hosts(Some(meta.id()), None);
+                let referencing = self.referencing_records(Some(meta.id()), None);
                 let haystacks: Vec<String> = [
                     meta.name().to_lowercase(),
                     meta.algorithm().to_lowercase(),
@@ -810,7 +823,7 @@ impl ShelluneView {
             });
             for entry in live {
                 let meta = entry.meta();
-                let referencing = self.referencing_hosts(None, Some(meta.id()));
+                let referencing = self.referencing_records(None, Some(meta.id()));
                 let haystacks: Vec<String> = [
                     meta.name().to_lowercase(),
                     meta.user().unwrap_or_default().to_lowercase(),
@@ -834,21 +847,24 @@ impl ShelluneView {
         rows
     }
 
-    /// The hosts that reference one record of the vault.
-    fn referencing_hosts(
+    /// The connections that reference one record of the vault, whatever their
+    /// protocol: an SSH host and a desktop record name a record the same way,
+    /// so the page counts and lists them together (R1).
+    fn referencing_records(
         &self,
         key: Option<KeyId>,
         credential: Option<CredentialId>,
-    ) -> Vec<HostConfig> {
+    ) -> Vec<ConnectionRecord> {
         self.book
-            .hosts()
-            .iter()
-            .filter(|host| match (key, credential) {
-                (Some(key), _) => host.managed_key_id() == Some(key),
-                (_, Some(credential)) => host.credential_id() == Some(credential),
+            .records()
+            .into_iter()
+            .filter(|record| match (key, credential) {
+                (Some(key), _) => {
+                    matches!(record, ConnectionRecord::Ssh(host) if host.managed_key_id() == Some(key))
+                }
+                (_, Some(credential)) => record.credential_id() == Some(credential),
                 _ => false,
             })
-            .cloned()
             .collect()
     }
 
@@ -869,7 +885,7 @@ impl ShelluneView {
             SecurityRecord::Key(id) => {
                 let entry = content.key(id)?;
                 let meta = entry.meta();
-                let referencing = self.referencing_hosts(Some(id), None);
+                let referencing = self.referencing_records(Some(id), None);
                 let mut body = div()
                     .flex()
                     .flex_col()
@@ -940,7 +956,7 @@ impl ShelluneView {
             SecurityRecord::Credential(id) => {
                 let entry = content.credential(id)?;
                 let meta = entry.meta();
-                let referencing = self.referencing_hosts(None, Some(id));
+                let referencing = self.referencing_records(None, Some(id));
                 let mut body = div()
                     .flex()
                     .flex_col()
@@ -1115,7 +1131,7 @@ impl ShelluneView {
     /// The connections that reference a record, each with its unbind action.
     fn security_references(
         &self,
-        hosts: &[HostConfig],
+        hosts: &[ConnectionRecord],
         record: SecurityRecord,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -1315,7 +1331,7 @@ impl ShelluneView {
             }
             SecurityAction::RotateKey(id) => {
                 let hosts: Vec<(HostId, bool)> = self
-                    .referencing_hosts(Some(id), None)
+                    .referencing_records(Some(id), None)
                     .iter()
                     .map(|host| (host.id(), true))
                     .collect();
@@ -1341,9 +1357,9 @@ impl ShelluneView {
             }
             SecurityAction::DeleteKey(id) => {
                 let affected = self
-                    .referencing_hosts(Some(id), None)
+                    .referencing_records(Some(id), None)
                     .iter()
-                    .map(HostConfig::id)
+                    .map(ConnectionRecord::id)
                     .collect();
                 self.security.dialog = Some(SecurityDialog::DeleteKey { key: id, affected });
             }
@@ -1372,9 +1388,9 @@ impl ShelluneView {
             SecurityAction::DuplicateCredential(id) => self.security_duplicate(id, cx),
             SecurityAction::DeleteCredential(id) => {
                 let affected = self
-                    .referencing_hosts(None, Some(id))
+                    .referencing_records(None, Some(id))
                     .iter()
-                    .map(HostConfig::id)
+                    .map(ConnectionRecord::id)
                     .collect();
                 self.security.dialog = Some(SecurityDialog::DeleteCredential {
                     credential: id,
@@ -1566,40 +1582,67 @@ impl ShelluneView {
         cx.notify();
     }
 
-    /// Unbinds one host from the record its detail card shows: the host keeps
-    /// everything else and asks for a sign-in choice at the next connection.
+    /// Unbinds one connection from the record its detail card shows: the record
+    /// keeps everything else and asks for a sign-in choice at the next
+    /// connection.
     fn security_unbind(&mut self, record: SecurityRecord, host: HostId, cx: &mut Context<Self>) {
         if self.security.busy() || self.security.dialog.is_some() {
             return;
         }
-        let Some(name) = self.book.host(host).map(|host| host.name().to_owned()) else {
+        let Some(name) = self
+            .book
+            .connection(host)
+            .map(|host| host.name().to_owned())
+        else {
             return;
         };
         self.security_run(
-            Box::new(move |content, hosts| {
-                // Only the host's reference goes; the vault's records keep
-                // everything they had. Clearing the method clears the reference
-                // it read (ADR-1). The changed record alone travels back, so
-                // the finish replays this one change instead of overwriting
-                // the whole book the job started from.
-                let mut target = hosts
-                    .iter()
-                    .find(|candidate| candidate.id() == host)
-                    .cloned()
-                    .ok_or_else(|| "the host is no longer saved".to_owned())?;
-                match record {
-                    SecurityRecord::Key(id) if target.managed_key_id() == Some(id) => {
-                        target.set_auth(None);
+            Box::new(move |content, hosts, connections| {
+                // Only the record's reference goes; the vault's records keep
+                // everything they had. An SSH host loses the method that read
+                // the reference, which clears it (ADR-1); a desktop record has
+                // no method, so the reference itself goes. The changed record
+                // alone travels back, so the finish replays this one change
+                // instead of overwriting the whole book the job started from.
+                let changed = if let Some(target) =
+                    hosts.iter().find(|candidate| candidate.id() == host)
+                {
+                    let mut unbound = target.clone();
+                    match record {
+                        SecurityRecord::Key(id) if unbound.managed_key_id() == Some(id) => {
+                            unbound.set_auth(None);
+                        }
+                        SecurityRecord::Credential(id) if unbound.credential_id() == Some(id) => {
+                            unbound.set_auth(None);
+                        }
+                        _ => return Err("the connection does not use this record".to_owned()),
                     }
-                    SecurityRecord::Credential(id) if target.credential_id() == Some(id) => {
-                        target.set_auth(None);
+                    ConnectionRecord::Ssh(unbound)
+                } else if let Some(target) =
+                    connections.iter().find(|candidate| candidate.id() == host)
+                {
+                    let mut unbound = target.clone();
+                    match (&mut unbound, record) {
+                        (ConnectionRecord::Rdp(config), SecurityRecord::Credential(id))
+                            if config.credential_id() == Some(id) =>
+                        {
+                            config.set_credential_id(None);
+                        }
+                        (ConnectionRecord::Vnc(config), SecurityRecord::Credential(id))
+                            if config.credential_id() == Some(id) =>
+                        {
+                            config.set_credential_id(None);
+                        }
+                        _ => return Err("the connection does not use this record".to_owned()),
                     }
-                    _ => return Err("the host does not use this record".to_owned()),
-                }
+                    unbound
+                } else {
+                    return Err("the connection is no longer saved".to_owned());
+                };
                 let _ = content;
                 Ok(SecurityChange::Save {
                     report: SecurityReport::Unbound { host: name },
-                    hosts: vec![target],
+                    records: vec![changed],
                 })
             }),
             cx,
@@ -1614,7 +1657,7 @@ impl ShelluneView {
         }
         let device = self.security.device.clone();
         self.security_run(
-            Box::new(move |content, _| {
+            Box::new(move |content, _, _| {
                 let record = content
                     .credential(id)
                     .ok_or_else(|| "the vault holds no such password".to_owned())?;
@@ -1631,7 +1674,7 @@ impl ShelluneView {
                     .map_err(|error| error.to_string())?;
                 Ok(SecurityChange::Save {
                     report: SecurityReport::CredentialDuplicated,
-                    hosts: Vec::new(),
+                    records: Vec::new(),
                 })
             }),
             cx,
@@ -1670,7 +1713,7 @@ impl ShelluneView {
                 }
                 let device = self.security.device.clone();
                 self.security_run(
-                    Box::new(move |content, _| {
+                    Box::new(move |content, _, _| {
                         security_import(content, &pem, &passphrase, &name, &device, strings)
                     }),
                     cx,
@@ -1690,7 +1733,7 @@ impl ShelluneView {
                 }
                 let device = self.security.device.clone();
                 self.security_run(
-                    Box::new(move |content, _| {
+                    Box::new(move |content, _, _| {
                         let key = keys_api::generate(kind).map_err(|e| e.to_string())?;
                         let public =
                             keys_api::public_data(&key).map_err(|error| error.to_string())?;
@@ -1715,7 +1758,7 @@ impl ShelluneView {
                             .map_err(|error| error.to_string())?;
                         Ok(SecurityChange::Save {
                             report: SecurityReport::KeySaved,
-                            hosts: Vec::new(),
+                            records: Vec::new(),
                         })
                     }),
                     cx,
@@ -1730,7 +1773,7 @@ impl ShelluneView {
                     return;
                 }
                 self.security_run(
-                    Box::new(move |content, _| {
+                    Box::new(move |content, _, _| {
                         let record = content
                             .key(key)
                             .ok_or_else(|| "the vault holds no such key".to_owned())?;
@@ -1749,7 +1792,7 @@ impl ShelluneView {
                         replace_key_meta(content, key, edited)?;
                         Ok(SecurityChange::Save {
                             report: SecurityReport::KeySaved,
-                            hosts: Vec::new(),
+                            records: Vec::new(),
                         })
                     }),
                     cx,
@@ -1783,7 +1826,7 @@ impl ShelluneView {
                 }
                 let device = self.security.device.clone();
                 self.security_run(
-                    Box::new(move |content, hosts| {
+                    Box::new(move |content, hosts, _connections| {
                         security_rotate(
                             content, hosts, previous, kind, &name, moving, retire, device,
                         )
@@ -1792,9 +1835,11 @@ impl ShelluneView {
                 );
             }
             DialogSnapshot::DeleteKey(key) => {
+                // A desktop record never names a key, so the unbind pass only
+                // has the hosts to walk.
                 self.security_run(
-                    Box::new(move |content, hosts| {
-                        security_delete(content, hosts, SecurityRecord::Key(key))
+                    Box::new(move |content, hosts, _connections| {
+                        security_delete(content, hosts, &[], SecurityRecord::Key(key))
                     }),
                     cx,
                 );
@@ -1813,7 +1858,7 @@ impl ShelluneView {
                 }
                 let device = self.security.device.clone();
                 self.security_run(
-                    Box::new(move |content, _| {
+                    Box::new(move |content, _, _| {
                         content
                             .insert_credential(VaultCredentialRecord::new(
                                 CredentialMeta::new(
@@ -1827,7 +1872,7 @@ impl ShelluneView {
                             .map_err(|error| error.to_string())?;
                         Ok(SecurityChange::Save {
                             report: SecurityReport::CredentialSaved,
-                            hosts: Vec::new(),
+                            records: Vec::new(),
                         })
                     }),
                     cx,
@@ -1847,7 +1892,7 @@ impl ShelluneView {
                     return;
                 }
                 self.security_run(
-                    Box::new(move |content, _| {
+                    Box::new(move |content, _, _| {
                         let record = content
                             .credential(credential)
                             .ok_or_else(|| "the vault holds no such password".to_owned())?;
@@ -1873,7 +1918,7 @@ impl ShelluneView {
                         replace_credential(content, credential, edited, secret)?;
                         Ok(SecurityChange::Save {
                             report: SecurityReport::CredentialEdited,
-                            hosts: Vec::new(),
+                            records: Vec::new(),
                         })
                     }),
                     cx,
@@ -1881,8 +1926,13 @@ impl ShelluneView {
             }
             DialogSnapshot::DeleteCredential(credential) => {
                 self.security_run(
-                    Box::new(move |content, hosts| {
-                        security_delete(content, hosts, SecurityRecord::Credential(credential))
+                    Box::new(move |content, hosts, connections| {
+                        security_delete(
+                            content,
+                            hosts,
+                            connections,
+                            SecurityRecord::Credential(credential),
+                        )
                     }),
                     cx,
                 );
@@ -1994,7 +2044,7 @@ impl ShelluneView {
             return;
         }
         self.security_run(
-            Box::new(move |content, _| {
+            Box::new(move |content, _, _| {
                 let body = content
                     .key(key)
                     .and_then(|record| record.private_key().cloned())
@@ -2026,14 +2076,15 @@ impl ShelluneView {
         let store = VaultStore::at(self.store.root());
         let secrets = self.secrets.clone();
         let hosts = self.book.hosts().to_vec();
+        let connections = self.book.connections().to_vec();
         self.security.busy = true;
         self.security.notice = None;
         // The book as the job starts from it, so the finish can tell an edit
         // the user made meanwhile from the change the job itself made.
-        self.security.job_book = Some(hosts.clone());
+        self.security.job_book = Some(self.book.records());
         let work = cx
             .background_executor()
-            .spawn(async move { security_apply(store, secrets, hosts, edit) });
+            .spawn(async move { security_apply(store, secrets, hosts, connections, edit) });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |view, cx| view.security_finished(result, cx));
@@ -2042,7 +2093,7 @@ impl ShelluneView {
         cx.notify();
     }
 
-    /// Takes in what one background job did. Host records are written only
+    /// Takes in what one background job did. Records are written only
     /// after the vault was saved; a host file that cannot be written rolls the
     /// vault back to what it was, so neither file describes a state the other
     /// contradicts.
@@ -2062,7 +2113,7 @@ impl ShelluneView {
             SecurityResult::Applied {
                 content,
                 previous,
-                hosts,
+                records,
                 changed,
                 report,
             } => {
@@ -2070,7 +2121,7 @@ impl ShelluneView {
                 self.security.dialog = None;
                 let mut drifted: Vec<String> = Vec::new();
                 if !changed.is_empty() {
-                    // The job changed some host references, and the vault was
+                    // The job changed some references, and the vault was
                     // saved against the book as the job saw it. The book may
                     // have moved since: instead of overwriting whole records
                     // with the job's copies - which would quietly revert every
@@ -2084,37 +2135,56 @@ impl ShelluneView {
                         .security
                         .job_book
                         .take()
-                        .unwrap_or_else(|| self.book.hosts().to_vec());
+                        .unwrap_or_else(|| self.book.records());
                     let mut next = self.book.clone();
                     let mut failed = None;
                     for id in &changed {
-                        let Some(post) = hosts.iter().find(|host| host.id() == *id) else {
+                        let Some(post) = records.iter().find(|record| record.id() == *id) else {
                             continue;
                         };
-                        let Some(pre) = job_book.iter().find(|host| host.id() == *id) else {
+                        let Some(pre) = job_book.iter().find(|record| record.id() == *id) else {
                             continue;
                         };
-                        let Some(current) = self.book.host(*id) else {
-                            // The host was deleted while the job ran: there is
+                        let Some(current) = self.book.connection(*id) else {
+                            // The record was deleted while the job ran: there is
                             // nothing to replay on, and its reference row has
                             // to leave the vault's mirror as well, which the
                             // reconcile pass below does.
                             continue;
                         };
                         let mut merged = current.clone();
-                        merged.set_auth(post.auth());
-                        merged.set_managed_key_id(post.managed_key_id());
-                        merged.set_credential_id(post.credential_id());
-                        if current != pre {
+                        // The reference fields are the job's to say; everything
+                        // else is the record's own, kept as it stands now.
+                        match (&mut merged, post) {
+                            (ConnectionRecord::Ssh(host), ConnectionRecord::Ssh(post)) => {
+                                host.set_auth(post.auth());
+                                host.set_managed_key_id(post.managed_key_id());
+                                host.set_credential_id(post.credential_id());
+                            }
+                            (ConnectionRecord::Rdp(config), ConnectionRecord::Rdp(post)) => {
+                                config.set_credential_id(post.credential_id());
+                            }
+                            (ConnectionRecord::Vnc(config), ConnectionRecord::Vnc(post)) => {
+                                config.set_credential_id(post.credential_id());
+                            }
+                            // A record cannot change protocol under the job;
+                            // the mismatch is not one to guess about.
+                            _ => continue,
+                        }
+                        if current != *pre {
                             // An edit landed here while the job ran; the notice
                             // names it so the overlap is read, not silent.
                             drifted.push(current.name().to_owned());
                         }
-                        if merged != *current
-                            && let Err(error) = next.update(merged, *id)
-                        {
-                            failed = Some(error.to_string());
-                            break;
+                        if merged != current {
+                            let outcome = match merged {
+                                ConnectionRecord::Ssh(host) => next.update(host, *id),
+                                other => next.update_connection(other, *id),
+                            };
+                            if let Err(error) = outcome {
+                                failed = Some(error.to_string());
+                                break;
+                            }
                         }
                     }
                     match failed {
@@ -2143,11 +2213,12 @@ impl ShelluneView {
                         }
                     }
                     // The saved mirror still describes the book the job saw. A
-                    // host that vanished under the job is the one case the
+                    // record that vanished under the job is the one case the
                     // replay above cannot cover, so the mirror is rewritten
                     // against the book as it now stands - the vault's own save
                     // checks then see one state again.
-                    if HostReference::snapshot(self.book.hosts()) != HostReference::snapshot(&hosts)
+                    if HostReference::snapshot_records(&self.book.records())
+                        != HostReference::snapshot_records(&records)
                     {
                         self.security_reconcile(cx);
                     }
@@ -2212,14 +2283,14 @@ impl ShelluneView {
         };
         let store = VaultStore::at(self.store.root());
         let secrets = self.secrets.clone();
-        let hosts = self.book.hosts().to_vec();
-        content.set_references(&HostReference::snapshot(&hosts));
+        let records = self.book.records();
+        content.set_references(&HostReference::snapshot_records(&records));
         self.security.busy = true;
         let work = cx.background_executor().spawn(async move {
             store
-                .save(
+                .save_records(
                     &content,
-                    &hosts,
+                    &records,
                     &[UnsealSource::LocalMachine],
                     KdfParams::default(),
                     secrets.as_ref(),
@@ -2249,13 +2320,13 @@ impl ShelluneView {
     fn security_rollback(&mut self, previous: VaultContent, cx: &mut Context<Self>) {
         let store = VaultStore::at(self.store.root());
         let secrets = self.secrets.clone();
-        let hosts = self.book.hosts().to_vec();
+        let records = self.book.records();
         self.security.busy = true;
         let work = cx.background_executor().spawn(async move {
             store
-                .save(
+                .save_records(
                     &previous,
-                    &hosts,
+                    &records,
                     &[UnsealSource::LocalMachine],
                     KdfParams::default(),
                     secrets.as_ref(),
@@ -2848,8 +2919,8 @@ impl ShelluneView {
         for host in affected {
             let name = self
                 .book
-                .host(*host)
-                .map(|host| host.name().to_owned())
+                .connection(*host)
+                .map(|record| record.name().to_owned())
                 .unwrap_or_else(|| host.to_string());
             body = body.child(
                 div()
@@ -3272,6 +3343,7 @@ fn security_apply(
     store: VaultStore,
     secrets: std::sync::Arc<dyn SecretStore>,
     hosts: Vec<HostConfig>,
+    connections: Vec<ConnectionRecord>,
     edit: SecurityEdit,
 ) -> SecurityResult {
     let mut content = match store.open(&UnsealSource::LocalMachine, secrets.as_ref()) {
@@ -3282,29 +3354,39 @@ fn security_apply(
         Err(error) => return SecurityResult::Failed(error.to_string()),
     };
     let previous = Box::new(content.clone());
-    match edit(&mut content, &hosts) {
+    match edit(&mut content, &hosts, &connections) {
         Ok(SecurityChange::ReadOnly(report)) => SecurityResult::Applied {
             content,
             previous,
-            hosts,
+            records: {
+                let mut all: Vec<ConnectionRecord> =
+                    hosts.into_iter().map(ConnectionRecord::Ssh).collect();
+                all.extend(connections);
+                all
+            },
             changed: Vec::new(),
             report,
         },
         Ok(SecurityChange::Save {
             report,
-            hosts: changed_records,
+            records: changed_records,
         }) => {
-            let mut all = hosts;
-            for host in &changed_records {
-                if let Some(slot) = all.iter_mut().find(|candidate| candidate.id() == host.id()) {
-                    *slot = host.clone();
+            let mut all: Vec<ConnectionRecord> =
+                hosts.into_iter().map(ConnectionRecord::Ssh).collect();
+            all.extend(connections);
+            for record in &changed_records {
+                if let Some(slot) = all
+                    .iter_mut()
+                    .find(|candidate| candidate.id() == record.id())
+                {
+                    *slot = record.clone();
                 }
             }
             // The reference snapshot and the catalog checks run inside the
-            // save: a host pointing at nothing, or a vault whose mirror
+            // save: a record pointing at nothing, or a vault whose mirror
             // disagrees with the book, is refused before any file is touched.
-            content.set_references(&HostReference::snapshot(&all));
-            if let Err(error) = store.save(
+            content.set_references(&HostReference::snapshot_records(&all));
+            if let Err(error) = store.save_records(
                 &content,
                 &all,
                 &[UnsealSource::LocalMachine],
@@ -3313,11 +3395,11 @@ fn security_apply(
             ) {
                 return SecurityResult::Failed(error.to_string());
             }
-            let changed = changed_records.iter().map(HostConfig::id).collect();
+            let changed = changed_records.iter().map(ConnectionRecord::id).collect();
             SecurityResult::Applied {
                 content,
                 previous,
-                hosts: all,
+                records: all,
                 changed,
                 report,
             }
@@ -3425,11 +3507,11 @@ fn security_import(
     Ok(match warning {
         Some(warning) => SecurityChange::Save {
             report: SecurityReport::ImportedWithWarning(warning),
-            hosts: Vec::new(),
+            records: Vec::new(),
         },
         None => SecurityChange::Save {
             report: SecurityReport::KeySaved,
-            hosts: Vec::new(),
+            records: Vec::new(),
         },
     })
 }
@@ -3487,17 +3569,18 @@ fn security_rotate(
     }
     // Only the moved records travel back: the finish replays their new
     // reference on the book as it stands then, keeping edits made meanwhile.
-    let moved_hosts: Vec<HostConfig> = moved
+    let moved_records: Vec<ConnectionRecord> = moved
         .iter()
         .filter(|host| moving.contains(&host.id()))
         .cloned()
+        .map(ConnectionRecord::Ssh)
         .collect();
     Ok(SecurityChange::Save {
         report: SecurityReport::Rotated {
             count: moving.len(),
             public_key: public.authorized_key,
         },
-        hosts: moved_hosts,
+        records: moved_records,
     })
 }
 
@@ -3506,9 +3589,10 @@ fn security_rotate(
 fn security_delete(
     content: &mut VaultContent,
     hosts: &[HostConfig],
+    connections: &[ConnectionRecord],
     record: SecurityRecord,
 ) -> Result<SecurityChange, String> {
-    let mut changed: Vec<HostConfig> = Vec::new();
+    let mut changed: Vec<ConnectionRecord> = Vec::new();
     let report = match record {
         SecurityRecord::Key(id) => {
             if !content.remove_key(id).map_err(|error| error.to_string())? {
@@ -3518,7 +3602,7 @@ fn security_delete(
                 if host.managed_key_id() == Some(id) {
                     let mut unbound = host.clone();
                     unbound.set_auth(None);
-                    changed.push(unbound);
+                    changed.push(ConnectionRecord::Ssh(unbound));
                 }
             }
             SecurityReport::KeyDeleted
@@ -3534,7 +3618,26 @@ fn security_delete(
                 if host.credential_id() == Some(id) {
                     let mut unbound = host.clone();
                     unbound.set_auth(None);
-                    changed.push(unbound);
+                    changed.push(ConnectionRecord::Ssh(unbound));
+                }
+            }
+            // A desktop record that names the password loses the reference the
+            // same way; its protocol has no method to clear, so the reference
+            // itself goes, and the vault's save would refuse the delete if the
+            // binding stayed.
+            for connection in connections {
+                if connection.credential_id() == Some(id) {
+                    match connection.clone() {
+                        ConnectionRecord::Rdp(mut config) => {
+                            config.set_credential_id(None);
+                            changed.push(ConnectionRecord::Rdp(config));
+                        }
+                        ConnectionRecord::Vnc(mut config) => {
+                            config.set_credential_id(None);
+                            changed.push(ConnectionRecord::Vnc(config));
+                        }
+                        _ => {}
+                    }
                 }
             }
             SecurityReport::CredentialDeleted
@@ -3542,7 +3645,7 @@ fn security_delete(
     };
     Ok(SecurityChange::Save {
         report,
-        hosts: changed,
+        records: changed,
     })
 }
 

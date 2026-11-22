@@ -4521,9 +4521,11 @@ impl ShelluneView {
         let tag = session.tag();
         let locale = self.workspace.locale();
         let pane = cx.new(|cx| desktop::DesktopPane::new(target, locale, self.trust.clone(), cx));
-        // The same password rule the window's own start uses: a typed one first, then
-        // a kept one, and nothing when there is neither.
-        let password = self.desktop_password(record);
+        // The same password rule the window's own start uses: a shared credential
+        // first, then a typed one, then a kept one. The hook exists for the link, so
+        // a vault problem the real start would refuse is reported as no password
+        // here rather than as a panic.
+        let password = self.desktop_password(record).ok().flatten();
         pane.update(cx, |pane, cx| pane.start(password.as_deref(), cx));
         self.attach_desktop(tag, pane, cx);
         session.id()
@@ -5102,23 +5104,45 @@ impl ShelluneView {
 
     /// The password one start of this record signs in with, when there is one.
     ///
-    /// A password typed in the form and not kept is used first: it was typed for this
-    /// connection, and the form closed before the attempt began. Only then is the
-    /// system store asked, and only when the record says it keeps one. Nothing is
-    /// kept in the pane, logged or drawn.
-    fn desktop_password(&mut self, record: &shellune_core::ConnectionRecord) -> Option<String> {
+    /// A record that names a shared credential of the vault reads the password from
+    /// there and nowhere else - the vault is the one place a shared password lives.
+    /// When it cannot (the vault is locked, or the record is gone or deleted), the
+    /// start is refused with a sentence instead of quietly falling back to a secret
+    /// that is not the one the record chose. Otherwise a password typed in the form
+    /// and not kept is used first: it was typed for this connection, and the form
+    /// closed before the attempt began. Only then is the system store asked, and only
+    /// when the record says it keeps one. Nothing is kept in the pane, logged or
+    /// drawn.
+    fn desktop_password(
+        &mut self,
+        record: &shellune_core::ConnectionRecord,
+    ) -> Result<Option<String>, String> {
+        if let Some(credential) = record.credential_id() {
+            let held = self
+                .security
+                .content()
+                .and_then(|vault| vault.credential(credential))
+                .and_then(|entry| entry.secret())
+                .cloned();
+            return match held {
+                Some(secret) => Ok(Some(secret.expose().to_owned())),
+                None => Err(crate::app::copy::security_for(self.workspace.locale())
+                    .credential_unavailable
+                    .to_owned()),
+            };
+        }
         if let Some(secret) = self.desktop_secrets.remove(&record.id()) {
-            return Some(secret.expose().to_owned());
+            return Ok(Some(secret.expose().to_owned()));
         }
         if record.remembers_secret() {
-            return self
+            return Ok(self
                 .secrets
                 .load(record.id())
                 .ok()
                 .flatten()
-                .map(|secret| secret.expose().to_owned());
+                .map(|secret| secret.expose().to_owned()));
         }
-        None
+        Ok(None)
     }
 
     /// Starts the saved desktop connection of one session.
@@ -5146,7 +5170,16 @@ impl ShelluneView {
             self.refuse_desktop(session, reason, cx);
             return;
         };
-        let password = self.desktop_password(&record);
+        let password = match self.desktop_password(&record) {
+            Ok(password) => password,
+            // A shared password the vault cannot hand over is a start that cannot
+            // sign in: the session says so instead of dialling with nothing and
+            // letting the server report a refusal that means less.
+            Err(reason) => {
+                self.refuse_desktop(session, reason, cx);
+                return;
+            }
+        };
         // The record says the attempt is being made before the socket is opened, so
         // a tab never shows an idle session while a connection is dialling.
         self.workspace.session_starting(session);

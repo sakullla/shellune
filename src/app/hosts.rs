@@ -3775,6 +3775,10 @@ pub struct ProtocolDraft {
     domain: String,
     /// The password typed for this connection, never part of the record.
     secret: String,
+    /// The shared credential of the vault this connection names, when it names
+    /// one. A desktop sign-in is a password, so the choice replaces the typed
+    /// field rather than sitting beside a method the way the host form's does.
+    credential: Option<CredentialId>,
     certificate: RdpCertificatePolicy,
     security: VncSecurity,
     /// Whether the clipboard is shared; on unless the record turned it off.
@@ -3812,6 +3816,7 @@ impl ProtocolDraft {
             user: String::new(),
             domain: String::new(),
             secret: String::new(),
+            credential: None,
             certificate: RdpCertificatePolicy::default(),
             security: VncSecurity::default(),
             clipboard: true,
@@ -3857,6 +3862,7 @@ impl ProtocolDraft {
                 draft.drive_folder = config.drive_folder().unwrap_or_default().to_owned();
                 draft.remember = config.remembers_secret();
                 draft.has_saved_secret = config.remembers_secret();
+                draft.credential = config.credential_id();
                 draft
             }
             ConnectionRecord::Vnc(config) => {
@@ -3875,6 +3881,7 @@ impl ProtocolDraft {
                 draft.clipboard = config.clipboard();
                 draft.remember = config.remembers_secret();
                 draft.has_saved_secret = config.remembers_secret();
+                draft.credential = config.credential_id();
                 draft
             }
             ConnectionRecord::Serial(config) => {
@@ -4082,6 +4089,45 @@ impl ProtocolDraft {
         true
     }
 
+    /// Whether this form is for a desktop protocol, whose sign-in is a password.
+    fn is_desktop(&self) -> bool {
+        matches!(self.protocol, ProtocolKind::Rdp | ProtocolKind::Vnc)
+    }
+
+    /// The shared vault credential this connection signs in with, when it names
+    /// one.
+    ///
+    /// Only a desktop protocol keeps the choice: a serial port signs in with
+    /// nothing, and an SSH connection is edited by the host form.
+    #[must_use]
+    pub fn credential_id(&self) -> Option<CredentialId> {
+        self.is_desktop().then_some(self.credential).flatten()
+    }
+
+    /// Chooses the shared vault credential this connection signs in with, or
+    /// clears it for a typed password.
+    ///
+    /// Ignored for a protocol that cannot name one, so a stale choice cannot
+    /// survive a protocol change.
+    pub fn set_credential(&mut self, id: Option<CredentialId>) -> bool {
+        if !self.is_desktop() {
+            return false;
+        }
+        let changed = self.credential != id;
+        self.credential = id;
+        changed
+    }
+
+    /// Whether this form asks for a password of its own.
+    ///
+    /// A shared credential of the vault is not a gap in the form: the vault holds
+    /// the password, so nothing is typed and nothing is remembered in the system
+    /// store.
+    #[must_use]
+    pub fn needs_secret(&self) -> bool {
+        self.credential.is_none()
+    }
+
     /// Whether the password typed here is to be kept in the system store.
     #[must_use]
     pub fn remember(&self) -> bool {
@@ -4101,10 +4147,14 @@ impl ProtocolDraft {
     ///
     /// Only when there is one to keep: a password typed now, or one already saved. A
     /// connection saved with the box ticked and nothing typed has nothing to keep, so
-    /// the record does not claim the store holds one.
+    /// the record does not claim the store holds one. A shared credential of the
+    /// vault keeps the password out of the system store entirely, the way the host
+    /// form's does.
     #[must_use]
     pub fn keeps_secret(&self) -> bool {
-        self.remember && (!self.secret.is_empty() || self.has_saved_secret)
+        self.credential.is_none()
+            && self.remember
+            && (!self.secret.is_empty() || self.has_saved_secret)
     }
 
     /// The password typed in this form, when one was typed.
@@ -4160,6 +4210,7 @@ impl ProtocolDraft {
                 config
                     .set_drive_folder(Some(self.drive_folder.as_str()))
                     .map_err(problem_of)?;
+                config.set_credential_id(self.credential_id());
                 config.set_remember_secret(self.keeps_secret());
                 ConnectionRecord::Rdp(config)
             }
@@ -4174,6 +4225,7 @@ impl ProtocolDraft {
                     .map_err(problem_of)?;
                 config.set_security(self.security);
                 config.set_clipboard(self.clipboard);
+                config.set_credential_id(self.credential_id());
                 config.set_remember_secret(self.keeps_secret());
                 ConnectionRecord::Vnc(config)
             }

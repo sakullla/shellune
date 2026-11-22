@@ -1213,6 +1213,17 @@ pub struct RdpConfig {
     certificate: RdpCertificatePolicy,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     remember_secret: bool,
+    /// The shared credential this connection signs in with, when it names one.
+    ///
+    /// Like a host's reference, this is an identifier and not a copy: every
+    /// connection that names the same credential shares one vault record, so
+    /// editing the password reaches all of them at once. A desktop record has no
+    /// sign-in method to pair it with - RDP and VNC always sign in with a
+    /// password - and no managed key to name. Absent on records written before
+    /// desktop connections could join the vault, which keeps an older file
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_id: Option<CredentialId>,
     /// Whether text and pictures copied on either side can be pasted on the other.
     #[serde(
         default = "clipboard_default",
@@ -1248,6 +1259,9 @@ struct RdpConfigWire {
     certificate: RdpCertificatePolicy,
     #[serde(default)]
     remember_secret: bool,
+    /// Absent in files written before desktop connections joined the vault.
+    #[serde(default)]
+    credential_id: Option<CredentialId>,
     #[serde(default = "clipboard_default")]
     clipboard: bool,
     #[serde(default)]
@@ -1272,6 +1286,7 @@ impl TryFrom<RdpConfigWire> for RdpConfig {
             domain: normalize_optional_text(wire.domain),
             certificate: wire.certificate,
             remember_secret: wire.remember_secret,
+            credential_id: wire.credential_id,
             clipboard: wire.clipboard,
             drive_folder: connection_drive_folder(wire.drive_folder)?,
         })
@@ -1301,6 +1316,7 @@ impl RdpConfig {
             domain: None,
             certificate: RdpCertificatePolicy::default(),
             remember_secret: false,
+            credential_id: None,
             clipboard: true,
             drive_folder: None,
         })
@@ -1485,6 +1501,22 @@ impl RdpConfig {
     pub fn set_remember_secret(&mut self, remember: bool) {
         self.remember_secret = remember;
     }
+
+    /// The shared credential this connection signs in with, when it names one.
+    #[must_use]
+    pub fn credential_id(&self) -> Option<CredentialId> {
+        self.credential_id
+    }
+
+    /// Assigns or clears the shared credential this connection signs in with.
+    ///
+    /// Only the identifier is kept, which is what makes the credential shared:
+    /// every connection naming the same id sees the one record, so an edit to it
+    /// reaches them all at once. Clearing with `None` unbinds the connection,
+    /// which then asks for a password of its own again.
+    pub fn set_credential_id(&mut self, id: Option<CredentialId>) {
+        self.credential_id = id;
+    }
 }
 
 /// A saved VNC connection (R18).
@@ -1511,6 +1543,14 @@ pub struct VncConfig {
     security: VncSecurity,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     remember_secret: bool,
+    /// The shared credential this connection signs in with, when it names one.
+    ///
+    /// The same reference a host or an RDP record keeps: an identifier, never a
+    /// copy, so every connection that names it shares one vault record. Absent
+    /// on records written before desktop connections could join the vault, which
+    /// keeps an older file byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_id: Option<CredentialId>,
     /// Whether text copied on either side can be pasted on the other.
     #[serde(
         default = "clipboard_default",
@@ -1537,6 +1577,9 @@ struct VncConfigWire {
     security: VncSecurity,
     #[serde(default)]
     remember_secret: bool,
+    /// Absent in files written before desktop connections joined the vault.
+    #[serde(default)]
+    credential_id: Option<CredentialId>,
     #[serde(default = "clipboard_default")]
     clipboard: bool,
 }
@@ -1556,6 +1599,7 @@ impl TryFrom<VncConfigWire> for VncConfig {
             user: connection_user(wire.user)?,
             security: wire.security,
             remember_secret: wire.remember_secret,
+            credential_id: wire.credential_id,
             clipboard: wire.clipboard,
         })
     }
@@ -1582,6 +1626,7 @@ impl VncConfig {
             user: None,
             security: VncSecurity::default(),
             remember_secret: false,
+            credential_id: None,
             clipboard: true,
         })
     }
@@ -1732,6 +1777,21 @@ impl VncConfig {
     /// Records or clears whether the system store may hold a credential for this id.
     pub fn set_remember_secret(&mut self, remember: bool) {
         self.remember_secret = remember;
+    }
+
+    /// The shared credential this connection signs in with, when it names one.
+    #[must_use]
+    pub fn credential_id(&self) -> Option<CredentialId> {
+        self.credential_id
+    }
+
+    /// Assigns or clears the shared credential this connection signs in with.
+    ///
+    /// Only the identifier is kept, which is what makes the credential shared;
+    /// clearing with `None` unbinds the connection, which then asks for a
+    /// password of its own again.
+    pub fn set_credential_id(&mut self, id: Option<CredentialId>) {
+        self.credential_id = id;
     }
 }
 
@@ -2133,6 +2193,22 @@ impl ConnectionRecord {
             Self::Rdp(config) => config.remembers_secret(),
             Self::Vnc(config) => config.remembers_secret(),
             Self::Serial(_) => false,
+        }
+    }
+
+    /// The shared credential of the vault this record signs in with, when it
+    /// names one.
+    ///
+    /// An SSH host answers only while its method reads the reference; a desktop
+    /// record has no method to pair with, so it answers whenever it names one. A
+    /// serial port never does.
+    #[must_use]
+    pub fn credential_id(&self) -> Option<CredentialId> {
+        match self {
+            Self::Ssh(host) => host.credential_id(),
+            Self::Rdp(config) => config.credential_id(),
+            Self::Vnc(config) => config.credential_id(),
+            Self::Serial(_) => None,
         }
     }
 
@@ -3427,6 +3503,87 @@ mod connection_tests {
 
     #[test]
     #[ignore = "opt-in RDP/VNC test"]
+    fn a_desktop_connection_names_a_shared_credential_and_an_old_record_stays_as_it_was() {
+        let credential = CredentialId::new();
+        let mut rdp = RdpConfig::new("office", "10.0.0.9", None::<String>).expect("valid");
+        assert_eq!(rdp.credential_id(), None, "a new record names nothing");
+        rdp.set_credential_id(Some(credential));
+        assert_eq!(rdp.credential_id(), Some(credential));
+        let written = serde_json::to_value(ConnectionRecord::Rdp(rdp.clone())).expect("serializes");
+        assert!(
+            written.get("credential_id").is_some(),
+            "a chosen reference is written: {written}"
+        );
+        let read: ConnectionRecord = serde_json::from_value(written).expect("reads back");
+        assert_eq!(
+            read.credential_id(),
+            Some(credential),
+            "the reference survives the round trip"
+        );
+        rdp.set_credential_id(None);
+        assert_eq!(rdp.credential_id(), None, "clearing unbinds the record");
+        let cleared = serde_json::to_value(ConnectionRecord::Rdp(rdp.clone())).expect("serializes");
+        assert!(
+            cleared.get("credential_id").is_none(),
+            "an unbound record writes no reference: {cleared}"
+        );
+
+        let mut vnc = VncConfig::new("wall", "10.0.0.7").expect("valid");
+        vnc.set_credential_id(Some(credential));
+        let read: ConnectionRecord = serde_json::from_value(
+            serde_json::to_value(ConnectionRecord::Vnc(vnc.clone())).expect("serializes"),
+        )
+        .expect("reads back");
+        assert_eq!(read.credential_id(), Some(credential));
+        vnc.set_credential_id(None);
+        let cleared = serde_json::to_value(ConnectionRecord::Vnc(vnc)).expect("serializes");
+        assert!(cleared.get("credential_id").is_none(), "{cleared}");
+
+        // A serial port signs in with nothing, so it never names a record.
+        let serial = ConnectionRecord::Serial(SerialConfig::new("console", "COM3").expect("valid"));
+        assert_eq!(serial.credential_id(), None);
+    }
+
+    #[test]
+    fn a_desktop_record_written_before_the_vault_joined_desktop_reads_and_writes_as_before() {
+        // Exactly the fields a build without the credential reference wrote: the
+        // record reads as the same connection it always was, with nothing to
+        // resolve, and writes back byte for byte.
+        let old_rdp = json!({
+            "protocol": "rdp",
+            "id": HostId::new(),
+            "name": "office",
+            "address": "10.0.0.9",
+            "port": 3389,
+            "user": "alice"
+        });
+        let read: ConnectionRecord =
+            serde_json::from_value(old_rdp.clone()).expect("an old RDP record reads");
+        assert_eq!(read.credential_id(), None);
+        assert_eq!(
+            serde_json::to_value(&read).expect("writes"),
+            old_rdp,
+            "an unbound record writes the bytes an older build wrote"
+        );
+
+        let old_vnc = json!({
+            "protocol": "vnc",
+            "id": HostId::new(),
+            "name": "wall",
+            "address": "10.0.0.7",
+            "port": 5900
+        });
+        let read: ConnectionRecord =
+            serde_json::from_value(old_vnc.clone()).expect("an old VNC record reads");
+        assert_eq!(read.credential_id(), None);
+        assert_eq!(
+            serde_json::to_value(&read).expect("writes"),
+            old_vnc,
+            "an unbound record writes the bytes an older build wrote"
+        );
+    }
+
+    #[test]
     fn a_mapped_folder_is_trimmed_and_a_control_character_is_refused() {
         let mut rdp = RdpConfig::new("office", "10.0.0.9", None::<String>).expect("valid");
         rdp.set_drive_folder(Some("/home/alice/shared"))

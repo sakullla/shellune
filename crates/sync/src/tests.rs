@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use shellune_core::{
-    AuthMethodKind, ConnectionRecord, CredentialId, CredentialMeta, HostConfig, HostId,
-    SecretString, SerialConfig, VaultRecordVersion,
+    AuthMethodKind, ConnectionRecord, CredentialId, CredentialMeta, HostConfig, HostId, RdpConfig,
+    SecretString, SerialConfig, VaultRecordVersion, VncConfig,
 };
 use shellune_storage::{
     AppSecret, ExportOptions, ForwardStore, GroupStore, HostStore, KdfParams, KeySource,
@@ -1558,16 +1558,11 @@ fn cheap_kdf() -> KdfParams {
     KdfParams::new(64, 1, 1).expect("cheap parameters")
 }
 
-fn ssh_hosts_of(state: &LocalState) -> Vec<HostConfig> {
-    state
-        .hosts
-        .records()
-        .iter()
-        .filter_map(|record| match record {
-            ConnectionRecord::Ssh(host) => Some(host.clone()),
-            _ => None,
-        })
-        .collect()
+/// The whole connection book of a state: the SSH hosts and the desktop and
+/// serial connections beside them, which a vault's reference mirror is the
+/// mirror of.
+fn connection_book_of(state: &LocalState) -> Vec<ConnectionRecord> {
+    state.hosts.records()
 }
 
 fn vault_store(machine: &Machine) -> VaultStore {
@@ -1581,15 +1576,15 @@ fn open_vault(machine: &Machine) -> VaultContent {
 }
 
 fn save_vault(machine: &Machine, content: &VaultContent) {
-    let hosts = ssh_hosts_of(&machine.load());
+    let records = connection_book_of(&machine.load());
     let mut content = content.clone();
-    // The vault's reference mirror is a function of the host book; the editing
-    // service keeps the two together, and so does this helper.
-    content.set_references(&shellune_storage::HostReference::snapshot(&hosts));
+    // The vault's reference mirror is a function of the whole connection book;
+    // the editing service keeps the two together, and so does this helper.
+    content.set_references(&shellune_storage::HostReference::snapshot_records(&records));
     vault_store(machine)
-        .save(
+        .save_records(
             &content,
-            &hosts,
+            &records,
             &[UnsealSource::LocalMachine],
             cheap_kdf(),
             &*machine.secrets,
@@ -1684,6 +1679,19 @@ fn add_host_with_credential(
     host.set_credential_id(Some(credential));
     let id = host.id();
     state.hosts.insert(host).expect("inserted");
+    id
+}
+
+/// Adds a saved RDP connection that signs in with a shared credential of the
+/// vault, the way the desktop form's picker binds one.
+fn add_rdp_with_credential(state: &mut LocalState, name: &str, credential: CredentialId) -> HostId {
+    let mut config = RdpConfig::new(name, "10.0.0.9", Some("desk")).expect("a valid record");
+    config.set_credential_id(Some(credential));
+    let id = config.id();
+    state
+        .hosts
+        .insert_connection(ConnectionRecord::Rdp(config))
+        .expect("inserted");
     id
 }
 
@@ -1794,7 +1802,7 @@ fn the_vault_travels_sealed_under_the_webdav_password() {
     assert_eq!(web.credential_id(), Some(credential));
     assert_eq!(
         vault.references(),
-        &shellune_storage::HostReference::snapshot(&ssh_hosts_of(&state))
+        &shellune_storage::HostReference::snapshot_records(&connection_book_of(&state))
     );
     expect_up_to_date(a.service.sync());
     expect_up_to_date(b.service.sync());
@@ -1804,6 +1812,83 @@ fn the_vault_travels_sealed_under_the_webdav_password() {
     let vault_text =
         std::fs::read_to_string(b.root.join(shellune_storage::VAULT_FILE_NAME)).expect("read");
     assert!(!vault_text.contains(VAULT_SECRET), "{vault_text}");
+}
+
+#[test]
+fn a_sync_keeps_the_desktop_references_in_the_vault_mirror() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let a = Machine::new("vault-desktop-a", Platform::Windows);
+    let b = Machine::new("vault-desktop-b", Platform::Linux);
+    for machine in [&a, &b] {
+        machine.connect(&server);
+        machine.update_config(|config| config.sync_secrets = true);
+    }
+    let credential = CredentialId::new();
+    let mut rdp = None;
+    let mut vnc = None;
+    a.edit(|state| {
+        add_host_with_credential(state, "web", credential);
+        rdp = Some(add_rdp_with_credential(state, "office", credential));
+        let mut config = VncConfig::new("wall", "10.0.0.7").expect("a valid record");
+        config.set_credential_id(Some(credential));
+        vnc = Some(config.id());
+        state
+            .hosts
+            .insert_connection(ConnectionRecord::Vnc(config))
+            .expect("inserted");
+    });
+    let (rdp, vnc) = (
+        rdp.expect("the RDP connection was added"),
+        vnc.expect("the VNC connection was added"),
+    );
+    create_vault(&a, |content| {
+        content
+            .insert_credential(credential_named(credential, "Prod login", 1, VAULT_SECRET))
+            .expect("inserts");
+    });
+
+    // The upload re-seals the vault against the whole connection book: the
+    // mirror it writes names the desktop connections too, not only the SSH
+    // host, so no local save is needed to rebuild what the sync wrote.
+    expect_uploaded(a.service.sync());
+    let uploaded = open_vault(&a);
+    assert_eq!(
+        uploaded.references().len(),
+        3,
+        "one SSH host and two desktop connections: {:?}",
+        uploaded.references()
+    );
+    for desktop in [rdp, vnc] {
+        assert!(
+            uploaded
+                .references()
+                .iter()
+                .any(|reference| reference.host() == desktop
+                    && reference.credential_id() == Some(credential)),
+            "the desktop binding is in the mirror the sync wrote"
+        );
+    }
+
+    // The machine that pulled writes the same mirror: every reference arrives
+    // with the vault instead of waiting for a local edit to restore them.
+    let pulled = expect_pulled(b.service.sync());
+    assert!(pulled.vault_restored.is_some(), "the vault travelled");
+    let vault = open_vault(&b);
+    let state = b.load();
+    assert_eq!(
+        vault.references(),
+        &shellune_storage::HostReference::snapshot_records(&connection_book_of(&state))
+    );
+    for desktop in [rdp, vnc] {
+        assert!(
+            vault
+                .references()
+                .iter()
+                .any(|reference| reference.host() == desktop
+                    && reference.credential_id() == Some(credential)),
+            "the pulled vault names the desktop connection as well"
+        );
+    }
 }
 
 #[test]
