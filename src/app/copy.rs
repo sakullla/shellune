@@ -5959,6 +5959,9 @@ security_strings! {
         "已创建独立副本，此后它单独变化。";
     /// One host was unbound
     unbind_done: "Unbound from {host}", "已解除与 {host} 的绑定";
+    /// A vault job overlapped edits the user made meanwhile
+    drift_kept: "Your edits to {names} were kept; the vault's reference change was applied on top of them.",
+        "对 {names} 的修改已保留，保险库的引用变更在其之上生效。";
     /// A key record was saved (create, generate or metadata edit)
     key_saved: "Key saved", "密钥已保存";
     /// Hint under the host editor's key picker
@@ -6147,7 +6150,9 @@ mod ux_tests {
         for (en, zh) in english.iter().zip(chinese.iter()) {
             assert!(!en.trim().is_empty() && !zh.trim().is_empty());
             assert_ne!(en, zh, "{en} is not translated");
-            for name in ["{name}", "{count}", "{path}", "{host}", "{bits}", "{date}"] {
+            for name in [
+                "{name}", "{count}", "{path}", "{host}", "{bits}", "{date}", "{names}",
+            ] {
                 assert_eq!(en.contains(name), zh.contains(name), "{en} / {zh}: {name}");
             }
         }

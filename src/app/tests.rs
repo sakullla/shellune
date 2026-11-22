@@ -42645,6 +42645,55 @@ async fn exporting_a_private_key_needs_its_own_passphrase_or_a_plain_risk_yes(
         Some(&shellune_core::SecretString::new("export-passphrase")),
     )
     .expect("the export opens with the passphrase it was given");
+
+    // The file is the owner's alone, and an export over a file with looser
+    // permissions narrows it: the rename brings a fresh 0600 file, not the
+    // mode the previous file happened to have.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&target)
+            .expect("the export exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a fresh export is readable by its owner alone"
+        );
+        let loose = dir.path().join("exported-again");
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::File::create(&loose).expect("the earlier file exists");
+            writeln!(file, "an older, looser export").expect("written");
+            let mut permissions = file
+                .metadata()
+                .expect("the earlier file has metadata")
+                .permissions();
+            permissions.set_mode(0o644);
+            file.set_permissions(permissions).expect("loosened");
+        }
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| {
+                view.security_export_to(
+                    key,
+                    loose.clone(),
+                    Some(shellune_core::SecretString::new("export-passphrase")),
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        let mode = std::fs::metadata(&loose)
+            .expect("the export exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "an export over a looser file narrows it to the owner alone"
+        );
+    }
 }
 
 /// While a vault job runs, the window keeps drawing and says so; the record
@@ -42715,4 +42764,160 @@ async fn generated_passwords_use_the_chosen_classes_and_length(cx: &mut TestAppC
     assert!(with_symbols.chars().any(|ch| !ch.is_alphanumeric()));
     let letters = crate::app::view::security::generate_password_for_test(64, true, false, false);
     assert!(letters.chars().all(|ch| ch.is_ascii_alphabetic()));
+}
+
+/// A desktop connection offers no vault binding it could not honour.
+///
+/// The RDP and VNC forms have no sign-in section and no vault pickers: their
+/// records cannot name a managed key or a shared credential, so no binding can
+/// exist that looks usable on screen and fails at the connection (R1). The
+/// pickers belong to the SSH form, and switching a new record to a desktop
+/// protocol takes them away with the whole section. Giving desktop records a
+/// place in the shared credential layer needs the record model itself to carry
+/// the reference - reported as an API need, not papered over here.
+#[gpui::test]
+async fn a_desktop_connection_offers_no_vault_binding_it_cannot_honour(cx: &mut TestAppContext) {
+    let dir = TempDir::new("security-desktop-pin");
+    let (view, cx) = security_view(cx, &dir);
+
+    // A shared password exists, so a picker would have something to offer if
+    // the desktop form offered one at all.
+    click(cx, "security.action.new-password");
+    type_into(cx, "security.dialog.name", "Prod login");
+    click(cx, "security.dialog.generate.password");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_credentials_for_test())
+            .len(),
+        1
+    );
+
+    // A new desktop record: the form it opens is the protocol form, and no
+    // vault picker of the SSH form's is ever drawn - the vault holds a shared
+    // password to offer, and the desktop form offers nothing of it, because a
+    // desktop record has no field to keep the reference in.
+    click(cx, "nav.hosts");
+    click(cx, "hosts.new");
+    click(cx, "connection.protocol.rdp");
+    assert!(
+        cx.update(|_window, app| {
+            let view = view.read(app);
+            (
+                view.hosts_state().is_editing_connection(),
+                view.hosts_state().is_editing(),
+            )
+        }) == (true, false),
+        "a desktop record is edited by the protocol form, which has no sign-in section"
+    );
+    assert!(
+        cx.debug_bounds("hosts.auth.credential.0").is_none(),
+        "the desktop form draws no shared-password picker although the vault holds one"
+    );
+    assert!(cx.debug_bounds("hosts.auth.managed.picker").is_none());
+    type_into(cx, "connection.field.address", "10.0.0.9");
+    click(cx, "connection.save");
+    cx.run_until_parked();
+
+    // Editing the saved desktop record stays the same way: no sign-in section
+    // and no vault picker appears for it either. A desktop row's edit control
+    // is the row's own, not the SSH row's.
+    click(cx, "hosts.connection.edit.0");
+    assert!(
+        cx.update(|_window, app| {
+            let view = view.read(app);
+            (
+                view.hosts_state().is_editing_connection(),
+                view.hosts_state().is_editing(),
+            )
+        }) == (true, false),
+        "an edited desktop record keeps the protocol form"
+    );
+    assert!(cx.debug_bounds("hosts.auth.managed.picker").is_none());
+    click(cx, "connection.cancel");
+    cx.run_until_parked();
+}
+
+/// An edit made while a vault job runs is kept when the job lands: the job's
+/// reference change is replayed on the record as it stands then, and the
+/// overlap is named on the page instead of quietly reverting the edit.
+#[gpui::test]
+async fn an_edit_made_while_a_vault_job_runs_is_kept_when_it_lands(cx: &mut TestAppContext) {
+    let dir = TempDir::new("security-drift");
+    let (view, cx) = security_view(cx, &dir);
+    let (key, _, _) = generate_key_on_page(&view, cx, "Deploy");
+
+    // One host bound to the key, through the host editor's own picker.
+    click(cx, "nav.hosts");
+    click(cx, "hosts.new");
+    type_into(cx, "hosts.field.name", "box");
+    type_into(cx, "hosts.field.address", "127.0.0.1");
+    clear_field(cx, "hosts.field.port", 2);
+    type_into(cx, "hosts.field.port", "1");
+    type_into(cx, "hosts.field.user", "ada");
+    click(cx, "hosts.auth.remote.method.managed-key");
+    click(cx, "hosts.auth.managed.key.0");
+    click(cx, "hosts.save");
+    cx.run_until_parked();
+
+    // The unbind runs with its finish held, so the window is exactly where a
+    // real user would be while the derivation runs.
+    click(cx, "nav.settings");
+    click(cx, "settings.item.keys-and-passwords");
+    click(cx, "security.key.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, _cx| view.security_hold_finish_for_test(true))
+    });
+    click(cx, "security.detail.unbind.0");
+    assert!(
+        cx.update(|_window, app| view.read(app).security_busy_for_test()),
+        "the unbind is in flight"
+    );
+
+    // Meanwhile the host is renamed - an edit to a record the job also touches.
+    click(cx, "nav.hosts");
+    click(cx, "hosts.edit.0");
+    clear_field(cx, "hosts.field.name", "box".len());
+    type_into(cx, "hosts.field.name", "box renamed");
+    click(cx, "hosts.save");
+    cx.run_until_parked();
+
+    // The job lands: the rename is kept, the unbinding is applied on top of
+    // it, and the page names the overlap instead of passing silently.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.security_release_finish_for_test(cx))
+    });
+    cx.run_until_parked();
+    let host = cx
+        .update(|_window, app| view.read(app).book().hosts().first().cloned())
+        .expect("the host is still there");
+    assert_eq!(
+        host.name(),
+        "box renamed",
+        "the edit made during the job is kept"
+    );
+    assert_eq!(host.managed_key_id(), None, "the unbinding still applied");
+    assert_eq!(host.auth(), None);
+    let notice = cx.update(|_window, app| view.read(app).security_notice_for_test());
+    let (text, _) = notice.expect("the overlap is named on the page");
+    assert!(
+        text.contains("box renamed"),
+        "the notice names the edited host: {text}"
+    );
+
+    // The vault still describes the book it sees: the next write goes through.
+    click(cx, "nav.settings");
+    click(cx, "settings.item.keys-and-passwords");
+    click(cx, "security.action.new-password");
+    type_into(cx, "security.dialog.name", "After the overlap");
+    click(cx, "security.dialog.generate.password");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    let refused_after = cx.update(|_window, app| {
+        view.read(app)
+            .security_notice_for_test()
+            .is_some_and(|(_, refused)| refused)
+    });
+    assert!(!refused_after, "a later vault write still succeeds");
+    let _ = key;
 }

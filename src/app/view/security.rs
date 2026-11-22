@@ -100,6 +100,10 @@ pub(crate) struct SecurityPage {
     /// The new public key a finished rotation asks the user to deploy, drawn
     /// until it is dismissed.
     rotation_public_key: Option<String>,
+    /// The host book as it was when the running job started, kept so the
+    /// job's reference changes can be replayed onto the book as it stands when
+    /// the job ends, instead of overwriting edits made meanwhile.
+    job_book: Option<Vec<HostConfig>>,
     /// The scroll handle of the open dialog's body.
     dialog_scroll: ScrollHandle,
     /// This window's name as a writer of vault records, drawn once per run.
@@ -267,6 +271,7 @@ impl SecurityPage {
             revealed: false,
             dialog: None,
             rotation_public_key: None,
+            job_book: None,
             dialog_scroll: ScrollHandle::new(),
             device: format!("app-{}", KeyId::new()),
             #[cfg(test)]
@@ -328,11 +333,14 @@ pub(crate) enum SecurityReport {
 
 /// How one edit wants the vault written.
 enum SecurityChange {
-    /// Save the vault; `hosts` is the full host list to write the book from.
+    /// Save the vault. `hosts` holds only the records the edit itself changed,
+    /// in their after state: they are merged onto the host book the job saw
+    /// for the save, and replayed onto the book as it stands when the job ends,
+    /// so an edit made meanwhile is kept rather than quietly reverted.
     Save {
         /// What the job did.
         report: SecurityReport,
-        /// The host records to adopt into the book.
+        /// The changed host records, after the edit.
         hosts: Vec<HostConfig>,
     },
     /// Nothing is written; the report is all the page needs.
@@ -352,8 +360,10 @@ enum SecurityResult {
         /// The content as it was before, for the rollback when the host file
         /// cannot be written.
         previous: Box<VaultContent>,
-        /// The host records to adopt into the book.
+        /// The whole host book as the job saved it against.
         hosts: Vec<HostConfig>,
+        /// Which hosts the edit changed, by identity.
+        changed: Vec<HostId>,
         /// What the job did.
         report: SecurityReport,
     },
@@ -963,8 +973,14 @@ impl ShelluneView {
                             )),
                     );
                 if let Some(user) = meta.user().filter(|text| !text.trim().is_empty()) {
-                    body =
-                        body.child(self.security_fact(strings.label_user, user.to_owned(), None));
+                    // Copyable the way the fingerprint and the public key are:
+                    // a login user name is what a person pastes into the next
+                    // form (R1).
+                    body = body.child(self.security_fact(
+                        strings.label_user,
+                        user.to_owned(),
+                        Some("security.detail.user"),
+                    ));
                 }
                 // The password itself: hidden by default, shown while this one
                 // card asks for it, and copyable without ever being drawn.
@@ -1129,8 +1145,9 @@ impl ShelluneView {
                     .child(strings.not_referenced),
             );
         }
-        for host in hosts {
+        for (index, host) in hosts.iter().enumerate() {
             let id = host.id();
+            let selector = format!("security.detail.unbind.{index}");
             column = column.child(
                 div()
                     .flex()
@@ -1148,8 +1165,11 @@ impl ShelluneView {
                     )
                     .child(
                         components::compact_button(strings.unbind, Variant::Ghost, metrics)
-                            .id(SharedString::from(format!("security.detail.unbind.{id}")))
-                            .debug_selector(move || format!("security.detail.unbind.{id}"))
+                            .id(SharedString::from(selector.clone()))
+                            .debug_selector({
+                                let selector = selector.clone();
+                                move || selector.clone()
+                            })
                             .when(!busy, |button| {
                                 button.on_click(cx.listener(move |this, _event, _window, cx| {
                                     this.security_unbind(record, id, cx);
@@ -1559,11 +1579,13 @@ impl ShelluneView {
             Box::new(move |content, hosts| {
                 // Only the host's reference goes; the vault's records keep
                 // everything they had. Clearing the method clears the reference
-                // it read (ADR-1).
-                let mut next = hosts.to_vec();
-                let target = next
-                    .iter_mut()
+                // it read (ADR-1). The changed record alone travels back, so
+                // the finish replays this one change instead of overwriting
+                // the whole book the job started from.
+                let mut target = hosts
+                    .iter()
                     .find(|candidate| candidate.id() == host)
+                    .cloned()
                     .ok_or_else(|| "the host is no longer saved".to_owned())?;
                 match record {
                     SecurityRecord::Key(id) if target.managed_key_id() == Some(id) => {
@@ -1577,7 +1599,7 @@ impl ShelluneView {
                 let _ = content;
                 Ok(SecurityChange::Save {
                     report: SecurityReport::Unbound { host: name },
-                    hosts: next,
+                    hosts: vec![target],
                 })
             }),
             cx,
@@ -1981,25 +2003,7 @@ impl ShelluneView {
                     keys_api::import_private_key(&body, None).map_err(|e| e.to_string())?;
                 let exported = keys_api::export_private_key(&parsed, passphrase.as_ref())
                     .map_err(|error| error.to_string())?;
-                // The file holds private key material, possibly unencrypted: only
-                // its owner may read it, whatever the process umask would allow.
-                #[cfg(unix)]
-                {
-                    use std::io::Write as _;
-                    use std::os::unix::fs::OpenOptionsExt as _;
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o600)
-                        .open(&path)
-                        .and_then(|mut file| file.write_all(exported.expose().as_bytes()))
-                        .map_err(|error| error.to_string())?;
-                }
-                #[cfg(not(unix))]
-                {
-                    std::fs::write(&path, exported.expose()).map_err(|error| error.to_string())?;
-                }
+                write_private_export(&path, exported.expose().as_bytes())?;
                 Ok(SecurityChange::ReadOnly(SecurityReport::Exported { path }))
             }),
             cx,
@@ -2024,6 +2028,9 @@ impl ShelluneView {
         let hosts = self.book.hosts().to_vec();
         self.security.busy = true;
         self.security.notice = None;
+        // The book as the job starts from it, so the finish can tell an edit
+        // the user made meanwhile from the change the job itself made.
+        self.security.job_book = Some(hosts.clone());
         let work = cx
             .background_executor()
             .spawn(async move { security_apply(store, secrets, hosts, edit) });
@@ -2056,15 +2063,56 @@ impl ShelluneView {
                 content,
                 previous,
                 hosts,
+                changed,
                 report,
             } => {
                 self.security.content = Some(content);
                 self.security.dialog = None;
-                if HostReference::snapshot(&hosts) != HostReference::snapshot(self.book.hosts()) {
+                let mut drifted: Vec<String> = Vec::new();
+                if !changed.is_empty() {
+                    // The job changed some host references, and the vault was
+                    // saved against the book as the job saw it. The book may
+                    // have moved since: instead of overwriting whole records
+                    // with the job's copies - which would quietly revert every
+                    // edit made while the Argon2 derivation ran - the job's
+                    // sign-in change is replayed on each record as it stands
+                    // now. Every other field the user edited is kept, and the
+                    // vault stays the authority on what the references say,
+                    // which is what keeps the saved mirror and the book
+                    // describing one state (ADR-1).
+                    let job_book = self
+                        .security
+                        .job_book
+                        .take()
+                        .unwrap_or_else(|| self.book.hosts().to_vec());
                     let mut next = self.book.clone();
                     let mut failed = None;
-                    for host in &hosts {
-                        if let Err(error) = next.update(host.clone(), host.id()) {
+                    for id in &changed {
+                        let Some(post) = hosts.iter().find(|host| host.id() == *id) else {
+                            continue;
+                        };
+                        let Some(pre) = job_book.iter().find(|host| host.id() == *id) else {
+                            continue;
+                        };
+                        let Some(current) = self.book.host(*id) else {
+                            // The host was deleted while the job ran: there is
+                            // nothing to replay on, and its reference row has
+                            // to leave the vault's mirror as well, which the
+                            // reconcile pass below does.
+                            continue;
+                        };
+                        let mut merged = current.clone();
+                        merged.set_auth(post.auth());
+                        merged.set_managed_key_id(post.managed_key_id());
+                        merged.set_credential_id(post.credential_id());
+                        if current != pre {
+                            // An edit landed here while the job ran; the notice
+                            // names it so the overlap is read, not silent.
+                            drifted.push(current.name().to_owned());
+                        }
+                        if merged != *current
+                            && let Err(error) = next.update(merged, *id)
+                        {
                             failed = Some(error.to_string());
                             break;
                         }
@@ -2094,8 +2142,25 @@ impl ShelluneView {
                             return;
                         }
                     }
+                    // The saved mirror still describes the book the job saw. A
+                    // host that vanished under the job is the one case the
+                    // replay above cannot cover, so the mirror is rewritten
+                    // against the book as it now stands - the vault's own save
+                    // checks then see one state again.
+                    if HostReference::snapshot(self.book.hosts()) != HostReference::snapshot(&hosts)
+                    {
+                        self.security_reconcile(cx);
+                    }
                 }
-                let (tone, text) = security_report_text(&report, strings);
+                self.security.job_book = None;
+                let (tone, text) = if drifted.is_empty() {
+                    security_report_text(&report, strings)
+                } else {
+                    (
+                        Tone::Warning,
+                        copy::fill(strings.drift_kept, &[("names", &drifted.join(", "))]),
+                    )
+                };
                 if let SecurityReport::Rotated { public_key, .. } = report {
                     self.security.rotation_public_key = Some(public_key);
                 }
@@ -2130,6 +2195,53 @@ impl ShelluneView {
                 );
             }
         }
+    }
+
+    /// Rewrites the vault's reference mirror against the book as it now
+    /// stands, quietly.
+    ///
+    /// The bookkeeping half of a finish whose book moved under the job: the
+    /// vault was saved against the book the job saw, and a host that vanished
+    /// or changed references meanwhile is not one the replay above can carry.
+    /// The rewrite says nothing of its own - the notice of the change the user
+    /// made is already on the page - but it holds the one-job rule until it
+    /// ends, so no second save can race it.
+    fn security_reconcile(&mut self, cx: &mut Context<Self>) {
+        let Some(mut content) = self.security.content.clone() else {
+            return;
+        };
+        let store = VaultStore::at(self.store.root());
+        let secrets = self.secrets.clone();
+        let hosts = self.book.hosts().to_vec();
+        content.set_references(&HostReference::snapshot(&hosts));
+        self.security.busy = true;
+        let work = cx.background_executor().spawn(async move {
+            store
+                .save(
+                    &content,
+                    &hosts,
+                    &[UnsealSource::LocalMachine],
+                    KdfParams::default(),
+                    secrets.as_ref(),
+                )
+                .map(|()| content)
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = work.await;
+            let _ = this.update(cx, |view, cx| {
+                view.security.busy = false;
+                match outcome {
+                    Ok(content) => view.security.content = Some(content),
+                    Err(reason) => view.security_set_notice(
+                        Tone::Danger,
+                        format!("{}: {reason}", view.security_strings().vault_failed),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Puts the vault back to what it was, against the host book that is still
@@ -3175,14 +3287,15 @@ fn security_apply(
             content,
             previous,
             hosts,
+            changed: Vec::new(),
             report,
         },
         Ok(SecurityChange::Save {
             report,
-            hosts: next,
+            hosts: changed_records,
         }) => {
             let mut all = hosts;
-            for host in &next {
+            for host in &changed_records {
                 if let Some(slot) = all.iter_mut().find(|candidate| candidate.id() == host.id()) {
                     *slot = host.clone();
                 }
@@ -3200,10 +3313,12 @@ fn security_apply(
             ) {
                 return SecurityResult::Failed(error.to_string());
             }
+            let changed = changed_records.iter().map(HostConfig::id).collect();
             SecurityResult::Applied {
                 content,
                 previous,
                 hosts: all,
+                changed,
                 report,
             }
         }
@@ -3370,12 +3485,19 @@ fn security_rotate(
             .remove_key(previous)
             .map_err(|error| error.to_string())?;
     }
+    // Only the moved records travel back: the finish replays their new
+    // reference on the book as it stands then, keeping edits made meanwhile.
+    let moved_hosts: Vec<HostConfig> = moved
+        .iter()
+        .filter(|host| moving.contains(&host.id()))
+        .cloned()
+        .collect();
     Ok(SecurityChange::Save {
         report: SecurityReport::Rotated {
             count: moving.len(),
             public_key: public.authorized_key,
         },
-        hosts: moved,
+        hosts: moved_hosts,
     })
 }
 
@@ -3386,15 +3508,17 @@ fn security_delete(
     hosts: &[HostConfig],
     record: SecurityRecord,
 ) -> Result<SecurityChange, String> {
-    let mut next = hosts.to_vec();
+    let mut changed: Vec<HostConfig> = Vec::new();
     let report = match record {
         SecurityRecord::Key(id) => {
             if !content.remove_key(id).map_err(|error| error.to_string())? {
                 return Err("the vault holds no such key".to_owned());
             }
-            for host in next.iter_mut() {
+            for host in hosts {
                 if host.managed_key_id() == Some(id) {
-                    host.set_auth(None);
+                    let mut unbound = host.clone();
+                    unbound.set_auth(None);
+                    changed.push(unbound);
                 }
             }
             SecurityReport::KeyDeleted
@@ -3406,9 +3530,11 @@ fn security_delete(
             {
                 return Err("the vault holds no such password".to_owned());
             }
-            for host in next.iter_mut() {
+            for host in hosts {
                 if host.credential_id() == Some(id) {
-                    host.set_auth(None);
+                    let mut unbound = host.clone();
+                    unbound.set_auth(None);
+                    changed.push(unbound);
                 }
             }
             SecurityReport::CredentialDeleted
@@ -3416,7 +3542,7 @@ fn security_delete(
     };
     Ok(SecurityChange::Save {
         report,
-        hosts: next,
+        hosts: changed,
     })
 }
 
@@ -3624,6 +3750,66 @@ fn capture_suffix(index: usize) -> String {
 // The password generator
 // ---------------------------------------------------------------------------
 
+/// Writes one private key export: to a fresh file beside the target, then an
+/// atomic rename over it.
+///
+/// Two properties the plain `fs::write` cannot give. A fresh file is created
+/// with the owner's permissions alone (0600), so an export never inherits a
+/// looser mode a file already at that path - or the process umask - would
+/// leave open; and the rename replaces the target in one step, so a write that
+/// fails halfway leaves the previous file exactly as it was instead of a
+/// truncated key.
+fn write_private_export(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    let directory = path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let temp = directory.join(format!(
+        ".{}.part-{}",
+        path.file_name()
+            .map(std::ffi::OsStr::to_string_lossy)
+            .unwrap_or_default(),
+        remote_now(),
+    ));
+    let write = || -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp)?
+                .write_all(bytes)?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?
+                .write_all(bytes)?;
+        }
+        Ok(())
+    };
+    write().map_err(|error| {
+        let _ = std::fs::remove_file(&temp);
+        error.to_string()
+    })?;
+    // A rename replaces in one step on the Unix-like platforms; Windows refuses
+    // to rename over an existing file, so the target steps aside there first -
+    // the window is the platform's own, and the copy that lands is complete.
+    if std::fs::rename(&temp, path).is_err() {
+        let _ = std::fs::remove_file(path);
+        std::fs::rename(&temp, path).map_err(|error| {
+            let _ = std::fs::remove_file(&temp);
+            error.to_string()
+        })?;
+    }
+    Ok(())
+}
+
 /// The generator, under the name the tests reach it by.
 #[cfg(test)]
 pub(crate) fn generate_password_for_test(
@@ -3668,9 +3854,10 @@ pub(crate) fn generate_password(
         set.extend_from_slice(LETTERS);
     }
     let count = set.len();
-    // The largest multiple of the set size a uniform byte pair can hold: values
-    // above it are drawn again, which is what makes each choice uniform.
-    let limit = (256 / count) * count;
+    // The largest multiple of the set size a uniform byte pair (a value in
+    // 0..65536) can hold: values above it are drawn again, which is what makes
+    // each choice uniform over the whole set.
+    let limit = (65_536 / count) * count;
     let mut stream = Entropy::new();
     let mut password = String::with_capacity(length);
     while password.len() < length {
