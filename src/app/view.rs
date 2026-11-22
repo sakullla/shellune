@@ -804,8 +804,8 @@ pub struct ShelluneView {
     /// listing fills the slice itself while a failed read's card does not fit in it.
     files_local_scroll: gpui::ScrollHandle,
     files_remote_scroll: gpui::ScrollHandle,
-    files_local_list_scroll: gpui::ScrollHandle,
-    files_remote_list_scroll: gpui::ScrollHandle,
+    files_local_list_scroll: UniformListScrollHandle,
+    files_remote_list_scroll: UniformListScrollHandle,
     /// Focus of the file view's keyboard stops (R4), in the order [`files_stops`] gives.
     ///
     /// Each one is a real control the pointer can also press; the handles make them
@@ -2889,8 +2889,8 @@ impl ShelluneView {
             files_remote_focus: cx.focus_handle(),
             files_local_scroll: gpui::ScrollHandle::new(),
             files_remote_scroll: gpui::ScrollHandle::new(),
-            files_local_list_scroll: gpui::ScrollHandle::new(),
-            files_remote_list_scroll: gpui::ScrollHandle::new(),
+            files_local_list_scroll: UniformListScrollHandle::new(),
+            files_remote_list_scroll: UniformListScrollHandle::new(),
             files_toolbar_upload_focus: cx.focus_handle(),
             files_toolbar_download_focus: cx.focus_handle(),
             files_card_upload_focus: cx.focus_handle(),
@@ -3698,7 +3698,7 @@ impl ShelluneView {
         // Windows and Linux, Cmd on macOS. Every other combination is left to the
         // field or the action it is bound to.
         let secondary = modifiers.number_of_modifiers() == 1 && modifiers.secondary();
-        if self.workspace.destination() != Destination::Hosts || self.hosts_keys_blocked() {
+        if !self.home_shown() || self.hosts_keys_blocked() {
             return false;
         }
         let search_focused = self.hosts_search.read(cx).focus_handle().is_focused(window);
@@ -3992,11 +3992,12 @@ impl ShelluneView {
                 let Some(view) = tab_view.upgrade() else {
                     return Vec::new();
                 };
-                let two_fields = view.read(app).hosts.group_editor().is_some_and(|editor| {
+                // A move or a deleted group asks only where to; the others only a name.
+                let choosing = view.read(app).hosts.group_editor().is_some_and(|editor| {
                     matches!(editor.action(), GroupAction::Delete(_) | GroupAction::Move)
                 });
-                if two_fields {
-                    vec![tab_name.clone(), tab_destination.clone()]
+                if choosing {
+                    vec![tab_destination.clone()]
                 } else {
                     vec![tab_name.clone()]
                 }
@@ -4006,10 +4007,11 @@ impl ShelluneView {
 
         let handle = name.read(cx).focus_handle().clone();
         window.focus(&handle);
-        let focus_destination = self
-            .hosts
-            .group_editor()
-            .is_some_and(|editor| !matches!(editor.action(), GroupAction::Create));
+        // The keyboard starts in the one field the dialog shows: a rename keeps its
+        // name field, a move or a deleted group starts in the destination search.
+        let focus_destination = self.hosts.group_editor().is_some_and(|editor| {
+            matches!(editor.action(), GroupAction::Delete(_) | GroupAction::Move)
+        });
         if focus_destination {
             let handle = destination.read(cx).focus_handle().clone();
             window.focus(&handle);
@@ -7090,7 +7092,7 @@ impl ShelluneView {
     /// The record a palette entry about favourites is for: the row under the hosts
     /// page's cursor, or the saved record behind the session on screen.
     pub(super) fn palette_favorite_target(&self) -> Option<HostId> {
-        if self.workspace.destination() == Destination::Hosts
+        if self.home_shown()
             && let Some(id) = self.active_hosts_cursor()
         {
             return Some(id);
@@ -12112,7 +12114,7 @@ impl ShelluneView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<Div> {
-        if self.workspace.destination() != Destination::Hosts {
+        if !self.home_shown() {
             return None;
         }
         let id = self.hosts.pending_delete()?;
@@ -12255,9 +12257,7 @@ impl ShelluneView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<Div> {
-        if self.workspace.destination() != Destination::Hosts
-            || !self.hosts.is_asking_batch_delete()
-        {
+        if !self.home_shown() || !self.hosts.is_asking_batch_delete() {
             return None;
         }
         let metrics = self.metrics();
@@ -12632,7 +12632,7 @@ impl ShelluneView {
             || self
                 .closing
                 .is_some_and(|id| self.close_needs_confirmation(id))
-            || (self.workspace.destination() == Destination::Hosts
+            || (self.home_shown()
                 && (self.hosts.pending_delete().is_some() || self.hosts.is_asking_batch_delete()))
     }
 
@@ -12784,14 +12784,11 @@ impl ShelluneView {
             return true;
         }
         // The deletion question is a dialog: Escape is the way out, and keeps the host.
-        if self.workspace.destination() == Destination::Hosts
-            && self.hosts.pending_delete().is_some()
-        {
+        if self.home_shown() && self.hosts.pending_delete().is_some() {
             self.cancel_delete_host(cx);
             return true;
         }
-        if self.workspace.destination() == Destination::Hosts && self.hosts.is_asking_batch_delete()
-        {
+        if self.home_shown() && self.hosts.is_asking_batch_delete() {
             self.cancel_batch_delete_hosts(cx);
             return true;
         }
@@ -12918,13 +12915,11 @@ impl ShelluneView {
             self.reclaim_focus(window, cx);
             return true;
         }
-        if self.workspace.destination() == Destination::Hosts
-            && self.group_search.read(cx).focus_handle().is_focused(window)
-        {
+        if self.home_shown() && self.group_search.read(cx).focus_handle().is_focused(window) {
             self.clear_group_query(window, cx);
             return true;
         }
-        if self.workspace.destination() == Destination::Hosts
+        if self.home_shown()
             && self.hosts_search.read(cx).focus_handle().is_focused(window)
             && !self.hosts.search().is_empty()
         {
@@ -13421,6 +13416,17 @@ impl ShelluneView {
     }
 
     /// The content under the top bar: the settings, a terminal, or the hosts home.
+    /// Whether the window is showing the home page (the hosts list).
+    ///
+    /// That is not the same as "the destination is Hosts": with no terminal to show,
+    /// the local-shells destination draws the home page too - at start-up and after the
+    /// last tab closes. A check on the destination alone left the page's own dialogs
+    /// (deleting a host) and keys unanswered there, so a press on Delete did nothing.
+    pub(super) fn home_shown(&self) -> bool {
+        let destination = self.workspace.destination();
+        destination != Destination::Settings && !self.shows_terminal(destination)
+    }
+
     fn destination_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let destination = self.workspace.destination();
         if destination == Destination::Settings {
@@ -15078,7 +15084,7 @@ impl ShelluneView {
     }
 
     /// The scroll of one column's listing, which turns the entries in it.
-    fn files_list_scroll(&self, source: FileSource) -> &gpui::ScrollHandle {
+    fn files_list_scroll(&self, source: FileSource) -> &UniformListScrollHandle {
         match source {
             FileSource::Local => &self.files_local_list_scroll,
             FileSource::Remote => &self.files_remote_list_scroll,
@@ -15466,9 +15472,14 @@ impl ShelluneView {
     /// content does not fit, which is what a failed read's card does at 200% text in the
     /// minimum window. Home and End go to one end or the other.
     fn files_turn(&mut self, source: FileSource, key: &str, cx: &mut Context<Self>) {
-        let listing = self.files_list_scroll(source);
+        let listing = self
+            .files_list_scroll(source)
+            .0
+            .borrow()
+            .base_handle
+            .clone();
         let target = if listing.max_offset().height > px(0.0) {
-            listing.clone()
+            listing
         } else {
             self.files_panel_scroll(source).clone()
         };
@@ -15653,7 +15664,7 @@ impl ShelluneView {
         // The rows are the list's children after the parent row; the column header
         // stands above the list and is not one of them.
         self.files_list_scroll(source)
-            .scroll_to_item(usize::from(has_parent) + next);
+            .scroll_to_item(usize::from(has_parent) + next, gpui::ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -16189,6 +16200,8 @@ impl ShelluneView {
             BrowseState::Ready(listing) => {
                 let list_id = files_element_id(source, "list");
                 let list_scroll = self.files_list_scroll(source).clone();
+                let list_base = list_scroll.0.borrow().base_handle.clone();
+                let has_parent = path.as_deref().is_some_and(|path| path != "/");
                 let mut list = div()
                     .id(list_id.clone())
                     .flex()
@@ -16201,7 +16214,7 @@ impl ShelluneView {
                     .overflow_y_scroll()
                     // Page Up/Down turns the entries themselves while they are taller
                     // than the box that holds them (R4).
-                    .track_scroll(&list_scroll)
+                    .track_scroll(&list_base)
                     // The listing lies on the page: its header's hairline and the rows'
                     // own faces are what set it apart, not a card around it (ADR-1).
                     .debug_selector({
@@ -16212,7 +16225,7 @@ impl ShelluneView {
                         gpui::MouseButton::Right,
                         self.files_blank_menu_listener(id, source, cx),
                     );
-                if path.as_deref().is_some_and(|path| path != "/") {
+                if has_parent {
                     list = list.child(self.files_parent_row(id, source, cx));
                 }
                 if listing.is_empty() {
@@ -16287,9 +16300,50 @@ impl ShelluneView {
                             .child(SharedString::from(strings.files_filter_none)),
                     );
                 }
-                for (index, entry) in rows.iter().enumerate() {
-                    list = list.child(self.files_row(id, source, index, entry, cx));
-                }
+                // A folder of hundreds of entries is drawn a screenful at a time: only
+                // the rows in view are built, so turning the list does not rebuild every
+                // row of both columns on each step of the wheel. The rows are one
+                // height (the compact row frame), which is what lets the list place
+                // them without measuring each one.
+                let listed: gpui::AnyElement = if rows.is_empty() {
+                    list.into_any_element()
+                } else {
+                    let count = rows.len() + usize::from(has_parent);
+                    gpui::uniform_list(
+                        list_id.clone(),
+                        count,
+                        cx.processor(move |view, range: std::ops::Range<usize>, _window, cx| {
+                            let rows = view.files.rows(id, source);
+                            range
+                                .filter_map(|position| {
+                                    if has_parent && position == 0 {
+                                        return Some(
+                                            view.files_parent_row(id, source, cx)
+                                                .into_any_element(),
+                                        );
+                                    }
+                                    let index = position - usize::from(has_parent);
+                                    rows.get(index).map(|entry| {
+                                        view.files_row(id, source, index, entry, cx)
+                                            .into_any_element()
+                                    })
+                                })
+                                .collect()
+                        }),
+                    )
+                    .track_scroll(list_scroll.clone())
+                    .flex_1()
+                    .min_h(metrics.list_row_height() * 2.0)
+                    .debug_selector({
+                        let list_id = list_id.clone();
+                        move || list_id.to_string()
+                    })
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        self.files_blank_menu_listener(id, source, cx),
+                    )
+                    .into_any_element()
+                };
                 div()
                     .flex()
                     .flex_col()
@@ -16299,7 +16353,7 @@ impl ShelluneView {
                     .child(self.files_filter_row(id, source, cx))
                     // The column header stays above the rows it sorts while they turn.
                     .child(self.files_list_header(id, source, cx))
-                    .child(list)
+                    .child(listed)
                     .into_any_element()
             }
         };
@@ -16431,9 +16485,9 @@ impl ShelluneView {
         // The listing's bar only while a listing is what the box holds: the handle
         // keeps the last listing's numbers while the next one loads.
         if listing {
-            content = content.child(crate::app::scrollbar::bar(
+            content = content.child(crate::app::scrollbar::for_list(
                 files_element_id(source, "list.scrollbar"),
-                self.files_list_scroll(source).clone(),
+                self.files_list_scroll(source),
             ));
         }
         if let Some(report) = self.files_report(id, source) {

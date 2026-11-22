@@ -151,7 +151,7 @@ impl std::fmt::LowerHex for Token {
     }
 }
 
-/// The dark palette: low-glare soft charcoal with one restrained periwinkle accent.
+/// The dark palette: deep ink slate with one restrained periwinkle accent.
 ///
 /// The surfaces are a calm charcoal grey ramp - canvas, panel, raised, dialog - lifted
 /// off pitch black to reduce halation during long sessions. The interaction fills are
@@ -160,8 +160,10 @@ impl std::fmt::LowerHex for Token {
 /// written here as the opaque colour that blend gives. A dark palette tells its layers
 /// apart by lightness and edge; the shadows are faint.
 pub mod dark {
-    /// The window's floor: behind the content area and around the terminal.
-    pub const CANVAS: u32 = 0x16181d;
+    /// The window's floor: behind the content area and around the terminal. It is the
+    /// terminal's own background, a step deeper than the panels, so the sidebar and the
+    /// title bar read as a layer above the list and the terminal.
+    pub const CANVAS: u32 = 0x12151a;
     /// The title bar, the tab strip, the sidebar and the status bar: the panel layer.
     pub const CHROME: u32 = 0x1c1f26;
     /// Panels, inputs, rows and cards.
@@ -191,7 +193,7 @@ pub mod dark {
     pub const ACCENT: u32 = 0x82b0ff;
     pub const ACCENT_HOVER: u32 = 0x94bcff;
     pub const ACCENT_PRESSED: u32 = 0x70a3fa;
-    pub const ON_ACCENT: u32 = 0x16181d;
+    pub const ON_ACCENT: u32 = 0x12151a;
     /// The accent 14% over the panel.
     pub const ACCENT_TINT: u32 = 0x2a3344;
     pub const ACCENT_ON_TINT: u32 = 0xc5dcff;
@@ -220,18 +222,21 @@ pub mod dark {
     pub const SCRIM: u32 = 0x000000;
     pub const SHADOW: u32 = 0x000000;
     /// The terminal's selection: the accent 32% over the terminal's background.
-    pub const SELECTION: u32 = 0x394965;
-    /// Eight low-chroma avatar pairs (tint, initials): slate blue, steel, teal, sage, moss,
-    /// sand, clay and heather, each hue 18% over the panel.
+    pub const SELECTION: u32 = 0x364763;
+    /// Eight avatar pairs (tint, initials): periwinkle, sky, teal, jade, moss, sand,
+    /// clay and rose. They are built in OKLCH at one lightness and one chroma with the
+    /// hues spread evenly, so each host keeps a colour of its own that is told apart at
+    /// a glance and none of them is louder than the rest. The earlier greys-with-a-hint
+    /// all read as the same slate.
     pub const AVATARS: [(u32, u32); 8] = [
-        (0x283244, 0xbcd3f5),
-        (0x2a3642, 0xbcd6ec),
-        (0x29393c, 0xb9e0dd),
-        (0x2a3836, 0xbae0ca),
-        (0x313832, 0xcde0b9),
-        (0x393732, 0xe6d6b8),
-        (0x393132, 0xe6c3b8),
-        (0x382e38, 0xe6bad0),
+        (0x28354e, 0xbcd4fe),
+        (0x193a4a, 0xa1dcfc),
+        (0x0f3d3f, 0x96e2e6),
+        (0x1c3d2e, 0xa6e3c4),
+        (0x2e3a1f, 0xc4dda8),
+        (0x413316, 0xeacf9a),
+        (0x4b2d22, 0xffc3ae),
+        (0x472b3b, 0xf8bfde),
     ];
     pub const TAB_ACCENTS: [u32; 6] = [0x9cbcd8, 0xb9aecb, 0x8fc6cf, 0xaec79a, 0xd3bc9c, 0xd4a8ae];
 }
@@ -292,42 +297,48 @@ pub mod light {
     pub const SHADOW: u32 = 0x000000;
     /// The terminal's selection: the accent 22% over the light terminal's background.
     pub const SELECTION: u32 = 0xc8d5ef;
+    /// The same eight hues as the dark avatars, as pale tints with deep initials.
     pub const AVATARS: [(u32, u32); 8] = [
-        (0xe6ecf8, 0x1d438a),
-        (0xe4ebf2, 0x244d73),
-        (0xe2efee, 0x1f6660),
-        (0xe4f0e8, 0x22663f),
-        (0xeaf0e4, 0x426624),
-        (0xf2ede4, 0x6b5020),
-        (0xf2e7e4, 0x6b3524),
-        (0xf0e5ec, 0x6b264d),
+        (0xe3edff, 0x2e5091),
+        (0xdaf1fe, 0x025a7b),
+        (0xd7f3f5, 0x065e62),
+        (0xdcf4e7, 0x046242),
+        (0xe7f1dc, 0x405e00),
+        (0xf6ecd7, 0x6a4d03),
+        (0xffe7df, 0x85371a),
+        (0xfde5f1, 0x7d3461),
     ];
     pub const TAB_ACCENTS: [u32; 6] = [0x2f5f86, 0x5d4a80, 0x1a6b74, 0x51662f, 0x8a5a20, 0x8b4450];
 
-    /// The terminal's default colours and its 16 ANSI colours, clean soft light.
+    /// The terminal's default colours and its 16 ANSI colours on light paper.
+    ///
+    /// The same hues as the dark table, built in OKLCH at one lightness band dark enough
+    /// to read at 4.5:1 on the paper; on light paper "bright" is the same hue a step
+    /// deeper, the emphasis a light theme can give. The background is the window's
+    /// canvas, as it is in the dark palette.
     ///
     /// Keyed by the dark values of `shellune_terminal::palette`; a colour a program
     /// set itself (256-colour or true colour) is drawn as it asked.
     pub const TERMINAL: &[(u32, u32)] = &[
-        (0xd4d9e2, 0x24292f), // foreground
-        (0x16181d, 0xf6f8fa), // background
-        (0x78a9ff, 0x2359c8), // cursor
-        (0x282c34, 0x32383f), // black
-        (0xe07a84, 0xb8323e), // red
-        (0x76c293, 0x1f6e3d), // green
-        (0xd9b56c, 0x855805), // yellow
-        (0x7aa6f0, 0x2359c8), // blue
-        (0xbe94e0, 0x7e399c), // magenta
-        (0x6cbdc9, 0x156c7d), // cyan
-        (0xb2b9c6, 0x57606a), // white
-        (0x8a92a1, 0x4d5560), // bright black
-        (0xec9ca4, 0xa22833), // bright red
-        (0x96d4ae, 0x175c32), // bright green
-        (0xe6cb8d, 0x704903), // bright yellow
-        (0x9ec0f8, 0x1b49a8), // bright blue
-        (0xd2b3eb, 0x6c2d87), // bright magenta
-        (0x8fd2dc, 0x0f5a69), // bright cyan
-        (0xdce1eb, 0x3b424c), // bright white
+        (0xdde0e5, 0x272b34), // foreground
+        (0x12151a, 0xf7f8fa), // background
+        (0x8eb8fe, 0x2359c8), // cursor
+        (0x353941, 0x393d46), // black
+        (0xf68882, 0xba3538), // red
+        (0x6bc987, 0x137d41), // green
+        (0xe1b856, 0x996103), // yellow
+        (0x77abf7, 0x1c65c8), // blue
+        (0xce90dc, 0x9240a4), // magenta
+        (0x59c4d4, 0x067a87), // cyan
+        (0xbabec4, 0x656971), // white
+        (0x818690, 0x50555e), // bright black
+        (0xfea6a0, 0x9b1c24), // bright red
+        (0x71e194, 0x016430), // bright green
+        (0xfbcc5a, 0x7a4d04), // bright yellow
+        (0x96c0fe, 0x024da9), // bright blue
+        (0xe7a1f7, 0x772a88), // bright magenta
+        (0x52ddf0, 0x01616b), // bright cyan
+        (0xf0f2f5, 0x44484f), // bright white
     ];
 }
 

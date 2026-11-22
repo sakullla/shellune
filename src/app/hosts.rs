@@ -1754,6 +1754,7 @@ impl HostsPanel {
     }
 
     /// Chooses what a selection means: the current result, or every saved host.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_scope(&mut self, scope: SelectionScope) {
         self.scope = scope;
     }

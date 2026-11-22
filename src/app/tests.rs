@@ -1404,6 +1404,36 @@ async fn closing_the_palette_returns_focus_to_the_field_that_opened_it(cx: &mut 
 }
 
 #[gpui::test]
+async fn delete_asks_on_the_home_page_the_local_shells_destination_draws(cx: &mut TestAppContext) {
+    let dir = TempDir::new("delete-home-local");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let (view, cx) = hosts_view(cx, dir.store());
+    focus_root(&view, cx);
+    // With no terminal open, the local-shells destination draws the home page: the
+    // window starts there and comes back there when the last tab closes.
+    cx.dispatch_action(GoToSessions);
+    cx.run_until_parked();
+    assert_eq!(destination_of(&view, cx), Destination::LocalShells);
+    assert!(
+        cx.update(|_window, app| view.read(app).home_shown()),
+        "the home page is what is on screen"
+    );
+
+    click(cx, "hosts.delete.0");
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().pending_delete().is_some()),
+        "the press asks the question"
+    );
+    assert!(
+        cx.debug_bounds("hosts.confirm").is_some(),
+        "and the question is drawn where the press was"
+    );
+}
+
+#[gpui::test]
 async fn clicking_a_navigation_entry_switches_the_current_object(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
@@ -24836,6 +24866,53 @@ async fn the_narrow_window_keeps_the_filter_and_its_menu_inside(cx: &mut TestApp
 }
 
 #[gpui::test]
+async fn moving_hosts_is_one_pick_from_the_list_of_groups(cx: &mut TestAppContext) {
+    let dir = TempDir::new("move-pick");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("web", "10.0.0.1", 22, "root", Some("Production")),
+            stored_host("db", "10.0.0.2", 22, "root", Some("Staging")),
+        ],
+    );
+    let (view, cx) = hosts_view(cx, dir.store());
+    click(cx, "hosts.select.0");
+    click(cx, "hosts.select.move");
+    assert!(cx.debug_bounds("hosts.group.move").is_some());
+    assert!(
+        cx.debug_bounds("hosts.group.name").is_none(),
+        "a move asks where to, not for a name"
+    );
+    // The list starts at "no group" (the empty field) followed by every group.
+    assert!(cx.debug_bounds("hosts.group.dest.none").is_some());
+    click(cx, "hosts.group.dest.1");
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app)
+                .hosts_state()
+                .group_editor()
+                .map(|editor| editor.destination().to_owned())
+                .as_deref(),
+            Some("Staging"),
+            "a click on a group is the answer"
+        );
+    });
+    click(cx, "hosts.group.confirm");
+    cx.update(|_window, app| {
+        let book = view.read(app).book();
+        let web = book
+            .hosts()
+            .iter()
+            .find(|host| host.name() == "web")
+            .expect("the host is kept");
+        assert_eq!(
+            web.group_path().map(|path| path.to_canonical()).as_deref(),
+            Some("Staging")
+        );
+    });
+}
+
+#[gpui::test]
 async fn a_batch_move_takes_every_host_the_filters_kept_and_keeps_them_saved(
     cx: &mut TestAppContext,
 ) {
@@ -24844,16 +24921,12 @@ async fn a_batch_move_takes_every_host_the_filters_kept_and_keeps_them_saved(
     seed_many(&store, 20);
     let (view, cx) = hosts_view(cx, store);
 
-    // The scope says what "select" covers before it covers anything.
     click(cx, "hosts.select.0");
     assert!(
         cx.debug_bounds("hosts.selection").is_some(),
         "a selection says how many hosts it holds and what it covers"
     );
-    assert!(
-        cx.debug_bounds("hosts.scope.current").is_some(),
-        "the scope names the current result, not the page"
-    );
+    // "Select all" takes the current result: every host the filters kept.
     click(cx, "hosts.select.scope");
     cx.update(|_window, app| {
         assert_eq!(

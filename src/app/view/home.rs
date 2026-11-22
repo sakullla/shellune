@@ -31,8 +31,7 @@ use crate::app::components::{self, ControlState, Variant};
 use crate::app::copy::{self, Strings, UxStrings};
 use crate::app::hosts::{
     GroupAction, HomeSection, HostList, HostListRow, HostProtocolFilter, HostSort,
-    HostStatusFilter, HostView, QuickTarget, SelectionScope, SidebarGroupRow, format_unix,
-    parse_quick_target,
+    HostStatusFilter, HostView, QuickTarget, SidebarGroupRow, format_unix, parse_quick_target,
 };
 use crate::app::icons::{self, Icon};
 use crate::app::nav::Destination;
@@ -1001,7 +1000,7 @@ impl ShelluneView {
 
         let group_search_focused = self.group_search.read(cx).focus_handle().is_focused(window);
         if group_search_focused {
-            if self.workspace.destination() != Destination::Hosts || self.hosts_keys_blocked() {
+            if !self.home_shown() || self.hosts_keys_blocked() {
                 return false;
             }
             let modifiers = &event.keystroke.modifiers;
@@ -1041,7 +1040,7 @@ impl ShelluneView {
         let focused_group = self.focused_group(window);
         let group_list_focused = self.group_list_focus.is_focused(window);
         if focused_place.is_none() && focused_group.is_none() && group_list_focused {
-            if self.workspace.destination() != Destination::Hosts || self.hosts_keys_blocked() {
+            if !self.home_shown() || self.hosts_keys_blocked() {
                 return false;
             }
             let modifiers = &event.keystroke.modifiers;
@@ -1102,7 +1101,7 @@ impl ShelluneView {
             (_, Some(path)) => SidebarStop::Group(path),
             _ => return false,
         };
-        if self.workspace.destination() != Destination::Hosts || self.hosts_keys_blocked() {
+        if !self.home_shown() || self.hosts_keys_blocked() {
             return false;
         }
         let modifiers = &event.keystroke.modifiers;
@@ -1771,26 +1770,14 @@ impl ShelluneView {
     fn hosts_selection_strip(&self, list: &HostList, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let ux = copy::ux();
-        let mut scopes = components::segmented(metrics);
-        for scope in SelectionScope::ALL {
-            let selected = self.hosts.scope() == scope;
-            scopes = scopes.child(
-                components::segment(scope.label(ux), selected, metrics)
-                    .id(scope.debug_selector())
-                    .debug_selector(move || scope.debug_selector().to_owned())
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.hosts.set_scope(scope);
-                        cx.notify();
-                    })),
-            );
-        }
         let count = copy::fill(
             ux.hosts_selection_count,
             &[("count", &self.hosts.selected_count().to_string())],
         );
-        let scope = self.hosts.scope();
-        let in_scope = list.ids_in_scope(scope).to_vec();
-        let scope_text = format!("{} {}", ux.hosts_scope_label, scope.label(ux));
+        // "Select all" takes what the list shows now - the search and the filters
+        // decide that - which is what a person who pressed it was looking at. The scope
+        // switch and its two captions that used to sit here asked a question nobody had.
+        let in_scope = list.ids_in_scope(self.hosts.scope()).to_vec();
 
         div()
             .flex()
@@ -1798,37 +1785,23 @@ impl ShelluneView {
             .items_center()
             .flex_wrap()
             .gap(metrics.scale(spacing::TIGHT))
-            .p(metrics.scale(spacing::TIGHT))
+            .py(metrics.scale(spacing::HALF))
+            .px(metrics.scale(spacing::TIGHT))
             .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::SURFACE_SELECTED))
+            .bg(theme::swatch(palette::ACCENT_TINT))
             .debug_selector(|| "hosts.selection".to_owned())
             .child(
                 div()
                     .flex_none()
+                    .px(metrics.scale(spacing::HALF))
                     .text_size(metrics.label_size())
                     .font_weight(metrics.medium_weight())
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .text_color(theme::swatch(palette::ACCENT_ON_TINT))
                     .debug_selector(|| "hosts.selection.count".to_owned())
                     .child(SharedString::from(count)),
             )
             .child(
-                div()
-                    .flex_none()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(SharedString::from(scope_text)),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .debug_selector(|| "hosts.selection.scope_note".to_owned())
-                    .child(ux.hosts_selection_ssh_only),
-            )
-            .child(scopes)
-            .child(
-                components::compact_button(ux.hosts_select_scope, Variant::Secondary, metrics)
+                components::compact_button(ux.hosts_select_scope, Variant::Ghost, metrics)
                     .id("hosts.select.scope")
                     .debug_selector(|| "hosts.select.scope".to_owned())
                     .on_click(cx.listener(move |this, _event, _window, cx| {
@@ -1844,8 +1817,9 @@ impl ShelluneView {
                         cx.notify();
                     })),
             )
+            .child(div().flex_1())
             .child(
-                components::compact_button(ux.hosts_group_move, Variant::Primary, metrics)
+                components::compact_button(ux.hosts_group_move, Variant::Secondary, metrics)
                     .id("hosts.select.move")
                     .debug_selector(|| "hosts.select.move".to_owned())
                     .on_click(cx.listener(|this, _event, window, cx| {
@@ -1856,6 +1830,8 @@ impl ShelluneView {
                 components::compact_button(ux.hosts_batch_open, Variant::Secondary, metrics)
                     .id("hosts.batch.open")
                     .debug_selector(|| "hosts.batch.open".to_owned())
+                    // A batch runs commands over SSH; the rule is said where it applies.
+                    .tooltip(components::tooltip(ux.hosts_selection_ssh_only))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.open_batch_preview(cx);
                     })),
@@ -2336,6 +2312,175 @@ impl ShelluneView {
     ///
     /// Deleting asks for a destination first: the hosts move, they are never deleted with
     /// the group (R18).
+    /// Where the hosts of a move or a deleted group go: "no group", every group with
+    /// how much it holds, and the typed path as a new group when none has it.
+    ///
+    /// The field above filters the list and holds the answer: a click on a row writes
+    /// that row's path into it, and a path nobody saved yet is offered as a new group.
+    /// While the field holds a saved path or nothing, the whole list stays in view with
+    /// that row marked, so the choice can still be changed with one click.
+    fn group_destination_picker(
+        &self,
+        text: &str,
+        action: &GroupAction,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let typed = text.trim().to_owned();
+        let all = crate::app::hosts::drawn_paths(&self.book, &self.groups);
+        // A group being deleted cannot take its own hosts, nor can anything inside it.
+        let allowed = |path: &GroupPath| match action {
+            GroupAction::Delete(gone) => !path.starts_with(gone),
+            _ => true,
+        };
+        let exact = all
+            .iter()
+            .any(|path| path.to_canonical().eq_ignore_ascii_case(&typed));
+        let paths: Vec<GroupPath> = if typed.is_empty() || exact {
+            all.into_iter().filter(|path| allowed(path)).collect()
+        } else {
+            crate::app::hosts::filtered_group_paths(&self.book, &self.groups, &typed)
+                .into_iter()
+                .filter(|path| allowed(path))
+                .collect()
+        };
+        let row_height = metrics.compact_control_height();
+        let hover = theme::swatch(palette::SURFACE_HOVER);
+        let row = |id: String,
+                   icon: Icon,
+                   label: String,
+                   marks: Vec<std::ops::Range<usize>>,
+                   count: Option<usize>,
+                   chosen: bool,
+                   value: String,
+                   cx: &mut Context<Self>| {
+            let selector = id.clone();
+            div()
+                .id(SharedString::from(id))
+                .debug_selector(move || selector.clone())
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(metrics.scale(spacing::TIGHT))
+                .h(row_height)
+                .px(metrics.scale(spacing::TIGHT))
+                .rounded(px(radius::SMALL))
+                .cursor_pointer()
+                .when(chosen, |row| row.bg(theme::swatch(palette::ACCENT_TINT)))
+                .when(!chosen, |row| row.hover(move |style| style.bg(hover)))
+                .child(icons::icon(
+                    icon,
+                    metrics.small_icon_size(),
+                    theme::swatch(if chosen {
+                        palette::ACCENT
+                    } else {
+                        palette::TEXT_MUTED
+                    }),
+                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(metrics.label_size())
+                        .text_color(theme::swatch(if chosen {
+                            palette::ACCENT_ON_TINT
+                        } else {
+                            palette::TEXT_PRIMARY
+                        }))
+                        .child(components::highlighted_text(label, marks)),
+                )
+                .children(count.map(|count| {
+                    div()
+                        .flex_none()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .child(SharedString::from(count.to_string()))
+                }))
+                .when(chosen, |row| {
+                    row.child(icons::icon(
+                        Icon::Check,
+                        metrics.small_icon_size(),
+                        theme::swatch(palette::ACCENT),
+                    ))
+                })
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    if let Some(field) = this.group_destination_field.clone() {
+                        let value = value.clone();
+                        field.update(cx, |field, cx| field.set_text(value, cx));
+                    }
+                    cx.notify();
+                }))
+        };
+
+        let mut list = div()
+            .id("hosts.group.dest.list")
+            .flex()
+            .flex_col()
+            .gap(px(components::HAIRLINE_WIDTH))
+            .w_full()
+            .p(metrics.scale(spacing::HAIRLINE))
+            .max_h(row_height * 6.5)
+            .overflow_y_scroll()
+            .track_scroll(&self.group_picker_scroll);
+        if typed.is_empty() || exact {
+            list = list.child(row(
+                "hosts.group.dest.none".to_owned(),
+                Icon::Close,
+                ux.hosts_move_none_row.to_owned(),
+                Vec::new(),
+                None,
+                typed.is_empty(),
+                String::new(),
+                cx,
+            ));
+        }
+        let searching = !typed.is_empty() && !exact;
+        for (index, path) in paths.iter().enumerate() {
+            let label = path.to_canonical();
+            let marks = if searching {
+                crate::app::palette::highlights(&label, &typed)
+            } else {
+                Vec::new()
+            };
+            let chosen = label.eq_ignore_ascii_case(&typed);
+            list = list.child(row(
+                format!("hosts.group.dest.{index}"),
+                Icon::Folder,
+                label.clone(),
+                marks,
+                Some(crate::app::hosts::records_under(&self.book, path)),
+                chosen,
+                label,
+                cx,
+            ));
+        }
+        if searching && GroupPath::parse(&typed).is_ok() {
+            list = list.child(row(
+                "hosts.group.dest.new".to_owned(),
+                Icon::Plus,
+                copy::fill(ux.hosts_group_picker_create, &[("name", &typed)]),
+                Vec::new(),
+                None,
+                true,
+                typed.clone(),
+                cx,
+            ));
+        }
+        div()
+            .relative()
+            .w_full()
+            .rounded(px(radius::MEDIUM))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .child(list)
+            .child(crate::app::scrollbar::bar(
+                "hosts.group.dest.scrollbar",
+                self.group_picker_scroll.clone(),
+            ))
+    }
+
     pub(super) fn group_dialog_overlay(
         &self,
         window: &gpui::Window,
@@ -2348,14 +2493,19 @@ impl ShelluneView {
         let action = editor.action().clone();
         let selector = action.debug_selector();
         let title = match &action {
-            GroupAction::Create => ux.hosts_group_new,
-            GroupAction::Rename(_) => ux.hosts_group_rename,
-            GroupAction::Move => ux.hosts_group_move,
-            GroupAction::Delete(_) => ux.hosts_group_delete,
+            GroupAction::Create => ux.hosts_group_new.to_owned(),
+            GroupAction::Rename(_) => ux.hosts_group_rename.to_owned(),
+            GroupAction::Move => copy::fill(
+                ux.hosts_move_title,
+                &[("count", &self.hosts.selected_count().to_string())],
+            ),
+            GroupAction::Delete(path) => {
+                format!("{} “{}”", ux.hosts_group_delete, path.to_canonical())
+            }
         };
         let (header, subtitle) = self.modal_header(
             Some(Icon::Folder),
-            title.to_owned(),
+            title,
             None,
             "hosts.group.close",
             cx,
@@ -2364,14 +2514,20 @@ impl ShelluneView {
             },
         );
 
+        // Moving and deleting ask one thing: where the hosts go. The dialog is a picker
+        // for that - a search over the groups that also takes a new path - and nothing
+        // else; the name field the other two actions need would only be a second box
+        // to wonder about.
+        let choosing = matches!(action, GroupAction::Delete(_) | GroupAction::Move);
         let mut body = div()
             .flex()
             .flex_col()
             .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::LOOSE))
             .pb(metrics.scale(spacing::LOOSE))
-            .debug_selector(move || selector.to_owned())
-            .child(
+            .debug_selector(move || selector.to_owned());
+        if !choosing {
+            body = body.child(
                 components::field_row(ux.hosts_group_name_label, metrics).child(
                     div()
                         .flex_1()
@@ -2380,42 +2536,34 @@ impl ShelluneView {
                         .children(self.group_name_field.clone()),
                 ),
             );
-        if matches!(action, GroupAction::Delete(_) | GroupAction::Move) {
-            let hosts = match &action {
-                // Every connection the group holds: the servers and the desktop or
-                // serial records, which move with it.
-                GroupAction::Delete(path) => {
-                    self.book.hosts_under_group(path).len()
-                        + self.book.connections_under_group(path).len()
-                }
-                _ => self.hosts.selected_count(),
-            };
+        }
+        if let GroupAction::Delete(path) = &action {
+            // Every connection the group holds: the servers and the desktop or serial
+            // records, which move with it.
+            let held = self.book.hosts_under_group(path).len()
+                + self.book.connections_under_group(path).len();
+            body = body.child(
+                div()
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .debug_selector(|| "hosts.group.body".to_owned())
+                    .child(SharedString::from(copy::fill(
+                        ux.hosts_group_delete_body,
+                        &[("count", &held.to_string())],
+                    ))),
+            );
+        }
+        if choosing {
             body = body
                 .child(
                     div()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                        .debug_selector(|| "hosts.group.body".to_owned())
-                        .child(SharedString::from(copy::fill(
-                            ux.hosts_group_delete_body,
-                            &[("count", &hosts.to_string())],
-                        ))),
+                        .flex()
+                        .w_full()
+                        .min_w_0()
+                        .debug_selector(|| "hosts.group.destination".to_owned())
+                        .children(self.group_destination_field.clone()),
                 )
-                .child(
-                    components::field_row(ux.hosts_group_destination_label, metrics).child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .debug_selector(|| "hosts.group.destination".to_owned())
-                            .children(self.group_destination_field.clone()),
-                    ),
-                )
-                .child(
-                    div()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_MUTED))
-                        .child(ux.hosts_group_destination_hint),
-                );
+                .child(self.group_destination_picker(editor.destination(), &action, cx));
         }
         if let Some(reason) = editor.error() {
             body = body.child(
@@ -2425,11 +2573,19 @@ impl ShelluneView {
                     .child(SharedString::from(reason.to_owned())),
             );
         }
-        let confirm = match &action {
-            GroupAction::Create => ux.hosts_group_create_action,
-            GroupAction::Rename(_) => ux.hosts_group_rename_action,
-            GroupAction::Move => ux.hosts_group_move_action,
-            GroupAction::Delete(_) => ux.hosts_group_delete_action,
+        // The answer names where the hosts go, so the button is read as the outcome.
+        let confirm: SharedString = match &action {
+            GroupAction::Create => ux.hosts_group_create_action.into(),
+            GroupAction::Rename(_) => ux.hosts_group_rename_action.into(),
+            GroupAction::Move => {
+                let target = editor.destination().trim();
+                if target.is_empty() {
+                    ux.hosts_move_ungrouped_action.into()
+                } else {
+                    copy::fill(ux.hosts_group_move_action, &[("name", target)]).into()
+                }
+            }
+            GroupAction::Delete(_) => ux.hosts_group_delete_action.into(),
         };
         // The shared dialog foot: a hairline over it, the actions on the right and the
         // answer last. Deleting a group cannot be taken back, so that answer is the

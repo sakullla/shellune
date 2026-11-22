@@ -12,113 +12,117 @@
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
-/// Default text colour, a soft cool off-white tuned for low glare on [`BACKGROUND`].
+/// Default text colour, a cool off-white a step below white, for low glare on
+/// [`BACKGROUND`].
 pub const FOREGROUND: Rgb = Rgb {
-    r: 0xd4,
-    g: 0xd9,
-    b: 0xe2,
+    r: 0xdd,
+    g: 0xe0,
+    b: 0xe5,
 };
 
-/// Default terminal background, a deep slate graphite matching the dark shell.
+/// Default terminal background, a deep ink slate; the dark shell's canvas is the same
+/// colour, so a terminal reads as the window and not as a box inside it.
 pub const BACKGROUND: Rgb = Rgb {
-    r: 0x16,
-    g: 0x18,
-    b: 0x1d,
+    r: 0x12,
+    g: 0x15,
+    b: 0x1a,
 };
 
 /// Default cursor colour, a calm sky blue matching the dark accent family.
 pub const CURSOR: Rgb = Rgb {
-    r: 0x78,
-    g: 0xa9,
-    b: 0xff,
+    r: 0x8e,
+    g: 0xb8,
+    b: 0xfe,
 };
 
 /// The sixteen ANSI colours.
 ///
-/// They are chosen for a low-glare deep slate canvas with natural, restrained
-/// saturation and checked for contrast in the tests: every colour a program can
-/// use as text stays readable on `BACKGROUND`, and the bright variants are
-/// visibly lighter rather than neon.
+/// They are built in OKLCH rather than picked in sRGB, so the eye reads them as one
+/// family: the six hues share one lightness band (yellow a little higher, which is
+/// where it reads as yellow rather than olive) and one restrained chroma, so no
+/// colour shouts over the others. Each bright slot is the same hue a clear step
+/// lighter, not a paler copy. The tests check that every colour a program can use
+/// as text stays readable on `BACKGROUND` and that the bright variants are lighter.
 pub const ANSI: [Rgb; 16] = [
     Rgb {
-        r: 0x28,
-        g: 0x2c,
-        b: 0x34,
+        r: 0x35,
+        g: 0x39,
+        b: 0x41,
     },
     Rgb {
-        r: 0xe0,
-        g: 0x7a,
-        b: 0x84,
+        r: 0xf6,
+        g: 0x88,
+        b: 0x82,
     },
     Rgb {
-        r: 0x76,
-        g: 0xc2,
-        b: 0x93,
+        r: 0x6b,
+        g: 0xc9,
+        b: 0x87,
     },
     Rgb {
-        r: 0xd9,
-        g: 0xb5,
-        b: 0x6c,
+        r: 0xe1,
+        g: 0xb8,
+        b: 0x56,
     },
     Rgb {
-        r: 0x7a,
-        g: 0xa6,
-        b: 0xf0,
+        r: 0x77,
+        g: 0xab,
+        b: 0xf7,
     },
     Rgb {
-        r: 0xbe,
-        g: 0x94,
-        b: 0xe0,
-    },
-    Rgb {
-        r: 0x6c,
-        g: 0xbd,
-        b: 0xc9,
-    },
-    Rgb {
-        r: 0xb2,
-        g: 0xb9,
-        b: 0xc6,
-    },
-    Rgb {
-        r: 0x8a,
-        g: 0x92,
-        b: 0xa1,
-    },
-    Rgb {
-        r: 0xec,
-        g: 0x9c,
-        b: 0xa4,
-    },
-    Rgb {
-        r: 0x96,
-        g: 0xd4,
-        b: 0xae,
-    },
-    Rgb {
-        r: 0xe6,
-        g: 0xcb,
-        b: 0x8d,
-    },
-    Rgb {
-        r: 0x9e,
-        g: 0xc0,
-        b: 0xf8,
-    },
-    Rgb {
-        r: 0xd2,
-        g: 0xb3,
-        b: 0xeb,
-    },
-    Rgb {
-        r: 0x8f,
-        g: 0xd2,
+        r: 0xce,
+        g: 0x90,
         b: 0xdc,
     },
     Rgb {
-        r: 0xdc,
+        r: 0x59,
+        g: 0xc4,
+        b: 0xd4,
+    },
+    Rgb {
+        r: 0xba,
+        g: 0xbe,
+        b: 0xc4,
+    },
+    Rgb {
+        r: 0x81,
+        g: 0x86,
+        b: 0x90,
+    },
+    Rgb {
+        r: 0xfe,
+        g: 0xa6,
+        b: 0xa0,
+    },
+    Rgb {
+        r: 0x71,
         g: 0xe1,
-        b: 0xeb,
+        b: 0x94,
+    },
+    Rgb {
+        r: 0xfb,
+        g: 0xcc,
+        b: 0x5a,
+    },
+    Rgb {
+        r: 0x96,
+        g: 0xc0,
+        b: 0xfe,
+    },
+    Rgb {
+        r: 0xe7,
+        g: 0xa1,
+        b: 0xf7,
+    },
+    Rgb {
+        r: 0x52,
+        g: 0xdd,
+        b: 0xf0,
+    },
+    Rgb {
+        r: 0xf0,
+        g: 0xf2,
+        b: 0xf5,
     },
 ];
 
