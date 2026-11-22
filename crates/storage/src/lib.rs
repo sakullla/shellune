@@ -37,6 +37,17 @@
 //!   and the accepted server identities, sealed as one AES-256-GCM ciphertext
 //!   under a random data key that every unseal secret — this machine's own, the
 //!   WebDAV password, the sync passphrase — can unwrap (R2, R9).
+//! * `BiometricAuthenticator` / `SystemAuthenticator` — the system's user
+//!   verification (Touch ID, Windows Hello, the desktop's keyring prompt)
+//!   behind one interface with a silent capability query and an error model
+//!   that keeps cancellation, failure, unavailability and an enrollment
+//!   change apart; no fingerprint template is ever seen, stored or synced
+//!   (R3, R4). `ScriptedAuthenticator` is the programmable double the tests
+//!   run against, so no test raises a real system prompt.
+//! * `SecurityStore` — the device-local lock policy (`security.json`): off,
+//!   unlock-vault or every-sensitive-operation, the idle lock and whether
+//!   this machine unlocks with biometrics. Choices about this computer, so a
+//!   backup, a sync and a portable export all leave them where they are.
 //!
 //! Loading is strict (a damaged or newer file is reported, never guessed at) and
 //! saving is atomic (a temporary file in the same directory is flushed and then
@@ -53,6 +64,7 @@
 
 mod audit;
 mod batch;
+mod biometric;
 mod book;
 mod credentials;
 mod error;
@@ -61,6 +73,7 @@ mod group;
 mod platforms;
 mod portable;
 mod preferences;
+mod security;
 mod snippets;
 mod ssh_config;
 mod store;
@@ -72,6 +85,12 @@ pub use audit::{CONFIG_KEYS, LOG_FIELDS, StoreEvent};
 pub use batch::{
     BatchStore, DIRECTORY as BATCH_DIRECTORY, RUNS_DIRECTORY as BATCH_RUNS_DIRECTORY, RunLog,
     TASKS_FILE_NAME as BATCH_TASKS_FILE_NAME,
+};
+#[cfg(target_os = "macos")]
+pub use biometric::BiometryProtectedEntry;
+pub use biometric::{
+    BiometricAuthenticator, BiometricCapability, BiometricError, LocalOnlyFallback,
+    ScriptedAuthenticator, SystemAuthenticator, VerificationPrompt,
 };
 pub use book::{
     FORMAT_VERSION, Group, HostBook, HostEdit, LegacyGroupLabel, RecentConnection, RecentHost,
@@ -94,6 +113,10 @@ pub use portable::{
 pub use preferences::{
     FILE_NAME as PREFERENCES_FILE_NAME, KeymapEntry, KeymapPreferences, Preferences,
     PreferencesProblem, PreferencesStore,
+};
+pub use security::{
+    DEFAULT_IDLE_LOCK_MINUTES, FILE_NAME as SECURITY_FILE_NAME, LockPolicy, SecurityProblem,
+    SecuritySettings, SecurityStore,
 };
 pub use snippets::{FILE_NAME as SNIPPETS_FILE_NAME, SnippetStore};
 pub use ssh_config::{

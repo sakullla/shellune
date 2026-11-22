@@ -26,3 +26,34 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 # Wipes the derived key and the decrypted passwords once they are used.
 zeroize = { workspace = true }
+
+# Device-local biometric and system user verification (R3, R4). Every crate
+# below is already in the lock file through the GPUI and keyring dependency
+# trees, so no new package enters the graph.
+[target.'cfg(target_os = "macos")'.dependencies]
+# LocalAuthentication (LAContext): the system's own biometric verification.
+objc2 = "0.6.5"
+# NSString (the localized reason the prompt shows) and NSError (the failure
+# codes it reports).
+objc2-foundation = "0.3.2"
+# The reply block `evaluatePolicy:localizedReason:reply:` takes.
+block2 = "0.6.2"
+# The keychain access control (biometryCurrentSet) that ties the vault's
+# local unseal secret to the enrolled biometric set.
+security-framework = "3.7.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Windows Hello user consent for desktop windows: the UserConsentVerifier the
+# interop interface verifies through, the COM apartment its activation needs,
+# and the window handle the prompt is parented to. The version is the one
+# already locked for the other Windows targets.
+windows = { version = "0.62.2", features = [
+    "Security_Credentials_UI",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_WinRT",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+# The async operation type those calls return, so the prompt can be waited
+# for on the calling thread.
+windows-future = "0.3.2"
