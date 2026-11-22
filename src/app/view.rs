@@ -31,7 +31,7 @@ use shellune_core::{
 use shellune_ssh::RemoteEvent;
 use shellune_ssh::{PtySize, X11Status};
 use shellune_storage::{
-    BookError, ForwardStore, GroupService, HostBook, HostStore, HostTrust, ImportOutcome,
+    BookError, ForwardStore, GroupService, HostBook, HostKey, HostStore, HostTrust, ImportOutcome,
     ImportPreview, ImportedHost, PreferencesProblem, PreferencesStore, SecretStore, SnippetStore,
     StorageError, TrustStore,
 };
@@ -86,6 +86,9 @@ use crate::app::workspace::{
 use crate::app::{components, theme::radius};
 #[cfg(test)]
 use shellune_storage::KeymapPreferences;
+// The lock's pending-operation queue: the connection and desktop paths name
+// their steps through it (R3).
+use self::security::SecurityPending;
 
 mod backup;
 pub(crate) mod banner;
@@ -2762,6 +2765,9 @@ impl ShelluneView {
         let sync_center =
             sync::SyncCenter::new(store.root(), secrets.clone(), workspace.locale(), cx)
                 .online(online);
+        // The device-local lock choices and the vault's device name live beside
+        // the data; both are read once while the store is still borrowed.
+        let data_root = store.root().to_path_buf();
 
         let mut view = Self {
             workspace,
@@ -2859,7 +2865,7 @@ impl ShelluneView {
             trust_book: HostTrust::new(),
             trust_error: None,
             secrets,
-            security: security::SecurityPage::new(cx),
+            security: security::SecurityPage::new(&data_root, cx),
             files: FileViews::new(),
             transfers: TransferViews::new(),
             forwards: ForwardCenter::new(),
@@ -5170,6 +5176,16 @@ impl ShelluneView {
             self.refuse_desktop(session, reason, cx);
             return;
         };
+        // A shared password the vault holds is a secret read like any other:
+        // the lock's gate verifies first when the policy asks, and a locked
+        // vault unlocks before the pane may sign in with it (R3).
+        if record.credential_id().is_some()
+            && !self.security.operation_granted
+            && self.security_begin(vec![SecurityPending::Desktop(session)], cx)
+        {
+            return;
+        }
+        self.security.operation_granted = false;
         let password = match self.desktop_password(&record) {
             Ok(password) => password,
             // A shared password the vault cannot hand over is a start that cannot
@@ -9144,6 +9160,37 @@ impl ShelluneView {
         &self.trust_book
     }
 
+    /// The accepted server identities a connection actually reads: this
+    /// device's legacy trust file with the vault's entries laid over it, the
+    /// vault being the authority (ADR-6).
+    ///
+    /// A version 2 sync document carries no plaintext `known_hosts` and its
+    /// apply clears this device's file, so reading the file alone would make
+    /// one sync forget every fingerprint this machine accepted; reading the
+    /// two as one - with the vault's record winning where both hold one - is
+    /// what keeps a restored vault connecting without asking again (R7, R8,
+    /// T5's handoff).
+    pub(crate) fn effective_trust(&self) -> HostTrust {
+        let mut trust = self.trust_book.clone();
+        let Some(vault) = self.security.content() else {
+            return trust;
+        };
+        for entry in vault.trust().entries() {
+            trust.forget(entry.host(), entry.port());
+            if let Ok(key) = HostKey::new(
+                entry.algorithm().to_owned(),
+                entry.fingerprint().to_owned(),
+                entry.public_key().to_owned(),
+            ) {
+                // The vault entry is already validated; a refusal here would
+                // mean the record contradicts itself, and the honest answer is
+                // to leave the host unknown rather than trust a broken record.
+                let _ = trust.accept(entry.host(), entry.port(), &key, entry.accepted_unix());
+            }
+        }
+        trust
+    }
+
     /// Whether the field one method uses is drawn as bullets.
     #[cfg(test)]
     pub fn remote_field_masked(
@@ -9198,10 +9245,40 @@ impl ShelluneView {
             self.fail_before_dial(reason, cx);
             return;
         }
+        // The vault's own gate runs before any credential is taken: a chain
+        // that signs in with a managed key or a shared password verifies first
+        // when the policy asks for it, and a locked vault unlocks (R3). The
+        // grant is one passage - the next connection asks again.
+        if self.chain_reads_vault()
+            && !self.security.operation_granted
+            && self.security_begin(vec![SecurityPending::ResumeChain(take_panel)], cx)
+        {
+            return;
+        }
+        self.security.operation_granted = false;
         if take_panel && !self.take_panel_auth(cx) {
             return;
         }
         self.fill_or_dial(cx);
+    }
+
+    /// Whether the chain on screen signs in with something only the vault can
+    /// hand over - a managed key or a shared password - which is what the lock
+    /// has a say about. A chain of typed passwords and key files is not the
+    /// vault's business and never prompts (R3).
+    fn chain_reads_vault(&self) -> bool {
+        let panel = self
+            .remote
+            .as_ref()
+            .is_some_and(|panel| panel.method() == remote::MethodChoice::ManagedKey);
+        let chain = self.chain.as_ref().is_some_and(|draft| {
+            draft.order().iter().any(|hop| {
+                draft.host(*hop).is_some_and(|host| {
+                    host.managed_key_id().is_some() || host.credential_id().is_some()
+                })
+            })
+        });
+        panel || chain
     }
 
     /// Moves the form's credentials onto the hop it is showing.
@@ -9230,6 +9307,7 @@ impl ShelluneView {
             cx.notify();
             return false;
         }
+        let known = remote::known_host_key(&self.effective_trust(), &host);
         let strings = self.workspace.strings();
         let auth = match self.remote.as_mut().map(|panel| panel.take_auth(strings)) {
             Some(Ok(auth)) => auth,
@@ -9242,7 +9320,6 @@ impl ShelluneView {
             }
             None => return false,
         };
-        let known = remote::known_host_key(&self.trust_book, &host);
         if let Some(draft) = self.chain.as_mut() {
             draft.push_auth(shellune_ssh::HopAuth::new(host.id(), auth, known));
         }
@@ -9385,7 +9462,7 @@ impl ShelluneView {
             }
             self.sync_remote_fields(cx);
         }
-        let known = remote::known_host_key(&self.trust_book, host);
+        let known = remote::known_host_key(&self.effective_trust(), host);
         let auth = if shown {
             // The vault's sign-in needs its one-time body handed to the panel
             // before the form can build the attempt's credentials.
@@ -9894,6 +9971,15 @@ impl ShelluneView {
             return false;
         }
         self.note_data_changed(cx);
+        // The hop's acceptance travels with the vault like any other (ADR-6);
+        // the mirror is a background job that never holds the chain back.
+        if let Some(entry) = self
+            .trust_book
+            .entry(&pending.prompt.host, pending.prompt.port)
+            .cloned()
+        {
+            self.security_mirror_trust(&entry, cx);
+        }
         true
     }
 
@@ -10296,6 +10382,12 @@ impl ShelluneView {
         }
         // The accepted identity is in the trust file and reached the connection.
         self.note_data_changed(cx);
+        // It also travels: from version 2 the vault is the authority a sync
+        // merges, so the acceptance is mirrored into it (ADR-6). The mirror
+        // never blocks this connection - it runs as its own background job.
+        if let Some(entry) = self.trust_book.entry(&prompt.host, prompt.port).cloned() {
+            self.security_mirror_trust(&entry, cx);
+        }
         if let Some(panel) = self.remote.as_mut() {
             panel.set_status(RemoteStatus::Connecting);
         }

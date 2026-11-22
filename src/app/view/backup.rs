@@ -25,9 +25,10 @@ use gpui::prelude::*;
 use gpui::{App, Context, Div, Entity, FontWeight, SharedString, Stateful, Window, div};
 use shellune_core::{HostId, SecretString};
 use shellune_storage::{
-    ApplyMode, ApplyOutcome, ApplyPlan, Change, ExportOptions, ExportOutcome, KdfParams, LocalData,
-    LocalState, Platform as DataPlatform, PlatformField, PortableError, SecretBundle, ShelluneData,
-    SnippetStore,
+    ApplyMode, ApplyOutcome, ApplyPlan, Change, ExportOptions, ExportOutcome, HostReference,
+    KdfParams, KeySource, LocalData, LocalState, PassphrasePurpose, Platform as DataPlatform,
+    PlatformField, PortableError, SecretBundle, ShelluneData, SnippetStore, UnsealSource,
+    VaultContent, VaultStore,
 };
 
 use super::ShelluneView;
@@ -51,8 +52,15 @@ pub(super) enum BackupDialog {
 /// export did.
 pub(super) struct ExportDialog {
     include_secrets: bool,
+    /// The whole vault travels: keys, passwords, metadata, references and
+    /// trust, as an encrypted block of a version 2 document (R9).
+    include_vault: bool,
     passphrase: Entity<TextField>,
     confirm: Entity<TextField>,
+    /// The sync passphrase of the vault export, typed only when no sync
+    /// passphrase is saved; the saved one is used without retyping (R9).
+    vault_passphrase: Entity<TextField>,
+    vault_confirm: Entity<TextField>,
     /// The system's save dialog is open, so a second press does not open another.
     choosing: bool,
     /// The export is being written on the background executor.
@@ -68,6 +76,8 @@ struct ExportReport {
     path: PathBuf,
     /// How many passwords are in the file; `None` when none were asked for.
     secrets: Option<usize>,
+    /// The encrypted vault travelled with it (R9).
+    vault: bool,
     /// The connections whose password the credential store could not read.
     unreadable: Vec<String>,
     /// The connections that remember a password the credential store does not have.
@@ -92,6 +102,14 @@ enum ImportStage {
         /// The passphrase is being tried on the background executor.
         running: bool,
     },
+    /// A version 2 file carries the encrypted vault, and the sync passphrase
+    /// it was sealed with is being asked for (R9).
+    VaultLocked {
+        document: Box<ShelluneData>,
+        field: Entity<TextField>,
+        problem: Option<String>,
+        running: bool,
+    },
     /// The preview is being applied on the background executor.
     Applying,
     /// What applying the file would change.
@@ -102,6 +120,8 @@ enum ImportStage {
         changed: bool,
         /// How many passwords were saved to the credential store.
         saved: usize,
+        /// The encrypted vault was restored with it (R9).
+        vault: bool,
         /// The connections whose password the credential store would not remove.
         not_forgotten: Vec<String>,
     },
@@ -125,6 +145,10 @@ struct BackupPreview {
     mode: ApplyMode,
     plan: ApplyPlan,
     missing_keys: Vec<MissingKey>,
+    /// The vault the document carried, opened with the sync passphrase: it is
+    /// restored as one piece with the document, secrets, metadata, references
+    /// and trust together (R9). The passphrase is kept for the save's wrap.
+    vault: Option<BackupVault>,
     /// The names of the records on this machine when the plan was made, for the
     /// passwords a plan forgets: those records may be gone from the result.
     local_names: HashMap<HostId, String>,
@@ -132,6 +156,25 @@ struct BackupPreview {
     confirm_replace: bool,
     /// Why the last apply did not happen.
     problem: Option<String>,
+}
+
+/// The opened vault of a version 2 backup and the passphrase that opened it.
+struct BackupVault {
+    content: VaultContent,
+    passphrase: SecretString,
+}
+
+/// What applying did to the vault a version 2 backup carried.
+enum BackupVaultOutcome {
+    /// The backup carried none; nothing vault-shaped was written.
+    NotInFile,
+    /// The vault was restored as one piece with the document (R9). The
+    /// content is carried for the reader that wants what landed; the window
+    /// re-reads the file it produced instead of trusting a copy.
+    Restored,
+    /// The document applied but the vault could not be written; the last good
+    /// vault file is untouched and the reason is shown.
+    Failed(String),
 }
 
 impl BackupPreview {
@@ -158,10 +201,11 @@ struct MissingKey {
     foreign: bool,
 }
 
-/// What a test reads of an export: the file, the passwords written, the names whose
-/// password could not be read, and the names whose password the store does not have.
+/// What a test reads of an export: the file, the passwords written, whether the
+/// encrypted vault travelled with it, the names whose password could not be read,
+/// and the names whose password the store does not have.
 #[cfg(test)]
-pub type ExportReportForTest = (PathBuf, Option<usize>, Vec<String>, Vec<String>);
+pub type ExportReportForTest = (PathBuf, Option<usize>, bool, Vec<String>, Vec<String>);
 
 /// The default name of a backup file: `shellune-backup-YYYYMMDD.json`.
 #[must_use]
@@ -328,20 +372,28 @@ impl ShelluneView {
         let strings = self.backup_strings();
         let passphrase = self.passphrase_field(strings.passphrase, cx);
         let confirm = self.passphrase_field(strings.passphrase_confirm, cx);
+        let vault_passphrase = self.passphrase_field(strings.export_vault_passphrase, cx);
+        let vault_confirm = self.passphrase_field(strings.export_vault_confirm, cx);
         let view = cx.entity().downgrade();
-        confirm.update(cx, |field, _cx| {
-            field.on_submit(move |_text, _window, app| {
-                view.update(app, |view, cx| {
-                    view.choose_backup_export_path(cx);
-                    false
-                })
-                .unwrap_or(false)
+        for field in [confirm.clone(), vault_confirm.clone()] {
+            let view = view.clone();
+            field.update(cx, |field, _cx| {
+                field.on_submit(move |_text, _window, app| {
+                    view.update(app, |view, cx| {
+                        view.choose_backup_export_path(cx);
+                        false
+                    })
+                    .unwrap_or(false)
+                });
             });
-        });
+        }
         self.backup = Some(BackupDialog::Export(ExportDialog {
             include_secrets: false,
+            include_vault: false,
             passphrase,
             confirm,
+            vault_passphrase,
+            vault_confirm,
             choosing: false,
             running: false,
             failure: None,
@@ -354,6 +406,12 @@ impl ShelluneView {
     pub(super) fn toggle_backup_secrets(&mut self, cx: &mut Context<Self>) {
         if let Some(BackupDialog::Export(dialog)) = self.backup.as_mut() {
             dialog.include_secrets = !dialog.include_secrets;
+            // A document carries either the version 1 password block or the
+            // version 2 vault, never both; the vault is the whole backup, so
+            // choosing it puts the old block away (R9).
+            if dialog.include_secrets {
+                dialog.include_vault = false;
+            }
             dialog.failure = None;
             // The first field the dialog now asks for takes the keyboard.
             if dialog.include_secrets {
@@ -363,13 +421,46 @@ impl ShelluneView {
         }
     }
 
+    /// Turns the vault on or off for the next export: the whole of it -
+    /// keys, passwords, metadata, references and trust - sealed under the
+    /// sync passphrase (R9).
+    pub(super) fn toggle_backup_vault(&mut self, cx: &mut Context<Self>) {
+        let saved = self.saved_sync_passphrase().is_some();
+        if let Some(BackupDialog::Export(dialog)) = self.backup.as_mut() {
+            dialog.include_vault = !dialog.include_vault;
+            if dialog.include_vault {
+                dialog.include_secrets = false;
+                if !saved {
+                    self.field_focus_pending =
+                        Some(dialog.vault_passphrase.read(cx).focus_handle().clone());
+                }
+            }
+            dialog.failure = None;
+            cx.notify();
+        }
+    }
+
     /// Why the export cannot start yet, when it cannot: the passwords need a passphrase,
-    /// typed the same way twice.
+    /// typed the same way twice; the vault needs a non-empty sync passphrase, which the
+    /// saved one already satisfies (R9).
     fn export_refusal(&self, dialog: &ExportDialog, cx: &App) -> Option<&'static str> {
+        let strings = self.backup_strings();
+        if dialog.include_vault {
+            if self.saved_sync_passphrase().is_some() {
+                return None;
+            }
+            let first = dialog.vault_passphrase.read(cx).text();
+            if first.trim().is_empty() {
+                return Some(strings.export_vault_required);
+            }
+            if first != dialog.vault_confirm.read(cx).text() {
+                return Some(strings.export_vault_mismatch);
+            }
+            return None;
+        }
         if !dialog.include_secrets {
             return None;
         }
-        let strings = self.backup_strings();
         let first = dialog.passphrase.read(cx).text();
         if first.trim().is_empty() {
             return Some(strings.passphrase_required);
@@ -432,6 +523,20 @@ impl ShelluneView {
         let passphrase = dialog
             .include_secrets
             .then(|| dialog.passphrase.read(cx).text().to_owned());
+        // The vault is sealed under the sync passphrase: the saved one when
+        // there is one, otherwise the one being set here, which becomes the
+        // saved one - a user sets this secret once, not per device (R9).
+        let vault_passphrase = if dialog.include_vault {
+            match self.saved_sync_passphrase() {
+                Some(saved) => Some((saved, false)),
+                None => Some((
+                    SecretString::new(dialog.vault_passphrase.read(cx).text().to_owned()),
+                    true,
+                )),
+            }
+        } else {
+            None
+        };
         let root = self.store.root().to_path_buf();
         let secrets = self.secrets.clone();
         let app_version = self.version().to_owned();
@@ -443,6 +548,8 @@ impl ShelluneView {
         // the data files are read and written: none of it happens on the UI thread.
         let target = path.clone();
         let with_secrets = passphrase.is_some();
+        let with_vault = vault_passphrase.is_some();
+        let vault_passphrase_in = vault_passphrase.clone();
         let work = cx.background_executor().spawn(async move {
             let local = LocalData::at(&root).load()?;
             let mut options = ExportOptions::new(DataPlatform::current());
@@ -450,6 +557,23 @@ impl ShelluneView {
             options.app_version = app_version;
             if let Some(passphrase) = passphrase {
                 options = options.with_passphrase(SecretString::new(passphrase));
+            }
+            if let Some((passphrase, _)) = &vault_passphrase_in {
+                // The vault this machine holds, opened with its own local
+                // unseal secret, sealed into the file under the passphrase
+                // alone: a copy no WebDAV password is needed to read (R9).
+                let content = VaultStore::at(&root)
+                    .open(&UnsealSource::LocalMachine, secrets.as_ref())
+                    .map_err(|error| PortableError::Local {
+                        label: "vault",
+                        reason: error.to_string(),
+                    })?;
+                let cipher =
+                    shellune_storage::VaultCipher::export_copy(&content, passphrase, backup_kdf())
+                        .map_err(|error| PortableError::Encrypt {
+                            reason: error.to_string(),
+                        })?;
+                options = options.with_vault(cipher);
             }
             let base = ShelluneData::read(&target).ok();
             let outcome = ShelluneData::export(&local, &options, &*secrets, base.as_ref())?;
@@ -459,7 +583,14 @@ impl ShelluneView {
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |view, cx| {
-                view.finish_backup_export(path, with_secrets, result, cx);
+                view.finish_backup_export(
+                    path,
+                    with_secrets,
+                    with_vault,
+                    vault_passphrase,
+                    result,
+                    cx,
+                );
             });
         })
         .detach();
@@ -467,10 +598,13 @@ impl ShelluneView {
     }
 
     /// Shows what the export on the background executor did.
+    #[allow(clippy::too_many_arguments)]
     fn finish_backup_export(
         &mut self,
         path: PathBuf,
         with_secrets: bool,
+        with_vault: bool,
+        vault_passphrase: Option<(SecretString, bool)>,
         result: Result<(LocalState, ExportOutcome), PortableError>,
         cx: &mut Context<Self>,
     ) {
@@ -493,19 +627,39 @@ impl ShelluneView {
                 dialog.report = Some(ExportReport {
                     path: path.clone(),
                     secrets: with_secrets.then_some(outcome.secrets_included.len()),
+                    vault: with_vault,
                     unreadable,
                     missing,
                 });
                 // The passphrase has done its work; it is not kept on screen.
-                let (first, second) = (dialog.passphrase.clone(), dialog.confirm.clone());
-                first.update(cx, |field, cx| field.set_text(String::new(), cx));
-                second.update(cx, |field, cx| field.set_text(String::new(), cx));
-                self.toast(
-                    Tone::Positive,
-                    strings.export_done,
-                    Some(super::home_relative(&path.display().to_string())),
-                    cx,
-                );
+                let fields = [
+                    dialog.passphrase.clone(),
+                    dialog.confirm.clone(),
+                    dialog.vault_passphrase.clone(),
+                    dialog.vault_confirm.clone(),
+                ];
+                // The one that was set for the first time is kept the only
+                // place a secret belongs: the system credential store (R9).
+                let saved_note = match vault_passphrase {
+                    Some((passphrase, true)) => self.save_sync_passphrase(&passphrase).err(),
+                    _ => None,
+                };
+                for field in fields {
+                    field.update(cx, |field, cx| field.set_text(String::new(), cx));
+                }
+                match saved_note {
+                    Some(reason) => {
+                        self.toast(Tone::Warning, strings.export_failed, Some(reason), cx);
+                    }
+                    None => {
+                        self.toast(
+                            Tone::Positive,
+                            strings.export_done,
+                            Some(super::home_relative(&path.display().to_string())),
+                            cx,
+                        );
+                    }
+                }
             }
             Err(error) => {
                 dialog.report = None;
@@ -544,7 +698,8 @@ impl ShelluneView {
     }
 
     /// Reads a backup file and opens the import dialog on it: refused with its reason,
-    /// asking for the passphrase, or showing the preview.
+    /// asking for the passphrase (the sealed passwords of a version 1 file, or the
+    /// encrypted vault of a version 2 one), or showing the preview.
     pub(super) fn read_backup(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let strings = self.backup_strings();
         let stage = match ShelluneData::read(&path) {
@@ -570,7 +725,30 @@ impl ShelluneView {
                     running: false,
                 }
             }
-            Ok(document) => self.plan_backup(document, Secrets::NotInFile, ApplyMode::Merge),
+            Ok(document) if document.has_vault() => {
+                // A version 2 backup is sealed under the sync passphrase and
+                // nothing else; the vault cannot even be counted before it
+                // opens (R9).
+                let field = self.passphrase_field(strings.export_vault_passphrase, cx);
+                let view = cx.entity().downgrade();
+                field.update(cx, |field, _cx| {
+                    field.on_submit(move |_text, _window, app| {
+                        view.update(app, |view, cx| {
+                            view.unlock_backup_vault(cx);
+                            false
+                        })
+                        .unwrap_or(false)
+                    });
+                });
+                self.field_focus_pending = Some(field.read(cx).focus_handle().clone());
+                ImportStage::VaultLocked {
+                    document: Box::new(document),
+                    field,
+                    problem: None,
+                    running: false,
+                }
+            }
+            Ok(document) => self.plan_backup(document, Secrets::NotInFile, None, ApplyMode::Merge),
         };
         self.backup = Some(BackupDialog::Import(ImportDialog { path, stage }));
         cx.notify();
@@ -581,6 +759,7 @@ impl ShelluneView {
         &self,
         document: ShelluneData,
         secrets: Secrets,
+        vault: Option<BackupVault>,
         mode: ApplyMode,
     ) -> ImportStage {
         let strings = self.backup_strings();
@@ -605,11 +784,117 @@ impl ShelluneView {
                 secrets,
                 mode,
                 plan,
+                vault,
                 confirm_replace: false,
                 problem: None,
             })),
             Err(error) => ImportStage::Refused(backup_error_text(&error, strings)),
         }
+    }
+
+    /// Tries the typed passphrase on the document's encrypted vault, on the
+    /// background executor: the derivation is slow on purpose (R9).
+    pub(super) fn unlock_backup_vault(&mut self, cx: &mut Context<Self>) {
+        let strings = self.backup_strings();
+        let Some(BackupDialog::Import(dialog)) = self.backup.as_mut() else {
+            return;
+        };
+        let ImportStage::VaultLocked {
+            document,
+            field,
+            problem,
+            running,
+        } = &mut dialog.stage
+        else {
+            return;
+        };
+        if *running {
+            return;
+        }
+        let typed = field.read(cx).text().to_owned();
+        if typed.trim().is_empty() {
+            *problem = Some(strings.import_passphrase_required.to_owned());
+            cx.notify();
+            return;
+        }
+        *running = true;
+        *problem = None;
+        let document = (**document).clone();
+        let secret = SecretString::new(typed);
+        let open_with = secret.clone();
+        let work = cx.background_executor().spawn(async move {
+            let opened = document.vault().and_then(|cipher| {
+                cipher
+                    .open(&KeySource::Passphrase {
+                        purpose: PassphrasePurpose::SyncPassphrase,
+                        value: open_with,
+                    })
+                    .ok()
+            });
+            (document, opened, secret)
+        });
+        cx.spawn(async move |this, cx| {
+            let (document, opened, secret) = work.await;
+            let _ = this.update(cx, |view, cx| {
+                view.finish_backup_vault_unlock(document, opened, secret, cx)
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Goes on to the preview with the opened vault, or back to the question.
+    /// A wrong passphrase is a wrong secret, not a damaged file: the file is
+    /// refused nothing, and nothing has been written (R9).
+    fn finish_backup_vault_unlock(
+        &mut self,
+        document: ShelluneData,
+        opened: Option<VaultContent>,
+        passphrase: SecretString,
+        cx: &mut Context<Self>,
+    ) {
+        let strings = self.backup_strings();
+        let still_asking = matches!(
+            self.backup.as_ref(),
+            Some(BackupDialog::Import(ImportDialog {
+                stage: ImportStage::VaultLocked { .. },
+                ..
+            }))
+        );
+        if !still_asking {
+            return;
+        }
+        match opened {
+            Some(content) => {
+                let vault = BackupVault {
+                    content,
+                    passphrase,
+                };
+                let stage =
+                    self.plan_backup(document, Secrets::NotInFile, Some(vault), ApplyMode::Merge);
+                self.put_backup_stage(stage);
+            }
+            None => {
+                let Some(BackupDialog::Import(dialog)) = self.backup.as_mut() else {
+                    return;
+                };
+                let ImportStage::VaultLocked {
+                    field,
+                    problem,
+                    running,
+                    ..
+                } = &mut dialog.stage
+                else {
+                    return;
+                };
+                *running = false;
+                *problem = Some(strings.wrong_passphrase.to_owned());
+                let field = field.clone();
+                field.update(cx, |field, cx| field.set_text(String::new(), cx));
+                self.field_focus_pending = Some(field.read(cx).focus_handle().clone());
+            }
+        }
+        cx.notify();
     }
 
     /// Opens the sealed passwords with the passphrase typed, or says it is wrong and
@@ -675,7 +960,8 @@ impl ShelluneView {
         }
         match opened {
             Ok(bundle) => {
-                let stage = self.plan_backup(document, Secrets::Opened(bundle), ApplyMode::Merge);
+                let stage =
+                    self.plan_backup(document, Secrets::Opened(bundle), None, ApplyMode::Merge);
                 self.put_backup_stage(stage);
             }
             Err(error) => {
@@ -710,7 +996,7 @@ impl ShelluneView {
             return;
         };
         let document = (**document).clone();
-        let stage = self.plan_backup(document, Secrets::Skipped, ApplyMode::Merge);
+        let stage = self.plan_backup(document, Secrets::Skipped, None, ApplyMode::Merge);
         if let Some(BackupDialog::Import(dialog)) = self.backup.as_mut() {
             dialog.stage = stage;
         }
@@ -750,9 +1036,12 @@ impl ShelluneView {
             return;
         }
         let BackupPreview {
-            document, secrets, ..
+            document,
+            secrets,
+            vault,
+            ..
         } = *preview;
-        let stage = self.plan_backup(document, secrets, mode);
+        let stage = self.plan_backup(document, secrets, vault, mode);
         self.put_backup_stage(stage);
         cx.notify();
     }
@@ -799,18 +1088,62 @@ impl ShelluneView {
         self.hold_data_writes();
         let data = LocalData::at(self.store.root());
         let secrets = self.secrets.clone();
+        let root = self.store.root().to_path_buf();
         let reason = match preview.mode {
             ApplyMode::Merge => "backup-merge",
             ApplyMode::Replace => "backup-replace",
         };
         let work = cx.background_executor().spawn(async move {
+            // The vault is checked against the book the apply would end with
+            // before anything is written: a backup whose bindings cannot hold
+            // fails whole, and this machine keeps what it had (R9).
+            if let Some(vault) = &preview.vault {
+                let records = preview.plan.result().hosts.records();
+                let mut content = vault.content.clone();
+                content.set_references(&HostReference::snapshot_records(&records));
+                if let Err(error) = content.validate_for_records(&records) {
+                    return (
+                        preview,
+                        Err(PortableError::Corrupt {
+                            reason: format!("the backup's vault cannot be applied: {error}"),
+                        }),
+                        BackupVaultOutcome::NotInFile,
+                    );
+                }
+            }
             let outcome = preview.plan.apply(&data, &*secrets, reason);
-            (preview, outcome)
+            // The document applied; the vault follows as one piece, sealed for
+            // this machine and for the passphrase that opened it (R9).
+            let vault_outcome = match (&outcome, preview.vault.as_ref()) {
+                (Ok(_), Some(vault)) => {
+                    let records = preview.plan.result().hosts.records();
+                    let mut content = vault.content.clone();
+                    content.set_references(&HostReference::snapshot_records(&records));
+                    match VaultStore::at(&root).save_records(
+                        &content,
+                        &records,
+                        &[
+                            UnsealSource::LocalMachine,
+                            UnsealSource::SyncPassphrase(vault.passphrase.clone()),
+                        ],
+                        backup_kdf(),
+                        &*secrets,
+                    ) {
+                        // The window re-reads the file this wrote, so the
+                        // outcome carries the fact and not a second copy of
+                        // the secrets.
+                        Ok(()) => BackupVaultOutcome::Restored,
+                        Err(error) => BackupVaultOutcome::Failed(error.to_string()),
+                    }
+                }
+                _ => BackupVaultOutcome::NotInFile,
+            };
+            (preview, outcome, vault_outcome)
         });
         cx.spawn(async move |this, cx| {
-            let (preview, outcome) = work.await;
+            let (preview, outcome, vault_outcome) = work.await;
             let _ = this.update(cx, |view, cx| {
-                view.finish_backup_apply(preview, outcome, cx)
+                view.finish_backup_apply(preview, outcome, vault_outcome, cx)
             });
         })
         .detach();
@@ -823,13 +1156,14 @@ impl ShelluneView {
         &mut self,
         preview: Box<BackupPreview>,
         outcome: Result<ApplyOutcome, PortableError>,
+        vault_outcome: BackupVaultOutcome,
         cx: &mut Context<Self>,
     ) {
         self.set_backup_in_sync_slot(false);
         // What the window saved meanwhile is merged onto the imported files first.
         let held = self.release_data_writes();
         let changed = outcome.is_ok() && !preview.plan.is_empty();
-        self.show_backup_apply(preview, outcome, cx);
+        self.show_backup_apply(preview, outcome, vault_outcome, cx);
         self.settle_held_writes(held, false, cx);
         // The imported data is a change like any other: with automatic sync on it is
         // uploaded after the debounce (R8).
@@ -845,6 +1179,7 @@ impl ShelluneView {
         &mut self,
         mut preview: Box<BackupPreview>,
         outcome: Result<ApplyOutcome, PortableError>,
+        vault_outcome: BackupVaultOutcome,
         cx: &mut Context<Self>,
     ) {
         let strings = self.backup_strings();
@@ -860,6 +1195,9 @@ impl ShelluneView {
             // lists follow it all the same.
             if outcome.is_ok() {
                 self.adopt_imported_data(preview.plan.preferences_changed(), cx);
+                if matches!(vault_outcome, BackupVaultOutcome::Restored) {
+                    self.vault_reread(cx);
+                }
             }
             return;
         }
@@ -872,22 +1210,46 @@ impl ShelluneView {
                     .map(|id| preview.name_of(*id))
                     .collect();
                 self.adopt_imported_data(preview.plan.preferences_changed(), cx);
+                let restored = matches!(vault_outcome, BackupVaultOutcome::Restored);
+                if restored {
+                    // The window's copy of the vault is the file that was just
+                    // written; the secrets, references and trust it holds are
+                    // what the connections read from now on (R9).
+                    self.vault_reread(cx);
+                }
                 self.put_backup_stage(ImportStage::Applied {
                     snapshot: outcome.snapshot,
                     changed,
                     saved: outcome.secrets_saved,
+                    vault: restored,
                     not_forgotten,
                 });
-                self.toast(Tone::Positive, strings.import_done, None, cx);
+                match &vault_outcome {
+                    BackupVaultOutcome::Restored => {
+                        self.toast(
+                            Tone::Positive,
+                            strings.import_done,
+                            Some(strings.import_done_vault.to_owned()),
+                            cx,
+                        );
+                    }
+                    BackupVaultOutcome::Failed(reason) => {
+                        self.toast(Tone::Warning, strings.import_done, Some(reason.clone()), cx);
+                    }
+                    BackupVaultOutcome::NotInFile => {
+                        self.toast(Tone::Positive, strings.import_done, None, cx);
+                    }
+                }
             }
             Err(PortableError::Changed) => {
                 let BackupPreview {
                     document,
                     secrets,
+                    vault,
                     mode,
                     ..
                 } = *preview;
-                let mut stage = self.plan_backup(document, secrets, mode);
+                let mut stage = self.plan_backup(document, secrets, vault, mode);
                 if let ImportStage::Preview(preview) = &mut stage {
                     preview.problem = Some(strings.error_changed.to_owned());
                 }
@@ -1058,15 +1420,47 @@ impl ShelluneView {
             |this, cx| this.close_backup(cx),
         );
         let refusal = self.export_refusal(dialog, cx);
-        let mut body = self.backup_body("backup.export.body", cx).child(
-            checkbox(
-                "backup.export.secrets",
-                strings.export_include_secrets,
-                dialog.include_secrets,
-                self.metrics(),
+        let mut body = self
+            .backup_body("backup.export.body", cx)
+            .child(
+                checkbox(
+                    "backup.export.vault",
+                    strings.export_include_vault,
+                    dialog.include_vault,
+                    self.metrics(),
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| this.toggle_backup_vault(cx))),
             )
-            .on_click(cx.listener(|this, _event, _window, cx| this.toggle_backup_secrets(cx))),
-        );
+            .child(
+                checkbox(
+                    "backup.export.secrets",
+                    strings.export_include_secrets,
+                    dialog.include_secrets,
+                    self.metrics(),
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| this.toggle_backup_secrets(cx))),
+            );
+        if dialog.include_vault {
+            body = body
+                .child(self.backup_caption(strings.export_vault_hint, "backup.export.vault.hint"));
+            if self.saved_sync_passphrase().is_some() {
+                body = body.child(
+                    self.backup_caption(strings.export_vault_saved, "backup.export.vault.saved"),
+                );
+            } else {
+                body = body
+                    .child(self.backup_field(
+                        strings.export_vault_passphrase,
+                        "backup.export.vault.passphrase",
+                        &dialog.vault_passphrase,
+                    ))
+                    .child(self.backup_field(
+                        strings.export_vault_confirm,
+                        "backup.export.vault.confirm",
+                        &dialog.vault_confirm,
+                    ));
+            }
+        }
         if dialog.include_secrets {
             body = body
                 .child(
@@ -1163,6 +1557,13 @@ impl ShelluneView {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(strings.export_done),
             )
+            .when(report.vault, |card| {
+                card.child(
+                    div()
+                        .debug_selector(|| "backup.export.report.vault".to_owned())
+                        .child(strings.export_done_vault),
+                )
+            })
             .child(
                 div()
                     .debug_selector(|| "backup.export.report.path".to_owned())
@@ -1282,6 +1683,56 @@ impl ShelluneView {
                         )),
                 )
             }
+            ImportStage::VaultLocked {
+                field,
+                problem,
+                running,
+                ..
+            } => {
+                let running = *running;
+                let mut body = body
+                    .child(
+                        self.backup_caption(
+                            strings.import_vault_locked,
+                            "backup.import.vault.locked",
+                        ),
+                    )
+                    .child(self.backup_field(
+                        strings.export_vault_passphrase,
+                        "backup.import.vault.passphrase",
+                        field,
+                    ));
+                if let Some(problem) = problem {
+                    body = body.child(self.backup_banner(
+                        Tone::Danger,
+                        problem.clone(),
+                        "backup.import.problem",
+                    ));
+                }
+                (
+                    body,
+                    footer
+                        .child(self.text_button(
+                            SharedString::from("backup.import.cancel"),
+                            strings.cancel,
+                            Variant::Ghost,
+                            cx,
+                            |this, cx| this.close_backup(cx),
+                        ))
+                        .child(self.backup_primary(
+                            "backup.import.vault.unlock",
+                            if running {
+                                strings.import_running
+                            } else {
+                                strings.import_unlock
+                            },
+                            Variant::Primary,
+                            !running,
+                            cx,
+                            |this, cx| this.unlock_backup_vault(cx),
+                        )),
+                )
+            }
             ImportStage::Applying => (
                 body.child(self.backup_caption(strings.import_running, "backup.import.working")),
                 footer,
@@ -1291,6 +1742,7 @@ impl ShelluneView {
                 snapshot,
                 changed,
                 saved,
+                vault,
                 not_forgotten,
             } => {
                 let mut text = match (snapshot, changed) {
@@ -1306,6 +1758,10 @@ impl ShelluneView {
                         strings.import_done_secrets,
                         &[("count", &saved.to_string())],
                     ));
+                }
+                if *vault {
+                    text.push(' ');
+                    text.push_str(strings.import_done_vault);
                 }
                 let mut body =
                     body.child(self.backup_banner(Tone::Positive, text, "backup.import.applied"));
@@ -1458,6 +1914,26 @@ impl ShelluneView {
                 &[("count", &forgets.len().to_string())],
             ));
         }
+        // The vault part of a version 2 backup is restored as one piece with
+        // the document; the preview says what it holds and that it replaces
+        // this device's vault, which is the decision the confirm makes (R9).
+        let vault_line = preview.vault.as_ref().map(|vault| {
+            copy::fill(
+                strings.preview_vault_line,
+                &[
+                    ("keys", &vault.content.keys().count().to_string()),
+                    (
+                        "passwords",
+                        &vault.content.credentials().count().to_string(),
+                    ),
+                    ("trust", &vault.content.trust().entries().len().to_string()),
+                ],
+            )
+        });
+        let vault_note = preview
+            .vault
+            .as_ref()
+            .map(|_| strings.preview_vault_replace.to_owned());
         let mut body = body
             .child(self.backup_caption(source, "backup.import.source"))
             .child(
@@ -1497,8 +1973,18 @@ impl ShelluneView {
                         strings.preview_preferences,
                         preferences,
                     ))
-                    .child(self.backup_count_row("secrets", strings.preview_secrets, secrets)),
+                    .child(self.backup_count_row("secrets", strings.preview_secrets, secrets))
+                    .when(vault_line.is_some(), |column| {
+                        column.child(self.backup_count_row(
+                            "vault",
+                            strings.preview_vault,
+                            vault_line.clone().unwrap_or_default(),
+                        ))
+                    }),
             );
+        if let Some(note) = vault_note {
+            body = body.child(self.backup_caption(note, "backup.import.vault.note"));
+        }
         if !forgets.is_empty() {
             body = body.child(self.backup_list(
                 Tone::Neutral,
@@ -1674,6 +2160,7 @@ impl ShelluneView {
             BackupDialog::Import(dialog) => match dialog.stage {
                 ImportStage::Refused(_) => "import.refused",
                 ImportStage::Locked { .. } => "import.locked",
+                ImportStage::VaultLocked { .. } => "import.vault-locked",
                 ImportStage::Applying => "import.applying",
                 ImportStage::Preview(_) => "import.preview",
                 ImportStage::Applied { .. } => "import.applied",
@@ -1696,6 +2183,7 @@ impl ShelluneView {
             BackupDialog::Import(dialog) => match &dialog.stage {
                 ImportStage::Refused(reason) => Some(reason.clone()),
                 ImportStage::Locked { problem, .. } => problem.clone(),
+                ImportStage::VaultLocked { problem, .. } => problem.clone(),
                 ImportStage::Preview(preview) => preview.problem.clone(),
                 ImportStage::Applied { .. } | ImportStage::Applying => None,
             },
@@ -1737,6 +2225,7 @@ impl ShelluneView {
         Some((
             report.path.clone(),
             report.secrets,
+            report.vault,
             report.unreadable.clone(),
             report.missing.clone(),
         ))

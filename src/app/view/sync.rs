@@ -40,7 +40,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::prelude::*;
-use gpui::{Context, Div, Entity, FontWeight, SharedString, Stateful, Window, div};
+use gpui::{Context, Div, Entity, FontWeight, SharedString, Stateful, Window, div, px};
 use shellune_core::{ForwardBook, SecretString};
 use shellune_storage::{
     ForwardStore, GroupService, HostBook, KdfParams, LocalData, LocalState, PersistError,
@@ -60,7 +60,7 @@ use crate::app::copy::{self, SyncStrings};
 use crate::app::icons::Icon;
 use crate::app::nav::Destination;
 use crate::app::text_field::TextField;
-use crate::app::theme::{self, Tone, palette, spacing};
+use crate::app::theme::{self, Tone, palette, radius, spacing};
 
 /// How long after the last saved change an automatic upload starts. Edits made in a
 /// burst become one upload.
@@ -120,7 +120,7 @@ pub(super) struct GroupWriter {
 }
 
 /// One sync the window asks the engine for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum SyncJob {
     /// Whatever the comparison says, started by the window (start, change, check).
     Auto,
@@ -132,21 +132,25 @@ pub(super) enum SyncJob {
     Pull,
     /// The answer to a conflict.
     Resolve(Resolution),
+    /// The answers to the vault records of a conflict, one per record
+    /// (ADR-5): the engine applies nothing of the vault until every one is
+    /// decided.
+    ResolveVault(Vec<shellune_sync::VaultChoice>),
 }
 
 impl SyncJob {
     /// Whether a person asked for it, so its outcome is worth a notification.
-    fn manual(self) -> bool {
+    fn manual(&self) -> bool {
         !matches!(self, Self::Auto)
     }
 
     /// Whether it may write the data files of this computer: anything that can end in
     /// a pull. An upload and "use this computer's data" only write the cloud.
-    fn writes_local(self) -> bool {
+    fn writes_local(&self) -> bool {
         matches!(
             self,
             Self::Auto | Self::Check | Self::Pull | Self::Resolve(Resolution::UseRemote)
-        )
+        ) || matches!(self, Self::ResolveVault(_))
     }
 }
 
@@ -196,10 +200,20 @@ pub(super) struct SyncCenter {
     form_problem: Option<String>,
     /// The conflict waiting for an answer.
     conflict: Option<ConflictReport>,
+    /// The per-record answers of the vault part of a conflict, in the report's
+    /// order; `None` is a record not decided yet (ADR-5: nothing of the vault
+    /// applies until every one is answered).
+    vault_choices: Vec<(
+        shellune_sync::VaultChoiceKey,
+        Option<shellune_sync::VaultChoiceSide>,
+    )>,
     /// Whether the conflict question is on screen.
     dialog: bool,
     /// The user put the question away; automatic checks do not ask again.
     conflict_dismissed: bool,
+    /// An automatic sync waited for the vault to be unlocked (ADR-4); drawn as
+    /// one line on the page until the unlock (or a manual sync) clears it.
+    deferred_locked: bool,
     /// How many jobs ended, for the tests.
     finished: usize,
     /// How many releases of held saves could not keep every edit (some dropped, or none
@@ -436,6 +450,24 @@ fn document_name(label: &str, strings: &SyncStrings) -> &'static str {
     }
 }
 
+/// The choice-table key of one vault conflict.
+fn choice_key_of(conflict: &shellune_sync::VaultConflict) -> shellune_sync::VaultChoiceKey {
+    match conflict {
+        shellune_sync::VaultConflict::Record { kind, id, .. } => {
+            shellune_sync::VaultChoiceKey::Record {
+                kind: *kind,
+                id: id.clone(),
+            }
+        }
+        shellune_sync::VaultConflict::Trust { host, port, .. } => {
+            shellune_sync::VaultChoiceKey::Trust {
+                host: host.clone(),
+                port: *port,
+            }
+        }
+    }
+}
+
 /// Whether the touched documents of `a` and `b` differ.
 fn touched_differ(a: &LocalState, b: &LocalState, touched: Touched) -> bool {
     (touched.hosts && a.hosts != b.hosts)
@@ -526,8 +558,10 @@ impl SyncCenter {
             test: TestStatus::Idle,
             form_problem: None,
             conflict: None,
+            vault_choices: Vec::new(),
             dialog: false,
             conflict_dismissed: false,
+            deferred_locked: false,
             finished: 0,
             held_lost: 0,
             gate: None,
@@ -591,6 +625,20 @@ impl ShelluneView {
         self.run_sync_job(SyncJob::Auto, cx);
     }
 
+    /// Whether an automatic sync would carry the vault while this device's
+    /// vault is locked: the one case a job must not start unattended, because
+    /// the engine's vault work reads the system credential store and could
+    /// raise the system's own prompt behind the user's back (ADR-4). A manual
+    /// sync is the user's own decision and always runs.
+    fn automatic_sync_blocked_by_lock(&self) -> bool {
+        self.sync
+            .config
+            .as_ref()
+            .is_some_and(|config| config.sync_secrets)
+            && shellune_storage::VaultStore::at(self.store.root()).exists()
+            && self.vault_locked()
+    }
+
     /// Notes that data that travels was saved. With automatic sync on, an upload starts
     /// [`DEBOUNCE`] after the last such note; while cloud data is being adopted the note
     /// is dropped, so a pull is not sent back.
@@ -642,24 +690,37 @@ impl ShelluneView {
         if !self.sync.network || !self.sync.configured() {
             return;
         }
+        // An automatic sync never raises a system verification behind the
+        // user's back: while the vault of this device is locked and the sync
+        // would carry it, the job waits for the unlock (or a manual sync)
+        // instead (ADR-4). It is not a failure - the next poll, change or
+        // unlock picks it up again.
+        if job == SyncJob::Auto && self.automatic_sync_blocked_by_lock() {
+            self.sync.deferred_locked = true;
+            cx.notify();
+            return;
+        }
+        self.sync.deferred_locked = false;
         if self.sync_slot_busy() {
-            self.sync.queued = match (self.sync.queued, job) {
-                (Some(waiting), SyncJob::Auto) => Some(waiting),
-                (_, job) => Some(job),
+            self.sync.queued = match self.sync.queued.take() {
+                waiting @ Some(_) if job == SyncJob::Auto => waiting,
+                _ => Some(job),
             };
             return;
         }
-        self.sync.running = Some(job);
+        self.sync.running = Some(job.clone());
         if job.writes_local() {
             self.hold_data_writes();
         }
         let service = self.sync.service.clone();
+        let ran = job.clone();
         let work = cx.background_executor().spawn(async move {
-            match job {
+            match ran {
                 SyncJob::Auto | SyncJob::Check => service.sync(),
                 SyncJob::Upload => service.upload(),
                 SyncJob::Pull => service.pull(),
                 SyncJob::Resolve(resolution) => service.resolve(resolution),
+                SyncJob::ResolveVault(choices) => service.resolve_vault(&choices),
             }
         });
         cx.spawn(async move |this, cx| {
@@ -709,6 +770,7 @@ impl ShelluneView {
             Ok(SyncOutcome::Pulled(report)) => {
                 self.sync_settled();
                 self.adopt_pulled_data(&report, held.preferences, strings.toast_pulled, cx);
+                self.adopt_synced_vault(&report, cx);
                 adopted = true;
             }
             // One side only connected to hosts: the merge was written here like a
@@ -716,11 +778,17 @@ impl ShelluneView {
             Ok(SyncOutcome::Merged(report)) => {
                 self.sync_settled();
                 self.adopt_pulled_data(&report, held.preferences, strings.toast_merged, cx);
+                self.adopt_synced_vault(&report, cx);
                 adopted = true;
             }
             Ok(SyncOutcome::Conflict(report)) => {
                 self.sync.failure = None;
                 let ask = job.manual() || !self.sync.conflict_dismissed;
+                self.sync.vault_choices = report
+                    .vault
+                    .iter()
+                    .map(|conflict| (choice_key_of(conflict), None))
+                    .collect();
                 self.sync.conflict = Some(report);
                 if ask {
                     self.sync.dialog = true;
@@ -743,6 +811,62 @@ impl ShelluneView {
         }
         self.settle_held_writes(held, adopted, cx);
         self.start_next_in_sync_slot(cx);
+        cx.notify();
+    }
+
+    /// Re-reads this machine's vault after a sync applied one (ADR-5): the
+    /// engine wrote the file, and the window's in-memory copy of the records,
+    /// the references and the trust is stale until it is opened again. A
+    /// locked device stays locked - the file changed, the memory did not fill.
+    fn adopt_synced_vault(&mut self, report: &PullReport, cx: &mut Context<Self>) {
+        if report.vault_restored.is_none() || self.vault_locked() {
+            return;
+        }
+        self.vault_reread(cx);
+    }
+
+    /// Starts the automatic sync an unlocked vault was waiting for (ADR-4).
+    /// Called from the unlock itself, so the deferral ends the moment the
+    /// vault opens again rather than at the next poll.
+    pub(super) fn resume_deferred_sync(&mut self, cx: &mut Context<Self>) {
+        if self.sync.deferred_locked
+            && self.sync.automatic()
+            && !self.automatic_sync_blocked_by_lock()
+        {
+            self.run_sync_job(SyncJob::Auto, cx);
+        }
+    }
+
+    /// The key one vault conflict is answered by, for the choice table.
+    fn choose_vault_side(
+        &mut self,
+        index: usize,
+        side: shellune_sync::VaultChoiceSide,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_, chosen)) = self.sync.vault_choices.get_mut(index) {
+            *chosen = Some(side);
+        }
+        cx.notify();
+    }
+
+    /// Sends the per-record answers of a vault conflict (ADR-5). Every record
+    /// decided is the engine's own precondition; the button that lands here is
+    /// only drawn when the last open one was answered.
+    pub(super) fn resolve_sync_vault(&mut self, cx: &mut Context<Self>) {
+        let choices: Vec<shellune_sync::VaultChoice> = self
+            .sync
+            .vault_choices
+            .iter()
+            .filter_map(|(key, side)| {
+                side.map(|side| shellune_sync::VaultChoice {
+                    key: key.clone(),
+                    side,
+                })
+            })
+            .collect();
+        self.sync.dialog = false;
+        self.run_sync_job(SyncJob::ResolveVault(choices), cx);
         cx.notify();
     }
 
@@ -1114,6 +1238,12 @@ impl ShelluneView {
         self.key_presence.forget();
         self.sync.applying = false;
         let mut notes = Vec::new();
+        if let Some(restored) = &report.vault_restored {
+            notes.push(copy::fill(
+                strings.pull_vault,
+                &[("version", &restored.global_counter.to_string())],
+            ));
+        }
         if !report.trust_conflicts.is_empty() {
             notes.push(copy::fill(
                 strings.pull_trust,
@@ -1170,7 +1300,22 @@ impl ShelluneView {
         let draft = self.sync_draft(cx);
         let password = self.sync.password.read(cx).text().to_owned();
         let passphrase = self.sync.passphrase.read(cx).text().to_owned();
-        if draft.sync_secrets && !self.sync.passphrase_saved && passphrase.trim().is_empty() {
+        // The vault travels under the WebDAV password when there is one, so
+        // that mode needs no second secret; a passwordless WebDAV must have
+        // the sync passphrase before the vault may travel at all (R5).
+        let webdav_password = !password.trim().is_empty()
+            || self
+                .sync
+                .service
+                .password()
+                .ok()
+                .flatten()
+                .is_some_and(|saved| !saved.expose().trim().is_empty());
+        if draft.sync_secrets
+            && !webdav_password
+            && !self.sync.passphrase_saved
+            && passphrase.trim().is_empty()
+        {
             self.sync.form_problem = Some(strings.passphrase_required.to_owned());
             cx.notify();
             return;
@@ -1349,6 +1494,27 @@ impl ShelluneView {
     pub(super) fn open_sync_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.select(Destination::Settings, window, cx);
         self.settings_select_category(Category::Sync, cx);
+    }
+
+    /// The saved sync passphrase, when a non-empty one is in the store (R9):
+    /// the one secret a vault backup and a passwordless WebDAV share.
+    pub(super) fn saved_sync_passphrase(&self) -> Option<SecretString> {
+        self.sync
+            .service
+            .passphrase()
+            .ok()
+            .flatten()
+            .filter(|passphrase| !passphrase.expose().trim().is_empty())
+    }
+
+    /// Saves the sync passphrase a backup export was sealed with, so the one
+    /// secret a user sets is the one every other device uses too (R9: no
+    /// third secret beside the WebDAV password and this one).
+    pub(super) fn save_sync_passphrase(&self, passphrase: &SecretString) -> Result<(), String> {
+        self.sync
+            .service
+            .set_passphrase(Some(passphrase))
+            .map_err(|error| sync_error_text(&SyncError::Credentials(error), self.sync_strings()))
     }
 
     /// The password fields follow the language on screen.
@@ -1625,6 +1791,13 @@ impl ShelluneView {
         if self.sync.configured() && self.sync.has_failure() && self.sync.running.is_none() {
             rows.push(self.sync_line(strings.retry_note, None, "settings.sync.retry"));
         }
+        if self.sync.deferred_locked {
+            rows.push(self.sync_line(
+                strings.deferred_locked,
+                Some(Tone::Neutral),
+                "settings.sync.deferred",
+            ));
+        }
         self.settings_card("sync", rows)
     }
 
@@ -1677,12 +1850,18 @@ impl ShelluneView {
         }
     }
 
-    /// The conflict question over the window (R10).
+    /// The conflict question over the window (R10), and the per-record vault
+    /// question that comes first when the conflict has vault records in it
+    /// (ADR-5): nothing of the vault applies until every record is answered,
+    /// and each answer is the user's own - never "the cloud is newer".
     pub(super) fn sync_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
         if !self.sync_dialog_open() {
             return None;
         }
         let report = self.sync.conflict.as_ref()?;
+        if !report.vault.is_empty() {
+            return Some(self.vault_conflict_overlay(report, window, cx));
+        }
         let strings = self.sync_strings();
         let metrics = self.metrics();
         let (header, subtitle) = self.modal_header(
@@ -1798,6 +1977,268 @@ impl ShelluneView {
             },
         ))
     }
+
+    /// The vault half of a conflict: one row per record or trusted identity,
+    /// each kept from this device or from the cloud on its own (ADR-5, R8).
+    /// The apply button stays inert until the last open one is answered.
+    fn vault_conflict_overlay(
+        &self,
+        report: &ConflictReport,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        use shellune_sync::{VaultChoiceSide, VaultConflict, VaultRecordSide};
+        let strings = self.sync_strings();
+        let metrics = self.metrics();
+        let (header, subtitle) = self.modal_header(
+            Some(Icon::Refresh),
+            strings.vault_conflict_title.to_owned(),
+            None,
+            "sync.vault.conflict.close",
+            cx,
+            |this, cx| this.resolve_sync_conflict(Resolution::Cancel, cx),
+        );
+        let source = copy::fill(
+            strings.conflict_source,
+            &[
+                ("platform", &platform_label(&report.remote_platform)),
+                ("version", &report.remote_app_version),
+                (
+                    "date",
+                    &crate::app::hosts::format_unix(report.remote_created_unix),
+                ),
+            ],
+        );
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .gap(metrics.scale(spacing::SNUG))
+            .px(metrics.scale(spacing::LOOSE))
+            .pb(metrics.scale(spacing::LOOSE))
+            .debug_selector(|| "sync.vault.conflict.body".to_owned())
+            .child(
+                components::banner(Tone::Warning, metrics)
+                    .whitespace_normal()
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .debug_selector(|| "sync.vault.conflict.intro".to_owned())
+                    .child(strings.vault_conflict_intro),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .debug_selector(|| "sync.vault.conflict.source".to_owned())
+                    .child(SharedString::from(source)),
+            );
+        let mut all_answered = true;
+        for (index, conflict) in report.vault.iter().enumerate() {
+            let chosen = self
+                .sync
+                .vault_choices
+                .get(index)
+                .and_then(|(_, side)| *side);
+            all_answered &= chosen.is_some();
+            let (label, local_line, remote_line) = match conflict {
+                VaultConflict::Record {
+                    name,
+                    local,
+                    remote,
+                    ..
+                } => {
+                    let side = |side: &VaultRecordSide, deleted: &'static str, device: String| {
+                        if side.deleted {
+                            deleted.to_owned()
+                        } else {
+                            copy::fill(
+                                strings.vault_side_device,
+                                &[("device", &device), ("count", &side.counter.to_string())],
+                            )
+                        }
+                    };
+                    let label = if local.deleted || remote.deleted {
+                        copy::fill(strings.vault_record_deleted_label, &[("name", name)])
+                    } else {
+                        copy::fill(
+                            strings.vault_record_label,
+                            &[
+                                ("name", name),
+                                ("count", &local.counter.max(remote.counter).to_string()),
+                            ],
+                        )
+                    };
+                    (
+                        label,
+                        side(local, strings.vault_side_deleted, local.device_id.clone()),
+                        side(remote, strings.vault_side_deleted, remote.device_id.clone()),
+                    )
+                }
+                VaultConflict::Trust {
+                    host,
+                    port,
+                    local,
+                    remote,
+                    ..
+                } => {
+                    let identity = |identity: &Option<shellune_sync::TrustIdentity>| {
+                        identity
+                            .as_ref()
+                            .map(|identity| {
+                                copy::fill(
+                                    strings.vault_side_fingerprint,
+                                    &[
+                                        ("algorithm", &identity.algorithm),
+                                        ("fingerprint", &identity.fingerprint),
+                                    ],
+                                )
+                            })
+                            .unwrap_or_else(|| strings.vault_side_deleted.to_owned())
+                    };
+                    (
+                        copy::fill(
+                            strings.vault_trust_label,
+                            &[("host", host), ("port", &port.to_string())],
+                        ),
+                        identity(local),
+                        identity(remote),
+                    )
+                }
+            };
+            let mut row = div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .min_w_0()
+                .gap(metrics.scale(spacing::HAIRLINE))
+                .p(metrics.scale(spacing::TIGHT))
+                .rounded(px(radius::MEDIUM))
+                .border_1()
+                .border_color(theme::swatch(palette::BORDER))
+                .debug_selector(move || format!("sync.vault.conflict.row.{index}"))
+                .child(
+                    div()
+                        .text_size(metrics.label_size())
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .child(SharedString::from(label)),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(crate::app::terminal::monospace_family())
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                        .child(SharedString::from(local_line)),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(crate::app::terminal::monospace_family())
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                        .child(SharedString::from(remote_line)),
+                );
+            let keep = |which: u8, picked: bool, selector: String, label: &'static str| {
+                components::compact_button(label, Variant::Secondary, metrics)
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .when(picked, |button| button.opacity(0.5))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        let side = if which == 0 {
+                            VaultChoiceSide::Local
+                        } else {
+                            VaultChoiceSide::Remote
+                        };
+                        this.choose_vault_side(index, side, cx);
+                    }))
+            };
+            row = row.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(keep(
+                        0,
+                        chosen == Some(VaultChoiceSide::Local),
+                        format!("sync.vault.conflict.local.{index}"),
+                        strings.vault_keep_local,
+                    ))
+                    .child(keep(
+                        1,
+                        chosen == Some(VaultChoiceSide::Remote),
+                        format!("sync.vault.conflict.remote.{index}"),
+                        strings.vault_keep_remote,
+                    )),
+            );
+            body = body.child(row);
+        }
+        body = body
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .debug_selector(|| "sync.vault.conflict.then".to_owned())
+                    .child(strings.vault_then_document),
+            )
+            .capture_key_down(
+                cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.resolve_sync_conflict(Resolution::Cancel, cx);
+                    }
+                }),
+            );
+        let apply = components::compact_button(
+            strings.vault_apply,
+            if all_answered {
+                Variant::Primary
+            } else {
+                Variant::Secondary
+            },
+            metrics,
+        )
+        .id("sync.vault.conflict.apply")
+        .debug_selector(|| "sync.vault.conflict.apply".to_owned())
+        .when(!all_answered, |button| button.opacity(0.5))
+        .when(all_answered, |button| {
+            button.on_click(cx.listener(|this, _event, _window, cx| {
+                this.resolve_sync_vault(cx);
+            }))
+        });
+        let footer = components::modal_footer(metrics)
+            .child(
+                self.text_button(
+                    SharedString::from("sync.vault.conflict.cancel"),
+                    strings.cancel,
+                    Variant::Ghost,
+                    cx,
+                    |this, cx| this.resolve_sync_conflict(Resolution::Cancel, cx),
+                )
+                .h(metrics.control_height()),
+            )
+            .child(apply);
+        self.modal(
+            window,
+            "sync.vault.conflict.dialog",
+            560.0,
+            ModalContent {
+                header,
+                subtitle,
+                body: body.into_any_element(),
+                footer: Some(footer),
+            },
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1894,6 +2335,71 @@ impl ShelluneView {
         });
         self.sync.dialog = true;
         cx.notify();
+    }
+
+    /// Opens the vault half of a conflict with one record and one trust
+    /// disagreement, the shape ADR-5 asks the user about one by one. Nothing
+    /// is applied by opening it.
+    #[cfg(test)]
+    pub fn open_sync_vault_conflict_for_test(&mut self, cx: &mut Context<Self>) {
+        use shellune_sync::{TrustIdentity, VaultConflict, VaultRecordKind, VaultRecordSide};
+        let report = ConflictReport {
+            first_sync: false,
+            remote_platform: "linux".to_owned(),
+            remote_app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            remote_created_unix: 1_794_816_000,
+            vault: vec![
+                VaultConflict::Record {
+                    kind: VaultRecordKind::Credential,
+                    id: "credential-1".to_owned(),
+                    name: "Prod login".to_owned(),
+                    local: VaultRecordSide {
+                        name: "Prod login".to_owned(),
+                        deleted: false,
+                        counter: 3,
+                        device_id: "device-a".to_owned(),
+                    },
+                    remote: VaultRecordSide {
+                        name: "Prod login".to_owned(),
+                        deleted: false,
+                        counter: 4,
+                        device_id: "device-b".to_owned(),
+                    },
+                },
+                VaultConflict::Trust {
+                    host: "web.example.com".to_owned(),
+                    port: 22,
+                    local: Some(TrustIdentity {
+                        algorithm: "ssh-ed25519".to_owned(),
+                        fingerprint: "SHA256:locallocallocallocallocallocallocal".to_owned(),
+                        accepted_unix: 1,
+                    }),
+                    remote: Some(TrustIdentity {
+                        algorithm: "ssh-ed25519".to_owned(),
+                        fingerprint: "SHA256:remoteremoteremoteremoteremoterem".to_owned(),
+                        accepted_unix: 2,
+                    }),
+                    remote_source_platform: "linux".to_owned(),
+                    remote_app_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    remote_created_unix: 1_794_816_000,
+                },
+            ],
+        };
+        self.sync.vault_choices = report
+            .vault
+            .iter()
+            .map(|conflict| (choice_key_of(conflict), None))
+            .collect();
+        self.sync.conflict = Some(report);
+        self.sync.dialog = true;
+        cx.notify();
+    }
+
+    /// Whether an automatic sync is waiting for the vault to be unlocked.
+    #[cfg(test)]
+    #[must_use]
+    pub fn sync_deferred_for_test(&self) -> bool {
+        self.sync.deferred_locked
     }
 
     /// What the connection test said: `None` before or while it runs, then whether it

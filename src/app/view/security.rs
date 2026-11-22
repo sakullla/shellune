@@ -17,7 +17,8 @@
 //! what happened; the window keeps drawing while the job runs.
 
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::prelude::*;
 use gpui::{
@@ -30,8 +31,10 @@ use shellune_core::{
 };
 use shellune_ssh::keys as keys_api;
 use shellune_storage::{
-    HostReference, KdfParams, SecretStore, UnsealSource, VaultContent, VaultCredentialRecord,
-    VaultKeyRecord, VaultStore, VaultStoreError,
+    AppSecret, BiometricAuthenticator, BiometricCapability, BiometricError, HostKey, HostReference,
+    KdfParams, LockPolicy, PassphrasePurpose, SecretStore, SecuritySettings, SecurityStore,
+    SystemAuthenticator, TrustEntry, UnsealSource, VaultContent, VaultCredentialRecord,
+    VaultKeyRecord, VaultStore, VaultStoreError, VerificationPrompt,
 };
 
 use super::ShelluneView;
@@ -66,6 +69,10 @@ const RSA_GENERATED_BITS: usize = 3072;
 /// Width of the security page's dialog, in logical pixels before the text scale.
 const DIALOG_WIDTH: f32 = 560.0;
 
+/// Width of the lock page's idle-minutes field, in logical pixels before the
+/// text scale: a three-digit number and nothing more.
+const IDLE_FIELD_WIDTH: f32 = 84.0;
+
 // ---------------------------------------------------------------------------
 // The page's state
 // ---------------------------------------------------------------------------
@@ -75,12 +82,26 @@ const DIALOG_WIDTH: f32 = 560.0;
 pub(crate) struct SecurityPage {
     /// The search that narrows both lists.
     search: Entity<TextField>,
+    /// The search that narrows the host-trust list of the security category's
+    /// trust page (R7).
+    trust_search: Entity<TextField>,
+    /// The idle-lock minutes of the lock page, as they stand on this device.
+    idle_field: Entity<TextField>,
     /// The vault as this window last read or wrote it, unlocked.
     ///
     /// `None` while no vault of this machine has been opened (or created) yet.
     /// Reads for one operation clone out of it; writes replace it with what the
-    /// job saved.
+    /// job saved. The lock of this device clears it (ADR-4): a locked vault
+    /// holds no secret in memory, so every reader - the connection path, the
+    /// page, a background sync - sees nothing until it is unlocked again.
     content: Option<VaultContent>,
+    /// The device-local lock: its policy, its biometric setting and whether the
+    /// vault is locked right now (R3, R4, ADR-4).
+    lock: VaultLock,
+    /// A verification already paid for lets one passage of the connection
+    /// gate through: the resumed dial must not ask again for the pass it just
+    /// got, and the next connection must (R3).
+    pub(crate) operation_granted: bool,
     /// A vault job is running on the background executor.
     busy: bool,
     /// The vault is being opened at start-up; nothing may start meanwhile.
@@ -109,9 +130,9 @@ pub(crate) struct SecurityPage {
     dialog_scroll: ScrollHandle,
     /// This window's name as a writer of vault records, drawn once per run.
     ///
-    /// The vault's record versions only need a name that tells two writers
-    /// apart; sync keeps its own device identity when it merges (ADR-5), which
-    /// is a later task's wiring.
+    /// It is the same identity the sync state keeps (`sync-state.json`), so a
+    /// record this window writes and a vault a sync merges agree on who wrote
+    /// what, and two app runs never invent two identities for one machine.
     device: String,
     /// Whether a test holds the finish of one job, to draw the busy state the
     /// window shows while work is in flight (the same shape as the sync
@@ -121,6 +142,105 @@ pub(crate) struct SecurityPage {
     /// The held job result, until the test releases it.
     #[cfg(test)]
     held: Option<SecurityResult>,
+}
+
+/// The lock of this one device: what it asks before the vault may be read, and
+/// whether it is asking right now (R3, R4, ADR-4).
+///
+/// The policy and the biometric switch are device-local `security.json`
+/// choices that never travel. `locked` is this window's memory of the vault:
+/// locking clears the opened content, unlocking verifies once with the system
+/// and opens the file again. A system that cannot verify leaves the vault
+/// locked; nothing here is ever treated as a pass on silence.
+pub(crate) struct VaultLock {
+    /// The saved choices of this machine, as they stand on disk.
+    settings: SecuritySettings,
+    /// Why the saved choices could not be used, when they could not.
+    problem: Option<shellune_storage::SecurityProblem>,
+    /// The system's user verification. The production implementation of the
+    /// platform in production; the tests hand in a `ScriptedAuthenticator` so
+    /// no test ever raises a real prompt.
+    authenticator: Arc<dyn BiometricAuthenticator>,
+    /// Whether the vault is locked on this device. Locking cleared the opened
+    /// content; a new secret read needs one verification first.
+    locked: bool,
+    /// A system verification is running; the answer decides what continues.
+    verifying: bool,
+    /// What runs when the running verification succeeds, in order: the unlock
+    /// first, then the one operation that asked for it. A denial or a
+    /// cancellation drops the whole queue - a cancelled prompt is never a pass.
+    pending: Vec<SecurityPending>,
+    /// The wall-clock moment the idle lock fires. Wall clock, not a monotonic
+    /// one, so a system sleep that outlasts the idle time counts as idle the
+    /// moment the machine is back.
+    idle_deadline: Option<SystemTime>,
+    /// Bumped by every schedule and every fire; a timer only acts on its own.
+    idle_generation: u64,
+}
+
+/// One step that waits for a system verification before it runs.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SecurityPending {
+    /// Open the vault of this machine; what follows needs it open.
+    Unlock,
+    /// Show the password of one record on the keys page.
+    Reveal(CredentialId),
+    /// Copy the password of one record, without drawing it.
+    Copy(CredentialId),
+    /// Continue the connection the chain form was about to dial; the flag is
+    /// the `take_panel` the interrupted call was given.
+    ResumeChain(bool),
+    /// Start one desktop session whose shared password the vault holds.
+    Desktop(shellune_core::SessionId),
+    /// Write the private-key export the open dialog has chosen a path for.
+    ExportKey,
+    /// Turn the biometric switch on, after one fresh verification.
+    EnableBiometric,
+    /// Turn the biometric switch off, after one fresh verification.
+    DisableBiometric,
+}
+
+impl VaultLock {
+    /// The lock as a fresh window holds it: the saved choices read from disk
+    /// (the defaults when there are none), the platform's verifier, and a
+    /// vault still to be opened.
+    fn new(root: &std::path::Path) -> Self {
+        let store = SecurityStore::at(root);
+        let (settings, problem) = store.load_reported();
+        Self {
+            settings,
+            problem,
+            authenticator: Arc::new(SystemAuthenticator),
+            locked: false,
+            verifying: false,
+            pending: Vec::new(),
+            idle_deadline: None,
+            idle_generation: 0,
+        }
+    }
+
+    /// Whether the user turned biometric unlocking on for this machine and
+    /// chose a policy that re-locks. Everything the lock does - the start-up
+    /// lock, the idle timer, the per-operation gate - hangs off this one
+    /// answer, because without it there is no system prompt to ask and the
+    /// local unseal secret of the OS credential store is the whole protection
+    /// (R3: nobody is forced to set a password for daily local use).
+    fn engaged(&self) -> bool {
+        self.settings.biometric_unlock == Some(true) && !self.settings.policy.is_disabled()
+    }
+
+    /// Whether every sensitive operation verifies afresh, however long the
+    /// vault has been unlocked. One success is never the next operation's
+    /// pass, so the gate asks the system again each time (R3).
+    fn verifies_every_operation(&self) -> bool {
+        self.settings.biometric_unlock == Some(true)
+            && self.settings.policy == LockPolicy::EverySensitiveOperation
+    }
+
+    /// The wall-clock idle time the settings ask for.
+    fn idle_lock(&self) -> Duration {
+        self.settings.idle_lock()
+    }
 }
 
 /// Which record of the vault the detail card is about.
@@ -248,12 +368,26 @@ pub(crate) enum SecurityDialog {
         /// The connections that sign in with it today.
         affected: Vec<HostId>,
     },
+    /// Remove one accepted server identity (R7). No password is asked for: the
+    /// record is public fact, and the vault this device can already unseal is
+    /// the only thing the change touches.
+    DeleteTrust {
+        /// The server name or address.
+        host: String,
+        /// The server port.
+        port: u16,
+    },
 }
 
 impl SecurityPage {
-    /// The page's fields, with its search created and nothing read yet.
-    pub(crate) fn new(cx: &mut Context<ShelluneView>) -> Self {
-        let placeholder = copy::security_for(Locale::current()).search_placeholder;
+    /// The page's fields, with its searches created and nothing read yet.
+    ///
+    /// The lock choices come from `security.json` beside the data, and the
+    /// device name is the one the sync state keeps: the two are created once
+    /// here so the whole run answers with one identity (ADR-5).
+    pub(crate) fn new(root: &std::path::Path, cx: &mut Context<ShelluneView>) -> Self {
+        let strings = copy::security_for(Locale::current());
+        let placeholder = strings.search_placeholder;
         let search = cx.new(|cx| {
             let mut field = TextField::new(placeholder, cx);
             field.set_leading_icon(Icon::Search, cx);
@@ -261,9 +395,36 @@ impl SecurityPage {
             field
         });
         cx.observe(&search, |_, _, cx| cx.notify()).detach();
+        let trust_search = cx.new(|cx| {
+            let mut field = TextField::new(strings.trust_search_placeholder, cx);
+            field.set_leading_icon(Icon::Search, cx);
+            field.set_clearable(true, cx);
+            field
+        });
+        cx.observe(&trust_search, |_, _, cx| cx.notify()).detach();
+        let lock = VaultLock::new(root);
+        let idle = lock
+            .settings
+            .idle_lock_minutes
+            .unwrap_or(shellune_storage::DEFAULT_IDLE_LOCK_MINUTES)
+            .to_string();
+        let idle_field = cx.new(|cx| TextField::with_text("", idle, cx));
+        // The idle minutes save on submit; a keystroke alone changes nothing,
+        // the way the sync form works.
+        let view = cx.entity().downgrade();
+        idle_field.update(cx, |field, _cx| {
+            field.on_submit(move |text, _window, app| {
+                view.update(app, |view, cx| view.security_set_idle_minutes(&text, cx))
+                    .unwrap_or(false)
+            });
+        });
         Self {
             search,
+            trust_search,
+            idle_field,
             content: None,
+            lock,
+            operation_granted: false,
             busy: false,
             warming: false,
             open_problem: None,
@@ -274,7 +435,7 @@ impl SecurityPage {
             rotation_public_key: None,
             job_book: None,
             dialog_scroll: ScrollHandle::new(),
-            device: format!("app-{}", KeyId::new()),
+            device: device_name(root),
             #[cfg(test)]
             hold_finish: false,
             #[cfg(test)]
@@ -291,6 +452,30 @@ impl SecurityPage {
     pub(crate) fn busy(&self) -> bool {
         self.busy || self.warming
     }
+}
+
+/// The device name this window writes vault records under: the one
+/// `sync-state.json` keeps, created and persisted on the first run that finds
+/// none, so the window and the sync engine name one writer (ADR-5).
+fn device_name(root: &std::path::Path) -> String {
+    let store = shellune_sync::SyncStateStore::at(root);
+    let mut state = store.load();
+    if let Some(device) = state.device_id {
+        return device;
+    }
+    // The same shape the sync engine gives its own fresh identities, drawn
+    // from the same random identifier source the core types use, so the two
+    // spellings of one device cannot be told apart.
+    let device = shellune_core::TransferId::new()
+        .as_uuid()
+        .simple()
+        .to_string();
+    state.device_id = Some(device.clone());
+    // A state file that cannot be written still leaves this run one identity;
+    // the next run makes its own, and the versions only ever needed to tell
+    // writers apart.
+    let _ = store.save(&state);
+    device
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +515,15 @@ pub(crate) enum SecurityReport {
     },
     /// An import was accepted with a warning worth reading.
     ImportedWithWarning(String),
+    /// An accepted server identity was removed (R7).
+    TrustForgotten {
+        /// The server it was for, as the page names it.
+        server: String,
+    },
+    /// An identity accepted at a connection prompt was mirrored into the
+    /// vault, so it travels with it (ADR-6). Quiet by design: the connection
+    /// already said what it did.
+    TrustMirrored,
 }
 
 /// How one edit wants the vault written.
@@ -394,6 +588,19 @@ struct SecurityRow {
     chip: String,
     hosts: usize,
     created: SystemTime,
+}
+
+/// One row of the host-trust list: the public facts of one accepted identity
+/// (R7). Everything here may be drawn, copied and logged - none of it secret.
+struct TrustRow {
+    host: String,
+    port: u16,
+    algorithm: String,
+    fingerprint: String,
+    accepted: u64,
+    /// Whether the vault holds the record (the authority a sync merges) or
+    /// only this device's legacy trust file does.
+    from_vault: bool,
 }
 
 /// The immediate actions of the page and its detail cards.
@@ -470,6 +677,52 @@ impl ShelluneView {
                     .debug_selector(|| "security.busy".to_owned())
                     .child(strings.busy),
             );
+        }
+        if self.security.lock.locked {
+            // A locked vault shows its state and the one way out where the
+            // lists would be: the secrets are not in memory to list (R3).
+            let locked = div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .min_w_0()
+                .gap(metrics.scale(spacing::TIGHT))
+                .p(metrics.scale(spacing::BASE))
+                .rounded(px(radius::MEDIUM))
+                .border_1()
+                .border_color(theme::swatch(palette::BORDER))
+                .debug_selector(|| "security.locked".to_owned())
+                .child(
+                    div()
+                        .text_size(metrics.body_size())
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .child(strings.lock_state_locked),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                        .whitespace_normal()
+                        .child(strings.lock_blocked),
+                )
+                .child(
+                    components::compact_button(
+                        if self.security.lock.verifying {
+                            strings.lock_state_verifying
+                        } else {
+                            strings.lock_unlock
+                        },
+                        Variant::Primary,
+                        metrics,
+                    )
+                    .id("security.locked.unlock")
+                    .debug_selector(|| "security.locked.unlock".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.security_begin(Vec::new(), cx);
+                    })),
+                );
+            page = page.child(locked);
         }
         if let Some(public_key) = &self.security.rotation_public_key {
             page = page.child(self.security_rotation_result(public_key, cx));
@@ -595,6 +848,390 @@ impl ShelluneView {
                 )
                 .child(SharedString::from(public_key.to_owned())),
             )
+    }
+
+    /// The security category's host-trust page: the accepted server identities
+    /// of the vault and of this device's legacy file, searchable, each with its
+    /// full fingerprint to copy and its removal one confirmation away (R7).
+    pub(super) fn trust_page(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.security_strings();
+        let mut page = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .gap(metrics.scale(spacing::BASE))
+            .debug_selector(|| "security.trust.page".to_owned())
+            .child(
+                div()
+                    .flex()
+                    .w_full()
+                    .min_w_0()
+                    .debug_selector(|| "security.trust.search".to_owned())
+                    .child(self.security.trust_search.clone()),
+            );
+        if let Some((tone, text)) = &self.security.notice {
+            page = page.child(
+                components::banner(*tone, metrics)
+                    .debug_selector(|| "security.notice".to_owned())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(SharedString::from(text.clone())),
+            );
+        }
+        if self.security.busy() {
+            page = page.child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "security.busy".to_owned())
+                    .child(strings.busy),
+            );
+        }
+        page.child(self.trust_list(cx))
+    }
+
+    /// The trust list: one row per accepted identity, narrowed by the search.
+    fn trust_list(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.security_strings();
+        let locale = self.workspace.locale();
+        let column = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .gap(metrics.scale(spacing::TIGHT))
+            .debug_selector(|| "security.trust.list".to_owned())
+            .child(
+                div()
+                    .text_size(metrics.body_size())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .debug_selector(|| "security.trust.title".to_owned())
+                    .child(strings.trust_title),
+            );
+        let rows = self.trust_rows(cx);
+        if rows.is_empty() {
+            let narrowed = !self.security.trust_search.read(cx).text().trim().is_empty();
+            return column.child(
+                div()
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "security.trust.empty".to_owned())
+                    .child(if narrowed {
+                        strings.trust_no_match
+                    } else {
+                        strings.trust_empty
+                    }),
+            );
+        }
+        let busy = self.security.busy() || self.security.dialog.is_some();
+        let count = rows.len();
+        let mut card = components::card(metrics).w_full().p(px(0.0)).gap(px(0.0));
+        for (index, row) in rows.into_iter().enumerate() {
+            let TrustRow {
+                host,
+                port,
+                algorithm,
+                fingerprint,
+                accepted,
+                from_vault,
+            } = row;
+            let server = format!("{host}:{port}");
+            let accepted_line = copy::fill(
+                strings.trust_accepted,
+                &[("date", &copy::relative_time(accepted, remote_now(), locale))],
+            );
+            let source_line = if from_vault {
+                strings.trust_from_vault
+            } else {
+                strings.trust_from_this_mac
+            };
+            let row_host = host.clone();
+            let row_port = port;
+            let delete = components::compact_button(
+                strings.trust_delete_action,
+                Variant::Secondary,
+                metrics,
+            )
+            .id(SharedString::from(format!("security.trust.delete.{index}")))
+            .debug_selector(move || format!("security.trust.delete.{index}"))
+            .when(!busy, |button| {
+                button.on_click(cx.listener(move |this, _event, _window, cx| {
+                    if this.security.busy() || this.security.dialog.is_some() {
+                        return;
+                    }
+                    this.security.dialog = Some(SecurityDialog::DeleteTrust {
+                        host: row_host.clone(),
+                        port: row_port,
+                    });
+                    cx.notify();
+                }))
+            });
+            card = card.child(
+                div()
+                    .flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap(metrics.scale(spacing::SNUG))
+                    .px(metrics.scale(spacing::BASE))
+                    .py(metrics.scale(spacing::SNUG))
+                    .when(index + 1 < count, |row| {
+                        row.border_b_1()
+                            .border_color(theme::swatch(palette::BORDER))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(metrics.scale(spacing::HAIRLINE))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(metrics.scale(spacing::TIGHT))
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(metrics.body_size())
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                            .debug_selector(move || {
+                                                format!("security.trust.host.{index}")
+                                            })
+                                            .child(SharedString::from(server)),
+                                    )
+                                    .child(components::chip_within(
+                                        SharedString::from(source_line),
+                                        if from_vault {
+                                            Tone::Accent
+                                        } else {
+                                            Tone::Neutral
+                                        },
+                                        metrics,
+                                    )),
+                            )
+                            .child(
+                                components::copy_on_click(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .font_family(crate::app::terminal::monospace_family())
+                                        .text_size(metrics.caption_size())
+                                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                        .debug_selector(move || {
+                                            format!("security.trust.fingerprint.{index}")
+                                        }),
+                                    fingerprint,
+                                )
+                                .child(SharedString::from(
+                                    format!("{algorithm} \u{b7} {accepted_line}"),
+                                )),
+                            ),
+                    )
+                    .child(delete),
+            );
+        }
+        column.child(card)
+    }
+
+    /// The rows of the trust list: the vault's identities first - it is the
+    /// authority - then this device's legacy entries no vault holds, narrowed
+    /// by the search over host, port, algorithm and the full fingerprint.
+    fn trust_rows(&self, cx: &App) -> Vec<TrustRow> {
+        let vault = self.security.content.as_ref();
+        let query = self
+            .security
+            .trust_search
+            .read(cx)
+            .text()
+            .trim()
+            .to_lowercase();
+        let needles: Vec<String> = query.split_whitespace().map(str::to_owned).collect();
+        let narrowed = !needles.is_empty();
+        let mut rows = Vec::new();
+        let mut push = |entry: &TrustEntry, from_vault: bool| {
+            let haystacks = [
+                entry.host().to_lowercase(),
+                entry.port().to_string(),
+                entry.algorithm().to_lowercase(),
+                entry.fingerprint().to_lowercase(),
+            ];
+            if narrowed
+                && !needles
+                    .iter()
+                    .all(|needle| haystacks.iter().any(|text| text.contains(needle)))
+            {
+                return;
+            }
+            rows.push(TrustRow {
+                host: entry.host().to_owned(),
+                port: entry.port(),
+                algorithm: entry.algorithm().to_owned(),
+                fingerprint: entry.fingerprint().to_owned(),
+                accepted: entry.accepted_unix(),
+                from_vault,
+            });
+        };
+        if let Some(vault) = vault {
+            for entry in vault.trust().entries() {
+                push(entry, true);
+            }
+        }
+        let in_vault = |entry: &TrustEntry| {
+            vault.is_some_and(|vault| vault.trust().entry(entry.host(), entry.port()).is_some())
+        };
+        for entry in self.trust_book.entries() {
+            if !in_vault(entry) {
+                push(entry, false);
+            }
+        }
+        // Where a reader looks: by host, then the older acceptance first, so
+        // the list a reader sees does not reshuffle between runs.
+        rows.sort_by(|a, b| {
+            a.host
+                .cmp(&b.host)
+                .then_with(|| a.port.cmp(&b.port))
+                .then_with(|| a.accepted.cmp(&b.accepted))
+                .then_with(|| a.fingerprint.cmp(&b.fingerprint))
+        });
+        rows
+    }
+
+    /// The security category's lock page: the state of this device's vault
+    /// lock, the biometric switch, the two protection modes and the idle lock
+    /// (R3, R4, ADR-4). Everything it shows is a choice about this machine.
+    pub(super) fn biometrics_page(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.security_strings();
+        let lock = &self.security.lock;
+        let biometric = lock.settings.biometric_unlock == Some(true);
+        let status = if lock.verifying {
+            strings.lock_state_verifying
+        } else if lock.locked {
+            strings.lock_state_locked
+        } else {
+            strings.lock_state_open
+        };
+        let status_row = self.settings_row(
+            "lock-status",
+            status,
+            "",
+            div().debug_selector(|| "security.lock.status".to_owned()),
+        );
+        let action = if lock.locked && !lock.verifying {
+            Some((
+                "security.lock.unlock",
+                strings.lock_unlock,
+                Variant::Primary,
+            ))
+        } else if lock.verifying {
+            None
+        } else {
+            Some(("security.lock.now", strings.lock_now, Variant::Secondary))
+        };
+        let action_row = action.map(|(selector, label, variant)| {
+            self.settings_row(
+                "lock-action",
+                "",
+                "",
+                div()
+                    .debug_selector(move || format!("{selector}.row"))
+                    .child(
+                        components::compact_button(label, variant, metrics)
+                            .id(SharedString::from(selector))
+                            .debug_selector(move || selector.to_owned())
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                if this.security.lock.locked {
+                                    this.security_begin(Vec::new(), cx);
+                                } else {
+                                    this.security_lock_now(cx);
+                                }
+                            })),
+                    ),
+            )
+        });
+        // The capability is asked silently as the page draws: it decides what
+        // the page may promise, it never raises a prompt, and it is not cached
+        // anywhere - a system whose answer is busy this moment is not folded
+        // into a permanent "unavailable" (R4, T4's handoff).
+        let capability = self.security.lock.authenticator.capability();
+        let capability_line = match capability {
+            BiometricCapability::Biometrics => strings.lock_capability_biometrics,
+            BiometricCapability::SystemUserVerification => strings.lock_capability_system,
+            BiometricCapability::Unavailable => strings.lock_capability_none,
+        };
+        let switch = |view: &Self,
+                      id: &'static str,
+                      on: bool,
+                      cx: &mut Context<Self>,
+                      pick: fn(&mut Self, bool, &mut Context<Self>)| {
+            view.switch_control(id, on, cx, pick)
+        };
+        let mut rows = vec![
+            status_row,
+            self.settings_row(
+                "lock-biometric",
+                strings.lock_biometric,
+                capability_line,
+                switch(
+                    self,
+                    "security.lock.biometric",
+                    biometric,
+                    cx,
+                    Self::security_toggle_biometric,
+                ),
+            ),
+        ];
+        rows.extend(action_row);
+        if biometric {
+            let every = lock.settings.policy == LockPolicy::EverySensitiveOperation;
+            rows.push(self.settings_row(
+                "lock-policy",
+                strings.lock_policy_label,
+                if every {
+                    strings.lock_policy_every_hint
+                } else {
+                    strings.lock_policy_unlock_hint
+                },
+                self.segments(
+                    "security.lock.policy",
+                    vec![
+                        (strings.lock_policy_unlock.to_owned(), !every),
+                        (strings.lock_policy_every.to_owned(), every),
+                    ],
+                    cx,
+                    |view, index, cx| view.security_set_lock_policy(index == 1, cx),
+                ),
+            ));
+            rows.push(
+                self.settings_row(
+                    "lock-idle",
+                    strings.lock_idle_label,
+                    strings.lock_idle_hint,
+                    div()
+                        .w(metrics.scale(IDLE_FIELD_WIDTH))
+                        .max_w(components::settings_row_content_cap(metrics))
+                        .debug_selector(|| "security.lock.idle".to_owned())
+                        .child(self.security.idle_field.clone()),
+                ),
+            );
+        }
+        if let Some(_problem) = &lock.problem {
+            rows.push(self.settings_row(
+                "lock-problem",
+                strings.lock_settings_problem,
+                "",
+                div().debug_selector(|| "security.lock.problem".to_owned()),
+            ));
+        }
+        self.settings_card("lock", rows)
     }
 
     /// One of the two lists: the keys, or the shared passwords.
@@ -1029,7 +1666,7 @@ impl ShelluneView {
                                 (None, _) => String::new(),
                             })),
                     );
-                if let Some(text) = value {
+                if value.is_some() {
                     if shown {
                         password_row = password_row.child(
                             components::compact_button(
@@ -1047,28 +1684,37 @@ impl ShelluneView {
                             )),
                         );
                     } else {
+                        let reveal_id = id;
                         password_row = password_row.child(
                             components::compact_button(strings.show, Variant::Ghost, metrics)
                                 .id("security.detail.reveal")
                                 .debug_selector(|| "security.detail.reveal".to_owned())
-                                .on_click(cx.listener(|this, _event, _window, cx| {
-                                    this.security.revealed = true;
-                                    cx.notify();
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    this.security_reveal(reveal_id, cx);
                                 })),
                         );
                     }
-                    let strings_copy = strings.copy_value;
+                    // Copy goes through the same gate as showing: the policy
+                    // that verifies every sensitive operation counts a copy as
+                    // one, and a pass is never carried to the next (R3).
+                    let copy_id = id;
                     password_row = password_row.child(
                         div()
+                            .cursor_pointer()
                             .debug_selector(|| "security.detail.copy.password".to_owned())
-                            .child(components::copy_on_click(
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |this, _event, _window, cx| {
+                                    this.security_copy_password(copy_id, cx);
+                                }),
+                            )
+                            .child(
                                 div()
                                     .flex_none()
                                     .text_size(metrics.caption_size())
                                     .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                                    .child(strings_copy),
-                                text,
-                            )),
+                                    .child(strings.copy_value),
+                            ),
                     );
                 }
                 body = body.child(password_row);
@@ -1937,7 +2583,109 @@ impl ShelluneView {
                     cx,
                 );
             }
+            DialogSnapshot::DeleteTrust { host, port } => {
+                self.security_forget_trust(&host, port, cx);
+            }
         }
+    }
+
+    /// Removes one accepted server identity (R7, ADR-6): from the vault, which
+    /// is the authority a sync merges, and from this device's legacy trust
+    /// file, so a restart finds nothing left to restore. No password, no
+    /// biometric prompt - the local unseal this machine already holds is the
+    /// only thing the change ever needs.
+    fn security_forget_trust(&mut self, host: &str, port: u16, cx: &mut Context<Self>) {
+        let server = format!("{host}:{port}");
+        let file_host = host.to_owned();
+        let file_port = port;
+        let in_vault = self
+            .security
+            .content
+            .as_ref()
+            .is_some_and(|vault| vault.trust().entry(host, port).is_some())
+            || VaultStore::at(self.store.root()).exists();
+        // The local record goes first and synchronously: whatever happens to
+        // the vault save behind it, this device's own file no longer restores
+        // the identity on the next start.
+        if self.trust_book.forget(&file_host, file_port)
+            && let Err(error) = self.write_trust_file()
+        {
+            let reason = error.to_string();
+            self.security_set_notice(
+                Tone::Danger,
+                format!("{}: {reason}", self.security_strings().vault_failed),
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        self.note_data_changed(cx);
+        if in_vault {
+            let report_server = server.clone();
+            self.security_run(
+                Box::new(move |content, _, _| {
+                    let mut trust = content.trust().clone();
+                    trust.forget(&file_host, file_port);
+                    content.set_trust(trust);
+                    Ok(SecurityChange::Save {
+                        report: SecurityReport::TrustForgotten {
+                            server: report_server,
+                        },
+                        records: Vec::new(),
+                    })
+                }),
+                cx,
+            );
+        } else {
+            self.security.dialog = None;
+            self.security_set_notice(
+                Tone::Positive,
+                copy::fill(
+                    self.security_strings().trust_deleted_note,
+                    &[("server", &server)],
+                ),
+                cx,
+            );
+            cx.notify();
+        }
+    }
+
+    /// Mirrors one identity a connection just accepted into the vault, so the
+    /// acceptance travels with it and every other device stops asking (ADR-6:
+    /// from version 2 the vault is the authority; the plain file is this
+    /// device's legacy, kept in step but never the second word).
+    ///
+    /// The mirror never blocks the connection that asked for it: if a vault
+    /// job is already running the acceptance stays in this device's file and
+    /// the next one mirrors both, and a vault this machine does not have yet
+    /// is created by the first record that needs one, not by a trust entry.
+    pub(super) fn security_mirror_trust(&mut self, entry: &TrustEntry, cx: &mut Context<Self>) {
+        if self.security.busy() || !VaultStore::at(self.store.root()).exists() {
+            return;
+        }
+        let host = entry.host().to_owned();
+        let port = entry.port();
+        let key = HostKey::new(
+            entry.algorithm().to_owned(),
+            entry.fingerprint().to_owned(),
+            entry.public_key().to_owned(),
+        );
+        let at = entry.accepted_unix();
+        self.security_run(
+            Box::new(move |content, _, _| {
+                let key = key.map_err(|error| error.to_string())?;
+                let mut trust = content.trust().clone();
+                trust
+                    .accept(&host, port, &key, at)
+                    .map_err(|error| error.to_string())?;
+                content.set_trust(trust);
+                Ok(SecurityChange::Save {
+                    report: SecurityReport::TrustMirrored,
+                    records: Vec::new(),
+                })
+            }),
+            cx,
+        );
     }
 
     /// The refusal slot of the open dialog, when it has one.
@@ -1979,6 +2727,13 @@ impl ShelluneView {
                 _ => return,
             };
         if choosing || self.security.busy() {
+            return;
+        }
+        // A private key leaving the vault is one of the operations that always
+        // verify anew, whatever the policy: the gate runs before the file
+        // chooser opens, so a cancelled verification leaves no file behind
+        // (R3).
+        if self.security_begin_always(vec![SecurityPending::ExportKey], cx) {
             return;
         }
         // The two refusals an export can make before a file is ever chosen: no
@@ -2062,7 +2817,9 @@ impl ShelluneView {
 
     /// Records the page's notice for the operation that just ended.
     fn security_set_notice(&mut self, tone: Tone, text: String, cx: &mut Context<Self>) {
-        self.security.notice = Some((tone, text));
+        // An empty sentence is no notice: the quiet reports (a trust mirror
+        // behind a connection) draw nothing rather than an empty banner.
+        self.security.notice = (!text.is_empty()).then_some((tone, text));
         cx.notify();
     }
 
@@ -2117,7 +2874,14 @@ impl ShelluneView {
                 changed,
                 report,
             } => {
-                self.security.content = Some(content);
+                // A locked vault stays locked: a write that ran behind the
+                // lock's back (a trust deletion, which needs no verification
+                // by ADR-6) does not silently hand the secrets back to memory.
+                if self.security.lock.locked {
+                    self.security.content = None;
+                } else {
+                    self.security.content = Some(content);
+                }
                 self.security.dialog = None;
                 let mut drifted: Vec<String> = Vec::new();
                 if !changed.is_empty() {
@@ -2291,7 +3055,7 @@ impl ShelluneView {
                 .save_records(
                     &content,
                     &records,
-                    &[UnsealSource::LocalMachine],
+                    &vault_unseal_sources(&store, secrets.as_ref()),
                     KdfParams::default(),
                     secrets.as_ref(),
                 )
@@ -2302,7 +3066,11 @@ impl ShelluneView {
             let _ = this.update(cx, |view, cx| {
                 view.security.busy = false;
                 match outcome {
-                    Ok(content) => view.security.content = Some(content),
+                    Ok(content) => {
+                        if !view.security.lock.locked {
+                            view.security.content = Some(content);
+                        }
+                    }
                     Err(reason) => view.security_set_notice(
                         Tone::Danger,
                         format!("{}: {reason}", view.security_strings().vault_failed),
@@ -2327,7 +3095,7 @@ impl ShelluneView {
                 .save_records(
                     &previous,
                     &records,
-                    &[UnsealSource::LocalMachine],
+                    &vault_unseal_sources(&store, secrets.as_ref()),
                     KdfParams::default(),
                     secrets.as_ref(),
                 )
@@ -2338,7 +3106,11 @@ impl ShelluneView {
             let _ = this.update(cx, |view, cx| {
                 view.security.busy = false;
                 match restored {
-                    Ok(content) => view.security.content = Some(content),
+                    Ok(content) => {
+                        if !view.security.lock.locked {
+                            view.security.content = Some(content);
+                        }
+                    }
                     Err(reason) => view.security_set_notice(
                         Tone::Danger,
                         format!("{}: {reason}", view.security_strings().vault_failed),
@@ -2354,10 +3126,26 @@ impl ShelluneView {
     /// Opens this machine's vault at start-up, so a connection that needs it
     /// does not wait for the settings page to be visited first. A machine with
     /// no vault yet stays without one until the first record creates it.
+    ///
+    /// A device whose lock is engaged does not keep what it opened: the vault
+    /// starts locked and one verification opens it (R3, ADR-4), so the open
+    /// here only checks the file is readable and marks the lock.
     pub(super) fn vault_warm(&mut self, cx: &mut Context<Self>) {
         if self.security.content.is_some() || self.security.warming {
             return;
         }
+        if self.security.lock.engaged() {
+            self.security.lock.locked = true;
+            cx.notify();
+            return;
+        }
+        self.vault_open_quietly(cx);
+    }
+
+    /// Opens the vault file in the background and keeps what it held, without
+    /// touching the lock: the start-up open of a device without the lock, the
+    /// second half of an unlock, and the re-read after a sync applied a vault.
+    pub(super) fn vault_open_quietly(&mut self, cx: &mut Context<Self>) {
         self.security.warming = true;
         let store = VaultStore::at(self.store.root());
         let secrets = self.secrets.clone();
@@ -2373,14 +3161,450 @@ impl ShelluneView {
             let _ = this.update(cx, |view, cx| {
                 view.security.warming = false;
                 match opened {
-                    Ok(Some(content)) => view.security.content = Some(content),
-                    Ok(None) => {}
-                    Err(reason) => view.security.open_problem = Some(reason),
+                    Ok(Some(content)) => {
+                        view.security.content = Some(content);
+                        // An unlock's follow-up steps waited for exactly this
+                        // file; they continue now that the vault is open.
+                        let waiting = std::mem::take(&mut view.security.lock.pending);
+                        if !waiting.is_empty() {
+                            view.security_resume(waiting, cx);
+                        }
+                    }
+                    Ok(None) => {
+                        // No vault exists: the steps that needed one simply
+                        // find nothing, the way an unlocked machine does.
+                        let waiting = std::mem::take(&mut view.security.lock.pending);
+                        if !waiting.is_empty() {
+                            view.security_resume(waiting, cx);
+                        }
+                    }
+                    Err(reason) => {
+                        // A vault that cannot be opened answers no request;
+                        // what waited for it dies with the reason shown.
+                        view.security.lock.pending.clear();
+                        view.security.open_problem = Some(reason);
+                    }
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    // -----------------------------------------------------------------------
+    // The lock of this device (R3, R4, ADR-4)
+    // -----------------------------------------------------------------------
+
+    /// Whether the vault of this device is locked: no secret is in memory, new
+    /// secret reads and managed-key sign-ins are refused until it is unlocked.
+    pub(crate) fn vault_locked(&self) -> bool {
+        self.security.lock.locked
+    }
+
+    /// Re-reads the vault file into memory, dropping the copy the window held:
+    /// what a sync (or any other writer outside this window) saved is what the
+    /// connections and the pages see from now on. A locked device stays
+    /// locked; only the file changed, not the memory.
+    pub(super) fn vault_reread(&mut self, cx: &mut Context<Self>) {
+        if self.security.lock.locked {
+            return;
+        }
+        self.security.content = None;
+        self.vault_open_quietly(cx);
+    }
+
+    /// Locks the vault now: the opened content leaves memory and the next
+    /// secret read waits for one verification. Established sessions keep what
+    /// they already have - a lock governs what may be read from now on, and
+    /// never tears a live connection down (R3).
+    pub(super) fn security_lock_now(&mut self, cx: &mut Context<Self>) {
+        if !self.security.lock.locked {
+            self.security.lock.locked = true;
+            self.security.lock.pending.clear();
+            self.security.lock.verifying = false;
+            self.security.lock.idle_deadline = None;
+            self.security.lock.idle_generation += 1;
+            self.security.operation_granted = false;
+            self.security.content = None;
+            self.security.revealed = false;
+            self.security_set_notice(
+                Tone::Neutral,
+                self.security_strings().lock_state_locked.to_owned(),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// Notes a sensitive use and schedules the idle lock from now (R3). A
+    /// system sleep counts: the deadline is wall clock, so a machine that
+    /// slept past it locks the moment it is back.
+    pub(super) fn security_touch(&mut self, cx: &mut Context<Self>) {
+        let lock = &mut self.security.lock;
+        if !lock.engaged() || lock.settings.policy.is_disabled() {
+            lock.idle_deadline = None;
+            return;
+        }
+        let wait = lock.idle_lock();
+        lock.idle_deadline = Some(SystemTime::now() + wait);
+        lock.idle_generation += 1;
+        let generation = lock.idle_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |view, cx| {
+                let lock = &mut view.security.lock;
+                if lock.idle_generation != generation {
+                    return;
+                }
+                lock.idle_deadline = None;
+                if !lock.locked {
+                    // A timer that still owns the generation is the idle time
+                    // passing without a sensitive use: a system sleep holds
+                    // the executor's timers and releases them on wake, so the
+                    // lock lands then too (R3).
+                    view.security_lock_now(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Shows the password of one record, behind the gate the lock asks for
+    /// (R3): the "every sensitive operation" policy verifies afresh each time,
+    /// and a locked vault unlocks first.
+    fn security_reveal(&mut self, credential: CredentialId, cx: &mut Context<Self>) {
+        if self.security_begin(vec![SecurityPending::Reveal(credential)], cx) {
+            return;
+        }
+        self.security.revealed = true;
+        self.security.detail = Some(SecurityRecord::Credential(credential));
+        self.security_touch(cx);
+        cx.notify();
+    }
+
+    /// Copies the password of one record without drawing it, behind the same
+    /// gate as showing it (R3).
+    fn security_copy_password(&mut self, credential: CredentialId, cx: &mut Context<Self>) {
+        if self.security_begin(vec![SecurityPending::Copy(credential)], cx) {
+            return;
+        }
+        if let Some(text) = self
+            .security
+            .content
+            .as_ref()
+            .and_then(|vault| vault.credential(credential))
+            .and_then(|record| record.secret())
+            .map(|secret| secret.expose().to_owned())
+        {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        }
+        self.security_touch(cx);
+    }
+
+    /// Runs `steps` behind the gate the lock asks for, or right away when it
+    /// asks for nothing. Returns whether the steps wait for a verification
+    /// (the caller does nothing more in that case: the queue continues on its
+    /// own, or dies with the prompt).
+    ///
+    /// - the lock off: nothing is asked, the steps run at once - nobody is
+    ///   forced to set a password for daily local use (R3);
+    /// - the vault locked: one verification opens it and the steps follow;
+    /// - every sensitive operation: one fresh verification per request, and a
+    ///   success is never carried to the next one (R3).
+    pub(super) fn security_begin(
+        &mut self,
+        steps: Vec<SecurityPending>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.security_begin_when(false, steps, cx)
+    }
+
+    /// [`Self::security_begin`] for the operations that verify anew in both
+    /// modes - a private key export, resetting the biometric protection (R3).
+    pub(super) fn security_begin_always(
+        &mut self,
+        steps: Vec<SecurityPending>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.security_begin_when(true, steps, cx)
+    }
+
+    /// The one gate both entry points share.
+    fn security_begin_when(
+        &mut self,
+        always: bool,
+        steps: Vec<SecurityPending>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let lock = &self.security.lock;
+        if !lock.engaged() && !lock.locked {
+            return false;
+        }
+        if lock.locked || lock.verifies_every_operation() || always {
+            if lock.verifying {
+                // One prompt at a time; a second request while the system is
+                // asking is refused rather than queued behind a prompt the
+                // user may be about to cancel.
+                let strings = self.security_strings();
+                self.security_set_notice(Tone::Warning, strings.lock_busy.to_owned(), cx);
+                return true;
+            }
+            let mut queue = Vec::with_capacity(steps.len() + 1);
+            if lock.locked {
+                queue.push(SecurityPending::Unlock);
+            }
+            queue.extend(steps);
+            self.security.lock.pending = queue;
+            self.security_verify(cx);
+            return true;
+        }
+        false
+    }
+
+    /// Asks the system to verify the user once, on the background executor:
+    /// some platform prompts wait for the person to answer.
+    fn security_verify(&mut self, cx: &mut Context<Self>) {
+        self.security.lock.verifying = true;
+        let authenticator = self.security.lock.authenticator.clone();
+        let prompt = VerificationPrompt::new(self.security_strings().lock_unlock.to_owned());
+        let work = cx
+            .background_executor()
+            .spawn(async move { authenticator.verify(&prompt) });
+        cx.spawn(async move |this, cx| {
+            let answer = work.await;
+            let _ = this.update(cx, |view, cx| view.security_verify_finished(answer, cx));
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Takes in the system's answer to the one verification in flight. A pass
+    /// runs what waited; anything else keeps the vault exactly as it was - a
+    /// cancellation, a mismatch or a busy system is never a pass (R3, R4).
+    fn security_verify_finished(
+        &mut self,
+        answer: Result<(), BiometricError>,
+        cx: &mut Context<Self>,
+    ) {
+        self.security.lock.verifying = false;
+        let strings = self.security_strings();
+        match answer {
+            Ok(()) => {
+                let queue = std::mem::take(&mut self.security.lock.pending);
+                self.security_resume(queue, cx);
+            }
+            Err(error) => {
+                self.security.lock.pending.clear();
+                if error.is_enrollment_changed() {
+                    // The biometric set changed, so this device's protection
+                    // no longer holds: biometric unlocking is turned off here
+                    // until the user re-enables it with a fresh verification
+                    // (R4), and the vault stays as it was.
+                    self.security_set_biometric(false, cx);
+                    self.security_set_notice(
+                        Tone::Warning,
+                        strings.lock_enrollment_changed.to_owned(),
+                        cx,
+                    );
+                } else {
+                    let text = if error.is_cancelled() {
+                        strings.lock_cancelled.to_owned()
+                    } else {
+                        match &error {
+                            BiometricError::Busy { .. } => strings.lock_busy.to_owned(),
+                            _ => format!("{} {}", strings.lock_failed, error),
+                        }
+                    };
+                    self.security_set_notice(Tone::Warning, text, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Writes the biometric switch of this device to its own file and this
+    /// window's state. Nothing here asks the system anything: the callers
+    /// either just verified, or are turning a dead setting off.
+    fn security_set_biometric(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.security.lock.settings.biometric_unlock = Some(on);
+        let store = SecurityStore::at(self.store.root());
+        if let Err(error) = store.save(&self.security.lock.settings) {
+            self.security_set_notice(
+                Tone::Danger,
+                format!("{}: {error}", self.security_strings().vault_failed),
+                cx,
+            );
+            return;
+        }
+        self.security.lock.problem = None;
+        if !on && !self.security.lock.locked {
+            // Turning the protection off while the vault is open leaves it
+            // open the plain way - the machine's own unseal secret is the
+            // whole protection now, and every function stays available (R3).
+            // A locked vault is not opened by this: the one path here that
+            // reaches a locked vault is an enrollment change, and that vault
+            // waits for a fresh verification (re-enabling, behind the switch)
+            // rather than falling back on silence (R4).
+            if self.security.content.is_none() && !self.security.warming {
+                self.vault_open_quietly(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Saves the lock choices of this device after a page edit. The policy
+    /// itself never prompts: it is a choice about this machine, not a secret.
+    pub(super) fn security_save_lock_settings(&mut self, cx: &mut Context<Self>) {
+        let store = SecurityStore::at(self.store.root());
+        if let Err(error) = store.save(&self.security.lock.settings) {
+            self.security_set_notice(
+                Tone::Danger,
+                format!("{}: {error}", self.security_strings().vault_failed),
+                cx,
+            );
+            return;
+        }
+        self.security.lock.problem = None;
+        cx.notify();
+    }
+
+    /// Turns the biometric switch, behind one fresh verification in both
+    /// directions: re-setting the biometric protection is one of the
+    /// operations that always verify anew (R3).
+    pub(super) fn security_toggle_biometric(&mut self, on: bool, cx: &mut Context<Self>) {
+        let current = self.security.lock.settings.biometric_unlock == Some(true);
+        if on == current || self.security.lock.verifying {
+            return;
+        }
+        if !on {
+            // Turning the protection off proves first that it is the owner
+            // asking, in either mode (R3).
+            if self.security_begin_always(vec![SecurityPending::DisableBiometric], cx) {
+                return;
+            }
+            self.security_set_biometric(false, cx);
+            return;
+        }
+        // Turning it on verifies once with whatever the system offers. A
+        // machine with nothing to call enables on the unlocked session alone -
+        // the system user is the whole protection it has, and the page's
+        // wording already promises no more than that (R4).
+        let capability = self.security.lock.authenticator.capability();
+        if !capability.can_verify_user() {
+            self.security_set_biometric(true, cx);
+            return;
+        }
+        self.security.lock.pending = vec![SecurityPending::EnableBiometric];
+        self.security_verify(cx);
+    }
+
+    /// Chooses the lock policy on the page. The "every sensitive operation"
+    /// choice is the stronger one; both keep the vault usable the moment the
+    /// policy allows it.
+    pub(super) fn security_set_lock_policy(&mut self, every: bool, cx: &mut Context<Self>) {
+        self.security.lock.settings.policy = if every {
+            LockPolicy::EverySensitiveOperation
+        } else {
+            LockPolicy::UnlockVault
+        };
+        self.security_save_lock_settings(cx);
+        self.security_touch(cx);
+    }
+
+    /// The lock page's idle minutes, as far as they parse.
+    pub(super) fn security_set_idle_minutes(
+        &mut self,
+        minutes: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let strings = self.security_strings();
+        let Ok(value) = minutes.trim().parse::<u16>() else {
+            self.security_set_notice(Tone::Warning, strings.lock_idle_refusal.to_owned(), cx);
+            return false;
+        };
+        if !(1..=1440).contains(&value) {
+            self.security_set_notice(Tone::Warning, strings.lock_idle_refusal.to_owned(), cx);
+            return false;
+        }
+        self.security.lock.settings.idle_lock_minutes = Some(value);
+        self.security_save_lock_settings(cx);
+        self.security_touch(cx);
+        true
+    }
+
+    /// Runs what a granted verification waited for, in order. The queue is the
+    /// only thing a pass buys: by the time it ends there is no standing
+    /// permission, so the next request asks the system again (R3).
+    fn security_resume(&mut self, queue: Vec<SecurityPending>, cx: &mut Context<Self>) {
+        let mut queue = queue.into_iter();
+        while let Some(step) = queue.next() {
+            match step {
+                SecurityPending::Unlock => {
+                    if self.security.lock.locked {
+                        self.security.lock.locked = false;
+                        self.security_set_notice(
+                            Tone::Positive,
+                            self.security_strings().lock_state_open.to_owned(),
+                            cx,
+                        );
+                        // The idle clock starts with the unlock, and an
+                        // automatic sync that waited for it starts now, not
+                        // at the next poll (ADR-4).
+                        self.security_touch(cx);
+                        self.resume_deferred_sync(cx);
+                    }
+                    if self.security.content.is_none() {
+                        // The rest of the queue needs the file open; it waits
+                        // for the background read and continues there.
+                        self.security.lock.pending = queue.collect();
+                        self.vault_open_quietly(cx);
+                        return;
+                    }
+                }
+                SecurityPending::Reveal(credential) => {
+                    self.security.revealed = true;
+                    self.security.detail = Some(SecurityRecord::Credential(credential));
+                    self.security_touch(cx);
+                }
+                SecurityPending::Copy(credential) => {
+                    if let Some(text) = self
+                        .security
+                        .content
+                        .as_ref()
+                        .and_then(|vault| vault.credential(credential))
+                        .and_then(|record| record.secret())
+                        .map(|secret| secret.expose().to_owned())
+                    {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                        self.security_touch(cx);
+                    }
+                }
+                SecurityPending::ResumeChain(take_panel) => {
+                    // One passage of the connection gate, already paid for:
+                    // the dial continues where it was interrupted (R3).
+                    self.security.operation_granted = true;
+                    self.security_touch(cx);
+                    self.finish_chain(take_panel, cx);
+                }
+                SecurityPending::Desktop(session) => {
+                    self.security.operation_granted = true;
+                    self.security_touch(cx);
+                    self.start_desktop_session(session, cx);
+                }
+                SecurityPending::ExportKey => {
+                    self.security_touch(cx);
+                    self.security_choose_export(cx);
+                }
+                SecurityPending::EnableBiometric => {
+                    self.security_set_biometric(true, cx);
+                    self.security_touch(cx);
+                }
+                SecurityPending::DisableBiometric => {
+                    self.security_set_biometric(false, cx);
+                }
+            }
+        }
+        cx.notify();
     }
 
     // -----------------------------------------------------------------------
@@ -2780,6 +4004,54 @@ impl ShelluneView {
                     footer,
                 )
             }
+            SecurityDialog::DeleteTrust { host, port } => {
+                let server = format!("{host}:{port}");
+                let metrics = self.metrics();
+                let entry = self.effective_trust().entry(host, *port).cloned();
+                let mut body = self
+                    .security_dialog_body("security.dialog.delete-trust", cx)
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .debug_selector(|| "security.dialog.trust.body".to_owned())
+                            .child(SharedString::from(copy::fill(
+                                strings.trust_delete_body,
+                                &[("server", &server)],
+                            ))),
+                    );
+                if let Some(entry) = entry {
+                    // The old identity stays fully in sight to the end: what
+                    // the confirmation removes is exactly this fingerprint
+                    // (R7), not "whatever the server presents next".
+                    body = body.child(
+                        div()
+                            .min_w_0()
+                            .max_w(metrics.scale(PUBLIC_KEY_MAX_WIDTH))
+                            .truncate()
+                            .font_family(crate::app::terminal::monospace_family())
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .debug_selector(|| "security.dialog.trust.fingerprint".to_owned())
+                            .child(SharedString::from(format!(
+                                "{} \u{b7} {}",
+                                entry.algorithm(),
+                                entry.fingerprint()
+                            ))),
+                    );
+                }
+                let footer = self.security_dialog_footer(strings.trust_delete_action, cx);
+                (
+                    strings.trust_delete_title.to_owned(),
+                    Some(server),
+                    Icon::Trash,
+                    body,
+                    footer,
+                )
+            }
         };
 
         let (header, subtitle) = self.modal_header(
@@ -3100,6 +4372,122 @@ impl ShelluneView {
         }
         cx.notify();
     }
+
+    /// Hands the window a scripted verifier, so a test states the answers the
+    /// system would give without ever raising a real prompt (R3, R4).
+    pub fn security_set_authenticator_for_test(
+        &mut self,
+        authenticator: std::sync::Arc<dyn BiometricAuthenticator>,
+    ) {
+        self.security.lock.authenticator = authenticator;
+    }
+
+    /// Turns the device's biometric protection on with a policy and an idle
+    /// time, the way the lock page does, and locks the vault as a start under
+    /// that protection would (R3).
+    pub fn security_enable_lock_for_test(
+        &mut self,
+        policy: LockPolicy,
+        idle_minutes: u16,
+        cx: &mut Context<Self>,
+    ) {
+        self.security.lock.settings = SecuritySettings {
+            policy,
+            idle_lock_minutes: Some(idle_minutes),
+            biometric_unlock: Some(true),
+        };
+        SecurityStore::at(self.store.root())
+            .save(&self.security.lock.settings)
+            .expect("the lock settings are written");
+        self.security_lock_now(cx);
+    }
+
+    /// Whether the vault of this device is locked right now.
+    pub fn security_locked_for_test(&self) -> bool {
+        self.security.lock.locked
+    }
+
+    /// The biometric switch as it stands on this device.
+    pub fn security_biometric_for_test(&self) -> bool {
+        self.security.lock.settings.biometric_unlock == Some(true)
+    }
+
+    /// Unlocks the vault the way the page's button does: one system
+    /// verification, then the file opens.
+    pub fn security_unlock_for_test(&mut self, cx: &mut Context<Self>) {
+        self.security_begin(Vec::new(), cx);
+    }
+
+    /// The rows of the host-trust page: host, port, algorithm, fingerprint and
+    /// whether the vault holds the record.
+    pub fn security_trust_rows_for_test(
+        &self,
+        cx: &App,
+    ) -> Vec<(String, u16, String, String, bool)> {
+        self.trust_rows(cx)
+            .into_iter()
+            .map(|row| {
+                (
+                    row.host,
+                    row.port,
+                    row.algorithm,
+                    row.fingerprint,
+                    row.from_vault,
+                )
+            })
+            .collect()
+    }
+
+    /// The identities the vault itself holds, as host and port.
+    pub fn security_vault_trust_for_test(&self) -> Vec<(String, u16)> {
+        self.security
+            .content
+            .as_ref()
+            .map(|vault| {
+                vault
+                    .trust()
+                    .entries()
+                    .iter()
+                    .map(|entry| (entry.host().to_owned(), entry.port()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Changes the lock policy the way the page does, without locking what is
+    /// already open: a test of the per-operation gate starts from an unlocked
+    /// vault (R3).
+    pub fn security_lock_settings_for_test(&mut self, policy: LockPolicy, cx: &mut Context<Self>) {
+        self.security.lock.settings.policy = policy;
+        self.security.lock.settings.biometric_unlock = Some(true);
+        SecurityStore::at(self.store.root())
+            .save(&self.security.lock.settings)
+            .expect("the lock settings are written");
+        cx.notify();
+    }
+
+    /// Shows the password of one record behind the lock's gate, as the card's
+    /// button does.
+    pub fn security_reveal_for_test(&mut self, credential: CredentialId, cx: &mut Context<Self>) {
+        self.security_reveal(credential, cx);
+    }
+
+    /// Hides the shown password again, as the card's own button does.
+    pub fn security_hide_password_for_test(&mut self, cx: &mut Context<Self>) {
+        self.security.revealed = false;
+        cx.notify();
+    }
+
+    /// Whether the detail card is showing a password.
+    pub fn security_password_shown_for_test(&self) -> bool {
+        self.security.revealed
+    }
+
+    /// The saved sync passphrase, the one secret a vault backup and a
+    /// passwordless WebDAV share (R9).
+    pub fn saved_sync_passphrase_for_test(&self) -> Option<SecretString> {
+        self.saved_sync_passphrase()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3146,6 +4534,10 @@ enum DialogSnapshot {
         password: String,
     },
     DeleteCredential(CredentialId),
+    DeleteTrust {
+        host: String,
+        port: u16,
+    },
 }
 
 /// Reads the open dialog's fields into owned values.
@@ -3221,6 +4613,10 @@ fn security_dialog_snapshot(dialog: Option<&SecurityDialog>, cx: &App) -> Option
         SecurityDialog::DeleteCredential { credential, .. } => {
             DialogSnapshot::DeleteCredential(*credential)
         }
+        SecurityDialog::DeleteTrust { host, port } => DialogSnapshot::DeleteTrust {
+            host: host.clone(),
+            port: *port,
+        },
     })
 }
 
@@ -3336,6 +4732,32 @@ fn security_check(
 // The vault job, off the UI thread
 // ---------------------------------------------------------------------------
 
+/// The ways a save of this machine's vault keeps itself openable: the local
+/// unseal secret, plus every passphrase wrap the file already carries whose
+/// secret the system store can still hand over (T5's handoff: an app-side
+/// save must not quietly drop the travelling wrap a sync left beside the
+/// local one, or the vault becomes a ciphertext only this machine can open).
+fn vault_unseal_sources(store: &VaultStore, secrets: &dyn SecretStore) -> Vec<UnsealSource> {
+    let mut sources = vec![UnsealSource::LocalMachine];
+    if let Ok(Some(cipher)) = store.read_cipher() {
+        for purpose in cipher.passphrase_purposes() {
+            let held = match purpose {
+                PassphrasePurpose::WebDavPassword => secrets.load_app(AppSecret::WebDavPassword),
+                PassphrasePurpose::SyncPassphrase => secrets.load_app(AppSecret::SyncPassphrase),
+            };
+            if let Ok(Some(secret)) = held
+                && !secret.expose().trim().is_empty()
+            {
+                sources.push(match purpose {
+                    PassphrasePurpose::WebDavPassword => UnsealSource::WebDavPassword(secret),
+                    PassphrasePurpose::SyncPassphrase => UnsealSource::SyncPassphrase(secret),
+                });
+            }
+        }
+    }
+    sources
+}
+
 /// Opens the vault of this machine, applies one edit and saves it - all off
 /// the UI thread. Nothing partial is ever written: the edit either returned a
 /// change, which is saved as a whole, or a refusal, which writes nothing.
@@ -3389,7 +4811,7 @@ fn security_apply(
             if let Err(error) = store.save_records(
                 &content,
                 &all,
-                &[UnsealSource::LocalMachine],
+                &vault_unseal_sources(&store, secrets.as_ref()),
                 KdfParams::default(),
                 secrets.as_ref(),
             ) {
@@ -3437,6 +4859,13 @@ fn security_report_text(report: &SecurityReport, strings: &SecurityStrings) -> (
             ),
         ),
         SecurityReport::ImportedWithWarning(warning) => (Tone::Warning, warning.clone()),
+        SecurityReport::TrustForgotten { server } => (
+            Tone::Positive,
+            copy::fill(strings.trust_deleted_note, &[("server", server)]),
+        ),
+        // The mirror runs behind a connection; its own line never displaces
+        // what the connection is saying, so it is drawn nowhere on its own.
+        SecurityReport::TrustMirrored => (Tone::Neutral, String::new()),
     }
 }
 
@@ -3822,6 +5251,51 @@ impl ShelluneView {
             ));
         }
         self.security.content = Some(vault);
+    }
+
+    /// Puts fixture accepted identities into the page's in-memory vault, so a
+    /// capture of the host-trust page shows rows, not an empty list: nothing
+    /// is written to disk and no server was ever asked about (R7).
+    pub fn capture_trust_entries(&mut self, count: usize) {
+        let mut vault = self.security.content.take().unwrap_or_default();
+        let mut trust = vault.trust().clone();
+        for index in 0..count {
+            let suffix = capture_suffix(index);
+            let key = HostKey::new(
+                "ssh-ed25519".to_owned(),
+                format!("SHA256:{suffix}"),
+                format!("AAAA{suffix}"),
+            )
+            .expect("a fixture identity is well formed");
+            trust
+                .accept(
+                    &format!("web-{index:02}.example.com"),
+                    22,
+                    &key,
+                    1_794_816_000,
+                )
+                .expect("a fixture identity is accepted");
+        }
+        vault.set_trust(trust);
+        self.security.content = Some(vault);
+    }
+
+    /// How many rows the host-trust page lists, for a shot's ready check.
+    pub fn security_trust_count_for_capture(&self) -> usize {
+        self.security
+            .content
+            .as_ref()
+            .map(|vault| vault.trust().entries().len())
+            .unwrap_or(0)
+    }
+
+    /// Turns the device's biometric protection on for a capture of the lock
+    /// page, without a vault to lock: the shot shows the switch, the policy
+    /// and the idle setting, and no system prompt is ever raised (R3).
+    pub fn capture_lock_engaged(&mut self) {
+        self.security.lock.settings.biometric_unlock = Some(true);
+        self.security.lock.settings.policy = LockPolicy::UnlockVault;
+        self.security.lock.settings.idle_lock_minutes = Some(15);
     }
 
     /// How many keys the fixture page lists, so a shot's ready check can say

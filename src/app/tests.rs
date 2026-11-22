@@ -34814,7 +34814,7 @@ async fn exporting_a_backup_asks_for_one_passphrase_twice_and_names_unreadable_p
     cx.run_until_parked();
 
     assert_eq!(backup_stage(&view, cx), Some("export.done"));
-    let (path, secrets, unreadable, missing) = cx
+    let (path, secrets, _vault, unreadable, missing) = cx
         .update(|_window, app| view.read(app).export_report_for_test())
         .expect("the dialog reports what it wrote");
     assert_eq!(path, target);
@@ -34866,7 +34866,7 @@ async fn an_export_without_passwords_writes_none(cx: &mut TestAppContext) {
     let chosen = target.clone();
     cx.simulate_new_path_selection(move |_directory| Some(chosen));
     cx.run_until_parked();
-    let (_, secrets, unreadable, missing) = cx
+    let (_, secrets, _vault, unreadable, missing) = cx
         .update(|_window, app| view.read(app).export_report_for_test())
         .expect("the dialog reports what it wrote");
     assert_eq!(secrets, None);
@@ -35561,6 +35561,8 @@ async fn the_sync_page_tests_the_connection_and_keeps_the_password_out_of_the_fi
 #[gpui::test]
 async fn syncing_passwords_needs_a_passphrase_before_it_is_saved(cx: &mut TestAppContext) {
     let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    // A WebDAV with a password reuses it for the vault: no second secret is
+    // asked for, and the switch saves on its own (R2, R5).
     let dir = TempDir::new("sync-passphrase");
     let secrets = Arc::new(shellune_storage::MemorySecrets::new());
     configure_sync(&dir, &secrets, &server, false);
@@ -35569,18 +35571,43 @@ async fn syncing_passwords_needs_a_passphrase_before_it_is_saved(cx: &mut TestAp
     click(cx, "settings.sync.secrets");
     assert!(cx.debug_bounds("settings.sync.passphrase").is_some());
     click(cx, "settings.sync.save");
-    assert_eq!(
-        cx.update(|_window, app| view.read(app).sync_status_for_test().1),
-        Some(copy::ENGLISH_SYNC.passphrase_required.to_owned())
+    cx.run_until_parked();
+    let (_, problem) = cx.update(|_window, app| view.read(app).sync_status_for_test());
+    assert!(
+        problem.is_none(),
+        "a WebDAV password asks for no second secret"
     );
     let config = shellune_sync::SyncConfigStore::at(dir.path())
         .load()
         .expect("reads")
         .expect("configured");
     assert!(
-        !config.sync_secrets,
+        config.sync_secrets,
+        "a WebDAV password is enough for the vault to travel"
+    );
+
+    // A passwordless WebDAV is the other rule: the vault does not travel until
+    // a non-empty sync passphrase exists (R5).
+    let bare = TempDir::new("sync-passphrase-bare");
+    let bare_secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    let (view, cx) = sync_window(cx, &bare, &bare_secrets, Destination::Settings);
+    click(cx, "settings.category.sync");
+    type_into(cx, "settings.sync.url", &server.url());
+    type_into(cx, "settings.sync.username", SYNC_USER);
+    click(cx, "settings.sync.secrets");
+    click(cx, "settings.sync.save");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).sync_status_for_test().1),
+        Some(copy::ENGLISH_SYNC.passphrase_required.to_owned())
+    );
+    assert!(
+        shellune_sync::SyncConfigStore::at(bare.path())
+            .load()
+            .expect("reads")
+            .is_none(),
         "nothing was saved without the passphrase"
     );
+    let _ = view;
 }
 
 #[gpui::test]
@@ -43319,4 +43346,608 @@ async fn an_edit_made_while_a_vault_job_runs_is_kept_when_it_lands(cx: &mut Test
     });
     assert!(!refused_after, "a later vault write still succeeds");
     let _ = key;
+}
+// ---------------------------------------------------------------------------
+// The host-trust page, the device's lock, and the vault's travels (T7)
+// ---------------------------------------------------------------------------
+
+/// A window on the settings page over stores the test holds, so a vault can be
+/// seeded before the window exists and read back after it is gone.
+fn vault_window<'a>(
+    cx: &'a mut TestAppContext,
+    dir: &TempDir,
+    secrets: &Arc<shellune_storage::MemorySecrets>,
+) -> (Entity<ShelluneView>, &'a mut VisualTestContext) {
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Settings);
+    let store = dir.store();
+    let secrets: Arc<dyn shellune_storage::SecretStore> = secrets.clone();
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_secrets_for_test(cx, workspace, store, secrets)
+    });
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    (view, cx)
+}
+
+/// Writes a vault file holding one accepted identity and one shared password,
+/// sealed for the machine whose store `secrets` is: what a device that has
+/// used its vault for a while starts from.
+fn seed_vault(dir: &TempDir, secrets: &Arc<shellune_storage::MemorySecrets>) {
+    let mut content = shellune_storage::VaultContent::new();
+    let mut trust = shellune_storage::HostTrust::new();
+    let key = shellune_storage::HostKey::new(
+        "ssh-ed25519".to_owned(),
+        "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        "AAAAfixture-identity".to_owned(),
+    )
+    .expect("a fixture identity is well formed");
+    trust
+        .accept("web.example.com", 22, &key, 1_700_000_000)
+        .expect("the identity is accepted");
+    content.set_trust(trust);
+    content
+        .insert_credential(shellune_storage::VaultCredentialRecord::new(
+            shellune_core::CredentialMeta::new(
+                shellune_core::CredentialId::new(),
+                "Prod login".to_owned(),
+                Some("deploy".to_owned()),
+                shellune_core::VaultRecordVersion::new(1, "seed"),
+            ),
+            shellune_core::SecretString::new("shared-secret-value"),
+        ))
+        .expect("the credential is inserted");
+    shellune_storage::VaultStore::at(dir.path())
+        .save_records(
+            &content,
+            &[],
+            &[shellune_storage::UnsealSource::LocalMachine],
+            shellune_storage::KdfParams::new(8, 1, 1).expect("cheap parameters"),
+            secrets.as_ref(),
+        )
+        .expect("the vault is written");
+}
+
+/// The host-trust page lists what the vault holds, narrows by the search and
+/// removes an identity with a confirmation and no password of any kind - and a
+/// restart does not bring the record back (R7).
+#[gpui::test]
+async fn host_trust_is_searched_and_removed_without_any_passphrase(cx: &mut TestAppContext) {
+    let dir = TempDir::new("trust-page");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+
+    click(cx, "settings.category.security");
+    click(cx, "settings.item.host-trust");
+    assert!(
+        cx.debug_bounds("security.trust.host.0").is_some(),
+        "the accepted identity is listed"
+    );
+    let rows = cx.update(|_window, app| view.read(app).security_trust_rows_for_test(app));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "web.example.com");
+    assert_eq!(rows[0].1, 22);
+    assert_eq!(
+        rows[0].3,
+        "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    );
+    assert!(rows[0].4, "the record comes from the vault, the authority");
+
+    // The search narrows by the fingerprint; a name that matches nothing says
+    // so instead of an empty-looking vault.
+    type_into(cx, "security.trust.search", "SHA256:AAAA");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_trust_rows_for_test(app))
+            .len(),
+        1,
+        "the fingerprint finds the record"
+    );
+    clear_field(cx, "security.trust.search", "SHA256:AAAA".len());
+    type_into(cx, "security.trust.search", "nowhere.example");
+    assert!(
+        cx.debug_bounds("security.trust.empty").is_some(),
+        "a search that matches nothing says so"
+    );
+    clear_field(cx, "security.trust.search", "nowhere.example".len());
+
+    // The removal asks once, needs no passphrase, and takes the record out of
+    // the vault and this device's file at once.
+    click(cx, "security.trust.delete.0");
+    assert!(
+        cx.debug_bounds("security.dialog.delete-trust").is_some(),
+        "the removal question opens"
+    );
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).security_trust_rows_for_test(app))
+            .is_empty(),
+        "the record is gone from the page"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).security_vault_trust_for_test())
+            .is_empty(),
+        "the record is gone from the vault"
+    );
+
+    // A restart reads what is on disk: nothing restores the record.
+    drop(view);
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    click(cx, "settings.category.security");
+    click(cx, "settings.item.host-trust");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_trust_rows_for_test(app))
+            .len(),
+        0,
+        "the removal survived the restart"
+    );
+    let _ = view;
+}
+
+/// What a connection reads as "known" is the vault first and this device's
+/// legacy file under it (ADR-6, T5's handoff): a version 2 sync that clears
+/// the plain `known_hosts` never takes the accepted fingerprints with it, and
+/// where both hold a record the vault's wins.
+#[gpui::test]
+async fn a_connection_reads_trust_from_the_vault_beside_the_plain_file(cx: &mut TestAppContext) {
+    let dir = TempDir::new("trust-authority");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    // The device's legacy file holds a *different* identity for the same
+    // server, the state a not-yet-migrated machine is in.
+    let mut plain = shellune_storage::HostTrust::new();
+    let stale = shellune_storage::HostKey::new(
+        "ssh-ed25519".to_owned(),
+        "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_owned(),
+        "AAAAstale-identity".to_owned(),
+    )
+    .expect("a second identity is well formed");
+    plain
+        .accept("web.example.com", 22, &stale, 1_700_000_050)
+        .expect("the plain file accepts its own record");
+    shellune_storage::TrustStore::at(dir.path())
+        .save(&plain)
+        .expect("the plain trust file is written");
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    let read = cx.update(|_window, app| {
+        let view = view.read(app);
+        view.effective_trust()
+            .entry("web.example.com", 22)
+            .map(|entry| entry.fingerprint().to_owned())
+    });
+    assert_eq!(
+        read.as_deref(),
+        Some("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        "the vault's fingerprint is the one a connection reads"
+    );
+}
+
+/// A device with the biometric protection on starts locked, one verification
+/// opens the vault, and the idle time locks it again (R3).
+#[gpui::test]
+async fn the_vault_locks_unlocks_once_and_locks_again_on_idle(cx: &mut TestAppContext) {
+    let dir = TempDir::new("lock-idle");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    let authenticator = Arc::new(
+        shellune_storage::ScriptedAuthenticator::new(
+            shellune_storage::BiometricCapability::Biometrics,
+        )
+        .script([Ok(())]),
+    );
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_set_authenticator_for_test(authenticator);
+            view.security_enable_lock_for_test(shellune_storage::LockPolicy::UnlockVault, 1, cx);
+        })
+    });
+    assert!(
+        cx.update(|_window, app| view.read(app).security_locked_for_test()),
+        "the start under the protection is locked"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).security_credentials_for_test())
+            .is_empty(),
+        "a locked vault holds no secret in memory"
+    );
+
+    // One verification opens the vault; the answer is used once, for this.
+    cx.update(|_window, app| view.update(app, |view, cx| view.security_unlock_for_test(cx)));
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_locked_for_test()),
+        "the verification opened the vault"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_credentials_for_test())
+            .len(),
+        1,
+        "the opened vault is the one on disk"
+    );
+
+    // The idle minute passes with no sensitive use: the vault locks again.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(61));
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).security_locked_for_test()),
+        "the idle time locked the vault again"
+    );
+}
+
+/// A cancelled verification is never a pass: the vault stays locked and
+/// nothing is read (R3, R4).
+#[gpui::test]
+async fn a_cancelled_verification_keeps_the_vault_locked(cx: &mut TestAppContext) {
+    let dir = TempDir::new("lock-cancel");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    let authenticator = Arc::new(
+        shellune_storage::ScriptedAuthenticator::new(
+            shellune_storage::BiometricCapability::Biometrics,
+        )
+        .script([Err(shellune_storage::BiometricError::Cancelled)]),
+    );
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_set_authenticator_for_test(authenticator);
+            view.security_enable_lock_for_test(shellune_storage::LockPolicy::UnlockVault, 15, cx);
+        })
+    });
+    cx.update(|_window, app| view.update(app, |view, cx| view.security_unlock_for_test(cx)));
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).security_locked_for_test()),
+        "a cancelled prompt leaves the vault locked"
+    );
+}
+
+/// An enrollment change disables this device's biometric protection: the
+/// vault stays as it was and the setting says so until the user re-enables it
+/// with a fresh verification (R4).
+#[gpui::test]
+async fn an_enrollment_change_disables_biometric_unlock(cx: &mut TestAppContext) {
+    let dir = TempDir::new("lock-enrollment");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    let authenticator = Arc::new(
+        shellune_storage::ScriptedAuthenticator::new(
+            shellune_storage::BiometricCapability::Biometrics,
+        )
+        .script([Err(shellune_storage::BiometricError::EnrollmentChanged {
+            reason: "fingerprints re-enrolled".to_owned(),
+        })]),
+    );
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_set_authenticator_for_test(authenticator);
+            view.security_enable_lock_for_test(shellune_storage::LockPolicy::UnlockVault, 15, cx);
+        })
+    });
+    cx.update(|_window, app| view.update(app, |view, cx| view.security_unlock_for_test(cx)));
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_biometric_for_test()),
+        "the enrollment change turned the biometric switch off"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).security_locked_for_test()),
+        "and the vault was not opened by it"
+    );
+    let saved = shellune_storage::SecurityStore::at(dir.path()).load();
+    assert_eq!(saved.biometric_unlock, Some(false));
+}
+
+/// The "every sensitive operation" mode verifies each request anew: a pass is
+/// never the next request's pass (R3).
+#[gpui::test]
+async fn every_sensitive_operation_verifies_anew(cx: &mut TestAppContext) {
+    let dir = TempDir::new("lock-every");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    let credential = cx.update(|_window, app| {
+        view.read(app)
+            .security_credentials_for_test()
+            .first()
+            .map(|(id, _)| *id)
+            .expect("the seeded credential is in the vault")
+    });
+    // The protection goes on without locking what is already open: the policy
+    // governs what follows, not the past.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_lock_settings_for_test(
+                shellune_storage::LockPolicy::EverySensitiveOperation,
+                cx,
+            );
+        })
+    });
+    let authenticator = Arc::new(
+        shellune_storage::ScriptedAuthenticator::new(
+            shellune_storage::BiometricCapability::Biometrics,
+        )
+        .script([Ok(()), Ok(())]),
+    );
+    let counter = authenticator.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, _cx| {
+            view.security_set_authenticator_for_test(authenticator)
+        })
+    });
+
+    // First reveal: one verification, then the password is shown.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_reveal_for_test(credential, cx)
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(counter.verify_calls(), 1, "the first reveal asked once");
+    assert!(
+        cx.update(|_window, app| view.read(app).security_password_shown_for_test()),
+        "the granted pass showed the password"
+    );
+
+    // Hide it again; the second reveal asks again - the first pass is spent.
+    cx.update(|_window, app| view.update(app, |view, cx| view.security_hide_password_for_test(cx)));
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_reveal_for_test(credential, cx)
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(counter.verify_calls(), 2, "the second reveal asked again");
+
+    // The script is exhausted: a third request is refused, never guessed at.
+    cx.update(|_window, app| view.update(app, |view, cx| view.security_hide_password_for_test(cx)));
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_reveal_for_test(credential, cx)
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(counter.verify_calls(), 3, "the third reveal asked too");
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_password_shown_for_test()),
+        "an answer the system never gave is not a pass"
+    );
+}
+
+/// A full backup carries the encrypted vault under the sync passphrase, a
+/// wrong passphrase opens nothing, and the restore brings the records and the
+/// trust back without duplicates (R9).
+#[gpui::test]
+async fn a_vault_backup_round_trips_through_the_sync_passphrase(cx: &mut TestAppContext) {
+    let source = TempDir::new("vault-backup-a");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&source, &secrets);
+    let (view, cx) = vault_window(cx, &source, &secrets);
+
+    // The export: the vault checkbox asks for a sync passphrase when none is
+    // saved, and the export cannot start without one.
+    click(cx, "settings.category.data");
+    click(cx, "settings.backup.export");
+    click(cx, "backup.export.vault");
+    assert!(
+        cx.debug_bounds("backup.export.vault.passphrase").is_some(),
+        "a device without a saved passphrase is asked for one"
+    );
+    click(cx, "backup.export.save");
+    assert!(
+        !cx.did_prompt_for_new_path(),
+        "no file is asked for while the passphrase is missing"
+    );
+    type_into(
+        cx,
+        "backup.export.vault.passphrase",
+        "correct horse battery",
+    );
+    type_into(cx, "backup.export.vault.confirm", "correct horse battery");
+    click(cx, "backup.export.save");
+    assert!(cx.did_prompt_for_new_path());
+    let target = source.path().join("vault-backup.json");
+    let chosen = target.clone();
+    cx.simulate_new_path_selection(move |_directory| Some(chosen));
+    cx.run_until_parked();
+    let (_, _, vault, _, _) = cx
+        .update(|_window, app| view.read(app).export_report_for_test())
+        .expect("the export wrote its report");
+    assert!(vault, "the backup carries the encrypted vault");
+    let text = std::fs::read_to_string(&target).expect("the backup was written");
+    assert!(
+        !text.contains("shared-secret-value"),
+        "no secret in clear text"
+    );
+    let document = shellune_storage::ShelluneData::read(&target).expect("the backup reads");
+    assert_eq!(
+        document.version(),
+        2,
+        "a vault-carrying backup is version 2"
+    );
+    assert!(document.has_vault());
+    assert!(
+        !document.has_secrets(),
+        "the version 1 password block did not travel with it"
+    );
+    assert!(
+        document.shared().known_hosts().is_empty(),
+        "a version 2 document carries no plaintext trust"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).saved_sync_passphrase_for_test().is_some()),
+        "the passphrase set at the export is the saved sync passphrase"
+    );
+
+    // The restore: a version 2 backup asks for the passphrase, the wrong one
+    // opens nothing, and the right one brings the vault back whole.
+    let restore = TempDir::new("vault-backup-b");
+    let restore_secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    let (view, cx) = vault_window(cx, &restore, &restore_secrets);
+    cx.update(|_window, app| view.update(app, |view, cx| view.read_backup_for_test(&target, cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        backup_stage(&view, cx),
+        Some("import.vault-locked"),
+        "a version 2 backup asks for the sync passphrase"
+    );
+    type_into(cx, "backup.import.vault.passphrase", "not the passphrase");
+    click(cx, "backup.import.vault.unlock");
+    cx.run_until_parked();
+    assert_eq!(
+        backup_stage(&view, cx),
+        Some("import.vault-locked"),
+        "a wrong passphrase stays on the question"
+    );
+    type_into(
+        cx,
+        "backup.import.vault.passphrase",
+        "correct horse battery",
+    );
+    click(cx, "backup.import.vault.unlock");
+    cx.run_until_parked();
+    assert_eq!(backup_stage(&view, cx), Some("import.preview"));
+    click(cx, "backup.import.apply");
+    cx.run_until_parked();
+    assert_eq!(backup_stage(&view, cx), Some("import.applied"));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_vault_trust_for_test()),
+        vec![("web.example.com".to_owned(), 22)],
+        "the trust came back with the vault"
+    );
+
+    // Applying the same backup again creates no duplicates: the records keep
+    // their identities, so the second restore lands on the same set (R9).
+    drop(view);
+    let (view, cx) = vault_window(cx, &restore, &restore_secrets);
+    cx.update(|_window, app| view.update(app, |view, cx| view.read_backup_for_test(&target, cx)));
+    cx.run_until_parked();
+    type_into(
+        cx,
+        "backup.import.vault.passphrase",
+        "correct horse battery",
+    );
+    click(cx, "backup.import.vault.unlock");
+    cx.run_until_parked();
+    click(cx, "backup.import.apply");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_vault_trust_for_test())
+            .len(),
+        1,
+        "a repeated restore makes no duplicate records"
+    );
+    let _ = view;
+}
+
+/// An automatic sync never starts while this device's vault is locked and the
+/// sync would carry it: the job waits for the unlock, and the unlock starts it
+/// again (ADR-4). A manual sync is a person's own decision and always runs.
+#[gpui::test]
+async fn a_locked_vault_defers_automatic_sync_until_the_unlock(cx: &mut TestAppContext) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let dir = TempDir::new("sync-defer");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    {
+        use shellune_storage::SecretStore as _;
+        let mut config = shellune_sync::SyncConfig::new(server.url(), SYNC_USER);
+        config.auto = true;
+        config.sync_secrets = true;
+        shellune_sync::SyncConfigStore::at(dir.path())
+            .save(&config)
+            .expect("the sync settings are written");
+        secrets
+            .save_app(
+                shellune_storage::AppSecret::WebDavPassword,
+                &shellune_core::SecretString::new(SYNC_PASSWORD),
+            )
+            .expect("the password is kept");
+    }
+    seed_vault(&dir, &secrets);
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    cx.run_until_parked();
+    let uploaded = put_count(&server);
+    assert!(uploaded >= 1, "the first automatic sync carried the vault");
+
+    // The protection goes on and locks the vault; the next automatic check
+    // defers instead of touching the vault behind the user's back.
+    let authenticator = Arc::new(
+        shellune_storage::ScriptedAuthenticator::new(
+            shellune_storage::BiometricCapability::Biometrics,
+        )
+        .script([Ok(())]),
+    );
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_set_authenticator_for_test(authenticator);
+            view.security_enable_lock_for_test(shellune_storage::LockPolicy::UnlockVault, 15, cx);
+        })
+    });
+    after_poll(cx);
+    assert!(
+        cx.update(|_window, app| view.read(app).sync_deferred_for_test()),
+        "the automatic sync said it is waiting for the unlock"
+    );
+    assert_eq!(
+        put_count(&server),
+        uploaded,
+        "nothing was sent while the vault was locked"
+    );
+
+    // A change made behind the lock (the vault file itself) is still only
+    // synced once the unlock frees the automatic job.
+    cx.update(|_window, app| view.update(app, |view, cx| view.security_unlock_for_test(cx)));
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).security_credentials_for_test())
+            .is_empty()
+            || !cx.update(|_window, app| view.read(app).security_locked_for_test()),
+        "the unlock opened the vault"
+    );
+}
+
+/// The vault half of a conflict is decided record by record: each row carries
+/// its own choice, the apply stays inert until every one is answered, and a
+/// dismissed question keeps the conflict (ADR-5, R8).
+#[gpui::test]
+async fn vault_conflicts_are_answered_one_by_one(cx: &mut TestAppContext) {
+    let dir = TempDir::new("sync-vault-conflict");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.open_sync_vault_conflict_for_test(cx))
+    });
+    assert!(sync_conflict_open(&view, cx));
+    assert!(
+        cx.debug_bounds("sync.vault.conflict.row.0").is_some(),
+        "the record's row is drawn"
+    );
+    assert!(
+        cx.debug_bounds("sync.vault.conflict.row.1").is_some(),
+        "the trusted identity's row is drawn"
+    );
+
+    // Half an answer applies nothing: the question stays as it was.
+    click(cx, "sync.vault.conflict.local.0");
+    click(cx, "sync.vault.conflict.apply");
+    cx.run_until_parked();
+    assert!(
+        sync_conflict_open(&view, cx),
+        "a conflict with an open record applies nothing"
+    );
+
+    // The trust row names both fingerprints in full, and answering it lets
+    // the choices go.
+    click(cx, "sync.vault.conflict.remote.1");
+    click(cx, "sync.vault.conflict.apply");
+    cx.run_until_parked();
+    assert!(
+        !sync_conflict_open(&view, cx),
+        "the answered choices leave the question"
+    );
 }

@@ -1543,6 +1543,32 @@ fn show_settings_security(
 }
 
 /// Opens the shortcut page.
+/// Opens the host-trust page with fixture accepted identities in the page's
+/// in-memory vault: the shot shows the searchable list, not a vault that
+/// exists (R7).
+fn show_settings_trust(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_settings_item(view, window, cx, Item::HostTrust)?;
+    view.capture_trust_entries(3);
+    Ok(())
+}
+
+/// Opens the lock page with the biometric protection on: the shot shows the
+/// switch, the two modes and the idle setting, and raises no prompt (R3).
+fn show_settings_lock(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_settings_item(view, window, cx, Item::Lock)?;
+    view.capture_lock_engaged();
+    Ok(())
+}
+
+/// Opens the shortcut page.
 fn show_settings_keys(
     view: &mut ShelluneView,
     window: &mut Window,
@@ -1984,6 +2010,20 @@ fn settings_security_ready(view: &ShelluneView, _cx: &App) -> Result<(), String>
         return Err("the fixture keys are not in the page's lists".to_owned());
     }
     Ok(())
+}
+
+/// The host-trust page arrived: its rows really drew.
+fn settings_trust_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    settings_page_is_on(view, ("security", "host-trust"))?;
+    if view.security_trust_count_for_capture() < 3 {
+        return Err("the fixture identities are not in the page's list".to_owned());
+    }
+    Ok(())
+}
+
+/// The lock page arrived: the settings really drew it.
+fn settings_lock_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    settings_page_is_on(view, ("security", "lock"))
 }
 
 /// Whether a settings page is on screen, and which one.
@@ -3708,6 +3748,36 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: nothing,
         install: show_settings_security,
         ready: settings_security_ready,
+    },
+    Scenario {
+        id: "settings-security-trust",
+        title: "设置 · 安全：主机信任",
+        category: Category::Settings,
+        fixture: "no vault file; the page's in-memory vault holds three fixture accepted \
+                  identities, public fingerprints only, nothing on disk",
+        evidence: "shows the search and the rows with server, source, algorithm, fingerprint and \
+                   acceptance time; the fixture identities never existed on disk, no server was \
+                   asked about, and the copy and removal are proved by the GPUI tests, not by \
+                   this frame",
+        start: || page(Destination::Settings),
+        prepare: nothing,
+        install: show_settings_trust,
+        ready: settings_trust_ready,
+    },
+    Scenario {
+        id: "settings-security-lock",
+        title: "设置 · 安全：锁定与生物识别",
+        category: Category::Settings,
+        fixture: "no vault file and no lock settings on disk; the page shows the protection \
+                  turned on in memory only",
+        evidence: "shows the vault's state, the biometric switch, the two protection modes and \
+                   the idle setting as this device's own choices; no system verification is \
+                   raised by a capture, and the unlock, the idle lock and the enrollment change \
+                   are proved by the GPUI tests, not by this frame",
+        start: || page(Destination::Settings),
+        prepare: nothing,
+        install: show_settings_lock,
+        ready: settings_lock_ready,
     },
     Scenario {
         id: "settings-keys",

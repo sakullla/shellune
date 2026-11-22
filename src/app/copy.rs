@@ -5153,6 +5153,43 @@ backup_strings! {
     export_running: "Saving the backup…", "正在保存备份…";
     /// Unlocking or applying is running in the background
     import_running: "Working…", "正在处理…";
+    /// Export checkbox: take the whole vault along
+    export_include_vault: "Include the vault (keys, passwords, host trust)",
+        "包含保险库（密钥、密码、主机信任）";
+    /// Under the vault checkbox: why the sync passphrase is asked for
+    export_vault_hint: "A backup with the vault's secrets always needs the non-empty sync passphrase, even when WebDAV has a password.",
+        "包含保险库秘密的备份始终需要非空同步口令，即使 WebDAV 已设置密码。";
+    /// The saved sync passphrase is used, no field is drawn
+    export_vault_saved: "The saved sync passphrase seals this backup; it is not retyped.",
+        "此备份使用已保存的同步口令密封，无需再次输入。";
+    /// Field label when no sync passphrase is saved yet
+    export_vault_passphrase: "Sync passphrase", "同步口令";
+    /// Confirmation field label
+    export_vault_confirm: "Repeat the sync passphrase", "重复输入同步口令";
+    /// Refusal: the two fields differ
+    export_vault_mismatch: "The two passphrases do not match.", "两次输入的口令不一致。";
+    /// Refusal: no passphrase and none saved
+    export_vault_required: "Enter the sync passphrase; it also becomes the one your other devices use.",
+        "请输入同步口令；它也会成为其他设备使用的口令。";
+    /// What the export wrote, with the vault in it
+    export_done_vault: "The backup carries the encrypted vault.", "备份已包含加密的保险库。";
+    /// The vault could not be opened for the export
+    export_vault_locked: "The vault could not be opened on this device, so it could not be included.",
+        "无法在此设备上打开保险库，因此无法包含它。";
+    /// Import stage: the file carries the encrypted vault and asks for the passphrase
+    import_vault_locked: "This backup carries the encrypted vault. Enter the sync passphrase it was sealed with.",
+        "这个备份包含加密的保险库，请输入密封时使用的同步口令。";
+    /// Preview row: what the vault part holds
+    preview_vault: "Vault", "保险库";
+    /// Preview line: the vault part's records and trust
+    preview_vault_line: "{keys} keys, {passwords} passwords, {trust} trusted identities",
+        "{keys} 把密钥、{passwords} 条密码、{trust} 条信任记录";
+    /// Preview line: the vault part replaces this device's vault
+    preview_vault_replace: "The file's vault replaces this device's vault.",
+        "文件中的保险库将替换此设备的保险库。";
+    /// Applied: the vault was restored
+    import_done_vault: "The vault was restored with all of its records and trust.",
+        "保险库已连同全部记录与信任恢复。";
 }
 
 /// The backup strings of one language.
@@ -5396,6 +5433,37 @@ sync_strings! {
     doc_trust: "trusted keys", "已信任指纹";
     /// Data document: preferences
     doc_preferences: "preferences", "偏好";
+    /// Vault conflict dialog title
+    vault_conflict_title: "Vault conflicts", "保险库冲突";
+    /// Vault conflict dialog intro
+    vault_conflict_intro: "Both sides changed these vault records differently. Nothing has been applied; each record is decided on its own, and the vault stays as it is until every one is answered.",
+        "两端对以下保险库记录做了不同修改。目前没有应用任何内容；每条记录单独决定，全部答复之前保险库保持不变。";
+    /// One record conflict, both sides changed it
+    vault_record_label: "{name} \u{b7} changed {count} times", "{name} · 修改了 {count} 次";
+    /// One record conflict, one side deleted it
+    vault_record_deleted_label: "{name} \u{b7} deleted on this device", "{name} · 此设备已删除";
+    /// One trust conflict
+    vault_trust_label: "{host}:{port} \u{b7} trusted identity", "{host}:{port} · 信任身份";
+    /// Caption of a side: which device wrote it
+    vault_side_device: "{device} \u{b7} {count} changes", "{device} · {count} 次修改";
+    /// Caption of a side: deleted
+    vault_side_deleted: "deleted", "已删除";
+    /// Caption of a side: a fingerprint, as the trust conflict shows it
+    vault_side_fingerprint: "{algorithm} \u{b7} {fingerprint}", "{algorithm}，指纹 {fingerprint}";
+    /// Button: keep this device's version
+    vault_keep_local: "Keep this device's", "保留此设备";
+    /// Button: keep the cloud's version
+    vault_keep_remote: "Keep the cloud's", "保留云端";
+    /// Button: apply all the choices made
+    vault_apply: "Apply choices", "应用选择";
+    /// The whole-document question waits behind the vault one
+    vault_then_document: "The data outside the vault is decided after these records.",
+        "这些记录处理完后，再决定保险库之外的数据。";
+    /// Automatic sync waits while the vault is locked
+    deferred_locked: "Automatic sync waits until the vault is unlocked", "自动同步等待保险库解锁";
+    /// A pull applied the cloud's vault
+    pull_vault: "The cloud's vault was applied (version {version}).",
+        "已应用云端保险库（版本 {version}）。";
 }
 
 /// The sync strings of one language.
@@ -5975,6 +6043,104 @@ security_strings! {
         "使用保险库中的共享密码，不再手动输入";
     /// Host editor: stop using a vault password
     host_credential_clear: "Type a password instead", "改为手动输入密码";
+    /// Settings item: the host trust page
+    trust_settings_item: "Host trust", "主机信任";
+    /// Under the trust page's name
+    trust_settings_hint: "The server fingerprints you have accepted, searchable and removable",
+        "已接受的服务器指纹，可搜索、可删除";
+    /// Search field placeholder of the trust page
+    trust_search_placeholder: "Search by host, port, algorithm or fingerprint",
+        "按主机、端口、算法或指纹搜索";
+    /// Section heading of the trust list
+    trust_title: "Accepted server identities", "已接受的服务器身份";
+    /// No trust record exists
+    trust_empty: "No server identity has been accepted yet.", "还没有接受过服务器身份。";
+    /// Nothing matches the search
+    trust_no_match: "No accepted identity matches the search.", "没有匹配的信任记录。";
+    /// Row caption: where the record came from
+    trust_from_vault: "vault", "保险库";
+    /// Row caption: where the record came from
+    trust_from_this_mac: "this device only", "仅此设备";
+    /// Detail label of a trust row
+    trust_accepted: "Accepted {date}", "接受于 {date}";
+    /// Delete dialog title of one trust record
+    trust_delete_title: "Remove trusted identity", "移除信任身份";
+    /// Delete dialog body
+    trust_delete_body: "The next connection to {server} asks about this server again, as an unknown host. No password is needed for this.",
+        "下次连接 {server} 时将按未知主机重新询问。此操作不需要任何口令。";
+    /// Delete dialog button
+    trust_delete_action: "Remove", "移除";
+    /// Delete finished
+    trust_deleted: "Trusted identity removed", "已移除信任身份";
+    /// Delete finished, naming the server
+    trust_deleted_note: "Trusted identity removed for {server}", "已移除 {server} 的信任身份";
+    /// Settings item: the lock and biometrics page
+    lock_settings_item: "Lock & biometrics", "锁定与生物识别";
+    /// Under the lock page's name
+    lock_settings_hint: "When this device asks you to verify again before opening the vault",
+        "此设备在何时要求重新验证后才能使用保险库";
+    /// Lock status: the vault is open on this device
+    lock_state_open: "Vault unlocked on this device", "保险库在此设备上已解锁";
+    /// Lock status: the vault is locked
+    lock_state_locked: "Vault locked", "保险库已锁定";
+    /// Lock status while a verification is running
+    lock_state_verifying: "Asking the system to verify you\u{2026}", "正在请求系统验证\u{2026}";
+    /// Button: lock now
+    lock_now: "Lock now", "立即锁定";
+    /// Button: unlock now
+    lock_unlock: "Unlock", "解锁";
+    /// Switch label: unlock this device's vault with biometrics
+    lock_biometric: "Unlock with biometrics", "使用生物识别解锁";
+    /// Under the biometrics switch
+    lock_biometric_hint: "Touch ID, Windows Hello or the system's own prompt, when this device offers one",
+        "此设备支持时使用 Touch ID、Windows Hello 或系统提示";
+    /// The biometric switch is on; the system says what it can do
+    lock_capability_biometrics: "This device verifies with its biometric sensor.",
+        "此设备使用生物识别传感器进行验证。";
+    /// The system can re-verify the user, but not with biometrics
+    lock_capability_system: "This device re-verifies with the system user (a password or PIN); it is not biometric strength.",
+        "此设备以系统用户方式重新验证（密码或 PIN），并非生物识别强度。";
+    /// The system offers nothing this app can call
+    lock_capability_none: "This device offers no system verification this app can call.",
+        "此设备没有可供应用调用的系统验证。";
+    /// Label of the policy segmented control
+    lock_policy_label: "Ask again", "重新验证时机";
+    /// Policy choice
+    lock_policy_unlock: "To unlock", "解锁时";
+    /// Policy choice
+    lock_policy_every: "Every sensitive operation", "每次敏感操作";
+    /// Under the policy control, the unlock-vault choice
+    lock_policy_unlock_hint: "One verification opens the vault until it locks again.",
+        "验证一次即解锁保险库，直到再次锁定。";
+    /// Under the policy control, the every-operation choice
+    lock_policy_every_hint: "Showing or copying a password, signing with a managed key and exporting each verify again.",
+        "显示或复制密码、使用受管密钥认证、导出等每次都重新验证。";
+    /// Label of the idle lock field
+    lock_idle_label: "Lock after idle", "空闲后锁定";
+    /// Under the idle lock field
+    lock_idle_hint: "Minutes without a sensitive use, 1 to 1440; a sleep counts.",
+        "敏感操作空闲的分钟数（1 到 1440），休眠同样计入。";
+    /// Refusal of the idle minutes field
+    lock_idle_refusal: "Enter minutes between 1 and 1440.", "请输入 1 到 1440 之间的分钟数。";
+    /// The saved lock choices could not be applied
+    lock_settings_problem: "The saved lock choices could not be read; the defaults are in use.",
+        "已保存的锁定设置无法读取，正在使用默认值。";
+    /// Verification was cancelled; nothing opened
+    lock_cancelled: "Verification was cancelled; the vault stays locked.", "验证已取消，保险库保持锁定。";
+    /// Verification did not match; nothing opened
+    lock_failed: "Verification did not match; the vault stays locked.", "验证未通过，保险库保持锁定。";
+    /// The system could not ask right now
+    lock_busy: "The system could not ask right now; try again in a moment.",
+        "系统暂时无法弹出验证，请稍后再试。";
+    /// The enrolled biometrics changed, so this device's protection was reset
+    lock_enrollment_changed: "The enrolled biometrics changed, so biometric unlocking was turned off on this device. Verify with the current WebDAV password or sync passphrase, then turn it on again.",
+        "已登记的生物识别发生变化，此设备的生物识别解锁已停用。请用当前 WebDAV 密码或同步口令重新解锁后再开启。";
+    /// A sensitive operation was blocked while the vault is locked
+    lock_blocked: "The vault is locked. Unlock it in Settings to use this.",
+        "保险库已锁定，请在设置中解锁后再使用。";
+    /// Re-enabling biometrics after it was reset needs a fresh verification
+    lock_reenable_note: "Turning biometrics back on asks the system to verify you once.",
+        "重新开启生物识别会请求系统验证一次。";
 }
 
 /// The security strings of one language.

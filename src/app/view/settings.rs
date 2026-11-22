@@ -96,6 +96,8 @@ pub(crate) enum Item {
     Highlight,
     Policy,
     KeysAndPassword,
+    HostTrust,
+    Lock,
     BellNotice,
     FinishedNotice,
     Shortcuts,
@@ -123,7 +125,7 @@ const TERMINAL: [Item; 4] = [
     Item::Highlight,
 ];
 const CONNECTION: [Item; 1] = [Item::Policy];
-const SECURITY: [Item; 1] = [Item::KeysAndPassword];
+const SECURITY: [Item; 3] = [Item::KeysAndPassword, Item::HostTrust, Item::Lock];
 const NOTICES: [Item; 2] = [Item::BellNotice, Item::FinishedNotice];
 const KEYS: [Item; 1] = [Item::Shortcuts];
 const DATA: [Item; 4] = [
@@ -230,7 +232,7 @@ impl Item {
                 Category::Terminal
             }
             Self::Policy => Category::Connection,
-            Self::KeysAndPassword => Category::Security,
+            Self::KeysAndPassword | Self::HostTrust | Self::Lock => Category::Security,
             Self::BellNotice | Self::FinishedNotice => Category::Notices,
             Self::Shortcuts => Category::Keys,
             Self::HostsFile | Self::Import | Self::ExportBackup | Self::ImportBackup => {
@@ -246,7 +248,13 @@ impl Item {
     pub(super) fn own_page(self) -> bool {
         matches!(
             self,
-            Self::Shortcuts | Self::Policy | Self::Sync | Self::Update | Self::KeysAndPassword
+            Self::Shortcuts
+                | Self::Policy
+                | Self::Sync
+                | Self::Update
+                | Self::KeysAndPassword
+                | Self::HostTrust
+                | Self::Lock
         )
     }
 
@@ -264,6 +272,8 @@ impl Item {
             Self::Highlight => "highlight",
             Self::Policy => "policy",
             Self::KeysAndPassword => "keys-and-passwords",
+            Self::HostTrust => "host-trust",
+            Self::Lock => "lock",
             Self::BellNotice => "bell-notice",
             Self::FinishedNotice => "finished-notice",
             Self::Shortcuts => "keys",
@@ -292,6 +302,8 @@ impl Item {
             Self::Highlight => ux.settings_highlight,
             Self::Policy => ux.settings_connection_policy,
             Self::KeysAndPassword => copy::security_for(locale).settings_item,
+            Self::HostTrust => copy::security_for(locale).trust_settings_item,
+            Self::Lock => copy::security_for(locale).lock_settings_item,
             Self::BellNotice => ux.settings_bell_notice,
             Self::FinishedNotice => ux.settings_finished_notice,
             Self::Shortcuts => ux.settings_keys,
@@ -320,6 +332,8 @@ impl Item {
             Self::Highlight => ux.settings_highlight_hint,
             Self::Policy => ux.settings_connection_hint,
             Self::KeysAndPassword => copy::security_for(locale).settings_hint,
+            Self::HostTrust => copy::security_for(locale).trust_settings_hint,
+            Self::Lock => copy::security_for(locale).lock_settings_hint,
             Self::BellNotice => ux.settings_bell_notice_hint,
             Self::FinishedNotice => ux.settings_finished_notice_hint,
             Self::Shortcuts => ux.settings_keys_hint,
@@ -907,6 +921,8 @@ impl ShelluneView {
             Item::Shortcuts => self.settings_keys_page(cx),
             Item::Policy => self.settings_connection_page(cx),
             Item::KeysAndPassword => self.security_page(cx),
+            Item::HostTrust => self.trust_page(cx),
+            Item::Lock => self.biometrics_page(cx),
             Item::Sync => self.sync_settings_page(cx),
             Item::Update => self.update_settings_page(cx),
             _ => self.settings_item_row(item, cx),
@@ -1079,6 +1095,8 @@ impl ShelluneView {
             Item::Shortcuts
             | Item::Policy
             | Item::KeysAndPassword
+            | Item::HostTrust
+            | Item::Lock
             | Item::Sync
             | Item::Update
             | Item::HostsFile
