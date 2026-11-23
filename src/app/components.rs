@@ -919,11 +919,11 @@ pub fn compact_button(label: impl Into<SharedString>, variant: Variant, metrics:
 
 /// The labelled main action at the end of a list row, such as a host's "Connect".
 ///
-/// A long list of rows that all end in the same framed button reads as a column of
-/// borders, and the one row the eye is on is lost in it. So the action rests as quiet
-/// words - still in view, still a target - and takes the secondary frame when its row
-/// is pointed at, or at once when `emphasized`: the keyboard's row, or the row Enter
-/// would open.
+/// A long list of rows that all end in the same words reads as a column of them, and
+/// the one row the eye is on is lost in it. So the action keeps its place but shows
+/// only on the row the pointer is on - in the secondary frame - or at once when
+/// `emphasized`: the keyboard's row, or the row Enter would open. The row itself
+/// connects on a double press or Enter, and its "⋯" stays in view.
 pub fn row_action_button(
     label: impl Into<SharedString>,
     emphasized: bool,
@@ -933,7 +933,11 @@ pub fn row_action_button(
         return compact_button(label, Variant::Secondary, metrics);
     }
     let framed = button_face(Variant::Secondary, ControlState::Resting);
-    compact_button(label, Variant::Ghost, metrics).group_hover(ROW_GROUP, hover_style(framed))
+    compact_button(label, Variant::Ghost, metrics)
+        .opacity(0.0)
+        .group_hover(ROW_GROUP, move |style| {
+            hover_style(framed)(style).opacity(1.0)
+        })
 }
 
 /// A square button that holds a short glyph such as "A+" or "×".
@@ -3329,6 +3333,14 @@ const TOOLBAR_MIN_HEIGHT: f32 = 44.0;
 /// centred, a hairline under it. The caller adds the title, the search field and the
 /// commands; a child with `flex_1` takes the room between them.
 pub fn toolbar(metrics: Metrics) -> Div {
+    toolbar_row(metrics)
+        .border_b_1()
+        .border_color(theme::swatch(palette::BORDER))
+}
+
+/// A [`toolbar`] without its hairline, for a page that draws the line across its full
+/// width and keeps the controls in a narrower column above it.
+pub fn toolbar_row(metrics: Metrics) -> Div {
     div()
         .flex()
         .flex_none()
@@ -3339,8 +3351,6 @@ pub fn toolbar(metrics: Metrics) -> Div {
         .min_h(metrics.scale(TOOLBAR_MIN_HEIGHT))
         .px(metrics.scale(spacing::SNUG))
         .py(metrics.scale(spacing::NARROW))
-        .border_b_1()
-        .border_color(theme::swatch(palette::BORDER))
 }
 
 /// The bar a state is stated in above the content it is about, without covering it

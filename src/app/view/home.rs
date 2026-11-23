@@ -119,6 +119,21 @@ const RECENT_STRIP_FRAME_WIDTH: f32 = 180.0;
 /// size.
 const FILTER_PANEL_WIDTH: f32 = 380.0;
 
+/// The widest the toolbar and the list become. Past it a wide window centres them
+/// instead of pulling a row's name, facts and actions apart across the screen.
+const CONTENT_MAX_WIDTH: f32 = 1080.0;
+
+/// The hairlines above and below the list's panel: one device-independent pixel each,
+/// unscaled like every hairline.
+const PANEL_EDGES: f32 = 2.0;
+
+/// A book smaller than this offers its other starting points under the list: with a
+/// few hosts the page is mostly room, and the room is better spent on the next step.
+const MORE_WAYS_BELOW: usize = 8;
+
+/// The narrowest a starting-point tile becomes before the tiles wrap.
+const MORE_TILE_MIN_WIDTH: f32 = 220.0;
+
 /// A menu of the home page: the toolbar's two and a group's own.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum HomeMenu {
@@ -1281,7 +1296,7 @@ impl ShelluneView {
             .when(!short, |body| body.min_h_0())
             .gap(metrics.scale(spacing::TIGHT))
             .px(metrics.scale(spacing::SNUG))
-            .pt(metrics.scale(spacing::TIGHT))
+            .pt(metrics.scale(spacing::SNUG))
             .pb(metrics.scale(spacing::SNUG))
             .children(
                 self.local_error
@@ -1413,8 +1428,33 @@ impl ShelluneView {
                 column.min_h_0().overflow_y_scroll().overflow_x_hidden()
             })
             .when(!short, |column| column.min_h_0().overflow_hidden())
-            .child(self.home_toolbar(list, window, cx))
-            .child(body)
+            // The hairline under the toolbar spans the page; the controls and the list
+            // keep to one centred column.
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_none()
+                    .items_center()
+                    .w_full()
+                    .border_b_1()
+                    .border_color(theme::swatch(palette::BORDER))
+                    .child(
+                        self.home_toolbar(list, window, cx)
+                            .max_w(metrics.scale(CONTENT_MAX_WIDTH)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .items_center()
+                    .w_full()
+                    .min_w_0()
+                    .when(!short, |column| column.min_h_0())
+                    .child(body.w_full().max_w(metrics.scale(CONTENT_MAX_WIDTH))),
+            )
     }
 
     /// The toolbar of the list: the place and its count, the search, the filter menu,
@@ -1532,7 +1572,7 @@ impl ShelluneView {
                 .inset_0(),
             );
 
-        components::toolbar(metrics)
+        components::toolbar_row(metrics)
             .debug_selector(|| "hosts.toolbar".to_owned())
             .flex_wrap()
             .child(title)
@@ -2096,16 +2136,176 @@ impl ShelluneView {
                 move || format!("hosts.list.{shown}")
             });
         if rows.is_empty() {
-            body.child(self.hosts_empty_list(cx))
-        } else {
+            return body.child(self.hosts_empty_list(cx));
+        }
+        // The rows sit on one panel that is as tall as they are: three hosts are a
+        // short card with the page's room under it, not three lines floating at the
+        // top of an empty column. A list taller than the window shrinks the panel to
+        // the room there is, and the list scrolls inside it.
+        let inset = metrics.scale(spacing::HALF);
+        #[allow(clippy::cast_precision_loss)]
+        let content = metrics.list_row_height() * rows.len() as f32 + inset * 2.0 + px(PANEL_EDGES);
+        let panel = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_shrink()
+            .w_full()
+            .min_w_0()
+            .when(!short, |panel| panel.min_h_0())
+            .h(content)
+            .p(inset)
+            .rounded(px(radius::LARGE))
+            .bg(theme::swatch(palette::RAISED))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .overflow_hidden()
+            .debug_selector(|| "hosts.panel".to_owned())
+            .child(self.hosts_virtual_list(rows, cx))
             // The bar comes after the list, so it reads the offsets the list wrote
             // this frame; it draws over the list's right edge and takes no room.
-            body.child(self.hosts_virtual_list(rows, cx))
-                .child(crate::app::scrollbar::for_list(
-                    "hosts.rows.scrollbar",
-                    &self.hosts_scroll,
-                ))
+            .child(crate::app::scrollbar::for_list(
+                "hosts.rows.scrollbar",
+                &self.hosts_scroll,
+            ));
+        body.child(panel).children(self.home_more_ways(list, cx))
+    }
+
+    /// Whether a small book offers its other starting points under the list: the
+    /// whole list, nothing typed, narrowed or picked, and fewer records than
+    /// [`MORE_WAYS_BELOW`].
+    fn home_more_ways_applies(&self, list: &HostList) -> bool {
+        self.hosts.section() == HomeSection::All
+            && self.hosts.search().trim().is_empty()
+            && self.hosts.filter().status() == HostStatusFilter::Any
+            && self.hosts.filter().protocol() == HostProtocolFilter::All
+            && self.hosts.selected().is_empty()
+            && list.total() > 0
+            && list.total() < MORE_WAYS_BELOW
+    }
+
+    /// The starting points of a small book: an import, a restore, the local terminal
+    /// and the search's quick connect, each a tile with one line on what it does.
+    fn home_more_ways(&self, list: &HostList, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.home_more_ways_applies(list) {
+            return None;
         }
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let backup = copy::backup_for(self.workspace.locale());
+        let tile = |key: &'static str, icon: Icon, title: &'static str, hint: &'static str| {
+            let selector = format!("home.more.{key}");
+            div()
+                .id(SharedString::from(selector.clone()))
+                .debug_selector(move || selector.clone())
+                .flex()
+                .flex_1()
+                .items_center()
+                .gap(metrics.scale(spacing::SNUG))
+                .min_w(metrics.scale(MORE_TILE_MIN_WIDTH))
+                .p(metrics.scale(spacing::SNUG))
+                .rounded(px(radius::LARGE))
+                .border_1()
+                .border_color(theme::swatch(palette::BORDER))
+                .cursor_pointer()
+                .hover(|style| {
+                    style
+                        .bg(theme::swatch(palette::SURFACE_HOVER))
+                        .border_color(theme::swatch(palette::BORDER_STRONG))
+                })
+                .child(components::leading_icon(icon, Tone::Neutral, metrics))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(metrics.scale(spacing::HALF))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(metrics.label_size())
+                                .font_weight(metrics.medium_weight())
+                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                .child(components::line_text(title)),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                .child(components::line_text(hint)),
+                        ),
+                )
+        };
+        let tiles = div()
+            .flex()
+            .flex_wrap()
+            .w_full()
+            .gap(metrics.scale(spacing::TIGHT))
+            .child(
+                tile(
+                    "quick",
+                    Icon::ArrowRight,
+                    ux.home_more_quick,
+                    ux.home_more_quick_hint,
+                )
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.focus_hosts_search(window, cx);
+                })),
+            )
+            .child(
+                tile(
+                    "import",
+                    Icon::Import,
+                    ux.home_import,
+                    ux.home_more_import_hint,
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.open_import(cx);
+                })),
+            )
+            .child(
+                tile(
+                    "local",
+                    Icon::Terminal,
+                    ux.home_local_button,
+                    ux.home_local_hint,
+                )
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    let choice = this.workspace.shell_choice();
+                    this.launch_choice(choice, window, cx);
+                })),
+            )
+            .child(
+                tile(
+                    "restore",
+                    Icon::FolderOpen,
+                    backup.home_restore,
+                    ux.home_more_restore_hint,
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.choose_backup_import(cx);
+                })),
+            );
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .w_full()
+                .gap(metrics.scale(spacing::TIGHT))
+                .pt(metrics.scale(spacing::LOOSE))
+                .debug_selector(|| "home.more".to_owned())
+                .child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .font_weight(metrics.medium_weight())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .child(components::line_text(ux.home_more_ways)),
+                )
+                .child(tiles),
+        )
     }
 
     /// What a list with no row says: the reason, and what would change it (R1, R3).
@@ -3230,6 +3430,58 @@ fn row_tools_slot(tools: Div, cursor: bool, keycap: Option<Stateful<Div>>) -> Di
         }))
 }
 
+/// The quiet facts of a row with its actions laid over them.
+///
+/// At rest a row shows what it is - its group, when it was last reached, its state -
+/// and no column of buttons. Under the pointer, and at once on the keyboard's row or
+/// the row Enter would open, the tools and Connect cover those facts in the same place,
+/// on the row's own fill, so nothing moves and no room is kept empty for them.
+fn row_facts_and_actions(
+    meta: Div,
+    tools: Div,
+    connect: Stateful<Div>,
+    shown: bool,
+    metrics: Metrics,
+) -> Div {
+    let veil = if shown {
+        palette::SURFACE_SELECTED
+    } else {
+        palette::SURFACE_HOVER
+    };
+    // The fills of a row are veils over the panel, so the cover is the panel's colour
+    // under the same veil: opaque, and the same shade as the row around it.
+    let actions = div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .right_0()
+        .flex()
+        .bg(theme::swatch(palette::RAISED))
+        .when(!shown, |cover| {
+            cover
+                .opacity(0.0)
+                .group_hover(components::ROW_GROUP, |style| style.opacity(1.0))
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap(metrics.scale(spacing::TIGHT))
+                .pl(metrics.scale(spacing::TIGHT))
+                .bg(theme::swatch(veil))
+                .child(tools)
+                .child(connect),
+        );
+    div()
+        .relative()
+        .flex()
+        .flex_none()
+        .items_center()
+        .child(meta)
+        .child(actions)
+}
+
 /// The always-visible entry to every command a saved record offers.
 fn record_more_button(
     selector: String,
@@ -3426,15 +3678,26 @@ fn host_row_element(
             beside,
             metrics,
         ))
-        .child(row_meta(
-            number,
-            "hosts",
-            host.show_meta,
-            host.group.clone(),
-            last,
-            host.open,
+        .child(row_facts_and_actions(
+            row_meta(
+                number,
+                "hosts",
+                host.show_meta,
+                host.group.clone(),
+                last,
+                host.open,
+                metrics,
+                ux,
+            ),
+            row_tools_slot(
+                tools,
+                cursor,
+                host.enter
+                    .then(|| enter_keycap(format!("hosts.enter.{number}"), metrics, ux)),
+            ),
+            connect_button,
+            cursor || host.enter,
             metrics,
-            ux,
         ))
         .child(favorite_star(
             host.favorite,
@@ -3444,13 +3707,6 @@ fn host_row_element(
             weak,
             metrics,
         ))
-        .child(row_tools_slot(
-            tools,
-            cursor,
-            host.enter
-                .then(|| enter_keycap(format!("hosts.enter.{number}"), metrics, ux)),
-        ))
-        .child(connect_button)
         .child(record_more_button(
             format!("hosts.more.{number}"),
             id,
@@ -3587,15 +3843,27 @@ fn connection_row_element(
             metrics,
         ))
         // A running session of this record says so, exactly as a host row does (R2).
-        .child(row_meta(
-            number,
-            "hosts.connection",
-            connection.show_meta,
-            connection.group.clone(),
-            None,
-            connection.open,
+        .child(row_facts_and_actions(
+            row_meta(
+                number,
+                "hosts.connection",
+                connection.show_meta,
+                connection.group.clone(),
+                None,
+                connection.open,
+                metrics,
+                ux,
+            ),
+            row_tools_slot(
+                tools,
+                cursor,
+                connection
+                    .enter
+                    .then(|| enter_keycap(format!("hosts.connection.enter.{number}"), metrics, ux)),
+            ),
+            connect_button,
+            cursor || connection.enter,
             metrics,
-            ux,
         ))
         .child(favorite_star(
             connection.favorite,
@@ -3605,14 +3873,6 @@ fn connection_row_element(
             weak,
             metrics,
         ))
-        .child(row_tools_slot(
-            tools,
-            cursor,
-            connection
-                .enter
-                .then(|| enter_keycap(format!("hosts.connection.enter.{number}"), metrics, ux)),
-        ))
-        .child(connect_button)
         .child(record_more_button(
             format!("hosts.connection.more.{number}"),
             id,

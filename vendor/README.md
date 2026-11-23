@@ -220,6 +220,9 @@ pointer: a host list inside a scrolling dialog moved together with the dialog. T
 patch keeps each container's maximum scroll from its last prepaint
 (`Interactivity::scroll_max`) and, in `paint_scroll_listener`, clamps the new offset
 first: when it changes, the event is consumed (`stop_propagation`); when the
-container is already at its end, the event reaches the containers behind it. Check
+container is already at its end, the event reaches the containers behind it. The
+scroll listener is registered before the element's own mouse listeners, so its
+`on_scroll_wheel` handlers (dispatched in reverse) still run when the container
+consumes the wheel - the settings page drops its pending category reveal there. Check
 after re-applying: a host picker in the port-forwarding dialog scrolls without moving
 the dialog, and keeps scrolling the dialog once the picker reaches its end.

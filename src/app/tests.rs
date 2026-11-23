@@ -13357,8 +13357,9 @@ async fn the_failed_reads_typed_entries_are_reached_and_pressed_with_the_keyboar
     let (view, cx, _id, files, transfers) = keyboard_remote(cx);
 
     // The page is already as small and as large-typed as it gets, so the slice the entries
-    // have to be reached in is the one measured below.
-    cx.simulate_resize(narrow_window());
+    // have to be reached in is the one measured below. The window is a little shorter than
+    // the narrow one, so the slice stays shorter than the card under the low top row.
+    cx.simulate_resize(size(narrow_window().width, px(440.0)));
     cx.run_until_parked();
     largest_text_size(&view, cx);
     cx.run_until_parked();
@@ -27357,6 +27358,52 @@ async fn a_short_book_has_no_recent_strip(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn a_small_book_sits_on_a_short_panel_and_offers_the_other_ways_to_start(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("home-more-ways");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("web", "10.0.0.5", 22, "deploy", None),
+            stored_host("db", "10.0.0.9", 22, "postgres", None),
+        ],
+    );
+    let (_view, cx) = hosts_view_with_trust(cx, &dir);
+
+    // The panel is as tall as its two rows, not the whole column.
+    let panel = bounds_of(cx, "hosts.panel");
+    let row = theme::Metrics::default().list_row_height();
+    assert!(
+        panel.size.height < row * 3.0,
+        "the panel hugs its two rows: {panel:?}"
+    );
+    // Under it, the ways to start that a small book has room for.
+    let more = bounds_of(cx, "home.more");
+    assert!(
+        more.top() >= panel.bottom(),
+        "the tiles follow the list: {more:?} under {panel:?}"
+    );
+    for tile in [
+        "home.more.quick",
+        "home.more.import",
+        "home.more.local",
+        "home.more.restore",
+    ] {
+        assert!(cx.debug_bounds(tile).is_some(), "{tile} is offered");
+    }
+
+    // The quick-connect tile hands the keyboard to the search.
+    click(cx, "home.more.quick");
+    cx.simulate_input("web");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("hosts.list.1").is_some(),
+        "what is typed after the tile narrows the list"
+    );
+}
+
+#[gpui::test]
 async fn a_double_click_on_a_host_row_connects_and_a_single_click_does_not(
     cx: &mut TestAppContext,
 ) {
@@ -27674,6 +27721,25 @@ async fn the_settings_page_scrolls_through_every_category_and_the_navigation_fol
     assert!(
         about.origin.y < area.origin.y + area.size.height,
         "the chosen category is scrolled into view: {about:?} in {area:?}"
+    );
+
+    // After a press in the navigation the wheel still scrolls the page: the reveal
+    // lets go instead of pulling the page back to the chosen heading every frame.
+    click(cx, "settings.category.terminal");
+    cx.run_until_parked();
+    let revealed = bounds_of(cx, "settings.section.terminal").origin.y;
+    for _ in 0..3 {
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(center.x, center.y),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+    }
+    let scrolled = bounds_of(cx, "settings.section.terminal").origin.y;
+    assert!(
+        scrolled < revealed - px(200.0),
+        "the wheel moved the page on from the revealed heading: {revealed:?} -> {scrolled:?}"
     );
 }
 
@@ -38425,7 +38491,7 @@ async fn a_state_card_in_a_short_pane_starts_at_its_top_and_scrolls_under_the_wh
 
     // Shorter than the compact window: the pane the card is drawn in has to be
     // shorter than the card for the card to be read by turning.
-    cx.simulate_resize(size(px(520.0), px(380.0)));
+    cx.simulate_resize(size(px(520.0), px(340.0)));
     largest_text_size(&view, cx);
     cx.run_until_parked();
 
@@ -39633,7 +39699,7 @@ async fn the_brand_fits_the_smallest_window_at_the_largest_text(cx: &mut TestApp
     }
 }
 
-/// The tabs stand in the middle of the head, 34 high; the current tab is the one raised
+/// The tabs stand in the middle of the head, 28 high; the current tab is the one raised
 /// pill and the hosts tab is pinned before the session tabs (ADR-7).
 #[gpui::test]
 async fn the_tabs_are_pills_in_the_middle_of_the_head(cx: &mut TestAppContext) {
@@ -39641,12 +39707,12 @@ async fn the_tabs_are_pills_in_the_middle_of_the_head(cx: &mut TestAppContext) {
     cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
     cx.simulate_resize(design_window());
     cx.run_until_parked();
-    assert_eq!(theme::Metrics::default().tab_height(), px(34.0));
+    assert_eq!(theme::Metrics::default().tab_height(), px(28.0));
     let head = bounds_of(cx, "topbar");
     let home = bounds_of(cx, "nav.hosts");
     assert!(
-        (home.size.height - px(34.0)).abs() <= px(0.5),
-        "a tab is 34 high: {home:?}"
+        (home.size.height - px(28.0)).abs() <= px(0.5),
+        "a tab is 28 high: {home:?}"
     );
     assert!(
         home.top() > head.top() + px(1.0)

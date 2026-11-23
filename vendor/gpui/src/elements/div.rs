@@ -1856,13 +1856,17 @@ impl Interactivity {
                                                 );
                                             }
 
+                                            // Shellune patch: the scroll listener goes in
+                                            // first, so the element's own wheel listeners
+                                            // (dispatched in reverse) still hear a wheel the
+                                            // chaining below stops at this container.
+                                            self.paint_scroll_listener(hitbox, &style, window, cx);
                                             self.paint_mouse_listeners(
                                                 hitbox,
                                                 element_state.as_mut(),
                                                 window,
                                                 cx,
                                             );
-                                            self.paint_scroll_listener(hitbox, &style, window, cx);
                                         }
 
                                         self.paint_keyboard_listeners(window, cx);

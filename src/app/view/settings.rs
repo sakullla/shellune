@@ -513,6 +513,11 @@ impl ShelluneView {
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 this.settings_page_key(event, window, cx);
             }))
+            // Any press on the page - the scrollbar's thumb too - hands the scroll back to
+            // the reader; a press on a category sets the reveal again on its click.
+            .capture_any_mouse_down(cx.listener(|this, _event, _window, _cx| {
+                this.settings_pending_reveal.set(false);
+            }))
             .flex()
             .flex_col()
             .flex_1()

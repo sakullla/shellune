@@ -1513,7 +1513,7 @@ impl Metrics {
 
     /// Height of the header that names the current object.
     pub fn header_height(self) -> Pixels {
-        self.scale(46.0)
+        self.scale(38.0)
     }
 
     /// Height of one list row.
@@ -1555,12 +1555,12 @@ impl Metrics {
         self.compact_control_height().max(px(HIT_TARGET))
     }
 
-    /// Height of one tab of the strip: 34 (ADR-7).
+    /// Height of one tab of the strip: 28, the compact controls' height (ADR-7).
     ///
     /// The tabs stand in the middle of the head, so the head's own height leaves an
     /// even margin above and below the current tab's raised pill.
     pub fn tab_height(self) -> Pixels {
-        self.scale(34.0)
+        self.scale(28.0)
     }
 
     /// The narrowest a tab of the strip becomes before the strip scrolls instead (R2).

@@ -3299,6 +3299,16 @@ pub struct UxStrings {
     pub home_recent_strip_hint: &'static str,
     /// The strip's link to the full recent view
     pub home_recent_strip_all: &'static str,
+    /// The heading over the starting points a small book offers under its list.
+    pub home_more_ways: &'static str,
+    /// What an import from the SSH config does, under its tile.
+    pub home_more_import_hint: &'static str,
+    /// What a restore does, under its tile.
+    pub home_more_restore_hint: &'static str,
+    /// What the quick-connect tile says: typing an address into the search connects.
+    pub home_more_quick: &'static str,
+    /// The line under the quick-connect tile.
+    pub home_more_quick_hint: &'static str,
     /// The home page's menu of local terminals
     pub home_local_button: &'static str,
     /// Heading of the serial connections in that menu
@@ -3863,6 +3873,11 @@ impl UxStrings {
             self.home_recent_strip,
             self.home_recent_strip_hint,
             self.home_recent_strip_all,
+            self.home_more_ways,
+            self.home_more_import_hint,
+            self.home_more_restore_hint,
+            self.home_more_quick,
+            self.home_more_quick_hint,
             self.home_local_button,
             self.home_serial_section,
             self.home_serial_new,
@@ -4366,6 +4381,11 @@ included",
     home_recent_strip: "Recent",
     home_recent_strip_hint: "Connect to {target} · {when}",
     home_recent_strip_all: "View all",
+    home_more_ways: "More ways to start",
+    home_more_import_hint: "Bring in the hosts of ~/.ssh/config",
+    home_more_restore_hint: "Hosts, keys and settings from a backup file",
+    home_more_quick: "Quick connect",
+    home_more_quick_hint: "Type user@host in the search and press Enter",
     home_local_button: "Local terminal",
     home_serial_section: "Serial",
     home_serial_new: "New serial connection",
@@ -4864,6 +4884,11 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     home_recent_strip: "最近",
     home_recent_strip_hint: "连接到 {target} · {when}",
     home_recent_strip_all: "查看全部",
+    home_more_ways: "更多开始方式",
+    home_more_import_hint: "导入 ~/.ssh/config 中的主机",
+    home_more_restore_hint: "从备份文件恢复主机、密钥和设置",
+    home_more_quick: "快速连接",
+    home_more_quick_hint: "在搜索框输入 user@host 后按回车",
     home_local_button: "本地终端",
     home_serial_section: "串口",
     home_serial_new: "新建串口连接",
