@@ -1862,11 +1862,16 @@ impl TerminalPane {
         let was_alternate = self.alternate_screen();
         let mut live = self.state.accepts_input();
         let changed = !events.is_empty();
-        let mut control = false;
+        // Coalesce plain log traffic. Applications that repaint the screen or
+        // change rendition keep their normal display cadence.
+        let mut streaming_text = ssh && !was_alternate;
         let mut output_bytes = 0;
         while !events.is_empty() {
             for event in coalesce_output(events) {
                 if let SourceEvent::Data(bytes) = event {
+                    if streaming_text && bytes.contains(&0x1b) {
+                        streaming_text = false;
+                    }
                     output_bytes += bytes.len();
                     self.wake_cursor();
                     let effects = self.core.feed(&bytes);
@@ -1874,7 +1879,7 @@ impl TerminalPane {
                     self.output_search_pending = self.search_open;
                     live = self.state.accepts_input();
                 } else {
-                    control = true;
+                    streaming_text = false;
                     live = self.handle_event(event, cx);
                 }
             }
@@ -1901,7 +1906,7 @@ impl TerminalPane {
             cx.notify();
         }
         if changed {
-            if ssh && !control {
+            if streaming_text && !self.alternate_screen() {
                 self.repaint_ssh_output(output_bytes, cx);
             } else {
                 cx.notify();
