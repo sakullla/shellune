@@ -224,24 +224,6 @@ pub mod dark {
     pub const SHADOW: u32 = 0x000000;
     /// The terminal's selection: the accent 32% over the terminal's background.
     pub const SELECTION: u32 = 0x32405f;
-    /// Twelve avatar pairs (tint, letters) around the hue wheel. They are built in
-    /// OKLCH at one lightness and one chroma (tint L 0.36 C 0.075, letters L 0.90
-    /// C 0.085), so each host keeps a colour of its own that is told apart at a glance
-    /// and none of them is louder than the rest.
-    pub const AVATARS: [(u32, u32); 12] = [
-        (0x293b64, 0xc3deff),
-        (0x02435f, 0xa6e8ff),
-        (0x004850, 0x98eff9),
-        (0x00493f, 0x9df1e0),
-        (0x14482b, 0xb1efc6),
-        (0x304517, 0xcceaae),
-        (0x463d00, 0xebe09e),
-        (0x543601, 0xffd79f),
-        (0x5c3015, 0xffceac),
-        (0x5f2c29, 0xffc9c2),
-        (0x5b2b3f, 0xffc7e1),
-        (0x4e2f55, 0xf8ccff),
-    ];
     pub const TAB_ACCENTS: [u32; 6] = [0x9cbcd8, 0xb9aecb, 0x8fc6cf, 0xaec79a, 0xd3bc9c, 0xd4a8ae];
 }
 
@@ -301,21 +283,6 @@ pub mod light {
     pub const SHADOW: u32 = 0x000000;
     /// The terminal's selection: the accent 22% over the light terminal's background.
     pub const SELECTION: u32 = 0xccd7f2;
-    /// The same twelve hues as the dark avatars, as pale tints with deep letters.
-    pub const AVATARS: [(u32, u32); 12] = [
-        (0xd8e8ff, 0x294793),
-        (0xc9eeff, 0x005589),
-        (0xc2f2f8, 0x005f6e),
-        (0xc5f3e9, 0x006250),
-        (0xcff2da, 0x00602a),
-        (0xddefcc, 0x345a00),
-        (0xefe9c3, 0x5e4c00),
-        (0xfce4c4, 0x753e00),
-        (0xffdfcb, 0x823000),
-        (0xffdcd7, 0x862726),
-        (0xffdbe9, 0x802651),
-        (0xf7defd, 0x6b3078),
-    ];
     pub const TAB_ACCENTS: [u32; 6] = [0x2f5f86, 0x5d4a80, 0x1a6b74, 0x51662f, 0x8a5a20, 0x8b4450];
 
     /// The terminal's default colours and its 16 ANSI colours on light paper.
@@ -470,23 +437,6 @@ pub mod palette {
         Token::veil(dark::SURFACE_SELECTED, light::SURFACE_SELECTED);
     /// A control under the pressed pointer, one step past selected. A veil.
     pub const SURFACE_PRESSED: Token = Token::veil(dark::SURFACE_PRESSED, light::SURFACE_PRESSED);
-
-    /// Host avatar pairs (tint, initials): eight low-chroma hues.
-    ///
-    /// An avatar says which host this is, so it must not compete with the accent that
-    /// says which host is current, nor with the status colours.
-    pub const AVATARS: [(Token, Token); 12] = {
-        let mut pairs = [(CANVAS, CANVAS); 12];
-        let mut index = 0;
-        while index < 12 {
-            pairs[index] = (
-                Token::new(dark::AVATARS[index].0, light::AVATARS[index].0),
-                Token::new(dark::AVATARS[index].1, light::AVATARS[index].1),
-            );
-            index += 1;
-        }
-        pairs
-    };
 
     /// Tab identity colours, in `TabAccent::ALL` order: slate, heather, steel, sage,
     /// sand, dust.
@@ -2170,9 +2120,6 @@ mod tests {
             ("on danger", palette::ON_DANGER, palette::DANGER_SOLID),
         ] {
             assert_floor(name, text, fill, BODY);
-        }
-        for (tint, text) in palette::AVATARS {
-            assert_floor(&format!("avatar {text:x}"), text, tint, BODY);
         }
         // An inactive control is still read, and an indicator is a graphic.
         assert_floor(

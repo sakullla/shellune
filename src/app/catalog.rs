@@ -14,7 +14,7 @@ use crate::app::components::{
     self, ButtonSize, ControlState, ListRow, Progress, Variant, button_sized, button_with_state,
 };
 use crate::app::icons::{self, Icon};
-use crate::app::theme::{self, Metrics, Token, Tone, palette, spacing};
+use crate::app::theme::{self, Metrics, Tone, palette, spacing};
 
 /// The four columns of the page, left to right.
 const COLUMNS: usize = 4;
@@ -237,28 +237,27 @@ fn feedback(metrics: Metrics) -> Div {
 
 /// The sidebar entries, the list rows and a toolbar.
 fn lists(metrics: Metrics) -> Div {
-    let avatar = |name: &'static str, pair: (Token, Token)| {
+    let avatar = |name: &'static str| {
         div()
             .flex()
             .flex_none()
             .items_center()
             .justify_center()
             .size(metrics.control_height())
-            .rounded(gpui::px(theme::radius::MEDIUM))
-            .bg(theme::swatch(pair.0))
+            .rounded(gpui::px(theme::radius::LARGE))
+            .bg(theme::swatch(palette::SURFACE_SELECTED))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
             .text_size(metrics.caption_size())
             .font_weight(metrics.title_weight())
-            .text_color(theme::swatch(pair.1))
+            .text_color(theme::swatch(palette::TEXT_SECONDARY))
             .child(crate::app::view::host_initials(name))
             .into_any_element()
     };
-    let row = |name: &'static str, address: &'static str, state: ControlState, index: usize| {
+    let row = |name: &'static str, address: &'static str, state: ControlState| {
         components::list_row(
             ListRow {
-                leading: Some(avatar(
-                    name,
-                    palette::AVATARS[index % palette::AVATARS.len()],
-                )),
+                leading: Some(avatar(name)),
                 title: SharedString::from(name),
                 subtitle: Some(SharedString::from(address)),
                 monospace_subtitle: true,
@@ -319,19 +318,13 @@ fn lists(metrics: Metrics) -> Div {
                 .child(components::sidebar_icon_item(Icon::Server, true, metrics))
                 .child(components::sidebar_icon_item(Icon::Layers, false, metrics)),
         )
-        .child(row(
-            "build-01",
-            "deploy@192.0.2.11",
-            ControlState::Resting,
-            0,
-        ))
+        .child(row("build-01", "deploy@192.0.2.11", ControlState::Resting))
         .child(row(
             "api-02",
             "deploy@192.0.2.24:2222",
             ControlState::Selected,
-            1,
         ))
-        .child(row("edge-03", "ops@198.51.100.7", ControlState::Hovered, 2))
+        .child(row("edge-03", "ops@198.51.100.7", ControlState::Hovered))
 }
 
 /// The floating layers: a menu, a toast and a status card.

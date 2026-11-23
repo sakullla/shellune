@@ -106,9 +106,6 @@ const RECENT_CHIP_WIDTH: f32 = 168.0;
 /// The edge of the small letter tile inside a recent chip, before zoom.
 const RECENT_CHIP_TILE: f32 = 20.0;
 
-/// The letters inside that tile, before zoom: half its edge, as a host avatar's are.
-const RECENT_CHIP_TILE_TEXT: f32 = RECENT_CHIP_TILE * 0.5;
-
 /// The room the strip's label and its "View all" take, before zoom.
 const RECENT_STRIP_FRAME_WIDTH: f32 = 180.0;
 
@@ -1960,7 +1957,6 @@ impl ShelluneView {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
         let monograms = self.monograms();
-        let hues = palette::AVATARS;
         let mut strip = div()
             .flex()
             .flex_none()
@@ -1993,7 +1989,7 @@ impl ShelluneView {
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| crate::app::monogram::initials(&name));
-            let (tile, ink) = hues[crate::app::monogram::colour_index(&name, hues.len())];
+            let platform = self.host_platform(id).map(str::to_owned);
             let when = copy::relative_time(entry.last_connected_unix, now, copy::Locale::current());
             let tip = copy::fill(
                 ux.home_recent_strip_hint,
@@ -2021,20 +2017,14 @@ impl ShelluneView {
                     .cursor_pointer()
                     .hover(move |style| style.bg(hover))
                     .tooltip(components::tooltip(tip))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .size(metrics.scale(RECENT_CHIP_TILE))
-                            .rounded(px(radius::SMALL))
-                            .bg(theme::swatch(tile))
-                            .text_size(metrics.scale(RECENT_CHIP_TILE_TEXT))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(theme::swatch(ink))
-                            .child(SharedString::from(letters)),
-                    )
+                    // The list's own tile, small: one look for a host wherever it is.
+                    .child(super::host_avatar_sized(
+                        &letters,
+                        platform.as_deref(),
+                        false,
+                        RECENT_CHIP_TILE,
+                        metrics,
+                    ))
                     .child(
                         div()
                             .min_w_0()
@@ -3728,7 +3718,6 @@ fn host_row_element(
     // boxes.
     let picking = selected || host.selecting;
     let avatar = super::host_avatar(
-        host.name.as_ref(),
         host.monogram.as_ref(),
         host.platform.as_ref().map(SharedString::as_ref),
         selected,
@@ -4017,7 +4006,6 @@ fn connection_row_element(
                         .tooltip(components::tooltip(ux.hosts_selection_ssh_only))
                 })
                 .child(super::host_avatar(
-                    connection.name.as_ref(),
                     connection.monogram.as_ref(),
                     None,
                     false,

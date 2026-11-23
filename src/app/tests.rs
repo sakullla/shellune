@@ -2706,13 +2706,29 @@ fn body_text_reaches_the_contrast_floor_on_every_surface() {
 
 #[test]
 fn host_avatar_initials_are_readable_on_their_tint() {
-    for (tint, text) in palette::AVATARS {
-        let ratio = theme::contrast::worst(text, tint);
+    // The tile is the selected veil over whatever the row stands on, its letters in the
+    // secondary ink; a picked row's tile is the accent tint with the accent's ink.
+    for (layer_name, layer) in [
+        ("surface", palette::SURFACE),
+        ("raised", palette::RAISED),
+        ("overlay", palette::OVERLAY),
+        (
+            "hovered raised",
+            palette::SURFACE_HOVER.over(palette::RAISED),
+        ),
+    ] {
+        let tile = palette::SURFACE_SELECTED.over(layer);
+        let ratio = theme::contrast::worst(palette::TEXT_SECONDARY, tile);
         assert!(
             ratio >= BODY_CONTRAST_FLOOR,
-            "avatar {text:x} on {tint:x} is {ratio:.2}:1"
+            "the avatar's letters on {layer_name} are {ratio:.2}:1"
         );
     }
+    let picked = theme::contrast::worst(palette::ACCENT_ON_TINT, palette::ACCENT_TINT);
+    assert!(
+        picked >= BODY_CONTRAST_FLOOR,
+        "a picked avatar is {picked:.2}:1"
+    );
 }
 
 #[test]
@@ -18510,11 +18526,6 @@ fn every_token_has_a_light_value_of_its_own() {
     ];
     for (name, token) in tokens
         .into_iter()
-        .chain(
-            palette::AVATARS
-                .iter()
-                .flat_map(|(tint, text)| [("avatar tint", *tint), ("avatar text", *text)]),
-        )
         .chain(palette::TAB_ACCENTS.map(|token| ("tab accent", token)))
     {
         assert_ne!(

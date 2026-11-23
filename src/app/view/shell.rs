@@ -1790,7 +1790,6 @@ impl ShelluneView {
         let in_flight = panel.status().is_busy() || panel.status().is_asking();
         let (header, subtitle) = self.modal_header_lead(
             Some(host_avatar(
-                host.name(),
                 &self
                     .monograms()
                     .remove(&host.id())

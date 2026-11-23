@@ -19603,6 +19603,45 @@ impl ShelluneView {
             .child(SharedString::from(text))
     }
 
+    /// The small tile of the saved record a session was started from, as the hosts list
+    /// draws it: `None` for a local shell, or for a record that is no longer saved.
+    fn tab_avatar(
+        &self,
+        kind: &SessionKind,
+        monograms: &std::collections::HashMap<HostId, String>,
+        metrics: Metrics,
+    ) -> Option<Div> {
+        let id = match kind {
+            SessionKind::Remote { host }
+            | SessionKind::Rdp { host }
+            | SessionKind::Vnc { host }
+            | SessionKind::Serial { host } => *host,
+            SessionKind::Local { .. } => return None,
+        };
+        let name = self
+            .book
+            .host(id)
+            .map(|host| host.name().to_owned())
+            .or_else(|| {
+                self.book
+                    .connections()
+                    .iter()
+                    .find(|record| record.id() == id)
+                    .map(|record| record.name().to_owned())
+            })?;
+        let monogram = monograms
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| crate::app::monogram::initials(&name));
+        Some(host_avatar_sized(
+            &monogram,
+            self.host_platform(id),
+            false,
+            TAB_AVATAR_SIZE,
+            metrics,
+        ))
+    }
+
     /// The tab of one session: what it is, what it runs and what it is doing.
     ///
     /// Every part R7 asks for is here: the name, the kind and the connection state are
@@ -19616,6 +19655,7 @@ impl ShelluneView {
         &self,
         id: SessionId,
         index: usize,
+        monograms: &std::collections::HashMap<HostId, String>,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
@@ -19732,16 +19772,25 @@ impl ShelluneView {
             )
             // The one tab of a compact row gives the kind's icon up to its title: the
             // kind is in the tooltip, and the name is what tells the tab apart (R2, R9).
+            // A tab of a saved record wears that record's tile from the hosts list - its
+            // colour, its letters or its system's mark - so a tab and its row are
+            // recognised as one thing; a local shell keeps the terminal icon.
             .when(!self.header_compact(), |body| {
-                body.child(tab_icon(
-                    match kind {
-                        PaneKind::Remote => Icon::Server,
-                        PaneKind::Desktop => Icon::Monitor,
-                        PaneKind::Local | PaneKind::Serial => Icon::Terminal,
-                    },
-                    selected,
-                    metrics,
-                ))
+                body.child(match self.tab_avatar(session.kind(), monograms, metrics) {
+                    Some(avatar) => avatar
+                        .debug_selector(move || format!("session.tab.avatar.{index}"))
+                        .into_any_element(),
+                    None => tab_icon(
+                        match kind {
+                            PaneKind::Remote => Icon::Server,
+                            PaneKind::Desktop => Icon::Monitor,
+                            PaneKind::Local | PaneKind::Serial => Icon::Terminal,
+                        },
+                        selected,
+                        metrics,
+                    )
+                    .into_any_element(),
+                })
             })
             .child(tab_title_label(
                 title,
@@ -19909,9 +19958,12 @@ impl ShelluneView {
             .min_w_0()
             .debug_selector(|| "session.tabs".to_owned());
         let shown = |index: usize| !compact || index == active.unwrap_or(0);
+        // The letters of every saved record, worked out once for the strip: a remote
+        // tab wears its host's tile, and the letters are the list's own.
+        let monograms = self.monograms();
         for index in (0..layout.tabs().len()).filter(|index| shown(*index)) {
             if let Some(id) = layout.anchor_of(index) {
-                scroller = scroller.child(self.session_tab(id, index, window, cx));
+                scroller = scroller.child(self.session_tab(id, index, &monograms, window, cx));
             } else {
                 scroller = scroller.child(self.pending_tab(index, window, cx));
             }
@@ -21309,6 +21361,24 @@ const TAB_ACCENT_MARK_HEIGHT: f32 = 16.0;
 /// The edge of a host's initials tile, in logical pixels before zoom.
 const HOST_AVATAR_SIZE: f32 = 36.0;
 
+/// The edge of the host tile a tab wears in place of the kind's icon: a little larger
+/// than the icon it replaces, so two letters still read.
+const TAB_AVATAR_SIZE: f32 = 18.0;
+
+/// The least share of the label size a small tile's letters keep, so a tab's two
+/// letters are not shrunk past reading.
+const AVATAR_MIN_TEXT_SHARE: f32 = 0.8;
+
+/// The letters of a tile, as a share of the label size at its size: a step under the
+/// name beside it, so the tile never shouts over the name.
+const AVATAR_TEXT_SHARE: f32 = 0.9;
+
+/// The system's mark, as a share of the tile's edge.
+const AVATAR_MARK_SHARE: f32 = 0.5;
+
+/// The smallest tile that draws its hairline edge: a list's tile does, a tab's does not.
+const AVATAR_FRAME_FROM: f32 = 24.0;
+
 /// How far a scroll offset may be from the one wanted, in pixels, before it is set
 /// again: closer than half a pixel draws the same frame.
 const SCROLL_SLACK: f32 = 0.5;
@@ -22020,53 +22090,70 @@ fn rebase_group_path(path: &GroupPath, from: &GroupPath, to: &GroupPath) -> Opti
     GroupPath::parse(&joined).ok()
 }
 
-/// A rounded square with the letters of a host, so a list is scanned by shape and
-/// colour before it is read.
+/// A rounded square with the system's mark or the letters of a host.
 ///
 /// The letters are the record's monogram, chosen against every saved record so two
-/// rows rarely share them; the colour is a hash of the whole name, so two that do
-/// still differ. A host that was really reached before is tinted in the positive tone,
-/// the same rule the recent view uses for its dot.
-fn host_avatar(
-    name: &str,
+/// rows rarely share them. The tile itself is neutral (see [`host_avatar_sized`]); a
+/// picked row's tile takes the accent with the row.
+fn host_avatar(monogram: &str, platform: Option<&str>, reached: bool, metrics: Metrics) -> Div {
+    host_avatar_sized(monogram, platform, reached, HOST_AVATAR_SIZE, metrics)
+}
+
+/// [`host_avatar`] at `size` logical pixels: the letters, the mark and the corner keep
+/// the list tile's proportions, so a tab's small tile is the same tile.
+fn host_avatar_sized(
     monogram: &str,
     platform: Option<&str>,
     reached: bool,
+    size: f32,
     metrics: Metrics,
 ) -> Div {
-    let (background, text) = if reached {
-        (palette::POSITIVE_TINT, palette::POSITIVE)
+    // A quiet tile, not a coloured block: a veil of the ink over whatever it sits on, a
+    // hairline edge at list size, and the system's mark or the letters in the secondary
+    // ink. Twelve saturated squares down a list read as a toy; the name and the address
+    // beside the tile are what tell hosts apart, and the system's mark helps where it is
+    // known. Only a picked row's tile takes the accent, with the row.
+    let (fill, ink) = if reached {
+        (palette::ACCENT_TINT, palette::ACCENT_ON_TINT)
     } else {
-        let hues = palette::AVATARS;
-        hues[crate::app::monogram::colour_index(name, hues.len())]
+        (palette::SURFACE_SELECTED, palette::TEXT_SECONDARY)
     };
+    let share = size / HOST_AVATAR_SIZE;
     let tile = div()
         .flex()
         .flex_none()
         .items_center()
         .justify_center()
-        .size(metrics.scale(HOST_AVATAR_SIZE))
-        .rounded(px(radius::LARGE))
-        .bg(theme::swatch(background))
-        .text_size(metrics.label_size())
-        .font_weight(FontWeight::BOLD)
-        .text_color(theme::swatch(text));
-    // A server that said which system it runs shows that system's mark in its own
-    // colour; one that has not yet shows its letters. The colour stays the name's, so
-    // two Debian hosts are still two different tiles.
-    let mark = metrics.scale(HOST_AVATAR_SIZE * 0.5);
+        .size(metrics.scale(size))
+        .rounded(metrics.scale(radius::LARGE * share).max(px(radius::SMALL)))
+        .bg(theme::swatch(fill))
+        // The edge is for a tile that stands in a list; a tab's small one is the mark
+        // alone on its veil, as an icon is.
+        .when(size >= AVATAR_FRAME_FROM, |tile| {
+            tile.border_1().border_color(theme::swatch(if reached {
+                palette::ACCENT_TINT
+            } else {
+                palette::BORDER
+            }))
+        })
+        .text_size(metrics.label_size() * share.max(AVATAR_MIN_TEXT_SHARE) * AVATAR_TEXT_SHARE)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme::swatch(ink));
+    // A server that said which system it runs shows that system's mark; one that has
+    // not yet shows its letters.
+    let mark = metrics.scale(size * AVATAR_MARK_SHARE);
     match platform {
         Some(id) if let Some(asset) = crate::app::os_icons::path(id) => {
             tile.debug_selector(move || format!("host.os.{id}")).child(
                 gpui::svg()
                     .path(asset)
                     .size(mark)
-                    .text_color(theme::swatch(text)),
+                    .text_color(theme::swatch(ink)),
             )
         }
         Some("windows") => tile
             .debug_selector(|| "host.os.windows".to_owned())
-            .child(icons::icon(Icon::Monitor, mark, theme::swatch(text))),
+            .child(icons::icon(Icon::Monitor, mark, theme::swatch(ink))),
         _ => tile.child(SharedString::from(monogram.to_owned())),
     }
 }
