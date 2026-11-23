@@ -151,27 +151,28 @@ impl std::fmt::LowerHex for Token {
     }
 }
 
-/// The dark palette: deep ink slate with one restrained periwinkle accent.
+/// The dark palette: near-black graphite with one clear periwinkle accent.
 ///
-/// The surfaces are a calm charcoal grey ramp - canvas, panel, raised, dialog - lifted
-/// off pitch black to reduce halation during long sessions. The interaction fills are
-/// white veils (hover 5%, selected 8%, pressed 10%) that lie over whichever layer they
-/// are drawn on; the hairlines are white over the panel (border 7%, strong border 12%),
-/// written here as the opaque colour that blend gives. A dark palette tells its layers
-/// apart by lightness and edge; the shadows are faint.
+/// The surfaces are a neutral graphite ramp - canvas, panel, raised, dialog - a step
+/// deeper than a grey slate, so text and the accent stand out and the layers still read
+/// apart. The floor stays off pitch black to reduce halation during long sessions. The
+/// interaction fills are white veils (hover 5%, selected 8%, pressed 10%) that lie over
+/// whichever layer they are drawn on; the hairlines are white over the panel (border 7%,
+/// strong border 12%), written here as the opaque colour that blend gives. A dark
+/// palette tells its layers apart by lightness and edge; the shadows are soft.
 pub mod dark {
     /// The window's floor: behind the content area and around the terminal. It is the
     /// terminal's own background, a step deeper than the panels, so the sidebar and the
     /// title bar read as a layer above the list and the terminal.
-    pub const CANVAS: u32 = 0x12151a;
+    pub const CANVAS: u32 = 0x0e1014;
     /// The title bar, the tab strip, the sidebar and the status bar: the panel layer.
-    pub const CHROME: u32 = 0x1c1f26;
+    pub const CHROME: u32 = 0x16181d;
     /// Panels, inputs, rows and cards.
-    pub const SURFACE: u32 = 0x1c1f26;
+    pub const SURFACE: u32 = 0x16181d;
     /// Things that float over content: menus, popovers, tooltips and toasts.
-    pub const RAISED: u32 = 0x232730;
+    pub const RAISED: u32 = 0x1d2026;
     /// Dialogs, the front-most layer.
-    pub const OVERLAY: u32 = 0x292d36;
+    pub const OVERLAY: u32 = 0x22252c;
     /// White at 5%, over whatever layer it is on.
     pub const SURFACE_HOVER: (u32, u8) = (0xffffff, 5);
     /// White at 8%.
@@ -179,142 +180,141 @@ pub mod dark {
     /// White at 10%.
     pub const SURFACE_PRESSED: (u32, u8) = (0xffffff, 10);
     /// White 7% over the panel.
-    pub const BORDER: u32 = 0x2c2f35;
+    pub const BORDER: u32 = 0x26282d;
     /// White 12% over the panel.
-    pub const BORDER_STRONG: u32 = 0x373a40;
-    pub const SEGMENT_TRACK: u32 = 0x13151a;
-    pub const SEGMENT_THUMB: u32 = 0x2a2f3a;
-    pub const TEXT_PRIMARY: u32 = 0xeceef2;
-    pub const TEXT_SECONDARY: u32 = 0xc3c8cf;
-    pub const TEXT_MUTED: u32 = 0xa8aeb6;
+    pub const BORDER_STRONG: u32 = 0x323438;
+    pub const SEGMENT_TRACK: u32 = 0x0f1115;
+    pub const SEGMENT_THUMB: u32 = 0x2b2e36;
+    pub const TEXT_PRIMARY: u32 = 0xeff1f5;
+    pub const TEXT_SECONDARY: u32 = 0xc6cad2;
+    pub const TEXT_MUTED: u32 = 0xa7acb5;
     /// The hint inside an empty field: a step below muted, so a hint is never read as
     /// a value that was typed.
-    pub const TEXT_PLACEHOLDER: u32 = 0x7c818a;
-    pub const ACCENT: u32 = 0x82b0ff;
-    pub const ACCENT_HOVER: u32 = 0x94bcff;
-    pub const ACCENT_PRESSED: u32 = 0x70a3fa;
-    pub const ON_ACCENT: u32 = 0x12151a;
-    /// The accent 14% over the panel.
-    pub const ACCENT_TINT: u32 = 0x2a3344;
-    pub const ACCENT_ON_TINT: u32 = 0xc5dcff;
-    pub const POSITIVE: u32 = 0x72cc9a;
-    pub const WARNING: u32 = 0xdfb76c;
-    pub const DANGER: u32 = 0xf49696;
-    pub const INFO: u32 = 0x82b8f5;
-    pub const PLANNED: u32 = 0xa8aeb6;
+    pub const TEXT_PLACEHOLDER: u32 = 0x777c85;
+    pub const ACCENT: u32 = 0x7fa6ff;
+    pub const ACCENT_HOVER: u32 = 0x96b6ff;
+    pub const ACCENT_PRESSED: u32 = 0x6b95f7;
+    pub const ON_ACCENT: u32 = 0x0b0d12;
+    /// The accent 20% over the panel.
+    pub const ACCENT_TINT: u32 = 0x2b344a;
+    pub const ACCENT_ON_TINT: u32 = 0xc7d9ff;
+    pub const POSITIVE: u32 = 0x6fd3a0;
+    pub const WARNING: u32 = 0xe6bb69;
+    pub const DANGER: u32 = 0xf7958f;
+    pub const INFO: u32 = 0x7fb9f7;
+    pub const PLANNED: u32 = 0xa7acb5;
     /// Each status colour 14% over the panel.
-    pub const POSITIVE_TINT: u32 = 0x283736;
-    pub const WARNING_TINT: u32 = 0x373430;
-    pub const DANGER_TINT: u32 = 0x3a3036;
-    pub const INFO_TINT: u32 = 0x2a3443;
+    pub const POSITIVE_TINT: u32 = 0x22322f;
+    pub const WARNING_TINT: u32 = 0x332f28;
+    pub const DANGER_TINT: u32 = 0x362a2d;
+    pub const INFO_TINT: u32 = 0x252f3c;
     pub const DANGER_SOLID: u32 = 0xc42b1c;
     pub const ON_DANGER: u32 = 0xf7f8fa;
-    pub const TRACK_OFF: u32 = 0x565c66;
-    pub const TRACK_OFF_HOVER: u32 = 0x636a75;
-    pub const TRACK_ON: u32 = 0x4376dc;
-    pub const TRACK_ON_HOVER: u32 = 0x4f82e6;
-    pub const KNOB: u32 = 0xf0f3f8;
-    pub const FOCUS_RING: u32 = 0x94bcff;
-    pub const DISABLED_SURFACE: u32 = 0x20232b;
-    pub const DISABLED_TEXT: u32 = 0x898f97;
-    pub const LOADING_TRACK: u32 = 0x2e323c;
-    pub const LOADING_FILL: u32 = 0x82b0ff;
+    pub const TRACK_OFF: u32 = 0x555b66;
+    pub const TRACK_OFF_HOVER: u32 = 0x626873;
+    pub const TRACK_ON: u32 = 0x3f73e0;
+    pub const TRACK_ON_HOVER: u32 = 0x4b7fea;
+    pub const KNOB: u32 = 0xf2f4f8;
+    pub const FOCUS_RING: u32 = 0x96b6ff;
+    pub const DISABLED_SURFACE: u32 = 0x1b1d23;
+    pub const DISABLED_TEXT: u32 = 0x878c95;
+    pub const LOADING_TRACK: u32 = 0x2a2d35;
+    pub const LOADING_FILL: u32 = 0x7fa6ff;
     pub const SCRIM: u32 = 0x000000;
     pub const SHADOW: u32 = 0x000000;
     /// The terminal's selection: the accent 32% over the terminal's background.
-    pub const SELECTION: u32 = 0x364763;
-    /// Twelve avatar pairs (tint, letters), a hue every 30 degrees around the wheel.
-    /// They are built in OKLCH at one lightness and one chroma with the hues spread
-    /// evenly, so each host keeps a colour of its own that is told apart at
-    /// a glance and none of them is louder than the rest. The earlier greys-with-a-hint
-    /// all read as the same slate.
+    pub const SELECTION: u32 = 0x32405f;
+    /// Twelve avatar pairs (tint, letters) around the hue wheel. They are built in
+    /// OKLCH at one lightness and one chroma (tint L 0.36 C 0.075, letters L 0.90
+    /// C 0.085), so each host keeps a colour of its own that is told apart at a glance
+    /// and none of them is louder than the rest.
     pub const AVATARS: [(u32, u32); 12] = [
-        (0x28354e, 0xbcd4fe),
-        (0x193a4a, 0xa1dcfc),
-        (0x103c41, 0x96e1ea),
-        (0x143d36, 0x9be3d4),
-        (0x203d2a, 0xace2bd),
-        (0x2d3a1f, 0xc2dda9),
-        (0x3b3617, 0xded49b),
-        (0x443217, 0xf0cc9c),
-        (0x492e1e, 0xfcc5a7),
-        (0x4b2b29, 0xfec1bb),
-        (0x492b37, 0xfcbfd5),
-        (0x402d45, 0xe9c3f2),
+        (0x293b64, 0xc3deff),
+        (0x02435f, 0xa6e8ff),
+        (0x004850, 0x98eff9),
+        (0x00493f, 0x9df1e0),
+        (0x14482b, 0xb1efc6),
+        (0x304517, 0xcceaae),
+        (0x463d00, 0xebe09e),
+        (0x543601, 0xffd79f),
+        (0x5c3015, 0xffceac),
+        (0x5f2c29, 0xffc9c2),
+        (0x5b2b3f, 0xffc7e1),
+        (0x4e2f55, 0xf8ccff),
     ];
     pub const TAB_ACCENTS: [u32; 6] = [0x9cbcd8, 0xb9aecb, 0x8fc6cf, 0xaec79a, 0xd3bc9c, 0xd4a8ae];
 }
 
-/// The light palette: clean cool-neutral paper with graphite text and calm blue accent.
+/// The light palette: bright cool-neutral paper with graphite text and a vivid blue accent.
 ///
-/// The floor is clean alabaster, the panels one step quieter cool grey and anything that
+/// The floor is near-white paper, the panels one step quieter cool grey and anything that
 /// floats is crisp white; the interaction fills are black veils (hover 4%, selected 6%,
 /// pressed 8%) over whichever layer they are on, and the hairlines are black over the
 /// panel (border 8%, strong border 14%).
 pub mod light {
-    pub const CANVAS: u32 = 0xf7f8fa;
-    pub const CHROME: u32 = 0xf0f2f5;
-    pub const SURFACE: u32 = 0xf0f2f5;
+    pub const CANVAS: u32 = 0xfafbfc;
+    pub const CHROME: u32 = 0xf2f4f7;
+    pub const SURFACE: u32 = 0xf2f4f7;
     pub const RAISED: u32 = 0xffffff;
     pub const OVERLAY: u32 = 0xffffff;
     pub const SURFACE_HOVER: (u32, u8) = (0x000000, 4);
     pub const SURFACE_SELECTED: (u32, u8) = (0x000000, 6);
     pub const SURFACE_PRESSED: (u32, u8) = (0x000000, 8);
-    pub const BORDER: u32 = 0xdddfe1;
-    pub const BORDER_STRONG: u32 = 0xced0d3;
-    pub const SEGMENT_TRACK: u32 = 0xe6e8ec;
+    pub const BORDER: u32 = 0xdfe0e3;
+    pub const BORDER_STRONG: u32 = 0xd0d2d4;
+    pub const SEGMENT_TRACK: u32 = 0xe7e9ed;
     pub const SEGMENT_THUMB: u32 = 0xffffff;
-    pub const TEXT_PRIMARY: u32 = 0x16191d;
-    pub const TEXT_SECONDARY: u32 = 0x3f454d;
-    pub const TEXT_MUTED: u32 = 0x5d636b;
-    pub const TEXT_PLACEHOLDER: u32 = 0x7f858d;
-    pub const ACCENT: u32 = 0x2359c8;
-    pub const ACCENT_HOVER: u32 = 0x1d4db5;
-    pub const ACCENT_PRESSED: u32 = 0x17419e;
+    pub const TEXT_PRIMARY: u32 = 0x14171c;
+    pub const TEXT_SECONDARY: u32 = 0x3d424b;
+    pub const TEXT_MUTED: u32 = 0x5c606a;
+    pub const TEXT_PLACEHOLDER: u32 = 0x81868f;
+    pub const ACCENT: u32 = 0x2756cf;
+    pub const ACCENT_HOVER: u32 = 0x224dc0;
+    pub const ACCENT_PRESSED: u32 = 0x1b41a6;
     pub const ON_ACCENT: u32 = 0xffffff;
-    /// The accent 10% over white.
-    pub const ACCENT_TINT: u32 = 0xe9eefa;
-    pub const ACCENT_ON_TINT: u32 = 0x1c49a8;
-    pub const POSITIVE: u32 = 0x166b3f;
-    pub const WARNING: u32 = 0x805100;
-    pub const DANGER: u32 = 0xb22b35;
-    pub const INFO: u32 = 0x1e5da8;
-    pub const PLANNED: u32 = 0x565c64;
+    /// The accent 12% over white.
+    pub const ACCENT_TINT: u32 = 0xe5ebf9;
+    pub const ACCENT_ON_TINT: u32 = 0x1f49ad;
+    pub const POSITIVE: u32 = 0x136c41;
+    pub const WARNING: u32 = 0x7f5200;
+    pub const DANGER: u32 = 0xb42a34;
+    pub const INFO: u32 = 0x1c5dac;
+    pub const PLANNED: u32 = 0x555b64;
     /// Each status colour 10% over white.
-    pub const POSITIVE_TINT: u32 = 0xe8f0ec;
+    pub const POSITIVE_TINT: u32 = 0xe7f0ec;
     pub const WARNING_TINT: u32 = 0xf2eee6;
-    pub const DANGER_TINT: u32 = 0xf7eaeb;
-    pub const INFO_TINT: u32 = 0xe8eff6;
+    pub const DANGER_TINT: u32 = 0xf8eaeb;
+    pub const INFO_TINT: u32 = 0xe8eff7;
     pub const DANGER_SOLID: u32 = 0xc42b1c;
     pub const ON_DANGER: u32 = 0xffffff;
-    pub const TRACK_OFF: u32 = 0x848a92;
-    pub const TRACK_OFF_HOVER: u32 = 0x757b83;
-    pub const TRACK_ON: u32 = 0x2359c8;
-    pub const TRACK_ON_HOVER: u32 = 0x1d4db5;
+    pub const TRACK_OFF: u32 = 0x848a93;
+    pub const TRACK_OFF_HOVER: u32 = 0x757b84;
+    pub const TRACK_ON: u32 = 0x2756cf;
+    pub const TRACK_ON_HOVER: u32 = 0x224dc0;
     pub const KNOB: u32 = 0xffffff;
-    pub const FOCUS_RING: u32 = 0x1d4db5;
-    pub const DISABLED_SURFACE: u32 = 0xebedf0;
-    pub const DISABLED_TEXT: u32 = 0x737981;
-    pub const LOADING_TRACK: u32 = 0xe0e3e8;
-    pub const LOADING_FILL: u32 = 0x2359c8;
+    pub const FOCUS_RING: u32 = 0x224dc0;
+    pub const DISABLED_SURFACE: u32 = 0xeceef1;
+    pub const DISABLED_TEXT: u32 = 0x747982;
+    pub const LOADING_TRACK: u32 = 0xe1e4e9;
+    pub const LOADING_FILL: u32 = 0x2756cf;
     pub const SCRIM: u32 = 0x111318;
     pub const SHADOW: u32 = 0x000000;
     /// The terminal's selection: the accent 22% over the light terminal's background.
-    pub const SELECTION: u32 = 0xc8d5ef;
+    pub const SELECTION: u32 = 0xccd7f2;
     /// The same twelve hues as the dark avatars, as pale tints with deep letters.
     pub const AVATARS: [(u32, u32); 12] = [
-        (0xe3edff, 0x2e5091),
-        (0xdaf1fe, 0x025a7b),
-        (0xd7f3f6, 0x005e66),
-        (0xd8f4ed, 0x036054),
-        (0xdef3e4, 0x046337),
-        (0xe6f1dc, 0x3d5e06),
-        (0xf1eed7, 0x5e5301),
-        (0xf9ead7, 0x6f4a04),
-        (0xfee8db, 0x833b02),
-        (0xfee7e4, 0x873431),
-        (0xfee5ee, 0x813356),
-        (0xf6e7fa, 0x6e3a79),
+        (0xd8e8ff, 0x294793),
+        (0xc9eeff, 0x005589),
+        (0xc2f2f8, 0x005f6e),
+        (0xc5f3e9, 0x006250),
+        (0xcff2da, 0x00602a),
+        (0xddefcc, 0x345a00),
+        (0xefe9c3, 0x5e4c00),
+        (0xfce4c4, 0x753e00),
+        (0xffdfcb, 0x823000),
+        (0xffdcd7, 0x862726),
+        (0xffdbe9, 0x802651),
+        (0xf7defd, 0x6b3078),
     ];
     pub const TAB_ACCENTS: [u32; 6] = [0x2f5f86, 0x5d4a80, 0x1a6b74, 0x51662f, 0x8a5a20, 0x8b4450];
 
@@ -329,8 +329,8 @@ pub mod light {
     /// set itself (256-colour or true colour) is drawn as it asked.
     pub const TERMINAL: &[(u32, u32)] = &[
         (0xdde0e5, 0x272b34), // foreground
-        (0x12151a, 0xf7f8fa), // background
-        (0x8eb8fe, 0x2359c8), // cursor
+        (0x0e1014, 0xfafbfc), // background
+        (0x8eb8fe, 0x2756cf), // cursor
         (0x353941, 0x393d46), // black
         (0xf68882, 0xba3538), // red
         (0x6bc987, 0x137d41), // green
@@ -612,36 +612,40 @@ pub mod spacing {
     pub const SPACIOUS: f32 = 32.0;
 }
 
-/// Corner radii in logical pixels: 4, 6, 8 and 12.
+/// Corner radii in logical pixels: 5, 8, 10 and 14.
 ///
 /// The radius grows with the object: the smaller a thing is, the tighter its corner, so
 /// a chip inside a card does not look rounder than the card.
 pub mod radius {
     /// Tags, badges, keycaps and checkboxes.
-    pub const SMALL: f32 = 4.0;
+    pub const SMALL: f32 = 5.0;
     /// Buttons, inputs, rows and menu entries.
-    pub const MEDIUM: f32 = 6.0;
+    pub const MEDIUM: f32 = 8.0;
     /// Cards, menus, toasts, tooltips and the terminal frame.
-    pub const LARGE: f32 = 8.0;
+    pub const LARGE: f32 = 10.0;
     /// Dialogs, the command palette and the splash mark.
-    pub const XLARGE: f32 = 12.0;
+    pub const XLARGE: f32 = 14.0;
 }
 
-/// Type scale in logical pixels: 12, 13, 14, 16, 20 and 28.
+/// Type scale in logical pixels: 12, 14, 15, 17, 24 and 32.
+///
+/// Body copy is 14: at 13 the Chinese interface read cramped next to its own Latin
+/// addresses, and the step from body to a page title was too small to give a page a
+/// head. The titles step clearly away from the body so a page has a hierarchy.
 pub mod type_scale {
     /// Captions: hints, metadata, the status bar and shortcut hints.
     pub const CAPTION: f32 = 12.0;
     /// Body copy, list rows and every control's label.
-    pub const BODY: f32 = 13.0;
+    pub const BODY: f32 = 14.0;
     /// Emphasised body: a card's or a banner's headline.
     #[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
-    pub const EMPHASIS: f32 = 14.0;
+    pub const EMPHASIS: f32 = 15.0;
     /// A small heading: a panel or a dialog title.
-    pub const TITLE: f32 = 16.0;
+    pub const TITLE: f32 = 17.0;
     /// A page title.
-    pub const HEADING: f32 = 20.0;
+    pub const HEADING: f32 = 24.0;
     /// The brand: the welcome and the splash.
-    pub const HERO: f32 = 28.0;
+    pub const HERO: f32 = 32.0;
 }
 
 /// The three weights the interface uses.
@@ -1188,7 +1192,7 @@ pub enum Elevation {
     /// Resting on the page: a border and a soft 0 1 2 shadow. Cards, the primary
     /// button, the chosen segment, a switch's knob.
     Raised,
-    /// Over the page: a border and a 0 8 24 shadow. Menus, popovers, tooltips,
+    /// Over the page: a border and a deep, soft 0 16 40 shadow. Menus, popovers, tooltips,
     /// toasts, dialogs and the command palette.
     Overlay,
 }
@@ -1203,8 +1207,8 @@ impl Elevation {
             (Self::Flat, _) => &[],
             (Self::Raised, false) => &[(1.0, 2.0, 0.0, 0.06)],
             (Self::Raised, true) => &[(1.0, 2.0, 0.0, 0.24)],
-            (Self::Overlay, false) => &[(1.0, 2.0, 0.0, 0.04), (8.0, 24.0, 0.0, 0.12)],
-            (Self::Overlay, true) => &[(1.0, 2.0, 0.0, 0.20), (8.0, 24.0, 0.0, 0.36)],
+            (Self::Overlay, false) => &[(2.0, 6.0, 0.0, 0.05), (16.0, 40.0, 0.0, 0.14)],
+            (Self::Overlay, true) => &[(2.0, 6.0, 0.0, 0.22), (16.0, 40.0, 0.0, 0.40)],
         };
         let ink = swatch(palette::SHADOW);
         layers
@@ -1595,7 +1599,7 @@ impl Metrics {
     }
 
     /// The label of a control - a button, a field, a menu entry - and of a form row:
-    /// body size, 13.
+    /// body size, 14.
     pub fn label_size(self) -> Pixels {
         self.scale(type_scale::BODY)
     }
@@ -2463,9 +2467,9 @@ mod tests {
             assert!(Elevation::Flat.shadows().is_empty());
             assert!(reach(Elevation::Raised) < reach(Elevation::Overlay));
             assert!(ink(Elevation::Raised) <= ink(Elevation::Overlay));
-            // Raised is the soft 0 1 2 and the overlay reaches 0 8 24.
+            // Raised is the soft 0 1 2 and the overlay reaches 0 16 40.
             assert!((reach(Elevation::Raised) - 3.0).abs() < f32::EPSILON);
-            assert!((reach(Elevation::Overlay) - 32.0).abs() < f32::EPSILON);
+            assert!((reach(Elevation::Overlay) - 56.0).abs() < f32::EPSILON);
         }
         // A shadow on the dark floor stays faint: the layers are told apart by fill
         // and edge there.
@@ -2636,7 +2640,7 @@ mod tests {
     #[test]
     fn radii_and_type_grow_with_the_object() {
         let radii = [radius::SMALL, radius::MEDIUM, radius::LARGE, radius::XLARGE];
-        assert_eq!(radii, [4.0, 6.0, 8.0, 12.0]);
+        assert_eq!(radii, [5.0, 8.0, 10.0, 14.0]);
         let sizes = [
             type_scale::CAPTION,
             type_scale::BODY,
@@ -2645,7 +2649,7 @@ mod tests {
             type_scale::HEADING,
             type_scale::HERO,
         ];
-        assert_eq!(sizes, [12.0, 13.0, 14.0, 16.0, 20.0, 28.0]);
+        assert_eq!(sizes, [12.0, 14.0, 15.0, 17.0, 24.0, 32.0]);
         let steps = [
             spacing::HALF,
             spacing::HAIRLINE,

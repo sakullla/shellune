@@ -298,7 +298,8 @@ async fn the_top_bar_and_the_home_fit_inside_the_design_window(cx: &mut TestAppC
     for selector in TOP_BAR {
         assert_fits_inside(bounds_of(cx, selector), viewport, selector);
     }
-    assert_fits_inside(bounds_of(cx, "header.title"), viewport, "home title");
+    // A first start has no record, so the page's head is the welcome's own title.
+    assert_fits_inside(bounds_of(cx, "empty.state.title"), viewport, "home title");
     assert_fits_inside(bounds_of(cx, "hosts.search"), viewport, "the page's search");
     assert_fits_inside(bounds_of(cx, "home.local"), viewport, "local terminals");
     assert_fits_inside(bounds_of(cx, "hosts.new"), viewport, "new host");
@@ -393,7 +394,13 @@ async fn large_text_chinese_keeps_every_page_inside_the_narrow_window(cx: &mut T
         }
         cx.run_until_parked();
         assert_eq!(destination_of(&view, cx), page, "{name}");
-        assert_within_width(bounds_of(cx, "header.title"), viewport, name);
+        // The empty home's head is the welcome's title; the settings name their page.
+        let title = if page == Destination::Settings {
+            "header.title"
+        } else {
+            "empty.state.title"
+        };
+        assert_within_width(bounds_of(cx, title), viewport, name);
         assert_fits_inside(bounds_of(cx, "nav.settings"), viewport, name);
         assert_within_width(bounds_of(cx, "content"), viewport, name);
         if page == Destination::Settings {
@@ -403,7 +410,7 @@ async fn large_text_chinese_keeps_every_page_inside_the_narrow_window(cx: &mut T
             assert_fits_inside(bounds_of(cx, "settings.picker.category"), viewport, name);
             assert_within_width(bounds_of(cx, "settings.picker.item"), viewport, name);
         } else {
-            assert_fits_inside(bounds_of(cx, "header.title"), viewport, name);
+            assert_fits_inside(bounds_of(cx, title), viewport, name);
         }
     }
 }
@@ -33853,12 +33860,11 @@ async fn the_home_is_a_sidebar_a_toolbar_and_one_list(cx: &mut TestAppContext) {
         "the local terminal sits under the groups"
     );
 
-    // The toolbar: the place and its count, the one search, the two menus and the one
+    // The toolbar: the sidebar's switch, the one search, the two menus and the one
     // primary action.
     let toolbar = bounds_of(cx, "hosts.toolbar");
     for part in [
-        "header.title",
-        "header.count",
+        "home.sidebar.toggle",
         "hosts.search",
         "hosts.filter",
         "hosts.more",
@@ -33870,6 +33876,18 @@ async fn the_home_is_a_sidebar_a_toolbar_and_one_list(cx: &mut TestAppContext) {
         );
     }
     assert!(toolbar.left() >= sidebar.right() - px(0.5));
+    // The place and its count head the content under the toolbar, once.
+    for part in ["header.title", "header.count"] {
+        let bounds = bounds_of(cx, part);
+        assert!(
+            bounds.top() >= toolbar.bottom() - px(0.5) && bounds.left() >= sidebar.right(),
+            "{part} heads the content under the toolbar: {bounds:?} {toolbar:?}"
+        );
+    }
+    assert!(
+        bounds_of(cx, "header.title").bottom() <= bounds_of(cx, "hosts.row.0").top() + px(0.5),
+        "the heading is above the list"
+    );
 
     // One list of four, each row with its address, tag, time and state.
     assert!(cx.debug_bounds("hosts.list.4").is_some());
@@ -40563,8 +40581,8 @@ fn home_row_connect_buttons_are_quiet_row_actions_while_new_host_is_primary() {
         "hosts.new must remain Variant::Primary"
     );
 
-    // A row's Connect is the shared row action: quiet words at rest, the secondary
-    // frame on the pointed or keyboard row, and never the page's one primary button.
+    // A row's Connect is the shared row action: hidden at rest, the accent's soft tint
+    // on the pointed or keyboard row, and never the page's one primary button.
     for (selector, reach) in [
         ("format!(\"hosts.connect.{number}\")", 200),
         ("\"hosts.connection.connect.{number}\"", 220),
@@ -40586,12 +40604,13 @@ fn home_row_connect_buttons_are_quiet_row_actions_while_new_host_is_primary() {
     let action = components
         .find("pub fn row_action_button(")
         .expect("row_action_button in components.rs");
-    let body = &components[action..action + 700];
+    let body = &components[action..action + 1400];
     assert!(
-        body.contains("Variant::Secondary") && body.contains("Variant::Ghost"),
-        "row_action_button rests as a ghost and is framed as a secondary button"
+        body.contains("palette::ACCENT_TINT") && body.contains("Variant::Ghost"),
+        "row_action_button rests as a ghost and wears the accent's soft tint when shown"
     );
-    assert!(!body.contains("Variant::Primary"));
+    // The solid accent is only what the button turns into under the pointer.
+    assert!(body.contains("hover(hover_style(solid))"));
 }
 
 #[gpui::test]

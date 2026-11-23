@@ -216,6 +216,14 @@ impl ShelluneView {
         }
     }
 
+    /// Whether the page under the head is the hosts home itself - the page
+    /// [`Self::destination_panel`] falls back to - rather than the settings or a
+    /// terminal.
+    pub(super) fn home_page_shown(&self) -> bool {
+        let destination = self.workspace.destination();
+        destination != Destination::Settings && !self.shows_terminal(destination)
+    }
+
     /// The window's head: the tab strip and, in the same surface under it, what the
     /// current session is doing (R12).
     ///
@@ -226,7 +234,10 @@ impl ShelluneView {
     /// window spend two rows on one object.
     pub(super) fn session_header(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         // One hairline closes the head along its whole width; the current tab is a
-        // raised pill inside the head and no longer reaches it (ADR-7).
+        // raised pill inside the head and no longer reaches it (ADR-7). Over the hosts
+        // home there is none: the head, the sidebar and the frame around the page's
+        // card are one chrome surface there, and the card's own edge is the line.
+        let open_below = self.home_page_shown();
         div()
             .relative()
             .flex()
@@ -235,15 +246,17 @@ impl ShelluneView {
             .w_full()
             .bg(theme::swatch(palette::CHROME))
             .debug_selector(|| "session.header".to_owned())
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .h(px(components::HAIRLINE_WIDTH))
-                    .bg(theme::swatch(palette::BORDER)),
-            )
+            .when(!open_below, |head| {
+                head.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .h(px(components::HAIRLINE_WIDTH))
+                        .bg(theme::swatch(palette::BORDER)),
+                )
+            })
             .child(self.top_bar(window, cx))
     }
 
@@ -422,6 +435,15 @@ impl ShelluneView {
             .overflow_hidden()
             .debug_selector(|| "session.context".to_owned())
             .child(components::status_dot(tone, metrics))
+            // What the session is, before where it is: the bar under a server and the
+            // bar under this computer's shell read alike, and only the target's shape
+            // told them apart. The words are the tab list's and the palette's.
+            .child({
+                let (label, remote, word) =
+                    super::overlays::kind_badge_parts(super::PaneKind::of(session.kind()), strings);
+                components::kind_badge(label, remote, metrics)
+                    .debug_selector(move || format!("session.kind.{word}"))
+            })
             .child(
                 self.copyable_text(
                     "session.target",

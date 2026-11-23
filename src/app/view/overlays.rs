@@ -99,7 +99,7 @@ fn attention_rows(
 /// character device it is. The second value is whether the badge wears the remote tint,
 /// and the third is the stable word a test and the capture use to ask which kind a row
 /// shows: the label itself is translated, the word is not.
-fn kind_badge_parts(
+pub(super) fn kind_badge_parts(
     kind: PaneKind,
     strings: &'static copy::Strings,
 ) -> (&'static str, bool, &'static str) {

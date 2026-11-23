@@ -35,7 +35,7 @@ use crate::app::hosts::{
 };
 use crate::app::icons::{self, Icon};
 use crate::app::nav::Destination;
-use crate::app::theme::{self, Metrics, Tone, palette, radius, spacing};
+use crate::app::theme::{self, Elevated as _, Metrics, Tone, palette, radius, spacing};
 use crate::app::view::ShelluneView;
 use crate::app::workspace::SectionState;
 
@@ -86,9 +86,6 @@ const ROW_TEXT_MIN_WIDTH: f32 = 96.0;
 /// The narrowest the search is drawn, before zoom.
 const SEARCH_MIN_WIDTH: f32 = 160.0;
 
-/// The widest the page title is drawn: a long group name gives way to the search.
-const TITLE_MAX_WIDTH: f32 = 240.0;
-
 /// How wide the toolbar's menus are, before zoom.
 const MENU_WIDTH: f32 = 232.0;
 
@@ -133,6 +130,16 @@ const MORE_WAYS_BELOW: usize = 8;
 
 /// The narrowest a starting-point tile becomes before the tiles wrap.
 const MORE_TILE_MIN_WIDTH: f32 = 220.0;
+
+/// The edge of the welcome's emblem and of the icon inside it.
+const WELCOME_EMBLEM_SIZE: f32 = 64.0;
+const WELCOME_EMBLEM_ICON_SIZE: f32 = 28.0;
+
+/// The widest the welcome's words run before they wrap.
+const WELCOME_WORDS_MAX_WIDTH: f32 = 460.0;
+
+/// The widest the welcome's starting points spread: two tiles a row.
+const WELCOME_TILES_MAX_WIDTH: f32 = 600.0;
 
 /// A menu of the home page: the toolbar's two and a group's own.
 #[derive(Clone, Debug, PartialEq)]
@@ -472,7 +479,11 @@ impl ShelluneView {
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .bg(theme::swatch(super::PAGE_FLOOR));
+            // The page is drawn on the chrome: the tab strip, the sidebar and the frame
+            // around the content are one surface, and the content is one rounded card
+            // inset in it. Two stacked bars with a hairline between them and a sidebar
+            // with an edge of its own read as an old admin page.
+            .bg(theme::swatch(palette::CHROME));
         if matches!(state, SectionState::Loading | SectionState::Failed) {
             let strings = self.strings();
             let mut card = self.section_card(Destination::Hosts, state);
@@ -512,7 +523,39 @@ impl ShelluneView {
                 "startup.page.sidebar",
                 0,
             ))
-            .child(self.home_entrance(self.home_main(&list, window, cx), "startup.page.list", 1))
+            .child(self.home_entrance(
+                self.home_card(self.home_main(&list, window, cx)),
+                "startup.page.list",
+                1,
+            ))
+    }
+
+    /// The inset card the main column sits in: the page's floor with a hairline edge and
+    /// a soft lift, rounded, a margin of chrome around it on the right and below.
+    fn home_card(&self, main: Stateful<Div>) -> Div {
+        let metrics = self.metrics();
+        div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .pr(metrics.scale(spacing::TIGHT))
+            .pb(metrics.scale(spacing::TIGHT))
+            .child(
+                div()
+                    .debug_selector(|| "home.card".to_owned())
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .rounded(px(radius::XLARGE))
+                    .bg(theme::swatch(super::PAGE_FLOOR))
+                    .border_1()
+                    .border_color(theme::swatch(palette::BORDER))
+                    .elevation(theme::Elevation::Raised)
+                    .overflow_hidden()
+                    .child(main),
+            )
     }
 
     /// The sidebar: every record, the favourites, the recent hosts, the groups, and the
@@ -529,18 +572,6 @@ impl ShelluneView {
             SIDEBAR_WIDTH
         });
 
-        let toggle = components::icon_only_button(Icon::Sidebar, metrics)
-            .id("home.sidebar.toggle")
-            .debug_selector(|| "home.sidebar.toggle".to_owned())
-            .tooltip(components::tooltip(if folded {
-                ux.home_sidebar_expand
-            } else {
-                ux.home_sidebar_collapse
-            }))
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.toggle_home_sidebar(cx);
-            }));
-
         let mut bar = div()
             .debug_selector(move || {
                 if folded {
@@ -556,20 +587,8 @@ impl ShelluneView {
             .min_h_0()
             .gap(metrics.scale(spacing::HALF))
             .p(metrics.scale(spacing::TIGHT))
-            .bg(theme::swatch(palette::SURFACE))
-            .border_r_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .when(folded, |bar| bar.items_center())
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .w_full()
-                    .when(folded, |row| row.justify_center())
-                    .when(!folded, |row| row.justify_end())
-                    .pb(metrics.scale(spacing::HAIRLINE))
-                    .child(toggle),
-            );
+            .bg(theme::swatch(palette::CHROME))
+            .when(folded, |bar| bar.items_center());
 
         let ring = theme::swatch(palette::FOCUS_RING);
         let places = [
@@ -1295,9 +1314,14 @@ impl ShelluneView {
             .min_w_0()
             .when(!short, |body| body.min_h_0())
             .gap(metrics.scale(spacing::TIGHT))
-            .px(metrics.scale(spacing::SNUG))
-            .pt(metrics.scale(spacing::SNUG))
+            .px(metrics.scale(spacing::WIDE))
+            .pt(metrics.scale(spacing::WIDE))
             .pb(metrics.scale(spacing::SNUG))
+            // The welcome says what the page is for in its own words; a "0" heading
+            // over it only repeated that there is nothing yet.
+            .when(!self.home_welcome_shown(), |body| {
+                body.child(self.home_heading(list))
+            })
             .children(
                 self.local_error
                     .as_ref()
@@ -1440,7 +1464,7 @@ impl ShelluneView {
                     .border_b_1()
                     .border_color(theme::swatch(palette::BORDER))
                     .child(
-                        self.home_toolbar(list, window, cx)
+                        self.home_toolbar(window, cx)
                             .max_w(metrics.scale(CONTENT_MAX_WIDTH)),
                     ),
             )
@@ -1457,50 +1481,79 @@ impl ShelluneView {
             )
     }
 
-    /// The toolbar of the list: the place and its count, the search, the filter menu,
-    /// the "⋯" menu and the one primary action, a new host (ADR-3).
-    fn home_toolbar(&self, list: &HostList, window: &Window, cx: &mut Context<Self>) -> Div {
+    /// The head of the list: the place in a page title and how many records it holds.
+    ///
+    /// It is the first line of the content, not a word squeezed into the toolbar
+    /// between the sidebar's switch and the search: the place is what the page is, so
+    /// it is said once, large, where the eye starts.
+    fn home_welcome_shown(&self) -> bool {
+        self.book.hosts().is_empty()
+            && self.book.connections().is_empty()
+            && self.hosts.search().trim().is_empty()
+    }
+
+    fn home_heading(&self, list: &HostList) -> Div {
         let metrics = self.metrics();
-        let strings = self.strings();
-        let ux = copy::ux();
         let count = if list.matched_len() == list.total() {
             list.matched_len().to_string()
         } else {
             format!("{} / {}", list.matched_len(), list.total())
         };
-        let title = div()
+        div()
             .flex()
             .flex_none()
             .items_center()
-            .gap(metrics.scale(spacing::TIGHT))
-            .max_w(metrics.scale(TITLE_MAX_WIDTH))
+            .gap(metrics.scale(spacing::SNUG))
             .min_w_0()
+            .pb(metrics.scale(spacing::HAIRLINE))
             .child(
                 div()
                     .min_w_0()
                     .truncate()
-                    .text_size(metrics.title_size())
+                    .text_size(metrics.heading_size())
                     .font_weight(metrics.title_weight())
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     .debug_selector(|| "header.title".to_owned())
                     .child(components::line_text(self.home_title())),
             )
             .child(
-                // A quiet pill beside the title: next to a 16px title a bare 13px
-                // number read as a subscript, and baseline alignment could not hold
-                // once the title began to truncate.
+                // A soft pill centred on the title: a bare number beside a large title
+                // sat on its baseline and read as a subscript.
                 div()
                     .flex_none()
-                    .px(metrics.scale(spacing::NARROW))
-                    .rounded(px(radius::SMALL))
+                    .px(metrics.scale(spacing::TIGHT))
+                    .py(metrics.scale(spacing::HALF))
+                    .rounded_full()
                     .bg(theme::swatch(palette::SURFACE_SELECTED))
                     .text_size(metrics.caption_size())
                     .font_weight(metrics.medium_weight())
                     .text_color(theme::swatch(palette::TEXT_SECONDARY))
                     .debug_selector(|| "header.count".to_owned())
                     .child(components::line_text(count)),
-            );
+            )
+    }
 
+    /// The toolbar of the list: the sidebar's switch, the search, the filter menu, the
+    /// "⋯" menu and the one primary action, a new host (ADR-3).
+    fn home_toolbar(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let ux = copy::ux();
+        // The sidebar's fold is a tool of the page, so it leads the page's toolbar, as
+        // in a file manager: the sidebar itself then starts with its places, and the
+        // control is in one spot whether the sidebar is words or a rail.
+        let folded = self.home_sidebar_folded();
+        let toggle = components::icon_only_button(Icon::Sidebar, metrics)
+            .id("home.sidebar.toggle")
+            .debug_selector(|| "home.sidebar.toggle".to_owned())
+            .tooltip(components::tooltip(if folded {
+                ux.home_sidebar_expand
+            } else {
+                ux.home_sidebar_collapse
+            }))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.toggle_home_sidebar(cx);
+            }));
         let focused = self.hosts_search.read(cx).focus_handle().is_focused(window);
         let empty = self.hosts.search().is_empty();
         let search = div()
@@ -1575,7 +1628,7 @@ impl ShelluneView {
         components::toolbar_row(metrics)
             .debug_selector(|| "hosts.toolbar".to_owned())
             .flex_wrap()
-            .child(title)
+            .child(toggle)
             .child(search)
             .child(
                 div()
@@ -2194,49 +2247,7 @@ impl ShelluneView {
         let ux = copy::ux();
         let backup = copy::backup_for(self.workspace.locale());
         let tile = |key: &'static str, icon: Icon, title: &'static str, hint: &'static str| {
-            let selector = format!("home.more.{key}");
-            div()
-                .id(SharedString::from(selector.clone()))
-                .debug_selector(move || selector.clone())
-                .flex()
-                .flex_1()
-                .items_center()
-                .gap(metrics.scale(spacing::SNUG))
-                .min_w(metrics.scale(MORE_TILE_MIN_WIDTH))
-                .p(metrics.scale(spacing::SNUG))
-                .rounded(px(radius::LARGE))
-                .border_1()
-                .border_color(theme::swatch(palette::BORDER))
-                .cursor_pointer()
-                .hover(|style| {
-                    style
-                        .bg(theme::swatch(palette::SURFACE_HOVER))
-                        .border_color(theme::swatch(palette::BORDER_STRONG))
-                })
-                .child(components::leading_icon(icon, Tone::Neutral, metrics))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w_0()
-                        .gap(metrics.scale(spacing::HALF))
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(metrics.label_size())
-                                .font_weight(metrics.medium_weight())
-                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                .child(components::line_text(title)),
-                        )
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                                .child(components::line_text(hint)),
-                        ),
-                )
+            start_tile(format!("home.more.{key}"), icon, title, hint, metrics)
         };
         let tiles = div()
             .flex()
@@ -2470,52 +2481,131 @@ impl ShelluneView {
         }
     }
 
-    /// The welcome of a book with no record: what a host is, and the ways to get one or
-    /// to start without one - a new host, an import, the local terminal, a backup.
+    /// The welcome of a book with no record: what a host is, the one main way to get
+    /// one, and the other ways to start - quick connect, an import, the local terminal
+    /// and a backup - as the same tiles a small book shows under its list.
+    ///
+    /// It stands in the middle of the room the list would take, not at its top: a
+    /// first start is a page of its own, and a row of buttons under the toolbar with an
+    /// empty window below read as a page that had not finished loading.
     fn home_welcome(&self, cx: &mut Context<Self>) -> AnyElement {
         let metrics = self.metrics();
         let strings = self.strings();
         let ux = copy::ux();
-        let actions = div()
+        let backup = copy::backup_for(self.workspace.locale());
+        let shortcut = if crate::app::Platform::current() == crate::app::Platform::MacOs {
+            "⌘N"
+        } else {
+            "Ctrl+N"
+        };
+
+        let emblem = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(metrics.scale(WELCOME_EMBLEM_SIZE))
+            .rounded(px(radius::XLARGE))
+            .bg(theme::swatch(palette::ACCENT_TINT))
+            .border_1()
+            .border_color(theme::faded(theme::swatch(palette::ACCENT), 0.28))
+            .elevation(theme::Elevation::Raised)
+            .child(icons::icon(
+                Icon::Server,
+                metrics.scale(WELCOME_EMBLEM_ICON_SIZE),
+                theme::swatch(palette::ACCENT),
+            ));
+        let words = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .max_w(metrics.scale(WELCOME_WORDS_MAX_WIDTH))
+            .child(
+                div()
+                    .text_center()
+                    .text_size(metrics.heading_size())
+                    .font_weight(metrics.title_weight())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .debug_selector(|| "empty.state.title".to_owned())
+                    .child(ux.home_welcome_title),
+            )
+            .child(
+                div()
+                    .whitespace_normal()
+                    .text_center()
+                    .text_size(metrics.body_size())
+                    .line_height(gpui::relative(1.55))
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .debug_selector(|| "empty.state.body".to_owned())
+                    .child(ux.home_welcome_body),
+            );
+        let new_host = components::icon_label_button(
+            Icon::Plus,
+            strings.primary_hosts,
+            Variant::Primary,
+            metrics,
+        )
+        .h(metrics.large_control_height())
+        .px(metrics.scale(spacing::WIDE))
+        // The shortcut rides on the button in the button's own ink, a veil of it
+        // behind: a keycap from the page's palette was a dark block on the accent.
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .h(metrics.scale(components::KBD_HEIGHT))
+                .px(metrics.scale(spacing::NARROW))
+                .rounded(px(radius::SMALL))
+                .bg(theme::faded(theme::swatch(palette::ON_ACCENT), 0.14))
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::ON_ACCENT))
+                .child(shortcut),
+        )
+        .id("hosts.empty.new")
+        .debug_selector(|| "hosts.empty.new".to_owned())
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            this.open_create_host(cx);
+        }));
+
+        let tiles = div()
             .flex()
             .flex_wrap()
-            .justify_center()
+            .w_full()
             .gap(metrics.scale(spacing::TIGHT))
             .child(
-                components::icon_label_button(
-                    Icon::Plus,
-                    strings.primary_hosts,
-                    Variant::Primary,
+                start_tile(
+                    "hosts.empty.quick".to_owned(),
+                    Icon::ArrowRight,
+                    ux.home_more_quick,
+                    ux.home_more_quick_hint,
                     metrics,
                 )
-                .id("hosts.empty.new")
-                .debug_selector(|| "hosts.empty.new".to_owned())
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.open_create_host(cx);
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.focus_hosts_search(window, cx);
                 })),
             )
             .child(
-                components::icon_label_button(
+                start_tile(
+                    "hosts.import.open".to_owned(),
                     Icon::Import,
                     ux.home_import,
-                    Variant::Secondary,
+                    ux.home_more_import_hint,
                     metrics,
                 )
-                .id("hosts.import.open")
-                .debug_selector(|| "hosts.import.open".to_owned())
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.open_import(cx);
                 })),
             )
             .child(
-                components::icon_label_button(
+                start_tile(
+                    "hosts.empty.local".to_owned(),
                     Icon::Terminal,
                     ux.home_local_button,
-                    Variant::Secondary,
+                    ux.home_local_hint,
                     metrics,
                 )
-                .id("hosts.empty.local")
-                .debug_selector(|| "hosts.empty.local".to_owned())
                 .on_click(cx.listener(|this, _event, window, cx| {
                     let choice = this.workspace.shell_choice();
                     this.launch_choice(choice, window, cx);
@@ -2524,28 +2614,55 @@ impl ShelluneView {
             // A new machine with a backup elsewhere starts here: the file chooser, then
             // the same preview the settings page shows (R5, R6).
             .child(
-                components::icon_label_button(
+                start_tile(
+                    "hosts.empty.restore".to_owned(),
                     Icon::FolderOpen,
-                    copy::backup_for(self.workspace.locale()).home_restore,
-                    Variant::Ghost,
+                    backup.home_restore,
+                    ux.home_more_restore_hint,
                     metrics,
                 )
-                .id("hosts.empty.restore")
-                .debug_selector(|| "hosts.empty.restore".to_owned())
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.choose_backup_import(cx);
                 })),
             );
-        let welcome = div()
+        let others = div()
+            .flex()
+            .flex_col()
             .w_full()
+            .max_w(metrics.scale(WELCOME_TILES_MAX_WIDTH))
+            .gap(metrics.scale(spacing::TIGHT))
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .font_weight(metrics.medium_weight())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(components::line_text(ux.home_more_ways)),
+            )
+            .child(tiles);
+
+        let welcome = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .w_full()
+            .min_w_0()
+            .gap(metrics.scale(spacing::LOOSE))
+            .px(metrics.scale(spacing::LOOSE))
+            .py(metrics.scale(spacing::SPACIOUS))
             .debug_selector(|| "hosts.empty".to_owned())
-            .child(components::empty_state(
-                Icon::Server,
-                ux.home_welcome_title,
-                Some(SharedString::from(ux.home_welcome_body)),
-                Some(actions.into_any_element()),
-                metrics,
-            ));
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(metrics.scale(spacing::BASE))
+                    .child(emblem)
+                    .child(words)
+                    .child(new_host),
+            )
+            .child(others);
         theme::enter(welcome, "hosts.empty.enter", theme::Enter::Rise)
     }
 
@@ -3389,6 +3506,78 @@ fn row_meta(
 }
 
 /// The commands a row reveals under the pointer and on the keyboard's row.
+/// One starting point: an icon tile, a name and one line on what it does, the whole
+/// card a target. The welcome and the foot of a small book both draw these, so a way
+/// to start looks the same wherever it is offered.
+fn start_tile(
+    selector: String,
+    icon: Icon,
+    title: &'static str,
+    hint: &'static str,
+    metrics: Metrics,
+) -> Stateful<Div> {
+    let arrow_ink = theme::swatch(palette::ACCENT);
+    div()
+        .id(SharedString::from(selector.clone()))
+        .debug_selector(move || selector.clone())
+        .group(START_TILE_GROUP)
+        .flex()
+        .flex_1()
+        // Two a row: four tiles laid three and one stretched the last across the page.
+        .flex_basis(gpui::relative(0.4))
+        .items_center()
+        .gap(metrics.scale(spacing::SNUG))
+        .min_w(metrics.scale(MORE_TILE_MIN_WIDTH))
+        .p(metrics.scale(spacing::SNUG))
+        .rounded(px(radius::LARGE))
+        .bg(theme::swatch(palette::RAISED))
+        .border_1()
+        .border_color(theme::swatch(palette::BORDER))
+        .cursor_pointer()
+        .hover(|style| {
+            style
+                .bg(theme::swatch_over(palette::SURFACE_HOVER, palette::RAISED))
+                .border_color(theme::swatch(palette::BORDER_STRONG))
+        })
+        .child(components::leading_icon(icon, Tone::Accent, metrics))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .gap(metrics.scale(spacing::HALF))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(metrics.label_size())
+                        .font_weight(metrics.medium_weight())
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .child(components::line_text(title)),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                        .child(components::line_text(hint)),
+                ),
+        )
+        // A quiet arrow that comes forward under the pointer: the card goes somewhere.
+        .child(
+            icons::icon(
+                Icon::ChevronRight,
+                metrics.small_icon_size(),
+                theme::swatch(palette::TEXT_PLACEHOLDER),
+            )
+            .flex_none()
+            .group_hover(START_TILE_GROUP, move |style| style.text_color(arrow_ink)),
+        )
+}
+
+/// The hover group of one [`start_tile`].
+const START_TILE_GROUP: &str = "start-tile";
+
 fn row_tools() -> Div {
     div().flex().flex_none().items_center().gap(px(0.0))
 }

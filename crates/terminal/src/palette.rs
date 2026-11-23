@@ -23,9 +23,9 @@ pub const FOREGROUND: Rgb = Rgb {
 /// Default terminal background, a deep ink slate; the dark shell's canvas is the same
 /// colour, so a terminal reads as the window and not as a box inside it.
 pub const BACKGROUND: Rgb = Rgb {
-    r: 0x12,
-    g: 0x15,
-    b: 0x1a,
+    r: 0x0e,
+    g: 0x10,
+    b: 0x14,
 };
 
 /// Default cursor colour, a calm sky blue matching the dark accent family.

@@ -598,7 +598,7 @@ fn chip_frame(tone: Tone, metrics: Metrics) -> Div {
         .gap(metrics.scale(spacing::NARROW))
         .h(metrics.scale(CHIP_HEIGHT))
         .px(metrics.scale(spacing::TIGHT))
-        .rounded(px(radius::SMALL))
+        .rounded_full()
         .bg(tone.chip_background())
         .border_1()
         .border_color(theme::faded(tone.text(), 0.16))
@@ -621,8 +621,8 @@ pub fn tag(label: impl Into<SharedString>, metrics: Metrics) -> Div {
         .flex_none()
         .items_center()
         .h(metrics.scale(CHIP_HEIGHT))
-        .px(metrics.scale(spacing::NARROW))
-        .rounded(px(radius::SMALL))
+        .px(metrics.scale(spacing::TIGHT))
+        .rounded_full()
         .bg(theme::swatch(palette::SURFACE_SELECTED))
         .text_size(metrics.caption_size())
         .text_color(theme::swatch(palette::TEXT_SECONDARY))
@@ -683,7 +683,7 @@ pub fn badge(count: usize, tone: Tone, metrics: Metrics) -> Div {
         .min_w(metrics.scale(BADGE_SIZE))
         .h(metrics.scale(BADGE_SIZE))
         .px(metrics.scale(spacing::NARROW))
-        .rounded(px(radius::SMALL))
+        .rounded_full()
         .font_weight(gpui::FontWeight::MEDIUM)
         .bg(theme::swatch(background))
         .text_size(metrics.caption_size())
@@ -929,15 +929,33 @@ pub fn row_action_button(
     emphasized: bool,
     metrics: Metrics,
 ) -> Div {
+    // The one coloured thing on a row: the accent's tint with the accent's ink on it,
+    // solid accent under the pointer. A row's action is what the row is for, and a
+    // grey frame beside three grey icons did not say so.
+    let soft = ControlFace::new(
+        Some(palette::ACCENT_TINT),
+        Some(palette::ACCENT_TINT),
+        palette::ACCENT_ON_TINT,
+    );
+    let solid = button_face(Variant::Primary, ControlState::Resting);
     if emphasized {
-        return compact_button(label, Variant::Secondary, metrics);
+        return button_frame(ButtonSize::Compact, soft, metrics)
+            .cursor_pointer()
+            .child(label.into())
+            .hover(hover_style(solid));
     }
-    let framed = button_face(Variant::Secondary, ControlState::Resting);
-    compact_button(label, Variant::Ghost, metrics)
-        .opacity(0.0)
-        .group_hover(ROW_GROUP, move |style| {
-            hover_style(framed)(style).opacity(1.0)
-        })
+    button_frame(
+        ButtonSize::Compact,
+        button_face(Variant::Ghost, ControlState::Resting),
+        metrics,
+    )
+    .cursor_pointer()
+    .child(label.into())
+    .opacity(0.0)
+    .group_hover(ROW_GROUP, move |style| {
+        hover_style(soft)(style).opacity(1.0)
+    })
+    .hover(hover_style(solid))
 }
 
 /// A square button that holds a short glyph such as "A+" or "×".
@@ -3008,7 +3026,7 @@ pub fn nav_item(
     metrics: Metrics,
 ) -> Div {
     let ink = theme::swatch(if selected {
-        palette::TEXT_PRIMARY
+        palette::ACCENT_ON_TINT
     } else {
         palette::TEXT_SECONDARY
     });
@@ -3039,7 +3057,7 @@ pub fn nav_item(
             theme::clear()
         })
         .when(selected, |item| {
-            item.bg(theme::swatch(palette::SURFACE_SELECTED))
+            item.bg(theme::swatch(palette::ACCENT_TINT))
                 .font_weight(metrics.medium_weight())
         })
         .when(!selected, |item| {
@@ -3254,14 +3272,27 @@ pub fn sidebar_item_in(
     yields_to: Option<&'static str>,
     metrics: Metrics,
 ) -> Div {
-    let (fill, ink) = if selected {
-        (Some(palette::SURFACE_SELECTED), palette::TEXT_PRIMARY)
+    // The chosen place wears the accent: its tint, the accent's ink on it and the
+    // accent itself on the icon, so "where am I" is read from colour before words.
+    let (fill, ink, icon_ink, count_ink) = if selected {
+        (
+            Some(palette::ACCENT_TINT),
+            palette::ACCENT_ON_TINT,
+            palette::ACCENT,
+            palette::ACCENT_ON_TINT,
+        )
     } else {
-        (None, palette::TEXT_SECONDARY)
+        (
+            None,
+            palette::TEXT_SECONDARY,
+            palette::TEXT_MUTED,
+            palette::TEXT_MUTED,
+        )
     };
     let hover_fill = theme::swatch(palette::SURFACE_HOVER);
     let hover_ink = theme::swatch(palette::TEXT_PRIMARY);
     let ink_color = theme::swatch(ink);
+    let icon_color = theme::swatch(icon_ink);
     div()
         .group(ICON_GROUP)
         .flex()
@@ -3282,15 +3313,16 @@ pub fn sidebar_item_in(
             item.hover(move |style| style.bg(hover_fill).text_color(hover_ink))
         })
         .child(
-            icons::icon(icon, metrics.icon_size(), ink_color)
-                .group_hover(ICON_GROUP, move |style| style.text_color(hover_ink)),
+            icons::icon(icon, metrics.icon_size(), icon_color).when(!selected, |icon| {
+                icon.group_hover(ICON_GROUP, move |style| style.text_color(hover_ink))
+            }),
         )
         .child(div().flex_1().min_w_0().truncate().child(line_text(label)))
         .children(count.map(|count| {
             div()
                 .flex_none()
                 .text_size(metrics.caption_size())
-                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .text_color(theme::swatch(count_ink))
                 .when_some(yields_to, |count, group| {
                     count.group_hover(group, |style| style.invisible())
                 })
@@ -3304,7 +3336,7 @@ pub fn sidebar_item_in(
 pub fn sidebar_icon_item(icon: Icon, selected: bool, metrics: Metrics) -> Div {
     let size = metrics.control_height();
     let ink = theme::swatch(if selected {
-        palette::TEXT_PRIMARY
+        palette::ACCENT
     } else {
         palette::TEXT_SECONDARY
     });
@@ -3317,7 +3349,7 @@ pub fn sidebar_icon_item(icon: Icon, selected: bool, metrics: Metrics) -> Div {
         .size(size)
         .rounded(px(radius::MEDIUM))
         .when(selected, |item| {
-            item.bg(theme::swatch(palette::SURFACE_SELECTED))
+            item.bg(theme::swatch(palette::ACCENT_TINT))
         })
         .when(!selected, |item| {
             item.hover(move |style| style.bg(hover_fill))

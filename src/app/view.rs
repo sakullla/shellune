@@ -21102,8 +21102,10 @@ fn browser_tab(
         .text_size(metrics.label_size())
         .cursor_pointer();
     if selected {
-        tab.bg(theme::swatch(palette::RAISED))
-            .border_color(theme::swatch(palette::BORDER))
+        // The thumb of a segmented control: one clear step off the chrome in both
+        // palettes, so the current tab is found at a glance among many.
+        tab.bg(theme::swatch(palette::SEGMENT_THUMB))
+            .border_color(theme::swatch(palette::BORDER_STRONG))
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
     } else {
         tab.border_color(gpui::transparent_black())
@@ -22044,7 +22046,7 @@ fn host_avatar(
         .items_center()
         .justify_center()
         .size(metrics.scale(HOST_AVATAR_SIZE))
-        .rounded(px(radius::MEDIUM))
+        .rounded(px(radius::LARGE))
         .bg(theme::swatch(background))
         .text_size(metrics.label_size())
         .font_weight(FontWeight::BOLD)

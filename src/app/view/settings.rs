@@ -590,20 +590,28 @@ impl ShelluneView {
                 let selector = format!("settings.section.{}", category.id());
                 move || selector.clone()
             })
+            // An element keeps one debug selector, the last one set, so the two names a
+            // title can have are on two boxes of the same size: the chosen category's
+            // title in view used to lose "header.title" to "settings.crumb".
             .child(
                 div()
                     .w_full()
                     .min_w_0()
-                    .text_size(metrics.heading_size())
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .when(category == shown.category(), |title| {
-                        title.debug_selector(|| "header.title".to_owned())
-                    })
                     .when(in_view, |title| {
                         title.debug_selector(|| "settings.crumb".to_owned())
                     })
-                    .child(category.label(locale)),
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .text_size(metrics.heading_size())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .when(category == shown.category(), |title| {
+                                title.debug_selector(|| "header.title".to_owned())
+                            })
+                            .child(category.label(locale)),
+                    ),
             );
         // The settings that are one control each share one card, one labelled row per
         // setting, like a system settings panel: a category reads as one block instead

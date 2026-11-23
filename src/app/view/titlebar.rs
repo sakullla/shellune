@@ -52,7 +52,11 @@ pub fn window_controls_width(platform: Platform) -> gpui::Pixels {
 const TRAFFIC_LIGHT_SIZE: f32 = 14.0;
 
 /// The width of the three macOS window buttons and the gaps between them, in points.
-const TRAFFIC_LIGHT_SPAN: f32 = 52.0;
+///
+/// The widest the system draws them: recent macOS releases enlarged the buttons and
+/// the gaps between them, and a span measured on an older release let the first tab
+/// touch the zoom button there.
+const TRAFFIC_LIGHT_SPAN: f32 = 60.0;
 
 /// How far the first macOS window button sits from the window's left edge, in points.
 const TRAFFIC_LIGHT_INSET: f32 = 16.0;
