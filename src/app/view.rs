@@ -19634,6 +19634,7 @@ impl ShelluneView {
             .cloned()
             .unwrap_or_else(|| crate::app::monogram::initials(&name));
         Some(host_avatar_sized(
+            &name,
             &monogram,
             self.host_platform(id),
             false,
@@ -22093,30 +22094,42 @@ fn rebase_group_path(path: &GroupPath, from: &GroupPath, to: &GroupPath) -> Opti
 /// A rounded square with the system's mark or the letters of a host.
 ///
 /// The letters are the record's monogram, chosen against every saved record so two
-/// rows rarely share them. The tile itself is neutral (see [`host_avatar_sized`]); a
-/// picked row's tile takes the accent with the row.
-fn host_avatar(monogram: &str, platform: Option<&str>, reached: bool, metrics: Metrics) -> Div {
-    host_avatar_sized(monogram, platform, reached, HOST_AVATAR_SIZE, metrics)
+/// rows rarely share them. The tile itself is neutral and its mark wears a soft hue
+/// chosen by the name (see [`host_avatar_sized`]); a picked row's tile takes the
+/// accent with the row.
+fn host_avatar(
+    name: &str,
+    monogram: &str,
+    platform: Option<&str>,
+    reached: bool,
+    metrics: Metrics,
+) -> Div {
+    host_avatar_sized(name, monogram, platform, reached, HOST_AVATAR_SIZE, metrics)
 }
 
 /// [`host_avatar`] at `size` logical pixels: the letters, the mark and the corner keep
 /// the list tile's proportions, so a tab's small tile is the same tile.
 fn host_avatar_sized(
+    name: &str,
     monogram: &str,
     platform: Option<&str>,
     reached: bool,
     size: f32,
     metrics: Metrics,
 ) -> Div {
-    // A quiet tile, not a coloured block: a veil of the ink over whatever it sits on, a
-    // hairline edge at list size, and the system's mark or the letters in the secondary
-    // ink. Twelve saturated squares down a list read as a toy; the name and the address
-    // beside the tile are what tell hosts apart, and the system's mark helps where it is
-    // known. Only a picked row's tile takes the accent, with the row.
+    // A quiet tile, not a coloured block: a veil of the ink over whatever it sits on and
+    // a hairline edge at list size. Only the mark - the system's or the letters - carries
+    // a hue, a soft one chosen by the record's name, so hosts are still told apart at a
+    // glance without twelve saturated squares down a list. A picked row's tile takes
+    // the accent, with the row.
     let (fill, ink) = if reached {
         (palette::ACCENT_TINT, palette::ACCENT_ON_TINT)
     } else {
-        (palette::SURFACE_SELECTED, palette::TEXT_SECONDARY)
+        let inks = palette::HOST_INKS;
+        (
+            palette::SURFACE_SELECTED,
+            inks[crate::app::monogram::colour_index(name, inks.len())],
+        )
     };
     let share = size / HOST_AVATAR_SIZE;
     let tile = div()

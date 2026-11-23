@@ -2019,6 +2019,7 @@ impl ShelluneView {
                     .tooltip(components::tooltip(tip))
                     // The list's own tile, small: one look for a host wherever it is.
                     .child(super::host_avatar_sized(
+                        &name,
                         &letters,
                         platform.as_deref(),
                         false,
@@ -3718,6 +3719,7 @@ fn host_row_element(
     // boxes.
     let picking = selected || host.selecting;
     let avatar = super::host_avatar(
+        host.name.as_ref(),
         host.monogram.as_ref(),
         host.platform.as_ref().map(SharedString::as_ref),
         selected,
@@ -4006,6 +4008,7 @@ fn connection_row_element(
                         .tooltip(components::tooltip(ux.hosts_selection_ssh_only))
                 })
                 .child(super::host_avatar(
+                    connection.name.as_ref(),
                     connection.monogram.as_ref(),
                     None,
                     false,

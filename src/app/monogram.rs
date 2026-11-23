@@ -111,6 +111,26 @@ pub fn assign<'a>(records: impl IntoIterator<Item = (HostId, &'a str)>) -> HashM
     chosen
 }
 
+/// A stable index into a palette of `len` colours for a name.
+///
+/// FNV-1a over the trimmed, lower-cased name: the same record gets the same colour on
+/// every run and every computer, two names that share their letters rarely share a
+/// colour, and a change of case is not a new colour.
+#[must_use]
+pub fn colour_index(name: &str, len: usize) -> usize {
+    // The 64-bit FNV offset basis and prime, written in decimal.
+    const OFFSET: u64 = 14_695_981_039_346_656_037;
+    const PRIME: u64 = 1_099_511_628_211;
+    let hash = name
+        .trim()
+        .to_lowercase()
+        .bytes()
+        .fold(OFFSET, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+        });
+    usize::try_from(hash % u64::try_from(len.max(1)).unwrap_or(1)).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +175,12 @@ mod tests {
     fn a_name_that_runs_out_of_letters_shares_its_usual_initials() {
         // "ab" is A, a second "ab" takes AB, and a third has nothing left but A.
         assert_eq!(letters(&["ab", "ab", "ab"]), ["A", "AB", "A"]);
+    }
+
+    #[test]
+    fn the_colour_is_stable_and_ignores_case_and_edges() {
+        assert_eq!(colour_index("Web-01", 12), colour_index("  web-01 ", 12));
+        assert!(colour_index("anything", 12) < 12);
+        assert_eq!(colour_index("x", 0), 0);
     }
 }

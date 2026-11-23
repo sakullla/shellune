@@ -2718,11 +2718,13 @@ fn host_avatar_initials_are_readable_on_their_tint() {
         ),
     ] {
         let tile = palette::SURFACE_SELECTED.over(layer);
-        let ratio = theme::contrast::worst(palette::TEXT_SECONDARY, tile);
-        assert!(
-            ratio >= BODY_CONTRAST_FLOOR,
-            "the avatar's letters on {layer_name} are {ratio:.2}:1"
-        );
+        for ink in palette::HOST_INKS {
+            let ratio = theme::contrast::worst(ink, tile);
+            assert!(
+                ratio >= BODY_CONTRAST_FLOOR,
+                "the avatar's mark {ink:x} on {layer_name} is {ratio:.2}:1"
+            );
+        }
     }
     let picked = theme::contrast::worst(palette::ACCENT_ON_TINT, palette::ACCENT_TINT);
     assert!(
@@ -18526,6 +18528,7 @@ fn every_token_has_a_light_value_of_its_own() {
     ];
     for (name, token) in tokens
         .into_iter()
+        .chain(palette::HOST_INKS.map(|token| ("host ink", token)))
         .chain(palette::TAB_ACCENTS.map(|token| ("tab accent", token)))
     {
         assert_ne!(

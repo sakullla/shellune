@@ -224,6 +224,14 @@ pub mod dark {
     pub const SHADOW: u32 = 0x000000;
     /// The terminal's selection: the accent 32% over the terminal's background.
     pub const SELECTION: u32 = 0x32405f;
+    /// The ink of a host tile's letters or system mark, one hue every 30 degrees,
+    /// built in OKLCH at one lightness and a low chroma (L 0.80, C 0.085). The tile
+    /// itself stays neutral; only the mark carries the hue, so a list is told apart
+    /// at a glance without a column of coloured blocks.
+    pub const HOST_INKS: [u32; 12] = [
+        0x9ebff5, 0x82c8ea, 0x77cfd3, 0x80d0bb, 0x96cea1, 0xb1c88b, 0xcfbe7e, 0xe1b581, 0xedad90,
+        0xf0a8a7, 0xe8a8c5, 0xd3aee4,
+    ];
     pub const TAB_ACCENTS: [u32; 6] = [0x9cbcd8, 0xb9aecb, 0x8fc6cf, 0xaec79a, 0xd3bc9c, 0xd4a8ae];
 }
 
@@ -283,6 +291,12 @@ pub mod light {
     pub const SHADOW: u32 = 0x000000;
     /// The terminal's selection: the accent 22% over the light terminal's background.
     pub const SELECTION: u32 = 0xccd7f2;
+    /// The same twelve hues as the dark inks, deep enough for light paper
+    /// (L 0.47, C 0.11).
+    pub const HOST_INKS: [u32; 12] = [
+        0x345a98, 0x00658c, 0x006c73, 0x006e57, 0x206b38, 0x4d6510, 0x6e5900, 0x814d00, 0x8c431f,
+        0x8e3d40, 0x873e63, 0x724685,
+    ];
     pub const TAB_ACCENTS: [u32; 6] = [0x2f5f86, 0x5d4a80, 0x1a6b74, 0x51662f, 0x8a5a20, 0x8b4450];
 
     /// The terminal's default colours and its 16 ANSI colours on light paper.
@@ -437,6 +451,17 @@ pub mod palette {
         Token::veil(dark::SURFACE_SELECTED, light::SURFACE_SELECTED);
     /// A control under the pressed pointer, one step past selected. A veil.
     pub const SURFACE_PRESSED: Token = Token::veil(dark::SURFACE_PRESSED, light::SURFACE_PRESSED);
+
+    /// The inks of host tiles' marks: one per hue, chosen by the record's name.
+    pub const HOST_INKS: [Token; 12] = {
+        let mut inks = [CANVAS; 12];
+        let mut index = 0;
+        while index < 12 {
+            inks[index] = Token::new(dark::HOST_INKS[index], light::HOST_INKS[index]);
+            index += 1;
+        }
+        inks
+    };
 
     /// Tab identity colours, in `TabAccent::ALL` order: slate, heather, steel, sage,
     /// sand, dust.
