@@ -62,6 +62,7 @@ pub use error::{ChainFailure, ConnectError, HopLocation};
 pub use forwarding::{ForwardCommand, ForwardEvent, ForwardFailure, ForwardLink, ForwardSpec};
 pub use hostkey::{HostKeyPrompt, KnownHostKey, PresentedKey};
 pub use keys::{ManagedKeyError, ManagedKeyKind, ManagedKeyPublic};
+pub use output::OutputReady;
 pub use session::{
     CONNECT_TIMEOUT, ConnectRequest, PtySize, RemoteEvent, RemoteSession, TERM_VALUE, TrustAnswer,
 };

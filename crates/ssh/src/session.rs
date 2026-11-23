@@ -566,6 +566,11 @@ impl RemoteSession {
             .map_err(|_| "the SSH connection is no longer open".to_owned())
     }
 
+    /// A wakeup for the terminal pane consuming this session's events.
+    pub fn output_ready(&self) -> crate::OutputReady {
+        self.events.output_ready()
+    }
+
     /// A bounded batch of pending events; poll again to consume remaining output.
     pub fn drain(&mut self) -> Vec<RemoteEvent> {
         self.events.drain()

@@ -416,6 +416,11 @@ impl ChainSession {
         self.events.try_recv().ok()
     }
 
+    /// A wakeup for the terminal pane consuming this session's events.
+    pub fn output_ready(&self) -> crate::OutputReady {
+        self.events.output_ready()
+    }
+
     /// Every event that arrived since the last call.
     pub fn drain(&mut self) -> Vec<ChainEvent> {
         self.events.drain()

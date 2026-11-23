@@ -272,15 +272,13 @@ impl IntegrationSplitter {
         Self { held: Vec::new() }
     }
 
+    /// With no pending marker or escape, the grid can read the caller's slice directly.
+    pub(crate) fn can_pass_through(&self, input: &[u8]) -> bool {
+        self.held.is_empty() && !input.contains(&0x1b)
+    }
+
     /// Appends `input` and returns every complete segment it now contains.
     pub(crate) fn push(&mut self, input: &[u8]) -> Vec<Segment> {
-        if self.held.is_empty() && !input.contains(&0x1b) {
-            return if input.is_empty() {
-                Vec::new()
-            } else {
-                vec![Segment::Bytes(input.to_vec())]
-            };
-        }
         self.held.extend_from_slice(input);
         let mut out = Vec::new();
         let mut plain = Vec::new();

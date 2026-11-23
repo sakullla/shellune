@@ -58,6 +58,10 @@ use crate::app::theme::{self, Metrics, Tone, palette as shell_palette, radius, s
 /// the point where typing feels delayed.
 pub const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(12);
 
+/// Let a busy SSH pane consume several transport batches before repainting. Check
+/// the deadline between batches so keyboard and window events still get a turn.
+const SSH_DRAIN_BUDGET: Duration = Duration::from_millis(8);
+
 /// How close two measured lengths of the bar must be, in pixels, to count as the
 /// same: layout rounding moves an edge by a fraction of a pixel between frames, and
 /// that must not ask for another frame.
@@ -642,6 +646,13 @@ pub enum SnippetOffer {
     Empty,
 }
 
+#[derive(Default)]
+struct OutputRepaint {
+    deadline: Option<std::time::Instant>,
+    bytes: usize,
+    pending: bool,
+}
+
 pub struct TerminalPane {
     /// Which session process this pane shows.
     ///
@@ -705,7 +716,7 @@ pub struct TerminalPane {
     #[cfg(feature = "ui-capture")]
     capture_selection: Option<CaptureSelection>,
     locale: Locale,
-    polling: bool,
+    poll_task: Option<gpui::Task<()>>,
     /// A multi-line or high-risk paste that has not been confirmed.
     ///
     /// It is not encoded and not written until [`TerminalPane::confirm_paste`].
@@ -726,6 +737,7 @@ pub struct TerminalPane {
     /// An unusable expression is its own answer: it is never drawn as "no matches".
     search_error: Option<String>,
     input_busy: bool,
+    output_repaint: OutputRepaint,
     output_search_at: Option<std::time::Instant>,
     output_search_pending: bool,
     search_hits: Vec<HistoryMatch>,
@@ -924,7 +936,7 @@ impl TerminalPane {
             #[cfg(feature = "ui-capture")]
             capture_selection: None,
             locale,
-            polling: false,
+            poll_task: None,
             pending_paste: None,
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
@@ -938,6 +950,7 @@ impl TerminalPane {
             search_cursor: 0,
             search_error: None,
             input_busy: false,
+            output_repaint: OutputRepaint::default(),
             output_search_at: None,
             output_search_pending: false,
             search_hits: Vec::new(),
@@ -1003,7 +1016,7 @@ impl TerminalPane {
             #[cfg(feature = "ui-capture")]
             capture_selection: None,
             locale,
-            polling: false,
+            poll_task: None,
             pending_paste: None,
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
@@ -1017,6 +1030,7 @@ impl TerminalPane {
             search_cursor: 0,
             search_error: None,
             input_busy: false,
+            output_repaint: OutputRepaint::default(),
             output_search_at: None,
             output_search_pending: false,
             search_hits: Vec::new(),
@@ -1081,7 +1095,7 @@ impl TerminalPane {
             #[cfg(feature = "ui-capture")]
             capture_selection: None,
             locale,
-            polling: false,
+            poll_task: None,
             pending_paste: None,
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
@@ -1095,6 +1109,7 @@ impl TerminalPane {
             search_cursor: 0,
             search_error: None,
             input_busy: false,
+            output_repaint: OutputRepaint::default(),
             output_search_at: None,
             output_search_pending: false,
             search_hits: Vec::new(),
@@ -1243,7 +1258,7 @@ impl TerminalPane {
             #[cfg(feature = "ui-capture")]
             capture_selection: None,
             locale,
-            polling: false,
+            poll_task: None,
             pending_paste: None,
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
@@ -1257,6 +1272,7 @@ impl TerminalPane {
             search_cursor: 0,
             search_error: None,
             input_busy: false,
+            output_repaint: OutputRepaint::default(),
             output_search_at: None,
             output_search_pending: false,
             search_hits: Vec::new(),
@@ -1343,7 +1359,7 @@ impl TerminalPane {
             None => {}
         }
         self.source = None;
-        self.polling = false;
+        self.poll_task = None;
         if self.state.accepts_input() {
             self.state = PaneState::Exited {
                 report: ExitReport::Clean,
@@ -1368,7 +1384,7 @@ impl TerminalPane {
         };
         let report = link.close();
         self.source = None;
-        self.polling = false;
+        self.poll_task = None;
         let closed = self.keep_close_note(&report);
         cx.notify();
         closed
@@ -1442,7 +1458,7 @@ impl TerminalPane {
             #[cfg(feature = "ui-capture")]
             capture_selection: None,
             locale,
-            polling: false,
+            poll_task: None,
             pending_paste: None,
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
@@ -1456,6 +1472,7 @@ impl TerminalPane {
             search_cursor: 0,
             search_error: None,
             input_busy: false,
+            output_repaint: OutputRepaint::default(),
             output_search_at: None,
             output_search_pending: false,
             search_hits: Vec::new(),
@@ -1732,21 +1749,50 @@ impl TerminalPane {
     }
 
     fn start_polling(&mut self, cx: &mut Context<Self>) {
-        if self.polling || self.source.is_none() {
+        if self.poll_task.is_some() {
             return;
         }
-        self.polling = true;
-        cx.spawn(async move |this, cx| {
+        let ready = match self.source.as_ref() {
+            Some(PaneSource::Remote(session)) => Some(session.output_ready()),
+            Some(PaneSource::Chain(session)) => Some(session.output_ready()),
+            Some(_) => None,
+            None => return,
+        };
+        self.poll_task = Some(cx.spawn(async move |this, cx| {
+            let mut search_pending = false;
+            let mut busy = Duration::ZERO;
             loop {
-                cx.background_executor().timer(OUTPUT_POLL_INTERVAL).await;
-                let keep_going = this.update(cx, |pane, cx| pane.drain_events(cx));
-                match keep_going {
-                    Ok(true) => {}
-                    _ => break,
+                if let Some(ready) = &ready
+                    && !search_pending
+                {
+                    ready.wait().await;
+                } else {
+                    cx.background_executor().timer(OUTPUT_POLL_INTERVAL).await;
+                }
+                let started = std::time::Instant::now();
+                let result = this.update(cx, |pane, cx| {
+                    (pane.drain_events(cx), pane.output_search_pending)
+                });
+                let Ok((true, pending)) = result else { break };
+                search_pending = pending;
+                // A full queue wakes synchronously. A short timer leaves the native
+                // event loop idle long enough to dispatch input and paint messages.
+                busy += started.elapsed();
+                if ready.is_some() && busy >= SSH_DRAIN_BUDGET {
+                    // WinRT thread-pool timers can round a 1ms request up to a
+                    // clock tick. Rust's Windows sleep uses a waitable timer.
+                    #[cfg(windows)]
+                    cx.background_executor()
+                        .spawn(async { std::thread::sleep(Duration::from_millis(1)) })
+                        .await;
+                    #[cfg(not(windows))]
+                    cx.background_executor()
+                        .timer(Duration::from_millis(1))
+                        .await;
+                    busy = Duration::ZERO;
                 }
             }
-        })
-        .detach();
+        }));
     }
 
     /// Applies events the caller already took from the source.
@@ -1786,7 +1832,9 @@ impl TerminalPane {
         let Some(source) = self.source.as_mut() else {
             return false;
         };
-        let events = source.drain();
+        let ssh = matches!(source, PaneSource::Remote(_) | PaneSource::Chain(_));
+        let deadline = std::time::Instant::now() + SSH_DRAIN_BUDGET;
+        let mut events = source.drain();
         // What the line itself reported - a refused send, a frame the driver cut short,
         // bytes it dropped - is taken even when no state event came with it: it is news
         // about the device, and the pane is where a person reads it.
@@ -1814,16 +1862,29 @@ impl TerminalPane {
         let was_alternate = self.alternate_screen();
         let mut live = self.state.accepts_input();
         let changed = !events.is_empty();
-        for event in coalesce_output(events) {
-            if let SourceEvent::Data(bytes) = event {
-                self.wake_cursor();
-                let effects = self.core.feed(&bytes);
-                self.apply_effects(effects, cx);
-                self.output_search_pending = true;
-                live = self.state.accepts_input();
-            } else {
-                live = self.handle_event(event, cx);
+        let mut control = false;
+        let mut output_bytes = 0;
+        while !events.is_empty() {
+            for event in coalesce_output(events) {
+                if let SourceEvent::Data(bytes) = event {
+                    output_bytes += bytes.len();
+                    self.wake_cursor();
+                    let effects = self.core.feed(&bytes);
+                    self.apply_effects(effects, cx);
+                    self.output_search_pending = self.search_open;
+                    live = self.state.accepts_input();
+                } else {
+                    control = true;
+                    live = self.handle_event(event, cx);
+                }
             }
+            if !ssh || !live || std::time::Instant::now() >= deadline {
+                break;
+            }
+            let Some(source) = self.source.as_mut() else {
+                break;
+            };
+            events = source.drain();
         }
         // A continuous log stream must not rescan all scrollback every 12 ms.
         // User edits/navigation still refresh immediately. Flush the pending scan
@@ -1840,9 +1901,53 @@ impl TerminalPane {
             cx.notify();
         }
         if changed {
-            cx.notify();
+            if ssh && !control {
+                self.repaint_ssh_output(output_bytes, cx);
+            } else {
+                cx.notify();
+            }
         }
         live
+    }
+
+    /// Echo and other small replies repaint immediately. During a flood, draw at
+    /// most once per interval and flush the final update even if no more data arrives.
+    fn repaint_ssh_output(&mut self, bytes: usize, cx: &mut Context<Self>) {
+        const FRAME_INTERVAL: Duration = Duration::from_millis(32);
+        const BURST_BYTES: usize = 4096;
+        if self.output_repaint.pending {
+            return;
+        }
+        let now = cx.background_executor().now();
+        let remaining = self
+            .output_repaint
+            .deadline
+            .map_or(Duration::ZERO, |deadline| {
+                deadline.saturating_duration_since(now)
+            });
+        if remaining.is_zero() {
+            self.output_repaint.deadline = Some(now + FRAME_INTERVAL);
+            self.output_repaint.bytes = bytes;
+            cx.notify();
+            return;
+        }
+        self.output_repaint.bytes = self.output_repaint.bytes.saturating_add(bytes);
+        if self.output_repaint.bytes < BURST_BYTES {
+            cx.notify();
+            return;
+        }
+        self.output_repaint.pending = true;
+        let timer = cx.background_executor().timer(remaining);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |pane, cx| {
+                pane.output_repaint.pending = false;
+                pane.output_repaint.deadline =
+                    Some(cx.background_executor().now() + FRAME_INTERVAL);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn handle_event(&mut self, event: SourceEvent, cx: &mut Context<Self>) -> bool {
@@ -4677,7 +4782,17 @@ impl TerminalPane {
         let mut run: Option<TextRun> = None;
         let mut shapes: Option<ShapeRun> = None;
         let mut pieces: Vec<gpui::Div> = Vec::new();
-        for (cell_index, rendered) in row.cells.iter().enumerate() {
+        // Backgrounds, selection and the cursor have already been placed. Plain
+        // spaces after the final glyph need neither contrast calculations nor shaping.
+        let glyph_cells = row
+            .cells
+            .iter()
+            .rposition(|cell| {
+                cell.text != " " || cell.attributes.underline || cell.attributes.strikethrough
+            })
+            .map_or(0, |last| last + 1);
+        let mut last_ink = None;
+        for (cell_index, rendered) in row.cells[..glyph_cells].iter().enumerate() {
             let span = rendered.width.max(1);
             let search_hit = if rendered.selected {
                 None
@@ -4694,11 +4809,15 @@ impl TerminalPane {
             } else if search_hit == Some(true) {
                 theme::swatch(shell_palette::ON_ACCENT)
             } else {
-                ink(
-                    color_of(rendered.foreground),
-                    background,
-                    rendered.attributes.dim,
-                )
+                let key = (rendered.foreground, background, rendered.attributes.dim);
+                match last_ink {
+                    Some((previous, ink)) if previous == key => ink,
+                    _ => {
+                        let value = ink(color_of(key.0), background, key.2);
+                        last_ink = Some((key, value));
+                        value
+                    }
+                }
             };
             let style = TextStyle {
                 ink,
@@ -4737,30 +4856,32 @@ impl TerminalPane {
             } else {
                 flush_shapes(&mut shapes, &mut pieces, cell, stroke, index);
                 let blank = rendered.text.trim().is_empty();
-                // Plain ASCII shares the grid font's advance, so a run of it can be
-                // drawn as one piece; anything else is drawn alone in its cells.
-                let plain = single && first.is_ascii() && span == 1;
-                let continues = run.as_ref().is_some_and(|current| {
-                    current.plain && current.style == style && current.end == column
+                let ascii = single && first.is_ascii() && span == 1;
+                let continues = run.as_mut().filter(|current| {
+                    current.style == style
+                        && current.end == column
+                        && current.glyphs.is_ascii() == ascii
                 });
-                if plain && continues {
-                    if let Some(current) = run.as_mut() {
-                        current.text.push_str(&rendered.text);
-                        current.end = column + span;
-                    }
-                } else if blank && !(style.underline || style.strike) {
-                    flush_text(&mut run, &mut pieces, cell, self.font_size, index);
+                if let Some(current) = continues {
+                    current.glyphs.push(&rendered.text, span);
+                    current.end = column + span;
                 } else {
                     flush_text(&mut run, &mut pieces, cell, self.font_size, index);
-                    run = Some(TextRun {
-                        text: rendered.text.clone(),
-                        style,
-                        plain,
-                        start: column,
-                        end: column + span,
-                    });
-                    if !plain {
-                        flush_text(&mut run, &mut pieces, cell, self.font_size, index);
+                    if !blank || style.underline || style.strike {
+                        let glyphs = if ascii {
+                            RunGlyphs::Ascii(rendered.text.clone())
+                        } else {
+                            RunGlyphs::Centered(vec![(
+                                SharedString::from(rendered.text.clone()),
+                                span,
+                            )])
+                        };
+                        run = Some(TextRun {
+                            glyphs,
+                            style,
+                            start: column,
+                            end: column + span,
+                        });
                     }
                 }
             }
@@ -5909,12 +6030,30 @@ struct TextStyle {
 
 /// Text waiting to be drawn from `start`.
 struct TextRun {
-    text: String,
+    glyphs: RunGlyphs,
     style: TextStyle,
-    /// Plain ASCII, which may take more characters; anything else is one cell.
-    plain: bool,
     start: usize,
     end: usize,
+}
+
+/// ASCII shares the grid font's advance. Fallback faces and combining marks
+/// are shaped per cell, then centered in the columns the terminal assigned.
+enum RunGlyphs {
+    Ascii(String),
+    Centered(Vec<(SharedString, usize)>),
+}
+
+impl RunGlyphs {
+    fn is_ascii(&self) -> bool {
+        matches!(self, Self::Ascii(_))
+    }
+
+    fn push(&mut self, text: &str, columns: usize) {
+        match self {
+            Self::Ascii(run) => run.push_str(text),
+            Self::Centered(cells) => cells.push((SharedString::from(text.to_owned()), columns)),
+        }
+    }
 }
 
 /// Cells of one drawn shape waiting to be drawn, as one piece when they tile.
@@ -5952,14 +6091,6 @@ fn flush_text(
         } else {
             FontWeight::NORMAL
         });
-    if !run.plain {
-        // A character from another face is centred in its cells; it may overhang
-        // them, as in other terminals, but never moves its neighbours.
-        piece = piece
-            .w(px((run.end - run.start) as f32 * cell.width))
-            .flex()
-            .justify_center();
-    }
     if style.italic {
         piece = piece.italic();
     }
@@ -5969,7 +6100,40 @@ fn flush_text(
     if style.strike {
         piece = piece.line_through();
     }
-    pieces.push(piece.child(SharedString::from(run.text)));
+    pieces.push(match run.glyphs {
+        RunGlyphs::Ascii(text) => piece.child(SharedString::from(text)),
+        RunGlyphs::Centered(cells) => {
+            let layer = canvas(
+                |_, _, _| (),
+                move |bounds, (), window, cx| {
+                    let text_style = window.text_style();
+                    // Match the grid and the old flex layout: snap each cell's origin
+                    // and its centered text offset separately to physical pixels.
+                    let scale = window.scale_factor();
+                    let snap = |value: Pixels| (value * scale).round() / scale;
+                    let row_left = bounds.left() - snap(px(start as f32 * cell.width));
+                    let mut column = start;
+                    for (text, columns) in cells {
+                        let width = px(columns as f32 * cell.width);
+                        let run = text_style.to_run(text.len());
+                        let line =
+                            window
+                                .text_system()
+                                .shape_line(text, px(font_size), &[run], None);
+                        let left = row_left + snap(px(column as f32 * cell.width));
+                        let offset = snap((width - line.width.ceil()) / 2.0);
+                        let origin = point(left + offset, bounds.top());
+                        let _ = line.paint(origin, px(cell.height), window, cx);
+                        column += columns;
+                    }
+                },
+            )
+            .size_full();
+            piece
+                .w(px((run.end - run.start) as f32 * cell.width))
+                .child(layer)
+        }
+    });
 }
 
 fn flush_shapes(
@@ -6445,7 +6609,7 @@ impl EntityInputHandler for TerminalPane {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let cell = self.cell.sanitized();
-        let cursor = self.core.snapshot().cursor?;
+        let cursor = self.core.visible_cursor()?;
         Some(Bounds::new(
             gpui::point(
                 element_bounds.origin.x + px(cursor.column as f32 * cell.width),
@@ -6462,6 +6626,42 @@ impl EntityInputHandler for TerminalPane {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         None
+    }
+}
+
+#[cfg(test)]
+mod output_repaint_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn small_replies_repaint_immediately_and_a_burst_flushes_after_its_last_read(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let pane = cx.new(|cx| {
+            TerminalPane::without_process(
+                LocalShell::new("Test shell", "test-shell"),
+                EventTag::new(shellune_core::SessionId::new(), 0),
+                GridSize::new(80, 24),
+                shellune_terminal::DEFAULT_FONT_SIZE,
+                Locale::English,
+                cx,
+            )
+        });
+        let paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = paints.clone();
+        let _observe = cx.update(|app| app.observe(&pane, move |_, _| count.set(count.get() + 1)));
+        for bytes in [1, 2, 65_536, 1, 65_536] {
+            pane.update(cx, |pane, cx| pane.repaint_ssh_output(bytes, cx));
+        }
+        cx.run_until_parked();
+        assert_eq!(paints.get(), 2);
+        cx.executor().advance_clock(Duration::from_millis(32));
+        cx.run_until_parked();
+        assert_eq!(paints.get(), 3);
+        cx.executor().advance_clock(Duration::from_millis(100));
+        pane.update(cx, |pane, cx| pane.repaint_ssh_output(1, cx));
+        cx.run_until_parked();
+        assert_eq!(paints.get(), 4);
     }
 }
 

@@ -456,22 +456,19 @@ impl TerminalCore {
     /// parsed into the grid as before. The grid is never cleared because a marker
     /// was missing or the presentation changed.
     pub fn feed(&mut self, bytes: &[u8]) -> TerminalEffects {
+        if bytes.is_empty() {
+            return TerminalEffects::default();
+        }
+        if self.splitter.can_pass_through(bytes) {
+            let plain_ascii = bytes.len() >= 256 && bytes.is_ascii();
+            return self.feed_grid(bytes, plain_ascii);
+        }
         let segments = self.splitter.push(bytes);
         let mut effects = TerminalEffects::default();
         for segment in segments {
             match segment {
                 Segment::Bytes(chunk) => {
-                    if chunk.is_empty() {
-                        continue;
-                    }
-                    self.advance_bytes(&chunk);
-                    let next = self.sink.take_effects();
-                    if let Some(title) = &next.title {
-                        self.title = Some(title.clone());
-                    }
-                    merge_effects(&mut effects, next);
-                    self.note_history();
-                    self.refresh_running_output();
+                    merge_effects(&mut effects, self.feed_grid(&chunk, false));
                 }
                 Segment::Event(event) => {
                     self.note_history();
@@ -491,6 +488,17 @@ impl TerminalCore {
                 }
             }
         }
+        effects
+    }
+
+    fn feed_grid(&mut self, bytes: &[u8], plain_ascii: bool) -> TerminalEffects {
+        self.advance_bytes(bytes, plain_ascii);
+        let effects = self.sink.take_effects();
+        if let Some(title) = &effects.title {
+            self.title = Some(title.clone());
+        }
+        self.note_history();
+        self.refresh_running_output();
         effects
     }
 
@@ -691,7 +699,11 @@ impl TerminalCore {
         let content = self.term.renderable_content();
         let display_offset = content.display_offset;
         let selection = content.selection;
-        let mut rows = vec![RenderedRow::default(); self.grid.rows];
+        let mut rows: Vec<_> = (0..self.grid.rows)
+            .map(|_| RenderedRow {
+                cells: Vec::with_capacity(self.grid.cols),
+            })
+            .collect();
         // Which cells the program left in the default ink: only those may be
         // highlighted, so a program's own colours always win.
         let mut plain: Vec<Vec<bool>> = vec![Vec::new(); self.grid.rows];
@@ -778,24 +790,35 @@ impl TerminalCore {
             }
         }
 
-        let cursor = point_to_viewport(display_offset, content.cursor.point)
-            // A cursor that is scrolled out of the viewport is not drawn: reporting
-            // it anyway would put it at a row the grid does not have.
-            .filter(|point| point.line < self.grid.rows)
-            .map(|point| RenderedCursor {
-                row: point.line,
-                column: point.column.0,
-                shape: content.cursor.shape,
-            });
-
         Snapshot {
             rows,
-            cursor,
+            cursor: self.viewport_cursor(display_offset, content.cursor),
             grid: self.grid,
             display_offset,
             history: self.term.grid().history_size(),
             mode: content.mode,
         }
+    }
+
+    /// Cursor geometry for input methods that only need its screen position.
+    #[must_use]
+    pub fn visible_cursor(&self) -> Option<RenderedCursor> {
+        let content = self.term.renderable_content();
+        self.viewport_cursor(content.display_offset, content.cursor)
+    }
+
+    fn viewport_cursor(
+        &self,
+        display_offset: usize,
+        cursor: alacritty_terminal::term::RenderableCursor,
+    ) -> Option<RenderedCursor> {
+        point_to_viewport(display_offset, cursor.point)
+            .filter(|point| point.line < self.grid.rows)
+            .map(|point| RenderedCursor {
+                row: point.line,
+                column: point.column.0,
+                shape: cursor.shape,
+            })
     }
 
     /// Turns the colouring of addresses, links and failures in plain output on or off.
@@ -1284,7 +1307,7 @@ impl TerminalCore {
     /// so anchors stay put without touching `lines_dropped`. At the limit the
     /// ring rotates instead: the row now at the top is the row that used to sit
     /// `dropped` lines below it, and that distance is what `lines_dropped` gains.
-    fn advance_bytes(&mut self, mut bytes: &[u8]) {
+    fn advance_bytes(&mut self, mut bytes: &[u8], plain_ascii: bool) {
         if bytes.is_empty() {
             return;
         }
@@ -1292,6 +1315,10 @@ impl TerminalCore {
             self.parser.advance(&mut self.term, bytes);
             return;
         }
+        // An escape-free ASCII read cannot introduce a new VT sequence. Its
+        // scroll bound can be counted in bulk instead of testing it per byte.
+        // The whole-read bound also covers every remaining suffix of the read.
+        let ascii_depth = plain_ascii.then(|| self.scroll_bound(bytes));
         while !bytes.is_empty() {
             if self.on_alternate_screen() {
                 // One byte at a time so a sequence that leaves the alternate grid
@@ -1318,7 +1345,10 @@ impl TerminalCore {
                     continue;
                 }
             }
-            let (n, depth) = self.measured_step(bytes);
+            let (n, depth) = match ascii_depth {
+                Some(depth) if depth < history.saturating_add(rows) => (bytes.len(), depth),
+                _ => self.measured_step(bytes),
+            };
             self.advance_measured(&mut bytes, n, depth);
         }
     }
@@ -1326,6 +1356,24 @@ impl TerminalCore {
     /// Bytes that can start a control sequence, as opposed to plain text.
     fn is_hazard(byte: u8) -> bool {
         byte == 0x1b || (0x80..=0x9f).contains(&byte)
+    }
+
+    /// Keep continuation bytes of a complete printable UTF-8 character together.
+    /// An isolated C1 byte or a partial character still takes the control-aware path.
+    fn text_unit_len(bytes: &[u8]) -> usize {
+        match bytes[0] {
+            0xc2..=0xf4 => {
+                let width = bytes[0].leading_ones() as usize;
+                if let Some(unit) = bytes.get(..width)
+                    && !(unit[0] == 0xc2 && unit[1] < 0xa0)
+                    && std::str::from_utf8(unit).is_ok()
+                {
+                    return width;
+                }
+                1
+            }
+            _ => 1,
+        }
     }
 
     /// How many leading bytes to parse while the alternate grid is showing.
@@ -1352,20 +1400,29 @@ impl TerminalCore {
         let rows = self.screen_rows();
         let active = self.history().saturating_add(rows).max(1);
         let limit = active - 1;
-        if Self::is_hazard(bytes[0]) {
-            let n = sequence_len(bytes).clamp(1, bytes.len());
-            let depth = self.scroll_bound(&bytes[..n]).min(limit).max(1);
-            return (n, depth);
-        }
         let cols = self.grid.cols.max(1);
         let mut n = 0;
         let mut newlines = 0usize;
-        while n < bytes.len() && !Self::is_hazard(bytes[n]) {
+        while n < bytes.len() {
+            let rest = &bytes[n..];
+            let width = if !Self::is_hazard(rest[0]) {
+                Self::text_unit_len(rest)
+            } else if let Some(len) = sgr_len(rest) {
+                // A complete rendition change cannot scroll or switch grids.
+                // Include it in the same history measurement as the text it styles.
+                len
+            } else if n == 0 {
+                let len = sequence_len(rest).clamp(1, rest.len());
+                let depth = self.scroll_bound(&rest[..len]).min(limit).max(1);
+                return (len, depth);
+            } else {
+                break;
+            };
             let mut next_newlines = newlines;
             if matches!(bytes[n], b'\n' | 0x0b | 0x0c) {
                 next_newlines += 1;
             }
-            let next = n + 1;
+            let next = n + width;
             // `rows` covers one control action already in progress at the start
             // of this slice. After that, only newlines and wraps scroll.
             let bound = rows + next_newlines + next / cols;
@@ -1379,7 +1436,7 @@ impl TerminalCore {
             }
         }
         let n = n.clamp(1, bytes.len());
-        let depth = self.scroll_bound(&bytes[..n]).min(limit).max(1);
+        let depth = (rows + newlines + n / cols).min(limit).max(1);
         (n, depth)
     }
 
@@ -1466,6 +1523,21 @@ impl TerminalCore {
     }
 }
 
+/// Only complete, numeric SGRs can share a measurement with printable text.
+/// Leave partial sequences, private modes and embedded controls to the VT parser
+/// in a separate step: those may scroll, clear history or switch screens.
+fn sgr_len(bytes: &[u8]) -> Option<usize> {
+    let params = bytes.strip_prefix(b"\x1b[")?;
+    for (index, byte) in params.iter().take(65).enumerate() {
+        match byte {
+            b'0'..=b'9' | b';' | b':' => continue,
+            b'm' => return Some(index + 3),
+            _ => break,
+        }
+    }
+    None
+}
+
 /// Leading control sequence, or one byte when `bytes` does not start one.
 ///
 /// A CSI or OSC is one terminal action (one scroll, one clear, one mode change),
@@ -1542,14 +1614,18 @@ fn highlight_row(row: &mut RenderedRow, plain: &[bool]) {
     if !plain.iter().any(|plain| *plain) {
         return;
     }
-    // The row's text, and for each byte the cell it came from.
-    let mut line = String::new();
-    let mut owner: Vec<usize> = Vec::new();
-    for (index, cell) in row.cells.iter().enumerate() {
-        line.push_str(&cell.text);
-        owner.extend(std::iter::repeat_n(index, cell.text.len()));
+    let line: String = row.cells.iter().map(|cell| cell.text.as_str()).collect();
+    let spans = crate::highlight::spans(&line);
+    if spans.is_empty() {
+        return;
     }
-    for (range, kind) in crate::highlight::spans(&line) {
+    let owner: Vec<_> = row
+        .cells
+        .iter()
+        .enumerate()
+        .flat_map(|(index, cell)| std::iter::repeat_n(index, cell.text.len()))
+        .collect();
+    for (range, kind) in spans {
         let colour = kind.colour();
         let first = owner.get(range.start).copied();
         let last = owner.get(range.end.saturating_sub(1)).copied();
@@ -2085,6 +2161,80 @@ mod tests {
         terminal.feed(b"same\r\n");
         assert_eq!(terminal.offset_of(parked), terminal.display_offset());
         assert_eq!(terminal.snapshot().text(), shown);
+    }
+
+    #[test]
+    fn mixed_utf8_keeps_the_same_history_anchors_across_read_boundaries() {
+        let mut data = "中한あ🙂e\u{301}\r\n".repeat(200).into_bytes();
+        data.extend_from_slice(b"\x1b[32m\xe4\x9b\x1b[0m\r\n\x85\x9b");
+        data.extend_from_slice("★終端🙂\r\n".repeat(30).as_bytes());
+        let mut reference = TerminalCore::new(9, 4, 20);
+        for byte in data.chunks(1) {
+            reference.feed(byte);
+        }
+        for batch in [2, 7, 64, data.len()] {
+            let mut terminal = TerminalCore::new(9, 4, 20);
+            for chunk in data.chunks(batch) {
+                terminal.feed(chunk);
+            }
+            assert_eq!(terminal.anchor_line(0, 0), reference.anchor_line(0, 0));
+            terminal.scroll(20);
+            reference.scroll(20);
+            assert_eq!(terminal.snapshot().text(), reference.snapshot().text());
+        }
+    }
+
+    #[test]
+    fn large_ascii_reads_keep_history_anchors_across_wraps_and_line_controls() {
+        let text = b"abcdefghijklmnopqrst\r\n123456\x0b789\x0cend\r\n".repeat(16);
+        for history in [3, 128] {
+            let mut reference = TerminalCore::new(9, 5, history);
+            let mut batched = TerminalCore::new(9, 5, history);
+            let preload = b"same\r\n".repeat(history + 5);
+            for term in [&mut reference, &mut batched] {
+                term.feed(&preload);
+                term.scroll(2);
+            }
+            for byte in text.chunks(1) {
+                reference.feed(byte);
+            }
+            batched.feed(&text);
+            assert_eq!(batched.anchor_line(0, 0), reference.anchor_line(0, 0));
+            assert_eq!(batched.snapshot(), reference.snapshot());
+            assert_eq!(batched.visible_cursor(), reference.snapshot().cursor);
+            batched.scroll_to_bottom();
+            reference.scroll_to_bottom();
+            assert_eq!(batched.snapshot(), reference.snapshot());
+            assert_eq!(batched.visible_cursor(), reference.snapshot().cursor);
+        }
+    }
+
+    #[test]
+    fn batched_rendition_changes_preserve_scrollback_styles_and_control_replies() {
+        let colored = b"\x1b[38;5;172mred\x1b[48;2;1;2;3m green\x1b[m!\r\n".repeat(30);
+        for batch in [2, 7, 64, colored.len()] {
+            let mut terminal = TerminalCore::new(8, 4, 9);
+            let mut reference = TerminalCore::new(8, 4, 9);
+            for phase in [
+                colored.as_slice(),
+                b"\x1b[32m\x1b[3S\x1b[1mB\x1b[6n",
+                b"\x1b[?1049h\x1b[4:1malt\x1b[6n",
+                b"\x1b[?1049l\x1b[0mhome\x1b[6n",
+                b"\x1b[3J\x1b[38;5;11mend",
+            ] {
+                let expected: Vec<_> = phase
+                    .chunks(1)
+                    .flat_map(|b| reference.feed(b).writes)
+                    .collect();
+                let actual: Vec<_> = phase
+                    .chunks(batch)
+                    .flat_map(|b| terminal.feed(b).writes)
+                    .collect();
+                assert_eq!(actual, expected);
+                assert_eq!(terminal.snapshot(), reference.snapshot());
+                assert_eq!(terminal.anchor_line(0, 0), reference.anchor_line(0, 0));
+            }
+        }
     }
 
     #[test]

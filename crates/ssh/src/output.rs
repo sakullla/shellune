@@ -1,11 +1,23 @@
 //! Bounded terminal output with lossless backpressure and bounded UI batches.
 use std::sync::Arc;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 
 const QUEUED_BYTES: usize = 1024 * 1024;
 const CHUNK: usize = 16 * 1024;
 const BATCH_BYTES: usize = 64 * 1024;
 const BATCH_EVENTS: usize = 64;
+
+/// A coalesced wakeup for the single consumer of an SSH terminal's event queue.
+/// Data, exit and status still come from the same ordered queue.
+#[derive(Clone, Default)]
+pub struct OutputReady(Arc<Notify>);
+
+impl OutputReady {
+    /// Waits until the consumer should drain again. A send before the wait is remembered.
+    pub async fn wait(&self) {
+        self.0.notified().await;
+    }
+}
 
 struct Entry<T> {
     event: T,
@@ -16,6 +28,7 @@ struct Entry<T> {
 pub(crate) struct Sender<T> {
     tx: mpsc::UnboundedSender<Entry<T>>,
     budget: Arc<Semaphore>,
+    ready: OutputReady,
 }
 
 impl<T> Clone for Sender<T> {
@@ -23,6 +36,7 @@ impl<T> Clone for Sender<T> {
         Self {
             tx: self.tx.clone(),
             budget: self.budget.clone(),
+            ready: self.ready.clone(),
         }
     }
 }
@@ -30,30 +44,37 @@ impl<T> Clone for Sender<T> {
 pub(crate) struct Receiver<T> {
     rx: mpsc::UnboundedReceiver<Entry<T>>,
     budget: Arc<Semaphore>,
+    ready: OutputReady,
 }
 
 pub(crate) fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let budget = Arc::new(Semaphore::new(QUEUED_BYTES));
+    let ready = OutputReady::default();
     (
         Sender {
             tx,
             budget: budget.clone(),
+            ready: ready.clone(),
         },
-        Receiver { rx, budget },
+        Receiver { rx, budget, ready },
     )
 }
 
 impl<T> Sender<T> {
     // Control events must remain ordered with output, without waiting for byte space.
     pub(crate) fn send(&self, event: T) -> Result<(), ()> {
-        self.tx
-            .send(Entry {
-                event,
-                bytes: 0,
-                _permit: None,
-            })
-            .map_err(|_| ())
+        self.enqueue(Entry {
+            event,
+            bytes: 0,
+            _permit: None,
+        })
+    }
+
+    fn enqueue(&self, entry: Entry<T>) -> Result<(), ()> {
+        self.tx.send(entry).map_err(|_| ())?;
+        self.ready.0.notify_one();
+        Ok(())
     }
 
     pub(crate) async fn data(&self, data: &[u8], wrap: impl Fn(Vec<u8>) -> T) -> Result<(), ()> {
@@ -65,19 +86,21 @@ impl<T> Sender<T> {
                 .acquire_many_owned(chunk.len().max(1024) as u32)
                 .await
                 .map_err(|_| ())?;
-            self.tx
-                .send(Entry {
-                    event: wrap(chunk.to_vec()),
-                    bytes: chunk.len(),
-                    _permit: Some(permit),
-                })
-                .map_err(|_| ())?;
+            self.enqueue(Entry {
+                event: wrap(chunk.to_vec()),
+                bytes: chunk.len(),
+                _permit: Some(permit),
+            })?;
         }
         Ok(())
     }
 }
 
 impl<T> Receiver<T> {
+    pub(crate) fn output_ready(&self) -> OutputReady {
+        self.ready.clone()
+    }
+
     pub(crate) fn try_recv(&mut self) -> Result<T, mpsc::error::TryRecvError> {
         self.rx.try_recv().map(|entry| entry.event)
     }
@@ -89,6 +112,9 @@ impl<T> Receiver<T> {
             let Ok(entry) = self.rx.try_recv() else { break };
             bytes += entry.bytes;
             events.push(entry.event);
+        }
+        if !self.rx.is_empty() {
+            self.ready.0.notify_one();
         }
         events
     }
@@ -103,6 +129,33 @@ impl<T> Drop for Receiver<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_single_consumer_wakes_for_queued_batches_and_later_control_events() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (tx, mut rx) = channel::<Vec<u8>>();
+                let ready = rx.output_ready();
+                tx.data(&vec![1; 2 * BATCH_BYTES], |chunk| chunk)
+                    .await
+                    .unwrap();
+                let deadline = std::time::Duration::from_secs(1);
+                for _ in 0..2 {
+                    tokio::time::timeout(deadline, ready.wait()).await.unwrap();
+                    assert_eq!(rx.drain().iter().map(Vec::len).sum::<usize>(), BATCH_BYTES);
+                }
+                let sender = tokio::spawn(async move {
+                    tokio::task::yield_now().await;
+                    tx.send(vec![2]).unwrap();
+                });
+                tokio::time::timeout(deadline, ready.wait()).await.unwrap();
+                assert_eq!(rx.drain(), vec![vec![2]]);
+                sender.await.unwrap();
+            });
+    }
 
     #[test]
     fn slow_consumer_is_bounded_ordered_and_drop_wakes_sender() {

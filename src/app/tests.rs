@@ -19984,6 +19984,33 @@ async fn the_new_tab_menu_hangs_from_its_control(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn terminal_shaping_preserves_decorated_spaces_at_the_end_of_a_row(cx: &mut TestAppContext) {
+    let (_pane, cx) = pane_with("x\x1b[4m  \x1b[0m\r\ny\x1b[9m  \x1b[0m\r\n", cx);
+    assert!(
+        cx.debug_bounds("terminal.text.0.1").is_some(),
+        "underlined spaces"
+    );
+    assert!(
+        cx.debug_bounds("terminal.text.1.1").is_some(),
+        "struck-through spaces"
+    );
+}
+
+#[gpui::test]
+async fn a_fallback_run_preserves_cell_widths_and_style_boundaries(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("中文한e\u{301}\x1b[4m終\x1b[0mx\r\n", cx);
+    let cell = cx.update(|_, app| pane.read(app).cell_size());
+    let row = bounds_of(cx, "terminal.row.0");
+    for (selector, column, columns) in [("terminal.text.0.0", 0, 7), ("terminal.text.0.7", 7, 2)] {
+        let run = bounds_of(cx, selector);
+        assert!((run.left() - row.left() - px(cell.width * column as f32)).abs() <= px(1.0));
+        assert!((run.size.width - px(cell.width * columns as f32)).abs() <= px(1.0));
+    }
+    let ascii = bounds_of(cx, "terminal.text.0.9");
+    assert!((ascii.left() - row.left() - px(9.0 * cell.width)).abs() <= px(1.0));
+}
+
+#[gpui::test]
 async fn frame_lines_and_wide_characters_keep_the_columns_after_them(cx: &mut TestAppContext) {
     // A frame line, a CJK character and an icon come from other faces at their own
     // widths. Each is drawn in its own cells, so the text after them still starts
