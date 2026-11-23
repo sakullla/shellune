@@ -272,9 +272,11 @@ impl IntegrationSplitter {
         Self { held: Vec::new() }
     }
 
-    /// With no pending marker or escape, the grid can read the caller's slice directly.
+    /// Only OSC needs splitting. Keep a trailing escape until we know its introducer.
     pub(crate) fn can_pass_through(&self, input: &[u8]) -> bool {
-        self.held.is_empty() && !input.contains(&0x1b)
+        self.held.is_empty()
+            && !input.ends_with(b"\x1b")
+            && (!input.contains(&b']') || !input.windows(2).any(|pair| pair == b"\x1b]"))
     }
 
     /// Appends `input` and returns every complete segment it now contains.
@@ -847,6 +849,22 @@ impl BlockBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_colour_change_passes_through_but_a_split_osc_waits_for_its_terminator() {
+        let mut splitter = IntegrationSplitter::new();
+        assert!(splitter.can_pass_through(b"\x1b[31m[warn]\x1b[0m"));
+        assert!(!splitter.can_pass_through(b"end\x1b"));
+        splitter.push(b"end\x1b");
+        assert!(!splitter.can_pass_through(b"]7;file:///tmp"));
+        assert!(splitter.push(b"]7;file:///tmp").is_empty());
+        assert!(!splitter.can_pass_through(b"\x07"));
+        assert!(matches!(
+            &splitter.push(b"\x07")[..],
+            [Segment::Directory(_)]
+        ));
+        assert!(splitter.can_pass_through(b"\x1b[2J"));
+    }
 
     #[test]
     fn block_retention_is_bounded_and_keeps_newest_commands() {

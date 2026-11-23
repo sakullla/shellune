@@ -4728,24 +4728,47 @@ impl TerminalPane {
             column += span;
         }
         backgrounds.extend(stretch);
-        for (start, end, color, search_hit) in backgrounds {
-            let bg = div()
+        if backgrounds.len() > 1 && search_marks.is_empty() {
+            // Colour bands have no layout or input of their own. Paint them in
+            // a single row element, behind the cursor and the text runs.
+            element = element.child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        for (start, end, color, _) in backgrounds {
+                            let left = px(start as f32 * width);
+                            let right = px(end as f32 * width);
+                            let band = Bounds::new(
+                                point(bounds.origin.x + left, bounds.origin.y),
+                                gpui::size(right - left, bounds.size.height),
+                            );
+                            window.paint_quad(gpui::fill(band, color));
+                        }
+                    },
+                )
                 .absolute()
-                .top_0()
-                .left(x(start))
-                .w(x(end - start))
-                .h(px(height))
-                .bg(color)
-                .when(search_hit == Some(false), |box_div| {
-                    box_div
-                        .border_b_1()
-                        .border_color(Tone::Warning.text())
-                        .debug_selector(|| "terminal.search.match".to_owned())
-                })
-                .when(search_hit == Some(true), |box_div| {
-                    box_div.debug_selector(|| "terminal.search.match.current".to_owned())
-                });
-            element = element.child(bg);
+                .inset_0(),
+            );
+        } else {
+            for (start, end, color, search_hit) in backgrounds {
+                let bg = div()
+                    .absolute()
+                    .top_0()
+                    .left(x(start))
+                    .w(x(end - start))
+                    .h(px(height))
+                    .bg(color)
+                    .when(search_hit == Some(false), |box_div| {
+                        box_div
+                            .border_b_1()
+                            .border_color(Tone::Warning.text())
+                            .debug_selector(|| "terminal.search.match".to_owned())
+                    })
+                    .when(search_hit == Some(true), |box_div| {
+                        box_div.debug_selector(|| "terminal.search.match.current".to_owned())
+                    });
+                element = element.child(bg);
+            }
         }
 
         if let Some(cursor) = cursor {

@@ -460,7 +460,7 @@ impl TerminalCore {
             return TerminalEffects::default();
         }
         if self.splitter.can_pass_through(bytes) {
-            let plain_ascii = bytes.len() >= 256 && bytes.is_ascii();
+            let plain_ascii = bytes.len() >= 256 && bytes.is_ascii() && !bytes.contains(&0x1b);
             return self.feed_grid(bytes, plain_ascii);
         }
         let segments = self.splitter.push(bytes);
