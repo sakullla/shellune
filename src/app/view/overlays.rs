@@ -249,6 +249,13 @@ impl ShelluneView {
         }) {
             return;
         }
+        if kept.is_some()
+            && current
+                .as_ref()
+                .is_some_and(|handle| self.is_overlay_internal_focus(handle, cx))
+        {
+            return;
+        }
         self.focus_return = current
             .filter(|handle| !self.is_overlay_internal_focus(handle, cx))
             .map(|handle| handle.downgrade());
@@ -1544,6 +1551,7 @@ impl ShelluneView {
         match kind {
             SessionKind::Local { shell } => {
                 if self.workspace.destination() != Destination::LocalShells {
+                    self.security_reset_reveal();
                     self.workspace.select(Destination::LocalShells);
                 }
                 self.session_terminal = true;
@@ -1581,6 +1589,7 @@ impl ShelluneView {
             | SessionKind::Serial { host } => {
                 if self.book.connection(host).is_some() {
                     if self.workspace.destination() != Destination::LocalShells {
+                        self.security_reset_reveal();
                         self.workspace.select(Destination::LocalShells);
                     }
                     self.session_terminal = true;

@@ -274,9 +274,14 @@ pub(crate) enum SecurityPending {
     Reveal(CredentialId),
     /// Copy the password of one record, without drawing it.
     Copy(CredentialId),
-    /// Continue the connection the chain form was about to dial; the flag is
-    /// the `take_panel` the interrupted call was given.
-    ResumeChain(bool),
+    /// Continue the connection the chain form was about to dial, bound to the
+    /// originating session (once parked/registered) and target host so tab
+    /// switches or opening another host never lose or cross-route the verification.
+    ResumeChain {
+        session: Option<shellune_core::SessionId>,
+        host: HostId,
+        take_panel: bool,
+    },
     /// Start one desktop session whose shared password the vault holds.
     Desktop(shellune_core::SessionId),
     /// Write the private-key export the open dialog has chosen a path for.
@@ -498,6 +503,55 @@ pub(crate) enum SecurityDialog {
     /// unlocked session is then the whole protection, and the page says so in
     /// exactly those words (R4, `LocalOnlyFallback`).
     BiometricRisk,
+}
+
+impl SecurityDialog {
+    /// Whether `handle` belongs to one of the text inputs owned by this open dialog.
+    pub(crate) fn owns_focus(&self, handle: &gpui::FocusHandle, cx: &App) -> bool {
+        match self {
+            Self::ImportKey {
+                pem,
+                passphrase,
+                name,
+                ..
+            } => [pem, passphrase, name]
+                .into_iter()
+                .any(|field| field.read(cx).focus_handle() == handle),
+            Self::GenerateKey { name, comment, .. } | Self::EditKey { name, comment, .. } => {
+                [name, comment]
+                    .into_iter()
+                    .any(|field| field.read(cx).focus_handle() == handle)
+            }
+            Self::ExportKey {
+                passphrase,
+                confirm,
+                ..
+            } => [passphrase, confirm]
+                .into_iter()
+                .any(|field| field.read(cx).focus_handle() == handle),
+            Self::RotateKey { name, .. } => name.read(cx).focus_handle() == handle,
+            Self::NewCredential {
+                name,
+                user,
+                secret,
+                length,
+                ..
+            }
+            | Self::EditCredential {
+                name,
+                user,
+                secret,
+                length,
+                ..
+            } => [name, user, secret, length]
+                .into_iter()
+                .any(|field| field.read(cx).focus_handle() == handle),
+            Self::DeleteKey { .. }
+            | Self::DeleteCredential { .. }
+            | Self::DeleteTrust { .. }
+            | Self::BiometricRisk => false,
+        }
+    }
 }
 
 impl SecurityPage {
@@ -988,7 +1042,6 @@ impl ShelluneView {
         let strings = self.security_strings();
         let independent_split = in_home && self.home_vault_independent_split();
         let mut page = div()
-            .track_focus(&self.security.list_focus)
             .flex()
             .flex_col()
             .w_full()
@@ -1159,13 +1212,16 @@ impl ShelluneView {
 
         let wide_split = in_home && self.home_vault_wide_split();
 
-        let lists_column = self.security_filtered_lists(cx).child(
-            div()
-                .text_size(metrics.caption_size())
-                .text_color(theme::swatch(palette::TEXT_MUTED))
-                .debug_selector(|| "security.secrets.hidden".to_owned())
-                .child(strings.secrets_hidden),
-        );
+        let lists_column = self
+            .security_filtered_lists(cx)
+            .track_focus(&self.security.list_focus)
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "security.secrets.hidden".to_owned())
+                    .child(strings.secrets_hidden),
+            );
 
         if wide_split {
             let detail_pane = match self
@@ -3223,6 +3279,10 @@ impl ShelluneView {
             self.focus_host_dialog = true;
             self.focus_host_dialog_keep_return = true;
         } else {
+            if self.host_fields.is_none() && self.protocol_fields.is_none() && self.backup.is_none()
+            {
+                self.modal_focus_captured = false;
+            }
             self.restore_focus_pending = true;
         }
         cx.notify();
@@ -4240,10 +4300,13 @@ impl ShelluneView {
                             self.restore_focus_pending = true;
                         }
                     }
-                    (Some(_), _) => {
-                        self.restore_focus_pending = true;
-                    }
-                    (None, _) => {
+                    (Some(_), _) | (None, _) => {
+                        if self.host_fields.is_none()
+                            && self.protocol_fields.is_none()
+                            && self.backup.is_none()
+                        {
+                            self.modal_focus_captured = false;
+                        }
                         self.restore_focus_pending = true;
                     }
                 }
@@ -4559,10 +4622,8 @@ impl ShelluneView {
         let aborted = std::mem::take(&mut self.security.lock.pending);
         for step in aborted {
             match step {
-                SecurityPending::ResumeChain(_) => {
-                    if let Some(panel) = self.remote.as_mut() {
-                        panel.set_form_error(reason.to_owned());
-                    }
+                SecurityPending::ResumeChain { session, host, .. } => {
+                    self.abort_chain_after_verify(session, host, reason);
                 }
                 SecurityPending::Desktop(session) => {
                     self.security_fail_desktop(session, reason.to_owned());
@@ -4579,6 +4640,10 @@ impl ShelluneView {
         session: shellune_core::SessionId,
         reason: String,
     ) {
+        self.forget_session_desktop_secret(session);
+        if self.workspace.session(session).is_none() {
+            return;
+        }
         self.security
             .session_verify_failures
             .insert(session, reason.clone());
@@ -4953,7 +5018,7 @@ impl ShelluneView {
                 step,
                 SecurityPending::Reveal(_)
                     | SecurityPending::Copy(_)
-                    | SecurityPending::ResumeChain(_)
+                    | SecurityPending::ResumeChain { .. }
                     | SecurityPending::Desktop(_)
                     | SecurityPending::ExportKey
                     | SecurityPending::OpenAction(_)
@@ -5015,17 +5080,23 @@ impl ShelluneView {
                         self.security_touch(cx);
                     }
                 }
-                SecurityPending::ResumeChain(take_panel) => {
+                SecurityPending::ResumeChain {
+                    session,
+                    host,
+                    take_panel,
+                } => {
                     // One passage of the connection gate, already paid for:
                     // the dial continues where it was interrupted (R3).
                     self.security.operation_granted = true;
                     self.security_touch(cx);
-                    self.finish_chain(take_panel, cx);
+                    self.resume_chain_after_verify(session, host, take_panel, cx);
+                    self.security.operation_granted = false;
                 }
                 SecurityPending::Desktop(session) => {
                     self.security.operation_granted = true;
                     self.security_touch(cx);
                     self.start_desktop_session(session, cx);
+                    self.security.operation_granted = false;
                 }
                 SecurityPending::ExportKey => {
                     // One passage of the export gate, already paid for: the
@@ -5033,11 +5104,13 @@ impl ShelluneView {
                     self.security.operation_granted = true;
                     self.security_touch(cx);
                     self.security_choose_export(cx);
+                    self.security.operation_granted = false;
                 }
                 SecurityPending::BackupVaultExport => {
                     self.security.operation_granted = true;
                     self.security_touch(cx);
                     self.choose_backup_export_path(cx);
+                    self.security.operation_granted = false;
                 }
                 SecurityPending::EnableBiometric => {
                     self.security_set_biometric(true, cx);
@@ -5089,15 +5162,63 @@ impl ShelluneView {
         window.focus(&self.security.list_focus);
     }
 
-    /// Whether an SSH/chain connection attempt is currently waiting on vault verification/open.
+    /// Whether the currently displayed SSH/chain connection attempt is waiting on vault verification/open.
     pub(crate) fn security_verifying_for_chain(&self) -> bool {
+        let Some((session, host)) = self.current_chain_target() else {
+            return false;
+        };
         (self.security.lock.verifying || self.security.warming)
-            && self
-                .security
-                .lock
-                .pending
-                .iter()
-                .any(|step| matches!(step, SecurityPending::ResumeChain(_)))
+            && self.security.lock.pending.iter().any(|step| {
+                matches!(
+                    step,
+                    SecurityPending::ResumeChain {
+                        session: pending_session,
+                        host: pending_host,
+                        ..
+                    } if *pending_session == session && *pending_host == host
+                )
+            })
+    }
+
+    /// Binds a newly registered `SessionId` onto an in-flight `ResumeChain` when an
+    /// unassigned foreground connection form gets parked onto its own session tab.
+    pub(crate) fn security_bind_parked_chain(
+        &mut self,
+        host: HostId,
+        session: shellune_core::SessionId,
+    ) {
+        for step in &mut self.security.lock.pending {
+            if let SecurityPending::ResumeChain {
+                session: slot @ None,
+                host: pending_host,
+                ..
+            } = step
+                && *pending_host == host
+            {
+                *slot = Some(session);
+            }
+        }
+    }
+
+    /// Drops any queued verification continuation and stale verification failure record
+    /// owned by a session that was closed.
+    pub(crate) fn security_drop_pending_session(&mut self, session: shellune_core::SessionId) {
+        self.security.session_verify_failures.remove(&session);
+        self.security.lock.pending.retain(|step| match step {
+            SecurityPending::Desktop(id) => *id != session,
+            SecurityPending::ResumeChain {
+                session: Some(id), ..
+            } => *id != session,
+            _ => true,
+        });
+    }
+
+    /// Drops any unassigned foreground `ResumeChain` step when its connection dialog is cancelled.
+    pub(crate) fn security_drop_unassigned_chain(&mut self) {
+        self.security
+            .lock
+            .pending
+            .retain(|step| !matches!(step, SecurityPending::ResumeChain { session: None, .. }));
     }
 
     /// Whether `session` (an RDP/VNC desktop session) is waiting on vault verification/open.
@@ -5129,6 +5250,14 @@ impl ShelluneView {
     /// Whether a vault modal dialog is currently open.
     pub(crate) fn security_dialog_open(&self) -> bool {
         self.security.dialog.is_some()
+    }
+
+    /// Whether `handle` belongs to one of the text inputs owned by the open vault dialog.
+    pub(crate) fn security_dialog_owns_focus(&self, handle: &gpui::FocusHandle, cx: &App) -> bool {
+        self.security
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.owns_focus(handle, cx))
     }
 
     /// Focus handle of the vault search input.
@@ -6259,6 +6388,11 @@ impl ShelluneView {
     /// Whether the detail card is showing a password.
     pub fn security_password_shown_for_test(&self) -> bool {
         self.security.revealed
+    }
+
+    /// Whether the one-shot sensitive-operation grant flag is currently set.
+    pub fn security_operation_granted_for_test(&self) -> bool {
+        self.security.operation_granted
     }
 
     /// The saved sync passphrase, the one secret a vault backup and a

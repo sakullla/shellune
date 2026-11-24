@@ -1088,6 +1088,12 @@ pub struct ShelluneView {
     /// Preserves `focus_return` when returning focus from a stacked inline vault dialog
     /// back to an already-open connection dialog.
     focus_host_dialog_keep_return: bool,
+    /// Whether `focus_return` has already been captured for the currently open modal form
+    /// stack (`host_fields`, `protocol_fields`, `security.dialog`, `backup`), preventing
+    /// nested modals or validation refocus from overwriting the pre-modal focus target.
+    modal_focus_captured: bool,
+    /// Whether a vault keys/passwords surface was visible on the previous rendered frame.
+    was_security_keys_surface_visible: bool,
     /// Focus to return to when an overlay closes. Weak, so a removed field is not kept.
     focus_return: Option<gpui::WeakFocusHandle>,
     /// The next draw gives the keyboard back to [`Self::focus_return`].
@@ -1305,6 +1311,24 @@ impl ProtocolFields {
             | ConnectionFormField::LocalEcho => None,
         }
     }
+
+    fn owns_focus(&self, handle: &FocusHandle, cx: &gpui::App) -> bool {
+        [
+            &self.name,
+            &self.group,
+            &self.address,
+            &self.port,
+            &self.user,
+            &self.domain,
+            &self.secret,
+            &self.drive_folder,
+            &self.device,
+            &self.baud,
+            &self.data_bits,
+        ]
+        .into_iter()
+        .any(|field| field.read(cx).focus_handle() == handle)
+    }
 }
 
 impl HostFields {
@@ -1320,6 +1344,22 @@ impl HostFields {
             HostField::StartupCommand => &self.startup,
             HostField::ProxyCommand => &self.proxy,
         }
+    }
+
+    fn owns_focus(&self, handle: &FocusHandle, cx: &gpui::App) -> bool {
+        [
+            &self.name,
+            &self.address,
+            &self.port,
+            &self.user,
+            &self.group,
+            &self.identity,
+            &self.secret,
+            &self.startup,
+            &self.proxy,
+        ]
+        .into_iter()
+        .any(|field| field.read(cx).focus_handle() == handle)
     }
 }
 
@@ -1354,6 +1394,12 @@ impl HostConnectionFields {
             ConnectionField::KeepaliveMisses => &self.misses,
             ConnectionField::ConnectTimeout => &self.timeout,
         }
+    }
+
+    fn owns_focus(&self, handle: &FocusHandle, cx: &gpui::App) -> bool {
+        [&self.interval, &self.misses, &self.timeout]
+            .into_iter()
+            .any(|field| field.read(cx).focus_handle() == handle)
     }
 }
 
@@ -3016,6 +3062,8 @@ impl ShelluneView {
             backup: None,
             focus_host_dialog: false,
             focus_host_dialog_keep_return: false,
+            modal_focus_captured: false,
+            was_security_keys_surface_visible: false,
             focus_return: None,
             restore_focus_pending: false,
             remember_tool_focus_pending: false,
@@ -4106,6 +4154,16 @@ impl ShelluneView {
     /// its failure are reported. A record that cannot describe a desktop is refused
     /// with the reason instead of opening a tab that would fail on its first frame.
     pub(super) fn open_desktop_connection(&mut self, id: HostId, cx: &mut Context<Self>) {
+        self.open_desktop_connection_with_ephemeral(id, None, cx);
+    }
+
+    pub(super) fn open_desktop_connection_with_ephemeral(
+        &mut self,
+        id: HostId,
+        ephemeral: Option<shellune_core::SecretString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.desktop_secrets.clear();
         if let Some(waiting) = self.security_verifying_desktop_session() {
             self.show_terminal_start(waiting, cx);
             return;
@@ -4135,7 +4193,30 @@ impl ShelluneView {
         let session = self
             .workspace
             .register_session_not_started(kind, record.name(), pane_target);
+        if let Some(secret) = ephemeral {
+            self.desktop_secrets.insert(id, secret);
+        }
         self.start_desktop_session(session.id(), cx);
+        self.desktop_secrets.remove(&id);
+    }
+
+    /// Clears any unconsumed one-shot desktop password belonging to `session`'s target host.
+    pub(crate) fn forget_session_desktop_secret(&mut self, session: SessionId) {
+        if let Some(host) = self
+            .workspace
+            .session(session)
+            .and_then(|s| match s.kind() {
+                SessionKind::Rdp { host } | SessionKind::Vnc { host } => Some(*host),
+                _ => None,
+            })
+        {
+            self.desktop_secrets.remove(&host);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn desktop_secret_count_for_test(&self) -> usize {
+        self.desktop_secrets.len()
     }
 
     /// Opens a saved serial record in a tab of its own (R2, R21).
@@ -5268,6 +5349,7 @@ impl ShelluneView {
             // A terminal that just opened is what the user asked for: show it, from
             // the hosts home or the settings alike.
             if self.workspace.destination() != Destination::LocalShells {
+                self.security_reset_reveal();
                 self.workspace.select(Destination::LocalShells);
                 self.workspace
                     .set_context(shellune_core::PanelSection::None);
@@ -5313,6 +5395,7 @@ impl ShelluneView {
         // already reported synchronously is copied into the session record immediately.
         self.sync_desktop(pane, cx);
         if self.workspace.destination() != Destination::LocalShells {
+            self.security_reset_reveal();
             self.workspace.select(Destination::LocalShells);
             self.workspace
                 .set_context(shellune_core::PanelSection::None);
@@ -5422,6 +5505,7 @@ impl ShelluneView {
         protocol: ProtocolKind,
         cx: &mut Context<Self>,
     ) {
+        self.desktop_secrets.remove(&host);
         let Some(record) = self.book.connection(host) else {
             cx.notify();
             return;
@@ -5783,6 +5867,7 @@ impl ShelluneView {
 
     /// Records that a desktop session cannot be started at all, and why.
     fn refuse_desktop(&mut self, session: SessionId, reason: String, cx: &mut Context<Self>) {
+        self.forget_session_desktop_secret(session);
         // Another attempt cannot bring back a connection record that is gone, so the
         // session stops offering one instead of looping (R12).
         self.workspace
@@ -5965,6 +6050,7 @@ impl ShelluneView {
         if self.pane_for(id).is_none() && self.desktop_for(id).is_none() {
             if self.has_session_form(id) {
                 if self.workspace.destination() != Destination::LocalShells {
+                    self.security_reset_reveal();
                     self.workspace.select(Destination::LocalShells);
                     self.workspace
                         .set_context(shellune_core::PanelSection::None);
@@ -5973,7 +6059,9 @@ impl ShelluneView {
             }
             return;
         }
-        if self.form_session.is_some() && self.form_session != Some(id) {
+        if (self.form_session.is_some() && self.form_session != Some(id))
+            || (self.form_session.is_none() && self.security_verifying_for_chain())
+        {
             self.park_focused_form();
             self.form_session = None;
         }
@@ -5983,6 +6071,7 @@ impl ShelluneView {
         // Hosts and transfers are context panels. Coming back from one of them lands
         // on the workspace, which shows whichever session was selected.
         if self.workspace.destination() != Destination::LocalShells {
+            self.security_reset_reveal();
             self.workspace.select(Destination::LocalShells);
             self.workspace
                 .set_context(shellune_core::PanelSection::None);
@@ -6105,6 +6194,8 @@ impl ShelluneView {
         // desktop or serial worker that kept running, would describe a session that is
         // over (R17, R18).
         self.x11.remove(&id);
+        self.forget_session_desktop_secret(id);
+        self.security_drop_pending_session(id);
         self.end_session_surface(id, cx);
         // The attempt that asked a trust, ProxyCommand or X11 question can no longer
         // answer it, so it is taken away with its panel and its secrets.
@@ -8106,6 +8197,7 @@ impl ShelluneView {
         self.host_connection_fields = None;
         self.last_invalid_host_field = None;
         self.invalid_host_fields.clear();
+        self.modal_focus_captured = false;
         self.restore_focus_pending = true;
         cx.notify();
     }
@@ -8582,6 +8674,7 @@ impl ShelluneView {
         self.protocol_fields = None;
         self.last_invalid_protocol_field = None;
         self.invalid_protocol_fields.clear();
+        self.modal_focus_captured = false;
         self.restore_focus_pending = true;
         cx.notify();
     }
@@ -8783,13 +8876,32 @@ impl ShelluneView {
         true
     }
 
-    /// Puts the password typed in the connection form where the next start finds it.
-    ///
-    /// A kept password goes to the system store, exactly as a host's does. One that is
-    /// not kept is handed to the next start of this connection, which is why it waits
-    /// here rather than being dropped with the form: the form closes before the attempt
-    /// begins, and a RDP or VNC server refuses a session that arrives without it.
-    /// Returns whether saving may go on; a store that refuses keeps the form open.
+    /// Validates and saves the non-SSH connection, returning an unremembered typed secret
+    /// exclusively when `commit_hosts` succeeded on disk ("Save & Connect").
+    pub(super) fn save_connection_for_connect(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(HostId, Option<shellune_core::SecretString>)> {
+        let typed = self
+            .hosts
+            .protocol_draft()
+            .and_then(|draft| draft.typed_secret().map(shellune_core::SecretString::new));
+        let id = self.save_connection(cx)?;
+        let ephemeral = self
+            .book
+            .connection(id)
+            .filter(|record| {
+                matches!(record.protocol(), ProtocolKind::Rdp | ProtocolKind::Vnc)
+                    && !record.remembers_secret()
+                    && record.credential_id().is_none()
+            })
+            .and(typed);
+        Some((id, ephemeral))
+    }
+
+    /// Puts a kept password typed in the connection form into the system store, or forgets
+    /// a previously kept one when remembering is turned off. Unremembered passwords are
+    /// never cached here on "Save"; only "Save & Connect" forwards a one-shot secret.
     fn store_connection_secret(
         &mut self,
         draft: &ProtocolDraft,
@@ -8799,6 +8911,7 @@ impl ShelluneView {
     ) -> bool {
         let typed = draft.typed_secret().map(shellune_core::SecretString::new);
         let id = record.id();
+        self.desktop_secrets.remove(&id);
         if record.remembers_secret() {
             if let Some(secret) = &typed
                 && let Err(error) = self.secrets.save(id, secret)
@@ -8808,22 +8921,10 @@ impl ShelluneView {
                 cx.notify();
                 return false;
             }
-            // The store is the one place now: a copy here would outlive its use.
-            self.desktop_secrets.remove(&id);
-        } else {
+        } else if saved.is_some_and(shellune_core::ConnectionRecord::remembers_secret) {
             // Turning remembering off removes what the store held; a store that cannot
             // be reached leaves an entry nobody reads, which is not a reason to fail.
-            if saved.is_some_and(shellune_core::ConnectionRecord::remembers_secret) {
-                let _ = self.secrets.forget(id);
-            }
-            match typed {
-                Some(secret) => {
-                    self.desktop_secrets.insert(id, secret);
-                }
-                None => {
-                    self.desktop_secrets.remove(&id);
-                }
-            }
+            let _ = self.secrets.forget(id);
         }
         if let Some(draft) = self.hosts.protocol_draft_mut() {
             draft.clear_secret();
@@ -8847,6 +8948,7 @@ impl ShelluneView {
                 self.invalid_host_fields.clear();
                 self.last_invalid_protocol_field = None;
                 self.invalid_protocol_fields.clear();
+                self.modal_focus_captured = false;
                 self.restore_focus_pending = true;
                 self.hosts.set_message(message.to_owned(), false);
                 let items = self.book.hosts().to_vec();
@@ -9632,7 +9734,7 @@ impl ShelluneView {
     /// before a transport existed, or the attempt was removed when that transport
     /// ended. That form is hung on the session it already has. A new session here would
     /// leave the one on screen to be replaced.
-    fn park_focused_form(&mut self) {
+    fn park_focused_form(&mut self) -> Option<SessionId> {
         // A leftover split or adopt belongs to the action that armed it. Parking a
         // form must not bind that form's session into the waiting pane.
         self.workspace.clear_armed();
@@ -9643,11 +9745,11 @@ impl ShelluneView {
             } else {
                 self.park_session_form(id);
             }
-            return;
+            return Some(id);
         }
         let Some(panel) = self.remote.take() else {
             self.chain = None;
-            return;
+            return None;
         };
         let target = self
             .chain
@@ -9657,6 +9759,7 @@ impl ShelluneView {
             .unwrap_or_else(|| panel.host().clone());
         let session = self.workspace.register_remote_session(&target);
         let id = session.id();
+        self.security_bind_parked_chain(target.id(), id);
         let generation = self
             .workspace
             .session(id)
@@ -9681,6 +9784,7 @@ impl ShelluneView {
             pending_rules: Vec::new(),
         });
         self.checkpoint_layout();
+        Some(id)
     }
 
     /// Hangs the focused form on a session that does not have an attempt yet.
@@ -9741,6 +9845,7 @@ impl ShelluneView {
             self.workspace.destination(),
             Destination::LocalShells | Destination::Sessions | Destination::Hosts
         ) {
+            self.security_reset_reveal();
             self.workspace.select(Destination::LocalShells);
         }
         self.sync_remote_fields(cx);
@@ -9947,6 +10052,7 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) {
         if self.workspace.destination() != Destination::LocalShells {
+            self.security_reset_reveal();
             self.workspace.select(Destination::LocalShells);
         }
         self.remote_opened_from_workspace = true;
@@ -10118,13 +10224,117 @@ impl ShelluneView {
         self.finish_chain(true, cx);
     }
 
+    /// Identifies the active foreground chain in `self.remote` / `self.chain`.
+    pub(crate) fn current_chain_target(&self) -> Option<(Option<SessionId>, HostId)> {
+        let panel = self.remote.as_ref()?;
+        let host = self
+            .chain
+            .as_ref()
+            .and_then(ChainDraft::target_host)
+            .map(HostConfig::id)
+            .unwrap_or_else(|| panel.host().id());
+        Some((self.form_session, host))
+    }
+
+    /// Writes a vault verification cancellation/failure reason onto either the foreground
+    /// connection form or the parked `Attempt` that requested the verification.
+    pub(crate) fn abort_chain_after_verify(
+        &mut self,
+        session: Option<SessionId>,
+        host: HostId,
+        reason: &str,
+    ) {
+        if self.current_chain_target() == Some((session, host)) {
+            if let Some(panel) = self.remote.as_mut() {
+                panel.set_form_error(reason.to_owned());
+            }
+            return;
+        }
+        if let Some(id) = session
+            && self
+                .attempts
+                .iter()
+                .any(|attempt| attempt.id == id && attempt.target.id() == host)
+            && let Some(panel) = self.panel_for_mut(id)
+        {
+            panel.set_form_error(reason.to_owned());
+        }
+    }
+
+    /// Continues an SSH chain after its vault verification succeeded, whether the chain
+    /// is still the foreground form or was parked onto its own session tab meanwhile.
+    pub(crate) fn resume_chain_after_verify(
+        &mut self,
+        session: Option<SessionId>,
+        host: HostId,
+        take_panel: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.showing_connection_form && self.current_chain_target() == Some((session, host)) {
+            self.finish_chain_inner(take_panel, false, cx);
+            return;
+        }
+        let mut target_session = session;
+        if self.current_chain_target() == Some((session, host)) {
+            target_session = self.park_focused_form().or(session);
+            self.form_session = None;
+        }
+        let Some(id) = target_session else {
+            return;
+        };
+        let Some(index) = self.attempt_index(id) else {
+            return;
+        };
+        if self.attempts[index].target.id() != host || self.attempts[index].link.is_some() {
+            return;
+        }
+        let saved_remote = self.remote.take();
+        let saved_chain = self.chain.take();
+        let saved_form_session = self.form_session.take();
+        let saved_showing = self.showing_connection_form;
+        let saved_reconnect = self.reconnect.take();
+        let saved_pending_ephemeral = self.pending_ephemeral.take();
+        let saved_forward_only = self.forward_only_dial;
+        let saved_pending_rules = std::mem::take(&mut self.pending_forward_rules);
+        let saved_active = self.active;
+
+        self.remote = self.attempts[index].panel.take();
+        self.chain = self.attempts[index].chain.take();
+        self.form_session = Some(id);
+        self.forward_only_dial = self.attempts[index].forward_only;
+        self.pending_forward_rules = std::mem::take(&mut self.attempts[index].pending_rules);
+
+        self.finish_chain_inner(take_panel, true, cx);
+        self.stash_focused_panel();
+
+        self.remote = saved_remote;
+        self.chain = saved_chain;
+        self.form_session = saved_form_session;
+        self.showing_connection_form = saved_showing;
+        self.reconnect = saved_reconnect;
+        self.pending_ephemeral = saved_pending_ephemeral;
+        self.forward_only_dial = saved_forward_only;
+        self.pending_forward_rules = saved_pending_rules;
+        self.active = saved_active;
+        if self.remote.is_some() {
+            self.sync_remote_fields(cx);
+        }
+        cx.notify();
+    }
+
     /// Collects credentials hop by hop and dials when every hop has them.
     ///
     /// `take_panel` is set when the user pressed connect: the form's fields are the
     /// current hop. Opening a host does not consume an empty field; it asks for the
     /// first hop that is still missing something.
     fn finish_chain(&mut self, take_panel: bool, cx: &mut Context<Self>) {
-        self.reap_aborted_ephemeral_ssh_secrets();
+        self.finish_chain_inner(take_panel, false, cx);
+    }
+
+    fn finish_chain_inner(&mut self, take_panel: bool, background: bool, cx: &mut Context<Self>) {
+        if !background {
+            self.reap_aborted_ephemeral_ssh_secrets();
+        }
         if self
             .remote
             .as_ref()
@@ -10139,6 +10349,9 @@ impl ShelluneView {
                 .pending_ephemeral
                 .as_ref()
                 .is_some_and(|pending| pending.id() == host.id())
+                || self
+                    .form_session
+                    .is_some_and(|sid| self.unsaved.iter().any(|(u, _)| *u == sid))
             {
                 ChainDraft::single(host)
             } else {
@@ -10151,7 +10364,7 @@ impl ShelluneView {
             .as_ref()
             .and_then(|draft| draft.fault().map(str::to_owned))
         {
-            self.fail_before_dial(reason, cx);
+            self.fail_before_dial_inner(reason, background, cx);
             return;
         }
         // The vault's own gate runs before any credential is taken: a chain
@@ -10162,10 +10375,20 @@ impl ShelluneView {
             if self.security_verifying_for_chain() {
                 return;
             }
+            let Some((session, host)) = self.current_chain_target() else {
+                return;
+            };
             if let Some(panel) = self.remote.as_mut() {
                 panel.clear_form_error();
             }
-            if self.security_begin(vec![SecurityPending::ResumeChain(take_panel)], cx) {
+            if self.security_begin(
+                vec![SecurityPending::ResumeChain {
+                    session,
+                    host,
+                    take_panel,
+                }],
+                cx,
+            ) {
                 if !self.security_verifying_for_chain() {
                     self.ephemeral_ssh_secrets.clear();
                     if let Some(panel) = self.remote.as_mut() {
@@ -10181,7 +10404,7 @@ impl ShelluneView {
         if take_panel && !self.take_panel_auth(cx) {
             return;
         }
-        self.fill_or_dial(cx);
+        self.fill_or_dial_inner(background, cx);
     }
 
     /// Whether the chain on screen signs in with something only the vault can
@@ -10249,11 +10472,11 @@ impl ShelluneView {
     }
 
     /// Fills hops that already have credentials, then dials or asks for the next one.
-    fn fill_or_dial(&mut self, cx: &mut Context<Self>) {
+    fn fill_or_dial_inner(&mut self, background: bool, cx: &mut Context<Self>) {
         loop {
             let next = self.chain.as_ref().and_then(ChainDraft::next_needed);
             let Some(hop_id) = next else {
-                self.dial_chain(cx);
+                self.dial_chain_inner(background, cx);
                 return;
             };
             let host = self
@@ -10262,20 +10485,21 @@ impl ShelluneView {
                 .and_then(|draft| draft.host(hop_id))
                 .cloned();
             let Some(host) = host else {
-                self.fail_before_dial(
+                self.fail_before_dial_inner(
                     "the jump chain names a host that is not saved. Nothing was connected and no command was run.".to_owned(),
+                    background,
                     cx,
                 );
                 return;
             };
             if let Some(ephemeral) = self.ephemeral_ssh_secrets.remove(&hop_id)
-                && self.absorb_saved(&host, Some(&ephemeral), cx)
+                && self.absorb_saved_inner(&host, Some(&ephemeral), background, cx)
             {
                 continue;
             }
             match self.saved_secret(&host) {
                 Err(reason) => {
-                    self.show_hop(host, cx);
+                    self.show_hop_inner(host, background, cx);
                     if let Some(panel) = self.remote.as_mut() {
                         panel.set_form_error(reason);
                     }
@@ -10283,12 +10507,12 @@ impl ShelluneView {
                     return;
                 }
                 Ok(secret) => {
-                    if self.absorb_saved(&host, secret.as_ref(), cx) {
+                    if self.absorb_saved_inner(&host, secret.as_ref(), background, cx) {
                         continue;
                     }
                 }
             }
-            self.show_hop(host, cx);
+            self.show_hop_inner(host, background, cx);
             cx.notify();
             return;
         }
@@ -10358,10 +10582,11 @@ impl ShelluneView {
     /// The hop on screen is copied into the fields first, so a one-click connection
     /// still shows the password it used. An earlier hop is recorded without replacing
     /// the form.
-    fn absorb_saved(
+    fn absorb_saved_inner(
         &mut self,
         host: &HostConfig,
         secret: Option<&shellune_core::SecretString>,
+        background: bool,
         cx: &mut Context<Self>,
     ) -> bool {
         if remote::stored_auth(host, secret, self.security.content()).is_none() {
@@ -10390,7 +10615,9 @@ impl ShelluneView {
                     _ => {}
                 }
             }
-            self.sync_remote_fields(cx);
+            if !background {
+                self.sync_remote_fields(cx);
+            }
         }
         let known = remote::known_host_key(&self.effective_trust(), host);
         let auth = if shown {
@@ -10419,7 +10646,7 @@ impl ShelluneView {
     }
 
     /// Shows the form for one hop and no other hop's fields.
-    fn show_hop(&mut self, host: HostConfig, cx: &mut Context<Self>) {
+    fn show_hop_inner(&mut self, host: HostConfig, background: bool, cx: &mut Context<Self>) {
         let multi = self
             .chain
             .as_ref()
@@ -10431,8 +10658,10 @@ impl ShelluneView {
             .is_some_and(|panel| panel.host().id() == host.id());
         if !same {
             self.remote = Some(RemotePanel::new(&host));
-            self.showing_connection_form = true;
-            self.sync_remote_fields(cx);
+            if !background {
+                self.showing_connection_form = true;
+                self.sync_remote_fields(cx);
+            }
         }
         if let Some(label) = label
             && let Some(panel) = self.remote.as_mut()
@@ -10442,8 +10671,10 @@ impl ShelluneView {
     }
 
     /// Refuses to dial and keeps the form. The host record is not changed.
-    fn fail_before_dial(&mut self, reason: String, cx: &mut Context<Self>) {
-        self.ephemeral_ssh_secrets.clear();
+    fn fail_before_dial_inner(&mut self, reason: String, background: bool, cx: &mut Context<Self>) {
+        if !background {
+            self.ephemeral_ssh_secrets.clear();
+        }
         let host = self
             .chain
             .as_ref()
@@ -10466,7 +10697,9 @@ impl ShelluneView {
             id
         };
         self.form_session = Some(id);
-        self.active = Some(id);
+        if !background {
+            self.active = Some(id);
+        }
         self.ensure_form_attempt(id, &host);
         if let Some(panel) = self.remote.as_mut() {
             panel.fail(RemoteFailure::new(
@@ -10484,6 +10717,10 @@ impl ShelluneView {
     /// Dials the chain. A ProxyCommand stays unstarted until the user confirms it, and
     /// a trusted display channel is asked for only after its risks were accepted.
     fn dial_chain(&mut self, cx: &mut Context<Self>) {
+        self.dial_chain_inner(false, cx);
+    }
+
+    fn dial_chain_inner(&mut self, background: bool, cx: &mut Context<Self>) {
         // A reconnect is only checked here, never started: the record moves to
         // "connecting" once, in `session_for_form`, right before its attempt exists.
         // Moving it here as well made the second move fail, which left the tab
@@ -10519,7 +10756,9 @@ impl ShelluneView {
             if let Some(panel) = self.remote.as_mut() {
                 panel.set_status(RemoteStatus::ConfirmingX11 { mode });
             }
-            self.showing_connection_form = true;
+            if !background {
+                self.showing_connection_form = true;
+            }
             cx.notify();
             return;
         }
@@ -10581,7 +10820,9 @@ impl ShelluneView {
             .map(Session::generation)
             .unwrap_or(0);
         self.form_session = Some(id);
-        self.active = Some(id);
+        if !background {
+            self.active = Some(id);
+        }
         self.attempts.retain(|attempt| attempt.id != id);
         self.attempts.push(Attempt {
             id,
@@ -10602,10 +10843,11 @@ impl ShelluneView {
         self.watch_attempt(id, cx);
         // Connecting is going to that server: its tab comes to the front at once and
         // shows the attempt, instead of a dialog over the page that was left. A
-        // forward-only dial has no terminal to go to and stays where it was.
-        if !forward_only {
+        // forward-only dial or a parked background verification resume stays where it was.
+        if !forward_only && !background {
             self.workspace.layout_mut().focus_session(id);
             if self.workspace.destination() != Destination::LocalShells {
+                self.security_reset_reveal();
                 self.workspace.select(Destination::LocalShells);
             }
         }
@@ -11704,6 +11946,7 @@ impl ShelluneView {
         if let Some(id) = self.form_session {
             self.close_session(id, cx);
         } else {
+            self.security_drop_unassigned_chain();
             if let Some(panel) = self.remote.as_mut() {
                 panel.clear_secrets();
             }
@@ -11801,6 +12044,7 @@ impl ShelluneView {
     /// session record, so the destination cannot show a terminal that has no process
     /// behind it.
     fn start_shell(&mut self, shell: LocalShell, cx: &mut Context<Self>) {
+        self.security_reset_reveal();
         let session = self.workspace.register_local_session(&shell);
         let held = self.workspace.layout_mut().take_adopted();
         self.launch_local(session.tag(), shell, LocalLaunch::New(held), cx);
@@ -11813,6 +12057,7 @@ impl ShelluneView {
     }
 
     fn show_terminal_start(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.security_reset_reveal();
         self.active = Some(id);
         self.workspace.layout_mut().focus_session(id);
         self.workspace.select(Destination::LocalShells);
@@ -13852,6 +14097,15 @@ impl ShelluneView {
         handle == &self.root_focus || self.destination_focus.iter().any(|item| item == handle)
     }
 
+    /// Whether a vault keys/passwords workbench surface is currently visible on screen.
+    pub(crate) fn is_security_keys_surface_visible(&self) -> bool {
+        match self.workspace.destination() {
+            Destination::Hosts => self.hosts.section() == crate::app::hosts::HomeSection::Vault,
+            Destination::Settings => self.settings_nav.current() == settings::Item::KeysAndPassword,
+            _ => false,
+        }
+    }
+
     /// Whether `handle` belongs to a persistent overlay/modal control rather than page content.
     pub(super) fn is_overlay_internal_focus(&self, handle: &FocusHandle, cx: &gpui::App) -> bool {
         handle == &self.snippet_focus
@@ -13860,6 +14114,19 @@ impl ShelluneView {
                 .snippet_panel
                 .search_field()
                 .is_some_and(|field| field.read(cx).focus_handle() == handle)
+            || self
+                .host_fields
+                .as_ref()
+                .is_some_and(|fields| fields.owns_focus(handle, cx))
+            || self
+                .host_connection_fields
+                .as_ref()
+                .is_some_and(|fields| fields.owns_focus(handle, cx))
+            || self
+                .protocol_fields
+                .as_ref()
+                .is_some_and(|fields| fields.owns_focus(handle, cx))
+            || self.security_dialog_owns_focus(handle, cx)
     }
 
     /// Remembers a field or terminal while one has the keyboard.
@@ -13878,6 +14145,8 @@ impl ShelluneView {
             || self.hosts.group_editor().is_some()
             || self.host_fields.is_some()
             || self.protocol_fields.is_some()
+            || self.security_dialog_open()
+            || self.backup.is_some()
             || self.host_menu.is_some()
             || self.home_menu.is_some()
             || self.tab_menu.is_some()
@@ -14843,6 +15112,7 @@ impl ShelluneView {
 
     /// Opens one thing the launcher offered, and closes the launcher.
     fn launch_item(&mut self, item: LaunchItem, window: &mut Window, cx: &mut Context<Self>) {
+        self.security_reset_reveal();
         self.shell_menu_open = false;
         self.launcher_field = None;
         match item {
@@ -14881,6 +15151,7 @@ impl ShelluneView {
 
     /// Remembers one shell as the default and opens it in a new tab.
     fn launch_choice(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.security_reset_reveal();
         self.workspace.select_shell(index);
         // A choice is not a typed path: the field closes so its text cannot win.
         self.custom_shell_open = false;
@@ -21732,6 +22003,11 @@ impl Render for ShelluneView {
         if self.catalog_held {
             return crate::app::catalog::design_catalog(self.metrics()).into_any_element();
         }
+        let keys_visible = self.is_security_keys_surface_visible();
+        if self.was_security_keys_surface_visible && !keys_visible {
+            self.security_reset_reveal();
+        }
+        self.was_security_keys_surface_visible = keys_visible;
         // A field's focus is noted before a click can blur it. Opening an overlay then
         // still knows which field to restore, even when the click already moved focus.
         self.note_content_focus(window, cx);
@@ -21752,6 +22028,13 @@ impl Render for ShelluneView {
             let destination = self.workspace.destination();
             let handle = self.destination_focus(destination).clone();
             window.focus(&handle);
+        }
+        let any_form_modal_open = self.host_fields.is_some()
+            || self.protocol_fields.is_some()
+            || self.security_dialog_open()
+            || self.backup.is_some();
+        if !any_form_modal_open {
+            self.modal_focus_captured = false;
         }
         if std::mem::take(&mut self.focus_host_dialog) {
             // The first field of whichever form is open gets the keyboard: address for SSH,
@@ -21774,8 +22057,12 @@ impl Render for ShelluneView {
                 })
             };
             if let Some(handle) = handle {
-                if !std::mem::take(&mut self.focus_host_dialog_keep_return) {
+                let keep = std::mem::take(&mut self.focus_host_dialog_keep_return);
+                if !keep && !self.modal_focus_captured {
                     self.remember_focus(window, cx);
+                }
+                if any_form_modal_open {
+                    self.modal_focus_captured = true;
                 }
                 window.focus(&handle);
             }
@@ -21790,12 +22077,20 @@ impl Render for ShelluneView {
         {
             window.focus(&handle);
         }
-        // A backup or sync dialog that just asked for a field gives it the keyboard, and
-        // remembers where the keyboard was so closing the dialog puts it back.
+        // A security, backup or sync dialog that just asked for a field gives it the keyboard,
+        // and remembers where the keyboard was once per outer modal stack so closing restores it.
         if let Some(handle) = self.field_focus_pending.take()
             && !handle.is_focused(window)
         {
-            self.remember_focus(window, cx);
+            if !self.modal_focus_captured
+                && self.host_fields.is_none()
+                && self.protocol_fields.is_none()
+            {
+                self.remember_focus(window, cx);
+            }
+            if any_form_modal_open {
+                self.modal_focus_captured = true;
+            }
             window.focus(&handle);
         }
         // The paste confirmation holds the keyboard while it is up. Nothing behind it
@@ -21878,9 +22173,6 @@ impl Render for ShelluneView {
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
             .key_context("Shellune")
             .track_focus(&self.root_focus)
-            .capture_any_mouse_down(cx.listener(|this, _event, _window, _cx| {
-                this.pointer_input = true;
-            }))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.pointer_input {
                     this.pointer_input = false;
@@ -22187,20 +22479,28 @@ impl Render for ShelluneView {
         self.record_frame(forms_drawn);
         // Draw one scrim for the current frame, including when one dialog replaces
         // another. Each modal keeps its own backdrop for hit testing.
-        root.when(self.modal_drawn.replace(false), |root| {
-            root.child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .bg(theme::scrim())
-                    .debug_selector(|| "modal.scrim".to_owned()),
+        div()
+            .size_full()
+            .capture_any_mouse_down(cx.listener(|this, _event, window, cx| {
+                this.pointer_input = true;
+                this.note_content_focus(window, cx);
+            }))
+            .child(
+                root.when(self.modal_drawn.replace(false), |root| {
+                    root.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .bg(theme::scrim())
+                            .debug_selector(|| "modal.scrim".to_owned()),
+                    )
+                })
+                .children(layers.into_iter().flatten())
+                .children(self.toast_stack(cx))
+                // The start fading out over the page it became, above everything (R3).
+                .children(self.startup_crossfade()),
             )
-        })
-        .children(layers.into_iter().flatten())
-        .children(self.toast_stack(cx))
-        // The start fading out over the page it became, above everything (R3).
-        .children(self.startup_crossfade())
-        .into_any_element()
+            .into_any_element()
     }
 }
 

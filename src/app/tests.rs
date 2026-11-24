@@ -30979,10 +30979,47 @@ async fn a_desktop_connection_starts_with_the_password_typed_in_its_form(cx: &mu
     cx.simulate_resize(size(px(1400.0), px(1300.0)));
     cx.run_until_parked();
 
-    let id = save_desktop_password_form(cx, &view, "connection.protocol.rdp", "rdp-pass", false);
+    // "Save" alone without remembering never retains the temporary password for later sessions.
+    let saved_only =
+        save_desktop_password_form(cx, &view, "connection.protocol.rdp", "not-kept", false);
     cx.update(|_window, cx| {
-        view.update(cx, |view, cx| view.connect_saved_connection(id, cx));
+        view.update(cx, |view, cx| view.connect_saved_connection(saved_only, cx));
     });
+    cx.run_until_parked();
+    let saved_only_session = cx
+        .update(|_window, app| view.read(app).open_tabs().last().copied())
+        .expect("the connection opened a tab");
+    cx.update(|_window, app| {
+        let pane = view
+            .read(app)
+            .desktop_of(saved_only_session)
+            .expect("the desktop surface is mounted")
+            .read(app);
+        assert_eq!(
+            pane.started_password(),
+            Some(None),
+            "Save alone without Remember password must never retain the temporary password"
+        );
+    });
+
+    // "Save & Connect" forwards the unremembered password once to the immediate attempt only.
+    click(cx, "nav.hosts");
+    cx.run_until_parked();
+    click(cx, "hosts.new");
+    click(cx, "connection.protocol.rdp");
+    type_into(cx, "connection.field.address", "127.0.0.1");
+    clear_field(cx, "connection.field.port", 4);
+    type_into(cx, "connection.field.port", "1");
+    type_into(cx, "connection.field.secret", "rdp-pass");
+    if cx.update(|_window, app| {
+        view.read(app)
+            .hosts_state()
+            .protocol_draft()
+            .is_some_and(|draft| draft.remember())
+    }) {
+        click(cx, "connection.field.remember");
+    }
+    click(cx, "connection.save_connect");
     cx.run_until_parked();
 
     let session = cx
@@ -30997,7 +31034,7 @@ async fn a_desktop_connection_starts_with_the_password_typed_in_its_form(cx: &mu
         assert_eq!(
             pane.started_password(),
             Some(Some("rdp-pass")),
-            "the attempt dials with the password that was just typed, even unkept"
+            "Save & Connect dials once with the unremembered password that was just typed"
         );
     });
 }
@@ -47510,5 +47547,616 @@ async fn pending_tab_menu_ssh_duplicate_menu_alignment_split_zoom_and_background
         split_cx.debug_bounds("terminal.failure").is_some()
             && split_cx.debug_bounds("terminal.failure.next").is_some(),
         "inactive background split pane immediately displays its top disconnect banner and Reconnect button"
+    );
+}
+
+#[gpui::test]
+async fn vault_gate_never_leaks_operation_granted_and_resume_chain_tracks_parked_and_switched_sessions(
+    app_cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("vault-gate-no-grant-leak-and-parked-chain");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+
+    // Seed one vault managed key + one vault shared credential + one RDP connection + two SSH hosts.
+    let generated = shellune_ssh::keys::generate(shellune_ssh::keys::ManagedKeyKind::Ed25519)
+        .expect("generate ed25519 key");
+    let public = shellune_ssh::keys::public_data(&generated).expect("public key data");
+    let pem = shellune_ssh::keys::export_private_key(&generated, None).expect("export key");
+    let key_id = shellune_core::KeyId::new();
+    let cred_id = shellune_core::CredentialId::new();
+    let mut content = shellune_storage::VaultContent::new();
+    content
+        .insert_key(shellune_storage::VaultKeyRecord::new(
+            shellune_core::ManagedKeyMeta::new(
+                key_id,
+                "Vault SSH key".to_owned(),
+                public.algorithm,
+                public.authorized_key,
+                public.fingerprint,
+                None,
+                shellune_core::VaultRecordVersion::new(1, "seed"),
+            ),
+            pem,
+        ))
+        .expect("insert key");
+    content
+        .insert_credential(shellune_storage::VaultCredentialRecord::new(
+            shellune_core::CredentialMeta::new(
+                cred_id,
+                "Vault shared pass".to_owned(),
+                Some("ops".to_owned()),
+                shellune_core::VaultRecordVersion::new(1, "seed"),
+            ),
+            shellune_core::SecretString::new("super-secret-pass"),
+        ))
+        .expect("insert credential");
+    shellune_storage::VaultStore::at(dir.path())
+        .save_records(
+            &content,
+            &[],
+            &[shellune_storage::UnsealSource::LocalMachine],
+            shellune_storage::KdfParams::new(8, 1, 1).expect("cheap kdf"),
+            secrets.as_ref(),
+        )
+        .expect("save vault");
+
+    let mut book = shellune_storage::HostBook::new();
+    let mut rdp_cfg =
+        shellune_core::RdpConfig::new("Vault RDP", "127.0.0.1", Some("ops")).expect("rdp config");
+    rdp_cfg.set_port(1).expect("closed port");
+    rdp_cfg.set_credential_id(Some(cred_id));
+    let rdp_record = shellune_core::ConnectionRecord::Rdp(rdp_cfg);
+    let rdp_id = rdp_record.id();
+    book.insert_connection(rdp_record).expect("insert rdp");
+
+    let mut ssh_vault =
+        shellune_core::HostConfig::new("vault-ssh", "127.0.0.1", 1, "ops").expect("ssh_vault");
+    ssh_vault.set_auth(Some(shellune_core::AuthMethodKind::ManagedKey));
+    ssh_vault.set_managed_key_id(Some(key_id));
+    book.insert(ssh_vault.clone()).expect("insert ssh_vault");
+
+    let mut ssh_plain =
+        shellune_core::HostConfig::new("plain-ssh", "127.0.0.1", 1, "guest").expect("ssh_plain");
+    ssh_plain.set_auth(Some(shellune_core::AuthMethodKind::Password));
+    let ssh_plain_id = ssh_plain.id();
+    book.insert(ssh_plain).expect("insert ssh_plain");
+    dir.store().save(&book).expect("save hosts");
+
+    // Scripted answers:
+    // 1) Ok(()) -> initial unlock
+    // 2) Ok(()) -> ExportKey verification held while dialog closes on Esc
+    // 3) Err(Cancelled) -> proves subsequent sensitive op STILL verifies instead of consuming leaked grant
+    // 4) Ok(()) -> Desktop verification held while target session closes
+    // 5) Err(Cancelled) -> proves subsequent sensitive op STILL verifies after closed desktop session
+    // 6) Ok(()) -> initial `open_remote(&ssh_vault)` to mount the live SSH tab
+    // 7) Err(Cancelled) -> parked duplicate SSH chain verification cancelled -> writes form_error on parked attempt
+    // 8) Ok(()) -> parked duplicate SSH chain verification approved while plain-ssh form is open -> dials parked tab only
+    let auth = Arc::new(
+        shellune_storage::ScriptedAuthenticator::new(
+            shellune_storage::BiometricCapability::Biometrics,
+        )
+        .script([
+            Ok(()),
+            Ok(()),
+            Err(shellune_storage::BiometricError::Cancelled),
+            Ok(()),
+            Err(shellune_storage::BiometricError::Cancelled),
+            Ok(()),
+            Err(shellune_storage::BiometricError::Cancelled),
+            Ok(()),
+        ]),
+    );
+    let mut ws = Workspace::new();
+    ws.select(Destination::Hosts);
+    let store = dir.store();
+    let secrets_dyn: Arc<dyn shellune_storage::SecretStore> = secrets.clone();
+    let (view, cx) = app_cx.add_window_view(move |_window, cx| {
+        let mut v = ShelluneView::with_secrets_for_test(cx, ws, store, secrets_dyn);
+        v.security_set_authenticator_for_test(auth);
+        v.security_enable_lock_for_test(
+            shellune_storage::LockPolicy::EverySensitiveOperation,
+            15,
+            cx,
+        );
+        v.security_unlock_for_test(cx);
+        v
+    });
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(size(px(1280.0), px(860.0)));
+    cx.run_until_parked();
+
+    // 1A. Start ExportKey verification, close dialog with Esc BEFORE verification resolves, then release Ok(()).
+    click(cx, "hosts.view.vault");
+    cx.run_until_parked();
+    click(cx, "security.key.0");
+    click(cx, "security.detail.action.2");
+    cx.run_until_parked();
+    click(cx, "security.dialog.export.plain");
+    click(cx, "security.dialog.export.risk");
+    cx.update(|_window, app| view.update(app, |v, _cx| v.security_hold_verify_for_test(true)));
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    // Dismiss the export dialog while system verification is still waiting.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_dialog_open()),
+        "export dialog closed while verification was pending"
+    );
+    cx.update(|_window, app| view.update(app, |v, cx| v.security_release_verify_for_test(cx)));
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_operation_granted_for_test()),
+        "operation_granted must be cleared even when ExportKey returned early after dialog dismissal"
+    );
+    // Subsequent sensitive operation (reveal credential) MUST ask the verifier (consuming answer #3 Cancelled).
+    click(cx, "security.credential.0");
+    click(cx, "security.detail.reveal");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_password_shown_for_test()),
+        "subsequent sensitive operation was NOT bypassed by a leaked operation_granted flag"
+    );
+
+    // 1B. Start RDP connection under EverySensitiveOperation, close its tab while verification is held,
+    //     release Ok(()) (#4), and prove the next RDP connection (#5 Cancelled) still hits the gate!
+    cx.update(|_window, app| {
+        view.update(app, |v, cx| {
+            v.security_hold_verify_for_test(true);
+            v.connect_saved_connection(rdp_id, cx);
+        });
+    });
+    cx.run_until_parked();
+    let waiting_rdp = cx
+        .update(|_window, app| view.read(app).active_session())
+        .expect("waiting rdp session");
+    cx.update(|_window, app| view.update(app, |v, cx| v.close_session(waiting_rdp, cx)));
+    cx.run_until_parked();
+    cx.update(|_window, app| view.update(app, |v, cx| v.security_release_verify_for_test(cx)));
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_operation_granted_for_test()),
+        "operation_granted must be false after target desktop tab closed mid-verification"
+    );
+    cx.update(|_window, app| view.update(app, |v, cx| v.connect_saved_connection(rdp_id, cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).desktop_start_count_for_test()),
+        0,
+        "next desktop connection still goes through verification instead of bypassing via stale grant"
+    );
+    let cancelled_rdp = cx
+        .update(|_window, app| view.read(app).active_session())
+        .expect("cancelled rdp session");
+    cx.update(|_window, app| view.update(app, |v, cx| v.close_session(cancelled_rdp, cx)));
+    cx.run_until_parked();
+
+    // 1C. Mount a live SSH tab for `ssh_vault` (#6 Ok), duplicate it while verification is held,
+    //     switch back to the original tab (parking the duplicate), and release Cancelled (#7).
+    cx.update(|_window, app| {
+        view.update(app, |v, cx| {
+            v.open_remote(&ssh_vault, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        view.update(app, |v, cx| {
+            v.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::Connected,
+                    shellune_ssh::RemoteEvent::Data(b"vault ready\r\n$ ".to_vec()),
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        view.update(app, |v, cx| {
+            v.pump_remote_once(cx);
+        });
+    });
+    cx.run_until_parked();
+    let live_ssh_id = cx
+        .update(|_window, app| view.read(app).active_session())
+        .expect("live ssh session");
+    cx.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.security_hold_verify_for_test(true);
+            v.duplicate_session(live_ssh_id, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let dup_id = cx
+        .update(|_window, app| view.read(app).active_session())
+        .expect("duplicated ssh session");
+    assert_ne!(dup_id, live_ssh_id);
+    assert!(
+        cx.debug_bounds("remote.verifying").is_some(),
+        "duplicated vault SSH session shows verifying state"
+    );
+
+    // Switch back to `live_ssh_id`, parking `dup_id`'s connection form into `self.attempts`.
+    cx.update(|_window, app| view.update(app, |v, cx| v.activate(live_ssh_id, cx)));
+    cx.run_until_parked();
+    cx.update(|_window, app| view.update(app, |v, cx| v.security_release_verify_for_test(cx)));
+    cx.run_until_parked();
+
+    // Switching back to `dup_id` reveals the cancellation banner written onto the parked attempt!
+    cx.update(|_window, app| view.update(app, |v, cx| v.activate(dup_id, cx)));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("remote.form.error").is_some(),
+        "cancelled verification writes cancellation reason onto the parked duplicate attempt"
+    );
+
+    // 1D. Retry `dup_id` with verification held, then open plain-password `ssh_plain`:
+    //     `ssh_plain` must NOT be shown as verifying, and releasing Ok(()) (#7) must dial
+    //     ONLY parked `dup_id` in the background while keeping `ssh_plain` on screen!
+    cx.update(|_window, app| view.update(app, |v, _cx| v.security_hold_verify_for_test(true)));
+    click(cx, "remote.connect");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("remote.verifying").is_some());
+
+    cx.update(|_window, app| {
+        let plain = view.read(app).book().host(ssh_plain_id).cloned().unwrap();
+        view.update(app, |v, cx| v.open_remote(&plain, cx));
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_verifying_for_chain()),
+        "opening another plain-password host while dup_id awaits verification never marks host B as verifying"
+    );
+    // In `verifying_vault` mode `remote.connect` has no click handler (`ControlState::Loading`);
+    // on `plain-ssh` clicking `remote.connect` with empty password immediately runs `connect_remote`!
+    click(cx, "remote.connect");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .remote_state()
+                .and_then(|panel| panel.form_error())
+                .is_some()
+        }),
+        "plain-ssh Connect button remains interactive while dup_id awaits vault verification"
+    );
+
+    cx.update(|_window, app| view.update(app, |v, cx| v.security_release_verify_for_test(cx)));
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).attempt_generation_for_test(dup_id).is_some()),
+        "verification approval dials the parked duplicate SSH attempt in the background"
+    );
+    assert_eq!(
+        cx.update(|_window, app| { view.read(app).remote_state().map(|panel| panel.host().id()) }),
+        Some(ssh_plain_id),
+        "foreground plain-password host form remains undisturbed when parked SSH verification completes"
+    );
+}
+
+#[gpui::test]
+async fn vault_revealed_password_resets_across_all_workspace_and_launcher_transitions(
+    app_cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("vault-reveal-navigation-reset");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+
+    let mut book = shellune_storage::HostBook::new();
+    let mut ssh_host =
+        shellune_core::HostConfig::new("ask-pass-ssh", "127.0.0.1", 1, "root").expect("ssh");
+    ssh_host.set_auth(Some(shellune_core::AuthMethodKind::Password));
+    book.insert(ssh_host.clone()).expect("insert ssh");
+    dir.store().save(&book).expect("save hosts");
+
+    let (view, cx) = vault_window(app_cx, &dir, &secrets);
+    cx.simulate_resize(size(px(1280.0), px(840.0)));
+    cx.run_until_parked();
+
+    // Mount one live terminal session tab so we can click/activate tabs from Vault.
+    let live_tab = live_remote(cx, &view);
+    cx.run_until_parked();
+
+    // 1. Reveal password on Home -> Vault, then activate an existing session tab: must hide immediately!
+    click(cx, "nav.hosts");
+    click(cx, "hosts.view.vault");
+    cx.run_until_parked();
+    click(cx, "security.credential.0");
+    click(cx, "security.detail.reveal");
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).security_password_shown_for_test()));
+
+    cx.update(|_window, app| view.update(app, |v, cx| v.activate(live_tab, cx)));
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_password_shown_for_test()),
+        "activating a session tab from Home -> Vault must immediately reset revealed password"
+    );
+
+    // 2. Return to Home -> Vault, reveal again, open connection card and click Continue in background (`hide_connection`):
+    //    must reset revealed password so returning to Home -> Vault never shows plaintext!
+    click(cx, "nav.hosts");
+    click(cx, "hosts.view.vault");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_password_shown_for_test()),
+        "returning to Home -> Vault keeps password masked"
+    );
+    click(cx, "security.detail.reveal");
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).security_password_shown_for_test()));
+
+    cx.update(|_window, app| view.update(app, |v, cx| v.open_remote(&ssh_host, cx)));
+    cx.run_until_parked();
+    cx.update(|_window, app| view.update(app, |v, cx| v.hide_connection_for_test(cx)));
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_password_shown_for_test()),
+        "hide_connection returning to Home -> Vault must reset revealed password"
+    );
+
+    // 3. Reveal on Settings -> Security -> Keys & Passwords, then start a new local shell via topbar:
+    //    must reset revealed password immediately!
+    click(cx, "nav.settings");
+    click(cx, "settings.category.security");
+    cx.run_until_parked();
+    click(cx, "security.credential.0");
+    click(cx, "security.detail.reveal");
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).security_password_shown_for_test()));
+
+    cx.update(|_window, app| view.update(app, |v, cx| v.activate(live_tab, cx)));
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_password_shown_for_test()),
+        "leaving Settings -> Security -> Keys via tab activation immediately hides revealed password"
+    );
+}
+
+#[gpui::test]
+async fn desktop_unremembered_password_is_strictly_one_shot_on_save_and_connect_only(
+    app_cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("desktop-ephemeral-secret-lifecycle");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let cred_id = shellune_storage::VaultStore::at(dir.path())
+        .open(
+            &shellune_storage::UnsealSource::LocalMachine,
+            secrets.as_ref(),
+        )
+        .expect("load vault")
+        .credentials()
+        .next()
+        .expect("cred")
+        .meta()
+        .id();
+
+    // Seed one vault-backed RDP record so we can also exercise the busy desktop verification gate.
+    let mut book = shellune_storage::HostBook::new();
+    let mut gated_cfg =
+        shellune_core::RdpConfig::new("Gated RDP", "127.0.0.1", Some("ops")).expect("rdp");
+    gated_cfg.set_port(1).expect("closed port");
+    gated_cfg.set_credential_id(Some(cred_id));
+    let gated_rdp = shellune_core::ConnectionRecord::Rdp(gated_cfg);
+    let gated_rdp_id = gated_rdp.id();
+    book.insert_connection(gated_rdp).expect("insert gated rdp");
+    dir.store().save(&book).expect("save hosts");
+
+    let auth = Arc::new(
+        shellune_storage::ScriptedAuthenticator::new(
+            shellune_storage::BiometricCapability::Biometrics,
+        )
+        .script([Ok(()), Err(shellune_storage::BiometricError::Cancelled)]),
+    );
+    let mut ws = Workspace::new();
+    ws.select(Destination::Hosts);
+    let store = dir.store();
+    let secrets_dyn: Arc<dyn shellune_storage::SecretStore> = secrets.clone();
+    let (view, cx) = app_cx.add_window_view(move |_window, cx| {
+        let mut v = ShelluneView::with_secrets_for_test(cx, ws, store, secrets_dyn);
+        v.security_set_authenticator_for_test(auth);
+        v.security_enable_lock_for_test(
+            shellune_storage::LockPolicy::EverySensitiveOperation,
+            15,
+            cx,
+        );
+        v.security_unlock_for_test(cx);
+        v
+    });
+    cx.simulate_resize(size(px(1280.0), px(900.0)));
+    cx.run_until_parked();
+
+    // 1. "Save" alone (`connection.save`) with Remember unticked MUST NOT store in `desktop_secrets`.
+    let temp_rdp_id = save_desktop_password_form(
+        cx,
+        &view,
+        "connection.protocol.rdp",
+        "temp-only-save-secret",
+        false,
+    );
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).desktop_secret_count_for_test()),
+        0,
+        "clicking Save alone with Remember unticked must leave zero secrets in desktop_secrets"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).saved_secret_for_test(temp_rdp_id)),
+        None,
+        "unremembered password is never written to SecretStore"
+    );
+
+    // 2. While `gated_rdp` occupies desktop verification, clicking "Save & Connect" on `temp_rdp_id`
+    //    hits the busy early-return in `open_desktop_connection_with_ephemeral` and MUST NOT leak `desktop_secrets`!
+    cx.update(|_window, app| {
+        view.update(app, |v, cx| {
+            v.security_hold_verify_for_test(true);
+            v.connect_saved_connection(gated_rdp_id, cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "nav.hosts");
+    cx.update(|_window, app| {
+        view.update(app, |v, cx| {
+            v.edit_connection_for_test(temp_rdp_id, cx);
+        });
+    });
+    cx.run_until_parked();
+    type_into(cx, "connection.field.secret", "busy-aborted-secret");
+    click(cx, "connection.save_connect");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).desktop_secret_count_for_test()),
+        0,
+        "Save & Connect aborted by busy desktop verification must not leave any secret in desktop_secrets"
+    );
+
+    // Release the held verification, return to Hosts, and run normal "Save & Connect":
+    // consumes the one-shot password immediately and leaves `desktop_secrets` empty afterwards!
+    cx.update(|_window, app| view.update(app, |v, cx| v.security_release_verify_for_test(cx)));
+    cx.run_until_parked();
+    click(cx, "nav.hosts");
+    cx.update(|_window, app| {
+        view.update(app, |v, cx| {
+            v.edit_connection_for_test(temp_rdp_id, cx);
+        });
+    });
+    cx.run_until_parked();
+    type_into(cx, "connection.field.secret", "one-shot-rdp-secret");
+    click(cx, "connection.save_connect");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).desktop_start_count_for_test()),
+        1,
+        "Save & Connect started the desktop session"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).desktop_secret_count_for_test()),
+        0,
+        "one-shot password was consumed immediately and leaves desktop_secrets empty for future sessions"
+    );
+}
+
+#[gpui::test]
+async fn vault_and_connection_modals_preserve_outer_focus_return_across_typing_validation_and_inline_creation(
+    app_cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("modal-focus-return-preservation");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let (view, cx) = vault_window(app_cx, &dir, &secrets);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(size(px(1280.0), px(860.0)));
+    cx.run_until_parked();
+
+    let vault_search_focused = |cx: &mut VisualTestContext| {
+        let handle = cx.update(|_window, app| view.read(app).security_search_focus(app));
+        cx.update(|window, _app| handle.is_focused(window))
+    };
+    let vault_list_focused = |cx: &mut VisualTestContext| {
+        cx.update(|window, app| view.read(app).security_list_focused(window))
+    };
+    let hosts_search_focused = |cx: &mut VisualTestContext| {
+        let handle = cx.update(|_window, app| view.read(app).hosts_search_focus_for_test(app));
+        cx.update(|window, _app| handle.is_focused(window))
+    };
+
+    // 1. Vault page: focus `security.search`, open NewCredential modal, trigger refusal refocus,
+    //    type into fields, then press Escape -> focus must return to `security.search`!
+    click(cx, "nav.hosts");
+    click(cx, "hosts.view.vault");
+    cx.run_until_parked();
+    click(cx, "security.search");
+    assert!(vault_search_focused(cx));
+
+    click(cx, "security.action.new-password");
+    cx.run_until_parked();
+    // Submit empty to trigger `security_focus_refused_field`, then type text (triggering redraws).
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    cx.simulate_input("Typing inside modal");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        vault_search_focused(cx),
+        "closing vault dialog after typing & refusal refocus restores focus to security.search"
+    );
+
+    // 2. Vault page: focus `security.list_focus`, open GenerateKey modal, type & save ->
+    //    focus must return to `security.list_focus`!
+    click(cx, "security.credential.0");
+    cx.run_until_parked();
+    assert!(vault_list_focused(cx));
+    click(cx, "security.action.generate");
+    cx.run_until_parked();
+    cx.simulate_input("Focus-return key");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        vault_list_focused(cx),
+        "saving vault dialog restores focus to security.list_focus"
+    );
+
+    // 3. Home page: focus `hosts.search`, open SSH dialog, trigger validation failure refocus AND
+    //    stacked inline `PendingVaultBind` credential dialog, then close SSH dialog ->
+    //    focus must return to `hosts.search`!
+    click(cx, "hosts.view.all");
+    cx.run_until_parked();
+    click(cx, "hosts.search");
+    assert!(hosts_search_focused(cx));
+
+    click(cx, "hosts.new");
+    cx.run_until_parked();
+    // Validation failure sets `field_focus_pending` while `host_fields` is already open.
+    click(cx, "hosts.save");
+    cx.run_until_parked();
+    // Open stacked inline shared-credential dialog (`PendingVaultBind::SshSharedCredential`).
+    click(cx, "hosts.auth.remote.method.password");
+    cx.run_until_parked();
+    click(cx, "hosts.auth.credential.new");
+    cx.run_until_parked();
+    type_into(cx, "security.dialog.name", "Stacked SSH cred");
+    click(cx, "security.dialog.generate.password");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().draft().is_some()),
+        "SSH dialog remains open after inline credential creation"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        hosts_search_focused(cx),
+        "closing SSH dialog after validation refocus and inline vault dialog restores focus to hosts.search"
+    );
+
+    // 4. Home page: focus `hosts.search`, open New -> switch to RDP, trigger validation failure +
+    //    inline `PendingVaultBind::DesktopSharedCredential` cancel + close RDP dialog ->
+    //    focus must return to `hosts.search`!
+    click(cx, "hosts.search");
+    assert!(hosts_search_focused(cx));
+    click(cx, "hosts.new");
+    click(cx, "connection.protocol.rdp");
+    cx.run_until_parked();
+    click(cx, "connection.save");
+    cx.run_until_parked();
+    click(cx, "connection.auth.credential.new");
+    cx.run_until_parked();
+    cx.simulate_input("Cancelled inline RDP cred");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        hosts_search_focused(cx),
+        "closing RDP dialog after protocol switch, validation refocus, and inline vault cancel restores hosts.search"
     );
 }

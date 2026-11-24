@@ -2162,6 +2162,7 @@ impl ShelluneView {
 
     /// Puts the connection dialog away while its attempt keeps running in its tab.
     pub(super) fn hide_connection(&mut self, cx: &mut Context<Self>) {
+        self.security_reset_reveal();
         let hidden = self.form_session;
         self.park_focused_form();
         // The form now lives on its attempt; nothing is on screen until its tab asks

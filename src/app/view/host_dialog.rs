@@ -582,10 +582,23 @@ impl ShelluneView {
 
     /// Saves the non-SSH connection and, when it was saved, connects to it at once.
     fn save_and_connect_connection(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.save_connection(cx) else {
+        let Some((id, ephemeral)) = self.save_connection_for_connect(cx) else {
             return;
         };
-        self.connect_saved_connection(id, cx);
+        let Some(protocol) = self.book.connection(id).map(|record| record.protocol()) else {
+            return;
+        };
+        match protocol {
+            ProtocolKind::Rdp | ProtocolKind::Vnc => {
+                self.open_desktop_connection_with_ephemeral(id, ephemeral, cx);
+            }
+            ProtocolKind::Serial => {
+                self.open_serial_connection(id, cx);
+            }
+            ProtocolKind::Ssh => {
+                self.connect_saved_host(id, cx);
+            }
+        }
     }
 
     /// One labelled field of the dialog.
