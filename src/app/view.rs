@@ -1092,6 +1092,10 @@ pub struct ShelluneView {
     focus_return: Option<gpui::WeakFocusHandle>,
     /// The next draw gives the keyboard back to [`Self::focus_return`].
     restore_focus_pending: bool,
+    /// The next draw notes [`Self::focus_return`] once before a newly opened tool claims focus.
+    remember_tool_focus_pending: bool,
+    /// Whether the current remote connection flow was started from inside an open terminal workspace.
+    remote_opened_from_workspace: bool,
     /// The session row whose menu is open, and where it was opened.
     session_menu: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
     /// The head's "more" menu: the session it acts on, and where it was opened (R5).
@@ -3014,6 +3018,8 @@ impl ShelluneView {
             focus_host_dialog_keep_return: false,
             focus_return: None,
             restore_focus_pending: false,
+            remember_tool_focus_pending: false,
+            remote_opened_from_workspace: false,
             rail_collapsed: false,
             host_connection_fields: None,
             protocol_fields: None,
@@ -4061,6 +4067,18 @@ impl ShelluneView {
     #[cfg(test)]
     pub fn hosts_search_focus_for_test(&self, cx: &gpui::App) -> FocusHandle {
         self.hosts_search.read(cx).focus_handle().clone()
+    }
+
+    /// The remote connection form's password field's focus, for a test.
+    #[cfg(test)]
+    pub fn remote_password_focus_for_test(&self, cx: &gpui::App) -> FocusHandle {
+        self.remote_fields.password.read(cx).focus_handle().clone()
+    }
+
+    /// The remote connection form's password field's text, for a test.
+    #[cfg(test)]
+    pub fn remote_password_text_for_test(&self, cx: &gpui::App) -> String {
+        self.remote_fields.password.read(cx).text().to_owned()
     }
 
     /// Connects a saved record with the protocol it was saved as (R2).
@@ -5945,10 +5963,19 @@ impl ShelluneView {
         self.tab_revealed.set(None);
         self.workspace.layout_mut().focus_session(id);
         if self.pane_for(id).is_none() && self.desktop_for(id).is_none() {
-            if self.attempt_index(id).is_some() {
+            if self.has_session_form(id) {
+                if self.workspace.destination() != Destination::LocalShells {
+                    self.workspace.select(Destination::LocalShells);
+                    self.workspace
+                        .set_context(shellune_core::PanelSection::None);
+                }
                 self.focus_attempt(id, cx);
             }
             return;
+        }
+        if self.form_session.is_some() && self.form_session != Some(id) {
+            self.park_focused_form();
+            self.form_session = None;
         }
         self.showing_connection_form = false;
         self.active = Some(id);
@@ -5983,6 +6010,8 @@ impl ShelluneView {
                 });
             if let Some(handle) = handle {
                 window.focus(&handle);
+            } else if self.showing_connection_form && self.form_session == Some(id) {
+                self.focus_remote_form_in(window, cx);
             }
         }
     }
@@ -9434,6 +9463,75 @@ impl ShelluneView {
         self.attempts.iter().position(|attempt| attempt.id == id)
     }
 
+    /// Whether `id` currently owns an in-flight or parked connection form/attempt.
+    pub(super) fn has_session_form(&self, id: SessionId) -> bool {
+        self.attempt_index(id).is_some() || (self.form_session == Some(id) && self.remote.is_some())
+    }
+
+    /// Ensures a pre-registered `form_session` has a backing `Attempt` entry even when
+    /// connection setup stops at the form before transport dialling starts.
+    fn ensure_form_attempt(&mut self, id: SessionId, host: &HostConfig) {
+        if self.form_session != Some(id) || self.attempt_index(id).is_some() {
+            return;
+        }
+        let generation = self
+            .workspace
+            .session(id)
+            .map(Session::generation)
+            .unwrap_or(0);
+        let ephemeral = self
+            .pending_ephemeral
+            .take()
+            .is_some_and(|pending| pending.id() == host.id())
+            || self.unsaved.iter().any(|(session, _)| *session == id);
+        self.attempts.push(Attempt {
+            id,
+            generation,
+            link: None,
+            watching: false,
+            panel: None,
+            chain: None,
+            pending_trust: None,
+            asking_hop: None,
+            target: host.clone(),
+            ephemeral,
+            forward_only: false,
+            pending_rules: Vec::new(),
+        });
+    }
+
+    /// Focuses the first interactive credential input on the open connection form, or
+    /// the current destination container when no credential field is asking for text.
+    pub(super) fn focus_remote_form_in(&self, window: &mut Window, cx: &gpui::App) {
+        if let Some(panel) = self.remote.as_ref()
+            && matches!(panel.status(), RemoteStatus::Idle)
+        {
+            let method = panel.method();
+            if method.takes_password() {
+                let handle = self.remote_fields.password.read(cx).focus_handle().clone();
+                window.focus(&handle);
+                return;
+            }
+            if method.needs_key_path() && panel.key_path().trim().is_empty() {
+                let handle = self.remote_fields.key_path.read(cx).focus_handle().clone();
+                window.focus(&handle);
+                return;
+            }
+            if method.needs_passphrase() {
+                let handle = self
+                    .remote_fields
+                    .passphrase
+                    .read(cx)
+                    .focus_handle()
+                    .clone();
+                window.focus(&handle);
+                return;
+            }
+        }
+        let handle = self.destination_focus(self.workspace.destination()).clone();
+        window.focus(&handle);
+    }
+
     /// The form of one attempt: the screen's form when it is focused, otherwise the
     /// copy kept on the attempt.
     fn panel_for(&self, id: SessionId) -> Option<&RemotePanel> {
@@ -9814,6 +9912,8 @@ impl ShelluneView {
         ephemeral: Option<shellune_core::SecretString>,
         cx: &mut Context<Self>,
     ) {
+        self.remote_opened_from_workspace =
+            self.workspace.destination() == Destination::LocalShells && !self.panes.is_empty();
         self.pending_open_files = None;
         self.forward_only_dial = false;
         self.pending_forward_rules.clear();
@@ -9831,6 +9931,8 @@ impl ShelluneView {
     /// that aim by parking first; a pane's own Connect button arms the adopt after
     /// the park, then calls this.
     pub(super) fn open_remote_after_park(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        self.remote_opened_from_workspace =
+            self.workspace.destination() == Destination::LocalShells && !self.panes.is_empty();
         self.ephemeral_ssh_secrets.clear();
         self.open_remote_after_park_inner(host, cx);
     }
@@ -9847,6 +9949,7 @@ impl ShelluneView {
         if self.workspace.destination() != Destination::LocalShells {
             self.workspace.select(Destination::LocalShells);
         }
+        self.remote_opened_from_workspace = true;
         self.session_terminal = true;
         self.pending_open_files = None;
         self.forward_only_dial = false;
@@ -9875,6 +9978,7 @@ impl ShelluneView {
         self.workspace.layout_mut().focus_session(new_id);
         self.checkpoint_layout();
         self.connect_when_ready(host, cx);
+        self.ensure_form_attempt(new_id, host);
         cx.notify();
     }
 
@@ -10363,6 +10467,7 @@ impl ShelluneView {
         };
         self.form_session = Some(id);
         self.active = Some(id);
+        self.ensure_form_attempt(id, &host);
         if let Some(panel) = self.remote.as_mut() {
             panel.fail(RemoteFailure::new(
                 reason.clone(),
@@ -10464,7 +10569,12 @@ impl ShelluneView {
         let ephemeral = self
             .pending_ephemeral
             .take()
-            .is_some_and(|pending| pending.id() == target_host.id());
+            .is_some_and(|pending| pending.id() == target_host.id())
+            || self
+                .attempts
+                .iter()
+                .any(|attempt| attempt.id == id && attempt.ephemeral)
+            || self.unsaved.iter().any(|(session, _)| *session == id);
         let generation = self
             .workspace
             .session(id)
@@ -11356,7 +11466,16 @@ impl ShelluneView {
                 }
                 id
             }
-            None => self.workspace.register_remote_session(&host).id(),
+            None => self
+                .form_session
+                .filter(|id| {
+                    self.workspace.session(*id).is_some()
+                        && self
+                            .attempts
+                            .iter()
+                            .all(|attempt| attempt.id != *id || attempt.link.is_none())
+                })
+                .unwrap_or_else(|| self.workspace.register_remote_session(&host).id()),
         };
         self.form_session = Some(id);
         self.active = Some(id);
@@ -13733,22 +13852,45 @@ impl ShelluneView {
         handle == &self.root_focus || self.destination_focus.iter().any(|item| item == handle)
     }
 
+    /// Whether `handle` belongs to a persistent overlay/modal control rather than page content.
+    pub(super) fn is_overlay_internal_focus(&self, handle: &FocusHandle, cx: &gpui::App) -> bool {
+        handle == &self.snippet_focus
+            || handle == &self.paste_focus
+            || self
+                .snippet_panel
+                .search_field()
+                .is_some_and(|field| field.read(cx).focus_handle() == handle)
+    }
+
     /// Remembers a field or terminal while one has the keyboard.
     ///
     /// Page focus does not replace it: a click that opens an overlay often blurs the
     /// field first, and the page focus that fills the gap is not where the user was.
     fn note_content_focus(&mut self, window: &Window, cx: &gpui::App) {
         if self.palette.is_some()
+            || self.tool.is_some()
+            || self.restore_focus_pending
+            || self.pane_focus_pending.is_some()
+            || self.quick_open
+            || self.tab_rename.is_some()
+            || self.tab_list_open
+            || self.import.is_open()
+            || self.hosts.group_editor().is_some()
             || self.host_fields.is_some()
             || self.protocol_fields.is_some()
             || self.host_menu.is_some()
+            || self.home_menu.is_some()
             || self.tab_menu.is_some()
             || self.session_menu.is_some()
+            || self.session_more.is_some()
+            || self.files_menu.is_some()
+            || self.paste_prompt_open(cx)
         {
             return;
         }
         if let Some(handle) = window.focused(cx)
             && !self.is_page_focus(&handle)
+            && !self.is_overlay_internal_focus(&handle, cx)
         {
             self.focus_return = Some(handle.downgrade());
         }
@@ -13989,7 +14131,12 @@ impl ShelluneView {
             && !self.connection_inline()
             && !self.connection_behind_screen()
         {
-            if self.form_session.is_some() {
+            if self.form_session.is_some()
+                && self
+                    .remote
+                    .as_ref()
+                    .is_some_and(|panel| panel.status().is_busy() || panel.status().is_asking())
+            {
                 self.hide_connection(cx);
             } else {
                 self.close_remote(cx);
@@ -14046,9 +14193,12 @@ impl ShelluneView {
         }
         if self.tool.is_some() {
             self.tool = None;
+            self.remember_tool_focus_pending = false;
             self.forwards.close_editor();
             self.pending_exposure = None;
             self.forward_confirm = None;
+            self.snippet_panel.keep();
+            self.snippet_panel.end_edit();
             self.restore_focus_pending = true;
             cx.notify();
             return true;
@@ -21629,6 +21779,9 @@ impl Render for ShelluneView {
                 }
                 window.focus(&handle);
             }
+        }
+        if std::mem::take(&mut self.remember_tool_focus_pending) {
+            self.remember_focus(window, cx);
         }
         // A command editor that was just opened takes the keyboard in its first field, so
         // the dialog can be written without touching the pointer.

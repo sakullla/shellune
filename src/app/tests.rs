@@ -46900,7 +46900,7 @@ async fn terminal_links_context_menu_and_shell_key_passthrough_invariants(cx: &m
 
 #[gpui::test]
 async fn snippets_drawer_keyboard_flow_formatted_hint_and_global_tool_entrypoints(
-    cx: &mut TestAppContext,
+    app_cx: &mut TestAppContext,
 ) {
     let dir = TempDir::new("snippets-and-global-tools");
     seed(
@@ -46916,7 +46916,7 @@ async fn snippets_drawer_keyboard_flow_formatted_hint_and_global_tool_entrypoint
         .save(&book)
         .expect("save snippets");
 
-    let (view, cx) = snippet_view(cx, &dir);
+    let (view, cx) = snippet_view(app_cx, &dir);
     let session = live_remote(cx, &view);
     show_remote_terminal(cx, &view, session);
 
@@ -47076,6 +47076,84 @@ async fn snippets_drawer_keyboard_flow_formatted_hint_and_global_tool_entrypoint
     );
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
+
+    // Closing Tool::Snippets via Escape or close button restores prior non-terminal field focus
+    // (hosts.search and vault security.search) instead of losing it to snippet_panel.search_field.
+    let hosts_search_focused = |cx: &mut VisualTestContext| {
+        let handle = cx.update(|_window, app| view.read(app).hosts_search_focus_for_test(app));
+        cx.update(|window, _app| handle.is_focused(window))
+    };
+    click(cx, "hosts.search");
+    assert!(
+        hosts_search_focused(cx),
+        "hosts.search holds focus before opening snippets"
+    );
+    click(cx, "hosts.more");
+    click(cx, "hosts.more.snippets");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        Some(crate::app::view::Tool::Snippets)
+    );
+    cx.simulate_input("mem");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        hosts_search_focused(cx),
+        "closing Tool::Snippets with Escape restores focus to hosts.search"
+    );
+
+    // Also via Command Palette -> ManageSnippets -> close button (`snippets.dialog.close`).
+    go(cx, crate::app::actions::OpenPalette);
+    cx.simulate_input("snippets");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.simulate_input("mem");
+    cx.run_until_parked();
+    click(cx, "snippets.dialog.close");
+    cx.run_until_parked();
+    assert!(
+        hosts_search_focused(cx),
+        "closing Tool::Snippets with close button restores focus to hosts.search"
+    );
+
+    // Vault search (`security.search`) focus is likewise preserved across Tool::Snippets.
+    let vdir = TempDir::new("snippets-vault-focus");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&vdir, &secrets);
+    shellune_storage::SnippetStore::at(vdir.path())
+        .save(&book)
+        .expect("save snippets");
+    let (vview, vcx) = vault_window(app_cx, &vdir, &secrets);
+    vcx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    vcx.simulate_resize(design_window());
+    click(vcx, "nav.hosts");
+    click(vcx, "hosts.view.vault");
+    vcx.run_until_parked();
+    click(vcx, "security.search");
+    let vault_search_focused = |vcx: &mut VisualTestContext| {
+        let handle = vcx.update(|_window, app| vview.read(app).security_search_focus(app));
+        vcx.update(|window, _app| handle.is_focused(window))
+    };
+    assert!(
+        vault_search_focused(vcx),
+        "security.search holds focus before opening snippets"
+    );
+    go(vcx, crate::app::actions::OpenPalette);
+    vcx.simulate_input("snippets");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    vcx.simulate_input("disk");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        vault_search_focused(vcx),
+        "closing Tool::Snippets restores focus to Vault security.search"
+    );
 }
 
 #[gpui::test]
@@ -47185,6 +47263,79 @@ async fn pending_tab_menu_ssh_duplicate_menu_alignment_split_zoom_and_background
     assert!(
         duplicated_active.is_some() && duplicated_active != Some(ssh_one),
         "duplicated SSH tab becomes the active session immediately"
+    );
+    assert!(
+        ssh_cx.update(|_window, app| ssh_view.read(app).connection_inline_for_test()),
+        "duplicated interactive-auth SSH tab renders its inline connection form"
+    );
+    assert!(
+        ssh_cx.debug_bounds("remote.hide").is_none(),
+        "idle pre-dial duplicated SSH form must not offer remote.hide"
+    );
+
+    // Type a password in the duplicated tab's form, switch back to live ssh_one tab,
+    // then switch back to the duplicated tab via click, select_tab, and Command Palette:
+    // the inline password form, its typed secret, and password field focus all survive.
+    type_into(ssh_cx, "remote.password", "dup-secret-pw");
+    assert_eq!(
+        ssh_cx.update(|_window, app| ssh_view.read(app).remote_password_text_for_test(app)),
+        "dup-secret-pw"
+    );
+    click(ssh_cx, "session.tab.0");
+    assert!(
+        !ssh_cx.update(|_window, app| ssh_view.read(app).connection_inline_for_test()),
+        "switching to live tab hides the inline connection form"
+    );
+    click(ssh_cx, "session.tab.1");
+    assert!(
+        ssh_cx.update(|_window, app| ssh_view.read(app).connection_inline_for_test()),
+        "clicking back to duplicated SSH tab restores its inline password form instead of a stuck spinner"
+    );
+    assert_eq!(
+        ssh_cx.update(|_window, app| ssh_view.read(app).remote_password_text_for_test(app)),
+        "dup-secret-pw",
+        "typed password survives switching tabs away and back"
+    );
+    assert!(
+        ssh_cx.update(|window, app| {
+            ssh_view
+                .read(app)
+                .remote_password_focus_for_test(app)
+                .is_focused(window)
+        }),
+        "clicking back to duplicated SSH tab focuses its password input"
+    );
+
+    // Also verify select_tab(0) -> select_tab(1) preserves the inline form.
+    ssh_cx.update(|window, app| ssh_view.update(app, |v, cx| v.select_tab(0, window, cx)));
+    ssh_cx.run_until_parked();
+    ssh_cx.update(|window, app| ssh_view.update(app, |v, cx| v.select_tab(1, window, cx)));
+    ssh_cx.run_until_parked();
+    assert!(
+        ssh_cx.update(|_window, app| ssh_view.read(app).connection_inline_for_test()),
+        "select_tab(1) restores the duplicated SSH tab's inline password form"
+    );
+
+    // Once the duplicated SSH tab actually starts dialling (in_flight), remote.hide appears
+    // and clicking it steps back to the live terminal tab inside LocalShells rather than Hosts.
+    ssh_cx.update(|_window, app| {
+        ssh_view.update(app, |v, cx| v.script_remote_attempt(Vec::new(), cx));
+    });
+    wait_for_loading_card(ssh_cx);
+    assert!(
+        ssh_cx.debug_bounds("remote.hide").is_some(),
+        "once in_flight, remote.hide is offered"
+    );
+    click(ssh_cx, "remote.hide");
+    assert_eq!(
+        ssh_cx.update(|_window, app| ssh_view.read(app).workspace().destination()),
+        Destination::LocalShells,
+        "hiding an in-flight duplicated SSH connection in a multi-tab workspace stays in LocalShells"
+    );
+    assert_eq!(
+        ssh_cx.update(|_window, app| ssh_view.read(app).active_session()),
+        Some(ssh_one),
+        "hiding the duplicated attempt activates the live terminal tab"
     );
 
     // Switch back to live ssh_one tab and verify session.more aligns on rename, accents, forwards, close_others, close_right.

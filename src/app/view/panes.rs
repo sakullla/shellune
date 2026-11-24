@@ -132,15 +132,29 @@ impl ShelluneView {
                 self.activate_in(id, window, cx);
                 return;
             }
-            if self.attempt_index(id).is_some() {
+            if self.has_session_form(id) {
+                if self.workspace.destination() != Destination::LocalShells {
+                    self.workspace.select(Destination::LocalShells);
+                    self.workspace
+                        .set_context(shellune_core::PanelSection::None);
+                }
                 self.focus_attempt(id, cx);
+                self.focus_remote_form_in(window, cx);
                 return;
+            }
+            if self.form_session.is_some() && self.form_session != Some(id) {
+                self.park_focused_form();
+                self.form_session = None;
             }
             self.active = Some(id);
             self.session_terminal = true;
             self.showing_connection_form = false;
             cx.notify();
             return;
+        }
+        if self.form_session.is_some() {
+            self.park_focused_form();
+            self.form_session = None;
         }
         self.active = None;
         self.session_terminal = true;
@@ -428,6 +442,10 @@ impl ShelluneView {
         if let Some(id) = session
             && (self.pane_for(id).is_some() || self.desktop_for(id).is_some())
         {
+            if self.form_session.is_some() && self.form_session != Some(id) {
+                self.park_focused_form();
+                self.form_session = None;
+            }
             self.showing_connection_form = false;
             // Moving the keyboard to a pane is looking at that pane's tab, so whatever
             // the tab was marked for has been seen — also when the tab was already on
@@ -447,10 +465,15 @@ impl ShelluneView {
             return;
         }
         if let Some(id) = session
-            && self.attempt_index(id).is_some()
+            && self.has_session_form(id)
         {
             self.focus_attempt(id, cx);
+            self.focus_remote_form_in(window, cx);
             return;
+        }
+        if self.form_session.is_some() {
+            self.park_focused_form();
+            self.form_session = None;
         }
         self.showing_connection_form = false;
         self.clear_viewed_attention(cx);

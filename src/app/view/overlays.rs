@@ -235,6 +235,7 @@ impl ShelluneView {
         let current = window.focused(cx);
         if let Some(handle) = current.as_ref()
             && !self.is_page_focus(handle)
+            && !self.is_overlay_internal_focus(handle, cx)
         {
             self.focus_return = Some(handle.downgrade());
             return;
@@ -243,13 +244,14 @@ impl ShelluneView {
             .focus_return
             .as_ref()
             .and_then(|handle| handle.upgrade());
-        if kept
-            .as_ref()
-            .is_some_and(|handle| !self.is_page_focus(handle))
-        {
+        if kept.as_ref().is_some_and(|handle| {
+            !self.is_page_focus(handle) && !self.is_overlay_internal_focus(handle, cx)
+        }) {
             return;
         }
-        self.focus_return = current.map(|handle| handle.downgrade());
+        self.focus_return = current
+            .filter(|handle| !self.is_overlay_internal_focus(handle, cx))
+            .map(|handle| handle.downgrade());
     }
 
     /// Returns the keyboard to the element that opened the overlay, or to the page.

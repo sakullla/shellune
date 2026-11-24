@@ -1882,7 +1882,7 @@ impl ShelluneView {
         // so that button would only take the room the reason and the next step need.
         // An attempt that is really in flight can also be ended here, which is the
         // only place it can be ended while the dialog is still what is on screen.
-        let can_background = self.form_session.is_some() && !failed;
+        let can_background = self.form_session.is_some() && in_flight && !failed;
         let can_cancel = panel.status().is_busy() || asking;
         let footer = (can_background || can_cancel).then(|| {
             components::modal_footer(metrics)
@@ -2050,6 +2050,7 @@ impl ShelluneView {
         let ux = copy::ux();
         let close = |this: &mut Self, cx: &mut Context<Self>| {
             this.tool = None;
+            this.remember_tool_focus_pending = false;
             this.forwards.close_editor();
             this.pending_exposure = None;
             // A question about one rule is about a page that is no longer on screen.
@@ -2161,17 +2162,34 @@ impl ShelluneView {
 
     /// Puts the connection dialog away while its attempt keeps running in its tab.
     pub(super) fn hide_connection(&mut self, cx: &mut Context<Self>) {
+        let hidden = self.form_session;
         self.park_focused_form();
         // The form now lives on its attempt; nothing is on screen until its tab asks
         // for it again.
         self.form_session = None;
         self.showing_connection_form = false;
-        // Put away from its own tab, an attempt that has no terminal yet leaves nothing
-        // to look at there: the window goes back to the hosts while it keeps running.
-        if self
-            .active
-            .is_some_and(|id| self.pane_for(id).is_none() && self.attempt_index(id).is_some())
-        {
+        // When the attempt was started inside a multi-tab terminal workspace, step back
+        // to another live workspace tab so the user stays in their terminals; otherwise
+        // return to the hosts list while the attempt keeps running.
+        if self.active.is_some_and(|id| {
+            self.pane_for(id).is_none()
+                && self.desktop_for(id).is_none()
+                && self.attempt_index(id).is_some()
+        }) {
+            let fallback = self
+                .remote_opened_from_workspace
+                .then(|| {
+                    self.tab_sessions().into_iter().find(|candidate| {
+                        Some(*candidate) != hidden
+                            && (self.pane_for(*candidate).is_some()
+                                || self.desktop_for(*candidate).is_some())
+                    })
+                })
+                .flatten();
+            if let Some(other) = fallback {
+                self.activate(other, cx);
+                return;
+            }
             self.workspace.select(Destination::Hosts);
         }
         cx.notify();
@@ -2179,6 +2197,9 @@ impl ShelluneView {
 
     /// Opens a tool over the current page.
     pub(super) fn open_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
+        if self.tool.is_none() {
+            self.remember_tool_focus_pending = true;
+        }
         self.tool = Some(tool);
         self.shell_menu_open = false;
         cx.notify();
@@ -2209,6 +2230,12 @@ impl ShelluneView {
     #[cfg(test)]
     pub fn tool_for_test(&self) -> Option<Tool> {
         self.tool
+    }
+
+    /// Whether the inline connection form is currently rendered in the active tab, for a test.
+    #[cfg(test)]
+    pub fn connection_inline_for_test(&self) -> bool {
+        self.connection_inline()
     }
 }
 
@@ -2442,10 +2469,11 @@ impl ShelluneView {
             SnippetOffer::Written => {
                 if self.tool == Some(Tool::Snippets) {
                     self.tool = None;
+                    self.remember_tool_focus_pending = false;
                     self.snippet_panel.keep();
                     self.snippet_panel.end_edit();
+                    self.focus_return = None;
                     self.pane_focus_pending = self.active;
-                    self.restore_focus_pending = true;
                 }
                 self.settle_snippet_note(cx);
                 let title = if execute {
@@ -2459,6 +2487,7 @@ impl ShelluneView {
             SnippetOffer::Waiting => {
                 if self.tool == Some(Tool::Snippets) {
                     self.tool = None;
+                    self.remember_tool_focus_pending = false;
                     self.snippet_panel.keep();
                     self.snippet_panel.end_edit();
                 }
