@@ -121,6 +121,9 @@ impl ShelluneView {
         self.active = self.workspace.layout().active_session();
         if let Some(id) = self.active {
             self.focus_pane(id, cx);
+        } else {
+            self.focus_return = None;
+            self.restore_focus_pending = true;
         }
         cx.notify();
     }
@@ -149,6 +152,9 @@ impl ShelluneView {
             self.active = Some(id);
             self.session_terminal = true;
             self.showing_connection_form = false;
+            self.focus_return = None;
+            let handle = self.destination_focus(self.workspace.destination()).clone();
+            window.focus(&handle);
             cx.notify();
             return;
         }
@@ -159,6 +165,7 @@ impl ShelluneView {
         self.active = None;
         self.session_terminal = true;
         self.showing_connection_form = false;
+        self.focus_return = None;
         if self.workspace.destination() != Destination::LocalShells {
             self.workspace.select(Destination::LocalShells);
         }
@@ -483,7 +490,10 @@ impl ShelluneView {
                         .map(|pane| pane.read(cx).focus_handle().clone())
                 });
             if let Some(handle) = handle {
+                self.focus_return = Some(handle.downgrade());
                 window.focus(&handle);
+            } else {
+                self.focus_return = None;
             }
             cx.notify();
             return;
@@ -501,6 +511,7 @@ impl ShelluneView {
         }
         self.showing_connection_form = false;
         self.clear_viewed_attention(cx);
+        self.focus_return = None;
         let handle = self.destination_focus(self.workspace.destination()).clone();
         window.focus(&handle);
         cx.notify();

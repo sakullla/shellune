@@ -2387,6 +2387,9 @@ impl ShelluneView {
                     // A batch runs commands over SSH; the rule is said where it applies.
                     .tooltip(components::tooltip(ux.hosts_selection_ssh_only))
                     .on_click(cx.listener(|this, _event, _window, cx| {
+                        if !this.batch.view().is_open() {
+                            this.remember_tool_focus_pending = true;
+                        }
                         this.open_batch_preview(cx);
                     })),
             )

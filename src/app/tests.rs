@@ -48823,3 +48823,362 @@ async fn global_tools_batch_focus_isolation_home_snippet_guard_and_context_split
         "layout active_session synchronizes with the reconnecting split pane"
     );
 }
+
+#[gpui::test]
+async fn modal_palette_cancel_batch_switch_and_pending_split_overlay_focus_isolation(
+    app_cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("modal-palette-cancel-batch-switch-and-pending-split");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let mut book = shellune_core::SnippetBook::new();
+    book.create("echo safe", "echo safe").expect("snippet");
+    shellune_storage::SnippetStore::at(dir.path())
+        .save(&book)
+        .expect("save snippets");
+
+    let (view, cx) = snippet_view(app_cx, &dir);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(design_window());
+    let session = live_remote(cx, &view);
+    show_remote_terminal(cx, &view, session);
+
+    let terminal_focused = |cx: &mut VisualTestContext| {
+        cx.update(|window, app| {
+            view.read(app)
+                .pane_of(session)
+                .is_some_and(|p| p.read(app).focus_handle().is_focused(window))
+        })
+    };
+    assert!(terminal_focused(cx));
+
+    // 1. Opening Transfers, Forwards (after Escape from editor), or Batch over a live terminal,
+    //    then opening Command Palette (Ctrl/Cmd+K) and cancelling it with Escape (or toggle)
+    //    must keep keyboard focus isolated from the underlying terminal PTY while the modal
+    //    stays open, and still restore terminal focus once the modal itself closes.
+    let sent_before = snippet_sent(cx, &view, session).len();
+
+    click(cx, "session.more");
+    click(cx, "session.more.transfers");
+    cx.run_until_parked();
+    go(cx, crate::app::actions::OpenPalette);
+    assert!(cx.update(|_window, app| view.read(app).palette_open()));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).palette_open()));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        Some(crate::app::view::Tool::Transfers),
+        "Transfers stays open after cancelling Command Palette"
+    );
+    assert!(
+        !terminal_focused(cx),
+        "cancelling Command Palette over Transfers must not focus the hidden terminal PTY"
+    );
+    cx.simulate_input("echo leaked-transfers");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session).len(),
+        sent_before,
+        "typing after cancelling palette over Transfers never reaches the hidden terminal PTY"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        terminal_focused(cx),
+        "closing Transfers after palette cancel restores terminal focus"
+    );
+
+    click(cx, "session.more");
+    click(cx, "session.more.global_forwards");
+    cx.run_until_parked();
+    click(cx, "forwards.new");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape"); // close forwards.form back to Forwards list
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("forwards.form").is_none());
+    go(cx, crate::app::actions::OpenPalette);
+    go(cx, crate::app::actions::OpenPalette); // cancel via second Ctrl/Cmd+K toggle
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).palette_open()));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        Some(crate::app::view::Tool::Forwards),
+    );
+    assert!(
+        !terminal_focused(cx),
+        "toggling Command Palette closed over Forwards must not focus the hidden terminal PTY"
+    );
+    cx.simulate_input("echo leaked-forwards");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session).len(),
+        sent_before,
+        "typing after toggling palette closed over Forwards never reaches the hidden terminal PTY"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(terminal_focused(cx));
+
+    click(cx, "session.more");
+    click(cx, "session.more.batch");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("batch.dialog").is_some());
+    go(cx, crate::app::actions::OpenPalette);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("batch.dialog").is_some());
+    assert!(
+        !terminal_focused(cx),
+        "cancelling Command Palette over unfocused Batch modal must not focus the hidden terminal PTY"
+    );
+    cx.simulate_input("echo leaked-batch");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session).len(),
+        sent_before,
+        "typing after cancelling palette over Batch never reaches the hidden terminal PTY"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(terminal_focused(cx));
+
+    // 2. Home multi-select bar `hosts.batch.open` isolates `hosts.search`, and switching from a
+    //    focused `batch.step.field.0` via Command Palette to Snippets, Transfers, Forwards,
+    //    New Host, or Import preserves `hosts.search` as the outer focus return target on Escape.
+    click(cx, "nav.hosts");
+    cx.run_until_parked();
+    let hosts_search_focused = |cx: &mut VisualTestContext| {
+        let handle = cx.update(|_window, app| view.read(app).hosts_search_focus_for_test(app));
+        cx.update(|window, _app| handle.is_focused(window))
+    };
+    click(cx, "hosts.select.0");
+    cx.run_until_parked();
+    click(cx, "hosts.search");
+    assert!(hosts_search_focused(cx));
+
+    click(cx, "hosts.batch.open");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("batch.dialog").is_some());
+    assert!(
+        !hosts_search_focused(cx),
+        "hosts.batch.open must move keyboard focus off hosts.search"
+    );
+    cx.simulate_input("leaked");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().search().to_owned()),
+        "",
+        "typing over Batch opened from hosts.batch.open must not mutate hosts.search"
+    );
+    go(cx, crate::app::actions::OpenPalette);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_input("still-isolated");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().search().to_owned()),
+        "",
+        "cancelling Command Palette over Batch must not leak keys into hosts.search"
+    );
+
+    let v_replacement_open = |v: &ShelluneView, label: &str| match label {
+        "Snippets" => v.tool_for_test() == Some(crate::app::view::Tool::Snippets),
+        "Transfers" => v.tool_for_test() == Some(crate::app::view::Tool::Transfers),
+        "Forwards" => v.tool_for_test() == Some(crate::app::view::Tool::Forwards),
+        "New Host" => v.hosts_state().draft().is_some(),
+        "Import" => v.import_open_for_test(),
+        _ => false,
+    };
+    for (palette_query, label) in [
+        (copy::ENGLISH_UX.snippet_manage_action, "Snippets"),
+        (ENGLISH.nav_transfers, "Transfers"),
+        (ENGLISH.nav_forwards, "Forwards"),
+        (ENGLISH.primary_hosts, "New Host"),
+        (ENGLISH.import_open, "Import"),
+    ] {
+        if !cx.update(|_window, app| view.read(app).batch_panel().view().is_open()) {
+            click(cx, "hosts.batch.open");
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.update(|_window, app| view.read(app).batch_panel().view().is_open()),
+            "Batch is open before switching to {label}"
+        );
+        type_into(cx, "batch.step.field.0", "uptime");
+        go(cx, crate::app::actions::OpenPalette);
+        cx.simulate_input(palette_query);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        redraw(cx);
+        assert!(
+            !cx.update(|_window, app| view.read(app).batch_panel().view().is_open()),
+            "switching from Batch via palette query {palette_query:?} ({label}) closes Batch"
+        );
+        assert!(
+            cx.update(|_window, app| v_replacement_open(view.read(app), label)),
+            "palette query {palette_query:?} opens {label}"
+        );
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        redraw(cx);
+        assert!(
+            hosts_search_focused(cx),
+            "closing {label} after switching from focused Batch field restores hosts.search"
+        );
+    }
+
+    // 3. Splitting an SSH session via keyboard shortcut (`SplitPaneRight` -> `split_active` ->
+    //    `present_active_pane`) or moving pane/tab focus to a pending waiting pane (`active_session() == None`)
+    //    clears `focus_return` so opening and closing overlays never leaks keys to the inactive SSH pane.
+    cx.update(|_window, app| view.update(app, |v, cx| v.activate(session, cx)));
+    cx.run_until_parked();
+    show_remote_terminal(cx, &view, session);
+    assert!(terminal_focused(cx));
+
+    let sent_before_shortcut_split = snippet_sent(cx, &view, session).len();
+    go(cx, crate::app::actions::SplitPaneRight);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        None,
+        "SplitPaneRight on SSH session activates the new pending split pane"
+    );
+    assert!(
+        !terminal_focused(cx),
+        "inactive left SSH pane does not hold focus when right pending split pane is active"
+    );
+
+    // Open and close Command Palette, Snippets, Transfers, and Tab List while pending pane is active.
+    go(cx, crate::app::actions::OpenPalette);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        !terminal_focused(cx),
+        "closing Command Palette on pending split pane must not focus inactive SSH pane"
+    );
+
+    go(cx, crate::app::actions::OpenPalette);
+    cx.simulate_input(copy::ENGLISH_UX.snippet_manage_action);
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("snippets.dialog").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        !terminal_focused(cx),
+        "closing Snippets on pending split pane must not focus inactive SSH pane"
+    );
+
+    go(cx, crate::app::actions::OpenPalette);
+    cx.simulate_input("transfers");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        !terminal_focused(cx),
+        "closing Transfers on pending split pane must not focus inactive SSH pane"
+    );
+
+    cx.update(|window, app| view.update(app, |v, cx| v.toggle_tab_list(window, cx)));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        !terminal_focused(cx),
+        "closing Tab List on pending split pane must not focus inactive SSH pane"
+    );
+
+    // Move focus to left live SSH pane, then back to right pending pane via FocusPaneRight,
+    // open/close Transfers, and verify typing still sends nothing to the inactive SSH pane.
+    go(cx, crate::app::actions::FocusPaneLeft);
+    cx.run_until_parked();
+    assert!(terminal_focused(cx));
+    go(cx, crate::app::actions::FocusPaneRight);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        None
+    );
+    go(cx, crate::app::actions::OpenPalette);
+    cx.simulate_input("transfers");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        !terminal_focused(cx),
+        "closing Transfers after FocusPaneRight to pending pane must not focus inactive SSH pane"
+    );
+    cx.simulate_input("echo blind-type");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session).len(),
+        sent_before_shortcut_split,
+        "typing on pending split pane after opening/closing overlays sends zero bytes to inactive SSH pane"
+    );
+
+    // Also open a second live shell tab, then switch back to Tab 0 via `select_tab(0)` (whose
+    // active pane is the pending split pane, so `show_layout_tab` takes the `active_session() == None`
+    // branch), then open and close Command Palette + Snippets and verify zero focus leakage to
+    // either the second tab's shell or Tab 0's inactive SSH pane.
+    go(cx, crate::app::actions::NewLocalShell);
+    cx.run_until_parked();
+    let second_tab_session =
+        cx.update(|_window, app| view.read(app).active_session().expect("new local shell"));
+    let second_shell_focused = |cx: &mut VisualTestContext| {
+        cx.update(|window, app| {
+            view.read(app)
+                .pane_of(second_tab_session)
+                .is_some_and(|p| p.read(app).focus_handle().is_focused(window))
+        })
+    };
+    assert!(second_shell_focused(cx));
+    cx.update(|window, app| view.update(app, |v, cx| v.select_tab(0, window, cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        None,
+        "switching via select_tab(0) back to tab with active pending split pane sets active_session to None"
+    );
+    go(cx, crate::app::actions::OpenPalette);
+    cx.simulate_input(copy::ENGLISH_UX.snippet_manage_action);
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("snippets.dialog").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        !terminal_focused(cx) && !second_shell_focused(cx),
+        "closing Snippets after select_tab to pending pane must not focus background shell or inactive SSH pane"
+    );
+    cx.simulate_input("echo tab-leak");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session).len(),
+        sent_before_shortcut_split,
+        "typing after select_tab to pending pane and closing overlay sends zero bytes to SSH pane"
+    );
+}

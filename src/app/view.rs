@@ -191,6 +191,9 @@ struct GroupOutcome {
 struct OpenPane {
     /// Which session process this pane shows.
     tag: EventTag,
+    /// Immutable keyboard focus handle of this pane's surface, kept here so focus
+    /// queries never re-borrow `Entity<TerminalPane>` / `Entity<DesktopPane>` mid-update.
+    focus: gpui::FocusHandle,
     /// What it draws: a character terminal, or a surface of another protocol.
     content: PaneContent,
 }
@@ -1104,6 +1107,11 @@ pub struct ShelluneView {
     restore_focus_pending: bool,
     /// The next draw notes [`Self::focus_return`] once before a newly opened tool claims focus.
     remember_tool_focus_pending: bool,
+    /// Weak focus handles of transient overlay inputs that were just closed or replaced,
+    /// kept until they expire so modal-to-modal switches never mistake them for page focus.
+    retired_overlay_focus: Vec<gpui::WeakFocusHandle>,
+    /// Whether the batch center was open on the previous draw.
+    batch_was_open: bool,
     /// Whether the current remote connection flow was started from inside an open terminal workspace.
     remote_opened_from_workspace: bool,
     /// The session row whose menu is open, and where it was opened.
@@ -3072,6 +3080,8 @@ impl ShelluneView {
             palette_focus_return: None,
             restore_focus_pending: false,
             remember_tool_focus_pending: false,
+            retired_overlay_focus: Vec::new(),
+            batch_was_open: false,
             remote_opened_from_workspace: false,
             rail_collapsed: false,
             host_connection_fields: None,
@@ -5084,20 +5094,26 @@ impl ShelluneView {
     pub(super) fn work_focus_for(
         &self,
         id: SessionId,
-        cx: &gpui::App,
+        _cx: &gpui::App,
     ) -> Option<gpui::FocusHandle> {
-        if let Some(pane) = self.pane_for(id) {
-            Some(pane.read(cx).focus_handle().clone())
-        } else {
-            self.desktop_for(id)
-                .map(|pane| pane.read(cx).focus_handle().clone())
-        }
+        self.panes
+            .iter()
+            .find(|open| open.tag.session == id)
+            .map(|open| open.focus.clone())
     }
 
     /// Keyboard focus handle of the currently active work surface, covering both
     /// `TerminalPane` and `DesktopPane` (ADR-1, R1).
     pub(super) fn active_work_focus(&self, cx: &gpui::App) -> Option<gpui::FocusHandle> {
         self.active.and_then(|id| self.work_focus_for(id, cx))
+    }
+
+    /// If `handle` belongs to an open terminal or desktop pane, returns its session id.
+    pub(super) fn session_of_work_focus(&self, handle: &FocusHandle) -> Option<SessionId> {
+        self.panes
+            .iter()
+            .find(|open| &open.focus == handle)
+            .map(|open| open.tag.session)
     }
 
     /// The terminal whose paste or saved command is waiting for an answer (R17).
@@ -5359,8 +5375,10 @@ impl ShelluneView {
             pane.set_highlight(highlight, cx);
             pane.set_focus_mode(focus_mode);
         });
+        let pane_focus = pane.read(cx).focus_handle().clone();
         self.panes.push(OpenPane {
             tag,
+            focus: pane_focus,
             content: PaneContent::Terminal(pane),
         });
         if focus {
@@ -5406,8 +5424,10 @@ impl ShelluneView {
             }
         })
         .detach();
+        let pane_focus = pane.read(cx).focus_handle().clone();
         self.panes.push(OpenPane {
             tag,
+            focus: pane_focus,
             content: PaneContent::Desktop(pane.clone()),
         });
         // `pane.start` runs before this observer is registered, so any failure or stage
@@ -6120,6 +6140,7 @@ impl ShelluneView {
                         .map(|pane| pane.read(cx).focus_handle().clone())
                 });
             if let Some(handle) = handle {
+                self.focus_return = Some(handle.downgrade());
                 window.focus(&handle);
             } else if self.showing_connection_form && self.form_session == Some(id) {
                 self.focus_remote_form_in(window, cx);
@@ -9126,14 +9147,17 @@ impl ShelluneView {
         self.open_import_at(path.to_owned(), cx);
     }
 
+    #[cfg(test)]
+    pub fn import_open_for_test(&self) -> bool {
+        self.import.is_open()
+    }
+
     fn open_import_at(&mut self, path: String, cx: &mut Context<Self>) {
         if !self.import.is_open() {
             self.remember_tool_focus_pending = true;
         }
+        self.close_editors_for_replacement(cx);
         self.import.open(path);
-        self.hosts.close_editor();
-        self.host_fields = None;
-        self.jump_picker = None;
         self.hosts.clear_message();
         let placeholder = self.strings().import_path_placeholder;
         let text = self.import.path().to_owned();
@@ -9655,18 +9679,20 @@ impl ShelluneView {
 
     /// Focuses the first interactive credential input on the open connection form, or
     /// the current destination container when no credential field is asking for text.
-    pub(super) fn focus_remote_form_in(&self, window: &mut Window, cx: &gpui::App) {
+    pub(super) fn focus_remote_form_in(&mut self, window: &mut Window, cx: &gpui::App) {
         if let Some(panel) = self.remote.as_ref()
             && matches!(panel.status(), RemoteStatus::Idle)
         {
             let method = panel.method();
             if method.takes_password() {
                 let handle = self.remote_fields.password.read(cx).focus_handle().clone();
+                self.focus_return = Some(handle.downgrade());
                 window.focus(&handle);
                 return;
             }
             if method.needs_key_path() && panel.key_path().trim().is_empty() {
                 let handle = self.remote_fields.key_path.read(cx).focus_handle().clone();
+                self.focus_return = Some(handle.downgrade());
                 window.focus(&handle);
                 return;
             }
@@ -9677,10 +9703,12 @@ impl ShelluneView {
                     .read(cx)
                     .focus_handle()
                     .clone();
+                self.focus_return = Some(handle.downgrade());
                 window.focus(&handle);
                 return;
             }
         }
+        self.focus_return = None;
         let handle = self.destination_focus(self.workspace.destination()).clone();
         window.focus(&handle);
     }
@@ -9906,6 +9934,9 @@ impl ShelluneView {
     /// Opens the quick-connection form on the workspace the user is already in.
     fn open_quick_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.security_reset_reveal();
+        if !self.quick_open {
+            self.remember_focus(window, cx);
+        }
         self.quick_open = true;
         self.quick_error = None;
         self.shell_menu_open = false;
@@ -14224,7 +14255,201 @@ impl ShelluneView {
                 .launcher_field
                 .as_ref()
                 .is_some_and(|field| field.read(cx).focus_handle() == handle)
+            || self
+                .batch
+                .steps()
+                .iter()
+                .any(|field| field.read(cx).focus_handle() == handle)
+            || self
+                .batch
+                .concurrency()
+                .is_some_and(|field| field.read(cx).focus_handle() == handle)
+            || self
+                .batch
+                .name()
+                .is_some_and(|field| field.read(cx).focus_handle() == handle)
+            || self
+                .retired_overlay_focus
+                .iter()
+                .any(|weak| weak.upgrade().as_ref() == Some(handle))
             || self.security_dialog_owns_focus(handle, cx)
+    }
+
+    /// Whether a modal dialog or tool overlay currently isolates keyboard input over the page.
+    pub(super) fn has_blocking_modal(&self, cx: &gpui::App) -> bool {
+        self.tool.is_some()
+            || self.batch.view().is_open()
+            || self.import.is_open()
+            || self.quick_open
+            || (self.showing_connection_form
+                && self.remote.is_some()
+                && !self.connection_inline()
+                && !self.connection_behind_screen())
+            || self.custom_shell_open
+            || self.tab_rename.is_some()
+            || self.tab_list_open
+            || self.host_fields.is_some()
+            || self.protocol_fields.is_some()
+            || self.hosts.group_editor().is_some()
+            || (self.home_shown()
+                && (self.hosts.pending_delete().is_some() || self.hosts.is_asking_batch_delete()))
+            || self.backup.is_some()
+            || self.security_dialog_open()
+            || self.sync_dialog_open()
+            || self.update_confirm_open()
+            || self.paste_prompt_open(cx)
+            || self.question_open()
+    }
+
+    /// Marks `handle` as a retired overlay input so modal replacement never mistakes it for page focus.
+    pub(super) fn retire_focus_handle(&mut self, handle: &FocusHandle) {
+        self.retired_overlay_focus
+            .retain(|weak| weak.upgrade().is_some());
+        if !self
+            .retired_overlay_focus
+            .iter()
+            .any(|weak| weak.upgrade().as_ref() == Some(handle))
+        {
+            self.retired_overlay_focus.push(handle.downgrade());
+        }
+    }
+
+    /// Retires any live text-field handles owned by the batch center before closing it.
+    pub(super) fn retire_batch_focus(&mut self, cx: &gpui::App) {
+        self.retired_overlay_focus
+            .retain(|weak| weak.upgrade().is_some());
+        for field in self.batch.steps() {
+            self.retired_overlay_focus
+                .push(field.read(cx).focus_handle().downgrade());
+        }
+        if let Some(field) = self.batch.concurrency() {
+            self.retired_overlay_focus
+                .push(field.read(cx).focus_handle().downgrade());
+        }
+        if let Some(field) = self.batch.name() {
+            self.retired_overlay_focus
+                .push(field.read(cx).focus_handle().downgrade());
+        }
+    }
+
+    /// Closes open host/connection editors without queuing focus restoration when another modal replaces them.
+    pub(super) fn close_editors_for_replacement(&mut self, cx: &gpui::App) {
+        self.retired_overlay_focus
+            .retain(|weak| weak.upgrade().is_some());
+        if let Some(fields) = self.host_fields.as_ref() {
+            for field in [
+                &fields.name,
+                &fields.address,
+                &fields.port,
+                &fields.user,
+                &fields.group,
+                &fields.identity,
+                &fields.secret,
+                &fields.startup,
+                &fields.proxy,
+            ] {
+                self.retired_overlay_focus
+                    .push(field.read(cx).focus_handle().downgrade());
+            }
+        }
+        if let Some(fields) = self.host_connection_fields.as_ref() {
+            for field in [&fields.interval, &fields.misses, &fields.timeout] {
+                self.retired_overlay_focus
+                    .push(field.read(cx).focus_handle().downgrade());
+            }
+        }
+        if let Some(fields) = self.protocol_fields.as_ref() {
+            for field in [
+                &fields.name,
+                &fields.group,
+                &fields.address,
+                &fields.port,
+                &fields.user,
+                &fields.domain,
+                &fields.secret,
+                &fields.drive_folder,
+                &fields.device,
+                &fields.baud,
+                &fields.data_bits,
+            ] {
+                self.retired_overlay_focus
+                    .push(field.read(cx).focus_handle().downgrade());
+            }
+        }
+        self.hosts.close_editor();
+        self.hosts.close_connection_editor();
+        self.jump_picker = None;
+        self.host_fields = None;
+        self.host_connection_fields = None;
+        self.protocol_fields = None;
+        self.last_invalid_host_field = None;
+        self.invalid_host_fields.clear();
+        self.last_invalid_protocol_field = None;
+        self.invalid_protocol_fields.clear();
+        self.modal_focus_captured = false;
+    }
+
+    /// Closes open import dialog without queuing focus restoration when another modal replaces it.
+    pub(super) fn close_import_for_replacement(&mut self, cx: &gpui::App) {
+        if !self.import.is_open() {
+            return;
+        }
+        self.retired_overlay_focus
+            .retain(|weak| weak.upgrade().is_some());
+        if let Some(field) = self.import_path.as_ref() {
+            self.retired_overlay_focus
+                .push(field.read(cx).focus_handle().downgrade());
+        }
+        if let Some(field) = self.import_search.as_ref() {
+            self.retired_overlay_focus
+                .push(field.read(cx).focus_handle().downgrade());
+        }
+        self.import.close();
+        self.import_path = None;
+        self.import_search = None;
+        self.modal_focus_captured = false;
+    }
+
+    /// Closes open floating tools/batch/import before switching to another modal or destination,
+    /// preserving [`Self::focus_return`] for the replacement surface.
+    pub(super) fn close_tools_for_modal(&mut self, cx: &gpui::App) {
+        if self.tool.is_some() {
+            self.tool = None;
+            self.forwards.close_editor();
+            self.pending_exposure = None;
+            self.forward_confirm = None;
+            self.snippet_panel.keep();
+            self.snippet_panel.end_edit();
+        }
+        if self.batch.view().is_open() {
+            self.retire_batch_focus(cx);
+            let _ = self.batch.close() || self.batch.hide();
+        }
+        self.close_import_for_replacement(cx);
+        self.batch_was_open = self.batch.view().is_open();
+        self.remember_tool_focus_pending = false;
+    }
+
+    /// Captures outer page focus and isolates keyboard focus onto `root_focus` for newly opened tools.
+    pub(super) fn settle_pending_tool_focus(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if std::mem::take(&mut self.remember_tool_focus_pending) {
+            self.remember_focus(window, cx);
+            self.batch_was_open = self.batch.view().is_open();
+            if self.snippet_focus_pending.is_none()
+                && (matches!(
+                    self.tool,
+                    Some(shell::Tool::Transfers | shell::Tool::Forwards)
+                ) || self.batch.view().is_open()
+                    || self.import.is_open())
+            {
+                let root = self.root_focus.clone();
+                window.focus(&root);
+            }
+        }
     }
 
     /// Remembers a field or terminal while one has the keyboard.
@@ -22174,18 +22399,14 @@ impl Render for ShelluneView {
                 window.focus(&handle);
             }
         }
-        if std::mem::take(&mut self.remember_tool_focus_pending) {
-            self.remember_focus(window, cx);
-            if self.snippet_focus_pending.is_none()
-                && (matches!(
-                    self.tool,
-                    Some(shell::Tool::Transfers | shell::Tool::Forwards)
-                ) || self.batch.view().is_open())
-            {
-                let root = self.root_focus.clone();
-                window.focus(&root);
-            }
+        self.retired_overlay_focus
+            .retain(|weak| weak.upgrade().is_some());
+        let batch_open = self.batch.view().is_open();
+        if batch_open && !self.batch_was_open && self.palette.is_none() {
+            self.remember_tool_focus_pending = true;
         }
+        self.batch_was_open = batch_open;
+        self.settle_pending_tool_focus(window, cx);
         // A command editor that was just opened takes the keyboard in its first field, so
         // the dialog can be written without touching the pointer.
         if let Some(handle) = self.snippet_focus_pending.take()
@@ -22342,7 +22563,7 @@ impl Render for ShelluneView {
                 // move the mark and Enter opens the row, so a saved task or a stored run
                 // is reached without a mouse (R4). Every other key, and every key while
                 // the editor is open, keeps its way to the field or the program.
-                if this.batch_key(event, window, cx) {
+                if !this.palette_open() && this.batch_key(event, window, cx) {
                     cx.stop_propagation();
                     return;
                 }

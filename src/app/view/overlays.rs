@@ -192,6 +192,7 @@ impl ShelluneView {
         self.session_menu = None;
         self.session_more = None;
         self.files_menu = None;
+        self.settle_pending_tool_focus(window, cx);
         // The field is made per opening so its placeholder is in the current language
         // and no earlier search is waiting in it.
         let placeholder = self.strings().palette_placeholder;
@@ -214,18 +215,32 @@ impl ShelluneView {
         })
         .detach();
         let current = window.focused(cx);
+        let modal_open = self.has_blocking_modal(cx);
         self.palette_focus_return = current
             .as_ref()
-            .filter(|handle| !self.is_page_focus(handle))
+            .filter(|handle| {
+                !self.is_page_focus(handle)
+                    && (!modal_open || self.session_of_work_focus(handle).is_none())
+            })
             .map(|handle| handle.downgrade())
             .or_else(|| {
-                self.focus_return
-                    .as_ref()
-                    .and_then(|handle| handle.upgrade())
-                    .filter(|handle| !self.is_page_focus(handle))
-                    .map(|handle| handle.downgrade())
+                (!modal_open)
+                    .then(|| {
+                        self.focus_return
+                            .as_ref()
+                            .and_then(|handle| handle.upgrade())
+                            .filter(|handle| !self.is_page_focus(handle))
+                            .map(|handle| handle.downgrade())
+                    })
+                    .flatten()
             })
-            .or_else(|| current.map(|handle| handle.downgrade()));
+            .or_else(|| {
+                if modal_open {
+                    Some(self.root_focus.downgrade())
+                } else {
+                    current.map(|handle| handle.downgrade())
+                }
+            });
         window.focus(field.read(cx).focus_handle());
         self.palette = Some(field);
         self.palette_query.clear();
@@ -239,12 +254,19 @@ impl ShelluneView {
             return;
         }
         self.palette_query.clear();
+        let modal_open = self.has_blocking_modal(cx);
         if let Some(handle) = self
             .palette_focus_return
             .take()
             .and_then(|handle| handle.upgrade())
         {
-            window.focus(&handle);
+            if modal_open && self.session_of_work_focus(&handle).is_some() {
+                window.focus(&self.root_focus.clone());
+            } else {
+                window.focus(&handle);
+            }
+        } else if modal_open {
+            window.focus(&self.root_focus.clone());
         } else {
             self.restore_focus(window, cx);
         }
@@ -288,8 +310,13 @@ impl ShelluneView {
     /// Returns the keyboard to the element that opened the overlay, or to the page.
     pub(super) fn restore_overlay_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(handle) = self.focus_return.take().and_then(|handle| handle.upgrade()) {
-            window.focus(&handle);
-            return;
+            let stale_work_surface = self.session_of_work_focus(&handle).is_some_and(|session| {
+                !self.shows_terminal(self.workspace.destination()) || self.active != Some(session)
+            });
+            if !stale_work_surface {
+                window.focus(&handle);
+                return;
+            }
         }
         self.restore_focus(window, cx);
     }
@@ -855,13 +882,28 @@ impl ShelluneView {
 
     /// Closes the palette and does what the entry says.
     fn run_palette(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(handle) = self
+            .palette_focus_return
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+            && self.is_overlay_internal_focus(&handle, cx)
+        {
+            self.retire_focus_handle(&handle);
+        }
         // Closing first lets the action decide where the keyboard goes next: a new
         // shell takes it, a page takes it, a form takes it.
         self.close_palette(window, cx);
         match command {
-            Command::Switch(id) => self.activate_in(id, window, cx),
-            Command::Shell(index) => self.launch_choice(index, window, cx),
+            Command::Switch(id) => {
+                self.close_tools_for_modal(cx);
+                self.activate_in(id, window, cx);
+            }
+            Command::Shell(index) => {
+                self.close_tools_for_modal(cx);
+                self.launch_choice(index, window, cx);
+            }
             Command::Connect(host) => {
+                self.close_tools_for_modal(cx);
                 self.security_reset_reveal();
                 if let Some(host) = self.book.host(host).cloned() {
                     // The connection belongs to the workspace. The hosts page is the
@@ -882,17 +924,23 @@ impl ShelluneView {
                 if destination == Destination::Forwards {
                     self.open_global_forwards(window, cx);
                 } else {
+                    if destination != Destination::Transfers {
+                        self.close_tools_for_modal(cx);
+                    }
                     self.select(destination, window, cx);
                 }
             }
             Command::OpenVault => {
+                self.close_tools_for_modal(cx);
                 self.select(Destination::Hosts, window, cx);
                 self.show_home_section(crate::app::hosts::HomeSection::Vault, cx);
             }
             Command::OpenHostTrust => {
+                self.close_tools_for_modal(cx);
                 self.open_host_trust_settings(window, cx);
             }
             Command::NewVaultCredential => {
+                self.close_tools_for_modal(cx);
                 self.select(Destination::Hosts, window, cx);
                 self.show_home_section(crate::app::hosts::HomeSection::Vault, cx);
                 self.security_open_palette_action(
@@ -901,11 +949,13 @@ impl ShelluneView {
                 );
             }
             Command::GenerateSshKey => {
+                self.close_tools_for_modal(cx);
                 self.select(Destination::Hosts, window, cx);
                 self.show_home_section(crate::app::hosts::HomeSection::Vault, cx);
                 self.security_open_palette_action(super::security::SecurityAction::Generate, cx);
             }
             Command::ImportSshKey => {
+                self.close_tools_for_modal(cx);
                 self.select(Destination::Hosts, window, cx);
                 self.show_home_section(crate::app::hosts::HomeSection::Vault, cx);
                 self.security_open_palette_action(super::security::SecurityAction::Import, cx);
@@ -915,14 +965,20 @@ impl ShelluneView {
                 self.security_begin(Vec::new(), cx);
             }
             Command::NewHost => {
+                self.close_tools_for_modal(cx);
                 self.select(Destination::Hosts, window, cx);
                 self.open_create_host(cx);
             }
             Command::ImportSshConfig => {
+                self.close_tools_for_modal(cx);
                 self.select(Destination::Hosts, window, cx);
                 self.open_import(cx);
             }
-            Command::QuickConnect => self.open_quick_connect(window, cx),
+            Command::QuickConnect => {
+                self.close_tools_for_modal(cx);
+                self.close_editors_for_replacement(cx);
+                self.open_quick_connect(window, cx);
+            }
             Command::InsertSnippet(id) => self.use_snippet(id, false, cx),
             Command::RunSnippet(id) => self.use_snippet(id, true, cx),
             Command::ManageSnippets => self.open_snippets(false, cx),
@@ -1315,6 +1371,8 @@ impl ShelluneView {
             self.snippet_panel.keep();
             self.snippet_panel.end_edit();
         }
+        self.close_import_for_replacement(cx);
+        self.close_editors_for_replacement(cx);
         self.remember_tool_focus_pending = true;
         if self.batch.show_active_run() {
             cx.notify();
@@ -2352,7 +2410,7 @@ impl ShelluneView {
     }
 
     /// Opens the all-tabs list, or closes it when it is open.
-    pub(super) fn toggle_tab_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_tab_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tab_list_open {
             self.close_tab_list(window, cx);
             return;

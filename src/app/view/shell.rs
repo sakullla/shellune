@@ -1694,6 +1694,7 @@ impl ShelluneView {
                 |this, cx| {
                     this.quick_open = false;
                     this.quick_error = None;
+                    this.restore_focus_pending = true;
                     cx.notify();
                 },
             );
@@ -2199,8 +2200,11 @@ impl ShelluneView {
     /// Opens a tool over the current page.
     pub(super) fn open_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
         if self.batch.view().is_open() {
+            self.retire_batch_focus(cx);
             let _ = self.batch.close() || self.batch.hide();
         }
+        self.close_import_for_replacement(cx);
+        self.close_editors_for_replacement(cx);
         if self.tool != Some(Tool::Snippets) || tool != Tool::Snippets {
             self.snippet_panel.keep();
             self.snippet_panel.end_edit();
