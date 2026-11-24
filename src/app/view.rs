@@ -96,7 +96,7 @@ pub(crate) mod batch;
 mod desktop;
 mod files_menu;
 mod forwarding;
-mod home;
+pub(crate) mod home;
 mod host_dialog;
 mod overlays;
 mod panes;
@@ -405,6 +405,9 @@ pub const FILES_PANEL_WIDTH: f32 = 340.0;
 /// minimum: below this the files take the terminal's place instead of squeezing both.
 pub const DOCK_MIN_WIDTH: f32 = (FILES_PANEL_WIDTH * 2.0 + 120.0) * 2.0 + 40.0;
 
+/// Vertical offset below the header when opening a row's context menu via keyboard.
+const KEYBOARD_HOST_MENU_TOP: f32 = 140.0;
+
 /// The widest one breadcrumb of a long path is drawn.
 ///
 /// A folder name is data, not a label: it can be longer than the column. Bounding one
@@ -587,6 +590,15 @@ pub struct ShelluneView {
     /// dials, and the connection is started after the form closes: this is where the
     /// typed value waits for that one start, and a start takes it away.
     desktop_secrets: std::collections::HashMap<HostId, shellune_core::SecretString>,
+    /// One-shot in-memory SSH password/passphrase typed when "Save & Connect" is pressed
+    /// with "Remember password" unticked: consumed once on dial and never written to disk.
+    ephemeral_ssh_secrets: std::collections::HashMap<HostId, shellune_core::SecretString>,
+    /// Saved SSH host whose next successful connection should immediately open the SFTP file view.
+    pending_open_files: Option<HostId>,
+    /// Field highlighted by the last SSH host form validation refusal, cleared on edit.
+    last_invalid_host_field: Option<Result<HostField, ConnectionField>>,
+    /// Field highlighted by the last non-SSH connection form validation refusal, cleared on edit.
+    last_invalid_protocol_field: Option<ConnectionFormField>,
     /// How many desktop attempts the window started, for the tests that prove one
     /// press opens one connection.
     #[cfg(test)]
@@ -2983,6 +2995,10 @@ impl ShelluneView {
             host_connection_fields: None,
             protocol_fields: None,
             desktop_secrets: std::collections::HashMap::new(),
+            ephemeral_ssh_secrets: std::collections::HashMap::new(),
+            pending_open_files: None,
+            last_invalid_host_field: None,
+            last_invalid_protocol_field: None,
             #[cfg(test)]
             desktop_starts: 0,
             theme_choice: theme::ThemeChoice::default(),
@@ -3735,6 +3751,31 @@ impl ShelluneView {
         true
     }
 
+    /// Moves keyboard focus from `hosts.search` to the host list, placing the cursor on
+    /// the first visible record when none is chosen yet.
+    pub(super) fn focus_hosts_list_from_search(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.hosts_keys_blocked() {
+            return false;
+        }
+        let rows = self.connectable_host_rows();
+        if self.active_hosts_cursor().is_none()
+            && let Some(&(row_index, first_id)) = rows.first()
+        {
+            self.hosts_cursor = Some(first_id);
+            self.hosts_scroll
+                .scroll_to_item(row_index, gpui::ScrollStrategy::Top);
+        }
+        let handle = self.destination_focus(Destination::Hosts).clone();
+        self.focus_return = None;
+        window.focus(&handle);
+        cx.notify();
+        true
+    }
+
     /// Handles Up/Down/Enter navigation on the Hosts page when no modal or menu is open.
     fn hosts_key(
         &mut self,
@@ -3747,6 +3788,8 @@ impl ShelluneView {
         // Windows and Linux, Cmd on macOS. Every other combination is left to the
         // field or the action it is bound to.
         let secondary = modifiers.number_of_modifiers() == 1 && modifiers.secondary();
+        let alt_only = modifiers.alt && modifiers.number_of_modifiers() == 1;
+        let shift_only = modifiers.shift && modifiers.number_of_modifiers() == 1;
         if !self.home_shown() || self.hosts_keys_blocked() {
             return false;
         }
@@ -3761,10 +3804,13 @@ impl ShelluneView {
         }
         // Shift+Tab from the search or the list goes to the sidebar's groups, where F2
         // and Delete rename and delete one (ADR-3).
-        if event.keystroke.key == "tab" && modifiers.shift && modifiers.number_of_modifiers() == 1 {
+        if event.keystroke.key == "tab" && shift_only {
             return self.focus_sidebar_groups(window, cx);
         }
-        if modifiers.number_of_modifiers() != 0 && !secondary {
+        if event.keystroke.key == "tab" && modifiers.number_of_modifiers() == 0 && search_focused {
+            return self.focus_hosts_list_from_search(window, cx);
+        }
+        if modifiers.number_of_modifiers() != 0 && !secondary && !alt_only && !shift_only {
             return false;
         }
         self.hosts_page_key(event, secondary, page_focused, window, cx)
@@ -3851,10 +3897,60 @@ impl ShelluneView {
                     self.open_create_host(cx);
                     true
                 }
+                "c" if page_focused => {
+                    if let Some(id) = self.active_hosts_cursor()
+                        && let Some(record) = self.book.connection(id)
+                    {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(record.target()));
+                        window.dispatch_action(Box::new(crate::app::actions::ShowCopied), cx);
+                        true
+                    } else {
+                        false
+                    }
+                }
                 _ => false,
             };
         }
-        match event.keystroke.key.as_str() {
+        let modifiers = &event.keystroke.modifiers;
+        let alt_only = modifiers.alt && modifiers.number_of_modifiers() == 1;
+        let shift_only = modifiers.shift && modifiers.number_of_modifiers() == 1;
+        let bare = modifiers.number_of_modifiers() == 0;
+        if alt_only {
+            if event.keystroke.key.eq_ignore_ascii_case("f")
+                && let Some(id) = self.active_hosts_cursor()
+            {
+                self.toggle_favorite(id, cx);
+                return true;
+            }
+            return false;
+        }
+        if shift_only {
+            if event.keystroke.key.eq_ignore_ascii_case("f10")
+                && let Some(id) = self.active_hosts_cursor()
+            {
+                let metrics = self.metrics();
+                let pos = gpui::point(
+                    (self.viewport_width
+                        - metrics.scale(overlays::HOST_MENU_WIDTH + spacing::WIDE))
+                    .max(metrics.scale(spacing::WIDE)),
+                    metrics.header_height() + metrics.scale(KEYBOARD_HOST_MENU_TOP),
+                );
+                self.open_host_menu_at(id, pos, window, cx);
+                return true;
+            }
+            if page_focused
+                && (event.keystroke.key == "*" || event.keystroke.key_char.as_deref() == Some("*"))
+                && let Some(id) = self.active_hosts_cursor()
+            {
+                self.toggle_favorite(id, cx);
+                return true;
+            }
+            return false;
+        }
+        if !bare {
+            return false;
+        }
+        match event.keystroke.key.to_ascii_lowercase().as_str() {
             "down" => self.step_hosts_cursor(1, cx),
             "up" => self.step_hosts_cursor(-1, cx),
             // "/" types itself into the search; from the page it goes there first.
@@ -3894,6 +3990,29 @@ impl ShelluneView {
             "delete" | "backspace" if page_focused => {
                 if let Some(id) = self.active_hosts_cursor() {
                     self.ask_delete_host(id, cx);
+                    true
+                } else {
+                    false
+                }
+            }
+            "*" if page_focused => {
+                if let Some(id) = self.active_hosts_cursor() {
+                    self.toggle_favorite(id, cx);
+                    true
+                } else {
+                    false
+                }
+            }
+            "contextmenu" | "apps" | "menu" if page_focused => {
+                if let Some(id) = self.active_hosts_cursor() {
+                    let metrics = self.metrics();
+                    let pos = gpui::point(
+                        (self.viewport_width
+                            - metrics.scale(overlays::HOST_MENU_WIDTH + spacing::WIDE))
+                        .max(metrics.scale(spacing::WIDE)),
+                        metrics.header_height() + metrics.scale(KEYBOARD_HOST_MENU_TOP),
+                    );
+                    self.open_host_menu_at(id, pos, window, cx);
                     true
                 } else {
                     false
@@ -3996,6 +4115,49 @@ impl ShelluneView {
         self.show_forwards_scope(crate::app::forwarding::ForwardScope::Host(id), cx);
     }
 
+    /// Connects to a saved SSH host (or activates its live session) and opens its SFTP file view.
+    pub(super) fn open_saved_files(
+        &mut self,
+        id: HostId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session_id) = self
+            .workspace
+            .sessions()
+            .items()
+            .iter()
+            .find_map(|session| {
+                matches!(session.kind(), SessionKind::Remote { host } if *host == id)
+                    .then(|| session.id())
+                    .filter(|sid| {
+                        matches!(session.state(), SessionState::Connected)
+                            && self.files.can_browse(*sid)
+                    })
+            })
+        {
+            self.activate_in(session_id, window, cx);
+            if !self.files.is_open(session_id) {
+                self.toggle_files(session_id, cx);
+            }
+            return;
+        }
+        let Some(host) = self.book.host(id).cloned() else {
+            return;
+        };
+        if !matches!(
+            self.workspace.destination(),
+            Destination::LocalShells | Destination::Sessions | Destination::Hosts
+        ) {
+            self.select(Destination::LocalShells, window, cx);
+        }
+        self.forward_only_dial = false;
+        self.pending_forward_rules.clear();
+        self.park_focused_form();
+        self.pending_open_files = Some(id);
+        self.open_remote_after_park(&host, cx);
+    }
+
     /// Opens the editor filled with a saved host, by identifier.
     pub(super) fn edit_saved_host(&mut self, id: HostId, cx: &mut Context<Self>) {
         let Some(host) = self.book.host(id).cloned() else {
@@ -4028,7 +4190,21 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) {
         let ux = copy::ux();
+        let initial_destination = match &action {
+            GroupAction::MoveSingle(id) => self
+                .book
+                .connection(*id)
+                .and_then(|record| record.group_path())
+                .map(|path| path.to_canonical())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
         self.hosts.open_group_dialog(action);
+        if !initial_destination.is_empty()
+            && let Some(editor) = self.hosts.group_editor_mut()
+        {
+            editor.set_destination(initial_destination.clone());
+        }
         self.group_problem = None;
         let start = self
             .hosts
@@ -4036,7 +4212,9 @@ impl ShelluneView {
             .map(|editor| editor.name().to_owned())
             .unwrap_or_default();
         let name = cx.new(|cx| TextField::with_text(ux.hosts_group_name_label, start, cx));
-        let destination = cx.new(|cx| TextField::new(ux.hosts_group_destination_hint, cx));
+        let destination = cx.new(|cx| {
+            TextField::with_text(ux.hosts_group_destination_hint, initial_destination, cx)
+        });
 
         // Every keystroke reaches the editor, so what the dialog shows and what a
         // confirmation would save are the same text. The observer is the view's own, so
@@ -4085,7 +4263,10 @@ impl ShelluneView {
                 };
                 // A move or a deleted group asks only where to; the others only a name.
                 let choosing = view.read(app).hosts.group_editor().is_some_and(|editor| {
-                    matches!(editor.action(), GroupAction::Delete(_) | GroupAction::Move)
+                    matches!(
+                        editor.action(),
+                        GroupAction::Delete(_) | GroupAction::Move | GroupAction::MoveSingle(_)
+                    )
                 });
                 if choosing {
                     vec![tab_destination.clone()]
@@ -4101,7 +4282,10 @@ impl ShelluneView {
         // The keyboard starts in the one field the dialog shows: a rename keeps its
         // name field, a move or a deleted group starts in the destination search.
         let focus_destination = self.hosts.group_editor().is_some_and(|editor| {
-            matches!(editor.action(), GroupAction::Delete(_) | GroupAction::Move)
+            matches!(
+                editor.action(),
+                GroupAction::Delete(_) | GroupAction::Move | GroupAction::MoveSingle(_)
+            )
         });
         if focus_destination {
             let handle = destination.read(cx).focus_handle().clone();
@@ -4165,19 +4349,21 @@ impl ShelluneView {
         // scratch copy and written with the other held edits afterwards.
         let writer = self.group_writer();
         let outcome = match &action {
-            GroupAction::Create => group_path_from_text(editor.name())
-                .and_then(|path| path.ok_or_else(|| ux.hosts_group_name_required.to_owned()))
-                .and_then(|path| {
-                    writer
-                        .service
-                        .create_group(&self.groups, &path)
-                        .map(|groups| GroupOutcome {
-                            hosts: None,
-                            groups,
-                            message: ux.hosts_group_created.to_owned(),
-                        })
-                        .map_err(|error| error.to_string())
-                }),
+            GroupAction::Create | GroupAction::CreateUnder(_) => {
+                group_path_from_text(editor.name())
+                    .and_then(|path| path.ok_or_else(|| ux.hosts_group_name_required.to_owned()))
+                    .and_then(|path| {
+                        writer
+                            .service
+                            .create_group(&self.groups, &path)
+                            .map(|groups| GroupOutcome {
+                                hosts: None,
+                                groups,
+                                message: ux.hosts_group_created.to_owned(),
+                            })
+                            .map_err(|error| error.to_string())
+                    })
+            }
             GroupAction::Rename(from) => group_path_from_text(editor.name())
                 .and_then(|path| path.ok_or_else(|| ux.hosts_group_name_required.to_owned()))
                 .and_then(|to| {
@@ -4215,6 +4401,22 @@ impl ShelluneView {
                             .map_err(|error| error.to_string())
                     })
                 }
+            }
+            GroupAction::MoveSingle(id) => {
+                group_path_from_text(editor.destination()).and_then(|destination| {
+                    writer
+                        .service
+                        .move_hosts(&self.book, &self.groups, &[*id], destination.as_ref())
+                        .map(|update| GroupOutcome {
+                            message: copy::fill(
+                                ux.hosts_moved,
+                                &[("count", &update.hosts_changed.to_string())],
+                            ),
+                            hosts: Some(update.hosts),
+                            groups: update.groups,
+                        })
+                        .map_err(|error| error.to_string())
+                })
             }
             GroupAction::Delete(path) => {
                 group_path_from_text(editor.destination()).and_then(|destination| {
@@ -5113,11 +5315,25 @@ impl ShelluneView {
                         // session reached the desktop (R17).
                         self.workspace.session_verified_and_authenticated(session);
                     }
-                    if matches!(phase, desktop::DesktopPhase::Live) {
+                    if matches!(phase, desktop::DesktopPhase::Live)
+                        && self.workspace.session_connected(session)
+                    {
                         // Only a picture makes a desktop session live: a server
                         // that accepted the session and drew nothing is still
                         // building it, and the record says so.
-                        self.workspace.session_connected(session);
+                        if let Some(host) =
+                            self.workspace
+                                .session(session)
+                                .and_then(|s| match s.kind() {
+                                    SessionKind::Rdp { host } | SessionKind::Vnc { host } => {
+                                        Some(*host)
+                                    }
+                                    _ => None,
+                                })
+                            && self.book.contains_connection(host)
+                        {
+                            self.record_host_connection(host, remote::now_unix(), cx);
+                        }
                     }
                 }
             }
@@ -5375,7 +5591,18 @@ impl ShelluneView {
                 if let Some(failure) = pane.read(cx).state().failure() {
                     view.workspace.session_failed(session, failure);
                 } else {
-                    view.workspace.session_connected(session);
+                    if view.workspace.session_connected(session)
+                        && let Some(host) =
+                            view.workspace
+                                .session(session)
+                                .and_then(|s| match s.kind() {
+                                    SessionKind::Serial { host } => Some(*host),
+                                    _ => None,
+                                })
+                        && view.book.contains_connection(host)
+                    {
+                        view.record_host_connection(host, remote::now_unix(), cx);
+                    }
                     view.workspace.clear_session_failure();
                 }
                 let focus = view.terminal_start_focused(session);
@@ -5450,7 +5677,11 @@ impl ShelluneView {
                 link, &device, &settings, local_echo, tag, grid, font_size, locale, pane_cx,
             )
         });
-        self.workspace.session_connected(session.id());
+        if self.workspace.session_connected(session.id())
+            && self.book.contains_connection(record.id())
+        {
+            self.record_host_connection(record.id(), remote::now_unix(), cx);
+        }
         self.workspace.clear_session_failure();
         self.push_pane(tag, pane, cx);
         session.id()
@@ -7096,7 +7327,18 @@ impl ShelluneView {
         // A phrase that reads as `user@host[:port]` is an address first: the list's top
         // row says "connect to …", and Enter dials it unless the arrows chose a row.
         let view = cx.entity().downgrade();
+        let tab_view = cx.entity().downgrade();
         search.update(cx, |field, _cx| {
+            field.on_tab(move |shift, window, app| {
+                if shift {
+                    return false;
+                }
+                tab_view
+                    .update(app, |view, cx| {
+                        view.focus_hosts_list_from_search(window, cx)
+                    })
+                    .unwrap_or(false)
+            });
             field.on_submit(move |_text, window, app| {
                 view.update(app, |view, cx| {
                     if let Some(id) = view.active_hosts_cursor() {
@@ -7330,16 +7572,31 @@ impl ShelluneView {
             {
                 view.reopen_group_picker();
             }
+            let mut changed = false;
             if let Some(draft) = view.hosts.draft_mut() {
-                draft.set_text(field, text);
-                // `root@10.0.0.12:2222` pasted into the address is three fields at once.
-                split = field == HostField::Address && draft.split_address();
+                let previous = draft.text(field).to_owned();
+                changed = draft.set_text(field, text.clone());
+                let is_paste = (!previous.is_empty() && !text.starts_with(&previous))
+                    || text.chars().count() >= previous.chars().count() + 2;
+                // `root@10.0.0.12:2222` pasted into the address is three fields at once;
+                // character-by-character typing waits until Save so multi-digit ports finish typing.
+                split = changed && is_paste && field == HostField::Address && draft.split_address();
             }
             if split {
                 view.refill_host_fields(
                     &[HostField::Address, HostField::User, HostField::Port],
                     cx,
                 );
+            }
+            if changed {
+                text_field.update(cx, |f, cx| f.set_invalid(false, cx));
+                if split && let Some(fields) = view.host_fields.as_ref() {
+                    let user_field = fields.user.clone();
+                    let port_field = fields.port.clone();
+                    user_field.update(cx, |f, cx| f.set_invalid(false, cx));
+                    port_field.update(cx, |f, cx| f.set_invalid(false, cx));
+                }
+                view.clear_stale_host_validation(Ok(field), split, cx);
             }
             cx.notify();
         })
@@ -7460,6 +7717,11 @@ impl ShelluneView {
         if let Some(draft) = self.hosts.draft_mut()
             && draft.connection_mut().set_text(field, text)
         {
+            if let Some(conn_fields) = self.host_connection_fields.as_ref() {
+                let entity = conn_fields.get(field).clone();
+                entity.update(cx, |f, cx| f.set_invalid(false, cx));
+            }
+            self.clear_stale_host_validation(Err(field), false, cx);
             cx.notify();
         }
     }
@@ -7534,12 +7796,21 @@ impl ShelluneView {
     /// Opens an empty form for a new host, pre-filling the current group when one is active.
     fn open_create_host(&mut self, cx: &mut Context<Self>) {
         let initial_group = match self.hosts.section() {
-            crate::app::hosts::HomeSection::Group(path) => Some(path.to_canonical()),
+            crate::app::hosts::HomeSection::Group(path) => Some(path),
             _ => None,
         };
+        self.open_create_host_in_group(initial_group, cx);
+    }
+
+    /// Opens an empty form for a new host pre-assigned to `group`.
+    pub(super) fn open_create_host_in_group(
+        &mut self,
+        group: Option<GroupPath>,
+        cx: &mut Context<Self>,
+    ) {
         self.hosts.open_create();
-        if let (Some(group), Some(draft)) = (initial_group, self.hosts.draft_mut()) {
-            draft.set_text(HostField::Group, group);
+        if let (Some(group), Some(draft)) = (group, self.hosts.draft_mut()) {
+            draft.set_text(HostField::Group, group.to_canonical());
         }
         self.open_host_fields(cx);
     }
@@ -7552,6 +7823,8 @@ impl ShelluneView {
 
     fn open_host_fields(&mut self, cx: &mut Context<Self>) {
         self.jump_picker = None;
+        self.last_invalid_host_field = None;
+        self.last_invalid_protocol_field = None;
         // The other protocol's fields belong to a form that is no longer drawn; a
         // switch back to this one builds its fields afresh (R7).
         self.protocol_fields = None;
@@ -7787,6 +8060,8 @@ impl ShelluneView {
 
     /// Builds the fields of the open protocol form and keeps the draft in step.
     fn open_protocol_fields(&mut self, cx: &mut Context<Self>) {
+        self.last_invalid_host_field = None;
+        self.last_invalid_protocol_field = None;
         let Some(draft) = self.hosts.protocol_draft().cloned() else {
             self.protocol_fields = None;
             return;
@@ -7948,12 +8223,157 @@ impl ShelluneView {
             {
                 view.reopen_group_picker();
             }
+            let mut changed = false;
+            let mut split = false;
             if let Some(draft) = view.hosts.protocol_draft_mut() {
-                draft.set_text(field, text);
+                let previous = draft.text(field).to_owned();
+                changed = draft.set_text(field, text.clone());
+                let is_paste = (!previous.is_empty() && !text.starts_with(&previous))
+                    || text.chars().count() >= previous.chars().count() + 2;
+                split = changed
+                    && is_paste
+                    && field == ConnectionFormField::Address
+                    && draft.split_address();
+            }
+            if split {
+                view.refill_protocol_fields(
+                    &[
+                        ConnectionFormField::Address,
+                        ConnectionFormField::User,
+                        ConnectionFormField::Port,
+                    ],
+                    cx,
+                );
+            }
+            if changed {
+                text_field.update(cx, |f, cx| f.set_invalid(false, cx));
+                if split && let Some(fields) = view.protocol_fields.as_ref() {
+                    let user_field = fields.user.clone();
+                    let port_field = fields.port.clone();
+                    user_field.update(cx, |f, cx| f.set_invalid(false, cx));
+                    port_field.update(cx, |f, cx| f.set_invalid(false, cx));
+                }
+                view.clear_stale_protocol_validation(field, split);
             }
             cx.notify();
         })
         .detach();
+    }
+
+    /// Writes the protocol draft's text back into the named dialog fields after splitting.
+    fn refill_protocol_fields(&mut self, which: &[ConnectionFormField], cx: &mut Context<Self>) {
+        let (Some(fields), Some(draft)) =
+            (self.protocol_fields.as_ref(), self.hosts.protocol_draft())
+        else {
+            return;
+        };
+        let updates: Vec<(Entity<TextField>, String)> = which
+            .iter()
+            .filter_map(|field| {
+                fields
+                    .get(*field)
+                    .cloned()
+                    .map(|entity| (entity, draft.text(*field).to_owned()))
+            })
+            .collect();
+        for (entity, text) in updates {
+            entity.update(cx, |field, cx| {
+                if field.text() != text {
+                    field.set_text(text, cx);
+                }
+            });
+        }
+    }
+
+    /// Clears stale SSH form validation message once the edited field (or the whole form) was updated.
+    pub(super) fn clear_stale_host_validation(
+        &mut self,
+        edited: Result<HostField, ConnectionField>,
+        split_address: bool,
+        _cx: &mut Context<Self>,
+    ) {
+        if !self.hosts.message().is_some_and(|m| m.failed()) {
+            return;
+        }
+        let matches_last = self.last_invalid_host_field == Some(edited)
+            || (split_address
+                && matches!(
+                    self.last_invalid_host_field,
+                    Some(Ok(HostField::Address | HostField::User | HostField::Port))
+                ));
+        let now_valid = self.hosts.draft().is_some_and(|draft| {
+            let saved = draft.editing().and_then(|id| self.book.host(id));
+            draft.build(saved).is_ok()
+        });
+        if matches_last || now_valid {
+            self.last_invalid_host_field = None;
+            self.hosts.clear_message();
+        }
+    }
+
+    /// Clears SSH validation markers when a non-text choice (like auth method) resolves the error.
+    pub(super) fn clear_resolved_host_validation(&mut self, cx: &mut Context<Self>) {
+        if !self.hosts.message().is_some_and(|m| m.failed()) {
+            return;
+        }
+        let resolved = self.hosts.draft().is_some_and(|draft| {
+            let saved = draft.editing().and_then(|id| self.book.host(id));
+            let current = draft.first_problem(saved).map(|(which, _)| which);
+            current.is_none()
+                || (self.last_invalid_host_field.is_some()
+                    && current != self.last_invalid_host_field)
+        });
+        if resolved {
+            if let Some(fields) = self.host_fields.as_ref() {
+                for candidate in HostField::ALL {
+                    let entity = fields.get(candidate).clone();
+                    entity.update(cx, |f, cx| f.set_invalid(false, cx));
+                }
+            }
+            self.last_invalid_host_field = None;
+            self.hosts.clear_message();
+        }
+    }
+
+    /// Clears stale protocol form validation message when the offending field is edited.
+    fn clear_stale_protocol_validation(
+        &mut self,
+        edited: ConnectionFormField,
+        split_address: bool,
+    ) {
+        if !self.hosts.message().is_some_and(|m| m.failed()) {
+            return;
+        }
+        let matches_last = self.last_invalid_protocol_field == Some(edited)
+            || (split_address
+                && matches!(
+                    self.last_invalid_protocol_field,
+                    Some(
+                        ConnectionFormField::Address
+                            | ConnectionFormField::User
+                            | ConnectionFormField::Port
+                    )
+                ));
+        let now_valid = self
+            .hosts
+            .protocol_draft()
+            .is_some_and(|draft| draft.build().is_ok());
+        if matches_last || now_valid {
+            self.last_invalid_protocol_field = None;
+            self.hosts.clear_message();
+        }
+    }
+
+    /// Whether an SSH host form text field currently carries the invalid red outline, for tests.
+    #[cfg(test)]
+    pub fn host_field_invalid_for_test(&self, field: HostField) -> bool {
+        self.host_fields.is_some() && self.last_invalid_host_field == Some(Ok(field))
+    }
+
+    /// Whether a protocol form text field currently carries the invalid red outline, for tests.
+    #[cfg(test)]
+    pub fn protocol_field_invalid_for_test(&self, field: ConnectionFormField) -> bool {
+        self.protocol_fields.is_some() && self.last_invalid_protocol_field == Some(field)
     }
 
     /// Closes the protocol form without touching the saved records.
@@ -7969,6 +8389,20 @@ impl ShelluneView {
     /// The record is written before the list adopts it: a failed write leaves the saved
     /// connections exactly as they were and keeps the form open with the reason.
     fn save_connection(&mut self, cx: &mut Context<Self>) -> Option<HostId> {
+        if self
+            .hosts
+            .protocol_draft_mut()
+            .is_some_and(ProtocolDraft::split_address)
+        {
+            self.refill_protocol_fields(
+                &[
+                    ConnectionFormField::Address,
+                    ConnectionFormField::User,
+                    ConnectionFormField::Port,
+                ],
+                cx,
+            );
+        }
         let draft = self.hosts.protocol_draft().cloned()?;
         let edit = match draft.build() {
             Ok(edit) => edit,
@@ -7976,6 +8410,7 @@ impl ShelluneView {
                 // The reason names the field it came from, so the form can show it there
                 // and the banner says which field to change.
                 let bad_field = problem.field();
+                self.last_invalid_protocol_field = Some(bad_field);
                 if let Some(fields) = self.protocol_fields.as_ref() {
                     for candidate in draft.fields() {
                         if let Some(entity) = fields.get(*candidate).cloned() {
@@ -8023,6 +8458,23 @@ impl ShelluneView {
     /// Returns the id of the host that was saved, or `None` when the dialog stays open
     /// with the reason it was refused.
     fn save_host(&mut self, cx: &mut Context<Self>) -> Option<HostId> {
+        self.save_host_internal(false, cx)
+    }
+
+    /// Validates and saves the SSH host, keeping an unremembered typed secret in memory
+    /// exclusively for the immediately following connection ("Save & Connect").
+    pub(super) fn save_host_for_connect(&mut self, cx: &mut Context<Self>) -> Option<HostId> {
+        self.save_host_internal(true, cx)
+    }
+
+    fn save_host_internal(
+        &mut self,
+        keep_ephemeral_for_connect: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<HostId> {
+        if self.hosts.draft_mut().is_some_and(HostDraft::split_address) {
+            self.refill_host_fields(&[HostField::Address, HostField::User, HostField::Port], cx);
+        }
         let draft = self.hosts.draft().cloned()?;
         let saved = draft.editing().and_then(|id| self.book.host(id)).cloned();
         let edit = match draft.build(saved.as_ref()) {
@@ -8031,6 +8483,7 @@ impl ShelluneView {
                 // The form stays open with what the user typed, and the reason names
                 // the field the domain refused.
                 let located = draft.first_problem(saved.as_ref()).map(|(which, _)| which);
+                self.last_invalid_host_field = located;
                 if let Some(fields) = self.host_fields.as_ref() {
                     for candidate in HostField::ALL {
                         let entity = fields.get(candidate).clone();
@@ -8078,7 +8531,13 @@ impl ShelluneView {
             cx.notify();
             return None;
         }
-        if !self.store_host_secret(&draft, edit.host(), saved.as_ref(), cx) {
+        if !self.store_host_secret(
+            &draft,
+            edit.host(),
+            saved.as_ref(),
+            keep_ephemeral_for_connect,
+            cx,
+        ) {
             return None;
         }
         self.commit_hosts(next, self.strings().hosts_saved, cx);
@@ -8096,6 +8555,7 @@ impl ShelluneView {
         draft: &HostDraft,
         host: &HostConfig,
         saved: Option<&HostConfig>,
+        keep_ephemeral_for_connect: bool,
         cx: &mut Context<Self>,
     ) -> bool {
         let strings = self.strings();
@@ -8111,10 +8571,19 @@ impl ShelluneView {
                     return false;
                 }
             }
-        } else if saved.is_some_and(HostConfig::remembers_secret) {
-            // Turning remembering off removes the secret; a store that cannot be reached
-            // leaves an entry nobody reads, which is not a reason to keep the old flag.
-            let _ = self.secrets.forget(host.id());
+            self.ephemeral_ssh_secrets.remove(&host.id());
+        } else {
+            if saved.is_some_and(HostConfig::remembers_secret) {
+                // Turning remembering off removes the secret; a store that cannot be reached
+                // leaves an entry nobody reads, which is not a reason to keep the old flag.
+                let _ = self.secrets.forget(host.id());
+            }
+            if keep_ephemeral_for_connect && let Some(secret) = draft.typed_secret() {
+                self.ephemeral_ssh_secrets
+                    .insert(host.id(), shellune_core::SecretString::new(secret));
+            } else {
+                self.ephemeral_ssh_secrets.remove(&host.id());
+            }
         }
         if let Some(draft) = self.hosts.draft_mut() {
             draft.clear_secret();
@@ -8247,6 +8716,7 @@ impl ShelluneView {
         };
         // A deleted connection's secret has nobody left to use it, wherever it waits.
         self.desktop_secrets.remove(&id);
+        self.ephemeral_ssh_secrets.remove(&id);
         if remembers_secret {
             let _ = self.secrets.forget(id);
         }
@@ -9164,6 +9634,7 @@ impl ShelluneView {
     /// cancelled, and its session stays. The new form asks only for what this host
     /// still needs.
     pub(crate) fn open_remote(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        self.pending_open_files = None;
         self.forward_only_dial = false;
         self.pending_forward_rules.clear();
         self.park_focused_form();
@@ -9421,6 +9892,11 @@ impl ShelluneView {
                 );
                 return;
             };
+            if let Some(ephemeral) = self.ephemeral_ssh_secrets.remove(&hop_id)
+                && self.absorb_saved(&host, Some(&ephemeral), cx)
+            {
+                continue;
+            }
             match self.saved_secret(&host) {
                 Err(reason) => {
                     self.show_hop(host, cx);
@@ -9522,7 +9998,10 @@ impl ShelluneView {
         if shown {
             if let Some(panel) = self.remote.as_mut() {
                 match host.auth() {
-                    Some(shellune_core::AuthMethodKind::Password) => {
+                    Some(
+                        shellune_core::AuthMethodKind::Password
+                        | shellune_core::AuthMethodKind::Auto,
+                    ) => {
                         if let Some(secret) = secret {
                             panel.set_password(secret.expose());
                         }
@@ -10189,6 +10668,12 @@ impl ShelluneView {
         if show {
             self.activate(id, cx);
         }
+        if self.pending_open_files == Some(host.id()) {
+            self.pending_open_files = None;
+            if self.files.can_browse(id) && !self.files.is_open(id) {
+                self.toggle_files(id, cx);
+            }
+        }
     }
 
     /// Records an attempt that did not open, in both the form and the session list.
@@ -10833,6 +11318,7 @@ impl ShelluneView {
         }
         self.reconnect = None;
         self.pending_ephemeral = None;
+        self.pending_open_files = None;
         self.chain = None;
         self.forward_only_dial = false;
         self.pending_forward_rules.clear();
@@ -12659,6 +13145,7 @@ impl ShelluneView {
         }
         for id in &ids {
             self.desktop_secrets.remove(id);
+            self.ephemeral_ssh_secrets.remove(id);
         }
         for id in remembered {
             let _ = self.secrets.forget(id);
@@ -13339,16 +13826,16 @@ impl ShelluneView {
             self.clear_group_query(window, cx);
             return true;
         }
-        if self.home_shown()
-            && self.hosts_search.read(cx).focus_handle().is_focused(window)
-            && !self.hosts.search().is_empty()
-        {
-            self.hosts_search
-                .update(cx, |field, cx| field.set_text("", cx));
-            self.hosts.set_search(String::new());
-            self.hosts_cursor = None;
-            cx.notify();
-            return true;
+        if self.home_shown() && self.hosts_search.read(cx).focus_handle().is_focused(window) {
+            if !self.hosts.search().is_empty() {
+                self.hosts_search
+                    .update(cx, |field, cx| field.set_text("", cx));
+                self.hosts.set_search(String::new());
+                self.hosts_cursor = None;
+                cx.notify();
+                return true;
+            }
+            return self.focus_hosts_list_from_search(window, cx);
         }
         if self.security_clear_search_if_focused(window, cx) {
             return true;
@@ -13541,22 +14028,27 @@ impl ShelluneView {
                 menu = menu.child(divider()).child(section(ux.home_hosts_section));
             }
             for (index, id) in hosts.into_iter().enumerate() {
-                let Some(host) = self.book.host(id) else {
+                let Some(record) = self.book.connection(id) else {
                     continue;
                 };
+                let (icon, detail) = match record.protocol() {
+                    ProtocolKind::Ssh => (Icon::Server, record.target()),
+                    ProtocolKind::Serial => (
+                        Icon::Terminal,
+                        format!("{} · {}", record.protocol().label(), record.target()),
+                    ),
+                    ProtocolKind::Rdp | ProtocolKind::Vnc => (
+                        Icon::Monitor,
+                        format!("{} · {}", record.protocol().label(), record.target()),
+                    ),
+                };
                 menu = menu.child(
-                    self.menu_item(
-                        Icon::Server,
-                        false,
-                        host.name().to_owned(),
-                        Some(host.target()),
-                        false,
-                    )
-                    .id(("launcher.host", index))
-                    .debug_selector(move || format!("launcher.host.{index}"))
-                    .on_click(cx.listener(move |this, _event, window, cx| {
-                        this.launch_item(LaunchItem::Host(id), window, cx);
-                    })),
+                    self.menu_item(icon, false, record.name().to_owned(), Some(detail), false)
+                        .id(("launcher.host", index))
+                        .debug_selector(move || format!("launcher.host.{index}"))
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            this.launch_item(LaunchItem::Host(id), window, cx);
+                        })),
                 );
             }
             if searching {
@@ -13882,18 +14374,23 @@ impl ShelluneView {
         let mut seen = std::collections::HashSet::new();
         let recent = self
             .book
-            .recent_hosts()
+            .recent_records()
             .into_iter()
-            .map(|recent| recent.host.id());
-        let all = self.book.hosts().iter().map(HostConfig::id);
+            .map(|(record, _, _)| record.id());
+        let all = self.book.records().into_iter().map(|record| record.id());
         for id in recent.chain(all) {
             if !seen.insert(id) {
                 continue;
             }
-            let Some(host) = self.book.host(id) else {
+            let Some(record) = self.book.connection(id) else {
                 continue;
             };
-            if words.is_empty() || matches(host.name()) || matches(&host.target()) {
+            let protocol = record.protocol().label();
+            if words.is_empty()
+                || matches(record.name())
+                || matches(&record.target())
+                || matches(protocol)
+            {
                 items.push(LaunchItem::Host(id));
             }
         }
@@ -13922,7 +14419,7 @@ impl ShelluneView {
         self.launcher_field = None;
         match item {
             LaunchItem::Shell(index) => self.launch_choice(index, window, cx),
-            LaunchItem::Host(id) => self.connect_saved_host(id, cx),
+            LaunchItem::Host(id) => self.connect_saved_connection(id, cx),
             LaunchItem::Address(target) => self.connect_quick_target(&target, window, cx),
         }
         cx.notify();

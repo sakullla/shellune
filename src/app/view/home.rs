@@ -117,6 +117,9 @@ const FILTER_PANEL_WIDTH: f32 = 380.0;
 /// instead of pulling a row's name, facts and actions apart across the screen.
 const CONTENT_MAX_WIDTH: f32 = 1080.0;
 
+/// The height of a row's tag pill, matching [`components::tag`], before zoom.
+const TAG_HEIGHT: f32 = 20.0;
+
 /// The hairlines above and below the list's panel: one device-independent pixel each,
 /// unscaled like every hairline.
 const PANEL_EDGES: f32 = 2.0;
@@ -186,6 +189,10 @@ struct ConnectionRowView {
     group: Option<SharedString>,
     /// Whether this window already holds a running session for the record.
     open: bool,
+    /// Relative time of the most recent connection, when reached and shown.
+    last: Option<SharedString>,
+    /// Exact timestamp and count of connections, for the hover tooltip.
+    last_exact: Option<SharedString>,
     /// Whether the keyboard cursor is on this row.
     cursor: bool,
     /// Whether Enter in the search opens this row: it is the search's first match and
@@ -621,7 +628,7 @@ impl ShelluneView {
                 HomeSection::Recent,
                 Icon::Clock,
                 strings.hosts_view_recent,
-                self.book.recent_hosts().len(),
+                self.book.recent_records().len(),
             ),
         ];
         for (slot, place, icon, label, count) in places {
@@ -901,6 +908,12 @@ impl ShelluneView {
             let drawn = self.group_rows_drawn.clone();
             let row_height = metrics.control_height() + metrics.scale(spacing::HALF);
             let reserve_chevron = rows_rc.iter().any(|row| row.has_children);
+            let group_query_text =
+                SharedString::from(if !self.hosts.group_query().trim().is_empty() {
+                    self.hosts.group_query().trim().to_owned()
+                } else {
+                    self.hosts.search().trim().to_owned()
+                });
             let vlist = uniform_list("hosts.groups.list", count, move |range, _window, _cx| {
                 drawn.set(drawn.get().max(range.len()));
                 let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
@@ -917,6 +930,7 @@ impl ShelluneView {
                                 height: row_height,
                                 reserve_chevron,
                             },
+                            group_query_text.as_ref(),
                             &weak,
                             metrics,
                         )
@@ -1390,12 +1404,10 @@ impl ShelluneView {
                     .as_ref()
                     .map(|reason| self.notice_line(reason.clone(), Tone::Danger)),
             );
-        // While the host dialog is open, its own refusals are shown inside it.
-        if let Some(message) = self
-            .hosts
-            .message()
-            .filter(|message| !(message.failed() && self.host_fields.is_some()))
-        {
+        // While the host or connection dialog is open, its own refusals are shown inside it.
+        if let Some(message) = self.hosts.message().filter(|message| {
+            !(message.failed() && (self.host_fields.is_some() || self.protocol_fields.is_some()))
+        }) {
             body = body.child(
                 components::banner(
                     if message.failed() {
@@ -1867,10 +1879,51 @@ impl ShelluneView {
                 // group's right-click menu offers are here too, so they have a visible
                 // button and not only a right press.
                 if let HomeSection::Group(path) = self.hosts.section() {
+                    let new_host_group = path.clone();
+                    let new_sub = path.clone();
                     let rename = path.clone();
                     let delete = path;
                     card = card
                         .child(components::menu_divider(metrics))
+                        .child(
+                            components::menu_entry(
+                                ux.hosts_group_new_host_here,
+                                "hosts.more.group.new_host",
+                                Some(Icon::Plus),
+                                true,
+                                false,
+                                metrics,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _event, _window, cx| {
+                                    this.close_home_menu(cx);
+                                    this.open_create_host_in_group(
+                                        Some(new_host_group.clone()),
+                                        cx,
+                                    );
+                                },
+                            )),
+                        )
+                        .child(
+                            components::menu_entry(
+                                ux.hosts_group_new_subgroup,
+                                "hosts.more.group.create_sub",
+                                Some(Icon::Folder),
+                                true,
+                                false,
+                                metrics,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _event, window, cx| {
+                                    this.close_home_menu(cx);
+                                    this.open_group_dialog(
+                                        GroupAction::CreateUnder(new_sub.clone()),
+                                        window,
+                                        cx,
+                                    );
+                                },
+                            )),
+                        )
                         .child(
                             components::menu_entry(
                                 ux.hosts_group_rename,
@@ -1915,9 +1968,48 @@ impl ShelluneView {
                 (card, below(self.home_more_anchor.get()))
             }
             HomeMenu::Group(path, position) => {
+                let new_host_group = path.clone();
+                let new_sub = path.clone();
                 let rename = path.clone();
                 let delete = path;
                 let card = components::menu_card("hosts.group.menu", metrics)
+                    .child(
+                        components::menu_entry(
+                            ux.hosts_group_new_host_here,
+                            "hosts.group.new_host.open",
+                            Some(Icon::Plus),
+                            true,
+                            false,
+                            metrics,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _event, _window, cx| {
+                                this.close_home_menu(cx);
+                                this.open_create_host_in_group(Some(new_host_group.clone()), cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        components::menu_entry(
+                            ux.hosts_group_new_subgroup,
+                            "hosts.group.create_sub.open",
+                            Some(Icon::Folder),
+                            true,
+                            false,
+                            metrics,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _event, window, cx| {
+                                this.close_home_menu(cx);
+                                this.open_group_dialog(
+                                    GroupAction::CreateUnder(new_sub.clone()),
+                                    window,
+                                    cx,
+                                );
+                            },
+                        )),
+                    )
+                    .child(components::menu_divider(metrics))
                     .child(
                         components::menu_entry(
                             ux.hosts_group_rename,
@@ -2008,15 +2100,17 @@ impl ShelluneView {
         }
         let metrics = self.metrics();
         let ux = copy::ux();
-        let recent = self.book.recent_hosts();
-        // The room beside the sidebar, the page's padding, the label and "View all".
+        let recent = self.book.recent_records();
+        // The room inside the centred content column (`CONTENT_MAX_WIDTH` minus `WIDE * 2`
+        // horizontal padding), minus the strip's label and "View all" button.
         let sidebar = if self.home_sidebar_folded() {
             SIDEBAR_FOLDED_WIDTH
         } else {
             SIDEBAR_WIDTH
         };
-        let room = self.viewport_width
-            - metrics.scale(sidebar + spacing::SNUG * 2.0 + RECENT_STRIP_FRAME_WIDTH);
+        let content_width =
+            (self.viewport_width - metrics.scale(sidebar)).min(metrics.scale(CONTENT_MAX_WIDTH));
+        let room = content_width - metrics.scale(spacing::WIDE * 2.0 + RECENT_STRIP_FRAME_WIDTH);
         let fits = (room / metrics.scale(RECENT_CHIP_WIDTH + spacing::TIGHT)).floor();
         let shown = (fits.max(1.0) as usize).min(RECENT_STRIP_MAX);
         let now = std::time::SystemTime::now()
@@ -2048,20 +2142,31 @@ impl ShelluneView {
                     ))
                     .child(ux.home_recent_strip),
             );
-        for (number, entry) in recent.iter().take(shown).enumerate() {
-            let id = entry.host.id();
-            let name = entry.host.name().to_owned();
+        for (number, (record, last_connected_unix, _connections)) in
+            recent.iter().take(shown).enumerate()
+        {
+            let id = record.id();
+            let name = record.name().to_owned();
             let letters = monograms
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| crate::app::monogram::initials(&name));
-            let platform = self.host_platform(id).map(str::to_owned);
-            let when = copy::relative_time(entry.last_connected_unix, now, copy::Locale::current());
+            let platform = record
+                .protocol()
+                .is_ssh()
+                .then(|| self.host_platform(id).map(str::to_owned))
+                .flatten();
+            let when = copy::relative_time(*last_connected_unix, now, copy::Locale::current());
+            let target_label = if record.protocol().is_ssh() {
+                record.target()
+            } else {
+                format!("{} · {}", record.protocol().label(), record.target())
+            };
             let tip = copy::fill(
                 ux.home_recent_strip_hint,
-                &[("target", &entry.host.target()), ("when", &when)],
+                &[("target", &target_label), ("when", &when)],
             );
-            let open = self.host_is_open(id);
+            let open = self.record_is_open(id);
             let hover = theme::swatch(palette::SURFACE_HOVER);
             strip = strip.child(
                 div()
@@ -2083,7 +2188,7 @@ impl ShelluneView {
                     .cursor_pointer()
                     .hover(move |style| style.bg(hover))
                     .tooltip(components::tooltip(tip))
-                    // The list's own tile, small: one look for a host wherever it is.
+                    // The list's own tile, small: one look for a record wherever it is.
                     .child(super::host_avatar_sized(
                         &name,
                         &letters,
@@ -2104,8 +2209,15 @@ impl ShelluneView {
                     .when(open, |chip| {
                         chip.child(components::status_dot(Tone::Positive, metrics))
                     })
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.open_host_menu(id, event, window, cx);
+                        }),
+                    )
                     .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.connect_saved_host(id, cx);
+                        this.connect_saved_connection(id, cx);
                     })),
             );
         }
@@ -2131,7 +2243,7 @@ impl ShelluneView {
             && self.hosts.selected().is_empty()
             && list.total() >= RECENT_STRIP_MIN_RECORDS
             && self.viewport_height >= self.metrics().scale(RECENT_STRIP_MIN_HEIGHT)
-            && !self.book.recent_hosts().is_empty()
+            && !self.book.recent_records().is_empty()
     }
 
     /// Whether the recent strip is on the page now, and which record Enter in the search
@@ -2752,6 +2864,7 @@ impl ShelluneView {
         } else {
             px(0.0)
         };
+        let search_query = SharedString::from(self.hosts.search().trim().to_owned());
         uniform_list("hosts.rows", rows.len(), move |range, _window, _cx| {
             drawn.set(drawn.get().max(range.len()));
             let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
@@ -2760,12 +2873,25 @@ impl ShelluneView {
                     SnapshotRow::Direct(direct) => {
                         direct_row_element(direct, &weak, row_height, metrics, ux)
                     }
-                    SnapshotRow::Host(host) => {
-                        host_row_element(host, &weak, row_height, prefix, metrics, strings, ux)
-                    }
-                    SnapshotRow::Connection(connection) => {
-                        connection_row_element(connection, &weak, row_height, metrics, strings, ux)
-                    }
+                    SnapshotRow::Host(host) => host_row_element(
+                        host,
+                        &weak,
+                        row_height,
+                        prefix,
+                        search_query.as_ref(),
+                        metrics,
+                        strings,
+                        ux,
+                    ),
+                    SnapshotRow::Connection(connection) => connection_row_element(
+                        connection,
+                        &weak,
+                        row_height,
+                        search_query.as_ref(),
+                        metrics,
+                        strings,
+                        ux,
+                    ),
                 };
                 items.push(element.into_any_element());
             }
@@ -2902,6 +3028,7 @@ impl ShelluneView {
                     let Some(saved) = self.book.connection(row.id) else {
                         continue;
                     };
+                    let recent = self.book.recent_of(row.id);
                     rows.push(SnapshotRow::Connection(ConnectionRowView {
                         id: row.id,
                         number: connections,
@@ -2913,6 +3040,22 @@ impl ShelluneView {
                             .then(|| saved.group_text().map(SharedString::from))
                             .flatten(),
                         open: self.connection_is_open(row.id),
+                        last: recent.as_ref().filter(|_| show_meta).map(|recent| {
+                            SharedString::from(copy::relative_time(
+                                recent.last_connected_unix(),
+                                now,
+                                copy::Locale::current(),
+                            ))
+                        }),
+                        last_exact: recent.as_ref().map(|recent| {
+                            SharedString::from(format!(
+                                "{} {} · {} {}",
+                                self.strings().host_last_connected,
+                                format_unix(recent.last_connected_unix()),
+                                recent.connections(),
+                                self.strings().host_connection_count
+                            ))
+                        }),
                         cursor: cursor == Some(row.id),
                         enter: enter == Some(row.id),
                         favorite: self.book.is_favorite(row.id),
@@ -2948,9 +3091,11 @@ impl ShelluneView {
         let columns = MetaColumns {
             tag: first.is_some_and(|first| groups.any(|group| group != Some(first)))
                 || (first.is_none() && groups.any(|group| group.is_some())),
-            time: rows
-                .iter()
-                .any(|row| matches!(row, SnapshotRow::Host(host) if host.last.is_some())),
+            time: rows.iter().any(|row| match row {
+                SnapshotRow::Host(host) => host.last.is_some(),
+                SnapshotRow::Connection(connection) => connection.last.is_some(),
+                SnapshotRow::Direct(_) => false,
+            }),
         };
         for row in &mut rows {
             match row {
@@ -3152,11 +3297,20 @@ impl ShelluneView {
         let selector = action.debug_selector();
         let title = match &action {
             GroupAction::Create => ux.hosts_group_new.to_owned(),
+            GroupAction::CreateUnder(_) => ux.hosts_group_new_subgroup.to_owned(),
             GroupAction::Rename(_) => ux.hosts_group_rename.to_owned(),
             GroupAction::Move => copy::fill(
                 ux.hosts_move_title,
                 &[("count", &self.hosts.selected_count().to_string())],
             ),
+            GroupAction::MoveSingle(id) => {
+                let name = self
+                    .book
+                    .connection(*id)
+                    .map(|record| record.name().to_owned())
+                    .unwrap_or_default();
+                copy::fill(ux.hosts_move_single_title, &[("name", &name)])
+            }
             GroupAction::Delete(path) => {
                 format!("{} “{}”", ux.hosts_group_delete, path.to_canonical())
             }
@@ -3176,7 +3330,10 @@ impl ShelluneView {
         // for that - a search over the groups that also takes a new path - and nothing
         // else; the name field the other two actions need would only be a second box
         // to wonder about.
-        let choosing = matches!(action, GroupAction::Delete(_) | GroupAction::Move);
+        let choosing = matches!(
+            action,
+            GroupAction::Delete(_) | GroupAction::Move | GroupAction::MoveSingle(_)
+        );
         let mut body = div()
             .flex()
             .flex_col()
@@ -3233,9 +3390,11 @@ impl ShelluneView {
         }
         // The answer names where the hosts go, so the button is read as the outcome.
         let confirm: SharedString = match &action {
-            GroupAction::Create => ux.hosts_group_create_action.into(),
+            GroupAction::Create | GroupAction::CreateUnder(_) => {
+                ux.hosts_group_create_action.into()
+            }
             GroupAction::Rename(_) => ux.hosts_group_rename_action.into(),
-            GroupAction::Move => {
+            GroupAction::Move | GroupAction::MoveSingle(_) => {
                 let target = editor.destination().trim();
                 if target.is_empty() {
                     ux.hosts_move_ungrouped_action.into()
@@ -3299,12 +3458,14 @@ struct GroupRowLayout {
     reserve_chevron: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn group_tree_row_element(
     group: &SidebarGroupRow,
     number: usize,
     section: &HomeSection,
     is_focused: bool,
     layout: GroupRowLayout,
+    query: &str,
     weak: &WeakEntity<ShelluneView>,
     metrics: Metrics,
 ) -> Stateful<Div> {
@@ -3375,6 +3536,31 @@ fn group_tree_row_element(
     } else {
         None
     };
+    let group_marks = if query.is_empty() {
+        Vec::new()
+    } else {
+        crate::app::palette::highlights(&label, query)
+    };
+    let item = if group_marks.is_empty() {
+        components::sidebar_item_in(
+            Icon::Folder,
+            label,
+            Some(group.hosts),
+            chosen,
+            Some(GROUP_ROW),
+            metrics,
+        )
+    } else {
+        sidebar_group_item_highlighted(
+            Icon::Folder,
+            label,
+            group_marks,
+            Some(group.hosts),
+            chosen,
+            Some(GROUP_ROW),
+            metrics,
+        )
+    };
     div()
         .id(SharedString::from(format!("hosts.tree.{number}")))
         .debug_selector(move || format!("hosts.tree.{number}"))
@@ -3392,17 +3578,7 @@ fn group_tree_row_element(
         .border_color(if is_focused { ring } else { theme::clear() })
         .rounded(px(radius::MEDIUM))
         .children(toggle)
-        .child(
-            components::sidebar_item_in(
-                Icon::Folder,
-                label,
-                Some(group.hosts),
-                chosen,
-                Some(GROUP_ROW),
-                metrics,
-            )
-            .flex_1(),
-        )
+        .child(item.flex_1())
         // The action takes the count's place while the row is pointed at, so the
         // counts share the edge the entries above them use.
         .child(
@@ -3468,11 +3644,127 @@ fn direct_row_element(
             direct.hint.clone(),
             false,
             None,
+            "",
             metrics,
         ))
         .when(direct.enter, |row| {
             row.child(components::kbd(ux.home_quick_enter, metrics))
         })
+}
+
+fn home_highlighted_line(text: SharedString, query: &str) -> gpui::StyledText {
+    if query.is_empty() {
+        return components::line_text(text);
+    }
+    let marks = crate::app::palette::highlights(text.as_ref(), query);
+    if marks.is_empty() {
+        components::line_text(text)
+    } else {
+        #[cfg(test)]
+        home_highlights::record(text.as_ref(), &marks);
+        components::highlighted_text(text, marks)
+    }
+}
+
+fn highlighted_tag(
+    label: SharedString,
+    marks: Vec<std::ops::Range<usize>>,
+    metrics: Metrics,
+) -> Div {
+    #[cfg(test)]
+    home_highlights::record(label.as_ref(), &marks);
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(metrics.scale(TAG_HEIGHT))
+        .px(metrics.scale(spacing::TIGHT))
+        .rounded_full()
+        .bg(theme::swatch(palette::SURFACE_SELECTED))
+        .text_size(metrics.caption_size())
+        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+        .min_w_0()
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .child(components::highlighted_text(label, marks)),
+        )
+}
+
+fn sidebar_group_item_highlighted(
+    icon: Icon,
+    label: String,
+    marks: Vec<std::ops::Range<usize>>,
+    count: Option<usize>,
+    selected: bool,
+    yields_to: Option<&'static str>,
+    metrics: Metrics,
+) -> Div {
+    #[cfg(test)]
+    home_highlights::record(&label, &marks);
+    let (fill, ink, icon_ink, count_ink) = if selected {
+        (
+            Some(palette::ACCENT_TINT),
+            palette::ACCENT_ON_TINT,
+            palette::ACCENT,
+            palette::ACCENT_ON_TINT,
+        )
+    } else {
+        (
+            None,
+            palette::TEXT_SECONDARY,
+            palette::TEXT_MUTED,
+            palette::TEXT_MUTED,
+        )
+    };
+    let hover_fill = theme::swatch(palette::SURFACE_HOVER);
+    let hover_ink = theme::swatch(palette::TEXT_PRIMARY);
+    let ink_color = theme::swatch(ink);
+    let icon_color = theme::swatch(icon_ink);
+    div()
+        .group(components::ICON_GROUP)
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(metrics.scale(spacing::TIGHT))
+        .w_full()
+        .min_w_0()
+        .h(metrics.control_height())
+        .px(metrics.scale(spacing::TIGHT))
+        .rounded(px(radius::MEDIUM))
+        .when_some(fill, |item, fill| item.bg(theme::swatch(fill)))
+        .text_size(metrics.label_size())
+        .text_color(ink_color)
+        .when(selected, |item| item.font_weight(metrics.medium_weight()))
+        .cursor_pointer()
+        .when(!selected, |item| {
+            item.hover(move |style| style.bg(hover_fill).text_color(hover_ink))
+        })
+        .child(
+            icons::icon(icon, metrics.icon_size(), icon_color).when(!selected, |icon| {
+                icon.group_hover(components::ICON_GROUP, move |style| {
+                    style.text_color(hover_ink)
+                })
+            }),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .child(components::highlighted_text(label, marks)),
+        )
+        .children(count.map(|count| {
+            div()
+                .flex_none()
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(count_ink))
+                .when_some(yields_to, |count, group| {
+                    count.group_hover(group, |style| style.invisible())
+                })
+                .child(SharedString::from(count.to_string()))
+        }))
 }
 
 /// The two lines of a row: the name with what is said beside it, and the address, each
@@ -3482,6 +3774,7 @@ fn row_text(
     subtitle: SharedString,
     monospace: bool,
     beside_title: Option<AnyElement>,
+    query: &str,
     metrics: Metrics,
 ) -> Div {
     div()
@@ -3503,7 +3796,7 @@ fn row_text(
                         .text_size(metrics.body_size())
                         .font_weight(metrics.medium_weight())
                         .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                        .child(components::line_text(title)),
+                        .child(home_highlighted_line(title, query)),
                 )
                 .children(beside_title),
         )
@@ -3517,7 +3810,7 @@ fn row_text(
                     })
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .child(components::line_text(subtitle)),
+                    .child(home_highlighted_line(subtitle, query)),
             ),
         )
 }
@@ -3541,6 +3834,7 @@ fn row_meta(
     group: Option<SharedString>,
     last: Option<(SharedString, SharedString)>,
     open: bool,
+    query: &str,
     metrics: Metrics,
     ux: &'static UxStrings,
 ) -> Div {
@@ -3558,8 +3852,17 @@ fn row_meta(
         .w(metrics.scale(ROW_TAG_WIDTH))
         .min_w_0()
         .children(group.map(|group| {
-            components::tag(group, metrics)
-                .max_w_full()
+            let marks = if query.is_empty() {
+                Vec::new()
+            } else {
+                crate::app::palette::highlights(group.as_ref(), query)
+            };
+            let pill = if marks.is_empty() {
+                components::tag(group, metrics)
+            } else {
+                highlighted_tag(group, marks, metrics)
+            };
+            pill.max_w_full()
                 .debug_selector(move || format!("{prefix}.tag.{number}"))
         }));
     let time_column = div()
@@ -3789,11 +4092,13 @@ fn record_more_button(
 
 /// One host inside the list: who it is, what it dials, its group, when it was reached,
 /// its state, and what can be done with it.
+#[allow(clippy::too_many_arguments)]
 fn host_row_element(
     host: &HostRowView,
     weak: &WeakEntity<ShelluneView>,
     row_height: Pixels,
     prefix: &'static str,
+    query: &str,
     metrics: Metrics,
     strings: &'static Strings,
     ux: &'static UxStrings,
@@ -3969,6 +4274,7 @@ fn host_row_element(
             host.target.clone(),
             true,
             beside,
+            query,
             metrics,
         ))
         .child(row_facts_and_actions(
@@ -3979,6 +4285,7 @@ fn host_row_element(
                 host.group.clone(),
                 last,
                 host.open,
+                query,
                 metrics,
                 ux,
             ),
@@ -4019,6 +4326,7 @@ fn connection_row_element(
     connection: &ConnectionRowView,
     weak: &WeakEntity<ShelluneView>,
     row_height: Pixels,
+    query: &str,
     metrics: Metrics,
     strings: &'static Strings,
     ux: &'static UxStrings,
@@ -4038,12 +4346,22 @@ fn connection_row_element(
         ControlState::Resting
     };
     let protocol = {
+        let proto_marks = if query.is_empty() {
+            Vec::new()
+        } else {
+            crate::app::palette::highlights(connection.protocol.as_ref(), query)
+        };
+        let proto_tag = if proto_marks.is_empty() {
+            components::tag(connection.protocol.clone(), metrics)
+        } else {
+            highlighted_tag(connection.protocol.clone(), proto_marks, metrics)
+        };
         let mut badges = div()
             .flex()
             .items_center()
             .gap(metrics.scale(spacing::HALF))
             .min_w_0()
-            .child(components::tag(connection.protocol.clone(), metrics));
+            .child(proto_tag);
         if let Some((label, tip)) = connection.vault_missing.clone() {
             badges = badges.child(
                 div()
@@ -4154,6 +4472,7 @@ fn connection_row_element(
             connection.target.clone(),
             true,
             Some(protocol),
+            query,
             metrics,
         ))
         // A running session of this record says so, exactly as a host row does (R2).
@@ -4163,8 +4482,12 @@ fn connection_row_element(
                 "hosts.connection",
                 connection.show_meta,
                 connection.group.clone(),
-                None,
+                connection
+                    .last
+                    .clone()
+                    .map(|last| (last, connection.last_exact.clone().unwrap_or_default())),
                 connection.open,
+                query,
                 metrics,
                 ux,
             ),
@@ -4261,4 +4584,36 @@ fn favorite_star(
             cx.stop_propagation();
             let _ = toggled.update(cx, |view, cx| view.toggle_favorite(id, cx));
         })
+}
+
+/// Records search highlight spans shaped by the home page during tests.
+#[cfg(test)]
+pub(crate) mod home_highlights {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static DRAWN: RefCell<Vec<(String, Vec<std::ops::Range<usize>>)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(text: &str, ranges: &[std::ops::Range<usize>]) {
+        if !ranges.is_empty() {
+            DRAWN.with(|drawn| drawn.borrow_mut().push((text.to_owned(), ranges.to_vec())));
+        }
+    }
+
+    pub fn clear() {
+        DRAWN.with(|drawn| drawn.borrow_mut().clear());
+    }
+
+    pub fn ranges_of(text: &str) -> Option<Vec<std::ops::Range<usize>>> {
+        DRAWN.with(|drawn| {
+            drawn
+                .borrow()
+                .iter()
+                .rev()
+                .find(|(candidate, _)| candidate == text)
+                .map(|(_, ranges)| ranges.clone())
+        })
+    }
 }

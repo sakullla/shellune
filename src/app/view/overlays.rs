@@ -40,7 +40,7 @@ const PALETTE_TITLE_MAX_WIDTH: f32 = 260.0;
 /// The least height a menu keeps in a window too short for all its entries.
 const MENU_MIN_HEIGHT: f32 = 120.0;
 /// The width the host menu is kept inside the window by.
-const HOST_MENU_WIDTH: f32 = 210.0;
+pub(super) const HOST_MENU_WIDTH: f32 = 210.0;
 /// The width the tab menu is kept inside the window by.
 const TAB_MENU_WIDTH: f32 = 230.0;
 /// The narrowest the tab menu is drawn: a row of colours fits across it.
@@ -338,16 +338,27 @@ impl ShelluneView {
         }
 
         let mut seen = Vec::new();
-        for recent in self.book.recent_hosts() {
-            let host = recent.host;
-            seen.push(host.id());
+        for (record, _, _) in self.book.recent_records() {
+            seen.push(record.id());
+            let (detail, icon) = match &record {
+                shellune_core::ConnectionRecord::Ssh(host) => {
+                    (host_palette_detail(host, locale), Icon::Plug)
+                }
+                other => (
+                    format!("{} · {}", other.protocol().label(), other.target()),
+                    match other.protocol() {
+                        shellune_core::ProtocolKind::Serial => Icon::Terminal,
+                        _ => Icon::Monitor,
+                    },
+                ),
+            };
             entries.push(Entry {
-                command: Command::Connect(host.id()),
+                command: Command::Connect(record.id()),
                 group: Group::Recent,
-                title: host.name().to_owned(),
-                detail: host_palette_detail(host, locale),
+                title: record.name().to_owned(),
+                detail,
                 shortcut: None,
-                icon: Icon::Plug,
+                icon,
                 current: false,
             });
         }
@@ -366,6 +377,9 @@ impl ShelluneView {
             });
         }
         for record in self.book.connections() {
+            if seen.contains(&record.id()) {
+                continue;
+            }
             entries.push(Entry {
                 command: Command::Connect(record.id()),
                 group: Group::Hosts,
@@ -1313,18 +1327,31 @@ impl ShelluneView {
                 })),
             );
         if is_ssh {
-            menu = menu.child(
-                item(
-                    strings.forward_open,
-                    "host.menu.forwards",
-                    Icon::Forward,
-                    false,
+            menu = menu
+                .child(
+                    item(
+                        ux.host_open_files,
+                        "host.menu.files",
+                        Icon::FolderOpen,
+                        false,
+                    )
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.close_host_menu(window, cx);
+                        this.open_saved_files(id, window, cx);
+                    })),
                 )
-                .on_click(cx.listener(move |this, _event, window, cx| {
-                    this.close_host_menu(window, cx);
-                    this.open_saved_forwards(id, cx);
-                })),
-            );
+                .child(
+                    item(
+                        strings.forward_open,
+                        "host.menu.forwards",
+                        Icon::Forward,
+                        false,
+                    )
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.close_host_menu(window, cx);
+                        this.open_saved_forwards(id, cx);
+                    })),
+                );
         }
         let delete_label = if is_ssh {
             strings.host_delete
@@ -1379,6 +1406,22 @@ impl ShelluneView {
                 .on_click(cx.listener(move |this, _event, window, cx| {
                     this.close_host_menu(window, cx);
                     this.duplicate_saved_connection(id, cx);
+                })),
+            )
+            .child(
+                item(
+                    ux.host_move_to_group,
+                    "host.menu.move_group",
+                    Icon::Folder,
+                    false,
+                )
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.close_host_menu(window, cx);
+                    this.open_group_dialog(
+                        crate::app::hosts::GroupAction::MoveSingle(id),
+                        window,
+                        cx,
+                    );
                 })),
             )
             .child(divider())

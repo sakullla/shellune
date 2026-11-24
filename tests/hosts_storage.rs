@@ -2104,10 +2104,18 @@ fn a_connection_identifier_is_unique_across_every_protocol() {
         Err(BookError::DuplicateHost { id: web.id() }),
         "the host list and the connection list share one namespace"
     );
+    book.record_connection(office.id(), 1_700_000_000)
+        .expect("a saved desktop connection records its recency too");
     assert_eq!(
-        book.record_connection(office.id(), 1_700_000_000),
-        Err(BookError::UnknownHost { id: office.id() }),
-        "a sign-in history is an SSH history, not a desktop one"
+        book.recent_of(office.id())
+            .map(|recent| (recent.last_connected_unix(), recent.connections())),
+        Some((1_700_000_000, 1))
+    );
+    let unknown = HostId::new();
+    assert_eq!(
+        book.record_connection(unknown, 1_700_000_000),
+        Err(BookError::UnknownHost { id: unknown }),
+        "an unknown identifier is still refused"
     );
 }
 
@@ -2965,4 +2973,75 @@ fn a_record_that_names_a_credential_still_fails_the_whole_document() {
         matches!(&error, PortableError::Corrupt { reason } if reason.contains("password") && !reason.contains("hunter2")),
         "{error}"
     );
+}
+
+#[test]
+fn recent_connections_record_list_persist_and_clean_up_across_all_protocols() {
+    let dir = TempDir::new("recent-all-protocols");
+    let store = dir.store();
+    let web = saved(&store, host("web", "10.0.0.5", 22, "deploy", None));
+    let mut book = store.load().expect("the book loads");
+    let office = rdp("Office", "10.0.0.9", "alice");
+    let wall = vnc("Wall", "10.0.0.7");
+    let console = serial("Console", "COM3");
+    book.insert_connection(office.clone())
+        .expect("rdp inserted");
+    book.insert_connection(wall.clone()).expect("vnc inserted");
+    book.insert_connection(console.clone())
+        .expect("serial inserted");
+
+    book.record_connection(web.id(), 1_700_000_100)
+        .expect("ssh recorded");
+    book.record_connection(office.id(), 1_700_000_300)
+        .expect("rdp recorded");
+    book.record_connection(wall.id(), 1_700_000_200)
+        .expect("vnc recorded");
+    book.record_connection(console.id(), 1_700_000_400)
+        .expect("serial recorded");
+    book.record_connection(office.id(), 1_700_000_500)
+        .expect("rdp recorded twice");
+
+    assert_eq!(
+        book.version(),
+        shellune_storage::FORMAT_VERSION,
+        "format version remains v1"
+    );
+    store.save(&book).expect("the book saves");
+
+    let mut reloaded = dir.store().load().expect("reloaded cleanly");
+    assert_eq!(reloaded.version(), 1);
+    let ordered: Vec<(HostId, u64, u32)> = reloaded
+        .recent_records()
+        .into_iter()
+        .map(|(record, at, count)| (record.id(), at, count))
+        .collect();
+    assert_eq!(
+        ordered,
+        vec![
+            (office.id(), 1_700_000_500, 2),
+            (console.id(), 1_700_000_400, 1),
+            (wall.id(), 1_700_000_200, 1),
+            (web.id(), 1_700_000_100, 1),
+        ],
+        "recent_records orders SSH, RDP, VNC and Serial newest first"
+    );
+
+    reloaded
+        .remove_connection(office.id())
+        .expect("rdp removed");
+    reloaded
+        .remove_connection(console.id())
+        .expect("serial removed");
+    assert!(reloaded.recent_of(office.id()).is_none());
+    assert!(reloaded.recent_of(console.id()).is_none());
+    store
+        .save(&reloaded)
+        .expect("saving after removing non-SSH recent records keeps invariants valid");
+    let after_remove = dir.store().load().expect("reloads after removal");
+    let remaining: Vec<HostId> = after_remove
+        .recent_records()
+        .into_iter()
+        .map(|(record, _, _)| record.id())
+        .collect();
+    assert_eq!(remaining, vec![wall.id(), web.id()]);
 }

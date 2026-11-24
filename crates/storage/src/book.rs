@@ -428,6 +428,29 @@ impl HostBook {
         recent
     }
 
+    /// The saved connections of any protocol that were reached, newest first.
+    ///
+    /// A deleted record is not listed: the recent view and quick shortcuts must never
+    /// offer a connection that no longer has a saved record.
+    #[must_use]
+    pub fn recent_records(&self) -> Vec<(ConnectionRecord, u64, u32)> {
+        let mut recent: Vec<(ConnectionRecord, u64, u32)> = self
+            .recents
+            .iter()
+            .filter_map(|recent| {
+                self.connection(recent.host())
+                    .map(|record| (record, recent.last_connected_unix(), recent.connections()))
+            })
+            .collect();
+        recent.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| left.0.name().cmp(right.0.name()))
+        });
+        recent
+    }
+
     /// Applies one validated edit.
     ///
     /// # Errors
@@ -676,10 +699,14 @@ impl HostBook {
                 }
                 if let Some(slot) = connection_slot {
                     self.connections.remove(slot);
+                    self.recents.retain(|recent| recent.host() != id);
                 }
             }
             other => {
                 if let Some(slot) = connection_slot {
+                    if self.connections[slot].protocol() != other.protocol() {
+                        self.recents.retain(|recent| recent.host() != id);
+                    }
                     self.connections[slot] = other;
                 } else {
                     self.connections.push(other);
@@ -710,6 +737,7 @@ impl HostBook {
             .iter()
             .position(|connection| connection.id() == id)
         {
+            self.recents.retain(|recent| recent.host() != id);
             self.favorites.retain(|favorite| *favorite != id);
             return Ok(self.connections.remove(slot));
         }
@@ -736,14 +764,14 @@ impl HostBook {
             .collect()
     }
 
-    /// Records that a host was really reached.
+    /// Records that a saved connection of any protocol was really reached.
     ///
     /// # Errors
     ///
-    /// Returns `BookError::UnknownHost` when the identifier names no saved host,
-    /// which is what stops a connection to a deleted host from being recorded.
+    /// Returns `BookError::UnknownHost` when the identifier names no saved record,
+    /// which stops a connection to a deleted record from being recorded.
     pub fn record_connection(&mut self, id: HostId, at_unix: u64) -> Result<(), BookError> {
-        if self.host(id).is_none() {
+        if !self.contains_connection(id) {
             return Err(BookError::UnknownHost { id });
         }
         match self.recents.iter_mut().find(|recent| recent.host() == id) {

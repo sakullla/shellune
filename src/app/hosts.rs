@@ -1929,6 +1929,11 @@ impl HostsPanel {
     pub fn open_group_dialog(&mut self, action: GroupAction) {
         let name = match &action {
             GroupAction::Rename(path) => path.to_canonical(),
+            GroupAction::CreateUnder(path) => format!("{}/", path.to_canonical()),
+            GroupAction::Create => match self.section() {
+                HomeSection::Group(path) => format!("{}/", path.to_canonical()),
+                _ => String::new(),
+            },
             _ => String::new(),
         };
         self.group_editor = Some(GroupEditor::new(action, name));
@@ -1967,6 +1972,18 @@ impl HostsPanel {
             .map(HostConfig::id)
             .collect();
         let kept: BTreeSet<HostId> = matched.iter().copied().collect();
+        let searched: BTreeSet<HostId> = book
+            .search_connections(&self.search)
+            .iter()
+            .map(ConnectionRecord::id)
+            .collect();
+        let mut connections: Vec<HostId> = book
+            .connections()
+            .iter()
+            .filter(|record| self.matches_connection(book, record, &searched, open))
+            .map(ConnectionRecord::id)
+            .collect();
+        let kept_connections: BTreeSet<HostId> = connections.iter().copied().collect();
         let mut rows = Vec::new();
         match self.view {
             HostView::All => {
@@ -1976,48 +1993,36 @@ impl HostsPanel {
                 for id in &matched {
                     rows.push(HostListRow::Host(HostRow { id: *id }));
                 }
+                self.sort_ids(book, &mut connections, |id| {
+                    book.connection(id).map(|record| record.name().to_owned())
+                });
+                for id in &connections {
+                    rows.push(HostListRow::Connection(ConnectionRow { id: *id }));
+                }
             }
             HostView::Recent => {
-                // The recent view is itself a filter: a host with no record is not in
-                // the list, so it must not be counted in "current results" either, or
-                // Select would pick hosts the user cannot see (R18).
-                let mut shown = Vec::new();
-                for recent in book.recent_hosts() {
-                    let id = recent.host.id();
-                    if kept.contains(&id) {
-                        shown.push(id);
-                        rows.push(HostListRow::Host(HostRow { id }));
+                // The recent view orders every reached record across SSH, RDP, VNC and
+                // Serial newest first, while keeping `matched` scoped to SSH hosts for
+                // SSH-only multi-select operations (R3, R18).
+                let mut shown_hosts = Vec::new();
+                let mut shown_connections = Vec::new();
+                for (record, _, _) in book.recent_records() {
+                    let id = record.id();
+                    if record.protocol().is_ssh() {
+                        if kept.contains(&id) {
+                            shown_hosts.push(id);
+                            rows.push(HostListRow::Host(HostRow { id }));
+                        }
+                    } else if kept_connections.contains(&id) {
+                        shown_connections.push(id);
+                        rows.push(HostListRow::Connection(ConnectionRow { id }));
                     }
                 }
-                matched = shown;
+                matched = shown_hosts;
+                connections = shown_connections;
             }
         }
         let _ = groups;
-        // The connections of another protocol are listed after the hosts. The recent
-        // view is a sign-in history, and one of them has no history to be found in.
-        let connections: Vec<HostId> = match self.view {
-            HostView::Recent => Vec::new(),
-            HostView::All => {
-                let searched: BTreeSet<HostId> = book
-                    .search_connections(&self.search)
-                    .iter()
-                    .map(ConnectionRecord::id)
-                    .collect();
-                let mut ids: Vec<HostId> = book
-                    .connections()
-                    .iter()
-                    .filter(|record| self.matches_connection(book, record, &searched, open))
-                    .map(ConnectionRecord::id)
-                    .collect();
-                self.sort_ids(book, &mut ids, |id| {
-                    book.connection(id).map(|record| record.name().to_owned())
-                });
-                ids
-            }
-        };
-        for id in &connections {
-            rows.push(HostListRow::Connection(ConnectionRow { id: *id }));
-        }
         if self.view == HostView::All && self.sort != HostSort::Saved {
             let row_id = |row: &HostListRow| match row {
                 HostListRow::Host(host) => Some(host.id),
@@ -2460,9 +2465,10 @@ impl HostsPanel {
             return false;
         }
         match self.filter.status {
-            HostStatusFilter::Any | HostStatusFilter::NeverConnected => true,
+            HostStatusFilter::Any => true,
             HostStatusFilter::Connected => open(record.id()),
-            HostStatusFilter::Recent => false,
+            HostStatusFilter::Recent => book.recent_of(record.id()).is_some(),
+            HostStatusFilter::NeverConnected => book.recent_of(record.id()).is_none(),
         }
     }
 
@@ -3259,12 +3265,16 @@ impl HostSelection {
 /// The group change a dialog is asking about (R18).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GroupAction {
-    /// Create a new group under the current one.
+    /// Create a new group (under the current one when viewing a group).
     Create,
+    /// Create a new subgroup under a named parent group.
+    CreateUnder(GroupPath),
     /// Rename a group and everything inside it.
     Rename(GroupPath),
     /// Move the selected hosts into a group.
     Move,
+    /// Move one saved record of any protocol into a group.
+    MoveSingle(HostId),
     /// Delete a group, first moving its hosts somewhere else.
     Delete(GroupPath),
 }
@@ -3274,9 +3284,9 @@ impl GroupAction {
     #[must_use]
     pub fn debug_selector(&self) -> &'static str {
         match self {
-            Self::Create => "hosts.group.create",
+            Self::Create | Self::CreateUnder(_) => "hosts.group.create",
             Self::Rename(_) => "hosts.group.rename",
-            Self::Move => "hosts.group.move",
+            Self::Move | Self::MoveSingle(_) => "hosts.group.move",
             Self::Delete(_) => "hosts.group.delete",
         }
     }
@@ -3847,9 +3857,9 @@ impl ProtocolDraft {
             stop_bits: SerialStopBits::default(),
             flow: SerialFlow::default(),
             local_echo: false,
-            // Nothing is kept until the box is ticked: the password is used for the
-            // attempt it was typed for, and only a ticked box puts it in the store.
-            remember: false,
+            // Matches SSH's default: a password typed on a new connection is kept unless
+            // the user unticks "Remember password" (R4).
+            remember: true,
         }
     }
 
@@ -4187,6 +4197,68 @@ impl ProtocolDraft {
     /// Forgets the typed password, once it has been handed on.
     pub fn clear_secret(&mut self) {
         self.secret.clear();
+    }
+
+    /// Splits a desktop address pasted as `user@host:port` or `host:port` into its
+    /// fields, returning whether it did (R4).
+    ///
+    /// User and port are only filled when their fields still hold their starting values,
+    /// and unbracketed IPv6 literals are left untouched.
+    pub fn split_address(&mut self) -> bool {
+        if !self.is_desktop() {
+            return false;
+        }
+        let text = self.address.trim().to_owned();
+        let (user, rest) = match text.split_once('@') {
+            Some((user, rest)) if !user.is_empty() && !rest.is_empty() => {
+                (Some(user.to_owned()), rest.to_owned())
+            }
+            _ => (None, text.clone()),
+        };
+        let (host, port) = if rest.starts_with('[') {
+            match rest.rsplit_once("]:") {
+                Some((bracketed, port))
+                    if !bracketed[1..].is_empty()
+                        && !port.is_empty()
+                        && port.chars().all(|ch| ch.is_ascii_digit()) =>
+                {
+                    (format!("{bracketed}]"), Some(port.to_owned()))
+                }
+                _ => (rest, None),
+            }
+        } else {
+            match rest.rsplit_once(':') {
+                Some((host, port))
+                    if !host.contains(':')
+                        && !host.is_empty()
+                        && !port.is_empty()
+                        && port.chars().all(|ch| ch.is_ascii_digit()) =>
+                {
+                    (host.to_owned(), Some(port.to_owned()))
+                }
+                _ => (rest, None),
+            }
+        };
+        if user.is_none() && port.is_none() {
+            return false;
+        }
+        self.address = host;
+        if let Some(user) = user
+            && self.user.trim().is_empty()
+        {
+            self.user = user;
+        }
+        let default_port = self
+            .protocol
+            .default_port()
+            .map(|p| p.to_string())
+            .unwrap_or_default();
+        if let Some(port) = port
+            && (self.port.trim().is_empty() || self.port == default_port)
+        {
+            self.port = port;
+        }
+        true
     }
 
     /// Turns this form into a copy of a saved connection (R9).
@@ -4693,25 +4765,23 @@ mod tests {
     #[ignore = "opt-in RDP/VNC test"]
     fn a_desktop_form_keeps_its_password_out_of_the_record() {
         let mut draft = ProtocolDraft::create(ProtocolKind::Vnc);
+        assert!(
+            draft.remember(),
+            "new desktop connections default to remembering passwords like SSH"
+        );
         draft.set_text(ConnectionFormField::Address, "10.0.0.7");
         draft.set_text(ConnectionFormField::Secret, "pw");
         assert_eq!(draft.typed_secret(), Some("pw"));
-        assert!(
-            !draft.keeps_secret(),
-            "nothing is kept until the box is ticked"
-        );
-        let edit = draft.build().expect("a valid VNC connection");
-        assert!(
-            !edit.record().remembers_secret(),
-            "a password typed without ticking the box is not claimed as kept"
-        );
-
-        // Ticking the box keeps it, and the record says so.
-        draft.set_remember(true);
         assert!(draft.keeps_secret());
         let edit = draft.build().expect("a valid VNC connection");
         assert!(edit.record().remembers_secret());
         let record = edit.record().clone();
+
+        // Unticking the box drops the kept flag.
+        draft.set_remember(false);
+        assert!(!draft.keeps_secret());
+        let unkept = draft.build().expect("a valid VNC connection");
+        assert!(!unkept.record().remembers_secret());
 
         // Reopened for an edit, the password is not put back in the field, and a blank
         // field keeps what the store holds.
@@ -6244,5 +6314,124 @@ mod tests {
             "validation uses localized template, got: {}",
             err.reason()
         );
+    }
+
+    #[test]
+    fn recent_view_sort_and_status_filters_treat_all_protocols_equally() {
+        let web = host("web", "10.0.0.5", 22, "deploy", Some("Prod"));
+        let idle = host("idle", "10.0.0.6", 22, "deploy", Some("Prod"));
+        let mut book = HostBook::from_hosts(vec![web.clone(), idle.clone()]).expect("hosts");
+        let office = rdp_record("Office", "10.0.0.9", "alice");
+        let wall = ConnectionRecord::Vnc(VncConfig::new("Wall", "10.0.0.7").expect("valid vnc"));
+        let console = serial_record("Console", "COM3");
+        let untouched_serial = serial_record("Spare", "COM4");
+        book.insert_connection(office.clone()).expect("rdp");
+        book.insert_connection(wall.clone()).expect("vnc");
+        book.insert_connection(console.clone()).expect("serial");
+        book.insert_connection(untouched_serial.clone())
+            .expect("spare serial");
+
+        book.record_connection(web.id(), 100).expect("ssh recent");
+        book.record_connection(wall.id(), 200).expect("vnc recent");
+        book.record_connection(console.id(), 300)
+            .expect("serial recent");
+        book.record_connection(office.id(), 400)
+            .expect("rdp recent");
+
+        let groups = GroupBook::new();
+        let no_sessions = |_: HostId| false;
+        let row_ids = |list: &HostList| -> Vec<HostId> {
+            list.rows()
+                .iter()
+                .filter_map(|row| match row {
+                    HostListRow::Host(h) => Some(h.id),
+                    HostListRow::Connection(c) => Some(c.id),
+                    HostListRow::Group(_) => None,
+                })
+                .collect()
+        };
+
+        let mut panel = HostsPanel::new();
+        panel.select_view(HostView::Recent);
+        let recent_list = panel.list(&book, &groups, &no_sessions);
+        assert_eq!(
+            row_ids(&recent_list),
+            vec![office.id(), console.id(), wall.id(), web.id()],
+            "HostView::Recent orders RDP, Serial, VNC and SSH newest first"
+        );
+        assert_eq!(recent_list.matched_len(), 4);
+        assert_eq!(
+            recent_list.ids_in_scope(SelectionScope::CurrentResults),
+            [web.id()],
+            "SSH multi-select scope stays restricted to SSH hosts"
+        );
+
+        panel.select_view(HostView::All);
+        panel.set_sort(HostSort::LastConnected);
+        let sorted = panel.list(&book, &groups, &no_sessions);
+        assert_eq!(
+            &row_ids(&sorted)[..4],
+            &[office.id(), console.id(), wall.id(), web.id()],
+            "HostSort::LastConnected orders reached protocols newest first ahead of unreached"
+        );
+
+        panel.set_sort(HostSort::Saved);
+        panel.set_status_filter(HostStatusFilter::Recent);
+        let filtered_recent = row_ids(&panel.list(&book, &groups, &no_sessions));
+        assert_eq!(filtered_recent.len(), 4);
+        assert!(filtered_recent.contains(&office.id()));
+        assert!(filtered_recent.contains(&wall.id()));
+        assert!(filtered_recent.contains(&console.id()));
+        assert!(filtered_recent.contains(&web.id()));
+
+        panel.set_status_filter(HostStatusFilter::NeverConnected);
+        let never = row_ids(&panel.list(&book, &groups, &no_sessions));
+        assert_eq!(never, vec![idle.id(), untouched_serial.id()]);
+    }
+
+    #[test]
+    fn desktop_protocol_draft_defaults_remember_and_splits_pasted_address() {
+        let mut rdp = ProtocolDraft::create(ProtocolKind::Rdp);
+        assert!(rdp.remember(), "RDP defaults remember=true");
+        rdp.set_text(ConnectionFormField::Address, "alice@10.0.0.9:3390");
+        assert!(rdp.split_address());
+        assert_eq!(rdp.text(ConnectionFormField::Address), "10.0.0.9");
+        assert_eq!(rdp.text(ConnectionFormField::User), "alice");
+        assert_eq!(rdp.text(ConnectionFormField::Port), "3390");
+
+        let mut vnc = ProtocolDraft::create(ProtocolKind::Vnc);
+        assert!(vnc.remember(), "VNC defaults remember=true");
+        vnc.set_text(ConnectionFormField::Address, "10.0.0.7:5902");
+        assert!(vnc.split_address());
+        assert_eq!(vnc.text(ConnectionFormField::Address), "10.0.0.7");
+        assert_eq!(vnc.text(ConnectionFormField::Port), "5902");
+
+        // Unbracketed IPv6 literal is not misparsed as host:port.
+        let mut ipv6 = ProtocolDraft::create(ProtocolKind::Rdp);
+        ipv6.set_text(ConnectionFormField::Address, "fe80::1");
+        assert!(!ipv6.split_address());
+        assert_eq!(ipv6.text(ConnectionFormField::Address), "fe80::1");
+
+        // Existing user and custom port are preserved.
+        let mut custom = ProtocolDraft::create(ProtocolKind::Rdp);
+        custom.set_text(ConnectionFormField::User, "bob");
+        custom.set_text(ConnectionFormField::Port, "4400");
+        custom.set_text(ConnectionFormField::Address, "alice@10.0.0.9:3390");
+        assert!(custom.split_address());
+        assert_eq!(custom.text(ConnectionFormField::Address), "10.0.0.9");
+        assert_eq!(custom.text(ConnectionFormField::User), "bob");
+        assert_eq!(custom.text(ConnectionFormField::Port), "4400");
+    }
+
+    #[test]
+    fn subgroup_creation_prefills_parent_prefix_with_trailing_slash() {
+        let mut panel = HostsPanel::new();
+        let prod = GroupPath::parse("Prod").expect("valid path");
+        panel.open_group_dialog(GroupAction::CreateUnder(prod.clone()));
+        assert_eq!(panel.group_editor().map(GroupEditor::name), Some("Prod/"));
+
+        panel.set_section(&HomeSection::Group(prod));
+        panel.open_group_dialog(GroupAction::Create);
+        assert_eq!(panel.group_editor().map(GroupEditor::name), Some("Prod/"));
     }
 }

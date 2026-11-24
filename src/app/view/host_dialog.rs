@@ -222,6 +222,7 @@ impl ShelluneView {
         if let Some(draft) = self.hosts.draft_mut()
             && draft.set_auth(kind)
         {
+            self.clear_resolved_host_validation(cx);
             cx.notify();
         }
     }
@@ -568,7 +569,7 @@ impl ShelluneView {
 
     /// Saves the host and, when it was saved, connects to it at once.
     fn save_and_connect(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.save_host(cx) else {
+        let Some(id) = self.save_host_for_connect(cx) else {
             return;
         };
         if let Some(host) = self.book.host(id).cloned() {

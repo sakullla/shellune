@@ -3433,6 +3433,16 @@ pub struct UxStrings {
     pub settings_reset_default: &'static str,
     /// Unsaved edits notice on WebDAV sync card
     pub sync_unsaved_changes: &'static str,
+    /// Context-menu action to move a single saved record into a group
+    pub host_move_to_group: &'static str,
+    /// Dialog title when moving a single saved record into a group
+    pub hosts_move_single_title: &'static str,
+    /// Context-menu action on an SSH host to connect and open the SFTP file browser
+    pub host_open_files: &'static str,
+    /// Sidebar group menu action to create a new host inside that group
+    pub hosts_group_new_host_here: &'static str,
+    /// Sidebar group menu action to create a subgroup under that group
+    pub hosts_group_new_subgroup: &'static str,
 }
 
 impl UxStrings {
@@ -3940,6 +3950,11 @@ impl UxStrings {
             self.quick_address_placeholder,
             self.settings_reset_default,
             self.sync_unsaved_changes,
+            self.host_move_to_group,
+            self.hosts_move_single_title,
+            self.host_open_files,
+            self.hosts_group_new_host_here,
+            self.hosts_group_new_subgroup,
         ]
     }
 }
@@ -4448,6 +4463,11 @@ included",
     quick_address_placeholder: "example.com or 192.0.2.10",
     settings_reset_default: "Reset",
     sync_unsaved_changes: "Unsaved changes — click Save before syncing",
+    host_move_to_group: "Move to group\u{2026}",
+    hosts_move_single_title: "Move “{name}” to group",
+    host_open_files: "Open files (SFTP)",
+    hosts_group_new_host_here: "New host in this group",
+    hosts_group_new_subgroup: "New subgroup",
 };
 
 /// Simplified Chinese.
@@ -4951,6 +4971,11 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     quick_address_placeholder: "example.com 或 192.0.2.10",
     settings_reset_default: "重置",
     sync_unsaved_changes: "有未保存的修改——请先点击保存再同步",
+    host_move_to_group: "移动到分组\u{2026}",
+    hosts_move_single_title: "将“{name}”移动到分组",
+    host_open_files: "打开文件（SFTP）",
+    hosts_group_new_host_here: "在此分组新建主机",
+    hosts_group_new_subgroup: "新建子分组",
 };
 
 /// The redesigned-shell strings of the current language.

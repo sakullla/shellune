@@ -30318,7 +30318,13 @@ fn save_desktop_password_form(
     clear_field(cx, "connection.field.port", 4);
     type_into(cx, "connection.field.port", "1");
     type_into(cx, "connection.field.secret", password);
-    if remember {
+    let current_remember = cx.update(|_window, app| {
+        view.read(app)
+            .hosts_state()
+            .protocol_draft()
+            .is_some_and(|draft| draft.remember())
+    });
+    if current_remember != remember {
         click(cx, "connection.field.remember");
     }
     click(cx, "connection.save");
@@ -45571,4 +45577,564 @@ async fn vault_warming_epoch_lock_race_and_desktop_every_operation_verification_
         ) && cx.debug_bounds("terminal.failure.unlock").is_some(),
         "locking the vault mid-verification transitions the waiting desktop session to Failed with Unlock action"
     );
+}
+
+#[gpui::test]
+async fn all_protocol_recents_record_on_live_session_and_appear_in_strip_views_launcher_and_chip_menu(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("all-proto-recents");
+    let mut book = HostBook::new();
+    for i in 0..6 {
+        book.insert(stored_host(
+            &format!("ssh-{i}"),
+            &format!("10.0.0.{}", i + 10),
+            22,
+            "deploy",
+            Some("Prod"),
+        ))
+        .expect("ssh inserted");
+    }
+    let ssh_id = book.hosts()[0].id();
+    let mut rdp_cfg =
+        shellune_core::RdpConfig::new("win-desk", "10.0.1.9", Some("alice")).expect("valid rdp");
+    rdp_cfg.set_port(3389).expect("valid port");
+    let rdp_rec = shellune_core::ConnectionRecord::Rdp(rdp_cfg);
+    let rdp_id = rdp_rec.id();
+    let vnc_rec = shellune_core::ConnectionRecord::Vnc(
+        shellune_core::VncConfig::new("kiosk-vnc", "10.0.1.7").expect("valid vnc"),
+    );
+    let vnc_id = vnc_rec.id();
+    let serial_rec = serial_record("uart-console", "COM250");
+    let serial_id = serial_rec.id();
+    book.insert_connection(rdp_rec.clone()).expect("rdp saved");
+    book.insert_connection(vnc_rec.clone()).expect("vnc saved");
+    book.insert_connection(serial_rec.clone())
+        .expect("serial saved");
+    book.record_connection(ssh_id, 1_700_000_000)
+        .expect("ssh recent seeded");
+    dir.store().save(&book).expect("book saved");
+
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.simulate_resize(size(px(1300.0), px(820.0)));
+    cx.run_until_parked();
+
+    // Connect RDP, VNC, and Serial through window session paths and verify automatic recency recording.
+    let (rdp_link, _) = ScriptedLink::new(live_desktop_events());
+    mount_scripted_desktop(&view, cx, &rdp_rec, rdp_link);
+
+    let (vnc_link, _) = ScriptedLink::new(live_desktop_events());
+    mount_scripted_desktop(&view, cx, &vnc_rec, vnc_link);
+
+    let (serial_link, _dev, _peer) = scripted_serial();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.queue_scripted_serial_for_test("COM250", serial_link);
+            view.connect_saved_connection(serial_id, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let reloaded = dir.store().load().expect("hosts.json reloads cleanly");
+    assert_eq!(reloaded.version(), shellune_storage::FORMAT_VERSION);
+    assert!(reloaded.recent_of(rdp_id).is_some(), "RDP recorded recent");
+    assert!(reloaded.recent_of(vnc_id).is_some(), "VNC recorded recent");
+    assert!(
+        reloaded.recent_of(serial_id).is_some(),
+        "Serial recorded recent"
+    );
+
+    // Return to Home and check Recent strip width clamping across 1180px, 1300px, and 1360px.
+    click(cx, "nav.hosts");
+    for width in [1180.0_f32, 1300.0, 1360.0] {
+        cx.simulate_resize(size(px(width), px(820.0)));
+        redraw(cx);
+        let strip_bounds = bounds_of(cx, "hosts.recent.strip");
+        let view_all_bounds = bounds_of(cx, "hosts.recent.strip.all");
+        assert!(
+            view_all_bounds.right() <= strip_bounds.right() + px(1.0),
+            "View all must not be clipped at viewport width {width}: {view_all_bounds:?} vs {strip_bounds:?}"
+        );
+    }
+
+    // Right-clicking a recent strip chip opens the context menu.
+    right_click(cx, "hosts.recent.chip.0");
+    assert!(
+        cx.debug_bounds("host.menu").is_some() && cx.debug_bounds("host.menu.move_group").is_some(),
+        "recent strip chip supports right-click context menu"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Sidebar Recent view lists SSH, RDP, VNC and Serial with timestamps.
+    click(cx, "hosts.view.recent");
+    assert!(
+        cx.debug_bounds("hosts.connection.0").is_some()
+            && cx.debug_bounds("hosts.connection.1").is_some()
+            && cx.debug_bounds("hosts.connection.2").is_some()
+            && cx.debug_bounds("hosts.connection.last.0").is_some(),
+        "Recent section shows non-SSH connections alongside SSH with last-connected timestamps"
+    );
+
+    // Top-bar + launcher lists saved RDP, VNC, Serial, and SSH records.
+    click(cx, "header.primary");
+    assert!(
+        cx.debug_bounds("launcher.host.0").is_some()
+            && cx.debug_bounds("launcher.host.3").is_some(),
+        "top-bar + launcher lists recent non-SSH and SSH records"
+    );
+    type_into(cx, "launcher.search", "uart-console");
+    assert!(
+        cx.debug_bounds("launcher.host.0").is_some(),
+        "launcher search finds saved Serial record"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn home_search_highlights_keyboard_loop_and_cursor_row_shortcuts(cx: &mut TestAppContext) {
+    let dir = TempDir::new("home-search-keyboard-loop");
+    let mut book = HostBook::new();
+    for idx in 0..8 {
+        let group = format!("Region{idx}");
+        book.insert(stored_host(
+            &format!("bastion-{idx}"),
+            &format!("10.20.0.{}", idx + 1),
+            22,
+            "ops",
+            Some(&group),
+        ))
+        .expect("host inserted");
+    }
+    let mut rdp_cfg =
+        shellune_core::RdpConfig::new(" JumpboxProd ", "10.20.9.9", Some("admin")).expect("rdp");
+    rdp_cfg.set_group_path(Some(GroupPath::parse("Region0").expect("group")));
+    let rdp_rec = shellune_core::ConnectionRecord::Rdp(rdp_cfg);
+    book.insert_connection(rdp_rec).expect("rdp inserted");
+    dir.store().save(&book).expect("saved");
+
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(size(px(1360.0), px(840.0)));
+    cx.run_until_parked();
+
+    // 1. Real-time search highlights on row name, target address, group tag, and sidebar group row.
+    crate::app::view::home::home_highlights::clear();
+    type_into(cx, "hosts.search", "bastion-0");
+    redraw(cx);
+    assert!(
+        crate::app::view::home::home_highlights::ranges_of("bastion-0")
+            .is_some_and(|ranges| !ranges.is_empty()),
+        "host name highlights matched search fragment"
+    );
+
+    clear_field(cx, "hosts.search", "bastion-0".len());
+    crate::app::view::home::home_highlights::clear();
+    type_into(cx, "hosts.search", "Region");
+    redraw(cx);
+    assert!(
+        crate::app::view::home::home_highlights::ranges_of("Region0")
+            .is_some_and(|ranges| !ranges.is_empty()),
+        "group tag and sidebar group row highlight matched search fragment"
+    );
+
+    // Independent sidebar group locator highlights matched group rows too.
+    clear_field(cx, "hosts.search", "Region".len());
+    crate::app::view::home::home_highlights::clear();
+    type_into(cx, "hosts.groups.search", "Region3");
+    redraw(cx);
+    assert!(
+        crate::app::view::home::home_highlights::ranges_of("Region3")
+            .is_some_and(|ranges| !ranges.is_empty()),
+        "sidebar group locator highlights matched group segment"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // 2. Search -> Tab (and empty-search Escape) moves focus to list and sets cursor on first row.
+    let first_id = cx.update(|_window, app| view.read(app).book().hosts()[0].id());
+    click(cx, "hosts.search");
+    type_into(cx, "hosts.search", "bastion");
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_cursor()),
+        Some(first_id),
+        "Tab from search lands cursor on first visible host row"
+    );
+    assert!(
+        !cx.update(|window, app| view
+            .read(app)
+            .hosts_search_focus_for_test(app)
+            .is_focused(window)),
+        "Tab moves focus out of hosts.search into the list"
+    );
+
+    // 3. Cursor row keyboard shortcuts: * / Alt+F favorite, Ctrl/Cmd+C copy target, Shift+F10 menu, F2 edit, Delete.
+    cx.simulate_keystrokes("*");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).book().is_favorite(first_id)),
+        "* toggles favorite on cursor row"
+    );
+    cx.simulate_keystrokes("alt-f");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).book().is_favorite(first_id)),
+        "Alt+F toggles favorite off on cursor row"
+    );
+
+    let copy_chord = if cfg!(target_os = "macos") {
+        "cmd-c"
+    } else {
+        "ctrl-c"
+    };
+    cx.simulate_keystrokes(copy_chord);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("ops@10.20.0.1:22".to_owned()),
+        "Ctrl/Cmd+C copies cursor row target address"
+    );
+
+    cx.simulate_keystrokes("shift-f10");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).host_menu_open()),
+        "Shift+F10 opens row context menu"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).host_menu_open()));
+
+    cx.simulate_keystrokes("f2");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("hosts.editor").is_some(),
+        "F2 opens edit dialog for cursor row"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("delete");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().pending_delete() == Some(first_id)),
+        "Delete opens delete confirmation for cursor row"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Empty-search Escape also moves focus from search to list.
+    click(cx, "hosts.search");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|window, app| view
+            .read(app)
+            .hosts_search_focus_for_test(app)
+            .is_focused(window))
+            && cx
+                .update(|_window, app| view.read(app).hosts_cursor())
+                .is_some(),
+        "second Escape on empty search transfers focus to host list"
+    );
+}
+
+#[gpui::test]
+async fn record_and_group_context_menus_move_single_open_sftp_and_prefill_subgroup(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("menus-move-sftp-subgroup");
+    let mut ssh_host = stored_host("sftp-box", "127.0.0.1", 22, "deploy", Some("Prod"));
+    ssh_host.set_auth(Some(shellune_core::AuthMethodKind::Agent));
+    let ssh_id = ssh_host.id();
+    let serial_rec = serial_record("rack-serial", "COM99");
+    let serial_id = serial_rec.id();
+    let mut book = HostBook::from_hosts(vec![ssh_host]).expect("ssh host");
+    book.insert_connection(serial_rec).expect("serial inserted");
+    dir.store().save(&book).expect("book saved");
+    let mut groups = shellune_core::GroupBook::new();
+    groups
+        .insert(&GroupPath::parse("Prod").expect("Prod"))
+        .expect("Prod");
+    groups
+        .insert(&GroupPath::parse("Lab").expect("Lab"))
+        .expect("Lab");
+    shellune_storage::GroupStore::at(dir.path())
+        .save(&groups)
+        .expect("groups saved");
+
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(size(px(1360.0), px(840.0)));
+    cx.run_until_parked();
+
+    // 1. Move single non-SSH record to "Lab" via context menu "Move to group…".
+    right_click(cx, "hosts.connection.0");
+    click(cx, "host.menu.move_group");
+    assert!(cx.debug_bounds("hosts.group.move").is_some());
+    type_into(cx, "hosts.group.destination", "Lab");
+    click(cx, "hosts.group.confirm");
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .book()
+                .connection(serial_id)
+                .and_then(|r| r.group_path())
+        }),
+        Some(GroupPath::parse("Lab").expect("Lab")),
+        "single non-SSH record moved to Lab"
+    );
+
+    // 2. Sidebar group context menu: "New host in this group" and "New subgroup" (pre-filling "Prod/").
+    right_click(cx, "hosts.tree.1");
+    click(cx, "hosts.group.new_host.open");
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .hosts_state()
+                .draft()
+                .map(|d| d.text(crate::app::hosts::HostField::Group).to_owned())
+        }),
+        Some("Prod".to_owned()),
+        "New host in this group pre-fills Group=Prod"
+    );
+    click(cx, "hosts.cancel");
+
+    right_click(cx, "hosts.tree.1");
+    click(cx, "hosts.group.create_sub.open");
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .hosts_state()
+                .group_editor()
+                .map(|e| e.name().to_owned())
+        }),
+        Some("Prod/".to_owned()),
+        "New subgroup pre-fills Prod/ prefix"
+    );
+    cx.simulate_input("East");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .groups()
+                .contains(&GroupPath::parse("Prod/East").expect("Prod/East"))
+        }),
+        "typing East and pressing Enter creates Prod/East"
+    );
+
+    // 3. SSH context menu "Open files (SFTP)" connects and automatically opens Files view.
+    right_click(cx, "hosts.row.0");
+    click(cx, "host.menu.files");
+    cx.run_until_parked();
+    let session_id = remote_session_ids(&view, cx)
+        .last()
+        .copied()
+        .expect("SSH session created");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            let scripted = shellune_ssh::ScriptedSession::new();
+            scripted.push(shellune_ssh::RemoteEvent::Connected);
+            scripted.push(shellune_ssh::RemoteEvent::Data(b"$ ".to_vec()));
+            view.install_scripted_session(session_id, scripted, cx);
+            view.attach_files_for_test(
+                session_id,
+                "sftp-box",
+                "deploy@127.0.0.1:22",
+                Box::new(FileAnswers::accepting()),
+                cx,
+            );
+            view.pump_remote_once(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).files_visible(session_id)),
+        "Open files (SFTP) automatically opens the session's SFTP file browser once connected"
+    );
+
+    // Closing files and selecting "Open files (SFTP)" again reuses the live SSH session.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).files_visible(session_id)));
+    click(cx, "nav.hosts");
+    right_click(cx, "hosts.row.0");
+    click(cx, "host.menu.files");
+    cx.run_until_parked();
+    assert_eq!(remote_session_ids(&view, cx).len(), 1);
+    assert!(
+        cx.update(|_window, app| view.read(app).files_visible(session_id)),
+        "Open files (SFTP) activates existing live SSH session and opens its SFTP view"
+    );
+    let _ = ssh_id;
+}
+
+#[gpui::test]
+async fn ssh_ephemeral_save_and_connect_dials_once_without_persisting_and_dialogs_split_and_clear_validation(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("ssh-ephemeral-and-dialog-ux");
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(size(px(1360.0), px(960.0)));
+    cx.run_until_parked();
+
+    // 1. Validation red border and footer banner clear immediately on editing offending field (SSH).
+    click(cx, "hosts.new");
+    click(cx, "hosts.save");
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .host_field_invalid_for_test(crate::app::hosts::HostField::Address)
+        }),
+        "empty SSH address marked invalid on save"
+    );
+    assert!(
+        cx.debug_bounds("hosts.field.address.problem").is_some()
+            && cx.debug_bounds("hosts.message").is_some()
+    );
+    type_into(cx, "hosts.field.address", "127.0.0.1");
+    assert!(
+        !cx.update(|_window, app| {
+            view.read(app)
+                .host_field_invalid_for_test(crate::app::hosts::HostField::Address)
+        }),
+        "editing SSH address clears red border state immediately"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().message().is_none()),
+        "editing offending SSH field clears inline problem and stale footer refusal immediately"
+    );
+
+    // 2. SSH untick Remember password + Save & Connect dials immediately without secondary prompt or disk persistence.
+    type_into(cx, "hosts.field.user", "deploy");
+    click(cx, "hosts.auth.remote.method.password");
+    type_into(cx, "hosts.field.secret", "burn-after-dial");
+    click(cx, "hosts.remember");
+    click(cx, "hosts.save_connect");
+    cx.run_until_parked();
+
+    let saved_ssh = cx.update(|_window, app| view.read(app).book().hosts()[0].clone());
+    assert!(
+        !saved_ssh.remembers_secret(),
+        "saved SSH host does not claim remembered secret"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).saved_secret_for_test(saved_ssh.id())),
+        None,
+        "ephemeral password is never written to system secret store"
+    );
+    let raw_hosts = std::fs::read_to_string(dir.path().join(shellune_storage::FILE_NAME))
+        .expect("hosts.json exists");
+    assert!(
+        !raw_hosts.contains("burn-after-dial"),
+        "ephemeral password never touches hosts.json"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        1,
+        "Save & Connect immediately started dialing with the ephemeral password instead of asking again"
+    );
+    let attempt_session = remote_session_ids(&view, cx)[0];
+    accept_attempt(&view, cx, attempt_session);
+    assert_eq!(
+        session_state(cx, &view, attempt_session),
+        Some(SessionState::Connected)
+    );
+
+    // Second connection to the same unremembered host asks for password (burn-after-reading).
+    click(cx, "nav.hosts");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.connect_saved_host(saved_ssh.id(), cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0,
+        "ephemeral password was consumed once; subsequent connect prompts for password"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // 3. RDP/VNC default remember=true, paste user@host:port splitting, and real-time validation clearing.
+    click(cx, "hosts.new");
+    click(cx, "connection.protocol.rdp");
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .hosts_state()
+                .protocol_draft()
+                .is_some_and(|d| d.remember())
+        }),
+        "new RDP connection defaults remember=true"
+    );
+    clear_field(cx, "connection.field.port", 4);
+    type_into(cx, "connection.field.port", "0");
+    type_into(cx, "connection.field.address", "10.0.0.9");
+    click(cx, "connection.save");
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .protocol_field_invalid_for_test(crate::app::hosts::ConnectionFormField::Port)
+        }),
+        "invalid RDP port marked with red border"
+    );
+    assert!(
+        cx.debug_bounds("connection.field.port.problem").is_some()
+            && cx.debug_bounds("connection.message").is_some()
+    );
+    clear_field(cx, "connection.field.port", 1);
+    type_into(cx, "connection.field.port", "3389");
+    assert!(
+        !cx.update(|_window, app| {
+            view.read(app)
+                .protocol_field_invalid_for_test(crate::app::hosts::ConnectionFormField::Port)
+        }),
+        "editing RDP port immediately clears red border"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().message().is_none()),
+        "editing offending RDP port immediately clears inline problem and footer error banner"
+    );
+
+    clear_field(cx, "connection.field.address", "10.0.0.9".len());
+    clear_field(cx, "connection.field.port", 4);
+    type_into(cx, "connection.field.port", "3389");
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+        "alice@10.0.0.9:3390".to_owned(),
+    ));
+    click(cx, "connection.field.address");
+    let paste_chord = if cfg!(target_os = "macos") {
+        "cmd-v"
+    } else {
+        "ctrl-v"
+    };
+    cx.simulate_keystrokes(paste_chord);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| {
+            let d = view
+                .read(app)
+                .hosts_state()
+                .protocol_draft()
+                .expect("rdp draft");
+            (
+                d.text(crate::app::hosts::ConnectionFormField::Address)
+                    .to_owned(),
+                d.text(crate::app::hosts::ConnectionFormField::User)
+                    .to_owned(),
+                d.text(crate::app::hosts::ConnectionFormField::Port)
+                    .to_owned(),
+            )
+        }),
+        ("10.0.0.9".to_owned(), "alice".to_owned(), "3390".to_owned()),
+        "pasting user@host:port into RDP address splits user, host, and port"
+    );
+    click(cx, "connection.cancel");
 }
