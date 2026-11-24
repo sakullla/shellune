@@ -194,6 +194,9 @@ struct OpenPane {
     /// Immutable keyboard focus handle of this pane's surface, kept here so focus
     /// queries never re-borrow `Entity<TerminalPane>` / `Entity<DesktopPane>` mid-update.
     focus: gpui::FocusHandle,
+    /// Lock-free paste-confirmation flag for terminal panes, kept here so modal queries
+    /// never re-borrow `Entity<TerminalPane>` while a pane callback updates the shell.
+    paste_waiting: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// What it draws: a character terminal, or a surface of another protocol.
     content: PaneContent,
 }
@@ -5123,11 +5126,11 @@ impl ShelluneView {
     /// target. The session on screen is asked first — that is the dialog a person sees —
     /// and every other pane after it, so an answer cannot be lost behind a dialog that
     /// is never drawn.
-    fn paste_prompt(&self, cx: &gpui::App) -> Option<(SessionId, Entity<TerminalPane>)> {
+    fn paste_prompt(&self, _cx: &gpui::App) -> Option<(SessionId, Entity<TerminalPane>)> {
         let waiting = |open: &OpenPane| {
-            open.content
-                .terminal()
-                .is_some_and(|pane| pane.read(cx).awaits_paste_confirmation())
+            open.paste_waiting
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
         };
         if let Some((id, pane)) = self
             .panes
@@ -5250,6 +5253,17 @@ impl ShelluneView {
         let Some(handle) = self.work_focus_for(id, cx) else {
             return;
         };
+        if self.palette.is_some() || self.has_blocking_modal(cx) {
+            if self.active == Some(id) && self.shows_terminal(self.workspace.destination()) {
+                self.focus_return = Some(handle.downgrade());
+            }
+            cx.notify();
+            return;
+        }
+        if !self.shows_terminal(self.workspace.destination()) {
+            cx.notify();
+            return;
+        }
         self.pane_focus_pending = Some(id);
         if let Some(window) = cx.active_window() {
             let _ = window.update(cx, |_view, window, _cx| window.focus(&handle));
@@ -5312,6 +5326,12 @@ impl ShelluneView {
     /// Puts the keyboard on what the page shows: the active terminal or desktop surface, or the page.
     /// Without this a control that disappeared would take every shortcut with it.
     fn reclaim_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() || self.has_blocking_modal(cx) {
+            let handle = self.blocking_modal_fallback_focus(cx);
+            window.focus(&handle);
+            cx.notify();
+            return;
+        }
         let destination = self.workspace.destination();
         if self.shows_terminal(destination)
             && let Some(handle) = self.active_work_focus(cx)
@@ -5376,9 +5396,11 @@ impl ShelluneView {
             pane.set_focus_mode(focus_mode);
         });
         let pane_focus = pane.read(cx).focus_handle().clone();
+        let paste_waiting = Some(pane.read(cx).paste_waiting_flag());
         self.panes.push(OpenPane {
             tag,
             focus: pane_focus,
+            paste_waiting,
             content: PaneContent::Terminal(pane),
         });
         if focus {
@@ -5428,6 +5450,7 @@ impl ShelluneView {
         self.panes.push(OpenPane {
             tag,
             focus: pane_focus,
+            paste_waiting: None,
             content: PaneContent::Desktop(pane.clone()),
         });
         // `pane.start` runs before this observer is registered, so any failure or stage
@@ -14297,8 +14320,77 @@ impl ShelluneView {
             || self.security_dialog_open()
             || self.sync_dialog_open()
             || self.update_confirm_open()
+            || self.key_capture.is_some()
             || self.paste_prompt_open(cx)
             || self.question_open()
+    }
+
+    /// Safe focus target inside the topmost blocking overlay/modal when focus is lost or
+    /// when a lower-priority surface must stay behind the modal backdrop.
+    pub(super) fn blocking_modal_fallback_focus(&self, cx: &gpui::App) -> FocusHandle {
+        if self.question_open() {
+            return self.root_focus.clone();
+        }
+        if self.paste_prompt_open(cx) {
+            return self.paste_focus.clone();
+        }
+        if self.key_capture.is_some() {
+            return self.root_focus.clone();
+        }
+        if let Some(field) = self.palette.as_ref() {
+            return field.read(cx).focus_handle().clone();
+        }
+        if self.security_dialog_open()
+            || self.backup.is_some()
+            || self.update_confirm_open()
+            || self.sync_dialog_open()
+            || self.batch.view().is_open()
+            || self.custom_shell_open
+            || self.host_fields.is_some()
+            || self.protocol_fields.is_some()
+            || self.hosts.group_editor().is_some()
+            || (self.home_shown()
+                && (self.hosts.pending_delete().is_some() || self.hosts.is_asking_batch_delete()))
+            || self.quick_open
+            || (self.showing_connection_form
+                && self.remote.is_some()
+                && !self.connection_inline()
+                && !self.connection_behind_screen())
+            || self.import.is_open()
+            || self.tab_rename.is_some()
+        {
+            return self.root_focus.clone();
+        }
+        if self.tool == Some(shell::Tool::Snippets) {
+            return self.snippet_focus.clone();
+        }
+        if self.tool.is_some() {
+            return self.root_focus.clone();
+        }
+        if self.tab_list_open {
+            return self.tab_list_focus.clone();
+        }
+        self.root_focus.clone()
+    }
+
+    /// Whether `handle` belongs to a page input, file browser, or live session surface
+    /// behind modal backdrops rather than an open modal's own controls.
+    pub(super) fn is_background_surface_focus(&self, handle: &FocusHandle, cx: &gpui::App) -> bool {
+        self.session_of_work_focus(handle).is_some()
+            || [&self.hosts_search, &self.group_search, &self.keys_search]
+                .into_iter()
+                .any(|field| field.read(cx).focus_handle() == handle)
+            || self
+                .files_filter_fields
+                .values()
+                .any(|field| field.read(cx).focus_handle() == handle)
+            || self
+                .files_field
+                .as_ref()
+                .is_some_and(|field| field.read(cx).focus_handle() == handle)
+            || handle == &self.files_local_focus
+            || handle == &self.files_remote_focus
+            || handle == &self.files_transfer_focus
     }
 
     /// Marks `handle` as a retired overlay input so modal replacement never mistakes it for page focus.
@@ -14458,28 +14550,16 @@ impl ShelluneView {
     /// field first, and the page focus that fills the gap is not where the user was.
     fn note_content_focus(&mut self, window: &Window, cx: &gpui::App) {
         if self.palette.is_some()
-            || self.tool.is_some()
-            || self.batch.view().is_open()
+            || self.has_blocking_modal(cx)
             || self.restore_focus_pending
             || self.pane_focus_pending.is_some()
-            || self.quick_open
             || self.shell_menu_open
-            || self.custom_shell_open
-            || self.tab_rename.is_some()
-            || self.tab_list_open
-            || self.import.is_open()
-            || self.hosts.group_editor().is_some()
-            || self.host_fields.is_some()
-            || self.protocol_fields.is_some()
-            || self.security_dialog_open()
-            || self.backup.is_some()
             || self.host_menu.is_some()
             || self.home_menu.is_some()
             || self.tab_menu.is_some()
             || self.session_menu.is_some()
             || self.session_more.is_some()
             || self.files_menu.is_some()
-            || self.paste_prompt_open(cx)
         {
             return;
         }
@@ -14495,6 +14575,26 @@ impl ShelluneView {
     #[cfg(test)]
     pub fn shell_path_focused(&self, window: &Window, cx: &gpui::App) -> bool {
         self.shell_path.read(cx).focus_handle().is_focused(window)
+    }
+
+    #[cfg(test)]
+    pub fn forward_listen_port_focus_for_test(&self, cx: &gpui::App) -> FocusHandle {
+        self.forward_listen_port.read(cx).focus_handle().clone()
+    }
+
+    #[cfg(test)]
+    pub fn forward_target_host_focus_for_test(&self, cx: &gpui::App) -> FocusHandle {
+        self.forward_target_host.read(cx).focus_handle().clone()
+    }
+
+    #[cfg(test)]
+    pub fn forward_target_port_focus_for_test(&self, cx: &gpui::App) -> FocusHandle {
+        self.forward_target_port.read(cx).focus_handle().clone()
+    }
+
+    #[cfg(test)]
+    pub fn forward_editor_open_for_test(&self) -> bool {
+        self.forwards.editor().is_some()
     }
 
     /// Asks every terminal to draw again, so a new palette reaches the ones that are
@@ -22346,15 +22446,21 @@ impl Render for ShelluneView {
             && self.active == Some(id)
             && self.shows_terminal(self.workspace.destination())
             && let Some(handle) = self.work_focus_for(id, cx)
-            && !handle.is_focused(window)
         {
-            window.focus(&handle);
+            if self.palette.is_some() || self.has_blocking_modal(cx) {
+                self.focus_return = Some(handle.downgrade());
+            } else if !handle.is_focused(window) {
+                window.focus(&handle);
+            }
         }
         if std::mem::take(&mut self.restore_focus_pending) {
             self.restore_overlay_focus(window, cx);
         } else if window.focused(cx).is_none() {
-            let destination = self.workspace.destination();
-            let handle = self.destination_focus(destination).clone();
+            let handle = if self.palette.is_some() || self.has_blocking_modal(cx) {
+                self.blocking_modal_fallback_focus(cx)
+            } else {
+                self.destination_focus(self.workspace.destination()).clone()
+            };
             window.focus(&handle);
         }
         let any_form_modal_open = self.host_fields.is_some()

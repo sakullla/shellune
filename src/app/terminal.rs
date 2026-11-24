@@ -737,6 +737,7 @@ pub struct TerminalPane {
     /// It is not encoded and not written until [`TerminalPane::confirm_paste`].
     /// Cancel drops it. Program keys are not answers to this prompt.
     pending_paste: Option<PendingPaste>,
+    paste_waiting: std::sync::Arc<std::sync::atomic::AtomicBool>,
     search_open: bool,
     /// When set, typed text edits the search query instead of the shell.
     ///
@@ -970,6 +971,7 @@ impl TerminalPane {
             locale,
             poll_task: None,
             pending_paste: None,
+            paste_waiting: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
             banner_slot: std::cell::RefCell::new(None),
@@ -1059,6 +1061,7 @@ impl TerminalPane {
             locale,
             poll_task: None,
             pending_paste: None,
+            paste_waiting: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
             banner_slot: std::cell::RefCell::new(None),
@@ -1147,6 +1150,7 @@ impl TerminalPane {
             locale,
             poll_task: None,
             pending_paste: None,
+            paste_waiting: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
             banner_slot: std::cell::RefCell::new(None),
@@ -1319,6 +1323,7 @@ impl TerminalPane {
             locale,
             poll_task: None,
             pending_paste: None,
+            paste_waiting: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
             banner_slot: std::cell::RefCell::new(None),
@@ -1528,6 +1533,7 @@ impl TerminalPane {
             locale,
             poll_task: None,
             pending_paste: None,
+            paste_waiting: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
             banner_slot: std::cell::RefCell::new(None),
@@ -2731,15 +2737,15 @@ impl TerminalPane {
             return;
         }
         if paste_needs_confirmation(text) {
-            self.pending_paste = Some(PendingPaste {
+            self.set_pending_paste(Some(PendingPaste {
                 text: text.to_owned(),
                 target: self.origin.label().to_owned(),
                 execute: false,
-            });
+            }));
             cx.notify();
             return;
         }
-        self.pending_paste = None;
+        self.set_pending_paste(None);
         self.write_paste(text, cx);
         cx.notify();
     }
@@ -2774,15 +2780,15 @@ impl TerminalPane {
             return SnippetOffer::Empty;
         }
         if paste_needs_confirmation(trimmed) {
-            self.pending_paste = Some(PendingPaste {
+            self.set_pending_paste(Some(PendingPaste {
                 text: trimmed.to_owned(),
                 target: self.origin.label().to_owned(),
                 execute,
-            });
+            }));
             cx.notify();
             return SnippetOffer::Waiting;
         }
-        self.pending_paste = None;
+        self.set_pending_paste(None);
         self.write_snippet(trimmed, execute, cx);
         cx.notify();
         SnippetOffer::Written
@@ -2793,7 +2799,7 @@ impl TerminalPane {
     /// Returns whether a paste was waiting. The bytes go through this pane's
     /// source, so another session cannot receive them.
     pub fn confirm_paste(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(pending) = self.pending_paste.take() else {
+        let Some(pending) = self.set_pending_paste(None) else {
             return false;
         };
         if pending.execute {
@@ -2807,9 +2813,21 @@ impl TerminalPane {
 
     /// Drops a held paste. Nothing is written.
     pub fn cancel_paste(&mut self, cx: &mut Context<Self>) {
-        if self.pending_paste.take().is_some() {
+        if self.set_pending_paste(None).is_some() {
             cx.notify();
         }
+    }
+
+    fn set_pending_paste(&mut self, pending: Option<PendingPaste>) -> Option<PendingPaste> {
+        self.paste_waiting
+            .store(pending.is_some(), std::sync::atomic::Ordering::Relaxed);
+        std::mem::replace(&mut self.pending_paste, pending)
+    }
+
+    /// Shared lock-free flag reflecting [`Self::awaits_paste_confirmation`] without borrowing the pane entity.
+    #[must_use]
+    pub fn paste_waiting_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.paste_waiting.clone()
     }
 
     /// The session a held paste would be sent to, when one is waiting.

@@ -220,7 +220,7 @@ impl ShelluneView {
             .as_ref()
             .filter(|handle| {
                 !self.is_page_focus(handle)
-                    && (!modal_open || self.session_of_work_focus(handle).is_none())
+                    && (!modal_open || !self.is_background_surface_focus(handle, cx))
             })
             .map(|handle| handle.downgrade())
             .or_else(|| {
@@ -236,7 +236,7 @@ impl ShelluneView {
             })
             .or_else(|| {
                 if modal_open {
-                    Some(self.root_focus.downgrade())
+                    Some(self.blocking_modal_fallback_focus(cx).downgrade())
                 } else {
                     current.map(|handle| handle.downgrade())
                 }
@@ -260,13 +260,23 @@ impl ShelluneView {
             .take()
             .and_then(|handle| handle.upgrade())
         {
-            if modal_open && self.session_of_work_focus(&handle).is_some() {
-                window.focus(&self.root_focus.clone());
-            } else {
+            let stale_work_surface = self.session_of_work_focus(&handle).is_some_and(|session| {
+                !self.shows_terminal(self.workspace.destination()) || self.active != Some(session)
+            });
+            if modal_open && self.is_background_surface_focus(&handle, cx) {
+                let fallback = self.blocking_modal_fallback_focus(cx);
+                window.focus(&fallback);
+            } else if !stale_work_surface {
                 window.focus(&handle);
+            } else if modal_open {
+                let fallback = self.blocking_modal_fallback_focus(cx);
+                window.focus(&fallback);
+            } else {
+                self.restore_focus(window, cx);
             }
         } else if modal_open {
-            window.focus(&self.root_focus.clone());
+            let fallback = self.blocking_modal_fallback_focus(cx);
+            window.focus(&fallback);
         } else {
             self.restore_focus(window, cx);
         }
@@ -309,6 +319,11 @@ impl ShelluneView {
 
     /// Returns the keyboard to the element that opened the overlay, or to the page.
     pub(super) fn restore_overlay_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() || self.has_blocking_modal(cx) {
+            let handle = self.blocking_modal_fallback_focus(cx);
+            window.focus(&handle);
+            return;
+        }
         if let Some(handle) = self.focus_return.take().and_then(|handle| handle.upgrade()) {
             let stale_work_surface = self.session_of_work_focus(&handle).is_some_and(|session| {
                 !self.shows_terminal(self.workspace.destination()) || self.active != Some(session)
@@ -323,6 +338,11 @@ impl ShelluneView {
 
     /// Focuses the active terminal or desktop surface on screen, or the current page when there is none.
     pub(super) fn restore_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() || self.has_blocking_modal(cx) {
+            let handle = self.blocking_modal_fallback_focus(cx);
+            window.focus(&handle);
+            return;
+        }
         let destination = self.workspace.destination();
         if self.shows_terminal(destination)
             && let Some(handle) = self.active_work_focus(cx)

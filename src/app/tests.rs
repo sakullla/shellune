@@ -49182,3 +49182,357 @@ async fn modal_palette_cancel_batch_switch_and_pending_split_overlay_focus_isola
         "typing after select_tab to pending pane and closing overlay sends zero bytes to SSH pane"
     );
 }
+
+#[gpui::test]
+async fn modal_field_unmount_reclaim_focus_and_async_pane_focus_isolation(
+    app_cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("modal-field-unmount-and-async-pane-focus");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("web", "10.0.0.5", 22, "deploy", None),
+            stored_host("db", "10.0.0.6", 22, "deploy", None),
+        ],
+    );
+
+    let (view, cx) = snippet_view(app_cx, &dir);
+    let session = live_remote(cx, &view);
+    show_remote_terminal(cx, &view, session);
+
+    let session_focused = |cx: &mut VisualTestContext, target: SessionId| {
+        cx.update(|window, app| {
+            view.read(app)
+                .pane_of(target)
+                .is_some_and(|p| p.read(app).focus_handle().is_focused(window))
+        })
+    };
+    assert!(session_focused(cx, session));
+    let sent_before = snippet_sent(cx, &view, session).len();
+
+    // 1. Port Forwarding modal (`Tool::Forwards`) over a live terminal:
+    //    (a) Focus listen port field -> click `forwards.form.close` (unmounts `forwards.form`).
+    //    (b) Focus target host field -> click `forwards.kind.2` (`Dynamic`, unmounts `forwards.target`).
+    //    (c) Fill valid rule with target port focused -> click `forwards.save` (unmounts `forwards.form`).
+    //    None of these `on_focus_lost` -> `reclaim_focus` transitions may leak focus to the terminal,
+    //    and pressing `Escape` afterwards restores terminal focus.
+    click(cx, "session.more");
+    click(cx, "session.more.global_forwards");
+    cx.run_until_parked();
+    click(cx, "forwards.new");
+    cx.run_until_parked();
+
+    let listen_port_handle =
+        cx.update(|_window, app| view.read(app).forward_listen_port_focus_for_test(app));
+    cx.update(|window, _app| window.focus(&listen_port_handle));
+    cx.simulate_input("8080");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(cx.update(|window, _app| listen_port_handle.is_focused(window)));
+
+    click(cx, "forwards.form.close");
+    redraw(cx);
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).forward_editor_open_for_test()),
+        "clicking forwards.form.close closes the tunnel editor"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        Some(crate::app::view::Tool::Forwards)
+    );
+    assert!(
+        !session_focused(cx, session),
+        "clicking forwards.form.close while listen port was focused must not focus hidden terminal"
+    );
+    cx.simulate_input("echo leaked-fwd-cancel");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session).len(),
+        sent_before,
+        "typing after forwards.form.close sends zero bytes to hidden terminal PTY"
+    );
+
+    click(cx, "forwards.new");
+    cx.run_until_parked();
+    let target_host_handle =
+        cx.update(|_window, app| view.read(app).forward_target_host_focus_for_test(app));
+    cx.update(|window, _app| window.focus(&target_host_handle));
+    cx.simulate_input("db.internal");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(cx.update(|window, _app| target_host_handle.is_focused(window)));
+
+    click(cx, "forwards.kind.2"); // Dynamic unmounts target host/port fields while form stays open
+    redraw(cx);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).forward_editor_kind_for_test()),
+        Some(shellune_core::ForwardKind::Dynamic)
+    );
+    assert!(
+        !session_focused(cx, session),
+        "switching tunnel kind to Dynamic while target host was focused must not focus hidden terminal"
+    );
+    cx.simulate_input("echo leaked-fwd-dynamic");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session).len(),
+        sent_before,
+        "typing after Dynamic switch sends zero bytes to hidden terminal PTY"
+    );
+
+    click(cx, "forwards.kind.0"); // Back to Local
+    cx.run_until_parked();
+    cx.update(|window, _app| window.focus(&listen_port_handle));
+    cx.simulate_input("18080");
+    cx.update(|window, _app| window.focus(&target_host_handle));
+    cx.simulate_input("db.internal");
+    let target_port_handle =
+        cx.update(|_window, app| view.read(app).forward_target_port_focus_for_test(app));
+    cx.update(|window, _app| window.focus(&target_port_handle));
+    cx.simulate_input("5432");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(cx.update(|window, _app| target_port_handle.is_focused(window)));
+
+    click(cx, "forwards.save");
+    redraw(cx);
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).forward_editor_open_for_test()),
+        "clicking forwards.save closes the tunnel editor after adopting the rule"
+    );
+    assert!(cx.debug_bounds("forwards.row.0").is_some());
+    assert!(
+        !session_focused(cx, session),
+        "clicking forwards.save while target port was focused must not focus hidden terminal"
+    );
+    cx.simulate_input("echo leaked-fwd-save");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session).len(),
+        sent_before,
+        "typing after forwards.save sends zero bytes to hidden terminal PTY"
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        session_focused(cx, session),
+        "pressing Escape to close Forwards restores terminal focus"
+    );
+
+    // 2. Batch modal (`Batch`) over a live terminal:
+    //    Focus `batch.step.field.0` -> click `batch.switch.library`, then back to `batch.switch.editor`,
+    //    focus `batch.step.field.0` -> click `batch.switch.history`, then press `Escape` to close Batch.
+    click(cx, "session.more");
+    click(cx, "session.more.batch");
+    cx.run_until_parked();
+    type_into(cx, "batch.step.field.0", "uptime");
+    click(cx, "batch.switch.library");
+    redraw(cx);
+    assert!(cx.debug_bounds("batch.dialog").is_some());
+    assert!(
+        !session_focused(cx, session),
+        "switching Batch to Library after focusing step field must not focus hidden terminal"
+    );
+    cx.simulate_input("echo leaked-batch-lib");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session).len(),
+        sent_before,
+        "typing on Batch Library tab sends zero bytes to hidden terminal PTY"
+    );
+
+    click(cx, "batch.switch.editor");
+    cx.run_until_parked();
+    type_into(cx, "batch.step.field.0", " -p");
+    click(cx, "batch.switch.history");
+    redraw(cx);
+    assert!(
+        !session_focused(cx, session),
+        "switching Batch to History after focusing step field must not focus hidden terminal"
+    );
+    cx.simulate_input("echo leaked-batch-hist");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session).len(),
+        sent_before,
+        "typing on Batch History tab sends zero bytes to hidden terminal PTY"
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        session_focused(cx, session),
+        "pressing Escape to close Batch restores terminal focus"
+    );
+
+    // 3. Quick Connect modal (`quick_open`) over a live terminal:
+    //    Focus `quick.password`, then switch auth method to `quick.method.agent` (unmounts password field).
+    go(cx, crate::app::actions::OpenPalette);
+    cx.simulate_input(ENGLISH.quick_connect);
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    click(cx, "quick.method.password");
+    type_into(cx, "quick.password", "s3cr3t");
+    click(cx, "quick.method.agent");
+    redraw(cx);
+    assert!(
+        !session_focused(cx, session),
+        "switching Quick Connect auth method away from focused password field must not focus hidden terminal"
+    );
+    cx.simulate_input("echo leaked-quick");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session).len(),
+        sent_before,
+        "typing after Quick Connect auth switch sends zero bytes to hidden terminal PTY"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(session_focused(cx, session));
+
+    // 4. Async remote connection completion (`on_remote_ready` -> `attach_pane` -> `focus_pane` +
+    //    `pane_focus_pending`) while a blocking modal (`Tool::Forwards`) is open must NOT steal
+    //    keyboard focus through the modal backdrop, and closing the modal afterwards hands focus
+    //    to the newly connected active terminal.
+    let second_host = cx.update(|_window, app| view.read(app).book().hosts()[1].clone());
+    cx.update(|_window, app| {
+        view.update(app, |v, cx| {
+            v.open_remote(&second_host, cx);
+            v.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::Connected,
+                    shellune_ssh::RemoteEvent::Data(b"db ready\r\n$ ".to_vec()),
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    // Open Forwards modal BEFORE the async connection finishes.
+    go(cx, crate::app::actions::OpenPalette);
+    cx.simulate_input(ENGLISH.nav_forwards);
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        Some(crate::app::view::Tool::Forwards)
+    );
+
+    // Now complete the async SSH handshake while Forwards stays open.
+    cx.update(|_window, app| {
+        view.update(app, |v, cx| v.pump_remote_once(cx));
+    });
+    cx.run_until_parked();
+    redraw(cx);
+
+    let second_session = cx.update(|_window, app| {
+        view.read(app)
+            .workspace()
+            .sessions()
+            .items()
+            .iter()
+            .map(shellune_core::Session::id)
+            .find(|id| *id != session && view.read(app).pane_of(*id).is_some())
+            .expect("second remote session attached")
+    });
+    let second_sent_before = snippet_sent(cx, &view, second_session).len();
+    assert!(
+        !session_focused(cx, session) && !session_focused(cx, second_session),
+        "async remote readiness while Forwards modal is open must not focus either terminal behind the backdrop"
+    );
+    cx.simulate_input("echo leaked-async-ready");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session).len(),
+        sent_before,
+        "typing during open Forwards after async connect sends zero bytes to first terminal"
+    );
+    assert_eq!(
+        snippet_sent(cx, &view, second_session).len(),
+        second_sent_before,
+        "typing during open Forwards after async connect sends zero bytes to newly connected terminal"
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        session_focused(cx, second_session),
+        "closing Forwards after async connect hands focus cleanly to the newly active terminal"
+    );
+
+    // 5. Stacked modal (`Rename Tab` via Command Palette) cancelled over `Tool::Transfers`, and
+    //    active session closed (`request_close_session` -> `drop_pane` -> `focus_pane`) while
+    //    `Tool::Transfers` stays open: neither may leak focus to the underlying terminal PTY,
+    //    and closing `Tool::Transfers` afterwards focuses the remaining active terminal.
+    click(cx, "session.more");
+    click(cx, "session.more.transfers");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        Some(crate::app::view::Tool::Transfers)
+    );
+    go(cx, crate::app::actions::OpenPalette);
+    cx.simulate_input(ENGLISH.tab_menu_rename);
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape"); // cancel Rename Tab while Transfers stays open
+    cx.run_until_parked();
+    redraw(cx);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        Some(crate::app::view::Tool::Transfers)
+    );
+    assert!(
+        !session_focused(cx, session) && !session_focused(cx, second_session),
+        "cancelling stacked Rename Tab over Transfers must not focus hidden terminal PTY"
+    );
+    cx.simulate_input("echo leaked-stacked-rename");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, second_session).len(),
+        second_sent_before
+    );
+
+    // Close the active `second_session` while `Transfers` remains open (`drop_pane` -> `focus_pane`).
+    cx.update(|_window, app| {
+        view.update(app, |v, cx| v.request_close_session(second_session, cx));
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        !session_focused(cx, session),
+        "closing active session behind open Transfers must not steal focus to remaining terminal"
+    );
+    cx.simulate_input("echo leaked-after-drop-pane");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(snippet_sent(cx, &view, session).len(), sent_before);
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        session_focused(cx, session),
+        "closing Transfers focuses the remaining active terminal"
+    );
+}
