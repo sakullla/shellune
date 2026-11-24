@@ -39,12 +39,66 @@ use shellune_storage::{
 
 use super::ShelluneView;
 use super::shell::{ModalBehaviour, ModalContent};
-use crate::app::components::{self, Variant, checkbox};
+use crate::app::components::{self, ControlState, Variant, checkbox};
 use crate::app::copy::{self, Locale, SecurityStrings};
 use crate::app::icons::Icon;
 use crate::app::text_field::TextField;
 use crate::app::theme::{self, Metrics, Tone, palette, radius, spacing};
 use crate::app::workspace::SectionStatus;
+
+/// Minimum available width (before zoom) at which the home vault workbench uses a
+/// side-by-side master-detail layout instead of a single column.
+const VAULT_SPLIT_MIN_WIDTH: f32 = 760.0;
+
+/// Width of the master-detail right column, before zoom.
+const VAULT_DETAIL_WIDTH: f32 = 360.0;
+
+/// Filter applied to the vault workbench lists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SecurityFilter {
+    /// Both SSH keys and shared passwords.
+    #[default]
+    All,
+    /// SSH keys only.
+    Keys,
+    /// Shared passwords only.
+    Credentials,
+    /// Records not referenced by any saved connection.
+    Unused,
+}
+
+impl SecurityFilter {
+    pub(crate) const ALL: [Self; 4] = [Self::All, Self::Keys, Self::Credentials, Self::Unused];
+
+    fn selector(self) -> &'static str {
+        match self {
+            Self::All => "security.filter.all",
+            Self::Keys => "security.filter.keys",
+            Self::Credentials => "security.filter.credentials",
+            Self::Unused => "security.filter.unused",
+        }
+    }
+
+    fn label(self, strings: &'static SecurityStrings) -> &'static str {
+        match self {
+            Self::All => strings.filter_all,
+            Self::Keys => strings.filter_keys,
+            Self::Credentials => strings.filter_credentials,
+            Self::Unused => strings.filter_unused,
+        }
+    }
+}
+
+/// Which open connection draft should automatically bind a newly created vault record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingVaultBind {
+    /// Bind the created/imported `KeyId` to the open SSH host draft.
+    SshManagedKey,
+    /// Bind the created `CredentialId` to the open SSH host draft.
+    SshSharedCredential,
+    /// Bind the created `CredentialId` to the open RDP/VNC connection draft.
+    DesktopSharedCredential,
+}
 
 /// The widest the public key line of a detail card is drawn.
 const PUBLIC_KEY_MAX_WIDTH: f32 = 520.0;
@@ -111,6 +165,18 @@ pub(crate) struct SecurityPage {
     /// The notice of the last operation: its tone and its sentence, never a
     /// secret.
     notice: Option<(Tone, String)>,
+    /// Filter applied to the vault lists.
+    filter: SecurityFilter,
+    /// Keyboard cursor across the visible vault rows.
+    cursor: Option<SecurityRecord>,
+    /// Focus handle for keyboard navigation on the vault lists.
+    list_focus: gpui::FocusHandle,
+    /// Scroll handle of the left master list in the split workbench.
+    list_scroll: ScrollHandle,
+    /// Scroll handle of the right detail pane in the split workbench.
+    detail_scroll: ScrollHandle,
+    /// Pending connection-dialog target to bind when an inline creation finishes.
+    pending_bind: Option<PendingVaultBind>,
     /// The record whose detail card is drawn.
     detail: Option<SecurityRecord>,
     /// Whether the detail card shows the password. Reset by every move, so a
@@ -142,6 +208,12 @@ pub(crate) struct SecurityPage {
     /// The held job result, until the test releases it.
     #[cfg(test)]
     held: Option<SecurityResult>,
+    /// Holds the finish of a system verification so tests can assert the waiting UI.
+    #[cfg(test)]
+    hold_verify: bool,
+    /// The held verification answer, until the test releases it.
+    #[cfg(test)]
+    held_verify: Option<Result<(), BiometricError>>,
 }
 
 /// The lock of this one device: what it asks before the vault may be read, and
@@ -201,6 +273,8 @@ pub(crate) enum SecurityPending {
     EnableBiometric,
     /// Turn the biometric switch off, after one fresh verification.
     DisableBiometric,
+    /// Open a security action dialog once the vault unlocks.
+    OpenAction(SecurityAction),
 }
 
 impl VaultLock {
@@ -377,6 +451,14 @@ pub(crate) enum SecurityDialog {
         user: Entity<TextField>,
         /// The new password, empty to keep the current one.
         secret: Entity<TextField>,
+        /// The chosen length of a generated password.
+        length: Entity<TextField>,
+        /// Whether letters are part of a generated password.
+        letters: bool,
+        /// Whether digits are part of one.
+        digits: bool,
+        /// Whether symbols are part of one.
+        symbols: bool,
         /// The last refusal.
         refusal: Option<String>,
     },
@@ -418,7 +500,35 @@ impl SecurityPage {
             field.set_clearable(true, cx);
             field
         });
-        cx.observe(&search, |_, _, cx| cx.notify()).detach();
+        let list_focus = cx.focus_handle();
+        let search_tab_view = cx.entity().downgrade();
+        search.update(cx, |field, _cx| {
+            field.on_tab(move |shift, window, app| {
+                if shift {
+                    return false;
+                }
+                let can_focus = search_tab_view
+                    .read_with(app, |view, _app| {
+                        !view.vault_locked() && view.security_record_count() > 0
+                    })
+                    .unwrap_or(false);
+                if !can_focus {
+                    return false;
+                }
+                let target_view = search_tab_view.clone();
+                window.defer(app, move |window, app| {
+                    let _ = target_view.update(app, |view, cx| {
+                        view.security_focus_list(window, cx);
+                    });
+                });
+                true
+            });
+        });
+        cx.observe(&search, |this, _, cx| {
+            this.security.revealed = false;
+            cx.notify();
+        })
+        .detach();
         let trust_search = cx.new(|cx| {
             let mut field = TextField::new(strings.trust_search_placeholder, cx);
             field.set_leading_icon(Icon::Search, cx);
@@ -453,6 +563,12 @@ impl SecurityPage {
             warming: false,
             open_problem: None,
             notice: None,
+            filter: SecurityFilter::All,
+            cursor: None,
+            list_focus,
+            list_scroll: ScrollHandle::new(),
+            detail_scroll: ScrollHandle::new(),
+            pending_bind: None,
             detail: None,
             revealed: false,
             dialog: None,
@@ -464,6 +580,10 @@ impl SecurityPage {
             hold_finish: false,
             #[cfg(test)]
             held: None,
+            #[cfg(test)]
+            hold_verify: false,
+            #[cfg(test)]
+            held_verify: None,
         }
     }
 
@@ -509,9 +629,9 @@ fn device_name(root: &std::path::Path) -> String {
 /// What one vault job changed, in words the page can show without a secret.
 pub(crate) enum SecurityReport {
     /// A key record was created (import or generation) or its metadata edited.
-    KeySaved,
+    KeySaved(KeyId),
     /// A shared password record was created.
-    CredentialSaved,
+    CredentialSaved(CredentialId),
     /// A shared password was edited; every reference now uses the new value.
     CredentialEdited,
     /// An independent copy of a shared password was created.
@@ -538,7 +658,12 @@ pub(crate) enum SecurityReport {
         path: PathBuf,
     },
     /// An import was accepted with a warning worth reading.
-    ImportedWithWarning(String),
+    ImportedWithWarning {
+        /// The imported key's identity.
+        id: KeyId,
+        /// The warning shown after import.
+        warning: String,
+    },
     /// An accepted server identity was removed (R7).
     TrustForgotten {
         /// The server it was for, as the page names it.
@@ -611,6 +736,9 @@ struct SecurityRow {
     caption: String,
     chip: String,
     hosts: usize,
+    host_names: Vec<String>,
+    public_key: Option<String>,
+    user: Option<String>,
     created: SystemTime,
 }
 
@@ -628,8 +756,8 @@ struct TrustRow {
 }
 
 /// The immediate actions of the page and its detail cards.
-#[derive(Clone, Copy, Debug)]
-enum SecurityAction {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SecurityAction {
     /// Open the import dialog.
     Import,
     /// Open the generate dialog.
@@ -661,18 +789,178 @@ impl ShelluneView {
         copy::security_for(self.workspace.locale())
     }
 
-    /// The whole page: the actions, the search, the detail card of the chosen
-    /// record and the two lists.
+    /// The whole page in Settings: single-column with a collapsible detail card.
     pub(super) fn security_page(&self, cx: &mut Context<Self>) -> Div {
+        self.security_workbench(false, cx)
+    }
+
+    /// The first-class vault workbench mounted inside the home page's main card.
+    pub(super) fn home_vault_main(
+        &self,
+        _window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let strings = self.security_strings();
+        let ux = copy::ux();
+        let folded = self.home_sidebar_folded();
+        let toggle = components::icon_only_button(Icon::Sidebar, metrics)
+            .id("home.sidebar.toggle")
+            .debug_selector(|| "home.sidebar.toggle".to_owned())
+            .tooltip(components::tooltip(if folded {
+                ux.home_sidebar_expand
+            } else {
+                ux.home_sidebar_collapse
+            }))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.toggle_home_sidebar(cx);
+            }));
+
+        let count_or_state = if self.security.lock.locked {
+            components::chip(strings.vault_locked_badge, Tone::Warning, metrics)
+                .debug_selector(|| "header.count".to_owned())
+                .into_any_element()
+        } else {
+            let total = self.security_record_count();
+            div()
+                .flex_none()
+                .px(metrics.scale(spacing::TIGHT))
+                .py(metrics.scale(spacing::HALF))
+                .rounded_full()
+                .bg(theme::swatch(palette::SURFACE_SELECTED))
+                .text_size(metrics.caption_size())
+                .font_weight(metrics.medium_weight())
+                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                .debug_selector(|| "header.count".to_owned())
+                .child(components::line_text(total.to_string()))
+                .into_any_element()
+        };
+
+        let mut toolbar_right = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(metrics.scale(spacing::HALF));
+        if self.security_topbar_lock_shown() {
+            let locked = self.security.lock.locked;
+            let verifying = self.security.lock.verifying;
+            let label = if verifying {
+                strings.lock_state_verifying
+            } else if locked {
+                strings.lock_unlock
+            } else {
+                strings.lock_now
+            };
+            toolbar_right = toolbar_right.child(
+                components::icon_label_button(
+                    if locked { Icon::Lock } else { Icon::Unlock },
+                    label,
+                    if locked {
+                        Variant::Primary
+                    } else {
+                        Variant::Ghost
+                    },
+                    metrics,
+                )
+                .h(metrics.compact_control_height())
+                .id("security.toolbar.lock")
+                .debug_selector(|| "security.toolbar.lock".to_owned())
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    if locked {
+                        this.security_begin(Vec::new(), cx);
+                    } else {
+                        this.security_lock_now(cx);
+                    }
+                })),
+            );
+        }
+
+        let toolbar = components::toolbar_row(metrics)
+            .debug_selector(|| "security.toolbar".to_owned())
+            .flex_wrap()
+            .child(toggle)
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .gap(metrics.scale(spacing::SNUG))
+                    .min_w_0()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(metrics.heading_size())
+                            .font_weight(metrics.title_weight())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .debug_selector(|| "header.title".to_owned())
+                            .child(components::line_text(strings.vault_nav_title)),
+                    )
+                    .child(count_or_state),
+            )
+            .child(toolbar_right);
+
+        div()
+            .id("home.vault")
+            .debug_selector(|| "home.vault".to_owned())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_none()
+                    .w_full()
+                    .border_b_1()
+                    .border_color(theme::swatch(palette::BORDER))
+                    .child(toolbar),
+            )
+            .child(
+                div()
+                    .id("home.vault.scroll")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .overflow_x_hidden()
+                    .px(metrics.scale(spacing::WIDE))
+                    .py(metrics.scale(spacing::BASE))
+                    .child(self.security_workbench(true, cx)),
+            )
+    }
+
+    /// Shared vault workbench body mounted in both Home (`in_home == true`) and Settings.
+    fn security_workbench(&self, in_home: bool, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.security_strings();
         let mut page = div()
+            .track_focus(&self.security.list_focus)
             .flex()
             .flex_col()
             .w_full()
             .min_w_0()
+            .when(in_home, |el| el.flex_1().min_h_0())
             .gap(metrics.scale(spacing::BASE))
-            .debug_selector(|| "security.page".to_owned());
+            .debug_selector(|| "security.page".to_owned())
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.security_workbench_capture_key(event, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                if event.keystroke.key == "escape"
+                    && event.keystroke.modifiers.number_of_modifiers() == 0
+                    && this.security_close_detail(cx)
+                {
+                    cx.stop_propagation();
+                }
+            }));
 
         if let Some(reason) = &self.security.open_problem {
             page = page.child(
@@ -703,8 +991,8 @@ impl ShelluneView {
             );
         }
         if self.security.lock.locked {
-            // A locked vault shows its state and the one way out where the
-            // lists would be: the secrets are not in memory to list (R3).
+            // A locked vault shows only banners and the unlock card — never active
+            // creation controls or misleading "no keys / no passwords" empty lists (R2).
             let locked = div()
                 .flex()
                 .flex_col()
@@ -746,7 +1034,7 @@ impl ShelluneView {
                         this.security_begin(Vec::new(), cx);
                     })),
                 );
-            page = page.child(locked);
+            return page.child(locked);
         }
         if let Some(public_key) = &self.security.rotation_public_key {
             page = page.child(self.security_rotation_result(public_key, cx));
@@ -790,32 +1078,169 @@ impl ShelluneView {
                 }))
             });
         }
-        page = page.child(actions).child(
-            div()
-                .flex()
-                .w_full()
-                .min_w_0()
-                .debug_selector(|| "security.search".to_owned())
-                .child(self.security.search.clone()),
-        );
 
-        if let Some(record) = self.security.detail
-            && let Some(card) = self.security_detail(record, cx)
-        {
-            page = page.child(card);
+        let mut filters = components::segmented(metrics)
+            .flex_wrap()
+            .max_w_full()
+            .debug_selector(|| "security.filter".to_owned());
+        for filter in SecurityFilter::ALL {
+            let chosen = self.security.filter == filter;
+            let selector = filter.selector();
+            filters = filters.child(
+                components::segment(filter.label(strings), chosen, metrics)
+                    .id(SharedString::from(selector))
+                    .debug_selector(move || selector.to_owned())
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.security_set_filter(filter, cx);
+                    })),
+            );
         }
 
         page = page
-            .child(self.security_list(true, cx))
-            .child(self.security_list(false, cx))
+            .child(actions)
             .child(
                 div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .debug_selector(|| "security.secrets.hidden".to_owned())
-                    .child(strings.secrets_hidden),
-            );
-        page
+                    .flex()
+                    .w_full()
+                    .min_w_0()
+                    .debug_selector(|| "security.search".to_owned())
+                    .child(self.security.search.clone()),
+            )
+            .child(div().flex().min_w_0().max_w_full().child(filters));
+
+        let sidebar_room = if self.home_sidebar_folded() {
+            super::home::SIDEBAR_FOLDED_WIDTH
+        } else {
+            super::home::SIDEBAR_WIDTH
+        };
+        let wide_split = in_home
+            && (self.viewport_width - metrics.scale(sidebar_room + spacing::TIGHT))
+                >= metrics.scale(VAULT_SPLIT_MIN_WIDTH);
+
+        let lists_column = self.security_filtered_lists(cx).child(
+            div()
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .debug_selector(|| "security.secrets.hidden".to_owned())
+                .child(strings.secrets_hidden),
+        );
+
+        if wide_split {
+            let detail_pane = match self
+                .security
+                .detail
+                .and_then(|record| self.security_detail(record, cx))
+            {
+                Some(card) => card,
+                None => components::card(metrics)
+                    .w_full()
+                    .p(metrics.scale(spacing::BASE))
+                    .debug_selector(|| "security.detail.placeholder".to_owned())
+                    .child(
+                        div()
+                            .whitespace_normal()
+                            .text_size(metrics.label_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(strings.detail_select_hint),
+                    ),
+            };
+            page.child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .items_start()
+                    .gap(metrics.scale(spacing::BASE))
+                    .debug_selector(|| "security.split".to_owned())
+                    .child(
+                        div()
+                            .id("security.list.scroll")
+                            .track_scroll(&self.security.list_scroll)
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .max_h_full()
+                            .overflow_y_scroll()
+                            .overflow_x_hidden()
+                            .child(lists_column),
+                    )
+                    .child(
+                        div()
+                            .id("security.detail.scroll")
+                            .track_scroll(&self.security.detail_scroll)
+                            .flex()
+                            .flex_col()
+                            .flex_none()
+                            .w(metrics.scale(VAULT_DETAIL_WIDTH))
+                            .max_w(gpui::relative(0.46))
+                            .min_w_0()
+                            .max_h_full()
+                            .overflow_y_scroll()
+                            .overflow_x_hidden()
+                            .child(detail_pane),
+                    ),
+            )
+        } else {
+            if let Some(record) = self.security.detail
+                && let Some(card) = self.security_detail(record, cx)
+            {
+                page = page.child(card);
+            }
+            page.child(lists_column)
+        }
+    }
+
+    /// Renders the key and/or shared password lists matching the active [`SecurityFilter`].
+    fn security_filtered_lists(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.security_strings();
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .gap(metrics.scale(spacing::BASE));
+        match self.security.filter {
+            SecurityFilter::All => {
+                col = col
+                    .child(self.security_list(true, cx))
+                    .child(self.security_list(false, cx));
+            }
+            SecurityFilter::Keys => {
+                col = col.child(self.security_list(true, cx));
+            }
+            SecurityFilter::Credentials => {
+                col = col.child(self.security_list(false, cx));
+            }
+            SecurityFilter::Unused => {
+                let key_rows = self.security_rows(true, cx);
+                let cred_rows = self.security_rows(false, cx);
+                if key_rows.is_empty() && cred_rows.is_empty() {
+                    let narrowed = !self.security.search.read(cx).text().trim().is_empty();
+                    col = col.child(
+                        div()
+                            .text_size(metrics.label_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .debug_selector(|| "security.unused.empty".to_owned())
+                            .child(if narrowed {
+                                strings.no_match
+                            } else {
+                                strings.empty_unused
+                            }),
+                    );
+                } else {
+                    if !key_rows.is_empty() {
+                        col = col.child(self.security_list(true, cx));
+                    }
+                    if !cred_rows.is_empty() {
+                        col = col.child(self.security_list(false, cx));
+                    }
+                }
+            }
+        }
+        col
     }
 
     /// The public key a finished rotation asks the user to deploy, with the
@@ -910,6 +1335,51 @@ impl ShelluneView {
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .debug_selector(|| "security.busy".to_owned())
                     .child(strings.busy),
+            );
+        }
+        if self.security.lock.locked {
+            page = page.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .w_full()
+                    .min_w_0()
+                    .p(metrics.scale(spacing::BASE))
+                    .rounded(px(radius::MEDIUM))
+                    .border_1()
+                    .border_color(theme::swatch(palette::BORDER))
+                    .bg(Tone::Warning.chip_background())
+                    .debug_selector(|| "security.trust.locked".to_owned())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(strings.trust_locked_hint),
+                    )
+                    .child(
+                        components::compact_button(
+                            if self.security.lock.verifying {
+                                strings.lock_state_verifying
+                            } else {
+                                strings.lock_unlock
+                            },
+                            Variant::Primary,
+                            metrics,
+                        )
+                        .id("security.trust.unlock")
+                        .debug_selector(|| "security.trust.unlock".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.security_begin(Vec::new(), cx);
+                            },
+                        )),
+                    ),
             );
         }
         page.child(self.trust_list(cx))
@@ -1271,6 +1741,8 @@ impl ShelluneView {
             (strings.credentials_title, "security.credentials")
         };
         let locale = self.workspace.locale();
+        let query = self.security.search.read(cx).text().trim().to_owned();
+        let busy = self.security.busy() || self.security.dialog.is_some();
         let column = div()
             .flex()
             .flex_col()
@@ -1293,7 +1765,7 @@ impl ShelluneView {
             } else {
                 strings.empty_credentials
             };
-            let narrowed = !self.security.search.read(cx).text().trim().is_empty();
+            let narrowed = !query.is_empty();
             return column.child(
                 div()
                     .text_size(metrics.label_size())
@@ -1303,6 +1775,7 @@ impl ShelluneView {
             );
         }
         let selected = self.security.detail;
+        let cursor = self.security.cursor;
         let count = rows.len();
         let mut card = components::card(metrics).w_full().p(px(0.0)).gap(px(0.0));
         for (index, row) in rows.into_iter().enumerate() {
@@ -1312,9 +1785,13 @@ impl ShelluneView {
                 caption,
                 chip,
                 hosts,
+                host_names,
+                public_key,
+                user,
                 created,
             } = row;
             let chosen = selected == Some(record);
+            let focused = cursor == Some(record);
             let row_selector = if keys {
                 format!("security.key.{index}")
             } else {
@@ -1323,7 +1800,19 @@ impl ShelluneView {
             let hosts_line = if hosts == 0 {
                 strings.not_referenced.to_owned()
             } else {
-                copy::fill(strings.hosts_count, &[("count", &hosts.to_string())])
+                let count_text = copy::fill(strings.hosts_count, &[("count", &hosts.to_string())]);
+                let preview: Vec<&str> = host_names.iter().take(2).map(String::as_str).collect();
+                if host_names.len() > 2 {
+                    format!(
+                        "{count_text} ({}, +{})",
+                        preview.join(", "),
+                        host_names.len() - 2
+                    )
+                } else if !preview.is_empty() {
+                    format!("{count_text} ({})", preview.join(", "))
+                } else {
+                    count_text
+                }
             };
             let created_line = copy::fill(
                 strings.created,
@@ -1332,8 +1821,118 @@ impl ShelluneView {
                     &copy::relative_time(unix_of(created), remote_now(), locale),
                 )],
             );
+            let meta_line = format!("{hosts_line} · {created_line}");
+
+            let mut row_actions = div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(metrics.scale(spacing::HAIRLINE));
+            match record {
+                SecurityRecord::Key(key_id) => {
+                    if let Some(pub_key) = public_key {
+                        let copy_sel = format!("security.key.copy.{index}");
+                        row_actions = row_actions.child(
+                            components::icon_only_button(Icon::Copy, metrics)
+                                .id(SharedString::from(copy_sel.clone()))
+                                .debug_selector({
+                                    let selector = copy_sel.clone();
+                                    move || selector.clone()
+                                })
+                                .tooltip(components::tooltip(strings.copy_public_key))
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    cx.stop_propagation();
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        pub_key.clone(),
+                                    ));
+                                    this.toast(
+                                        Tone::Positive,
+                                        copy::ux_for(this.workspace.locale()).toast_copied,
+                                        None,
+                                        cx,
+                                    );
+                                })),
+                        );
+                    }
+                    let edit_sel = format!("security.key.edit.{index}");
+                    let edit_btn = components::icon_only_button(Icon::Pencil, metrics)
+                        .id(SharedString::from(edit_sel.clone()))
+                        .debug_selector({
+                            let selector = edit_sel.clone();
+                            move || selector.clone()
+                        })
+                        .tooltip(components::tooltip(strings.edit));
+                    row_actions = row_actions.child(if busy {
+                        edit_btn
+                    } else {
+                        edit_btn.on_click(cx.listener(move |this, _event, _window, cx| {
+                            cx.stop_propagation();
+                            this.security_start(SecurityAction::EditKey(key_id), cx);
+                        }))
+                    });
+                }
+                SecurityRecord::Credential(cred_id) => {
+                    if let Some(user_val) = user.filter(|u| !u.trim().is_empty()) {
+                        let copy_user_sel = format!("security.credential.copy-user.{index}");
+                        row_actions = row_actions.child(
+                            components::icon_only_button(Icon::Copy, metrics)
+                                .id(SharedString::from(copy_user_sel.clone()))
+                                .debug_selector({
+                                    let selector = copy_user_sel.clone();
+                                    move || selector.clone()
+                                })
+                                .tooltip(components::tooltip(strings.copy_username))
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    cx.stop_propagation();
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        user_val.clone(),
+                                    ));
+                                    this.toast(
+                                        Tone::Positive,
+                                        copy::ux_for(this.workspace.locale()).toast_copied,
+                                        Some(user_val.clone()),
+                                        cx,
+                                    );
+                                })),
+                        );
+                    }
+                    let copy_pass_sel = format!("security.credential.copy-password.{index}");
+                    row_actions = row_actions.child(
+                        components::icon_only_button(Icon::Lock, metrics)
+                            .id(SharedString::from(copy_pass_sel.clone()))
+                            .debug_selector({
+                                let selector = copy_pass_sel.clone();
+                                move || selector.clone()
+                            })
+                            .tooltip(components::tooltip(strings.copy_password))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                cx.stop_propagation();
+                                this.security_copy_password(cred_id, cx);
+                            })),
+                    );
+                    let edit_sel = format!("security.credential.edit.{index}");
+                    let edit_btn = components::icon_only_button(Icon::Pencil, metrics)
+                        .id(SharedString::from(edit_sel.clone()))
+                        .debug_selector({
+                            let selector = edit_sel.clone();
+                            move || selector.clone()
+                        })
+                        .tooltip(components::tooltip(strings.edit));
+                    row_actions = row_actions.child(if busy {
+                        edit_btn
+                    } else {
+                        edit_btn.on_click(cx.listener(move |this, _event, _window, cx| {
+                            cx.stop_propagation();
+                            this.security_start(SecurityAction::EditCredential(cred_id), cx);
+                        }))
+                    });
+                }
+            }
+
+            let hover_bg = theme::swatch(palette::SURFACE_HOVER);
             card = card.child(
                 div()
+                    .group("security-row")
                     .flex()
                     .w_full()
                     .min_w_0()
@@ -1348,6 +1947,8 @@ impl ShelluneView {
                     .when(chosen, |row| {
                         row.bg(theme::swatch(palette::SURFACE_SELECTED))
                     })
+                    .when(!chosen && focused, |row| row.bg(hover_bg))
+                    .when(!chosen, |row| row.hover(move |style| style.bg(hover_bg)))
                     .cursor_pointer()
                     .id(SharedString::from(row_selector.clone()))
                     .debug_selector({
@@ -1355,7 +1956,7 @@ impl ShelluneView {
                         move || selector.clone()
                     })
                     .child(
-                        components::accent_mark(chosen, metrics)
+                        components::accent_mark(chosen || focused, metrics)
                             .h_auto()
                             .my(metrics.scale(spacing::SNUG)),
                     )
@@ -1379,7 +1980,7 @@ impl ShelluneView {
                                             .text_size(metrics.body_size())
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                            .child(SharedString::from(name)),
+                                            .child(security_highlighted(&name, &query)),
                                     )
                                     .child(components::chip_within(
                                         SharedString::from(chip),
@@ -1387,24 +1988,26 @@ impl ShelluneView {
                                         metrics,
                                     )),
                             )
+                            .when(!caption.is_empty(), |col| {
+                                col.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(metrics.caption_size())
+                                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                                        .child(security_highlighted(&caption, &query)),
+                                )
+                            })
                             .child(
                                 div()
                                     .min_w_0()
                                     .truncate()
                                     .text_size(metrics.caption_size())
-                                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                                    .child(SharedString::from(caption)),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_size(metrics.caption_size())
                                     .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                                    .child(SharedString::from(format!(
-                                        "{hosts_line} · {created_line}"
-                                    ))),
+                                    .child(security_highlighted(&meta_line, &query)),
                             ),
                     )
+                    .child(row_actions)
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         this.security_pick(record, cx);
                     })),
@@ -1413,12 +2016,13 @@ impl ShelluneView {
         column.child(card)
     }
 
-    /// The rows of one list, narrowed by the search.
+    /// The rows of one list, narrowed by the search and active [`SecurityFilter`].
     fn security_rows(&self, keys: bool, cx: &App) -> Vec<SecurityRow> {
         let Some(content) = self.security.content.as_ref() else {
             return Vec::new();
         };
         let strings = self.security_strings();
+        let unused_only = self.security.filter == SecurityFilter::Unused;
         let query = self.security.search.read(cx).text().trim().to_lowercase();
         let needles: Vec<String> = query.split_whitespace().map(str::to_owned).collect();
         let narrowed = !needles.is_empty();
@@ -1452,6 +2056,9 @@ impl ShelluneView {
                     continue;
                 }
                 let referencing = self.referencing_records(Some(meta.id()), None);
+                if unused_only && !referencing.is_empty() {
+                    continue;
+                }
                 let haystacks: Vec<String> = [
                     meta.name().to_lowercase(),
                     meta.algorithm().to_lowercase(),
@@ -1470,6 +2077,12 @@ impl ShelluneView {
                     caption: format!("{} · {}", meta.algorithm(), meta.fingerprint()),
                     chip: strings.kind_key.to_owned(),
                     hosts: referencing.len(),
+                    host_names: referencing
+                        .iter()
+                        .map(|host| host.name().to_owned())
+                        .collect(),
+                    public_key: Some(meta.public_key().to_owned()),
+                    user: None,
                     created: meta.created_at(),
                 });
             }
@@ -1488,6 +2101,9 @@ impl ShelluneView {
             for entry in live {
                 let meta = entry.meta();
                 let referencing = self.referencing_records(None, Some(meta.id()));
+                if unused_only && !referencing.is_empty() {
+                    continue;
+                }
                 let haystacks: Vec<String> = [
                     meta.name().to_lowercase(),
                     meta.user().unwrap_or_default().to_lowercase(),
@@ -1504,6 +2120,12 @@ impl ShelluneView {
                     caption: meta.user().map(str::to_owned).unwrap_or_default(),
                     chip: strings.kind_credential.to_owned(),
                     hosts: referencing.len(),
+                    host_names: referencing
+                        .iter()
+                        .map(|host| host.name().to_owned())
+                        .collect(),
+                    public_key: None,
+                    user: meta.user().map(str::to_owned),
                     created: meta.created_at(),
                 });
             }
@@ -1545,11 +2167,22 @@ impl ShelluneView {
             .gap(px(0.0))
             .debug_selector(|| "security.detail".to_owned());
 
+        let close_button = components::icon_only_button(Icon::Close, metrics)
+            .id("security.detail.close")
+            .debug_selector(|| "security.detail.close".to_owned())
+            .tooltip(components::tooltip(strings.close))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.security_close_detail(cx);
+            }));
+
         match record {
             SecurityRecord::Key(id) => {
                 let entry = content.key(id)?;
                 let meta = entry.meta();
                 let referencing = self.referencing_records(Some(id), None);
+                let rotate_disabled = referencing
+                    .is_empty()
+                    .then_some(strings.rotate_disabled_unused);
                 let mut body = div()
                     .flex()
                     .flex_col()
@@ -1563,29 +2196,40 @@ impl ShelluneView {
                         div()
                             .flex()
                             .items_center()
+                            .justify_between()
                             .gap(metrics.scale(spacing::TIGHT))
                             .min_w_0()
-                            .flex_wrap()
                             .child(
                                 div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(metrics.scale(spacing::TIGHT))
                                     .min_w_0()
-                                    .truncate()
-                                    .text_size(metrics.body_size())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                    .child(SharedString::from(meta.name().to_owned())),
+                                    .flex_wrap()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(metrics.body_size())
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                            .child(SharedString::from(meta.name().to_owned())),
+                                    )
+                                    .child(components::chip_within(
+                                        SharedString::from(strings.kind_key),
+                                        Tone::Accent,
+                                        metrics,
+                                    )),
                             )
-                            .child(components::chip_within(
-                                SharedString::from(strings.kind_key),
-                                Tone::Accent,
-                                metrics,
-                            )),
+                            .child(close_button),
                     );
                 if let Some(comment) = meta.comment().filter(|text| !text.trim().is_empty()) {
                     body = body.child(self.security_fact(
                         strings.label_comment,
                         comment.to_owned(),
                         None,
+                        None,
+                        cx,
                     ));
                 }
                 body = body
@@ -1593,25 +2237,35 @@ impl ShelluneView {
                         strings.label_algorithm,
                         meta.algorithm().to_owned(),
                         None,
+                        None,
+                        cx,
                     ))
                     .child(self.security_fact(
                         strings.label_fingerprint,
                         meta.fingerprint().to_owned(),
                         Some("security.detail.fingerprint"),
+                        Some(("security.detail.copy.fingerprint", strings.copy_fingerprint)),
+                        cx,
                     ))
                     .child(self.security_fact(
                         strings.label_public_key,
                         meta.public_key().to_owned(),
                         Some("security.detail.public"),
+                        Some(("security.detail.copy.public", strings.copy_public_key)),
+                        cx,
                     ));
                 card = card.child(body);
                 card = card.child(self.security_references(&referencing, record, cx));
                 card = card.child(self.security_actions_row(
                     &[
-                        (SecurityAction::EditKey(id), strings.edit),
-                        (SecurityAction::RotateKey(id), strings.rotate),
-                        (SecurityAction::ExportKey(id), strings.export_choose),
-                        (SecurityAction::DeleteKey(id), strings.delete),
+                        (SecurityAction::EditKey(id), strings.edit, None),
+                        (
+                            SecurityAction::RotateKey(id),
+                            strings.rotate,
+                            rotate_disabled,
+                        ),
+                        (SecurityAction::ExportKey(id), strings.export_choose, None),
+                        (SecurityAction::DeleteKey(id), strings.delete, None),
                     ],
                     busy,
                     cx,
@@ -1634,23 +2288,32 @@ impl ShelluneView {
                         div()
                             .flex()
                             .items_center()
+                            .justify_between()
                             .gap(metrics.scale(spacing::TIGHT))
                             .min_w_0()
-                            .flex_wrap()
                             .child(
                                 div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(metrics.scale(spacing::TIGHT))
                                     .min_w_0()
-                                    .truncate()
-                                    .text_size(metrics.body_size())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                    .child(SharedString::from(meta.name().to_owned())),
+                                    .flex_wrap()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(metrics.body_size())
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                            .child(SharedString::from(meta.name().to_owned())),
+                                    )
+                                    .child(components::chip_within(
+                                        SharedString::from(strings.kind_credential),
+                                        Tone::Accent,
+                                        metrics,
+                                    )),
                             )
-                            .child(components::chip_within(
-                                SharedString::from(strings.kind_credential),
-                                Tone::Accent,
-                                metrics,
-                            )),
+                            .child(close_button),
                     );
                 if let Some(user) = meta.user().filter(|text| !text.trim().is_empty()) {
                     // Copyable the way the fingerprint and the public key are:
@@ -1660,6 +2323,8 @@ impl ShelluneView {
                         strings.label_user,
                         user.to_owned(),
                         Some("security.detail.user"),
+                        Some(("security.detail.copy.user", strings.copy_username)),
+                        cx,
                     ));
                 }
                 // The password itself: hidden by default, shown while this one
@@ -1726,22 +2391,13 @@ impl ShelluneView {
                     // one, and a pass is never carried to the next (R3).
                     let copy_id = id;
                     password_row = password_row.child(
-                        div()
-                            .cursor_pointer()
+                        components::compact_button(strings.copy_value, Variant::Ghost, metrics)
+                            .id("security.detail.copy.password")
                             .debug_selector(|| "security.detail.copy.password".to_owned())
-                            .on_mouse_down(
-                                gpui::MouseButton::Left,
-                                cx.listener(move |this, _event, _window, cx| {
-                                    this.security_copy_password(copy_id, cx);
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_size(metrics.caption_size())
-                                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                                    .child(strings.copy_value),
-                            ),
+                            .tooltip(components::tooltip(strings.copy_password))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.security_copy_password(copy_id, cx);
+                            })),
                     );
                 }
                 body = body.child(password_row);
@@ -1749,9 +2405,13 @@ impl ShelluneView {
                 card = card.child(self.security_references(&referencing, record, cx));
                 card = card.child(self.security_actions_row(
                     &[
-                        (SecurityAction::EditCredential(id), strings.edit),
-                        (SecurityAction::DuplicateCredential(id), strings.duplicate),
-                        (SecurityAction::DeleteCredential(id), strings.delete),
+                        (SecurityAction::EditCredential(id), strings.edit, None),
+                        (
+                            SecurityAction::DuplicateCredential(id),
+                            strings.duplicate,
+                            None,
+                        ),
+                        (SecurityAction::DeleteCredential(id), strings.delete, None),
                     ],
                     busy,
                     cx,
@@ -1761,14 +2421,17 @@ impl ShelluneView {
         Some(card)
     }
 
-    /// One fact line of a detail card, copyable when it is long and public.
+    /// One fact line of a detail card, with an explicit copy button and toast when copyable.
     fn security_fact(
         &self,
         label: &'static str,
         value: String,
         selector: Option<&'static str>,
+        copy_control: Option<(&'static str, &'static str)>,
+        cx: &mut Context<Self>,
     ) -> Div {
         let metrics = self.metrics();
+        let strings = self.security_strings();
         let mut column = div()
             .flex()
             .flex_col()
@@ -1791,17 +2454,40 @@ impl ShelluneView {
         if let Some(selector) = selector {
             line = line.debug_selector(move || selector.to_owned());
         }
-        // A fingerprint and a public key are what a person copies elsewhere;
-        // the comment and the user name are short enough to select by hand.
+        let copy_value = value.clone();
         let line = if selector.is_some() {
             components::copy_on_click(line, value.clone()).child(SharedString::from(value))
         } else {
             line.child(SharedString::from(value))
         };
-        column.child(div().flex().items_center().min_w_0().child(line))
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .flex_wrap()
+            .min_w_0()
+            .child(line);
+        if let Some((copy_selector, copy_tip)) = copy_control {
+            row = row.child(
+                components::compact_button(strings.copy_value, Variant::Ghost, metrics)
+                    .id(SharedString::from(copy_selector))
+                    .debug_selector(move || copy_selector.to_owned())
+                    .tooltip(components::tooltip(copy_tip))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_value.clone()));
+                        this.toast(
+                            Tone::Positive,
+                            copy::ux_for(this.workspace.locale()).toast_copied,
+                            None,
+                            cx,
+                        );
+                    })),
+            );
+        }
+        column.child(row)
     }
 
-    /// The connections that reference a record, each with its unbind action.
+    /// The connections that reference a record, each with edit and unbind actions.
     fn security_references(
         &self,
         hosts: &[ConnectionRecord],
@@ -1836,6 +2522,7 @@ impl ShelluneView {
         }
         for (index, host) in hosts.iter().enumerate() {
             let id = host.id();
+            let edit_selector = format!("security.detail.edit-host.{index}");
             let selector = format!("security.detail.unbind.{index}");
             column = column.child(
                 div()
@@ -1851,6 +2538,19 @@ impl ShelluneView {
                             .text_size(metrics.label_size())
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
                             .child(SharedString::from(host.name().to_owned())),
+                    )
+                    .child(
+                        components::compact_button(strings.edit, Variant::Ghost, metrics)
+                            .id(SharedString::from(edit_selector.clone()))
+                            .debug_selector({
+                                let edit_selector = edit_selector.clone();
+                                move || edit_selector.clone()
+                            })
+                            .when(!busy, |button| {
+                                button.on_click(cx.listener(move |this, _event, _window, cx| {
+                                    this.edit_saved_connection(id, cx);
+                                }))
+                            }),
                     )
                     .child(
                         components::compact_button(strings.unbind, Variant::Ghost, metrics)
@@ -1873,7 +2573,7 @@ impl ShelluneView {
     /// The action buttons of one detail card.
     fn security_actions_row(
         &self,
-        actions: &[(SecurityAction, &'static str)],
+        actions: &[(SecurityAction, &'static str, Option<&'static str>)],
         busy: bool,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -1886,22 +2586,33 @@ impl ShelluneView {
             .px(metrics.scale(spacing::BASE))
             .py(metrics.scale(spacing::SNUG))
             .debug_selector(|| "security.detail.actions".to_owned());
-        for (index, (action, label)) in actions.iter().copied().enumerate() {
+        for (index, (action, label, disabled_reason)) in actions.iter().copied().enumerate() {
             let selector = format!("security.detail.action.{index}");
             let reserved = components::compact_label_reserved_width(label, metrics);
-            let button = components::compact_button(label, Variant::Secondary, metrics)
-                .min_w(reserved)
-                .max_w_full()
-                .flex_shrink()
-                .whitespace_normal()
-                .h(gpui::auto())
-                .min_h(metrics.compact_control_height())
-                .id(SharedString::from(selector.clone()))
-                .debug_selector({
-                    let selector = selector.clone();
-                    move || selector.clone()
-                });
-            row = row.child(if busy {
+            let state = if disabled_reason.is_some() || busy {
+                ControlState::Disabled
+            } else {
+                ControlState::Resting
+            };
+            let button =
+                components::compact_button_with_state(label, Variant::Secondary, state, metrics)
+                    .min_w(reserved)
+                    .max_w_full()
+                    .flex_shrink()
+                    .whitespace_normal()
+                    .h(gpui::auto())
+                    .min_h(metrics.compact_control_height())
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector({
+                        let selector = selector.clone();
+                        move || selector.clone()
+                    });
+            let button = if let Some(reason) = disabled_reason {
+                button.tooltip(components::tooltip(reason))
+            } else {
+                button
+            };
+            row = row.child(if busy || disabled_reason.is_some() {
                 button
             } else {
                 button.on_click(cx.listener(move |this, _event, _window, cx| {
@@ -1917,20 +2628,18 @@ impl ShelluneView {
     // -----------------------------------------------------------------------
 
     /// Opens the dialog, or runs the immediate action, one control asked for.
-    fn security_start(&mut self, action: SecurityAction, cx: &mut Context<Self>) {
+    pub(crate) fn security_start(&mut self, action: SecurityAction, cx: &mut Context<Self>) {
         if self.security.busy() || self.security.dialog.is_some() {
             return;
         }
         let strings = self.security_strings();
         match action {
             SecurityAction::Import => {
-                let pem = cx.new(|cx| {
-                    let mut field = TextField::new(strings.import_pem, cx);
-                    field.set_keeps_line_breaks(true, cx);
-                    field
-                });
+                let pem = self.security_dialog_text_field(strings.import_pem, "", true, false, cx);
                 let passphrase = self.security_secret_field(cx);
-                let name = cx.new(|cx| TextField::new(strings.import_name, cx));
+                let name =
+                    self.security_dialog_text_field(strings.import_name, "", false, true, cx);
+                self.field_focus_pending = Some(pem.read(cx).focus_handle().clone());
                 self.security.dialog = Some(SecurityDialog::ImportKey {
                     pem,
                     passphrase,
@@ -1939,8 +2648,11 @@ impl ShelluneView {
                 });
             }
             SecurityAction::Generate => {
-                let name = cx.new(|cx| TextField::new(strings.generate_name, cx));
-                let comment = cx.new(|cx| TextField::new(strings.generate_comment, cx));
+                let name =
+                    self.security_dialog_text_field(strings.generate_name, "", false, true, cx);
+                let comment =
+                    self.security_dialog_text_field(strings.generate_comment, "", false, true, cx);
+                self.field_focus_pending = Some(name.read(cx).focus_handle().clone());
                 self.security.dialog = Some(SecurityDialog::GenerateKey {
                     kind: keys_api::ManagedKeyKind::Ed25519,
                     name,
@@ -1949,11 +2661,19 @@ impl ShelluneView {
                 });
             }
             SecurityAction::NewCredential => {
-                let name = cx.new(|cx| TextField::new(strings.credential_name, cx));
-                let user = cx.new(|cx| TextField::new(strings.credential_user, cx));
+                let name =
+                    self.security_dialog_text_field(strings.credential_name, "", false, true, cx);
+                let user =
+                    self.security_dialog_text_field(strings.credential_user, "", false, true, cx);
                 let secret = self.security_secret_field(cx);
-                let length =
-                    cx.new(|cx| TextField::with_text("", PASSWORD_LENGTH_DEFAULT.to_string(), cx));
+                let length = self.security_dialog_text_field(
+                    "",
+                    &PASSWORD_LENGTH_DEFAULT.to_string(),
+                    false,
+                    false,
+                    cx,
+                );
+                self.field_focus_pending = Some(name.read(cx).focus_handle().clone());
                 self.security.dialog = Some(SecurityDialog::NewCredential {
                     name,
                     user,
@@ -1966,18 +2686,24 @@ impl ShelluneView {
                 });
             }
             SecurityAction::EditKey(id) => {
-                let Some(entry) = self
+                let Some((initial_name, initial_comment)) = self
                     .security
                     .content
                     .as_ref()
                     .and_then(|vault| vault.key(id))
+                    .map(|entry| {
+                        (
+                            entry.meta().name().to_owned(),
+                            entry.meta().comment().unwrap_or_default().to_owned(),
+                        )
+                    })
                 else {
                     return;
                 };
-                let meta = entry.meta();
-                let name = cx.new(|cx| TextField::with_text("", meta.name(), cx));
+                let name = self.security_dialog_text_field("", &initial_name, false, true, cx);
                 let comment =
-                    cx.new(|cx| TextField::with_text("", meta.comment().unwrap_or_default(), cx));
+                    self.security_dialog_text_field("", &initial_comment, false, true, cx);
+                self.field_focus_pending = Some(name.read(cx).focus_handle().clone());
                 self.security.dialog = Some(SecurityDialog::EditKey {
                     key: id,
                     name,
@@ -1991,6 +2717,7 @@ impl ShelluneView {
                 }
                 let passphrase = self.security_secret_field(cx);
                 let confirm = self.security_secret_field(cx);
+                self.field_focus_pending = Some(passphrase.read(cx).focus_handle().clone());
                 self.security.dialog = Some(SecurityDialog::ExportKey {
                     key: id,
                     passphrase,
@@ -2018,7 +2745,14 @@ impl ShelluneView {
                     .and_then(|vault| vault.key(id))
                     .map(|entry| entry.meta().name().to_owned())
                     .unwrap_or_default();
-                let name = cx.new(|cx| TextField::with_text("", format!("{previous_name} 2"), cx));
+                let name = self.security_dialog_text_field(
+                    "",
+                    &format!("{previous_name} 2"),
+                    false,
+                    true,
+                    cx,
+                );
+                self.field_focus_pending = Some(name.read(cx).focus_handle().clone());
                 self.security.dialog = Some(SecurityDialog::RotateKey {
                     previous: id,
                     kind: keys_api::ManagedKeyKind::Ed25519,
@@ -2037,24 +2771,40 @@ impl ShelluneView {
                 self.security.dialog = Some(SecurityDialog::DeleteKey { key: id, affected });
             }
             SecurityAction::EditCredential(id) => {
-                let Some(entry) = self
+                let Some((initial_name, initial_user)) = self
                     .security
                     .content
                     .as_ref()
                     .and_then(|vault| vault.credential(id))
+                    .map(|entry| {
+                        (
+                            entry.meta().name().to_owned(),
+                            entry.meta().user().unwrap_or_default().to_owned(),
+                        )
+                    })
                 else {
                     return;
                 };
-                let meta = entry.meta();
-                let name = cx.new(|cx| TextField::with_text("", meta.name(), cx));
-                let user =
-                    cx.new(|cx| TextField::with_text("", meta.user().unwrap_or_default(), cx));
+                let name = self.security_dialog_text_field("", &initial_name, false, true, cx);
+                let user = self.security_dialog_text_field("", &initial_user, false, true, cx);
                 let secret = self.security_secret_field(cx);
+                let length = self.security_dialog_text_field(
+                    "",
+                    &PASSWORD_LENGTH_DEFAULT.to_string(),
+                    false,
+                    false,
+                    cx,
+                );
+                self.field_focus_pending = Some(name.read(cx).focus_handle().clone());
                 self.security.dialog = Some(SecurityDialog::EditCredential {
                     credential: id,
                     name,
                     user,
                     secret,
+                    length,
+                    letters: true,
+                    digits: true,
+                    symbols: true,
                     refusal: None,
                 });
             }
@@ -2074,6 +2824,46 @@ impl ShelluneView {
         cx.notify();
     }
 
+    /// Creates a dialog text field that clears stale refusal banners on edit and
+    /// optionally submits the dialog on Enter.
+    fn security_dialog_text_field(
+        &self,
+        placeholder: &'static str,
+        initial: &str,
+        keeps_breaks: bool,
+        submit_on_enter: bool,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextField> {
+        let initial_owned = initial.to_owned();
+        let field = cx.new(|cx| {
+            let mut field = if initial_owned.is_empty() {
+                TextField::new(placeholder, cx)
+            } else {
+                TextField::with_text(placeholder, initial_owned, cx)
+            };
+            if keeps_breaks {
+                field.set_keeps_line_breaks(true, cx);
+            }
+            field
+        });
+        if submit_on_enter {
+            let view = cx.entity().downgrade();
+            field.update(cx, |field, _cx| {
+                field.on_submit(move |_text, window, app| {
+                    let submit_view = view.clone();
+                    window.defer(app, move |_window, app| {
+                        let _ = submit_view.update(app, |view, cx| {
+                            view.security_submit(cx);
+                        });
+                    });
+                    false
+                });
+            });
+        }
+        self.security_observe_dialog_field(&field, cx);
+        field
+    }
+
     /// A masked, revealable field for a secret a dialog asks for.
     fn security_secret_field(&self, cx: &mut Context<Self>) -> Entity<TextField> {
         let strings = self.security_strings();
@@ -2083,8 +2873,93 @@ impl ShelluneView {
             field.set_revealable(true, cx);
             field
         });
-        cx.observe(&field, |_, _, cx| cx.notify()).detach();
+        let view = cx.entity().downgrade();
+        field.update(cx, |field, _cx| {
+            field.on_submit(move |_text, window, app| {
+                let submit_view = view.clone();
+                window.defer(app, move |_window, app| {
+                    let _ = submit_view.update(app, |view, cx| {
+                        view.security_submit(cx);
+                    });
+                });
+                false
+            });
+        });
+        self.security_observe_dialog_field(&field, cx);
         field
+    }
+
+    fn security_observe_dialog_field(&self, field: &Entity<TextField>, cx: &mut Context<Self>) {
+        let mut previous = field.read(cx).text().to_owned();
+        cx.observe(field, move |this, field, cx| {
+            let now = field.read(cx).text();
+            if now != previous {
+                previous = now.to_owned();
+                if let Some(slot) = this.security_refusal_slot() {
+                    *slot = None;
+                }
+            }
+            cx.notify();
+        })
+        .detach();
+    }
+
+    /// Opens the system file picker to load a local private key file into the Import dialog.
+    fn security_browse_import_file(&mut self, cx: &mut Context<Self>) {
+        let answer = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = answer.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = this.update(cx, |view, cx| view.security_load_import_file(&path, cx));
+        })
+        .detach();
+    }
+
+    /// Reads `path` into the open `ImportKey` dialog's PEM field and auto-fills `name`
+    /// with the filename when `name` is still empty.
+    pub(crate) fn security_load_import_file(
+        &mut self,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) {
+        let strings = self.security_strings();
+        let Some(SecurityDialog::ImportKey {
+            pem, name, refusal, ..
+        }) = self.security.dialog.as_mut()
+        else {
+            return;
+        };
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                let pem = pem.clone();
+                let name = name.clone();
+                *refusal = None;
+                pem.update(cx, |field, cx| field.set_text(contents, cx));
+                if name.read(cx).text().trim().is_empty()
+                    && let Some(file_name) = path
+                        .file_name()
+                        .and_then(|os| os.to_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                {
+                    let suggested = file_name.to_owned();
+                    name.update(cx, |field, cx| field.set_text(suggested, cx));
+                }
+            }
+            Err(error) => {
+                *refusal = Some(format!("{}: {error}", strings.import_file_failed));
+            }
+        }
+        cx.notify();
     }
 
     fn security_key_missing(&self, id: KeyId) -> bool {
@@ -2095,21 +2970,194 @@ impl ShelluneView {
             .is_none()
     }
 
+    /// Switches the active [`SecurityFilter`], clearing revealed secrets and any
+    /// detail selection that the new filter hides.
+    fn security_set_filter(&mut self, filter: SecurityFilter, cx: &mut Context<Self>) {
+        if self.security.filter == filter {
+            return;
+        }
+        self.security.filter = filter;
+        self.security.revealed = false;
+        let visible = self.security_visible_records(cx);
+        if let Some(detail) = self.security.detail
+            && !visible.contains(&detail)
+        {
+            self.security.detail = None;
+        }
+        if let Some(cursor) = self.security.cursor
+            && !visible.contains(&cursor)
+        {
+            self.security.cursor = visible.first().copied();
+        }
+        cx.notify();
+    }
+
+    /// All currently visible records in visual list order.
+    pub(crate) fn security_visible_records(&self, cx: &App) -> Vec<SecurityRecord> {
+        if self.security.lock.locked {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        match self.security.filter {
+            SecurityFilter::All | SecurityFilter::Unused => {
+                out.extend(self.security_rows(true, cx).into_iter().map(|r| r.record));
+                out.extend(self.security_rows(false, cx).into_iter().map(|r| r.record));
+            }
+            SecurityFilter::Keys => {
+                out.extend(self.security_rows(true, cx).into_iter().map(|r| r.record));
+            }
+            SecurityFilter::Credentials => {
+                out.extend(self.security_rows(false, cx).into_iter().map(|r| r.record));
+            }
+        }
+        out
+    }
+
+    /// Moves keyboard focus from the search box into the vault record list.
+    pub(crate) fn security_focus_list(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let visible = self.security_visible_records(cx);
+        if visible.is_empty() {
+            return false;
+        }
+        if self.security.cursor.is_none_or(|c| !visible.contains(&c)) {
+            self.security.cursor = self
+                .security
+                .detail
+                .filter(|d| visible.contains(d))
+                .or_else(|| visible.first().copied());
+        }
+        window.focus(&self.security.list_focus);
+        cx.notify();
+        true
+    }
+
+    /// Steps the keyboard cursor up or down across visible vault records.
+    pub(crate) fn security_step_cursor(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        let visible = self.security_visible_records(cx);
+        if visible.is_empty() {
+            return false;
+        }
+        let current = self
+            .security
+            .cursor
+            .or(self.security.detail)
+            .and_then(|record| visible.iter().position(|candidate| *candidate == record));
+        let next = match current {
+            Some(index) => {
+                if delta >= 0 {
+                    (index + 1).min(visible.len() - 1)
+                } else {
+                    index.saturating_sub(1)
+                }
+            }
+            None => {
+                if delta >= 0 {
+                    0
+                } else {
+                    visible.len() - 1
+                }
+            }
+        };
+        self.security.cursor = Some(visible[next]);
+        cx.notify();
+        true
+    }
+
+    /// Opens the detail card for the keyboard-focused vault record.
+    pub(crate) fn security_activate_cursor(&mut self, cx: &mut Context<Self>) -> bool {
+        let visible = self.security_visible_records(cx);
+        if visible.is_empty() {
+            return false;
+        }
+        let target = self
+            .security
+            .cursor
+            .filter(|record| visible.contains(record))
+            .or_else(|| visible.first().copied());
+        let Some(record) = target else {
+            return false;
+        };
+        self.security.cursor = Some(record);
+        self.security_pick(record, cx);
+        true
+    }
+
+    fn security_workbench_capture_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.security.lock.locked || self.security.dialog.is_some() {
+            return false;
+        }
+        if event.keystroke.modifiers.number_of_modifiers() != 0 {
+            return false;
+        }
+        let search_focused = self
+            .security
+            .search
+            .read(cx)
+            .focus_handle()
+            .is_focused(window);
+        match event.keystroke.key.as_str() {
+            "down" => {
+                if search_focused {
+                    window.focus(&self.security.list_focus);
+                }
+                self.security_step_cursor(1, cx)
+            }
+            "up" if !search_focused => self.security_step_cursor(-1, cx),
+            "enter" if !search_focused => self.security_activate_cursor(cx),
+            _ => false,
+        }
+    }
+
     /// Chooses the record whose detail card is drawn.
     fn security_pick(&mut self, record: SecurityRecord, cx: &mut Context<Self>) {
         self.security.detail = Some(record);
+        self.security.cursor = Some(record);
         // A reveal belongs to the record it was asked for, never to the next.
         self.security.revealed = false;
         cx.notify();
     }
 
+    /// Collapses the detail card and clears any revealed secret.
+    pub(crate) fn security_close_detail(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.security.detail.is_some() || self.security.revealed {
+            self.security.detail = None;
+            self.security.revealed = false;
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    /// Resets any revealed secret when leaving the vault view.
+    pub(crate) fn security_reset_reveal(&mut self) {
+        self.security.revealed = false;
+    }
+
     /// Closes the page's dialog; a job in flight keeps it until it ends.
-    fn security_close_dialog(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn security_close_dialog(&mut self, cx: &mut Context<Self>) {
         if self.security.busy {
             return;
         }
+        let had_bind = self.security.pending_bind.take();
         self.security.dialog = None;
         self.security.rotation_public_key = None;
+        self.restore_focus_pending = true;
+        if matches!(
+            had_bind,
+            Some(PendingVaultBind::SshManagedKey | PendingVaultBind::SshSharedCredential)
+        ) && self.host_fields.is_some()
+        {
+            self.focus_host_dialog = true;
+        }
         cx.notify();
     }
 
@@ -2208,38 +3256,50 @@ impl ShelluneView {
     /// Turns one character class of the password generator on or off.
     fn security_toggle_charset(&mut self, which: u8, cx: &mut Context<Self>) {
         self.security_dialog_with(
-            |dialog| {
-                if let SecurityDialog::NewCredential {
+            |dialog| match dialog {
+                SecurityDialog::NewCredential {
                     letters,
                     digits,
                     symbols,
                     ..
-                } = dialog
-                {
-                    match which {
-                        0 => *letters = !*letters,
-                        1 => *digits = !*digits,
-                        _ => *symbols = !*symbols,
-                    }
                 }
+                | SecurityDialog::EditCredential {
+                    letters,
+                    digits,
+                    symbols,
+                    ..
+                } => match which {
+                    0 => *letters = !*letters,
+                    1 => *digits = !*digits,
+                    _ => *symbols = !*symbols,
+                },
+                _ => {}
             },
             cx,
         );
     }
 
-    /// Fills the new-password field with a generated value, so the value is
+    /// Fills the password field with a generated value, so the value is
     /// visible, editable and refused as a whole when no class remains.
     fn security_generate_password(&mut self, cx: &mut Context<Self>) {
-        let Some(SecurityDialog::NewCredential {
-            secret,
-            length,
-            letters,
-            digits,
-            symbols,
-            ..
-        }) = self.security.dialog.as_ref()
-        else {
-            return;
+        let (secret, length, letters, digits, symbols) = match self.security.dialog.as_ref() {
+            Some(SecurityDialog::NewCredential {
+                secret,
+                length,
+                letters,
+                digits,
+                symbols,
+                ..
+            })
+            | Some(SecurityDialog::EditCredential {
+                secret,
+                length,
+                letters,
+                digits,
+                symbols,
+                ..
+            }) => (secret.clone(), length.clone(), *letters, *digits, *symbols),
+            _ => return,
         };
         let length = length
             .read(cx)
@@ -2249,9 +3309,8 @@ impl ShelluneView {
             .ok()
             .unwrap_or(PASSWORD_LENGTH_DEFAULT)
             .clamp(PASSWORD_LENGTH_MIN, PASSWORD_LENGTH_MAX);
-        let value = generate_password(length, *letters, *digits, *symbols);
-        let field = secret.clone();
-        field.update(cx, |field, cx| field.set_text(value, cx));
+        let value = generate_password(length, letters, digits, symbols);
+        secret.update(cx, |field, cx| field.set_text(value, cx));
         cx.notify();
     }
 
@@ -2381,6 +3440,7 @@ impl ShelluneView {
                     if let Some(slot) = self.security_refusal_slot() {
                         *slot = Some(strings.import_missing.to_owned());
                     }
+                    self.security_focus_missing_field(cx);
                     cx.notify();
                     return;
                 }
@@ -2401,6 +3461,7 @@ impl ShelluneView {
                     if let Some(slot) = self.security_refusal_slot() {
                         *slot = Some(strings.name_required.to_owned());
                     }
+                    self.security_focus_missing_field(cx);
                     cx.notify();
                     return;
                 }
@@ -2415,10 +3476,11 @@ impl ShelluneView {
                         // it with a passphrase of its own.
                         let body = keys_api::export_private_key(&key, None)
                             .map_err(|error| error.to_string())?;
+                        let id = KeyId::new();
                         content
                             .insert_key(VaultKeyRecord::new(
                                 ManagedKeyMeta::new(
-                                    KeyId::new(),
+                                    id,
                                     name,
                                     public.algorithm,
                                     public.authorized_key,
@@ -2430,7 +3492,7 @@ impl ShelluneView {
                             ))
                             .map_err(|error| error.to_string())?;
                         Ok(SecurityChange::Save {
-                            report: SecurityReport::KeySaved,
+                            report: SecurityReport::KeySaved(id),
                             records: Vec::new(),
                         })
                     }),
@@ -2464,7 +3526,7 @@ impl ShelluneView {
                         );
                         replace_key_meta(content, key, edited)?;
                         Ok(SecurityChange::Save {
-                            report: SecurityReport::KeySaved,
+                            report: SecurityReport::KeySaved(key),
                             records: Vec::new(),
                         })
                     }),
@@ -2532,10 +3594,11 @@ impl ShelluneView {
                 let device = self.security.device.clone();
                 self.security_run(
                     Box::new(move |content, _, _| {
+                        let id = CredentialId::new();
                         content
                             .insert_credential(VaultCredentialRecord::new(
                                 CredentialMeta::new(
-                                    CredentialId::new(),
+                                    id,
                                     name,
                                     (!user.is_empty()).then(|| user.clone()),
                                     VaultRecordVersion::new(1, device),
@@ -2544,7 +3607,7 @@ impl ShelluneView {
                             ))
                             .map_err(|error| error.to_string())?;
                         Ok(SecurityChange::Save {
-                            report: SecurityReport::CredentialSaved,
+                            report: SecurityReport::CredentialSaved(id),
                             records: Vec::new(),
                         })
                     }),
@@ -2729,6 +3792,41 @@ impl ShelluneView {
             | Some(SecurityDialog::NewCredential { refusal, .. })
             | Some(SecurityDialog::EditCredential { refusal, .. }) => Some(refusal),
             _ => None,
+        }
+    }
+
+    /// Places keyboard focus in the open dialog's first empty required field after a refusal.
+    fn security_focus_missing_field(&mut self, cx: &App) {
+        let target = match self.security.dialog.as_ref() {
+            Some(SecurityDialog::ImportKey { pem, name, .. }) => {
+                if pem.read(cx).text().trim().is_empty() {
+                    Some(pem.read(cx).focus_handle().clone())
+                } else {
+                    Some(name.read(cx).focus_handle().clone())
+                }
+            }
+            Some(
+                SecurityDialog::GenerateKey { name, .. }
+                | SecurityDialog::EditKey { name, .. }
+                | SecurityDialog::RotateKey { name, .. },
+            ) => Some(name.read(cx).focus_handle().clone()),
+            Some(SecurityDialog::NewCredential { name, secret, .. }) => {
+                if name.read(cx).text().trim().is_empty() {
+                    Some(name.read(cx).focus_handle().clone())
+                } else {
+                    Some(secret.read(cx).focus_handle().clone())
+                }
+            }
+            Some(SecurityDialog::EditCredential { name, .. }) => {
+                Some(name.read(cx).focus_handle().clone())
+            }
+            Some(SecurityDialog::ExportKey { passphrase, .. }) => {
+                Some(passphrase.read(cx).focus_handle().clone())
+            }
+            _ => None,
+        };
+        if target.is_some() {
+            self.field_focus_pending = target;
         }
     }
 
@@ -3022,6 +4120,51 @@ impl ShelluneView {
                     }
                 }
                 self.security.job_book = None;
+                if matches!(
+                    report,
+                    SecurityReport::KeyDeleted | SecurityReport::CredentialDeleted
+                ) {
+                    self.security.detail = None;
+                    self.security.revealed = false;
+                }
+                match (self.security.pending_bind.take(), &report) {
+                    (
+                        Some(PendingVaultBind::SshManagedKey),
+                        SecurityReport::KeySaved(id)
+                        | SecurityReport::ImportedWithWarning { id, .. },
+                    ) => {
+                        if let Some(draft) = self.hosts.draft_mut() {
+                            draft.set_auth(shellune_core::AuthMethodKind::ManagedKey);
+                            draft.set_managed_key(Some(*id));
+                        }
+                        self.focus_host_dialog = true;
+                    }
+                    (
+                        Some(PendingVaultBind::SshSharedCredential),
+                        SecurityReport::CredentialSaved(id),
+                    ) => {
+                        if let Some(draft) = self.hosts.draft_mut() {
+                            draft.set_auth(shellune_core::AuthMethodKind::Password);
+                            draft.set_credential(Some(*id));
+                        }
+                        self.focus_host_dialog = true;
+                    }
+                    (
+                        Some(PendingVaultBind::DesktopSharedCredential),
+                        SecurityReport::CredentialSaved(id),
+                    ) => {
+                        if let Some(draft) = self.hosts.protocol_draft_mut() {
+                            draft.set_credential(Some(*id));
+                        }
+                        self.restore_focus_pending = true;
+                    }
+                    (Some(_), _) => {
+                        self.restore_focus_pending = true;
+                    }
+                    (None, _) => {
+                        self.restore_focus_pending = true;
+                    }
+                }
                 let (tone, text) = if drifted.is_empty() {
                     security_report_text(&report, strings)
                 } else {
@@ -3081,7 +4224,7 @@ impl ShelluneView {
         };
         let store = VaultStore::at(self.store.root());
         let secrets = self.secrets.clone();
-        let records = self.book.records();
+        let records = records_for_vault_mirror(&content, &content, &self.book.records());
         content.set_references(&HostReference::snapshot_records(&records));
         self.security.busy = true;
         let work = cx.background_executor().spawn(async move {
@@ -3122,7 +4265,7 @@ impl ShelluneView {
     fn security_rollback(&mut self, previous: VaultContent, cx: &mut Context<Self>) {
         let store = VaultStore::at(self.store.root());
         let secrets = self.secrets.clone();
-        let records = self.book.records();
+        let records = records_for_vault_mirror(&previous, &previous, &self.book.records());
         self.security.busy = true;
         let work = cx.background_executor().spawn(async move {
             store
@@ -3196,7 +4339,19 @@ impl ShelluneView {
                 view.security.warming = false;
                 match opened {
                     Ok(Some(content)) => {
+                        let first_live_key = content
+                            .keys()
+                            .filter(|record| record.meta().is_live())
+                            .min_by(|a, b| a.meta().name().cmp(b.meta().name()))
+                            .map(|record| record.meta().id());
                         view.security.content = Some(content);
+                        if let Some(first) = first_live_key
+                            && let Some(draft) = view.hosts.draft_mut()
+                            && draft.auth() == shellune_core::AuthMethodKind::ManagedKey
+                            && draft.managed_key_id().is_none()
+                        {
+                            draft.set_managed_key(Some(first));
+                        }
                         // An unlock's follow-up steps waited for exactly this
                         // file; they continue now that the vault is open.
                         let waiting = std::mem::take(&mut view.security.lock.pending);
@@ -3331,6 +4486,8 @@ impl ShelluneView {
             .map(|secret| secret.expose().to_owned())
         {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+            let copied_title = self.security_strings().password_copied;
+            self.toast(Tone::Positive, copied_title, None, cx);
         }
         self.security_touch(cx);
     }
@@ -3420,6 +4577,12 @@ impl ShelluneView {
         answer: Result<(), BiometricError>,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(test)]
+        if self.security.hold_verify {
+            self.security.held_verify = Some(answer);
+            cx.notify();
+            return;
+        }
         self.security.lock.verifying = false;
         let strings = self.security_strings();
         match answer {
@@ -3428,28 +4591,40 @@ impl ShelluneView {
                 self.security_resume(queue, cx);
             }
             Err(error) => {
-                self.security.lock.pending.clear();
-                if error.is_enrollment_changed() {
+                let aborted = std::mem::take(&mut self.security.lock.pending);
+                let reason = if error.is_enrollment_changed() {
                     // The biometric set changed, so this device's protection
                     // no longer holds: biometric unlocking is turned off here
                     // until the user re-enables it with a fresh verification
                     // (R4), and the vault stays as it was.
                     self.security_set_biometric(false, cx);
-                    self.security_set_notice(
-                        Tone::Warning,
-                        strings.lock_enrollment_changed.to_owned(),
-                        cx,
-                    );
+                    strings.lock_enrollment_changed.to_owned()
+                } else if error.is_cancelled() {
+                    strings.lock_cancelled.to_owned()
                 } else {
-                    let text = if error.is_cancelled() {
-                        strings.lock_cancelled.to_owned()
-                    } else {
-                        match &error {
-                            BiometricError::Busy { .. } => strings.lock_busy.to_owned(),
-                            _ => format!("{} {}", strings.lock_failed, error),
+                    match &error {
+                        BiometricError::Busy { .. } => strings.lock_busy.to_owned(),
+                        _ => format!("{} {}", strings.lock_failed, error),
+                    }
+                };
+                self.security_set_notice(Tone::Warning, reason.clone(), cx);
+                for step in aborted {
+                    match step {
+                        SecurityPending::ResumeChain(_) => {
+                            if let Some(panel) = self.remote.as_mut() {
+                                panel.set_form_error(reason.clone());
+                            }
                         }
-                    };
-                    self.security_set_notice(Tone::Warning, text, cx);
+                        SecurityPending::Desktop(session) => {
+                            self.workspace.session_failed(
+                                session,
+                                shellune_core::SessionFailure::ConnectionFailed {
+                                    reason: reason.clone(),
+                                },
+                            );
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -3639,6 +4814,8 @@ impl ShelluneView {
                         .map(|secret| secret.expose().to_owned())
                     {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                        let copied_title = self.security_strings().password_copied;
+                        self.toast(Tone::Positive, copied_title, None, cx);
                         self.security_touch(cx);
                     }
                 }
@@ -3673,9 +4850,158 @@ impl ShelluneView {
                 SecurityPending::DisableBiometric => {
                     self.security_set_biometric(false, cx);
                 }
+                SecurityPending::OpenAction(action) => {
+                    self.security_start(action, cx);
+                }
             }
         }
         cx.notify();
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-surface vault queries & entry points
+    // -----------------------------------------------------------------------
+
+    /// Total live keys and shared passwords currently loaded in the unlocked vault.
+    pub(crate) fn security_record_count(&self) -> usize {
+        let Some(content) = self.security.content.as_ref() else {
+            return 0;
+        };
+        content.keys().filter(|r| r.meta().is_live()).count()
+            + content.credentials().filter(|r| r.meta().is_live()).count()
+    }
+
+    /// Whether the topbar should display the vault lock/unlock quick control.
+    pub(crate) fn security_topbar_lock_shown(&self) -> bool {
+        self.security.lock.engaged() || self.security.lock.locked
+    }
+
+    /// Whether a system/biometric verification prompt is currently in flight.
+    pub(crate) fn security_verifying(&self) -> bool {
+        self.security.lock.verifying
+    }
+
+    /// Whether an SSH/chain connection attempt is currently waiting on vault verification/open.
+    pub(crate) fn security_verifying_for_chain(&self) -> bool {
+        (self.security.lock.verifying || self.security.warming)
+            && self
+                .security
+                .lock
+                .pending
+                .iter()
+                .any(|step| matches!(step, SecurityPending::ResumeChain(_)))
+    }
+
+    /// Whether `session` (an RDP/VNC desktop session) is waiting on vault verification/open.
+    pub(crate) fn security_verifying_for_desktop(&self, session: shellune_core::SessionId) -> bool {
+        (self.security.lock.verifying || self.security.warming)
+            && self
+                .security
+                .lock
+                .pending
+                .iter()
+                .any(|step| matches!(step, SecurityPending::Desktop(id) if *id == session))
+    }
+
+    /// Whether any desktop session is currently waiting on vault verification/open, returning its ID.
+    pub(crate) fn security_verifying_desktop_session(&self) -> Option<shellune_core::SessionId> {
+        if !(self.security.lock.verifying || self.security.warming) {
+            return None;
+        }
+        self.security
+            .lock
+            .pending
+            .iter()
+            .find_map(|step| match step {
+                SecurityPending::Desktop(id) => Some(*id),
+                _ => None,
+            })
+    }
+
+    /// Whether a vault modal dialog is currently open.
+    pub(crate) fn security_dialog_open(&self) -> bool {
+        self.security.dialog.is_some()
+    }
+
+    /// Focus handle of the vault search input.
+    pub(crate) fn security_search_focus(&self, cx: &App) -> gpui::FocusHandle {
+        self.security.search.read(cx).focus_handle().clone()
+    }
+
+    /// Clears the vault search input on Escape when it is focused and non-empty.
+    pub(crate) fn security_clear_search_if_focused(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self
+            .security
+            .search
+            .read(cx)
+            .focus_handle()
+            .is_focused(window)
+            && !self.security.search.read(cx).text().is_empty()
+        {
+            let search = self.security.search.clone();
+            search.update(cx, |field, cx| field.set_text("", cx));
+            self.security.revealed = false;
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    /// Whether `id` is known to be missing from the unlocked vault.
+    pub(crate) fn security_vault_key_missing(&self, id: KeyId) -> bool {
+        if self.security.lock.locked || self.security.warming {
+            return false;
+        }
+        match self.security.content.as_ref() {
+            Some(vault) => vault.key(id).is_none_or(|record| !record.meta().is_live()),
+            None => !VaultStore::at(self.store.root()).exists(),
+        }
+    }
+
+    /// Whether `id` is known to be missing from the unlocked vault.
+    pub(crate) fn security_vault_credential_missing(&self, id: CredentialId) -> bool {
+        if self.security.lock.locked || self.security.warming {
+            return false;
+        }
+        match self.security.content.as_ref() {
+            Some(vault) => vault
+                .credential(id)
+                .is_none_or(|record| !record.meta().is_live()),
+            None => !VaultStore::at(self.store.root()).exists(),
+        }
+    }
+
+    /// Opens a vault creation dialog stacked above an open connection draft,
+    /// auto-binding the saved record back into that draft.
+    pub(crate) fn security_open_inline(
+        &mut self,
+        action: SecurityAction,
+        bind: PendingVaultBind,
+        cx: &mut Context<Self>,
+    ) {
+        if self.security.busy() || self.security.dialog.is_some() {
+            return;
+        }
+        self.security.pending_bind = Some(bind);
+        self.security_start(action, cx);
+    }
+
+    /// Opens a vault creation dialog from the Command Palette, unlocking first if locked.
+    pub(crate) fn security_open_palette_action(
+        &mut self,
+        action: SecurityAction,
+        cx: &mut Context<Self>,
+    ) {
+        self.security.pending_bind = None;
+        if self.security.lock.locked {
+            self.security_begin(vec![SecurityPending::OpenAction(action)], cx);
+            return;
+        }
+        self.security_start(action, cx);
     }
 
     // -----------------------------------------------------------------------
@@ -3689,8 +5015,20 @@ impl ShelluneView {
         let metrics = self.metrics();
         let (title, intro, icon, body, footer) = match dialog {
             SecurityDialog::ImportKey { refusal, .. } => {
+                let browse = components::icon_label_button(
+                    Icon::FolderOpen,
+                    strings.import_browse_file,
+                    Variant::Secondary,
+                    metrics,
+                )
+                .id("security.dialog.import.browse")
+                .debug_selector(|| "security.dialog.import.browse".to_owned())
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.security_browse_import_file(cx);
+                }));
                 let body = self
                     .security_dialog_body("security.dialog.import", cx)
+                    .child(div().flex().items_center().child(browse))
                     .child(self.security_dialog_field(
                         "security.dialog.pem",
                         strings.import_pem,
@@ -3711,7 +5049,7 @@ impl ShelluneView {
                             .clone()
                             .map(|reason| security_refusal_banner(reason, metrics)),
                     );
-                let footer = self.security_dialog_footer(strings.import_key, cx);
+                let footer = self.security_dialog_footer(strings.import_key, Variant::Primary, cx);
                 (
                     strings.import_title.to_owned(),
                     Some(strings.import_intro.to_owned()),
@@ -3741,7 +5079,8 @@ impl ShelluneView {
                         .clone()
                         .map(|reason| security_refusal_banner(reason, metrics)),
                 );
-                let footer = self.security_dialog_footer(strings.generate_key, cx);
+                let footer =
+                    self.security_dialog_footer(strings.generate_key, Variant::Primary, cx);
                 (
                     strings.generate_title.to_owned(),
                     None,
@@ -3768,7 +5107,7 @@ impl ShelluneView {
                             .clone()
                             .map(|reason| security_refusal_banner(reason, metrics)),
                     );
-                let footer = self.security_dialog_footer(strings.save, cx);
+                let footer = self.security_dialog_footer(strings.save, Variant::Primary, cx);
                 (
                     strings.edit_key_title.to_owned(),
                     Some(strings.edit_key_note.to_owned()),
@@ -3847,7 +5186,8 @@ impl ShelluneView {
                             .debug_selector(|| "security.dialog.export.saved".to_owned())
                             .child(SharedString::from(path))
                     }));
-                let footer = self.security_dialog_footer(strings.export_choose, cx);
+                let footer =
+                    self.security_dialog_footer(strings.export_choose, Variant::Primary, cx);
                 (
                     strings.export_title.to_owned(),
                     Some(strings.export_intro.to_owned()),
@@ -3925,7 +5265,7 @@ impl ShelluneView {
                             .text_color(theme::swatch(palette::TEXT_MUTED))
                             .child(strings.rotate_intro),
                     );
-                let footer = self.security_dialog_footer(strings.rotate, cx);
+                let footer = self.security_dialog_footer(strings.rotate, Variant::Primary, cx);
                 (
                     strings.rotate_title.to_owned(),
                     Some(strings.rotate_intro.to_owned()),
@@ -3943,7 +5283,7 @@ impl ShelluneView {
                     affected,
                     cx,
                 );
-                let footer = self.security_dialog_footer(strings.delete, cx);
+                let footer = self.security_dialog_footer(strings.delete, Variant::Danger, cx);
                 (
                     strings.delete_key_title.to_owned(),
                     None,
@@ -4016,7 +5356,7 @@ impl ShelluneView {
                             .clone()
                             .map(|reason| security_refusal_banner(reason, metrics)),
                     );
-                let footer = self.security_dialog_footer(strings.save, cx);
+                let footer = self.security_dialog_footer(strings.save, Variant::Primary, cx);
                 (
                     strings.new_credential_title.to_owned(),
                     None,
@@ -4025,8 +5365,14 @@ impl ShelluneView {
                     footer,
                 )
             }
-            SecurityDialog::EditCredential { refusal, .. } => {
-                let body = self
+            SecurityDialog::EditCredential {
+                letters,
+                digits,
+                symbols,
+                refusal,
+                ..
+            } => {
+                let mut body = self
                     .security_dialog_body("security.dialog.edit-credential", cx)
                     .child(self.security_dialog_field(
                         "security.dialog.name",
@@ -4042,13 +5388,48 @@ impl ShelluneView {
                         "security.dialog.secret",
                         strings.edit_credential_password,
                         dialog_secret(dialog),
+                    ));
+                for (which, label, checked) in [
+                    (0_u8, strings.charset_letters, *letters),
+                    (1, strings.charset_digits, *digits),
+                    (2, strings.charset_symbols, *symbols),
+                ] {
+                    let selector = format!("security.dialog.charset.{which}");
+                    body = body.child(security_check(
+                        selector,
+                        label,
+                        checked,
+                        metrics,
+                        cx,
+                        move |this, cx| this.security_toggle_charset(which, cx),
+                    ));
+                }
+                body = body
+                    .child(self.security_dialog_field(
+                        "security.dialog.length",
+                        strings.password_length,
+                        dialog_length(dialog),
                     ))
+                    .child(
+                        components::compact_button(
+                            strings.generate_password,
+                            Variant::Secondary,
+                            metrics,
+                        )
+                        .id("security.dialog.generate.password")
+                        .debug_selector(|| "security.dialog.generate.password".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.security_generate_password(cx);
+                            },
+                        )),
+                    )
                     .children(
                         refusal
                             .clone()
                             .map(|reason| security_refusal_banner(reason, metrics)),
                     );
-                let footer = self.security_dialog_footer(strings.save, cx);
+                let footer = self.security_dialog_footer(strings.save, Variant::Primary, cx);
                 (
                     strings.edit_credential_title.to_owned(),
                     None,
@@ -4066,7 +5447,7 @@ impl ShelluneView {
                     affected,
                     cx,
                 );
-                let footer = self.security_dialog_footer(strings.delete, cx);
+                let footer = self.security_dialog_footer(strings.delete, Variant::Danger, cx);
                 (
                     strings.delete_credential_title.to_owned(),
                     None,
@@ -4114,7 +5495,8 @@ impl ShelluneView {
                             ))),
                     );
                 }
-                let footer = self.security_dialog_footer(strings.trust_delete_action, cx);
+                let footer =
+                    self.security_dialog_footer(strings.trust_delete_action, Variant::Danger, cx);
                 (
                     strings.trust_delete_title.to_owned(),
                     Some(server),
@@ -4137,7 +5519,11 @@ impl ShelluneView {
                             .debug_selector(|| "security.dialog.biometric-risk.body".to_owned())
                             .child(strings.biometric_risk_body),
                     );
-                let footer = self.security_dialog_footer(strings.biometric_risk_confirm, cx);
+                let footer = self.security_dialog_footer(
+                    strings.biometric_risk_confirm,
+                    Variant::Primary,
+                    cx,
+                );
                 (
                     strings.biometric_risk_title.to_owned(),
                     None,
@@ -4304,7 +5690,12 @@ impl ShelluneView {
     }
 
     /// The actions of a dialog: leave it, or run what it describes.
-    fn security_dialog_footer(&self, primary: &'static str, cx: &mut Context<Self>) -> Div {
+    fn security_dialog_footer(
+        &self,
+        primary: &'static str,
+        variant: Variant,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let metrics = self.metrics();
         let strings = self.security_strings();
         components::modal_footer(metrics)
@@ -4322,7 +5713,7 @@ impl ShelluneView {
                 self.text_button(
                     SharedString::from("security.dialog.submit"),
                     primary,
-                    Variant::Primary,
+                    variant,
                     cx,
                     |this, cx| this.security_submit(cx),
                 )
@@ -4349,6 +5740,34 @@ impl ShelluneView {
         if let Some(result) = self.security.held.take() {
             self.security_finished(result, cx);
         }
+    }
+
+    /// Holds (or releases) the finish of the next system verification prompt.
+    pub fn security_hold_verify_for_test(&mut self, hold: bool) {
+        self.security.hold_verify = hold;
+    }
+
+    /// Lets a held system verification finish, applying its answer.
+    pub fn security_release_verify_for_test(&mut self, cx: &mut Context<Self>) {
+        self.security.hold_verify = false;
+        if let Some(answer) = self.security.held_verify.take() {
+            self.security_verify_finished(answer, cx);
+        }
+    }
+
+    /// Reads the open dialog's `name` field text, when present, for tests.
+    pub fn security_dialog_name_for_test(&self, cx: &App) -> Option<String> {
+        dialog_name(self.security.dialog.as_ref()?).map(|field| field.read(cx).text().to_owned())
+    }
+
+    /// Reads the open import dialog's `pem` field text, when present, for tests.
+    pub fn security_dialog_pem_for_test(&self, cx: &App) -> Option<String> {
+        dialog_pem(self.security.dialog.as_ref()?).map(|field| field.read(cx).text().to_owned())
+    }
+
+    /// Whether a vault detail card is currently open.
+    pub fn security_detail_open_for_test(&self) -> bool {
+        self.security.detail.is_some()
     }
 
     /// The live keys of the vault: their identity, name and fingerprint.
@@ -4785,7 +6204,8 @@ fn dialog_secret(dialog: &SecurityDialog) -> Option<&Entity<TextField>> {
 
 fn dialog_length(dialog: &SecurityDialog) -> Option<&Entity<TextField>> {
     match dialog {
-        SecurityDialog::NewCredential { length, .. } => Some(length),
+        SecurityDialog::NewCredential { length, .. }
+        | SecurityDialog::EditCredential { length, .. } => Some(length),
         _ => None,
     }
 }
@@ -4909,12 +6329,15 @@ fn security_apply(
                 }
             }
             // The reference snapshot and the catalog checks run inside the
-            // save: a record pointing at nothing, or a vault whose mirror
-            // disagrees with the book, is refused before any file is touched.
-            content.set_references(&HostReference::snapshot_records(&all));
+            // save: an edit that removed a live record without unbinding its
+            // hosts is refused before any file is touched, while pre-existing
+            // orphan references in `hosts.json` (already absent before this
+            // edit) do not deadlock creating a new record to heal them (R2).
+            let mirror_records = records_for_vault_mirror(&previous, &content, &all);
+            content.set_references(&HostReference::snapshot_records(&mirror_records));
             if let Err(error) = store.save_records(
                 &content,
-                &all,
+                &mirror_records,
                 &vault_unseal_sources(&store, secrets.as_ref()),
                 KdfParams::default(),
                 secrets.as_ref(),
@@ -4934,11 +6357,72 @@ fn security_apply(
     }
 }
 
+/// Filters pre-existing orphan vault references (already missing in `previous` and still
+/// missing in `content`) out of the mirror slice passed to `VaultStore::save_records`, so
+/// a user can create/import a replacement key or password to heal a broken connection while
+/// still rejecting any edit that deletes a live bound record without unbinding its hosts.
+fn records_for_vault_mirror(
+    previous: &VaultContent,
+    content: &VaultContent,
+    records: &[ConnectionRecord],
+) -> Vec<ConnectionRecord> {
+    let key_live = |vault: &VaultContent, id: KeyId| {
+        vault.key(id).is_some_and(|record| record.meta().is_live())
+    };
+    let cred_live = |vault: &VaultContent, id: CredentialId| {
+        vault
+            .credential(id)
+            .is_some_and(|record| record.meta().is_live())
+    };
+    records
+        .iter()
+        .cloned()
+        .map(|mut record| {
+            match &mut record {
+                ConnectionRecord::Ssh(host) => {
+                    if let Some(id) = host.managed_key_id()
+                        && !key_live(previous, id)
+                        && !key_live(content, id)
+                    {
+                        host.set_auth(None);
+                    }
+                    if let Some(id) = host.credential_id()
+                        && !cred_live(previous, id)
+                        && !cred_live(content, id)
+                    {
+                        host.set_auth(None);
+                    }
+                }
+                ConnectionRecord::Rdp(cfg) => {
+                    if let Some(id) = cfg.credential_id()
+                        && !cred_live(previous, id)
+                        && !cred_live(content, id)
+                    {
+                        cfg.set_credential_id(None);
+                    }
+                }
+                ConnectionRecord::Vnc(cfg) => {
+                    if let Some(id) = cfg.credential_id()
+                        && !cred_live(previous, id)
+                        && !cred_live(content, id)
+                    {
+                        cfg.set_credential_id(None);
+                    }
+                }
+                ConnectionRecord::Serial(_) => {}
+            }
+            record
+        })
+        .collect()
+}
+
 /// The localized sentence of one report, and the tone it is drawn in.
 fn security_report_text(report: &SecurityReport, strings: &SecurityStrings) -> (Tone, String) {
     match report {
-        SecurityReport::KeySaved => (Tone::Positive, strings.key_saved.to_owned()),
-        SecurityReport::CredentialSaved => (Tone::Positive, strings.credential_created.to_owned()),
+        SecurityReport::KeySaved(_) => (Tone::Positive, strings.key_saved.to_owned()),
+        SecurityReport::CredentialSaved(_) => {
+            (Tone::Positive, strings.credential_created.to_owned())
+        }
         SecurityReport::CredentialEdited => (Tone::Positive, strings.credential_edited.to_owned()),
         SecurityReport::CredentialDuplicated => {
             (Tone::Positive, strings.credential_duplicated.to_owned())
@@ -4962,7 +6446,7 @@ fn security_report_text(report: &SecurityReport, strings: &SecurityStrings) -> (
                 &[("path", &path.display().to_string())],
             ),
         ),
-        SecurityReport::ImportedWithWarning(warning) => (Tone::Warning, warning.clone()),
+        SecurityReport::ImportedWithWarning { warning, .. } => (Tone::Warning, warning.clone()),
         SecurityReport::TrustForgotten { server } => (
             Tone::Positive,
             copy::fill(strings.trust_deleted_note, &[("server", server)]),
@@ -5016,8 +6500,9 @@ fn security_import(
     // The vault keeps the key unencrypted inside its own sealed body; the file
     // it came from is never read again.
     let body = keys_api::export_private_key(&key, None).map_err(|error| error.to_string())?;
+    let id = KeyId::new();
     let meta = ManagedKeyMeta::new(
-        KeyId::new(),
+        id,
         name,
         public.algorithm,
         public.authorized_key,
@@ -5039,14 +6524,27 @@ fn security_import(
     });
     Ok(match warning {
         Some(warning) => SecurityChange::Save {
-            report: SecurityReport::ImportedWithWarning(warning),
+            report: SecurityReport::ImportedWithWarning { id, warning },
             records: Vec::new(),
         },
         None => SecurityChange::Save {
-            report: SecurityReport::KeySaved,
+            report: SecurityReport::KeySaved(id),
             records: Vec::new(),
         },
     })
+}
+
+/// Renders text with accent search highlights when `query` is non-empty.
+fn security_highlighted(text: &str, query: &str) -> gpui::AnyElement {
+    if query.is_empty() {
+        SharedString::from(text.to_owned()).into_any_element()
+    } else {
+        components::highlighted_text(
+            text.to_owned(),
+            crate::app::palette::highlights(text, query),
+        )
+        .into_any_element()
+    }
 }
 
 /// Rotates one key: the whole transaction is checked on a catalog of the

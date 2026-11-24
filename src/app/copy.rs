@@ -6194,6 +6194,87 @@ security_strings! {
         "此设备没有可供应用调用的系统验证，因此保护仅来自已解锁的用户会话：使用此设备的任何人都可以打开保险库。这不等同于生物识别强度。此形态下保险库不会自动锁定，且可随时关闭。";
     /// Risk dialog confirm button
     biometric_risk_confirm: "Turn on anyway", "仍然开启";
+    /// Home sidebar & Vault workbench title
+    vault_nav_title: "Vault", "密码库";
+    /// Home sidebar trailing badge when vault is locked
+    vault_locked_badge: "Locked", "已锁定";
+    /// Command palette: open the vault workbench
+    palette_open_vault: "Open vault", "打开密码库";
+    /// Command palette detail for opening the vault
+    palette_open_vault_hint: "SSH keys, shared passwords and connection bindings",
+        "管理 SSH 密钥、共享密码与连接绑定";
+    /// Command palette: create a shared password
+    palette_new_password: "New shared password…", "新建共享密码…";
+    /// Command palette: generate an SSH key
+    palette_generate_key: "Generate SSH key…", "生成 SSH 密钥…";
+    /// Command palette: import an SSH private key
+    palette_import_key: "Import SSH key…", "导入 SSH 密钥…";
+    /// Command palette: open host trust settings
+    palette_open_trust: "Open host trust", "打开主机信任";
+    /// Command palette: lock the vault immediately
+    palette_lock_now: "Lock vault now", "立即锁定密码库";
+    /// Command palette: unlock the vault
+    palette_unlock_vault: "Unlock vault", "解锁密码库";
+    /// Top bar tooltip when device lock is engaged and vault is unlocked
+    topbar_lock_tip: "Vault unlocked — click to lock now", "密码库已解锁——点击立即锁定";
+    /// Top bar tooltip when vault is locked
+    topbar_unlock_tip: "Vault locked — click to unlock", "密码库已锁定——点击解锁";
+    /// Filter segment: all records
+    filter_all: "All", "全部";
+    /// Filter segment: SSH keys only
+    filter_keys: "SSH keys", "SSH 密钥";
+    /// Filter segment: shared passwords only
+    filter_credentials: "Shared passwords", "共享密码";
+    /// Filter segment: records with no bound connection
+    filter_unused: "Unused", "未绑定连接";
+    /// Empty state when filtering for unused records
+    empty_unused: "Every record in the vault is bound to at least one connection.",
+        "密码库中的记录均已绑定到连接。";
+    /// Empty-selection guide in the wide master-detail vault workbench
+    detail_select_hint: "Select a key or password on the left to inspect its details, copy values or manage bound connections.",
+        "在左侧选择密钥或共享密码，以查看详情、复制内容或管理绑定的连接。";
+    /// Tooltip for copying a key's public key
+    copy_public_key: "Copy public key", "复制公钥";
+    /// Tooltip for copying a key's fingerprint
+    copy_fingerprint: "Copy fingerprint", "复制指纹";
+    /// Tooltip for copying a credential's username
+    copy_username: "Copy username", "复制用户名";
+    /// Tooltip for copying a credential's password
+    copy_password: "Copy password", "复制密码";
+    /// Toast title when a password is copied to the clipboard
+    password_copied: "Password copied", "密码已复制";
+    /// Button in import private key dialog to choose a local file
+    import_browse_file: "Browse file…", "浏览文件…";
+    /// Error prefix when a chosen private key file could not be read
+    import_file_failed: "Could not read key file", "无法读取密钥文件";
+    /// Disabled tooltip on Rotate when no connection uses the key
+    rotate_disabled_unused: "No connection uses this key yet, so there is nothing to rotate.",
+        "尚无连接绑定此密钥，无需轮换。";
+    /// Host trust page banner when the vault is locked
+    trust_locked_hint: "The vault is locked. Server identities stored in the vault are hidden until you unlock it.",
+        "密码库已锁定。保存在密码库中的服务器身份在解锁前不会显示。";
+    /// Connection dialog locked state for application keys
+    host_vault_locked_key: "The vault is locked. Unlock it to choose or add an application key.",
+        "密码库已锁定，解锁后可选择或添加应用密钥。";
+    /// Connection dialog locked state note when an application key is already bound
+    host_vault_locked_bound_key: "This host already references a key in the locked vault; saving keeps that binding.",
+        "此主机已绑定密码库中的密钥，直接保存将保留当前绑定。";
+    /// Connection dialog locked state for shared passwords
+    host_vault_locked_credential: "The vault is locked. Unlock it to pick or create a shared password.",
+        "密码库已锁定，解锁后可选择或新建共享密码。";
+    /// Connection dialog locked state when a shared password is already bound
+    host_vault_locked_bound_credential: "This connection is bound to a shared password in the locked vault.",
+        "此连接已绑定密码库中的共享密码（当前密码库已锁定）。";
+    /// Warning chip when a bound vault key is missing
+    vault_key_missing_chip: "Vault key missing", "密码库密钥缺失";
+    /// Warning tooltip/message when a bound vault key is missing
+    vault_key_missing_tip: "The application key bound to this host is no longer in the vault. Pick or create another key.",
+        "此主机绑定的应用密钥已不在密码库中，请重新选择或创建密钥。";
+    /// Warning chip when a bound shared password is missing
+    vault_credential_missing_chip: "Shared password missing", "共享密码缺失";
+    /// Warning tooltip/message when a bound shared password is missing
+    vault_credential_missing_tip: "The shared password bound to this connection is no longer in the vault. Pick another or type a password.",
+        "此连接绑定的共享密码已不在密码库中，请重新选择或手动输入密码。";
 }
 
 /// The security strings of one language.

@@ -559,6 +559,11 @@ impl RemotePanel {
         self.form_error = Some(reason.into());
     }
 
+    /// Clears a previous form refusal when starting a fresh verification or attempt.
+    pub fn clear_form_error(&mut self) {
+        self.form_error = None;
+    }
+
     /// Drops everything typed, which is what closing the panel does.
     pub fn clear_secrets(&mut self) {
         self.password.clear();

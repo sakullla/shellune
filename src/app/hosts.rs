@@ -62,6 +62,8 @@ pub enum HomeSection {
     Favorites,
     /// The hosts that were reached before, newest first.
     Recent,
+    /// The vault workbench: SSH keys and shared passwords.
+    Vault,
     /// One group and everything inside it.
     Group(GroupPath),
 }
@@ -75,6 +77,7 @@ impl HomeSection {
             Self::All => "hosts.view.all",
             Self::Favorites => "hosts.view.favorites",
             Self::Recent => "hosts.view.recent",
+            Self::Vault => "hosts.view.vault",
             Self::Group(_) => "hosts.view.group",
         }
     }
@@ -1434,6 +1437,8 @@ impl HostsMessage {
 #[derive(Debug, Default)]
 pub struct HostsPanel {
     view: HostView,
+    /// Whether the home sidebar currently shows the vault workbench instead of the host list.
+    vault: bool,
     search: String,
     /// Independent sidebar group locator query (R9): never alters host search or filters.
     group_query: String,
@@ -1478,6 +1483,9 @@ impl HostsPanel {
     /// Switches the list view and clears a pending question, which belonged to what
     /// the user was looking at.
     pub fn select_view(&mut self, view: HostView) {
+        if view == HostView::Recent {
+            self.vault = false;
+        }
         if self.view != view {
             self.view = view;
             self.pending_delete = None;
@@ -1488,7 +1496,9 @@ impl HostsPanel {
     /// The sidebar place the list shows, read from the view and the filters.
     #[must_use]
     pub fn section(&self) -> HomeSection {
-        if self.view == HostView::Recent {
+        if self.vault {
+            HomeSection::Vault
+        } else if self.view == HostView::Recent {
             HomeSection::Recent
         } else if let Some(group) = &self.filter.group {
             HomeSection::Group(group.clone())
@@ -1503,12 +1513,14 @@ impl HostsPanel {
     /// are set for it together, so two places are never half-chosen at once. The
     /// status filter, the sort and the search stay as they were.
     pub fn set_section(&mut self, section: &HomeSection) {
-        let (view, favorites, group) = match section {
-            HomeSection::All => (HostView::All, false, None),
-            HomeSection::Favorites => (HostView::All, true, None),
-            HomeSection::Recent => (HostView::Recent, false, None),
-            HomeSection::Group(path) => (HostView::All, false, Some(path.clone())),
+        let (vault, view, favorites, group) = match section {
+            HomeSection::All => (false, HostView::All, false, None),
+            HomeSection::Favorites => (false, HostView::All, true, None),
+            HomeSection::Recent => (false, HostView::Recent, false, None),
+            HomeSection::Vault => (true, HostView::All, false, None),
+            HomeSection::Group(path) => (false, HostView::All, false, Some(path.clone())),
         };
+        self.vault = vault;
         self.select_view(view);
         self.set_favorites_filter(favorites);
         self.set_group_filter(group);
@@ -1785,6 +1797,9 @@ impl HostsPanel {
     /// hidden by the narrow layout still narrows the list, and dropping the filter is
     /// the only way back to every group.
     pub fn set_group_filter(&mut self, group: Option<GroupPath>) {
+        if group.is_some() {
+            self.vault = false;
+        }
         if self.filter.group != group {
             self.filter.group = group;
             self.pending_delete = None;
@@ -1812,6 +1827,9 @@ impl HostsPanel {
     /// It sits beside the group and the status rather than replacing either: "my
     /// favourites in Prod" is one question, and dropping the filters drops all three.
     pub fn set_favorites_filter(&mut self, favorites: bool) {
+        if favorites {
+            self.vault = false;
+        }
         if self.filter.favorites != favorites {
             self.filter.favorites = favorites;
             self.pending_delete = None;
@@ -5952,7 +5970,13 @@ mod tests {
         assert_eq!(panel.section(), HomeSection::Recent);
         assert_eq!(panel.view(), HostView::Recent);
         assert_eq!(panel.filter().group(), None);
+        panel.set_section(&HomeSection::Vault);
+        assert_eq!(panel.section(), HomeSection::Vault);
+        assert_eq!(panel.view(), HostView::All);
+        assert_eq!(panel.filter().group(), None);
+        assert!(!panel.filter().favorites());
         panel.set_section(&HomeSection::All);
+        assert_eq!(panel.section(), HomeSection::All);
         assert_eq!(panel.view(), HostView::All);
         assert_eq!(
             panel.filter().status(),

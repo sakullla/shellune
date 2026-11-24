@@ -635,8 +635,8 @@ pub struct ShelluneView {
     /// Whether the group dropdown was put away (Escape, or a pick) since the group
     /// field's text last changed; typing or pressing Down opens it again.
     group_picker_closed: bool,
-    /// Keyboard stops for the Home sidebar's fixed places: All, Favorites, Recent, Local.
-    sidebar_place_focus: [FocusHandle; 4],
+    /// Keyboard stops for the Home sidebar's fixed places: All, Favorites, Recent, Vault, Local.
+    sidebar_place_focus: [FocusHandle; 5],
     /// The host or connection row whose right-click menu is open, and where the pointer opened it.
     host_menu: Option<(HostId, gpui::Point<gpui::Pixels>)>,
     /// The connection form on screen. Other attempts keep theirs on [`Attempt::panel`].
@@ -2826,6 +2826,7 @@ impl ShelluneView {
                 cx.focus_handle().tab_stop(true),
                 cx.focus_handle().tab_stop(true),
                 cx.focus_handle().tab_stop(true),
+                cx.focus_handle().tab_stop(true),
             ],
             host_menu: None,
             remote: None,
@@ -3746,10 +3747,11 @@ impl ShelluneView {
             return false;
         }
         let search_focused = self.hosts_search.read(cx).focus_handle().is_focused(window);
+        let vault_search_focused = self.security_search_focus(cx).is_focused(window);
         let page_focused = self
             .destination_focus(Destination::Hosts)
             .is_focused(window);
-        if !search_focused && !page_focused {
+        if !search_focused && !vault_search_focused && !page_focused {
             return false;
         }
         // Shift+Tab from the search or the list goes to the sidebar's groups, where F2
@@ -3780,10 +3782,11 @@ impl ShelluneView {
             || self.home_menu.is_some()
             || self.tab_menu.is_some()
             || self.shell_menu_open
-            // A backup or sync dialog is a question over the page: the list behind it
+            // A backup, sync or vault dialog is a question over the page: the list behind it
             // must not move or connect while it is answered.
             || self.backup.is_some()
             || self.sync_dialog_open()
+            || self.security_dialog_open()
     }
 
     /// The hosts page's own keys, once the search or the list holds the keyboard.
@@ -3795,6 +3798,34 @@ impl ShelluneView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.hosts.section() == crate::app::hosts::HomeSection::Vault {
+            if secondary {
+                return match event.keystroke.key.as_str() {
+                    "f" => {
+                        self.focus_hosts_search(window, cx);
+                        true
+                    }
+                    "n" => {
+                        self.security_open_palette_action(
+                            security::SecurityAction::NewCredential,
+                            cx,
+                        );
+                        true
+                    }
+                    _ => false,
+                };
+            }
+            return match event.keystroke.key.as_str() {
+                "down" => self.security_step_cursor(1, cx),
+                "up" if page_focused => self.security_step_cursor(-1, cx),
+                "/" if page_focused => {
+                    self.focus_hosts_search(window, cx);
+                    true
+                }
+                "enter" if page_focused => self.security_activate_cursor(cx),
+                _ => false,
+            };
+        }
         // Ctrl/Cmd+F finds and Ctrl/Cmd+N makes a new host, from the page or the search
         // (ADR-3). The terminal's own search is bound in the terminal, so the two never
         // meet.
@@ -3897,6 +3928,10 @@ impl ShelluneView {
     /// its failure are reported. A record that cannot describe a desktop is refused
     /// with the reason instead of opening a tab that would fail on its first frame.
     pub(super) fn open_desktop_connection(&mut self, id: HostId, cx: &mut Context<Self>) {
+        if let Some(waiting) = self.security_verifying_desktop_session() {
+            self.show_terminal_start(waiting, cx);
+            return;
+        }
         let Some(record) = self.book.connection(id) else {
             cx.notify();
             return;
@@ -5180,6 +5215,10 @@ impl ShelluneView {
             self.refuse_desktop(session, reason, cx);
             return;
         };
+        if self.security_verifying_for_desktop(session) {
+            self.show_terminal_start(session, cx);
+            return;
+        }
         // A shared password the vault holds is a secret read like any other:
         // the lock's gate verifies first when the policy asks, and a locked
         // vault unlocks before the pane may sign in with it (R3).
@@ -5187,6 +5226,8 @@ impl ShelluneView {
             && !self.security.operation_granted
             && self.security_begin(vec![SecurityPending::Desktop(session)], cx)
         {
+            self.workspace.session_starting(session);
+            self.show_terminal_start(session, cx);
             return;
         }
         self.security.operation_granted = false;
@@ -5197,6 +5238,7 @@ impl ShelluneView {
             // letting the server report a refusal that means less.
             Err(reason) => {
                 self.refuse_desktop(session, reason, cx);
+                self.show_terminal_start(session, cx);
                 return;
             }
         };
@@ -6948,6 +6990,7 @@ impl ShelluneView {
     /// on screen. A host list that is still loading does not get in the way: the
     /// destination changes either way.
     fn select(&mut self, destination: Destination, window: &mut Window, cx: &mut Context<Self>) {
+        self.security_reset_reveal();
         // A capture layer that is still open belongs to the page that opened it; leaving
         // it behind would keep taking every key.
         if self.key_capture.is_some() {
@@ -7677,7 +7720,7 @@ impl ShelluneView {
     // -----------------------------------------------------------------------
 
     /// Opens the form of a saved connection, whichever protocol it is.
-    fn edit_saved_connection(&mut self, id: HostId, cx: &mut Context<Self>) {
+    pub(super) fn edit_saved_connection(&mut self, id: HostId, cx: &mut Context<Self>) {
         let Some(record) = self.book.connection(id) else {
             return;
         };
@@ -9249,11 +9292,22 @@ impl ShelluneView {
         // that signs in with a managed key or a shared password verifies first
         // when the policy asks for it, and a locked vault unlocks (R3). The
         // grant is one passage - the next connection asks again.
-        if self.chain_reads_vault()
-            && !self.security.operation_granted
-            && self.security_begin(vec![SecurityPending::ResumeChain(take_panel)], cx)
-        {
-            return;
+        if self.chain_reads_vault() && !self.security.operation_granted {
+            if self.security_verifying_for_chain() {
+                return;
+            }
+            if let Some(panel) = self.remote.as_mut() {
+                panel.clear_form_error();
+            }
+            let was_other_verifying = self.security_verifying();
+            if self.security_begin(vec![SecurityPending::ResumeChain(take_panel)], cx) {
+                if was_other_verifying && let Some(panel) = self.remote.as_mut() {
+                    let busy_text = copy::security_for(self.workspace.locale()).lock_busy;
+                    panel.set_form_error(busy_text);
+                }
+                cx.notify();
+                return;
+            }
         }
         self.security.operation_granted = false;
         if take_panel && !self.take_panel_auth(cx) {
@@ -11726,14 +11780,24 @@ impl ShelluneView {
         // name and a fingerprint, not a path they would have to trust (R1).
         if method == MethodChoice::ManagedKey {
             let security = crate::app::copy::security_for(self.workspace.locale());
-            let named = panel
-                .host()
-                .managed_key_id()
-                .and_then(|key| self.security.content().and_then(|vault| vault.key(key)))
-                .map(|entry| format!("{} · {}", entry.meta().name(), entry.meta().fingerprint()));
-            let line = match named {
-                Some(named) => copy::fill(security.managed_chosen, &[("name", &named)]),
-                None => security.method_none.to_owned(),
+            let line = if self.vault_locked() {
+                if panel.host().managed_key_id().is_some() {
+                    security.host_vault_locked_bound_key.to_owned()
+                } else {
+                    security.host_vault_locked_key.to_owned()
+                }
+            } else {
+                let named = panel
+                    .host()
+                    .managed_key_id()
+                    .and_then(|key| self.security.content().and_then(|vault| vault.key(key)))
+                    .map(|entry| {
+                        format!("{} · {}", entry.meta().name(), entry.meta().fingerprint())
+                    });
+                match named {
+                    Some(named) => copy::fill(security.managed_chosen, &[("name", &named)]),
+                    None => security.method_none.to_owned(),
+                }
             };
             form = form.child(
                 caption_line(line, metrics).debug_selector(|| "remote.managed.key".to_owned()),
@@ -11867,6 +11931,7 @@ impl ShelluneView {
             }
         }
 
+        let verifying_vault = self.security_verifying_for_chain();
         if busy {
             form = form.child(
                 div()
@@ -11875,6 +11940,36 @@ impl ShelluneView {
                     .debug_selector(|| "remote.busy".to_owned())
                     .child(strings.remote_connecting),
             );
+        } else if verifying_vault {
+            let security = copy::security_for(self.workspace.locale());
+            let failed = panel.status().failure().is_some();
+            let (selector, label) = if failed {
+                ("remote.retry", strings.recovery_retry)
+            } else {
+                ("remote.connect", strings.remote_connect)
+            };
+            form = form
+                .child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(Tone::Warning.text())
+                        .debug_selector(|| "remote.verifying".to_owned())
+                        .child(security.lock_state_verifying),
+                )
+                .child(
+                    div().flex().justify_end().child(
+                        components::button_with_state(
+                            label,
+                            Variant::Primary,
+                            ControlState::Loading,
+                            metrics,
+                        )
+                        .id(SharedString::from(selector))
+                        .debug_selector(move || selector.to_owned())
+                        .h(metrics.control_height())
+                        .px(metrics.scale(spacing::BASE)),
+                    ),
+                );
         } else {
             // After a failure the same button tries again with whatever the form now
             // says - one primary action, not a retry in the card and a connect here.
@@ -11884,26 +11979,51 @@ impl ShelluneView {
             } else {
                 ("remote.connect", strings.remote_connect)
             };
-            form = form.child(
-                div().flex().justify_end().child(
+            let mut action_row = div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_end()
+                .gap(metrics.scale(spacing::TIGHT));
+            if self.vault_locked() && self.chain_reads_vault() {
+                let security = copy::security_for(self.workspace.locale());
+                action_row = action_row.child(
                     self.icon_text_button(
-                        SharedString::from(selector),
-                        if failed { Icon::Refresh } else { Icon::Plug },
-                        label,
-                        Variant::Primary,
+                        SharedString::from("remote.vault.unlock"),
+                        Icon::Unlock,
+                        security.lock_unlock,
+                        Variant::Secondary,
                         cx,
-                        move |view, cx| {
-                            if failed {
-                                view.retry_remote(cx);
-                            } else {
-                                view.connect_remote(cx);
+                        |view, cx| {
+                            if let Some(panel) = view.remote.as_mut() {
+                                panel.clear_form_error();
                             }
+                            view.security_begin(Vec::new(), cx);
                         },
                     )
                     .h(metrics.control_height())
                     .px(metrics.scale(spacing::BASE)),
-                ),
+                );
+            }
+            action_row = action_row.child(
+                self.icon_text_button(
+                    SharedString::from(selector),
+                    if failed { Icon::Refresh } else { Icon::Plug },
+                    label,
+                    Variant::Primary,
+                    cx,
+                    move |view, cx| {
+                        if failed {
+                            view.retry_remote(cx);
+                        } else {
+                            view.connect_remote(cx);
+                        }
+                    },
+                )
+                .h(metrics.control_height())
+                .px(metrics.scale(spacing::BASE)),
             );
+            form = form.child(action_row);
         }
         form
     }
@@ -12997,8 +13117,12 @@ impl ShelluneView {
             self.close_palette(window, cx);
             return true;
         }
-        // A backup dialog is a question over the settings page: Escape leaves it and
-        // writes nothing (R5, R6).
+        // A backup or vault dialog sits above pages and connection editors: Escape closes
+        // only the topmost dialog and leaves any underlying draft untouched.
+        if self.security_dialog_open() {
+            self.security_close_dialog(cx);
+            return true;
+        }
         if self.backup.is_some() {
             self.close_backup(cx);
             return true;
@@ -13203,6 +13327,16 @@ impl ShelluneView {
             self.hosts.set_search(String::new());
             self.hosts_cursor = None;
             cx.notify();
+            return true;
+        }
+        if self.security_clear_search_if_focused(window, cx) {
+            return true;
+        }
+        if ((self.home_shown() && self.hosts.section() == crate::app::hosts::HomeSection::Vault)
+            || (self.workspace.destination() == Destination::Settings
+                && self.settings_nav.current() == settings::Item::KeysAndPassword))
+            && self.security_close_detail(cx)
+        {
             return true;
         }
         // The banner over an ended or reconnecting terminal is the last thing Escape
@@ -13900,6 +14034,11 @@ impl ShelluneView {
                 || self.desktop_for(id).is_some()
                 || self.workspace.connection_wait(id).is_some()
                 || self.reconnect_screen(id).is_some()
+                || (self.workspace.layout().active_session() == Some(id)
+                    && self
+                        .workspace
+                        .status(id)
+                        .is_some_and(|status| status.phase() == SessionPhase::Ended))
         });
         // A waiting pane is drawn in the workspace, and so is a connection being set up
         // in its own tab.
@@ -19512,6 +19651,33 @@ impl ShelluneView {
         // window made the reader look for it.
         let can_reconnect =
             self.workspace.session(id).is_some_and(may_reconnect) && !self.connection_inline();
+        let needs_vault_unlock = self.vault_locked()
+            && self
+                .workspace
+                .session(id)
+                .is_some_and(|session| match session.kind() {
+                    SessionKind::Remote { host } => self.book.host(*host).is_some_and(|h| {
+                        h.managed_key_id().is_some() || h.credential_id().is_some()
+                    }),
+                    SessionKind::Rdp { host } | SessionKind::Vnc { host } => self
+                        .book
+                        .connection(*host)
+                        .is_some_and(|record| record.credential_id().is_some()),
+                    _ => false,
+                });
+        if needs_vault_unlock {
+            let security = copy::security_for(locale);
+            actions = actions.child(self.icon_text_button(
+                SharedString::from("terminal.failure.unlock"),
+                Icon::Unlock,
+                security.lock_unlock,
+                Variant::Secondary,
+                cx,
+                |view, cx| {
+                    view.security_begin(Vec::new(), cx);
+                },
+            ));
+        }
         match status.step() {
             Some(SessionStep::Reconnect) if can_reconnect => {
                 actions = actions.child(self.icon_text_button(

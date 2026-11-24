@@ -44141,15 +44141,51 @@ async fn a_locked_vault_defers_automatic_sync_until_the_unlock(cx: &mut TestAppC
         "nothing was sent while the vault was locked"
     );
 
-    // A change made behind the lock (the vault file itself) is still only
+    // A locked vault page hides active creation controls and fake empty lists;
+    // a change written directly to the vault file behind the lock is still only
     // synced once the unlock frees the automatic job.
     click(cx, "settings.category.security");
     click(cx, "settings.item.keys-and-passwords");
-    click(cx, "security.action.new-password");
-    type_into(cx, "security.dialog.name", "Behind the lock");
-    type_into(cx, "security.dialog.secret", "another-secret-value");
-    click(cx, "security.dialog.submit");
-    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("security.locked").is_some()
+            && cx.update(|_window, app| view.read(app).security_locked_for_test()),
+        "locked vault shows the unlock card"
+    );
+    {
+        let store = shellune_storage::VaultStore::at(dir.path());
+        let mut content = store
+            .open(
+                &shellune_storage::UnsealSource::LocalMachine,
+                secrets.as_ref(),
+            )
+            .expect("the vault opens on disk");
+        content
+            .insert_credential(shellune_storage::VaultCredentialRecord::new(
+                shellune_core::CredentialMeta::new(
+                    shellune_core::CredentialId::new(),
+                    "Behind the lock".to_owned(),
+                    None,
+                    shellune_core::VaultRecordVersion::new(1, "seed"),
+                ),
+                shellune_core::SecretString::new("another-secret-value"),
+            ))
+            .expect("the second credential is inserted");
+        store
+            .save_records(
+                &content,
+                &[],
+                &[
+                    shellune_storage::UnsealSource::LocalMachine,
+                    shellune_storage::UnsealSource::WebDavPassword(
+                        shellune_core::SecretString::new(SYNC_PASSWORD),
+                    ),
+                ],
+                shellune_storage::KdfParams::new(8, 1, 1).expect("cheap parameters"),
+                secrets.as_ref(),
+            )
+            .expect("the vault change is saved behind the lock");
+    }
+    after_poll(cx);
     assert_eq!(
         put_count(&server),
         uploaded,
@@ -44372,4 +44408,733 @@ async fn a_machine_without_verification_enables_a_session_only_lock(cx: &mut Tes
     let saved = shellune_storage::SecurityStore::at(dir.path()).load();
     assert_eq!(saved.biometric_unlock, Some(false));
     let _ = view;
+}
+
+// ---------------------------------------------------------------------------
+// Home Vault workbench, Command Palette, Topbar lock & Connection integration
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+async fn home_vault_sidebar_palette_and_topbar_share_one_security_state(cx: &mut TestAppContext) {
+    let dir = TempDir::new("home-vault-shared");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+
+    // Navigate to Home: expanded sidebar shows `hosts.view.vault` with count; folded rail keeps it too.
+    click(cx, "nav.hosts");
+    cx.simulate_resize(size(px(1200.0), px(800.0)));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("hosts.view.vault").is_some(),
+        "Home sidebar exposes the first-class Vault entry"
+    );
+    click(cx, "home.sidebar.toggle");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("home.sidebar.folded").is_some()
+            && cx.debug_bounds("hosts.view.vault").is_some(),
+        "folded Home rail keeps the Vault icon entry"
+    );
+    click(cx, "home.sidebar.toggle");
+    cx.run_until_parked();
+
+    // Open Home Vault and create a key; verify Settings -> Security -> Keys & passwords sees the same state.
+    click(cx, "hosts.view.vault");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("home.vault").is_some() && cx.debug_bounds("security.page").is_some(),
+        "Home mounts the Vault workbench"
+    );
+    click(cx, "security.action.generate");
+    cx.simulate_input("Home workbench key");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_keys_for_test().len()),
+        1
+    );
+
+    click(cx, "nav.settings");
+    click(cx, "settings.category.security");
+    click(cx, "settings.item.keys-and-passwords");
+    assert!(
+        cx.debug_bounds("security.key.0").is_some(),
+        "Settings shares the exact same SecurityPage state as Home Vault"
+    );
+
+    // Command Palette reaches Open vault, Open host trust, and Vault creation actions.
+    go(cx, crate::app::actions::OpenPalette);
+    cx.simulate_input("Open host trust");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("security.trust.page").is_some(),
+        "Command Palette opens Host Trust settings"
+    );
+
+    go(cx, crate::app::actions::OpenPalette);
+    cx.simulate_input("Open vault");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("home.vault").is_some(),
+        "Command Palette navigates directly to Home Vault"
+    );
+
+    // Engage device lock: Topbar shows `topbar.vault` + locked badge; locked Vault hides actions & empty lists;
+    // Host Trust shows `security.trust.locked` banner + unlock button.
+    let authenticator = Arc::new(
+        shellune_storage::ScriptedAuthenticator::new(
+            shellune_storage::BiometricCapability::Biometrics,
+        )
+        .script([Ok(()), Ok(())]),
+    );
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_set_authenticator_for_test(authenticator);
+            view.security_enable_lock_for_test(shellune_storage::LockPolicy::UnlockVault, 15, cx);
+        })
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("topbar.vault").is_some()
+            && cx.debug_bounds("topbar.vault.locked").is_some()
+            && cx.debug_bounds("security.locked").is_some(),
+        "topbar and vault page render the locked state"
+    );
+
+    click(cx, "nav.settings");
+    click(cx, "settings.category.security");
+    click(cx, "settings.item.host-trust");
+    assert!(
+        cx.debug_bounds("security.trust.locked").is_some()
+            && cx.debug_bounds("security.trust.unlock").is_some(),
+        "Host Trust page explains that vault-backed identities are hidden while locked"
+    );
+
+    // One-click Topbar unlock and re-lock.
+    click(cx, "topbar.vault");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_locked_for_test()),
+        "clicking topbar.vault unlocks the vault"
+    );
+    click(cx, "topbar.vault");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).security_locked_for_test())
+            && cx.debug_bounds("topbar.vault.locked").is_some(),
+        "clicking topbar.vault again locks the vault immediately"
+    );
+
+    // Narrow window geometry budgets (720x480, 520x480, 440x480) fit cleanly with lock engaged.
+    click(cx, "nav.hosts");
+    click(cx, "hosts.view.vault");
+    for width in [720.0, 520.0, 440.0] {
+        let viewport = size(px(width), px(480.0));
+        cx.simulate_resize(viewport);
+        cx.run_until_parked();
+        assert_within_width(bounds_of(cx, "topbar.vault"), viewport, "topbar.vault");
+        assert_within_width(
+            bounds_of(cx, "security.locked"),
+            viewport,
+            "security.locked",
+        );
+    }
+
+    // Verify on a fresh window that starts locked (unpolluted GPUI debug_bounds map) that
+    // creation buttons, search, and misleading empty lists are NEVER painted while locked.
+    drop(view);
+    let fresh_auth = Arc::new(shellune_storage::ScriptedAuthenticator::new(
+        shellune_storage::BiometricCapability::Biometrics,
+    ));
+    let mut locked_ws = Workspace::new();
+    locked_ws.select(Destination::Hosts);
+    let locked_store = dir.store();
+    let locked_secrets: Arc<dyn shellune_storage::SecretStore> = secrets.clone();
+    let (locked_view, cx) = cx.add_window_view(move |_window, cx| {
+        let mut v =
+            ShelluneView::with_secrets_for_test(cx, locked_ws, locked_store, locked_secrets);
+        v.security_set_authenticator_for_test(fresh_auth);
+        v.security_relaunch_for_test(cx);
+        v
+    });
+    cx.simulate_resize(size(px(1200.0), px(800.0)));
+    cx.run_until_parked();
+    click(cx, "hosts.view.vault");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("security.locked").is_some()
+            && cx.debug_bounds("security.actions").is_none()
+            && cx.debug_bounds("security.action.new-password").is_none()
+            && cx.debug_bounds("security.search").is_none()
+            && cx.debug_bounds("security.keys.empty").is_none()
+            && cx.debug_bounds("security.credentials.empty").is_none(),
+        "fresh locked window never paints vault creation controls, search or fake empty lists"
+    );
+    let _ = locked_view;
+}
+
+#[gpui::test]
+async fn vault_workbench_filters_highlights_master_detail_keyboard_and_copy_toasts(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("vault-workbench-ux");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let cred_id = shellune_storage::VaultStore::at(dir.path())
+        .open(
+            &shellune_storage::UnsealSource::LocalMachine,
+            secrets.as_ref(),
+        )
+        .expect("open seeded vault")
+        .credentials()
+        .next()
+        .expect("seeded credential")
+        .meta()
+        .id();
+    let mut bound_host = shellune_core::HostConfig::new("bastion-prod", "10.0.0.5", 22, "deploy")
+        .expect("valid host");
+    bound_host.set_auth(Some(shellune_core::AuthMethodKind::Password));
+    bound_host.set_credential_id(Some(cred_id));
+    {
+        let mut book = HostBook::new();
+        book.insert(bound_host).expect("insert host");
+        dir.store().save(&book).expect("save hosts");
+    }
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+
+    click(cx, "nav.hosts");
+    cx.simulate_resize(size(px(1280.0), px(840.0)));
+    click(cx, "hosts.view.vault");
+    cx.run_until_parked();
+
+    click(cx, "security.action.generate");
+    cx.simulate_input("Unused deploy key");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    // Wide Home view uses side-by-side master-detail with an empty-selection placeholder first.
+    assert!(
+        cx.debug_bounds("security.split").is_some()
+            && cx.debug_bounds("security.detail.placeholder").is_some(),
+        "wide Home Vault renders master-detail split with placeholder"
+    );
+
+    // Filters: Keys, Credentials, Unused, All.
+    let key_id = cx.update(|_window, app| view.read(app).security_keys_for_test()[0].0);
+    click(cx, "security.filter.keys");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_visible_records(app)),
+        vec![crate::app::view::security::SecurityRecord::Key(key_id)]
+    );
+    click(cx, "security.filter.credentials");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_visible_records(app)),
+        vec![crate::app::view::security::SecurityRecord::Credential(
+            cred_id
+        )]
+    );
+    click(cx, "security.filter.unused");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_visible_records(app)),
+        vec![crate::app::view::security::SecurityRecord::Key(key_id)],
+        "Unused filter keeps only the unbound key and hides the bound credential"
+    );
+    click(cx, "security.filter.all");
+
+    // Keyboard navigation: focus search -> Tab to list -> Down -> Enter opens detail.
+    click(cx, "security.search");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes("down");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("security.detail.credential").is_some(),
+        "keyboard Down + Enter selects the second visible record (Prod login)"
+    );
+
+    // Reveal password, then verify Escape collapses detail & resets `revealed = false`.
+    click(cx, "security.detail.reveal");
+    assert!(cx.update(|_window, app| view.read(app).security_password_shown_for_test()));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_password_shown_for_test())
+            && !cx.update(|_window, app| view.read(app).security_detail_open_for_test()),
+        "Escape collapses detail and clears revealed secret"
+    );
+
+    // Reveal again, then leave Vault section -> `revealed` resets immediately.
+    click(cx, "security.credential.0");
+    click(cx, "security.detail.reveal");
+    assert!(cx.update(|_window, app| view.read(app).security_password_shown_for_test()));
+    click(cx, "hosts.view.all");
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_password_shown_for_test()),
+        "leaving Home Vault immediately clears any revealed password"
+    );
+    click(cx, "hosts.view.vault");
+
+    // Search highlighting & host-name search ("bastion-prod" matches the bound credential).
+    type_into(cx, "security.search", "bastion");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_visible_records(app)),
+        vec![crate::app::view::security::SecurityRecord::Credential(
+            cred_id
+        )],
+        "searching by bound host name narrows to the referencing credential"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Hit targets >= 24x24, inline row quick copy, and detail explicit copy buttons + Toast feedback.
+    for selector in [
+        "security.key.copy.0",
+        "security.key.edit.0",
+        "security.credential.copy-user.0",
+        "security.credential.copy-password.0",
+        "security.credential.edit.0",
+    ] {
+        let b = bounds_of(cx, selector);
+        assert!(
+            b.size.width >= px(24.0) && b.size.height >= px(24.0),
+            "{selector} meets 24x24 hit target: {:?}",
+            b.size
+        );
+    }
+
+    click(cx, "security.credential.copy-user.0");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("deploy".to_owned())
+    );
+    click(cx, "security.credential.copy-password.0");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("shared-secret-value".to_owned())
+    );
+    let toasts = cx.update(|_window, app| view.read(app).toast_titles());
+    assert!(
+        toasts.iter().any(|t| t == "Password copied")
+            && !toasts.iter().any(|t| t.contains("shared-secret-value")),
+        "copying password emits confirmation toast without leaking secret: {toasts:?}"
+    );
+
+    click(cx, "security.key.0");
+    for selector in [
+        "security.detail.close",
+        "security.detail.copy.fingerprint",
+        "security.detail.copy.public",
+    ] {
+        let b = bounds_of(cx, selector);
+        assert!(
+            b.size.width >= px(24.0) && b.size.height >= px(24.0),
+            "{selector} meets 24x24 hit target: {:?}",
+            b.size
+        );
+    }
+    click(cx, "security.detail.copy.public");
+    assert!(
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()
+            .starts_with("ssh-ed25519 "),
+        "detail public key button copies OpenSSH public key"
+    );
+
+    // Narrow window switches from split to single-column collapsible detail cleanly.
+    let narrow = size(px(520.0), px(480.0));
+    cx.simulate_resize(narrow);
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).security_detail_open_for_test()),
+        "narrow window keeps detail open as a collapsible single-column card"
+    );
+    assert_within_width(bounds_of(cx, "security.detail"), narrow, "security.detail");
+    click(cx, "security.detail.close");
+    assert!(!cx.update(|_window, app| view.read(app).security_detail_open_for_test()));
+    let _ = view;
+}
+
+#[gpui::test]
+async fn vault_dialogs_support_file_import_edit_generator_disabled_rotate_and_keyboard_ux(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("vault-dialogs-ux");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+
+    click(cx, "nav.hosts");
+    cx.simulate_resize(size(px(1200.0), px(840.0)));
+    click(cx, "hosts.view.vault");
+    cx.run_until_parked();
+
+    // 1. Auto-focus first field, refusal banner cleared on edit, and Enter submit in single-line field.
+    click(cx, "security.action.generate");
+    cx.run_until_parked();
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).security_dialog_refusal_for_test().is_some()),
+        "empty name triggers refusal banner"
+    );
+    // Without clicking any field, typing goes straight into the focused `name` field and clears refusal!
+    cx.simulate_input("Auto-focused key");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).security_dialog_refusal_for_test().is_none()),
+        "editing a dialog field immediately clears the stale refusal banner"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_keys_for_test().len()),
+        1,
+        "pressing Enter in a single-line dialog field submits the form"
+    );
+
+    // 2. Unused key disables `Rotate…` (`security.detail.action.1`).
+    click(cx, "security.key.0");
+    click(cx, "security.detail.action.1");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("security.dialog.rotate").is_none(),
+        "Rotate button is disabled when no connection references the key"
+    );
+
+    // 3. Import private key file browse loads PEM text and auto-fills empty `name` with filename.
+    let generated = shellune_ssh::keys::generate(shellune_ssh::keys::ManagedKeyKind::Ed25519)
+        .expect("generate test key");
+    let exported = shellune_ssh::keys::export_private_key(&generated, None).expect("export pem");
+    let key_file = dir.path().join("id_ed25519_staging");
+    std::fs::write(&key_file, exported.expose()).expect("write key file");
+
+    click(cx, "security.action.import");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("security.dialog.import.browse").is_some(),
+        "Import dialog renders Browse file button"
+    );
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_load_import_file(&key_file, cx)
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_dialog_name_for_test(app)),
+        Some("id_ed25519_staging".to_owned()),
+        "loading a key file auto-fills an empty name field with the filename"
+    );
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .security_dialog_pem_for_test(app)
+                .unwrap_or_default()
+                .contains("OPENSSH PRIVATE KEY")
+        }),
+        "loading a key file populates the PEM field"
+    );
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_keys_for_test().len()),
+        2
+    );
+
+    // 4. EditCredential offers the password generator and updates the stored password.
+    let cred_id = cx.update(|_window, app| view.read(app).security_credentials_for_test()[0].0);
+    click(cx, "security.credential.0");
+    click(cx, "security.detail.action.0");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("security.dialog.edit-credential").is_some()
+            && cx
+                .debug_bounds("security.dialog.generate.password")
+                .is_some()
+            && cx.debug_bounds("security.dialog.length").is_some(),
+        "Edit shared password dialog provides the random password generator"
+    );
+    click(cx, "security.dialog.generate.password");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    let updated_secret = cx
+        .update(|_window, app| {
+            view.read(app)
+                .security_credential_password_for_test(cred_id)
+        })
+        .expect("credential still exists");
+    assert_eq!(
+        updated_secret.len(),
+        20,
+        "generated password in EditCredential saved a 20-char random password"
+    );
+    assert_ne!(updated_secret, "shared-secret-value");
+    let _ = view;
+}
+
+#[gpui::test]
+async fn connection_dialogs_handle_locked_vault_inline_creation_missing_records_and_verification_states(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("vault-connections-ux");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+
+    // Seed one SSH host with a missing KeyId and one RDP connection with the valid seeded CredentialId.
+    let valid_cred = shellune_storage::VaultStore::at(dir.path())
+        .open(
+            &shellune_storage::UnsealSource::LocalMachine,
+            secrets.as_ref(),
+        )
+        .expect("open seeded vault")
+        .credentials()
+        .next()
+        .expect("seeded credential")
+        .meta()
+        .id();
+    let missing_key = shellune_core::KeyId::new();
+    let mut ssh_missing =
+        shellune_core::HostConfig::new("orphan-ssh", "10.0.0.11", 22, "root").expect("valid host");
+    ssh_missing.set_auth(Some(shellune_core::AuthMethodKind::ManagedKey));
+    ssh_missing.set_managed_key_id(Some(missing_key));
+
+    let mut rdp_bound =
+        shellune_core::RdpConfig::new("office-rdp", "127.0.0.1", Some("alice")).expect("valid rdp");
+    rdp_bound.set_port(1).expect("closed port");
+    rdp_bound.set_credential_id(Some(valid_cred));
+    {
+        let mut book = HostBook::new();
+        book.insert(ssh_missing).expect("insert ssh");
+        book.insert_connection(shellune_core::ConnectionRecord::Rdp(rdp_bound))
+            .expect("insert rdp");
+        dir.store().save(&book).expect("save book");
+    }
+
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    click(cx, "nav.hosts");
+    cx.simulate_resize(size(px(1200.0), px(840.0)));
+    cx.run_until_parked();
+
+    // 1. Missing vault key warning badge on Home row and inside Edit Host dialog.
+    assert!(
+        cx.debug_bounds("hosts.vault-missing.0").is_some(),
+        "Home row warns when a host's bound vault key is missing"
+    );
+    click(cx, "hosts.edit.0");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("hosts.auth.managed.missing").is_some(),
+        "Edit Host dialog warns when the bound vault key is missing"
+    );
+
+    // 2. Inline key generation from SSH Host dialog: Escape closes ONLY the stacked vault dialog,
+    //    and submitting auto-binds the new KeyId while preserving typed host fields!
+    clear_field(cx, "hosts.field.name", "orphan-ssh".len());
+    type_into(cx, "hosts.field.name", "healed-ssh");
+    click(cx, "hosts.auth.managed.generate");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("security.dialog.generate").is_some(),
+        "Generate key dialog stacks above the open Host dialog"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_dialog_open())
+            && cx.update(|_window, app| view.read(app).hosts_state().draft().is_some()),
+        "Escape dismisses only the stacked vault dialog and preserves the underlying Host draft"
+    );
+
+    click(cx, "hosts.auth.managed.generate");
+    cx.run_until_parked();
+    cx.simulate_input("Inline generated key");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    let (new_key_id, _, _) =
+        cx.update(|_window, app| view.read(app).security_keys_for_test())[0].clone();
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app).hosts_state().draft().map(|d| {
+                (
+                    d.text(crate::app::hosts::HostField::Name).to_owned(),
+                    d.managed_key_id(),
+                )
+            })
+        }),
+        Some(("healed-ssh".to_owned(), Some(new_key_id))),
+        "inline-generated key auto-binds to the SSH draft without losing typed fields"
+    );
+    click(cx, "hosts.save");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_vault_key_missing(new_key_id)),
+        "saving the healed binding resolves the missing-key warning"
+    );
+
+    // 3. Inline shared password creation from an RDP connection dialog auto-binds too.
+    click(cx, "hosts.connection.edit.0");
+    cx.run_until_parked();
+    click(cx, "connection.auth.credential.new");
+    cx.run_until_parked();
+    type_into(cx, "security.dialog.name", "Inline RDP cred");
+    click(cx, "security.dialog.generate.password");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    let inline_cred_id = cx
+        .update(|_window, app| {
+            view.read(app)
+                .security_credentials_for_test()
+                .into_iter()
+                .find(|(_, name)| name == "Inline RDP cred")
+                .map(|(id, _)| id)
+        })
+        .expect("inline credential saved");
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .hosts_state()
+                .protocol_draft()
+                .and_then(|d| d.credential_id())
+        }),
+        Some(inline_cred_id),
+        "inline-created shared password auto-binds to the open RDP draft"
+    );
+    click(cx, "connection.save");
+    cx.run_until_parked();
+
+    // 4. Lock the vault: SSH & RDP dialogs show locked banner + inline unlock + clear option,
+    //    never false `hosts.auth.managed.none`.
+    let auth_cancel_then_pass = Arc::new(
+        shellune_storage::ScriptedAuthenticator::new(
+            shellune_storage::BiometricCapability::Biometrics,
+        )
+        .script([
+            Err(shellune_storage::BiometricError::Cancelled),
+            Err(shellune_storage::BiometricError::Cancelled),
+            Ok(()),
+        ]),
+    );
+    let auth_counter = auth_cancel_then_pass.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_set_authenticator_for_test(auth_cancel_then_pass);
+            view.security_enable_lock_for_test(shellune_storage::LockPolicy::UnlockVault, 15, cx);
+        })
+    });
+    cx.run_until_parked();
+
+    click(cx, "hosts.edit.0");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("hosts.auth.vault.locked").is_some()
+            && cx.debug_bounds("hosts.auth.vault.unlock").is_some(),
+        "locked SSH dialog shows locked banner + inline Unlock"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    click(cx, "hosts.connection.edit.0");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("connection.auth.vault.locked").is_some()
+            && cx.debug_bounds("connection.auth.vault.unlock").is_some()
+            && cx
+                .debug_bounds("connection.auth.credential.clear")
+                .is_some(),
+        "locked RDP dialog shows locked banner + inline Unlock + 'Type a password instead'"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // 5. Waiting on verification & cancel feedback in-place on SSH connection surface:
+    cx.update(|_window, app| view.update(app, |v, _cx| v.security_hold_verify_for_test(true)));
+    click(cx, "hosts.connect.0");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("remote.verifying").is_some(),
+        "SSH remote form displays waiting-for-verification state while prompt is in flight"
+    );
+    // Release cancelled verification -> error shown in-place on `remote.form.error` with Unlock + Connect!
+    cx.update(|_window, app| view.update(app, |v, cx| v.security_release_verify_for_test(cx)));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("remote.form.error").is_some()
+            && cx.debug_bounds("remote.vault.unlock").is_some()
+            && cx.debug_bounds("remote.connect").is_some(),
+        "cancelled SSH verification displays reason in-place on remote.form.error with Unlock & Connect"
+    );
+    assert_eq!(auth_counter.verify_calls(), 1);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // 6. Waiting on verification, duplicate-click guard, cancel in-place on `terminal.failure`, and Unlock/Retry for RDP:
+    click(cx, "nav.hosts");
+    cx.update(|_window, app| view.update(app, |v, _cx| v.security_hold_verify_for_test(true)));
+    click(cx, "hosts.connection.connect.0");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("session.verifying").is_some(),
+        "RDP tab switches to workspace and shows session.verifying while awaiting verification"
+    );
+    // Attempting a second start while verifying does NOT spawn a second tab or second prompt!
+    let rdp_host_id = cx.update(|_window, app| view.read(app).book().connections()[0].id());
+    cx.update(|_window, app| view.update(app, |v, cx| v.connect_saved_connection(rdp_host_id, cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs().len()),
+        1,
+        "duplicate connection trigger while verifying does not create duplicate tabs"
+    );
+    assert_eq!(auth_counter.verify_calls(), 2);
+
+    // Release cancelled verification -> `terminal.failure` renders in-place with `terminal.failure.unlock` and `terminal.failure.next`!
+    cx.update(|_window, app| view.update(app, |v, cx| v.security_release_verify_for_test(cx)));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("terminal.failure").is_some()
+            && cx.debug_bounds("terminal.failure.unlock").is_some()
+            && cx.debug_bounds("terminal.failure.next").is_some(),
+        "cancelled desktop verification surfaces in-place failure card with Unlock and Reconnect"
+    );
+
+    // Clicking Unlock on the failure banner passes the 3rd scripted verification and unlocks the vault!
+    click(cx, "terminal.failure.unlock");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_locked_for_test()),
+        "inline Unlock on terminal.failure unlocks the vault"
+    );
+    drop(view);
+
+    // Fresh locked window proves SSH ManagedKey dialog never renders false `hosts.auth.managed.none`.
+    let fresh_auth = Arc::new(shellune_storage::ScriptedAuthenticator::new(
+        shellune_storage::BiometricCapability::Biometrics,
+    ));
+    let mut fresh_ws = Workspace::new();
+    fresh_ws.select(Destination::Hosts);
+    let fresh_store = dir.store();
+    let fresh_secrets: Arc<dyn shellune_storage::SecretStore> = secrets.clone();
+    let (fresh_view, cx) = cx.add_window_view(move |_window, cx| {
+        let mut v = ShelluneView::with_secrets_for_test(cx, fresh_ws, fresh_store, fresh_secrets);
+        v.security_set_authenticator_for_test(fresh_auth);
+        v.security_relaunch_for_test(cx);
+        v
+    });
+    cx.simulate_resize(size(px(1200.0), px(840.0)));
+    cx.run_until_parked();
+    click(cx, "hosts.edit.0");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("hosts.auth.vault.locked").is_some()
+            && cx.debug_bounds("hosts.auth.managed.none").is_none(),
+        "fresh locked SSH dialog shows locked banner and never renders false 'no key in vault'"
+    );
+    let _ = fresh_view;
 }

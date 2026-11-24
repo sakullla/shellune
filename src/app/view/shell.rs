@@ -330,6 +330,37 @@ impl ShelluneView {
                         })),
                 )
             })
+            .when(self.security_topbar_lock_shown(), |row| {
+                let security = copy::security_for(self.workspace.locale());
+                let locked = self.vault_locked();
+                let verifying = self.security_verifying();
+                let tip = if verifying {
+                    security.lock_state_verifying.to_owned()
+                } else if locked {
+                    security.topbar_unlock_tip.to_owned()
+                } else {
+                    security.topbar_lock_tip.to_owned()
+                };
+                row.child(
+                    self.bar_icon(
+                        "topbar.vault",
+                        if locked { Icon::Lock } else { Icon::Unlock },
+                        tip,
+                        locked,
+                    )
+                    .relative()
+                    .when(locked, |btn| {
+                        btn.child(notice_badge(Tone::Warning, "topbar.vault.locked", metrics))
+                    })
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        if this.vault_locked() {
+                            this.security_begin(Vec::new(), cx);
+                        } else {
+                            this.security_lock_now(cx);
+                        }
+                    })),
+                )
+            })
             .child(
                 self.bar_icon(
                     "palette.open",
@@ -458,7 +489,19 @@ impl ShelluneView {
                 ),
             )
             .when(!live && !banner_shown, |row| {
-                row.child(components::chip(state_label, tone, metrics))
+                if self.security_verifying_for_desktop(id) {
+                    let security = copy::security_for(self.workspace.locale());
+                    row.child(
+                        components::chip(
+                            SharedString::from(security.lock_state_verifying),
+                            Tone::Warning,
+                            metrics,
+                        )
+                        .debug_selector(|| "session.verifying".to_owned()),
+                    )
+                } else {
+                    row.child(components::chip(state_label, tone, metrics))
+                }
             })
             // "X11 off" is the default and says nothing; only a bridge that is up,
             // coming up or failed is worth a chip.
@@ -813,7 +856,8 @@ impl ShelluneView {
         // Each notice the full row would draw takes at least an icon's room beside the
         // parts above; without that room the row folds them into its controls instead
         // of letting the current tab give way (R2).
-        let notices = self.topbar_notice_count() as f32;
+        let notices =
+            (self.topbar_notice_count() + usize::from(self.security_topbar_lock_shown())) as f32;
         self.viewport_width
             < metrics.scale(HEADER_FULL_ROW + NOTICE_ICON_ROOM * notices)
                 + super::titlebar::window_controls_width(Platform::current())

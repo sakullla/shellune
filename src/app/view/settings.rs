@@ -388,7 +388,7 @@ impl SettingsNav {
     }
 
     /// The item the page shows.
-    fn current(&self) -> Item {
+    pub(super) fn current(&self) -> Item {
         self.category.items()[self.item_of(self.category)]
     }
 }
@@ -1978,8 +1978,20 @@ impl ShelluneView {
             .collect()
     }
 
+    /// Opens the Host Trust page in Settings (used by the Command Palette).
+    pub(super) fn open_host_trust_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(Destination::Settings, window, cx);
+        let index = Category::Security
+            .items()
+            .iter()
+            .position(|candidate| *candidate == Item::HostTrust)
+            .unwrap_or(1);
+        self.settings_select_item(Category::Security, index, cx);
+    }
+
     /// Opens one category, keeping the item it was last on (R16).
     pub(super) fn settings_select_category(&mut self, category: Category, cx: &mut Context<Self>) {
+        self.security_reset_reveal();
         self.settings_nav.nav_focus = false;
         self.settings_nav.category = category;
         // Pressed again after scrolling away, the same category still scrolls back to it.
@@ -1994,6 +2006,7 @@ impl ShelluneView {
         index: usize,
         cx: &mut Context<Self>,
     ) {
+        self.security_reset_reveal();
         self.settings_nav.category = category;
         self.settings_nav.set_item(category, index);
         self.settings_nav.nav_focus = false;
@@ -2015,6 +2028,7 @@ impl ShelluneView {
 
     /// Moves the chosen category by one, wrapping.
     fn settings_step_category(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.security_reset_reveal();
         let all = Category::ALL;
         let at = all
             .iter()
@@ -2027,6 +2041,7 @@ impl ShelluneView {
 
     /// Moves the chosen item inside the current category, wrapping.
     fn settings_step_item(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.security_reset_reveal();
         let category = self.settings_nav.category;
         let count = category.items().len();
         let at = self.settings_nav.item_of(category);
@@ -2073,6 +2088,12 @@ impl ShelluneView {
             return;
         }
         if event.keystroke.key == "escape" {
+            if self.settings_nav.current() == Item::KeysAndPassword
+                && self.security_close_detail(cx)
+            {
+                cx.stop_propagation();
+                return;
+            }
             self.settings_nav.nav_focus = true;
             window.focus(self.destination_focus(Destination::Settings));
             cx.notify();

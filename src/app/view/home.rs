@@ -200,6 +200,8 @@ struct ConnectionRowView {
     show_meta: MetaColumns,
     /// Whether any SSH host is currently selected, showing the SSH-only multi-select boundary.
     selecting: bool,
+    /// Warning chip and tooltip when a bound vault credential is missing.
+    vault_missing: Option<(SharedString, SharedString)>,
 }
 
 /// One host of the list, with what its row shows.
@@ -248,6 +250,8 @@ struct HostRowView {
     /// computer: a record that came from another machine keeps its path and says so,
     /// rather than failing only once a connection is tried (R9).
     key_missing: Option<(SharedString, SharedString)>,
+    /// Warning chip and tooltip when a bound vault key or shared password is missing.
+    vault_missing: Option<(SharedString, SharedString)>,
 }
 
 /// Which of a row's quiet columns the list draws.
@@ -320,6 +324,7 @@ impl ShelluneView {
     /// one group. The list starts again from its top and the keyboard cursor is dropped,
     /// since the row it was on may not be in the new place.
     pub fn show_home_section(&mut self, section: HomeSection, cx: &mut Context<Self>) {
+        self.security_reset_reveal();
         self.hosts.set_section(&section);
         if let HomeSection::Group(path) = &section {
             self.hosts.set_expanded(path, true);
@@ -401,7 +406,11 @@ impl ShelluneView {
 
     /// Gives the keyboard to the page's search, with what it holds kept.
     pub(super) fn focus_hosts_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let handle = self.hosts_search.read(cx).focus_handle().clone();
+        let handle = if self.hosts.section() == HomeSection::Vault {
+            self.security_search_focus(cx)
+        } else {
+            self.hosts_search.read(cx).focus_handle().clone()
+        };
         window.focus(&handle);
         cx.notify();
     }
@@ -448,6 +457,9 @@ impl ShelluneView {
             HomeSection::All => strings.hosts_view_all.to_owned(),
             HomeSection::Favorites => copy::ux().home_favorites_section.to_owned(),
             HomeSection::Recent => strings.hosts_view_recent.to_owned(),
+            HomeSection::Vault => copy::security_for(self.workspace.locale())
+                .vault_nav_title
+                .to_owned(),
             HomeSection::Group(path) => path.to_canonical(),
         }
     }
@@ -512,6 +524,11 @@ impl ShelluneView {
         let list = self
             .hosts
             .list(&self.book, &self.groups, &|id| self.record_is_open(id));
+        let main = if self.hosts.section() == HomeSection::Vault {
+            self.home_vault_main(window, cx)
+        } else {
+            self.home_main(&list, window, cx)
+        };
         // Behind the fading start the sidebar arrives first and the list just after it
         // (R3); at any other time both are simply there.
         page.flex_row()
@@ -520,11 +537,7 @@ impl ShelluneView {
                 "startup.page.sidebar",
                 0,
             ))
-            .child(self.home_entrance(
-                self.home_card(self.home_main(&list, window, cx)),
-                "startup.page.list",
-                1,
-            ))
+            .child(self.home_entrance(self.home_card(main), "startup.page.list", 1))
     }
 
     /// The inset card the main column sits in: the page's floor with a hairline edge and
@@ -636,6 +649,56 @@ impl ShelluneView {
             );
         }
 
+        // First-class Vault entry: shares the single SecurityPage state with Settings (R1).
+        let security = copy::security_for(self.workspace.locale());
+        let vault_chosen = section == HomeSection::Vault;
+        let vault_locked = self.vault_locked();
+        let vault_count = self.security_record_count();
+        let vault_focus = self.sidebar_place_focus[3].clone();
+        let vault_focus_click = vault_focus.clone();
+        let vault_icon = if vault_locked { Icon::Lock } else { Icon::Key };
+        let vault_item = if folded {
+            components::sidebar_icon_item(vault_icon, vault_chosen, metrics)
+        } else if vault_locked {
+            components::sidebar_item_status(
+                vault_icon,
+                security.vault_nav_title,
+                security.vault_locked_badge,
+                vault_chosen,
+                metrics,
+            )
+        } else {
+            components::sidebar_item(
+                vault_icon,
+                security.vault_nav_title,
+                Some(vault_count),
+                vault_chosen,
+                metrics,
+            )
+        };
+        let vault_tip = if vault_locked {
+            format!(
+                "{} · {}",
+                security.vault_nav_title, security.vault_locked_badge
+            )
+        } else {
+            format!("{} ({vault_count})", security.vault_nav_title)
+        };
+        bar = bar.child(
+            vault_item
+                .id("hosts.view.vault")
+                .debug_selector(|| "hosts.view.vault".to_owned())
+                .track_focus(&vault_focus)
+                .border_1()
+                .border_color(theme::clear())
+                .focus(move |style| style.border_color(ring))
+                .when(folded, |item| item.tooltip(components::tooltip(vault_tip)))
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    window.focus(&vault_focus_click);
+                    this.show_home_section(HomeSection::Vault, cx);
+                })),
+        );
+
         bar = bar.child(
             div()
                 .flex_none()
@@ -678,7 +741,7 @@ impl ShelluneView {
                 metrics,
             )
         };
-        let local_focus = self.sidebar_place_focus[3].clone();
+        let local_focus = self.sidebar_place_focus[4].clone();
         let local_focus_click = local_focus.clone();
         bar.when(folded, |bar| bar.child(div().flex_1().min_h_0()))
             .child(
@@ -1065,6 +1128,7 @@ impl ShelluneView {
             HomeSection::All | HomeSection::Group(_) => 0,
             HomeSection::Favorites => 1,
             HomeSection::Recent => 2,
+            HomeSection::Vault => 3,
         };
         window.focus(&self.sidebar_place_focus[place_slot].clone());
         cx.notify();
@@ -1158,7 +1222,7 @@ impl ShelluneView {
                     if let Some(first) = drawn.first().cloned() {
                         self.focus_group_row(&first, window, cx);
                     } else {
-                        window.focus(&self.sidebar_place_focus[3].clone());
+                        window.focus(&self.sidebar_place_focus[4].clone());
                         cx.notify();
                     }
                     return true;
@@ -1167,7 +1231,7 @@ impl ShelluneView {
                     if let Some(last) = drawn.last().cloned() {
                         self.focus_group_row(&last, window, cx);
                     } else {
-                        window.focus(&self.sidebar_place_focus[2].clone());
+                        window.focus(&self.sidebar_place_focus[3].clone());
                         cx.notify();
                     }
                     return true;
@@ -1187,7 +1251,8 @@ impl ShelluneView {
             (Some(0), _) => SidebarStop::Place(0, HomeSection::All),
             (Some(1), _) => SidebarStop::Place(1, HomeSection::Favorites),
             (Some(2), _) => SidebarStop::Place(2, HomeSection::Recent),
-            (Some(3), _) => SidebarStop::Local,
+            (Some(3), _) => SidebarStop::Place(3, HomeSection::Vault),
+            (Some(4), _) => SidebarStop::Local,
             (_, Some(path)) => SidebarStop::Group(path),
             _ => return false,
         };
@@ -1208,6 +1273,7 @@ impl ShelluneView {
             SidebarStop::Place(0, HomeSection::All),
             SidebarStop::Place(1, HomeSection::Favorites),
             SidebarStop::Place(2, HomeSection::Recent),
+            SidebarStop::Place(3, HomeSection::Vault),
         ];
         let drawn = if self.home_sidebar_folded() {
             Vec::new()
@@ -1281,7 +1347,7 @@ impl ShelluneView {
                             self.focus_group_row(path, window, cx);
                         }
                         SidebarStop::Local => {
-                            window.focus(&self.sidebar_place_focus[3].clone());
+                            window.focus(&self.sidebar_place_focus[4].clone());
                             cx.notify();
                         }
                     }
@@ -2457,7 +2523,7 @@ impl ShelluneView {
                     )
                     .into_any_element(),
             ),
-            HomeSection::All => note(
+            HomeSection::All | HomeSection::Vault => note(
                 "hosts.group.empty",
                 Icon::Folder,
                 SharedString::from(strings.hosts_no_match),
@@ -2803,6 +2869,32 @@ impl ShelluneView {
                                     )),
                                 )
                             }),
+                        vault_missing: saved
+                            .managed_key_id()
+                            .filter(|id| self.security_vault_key_missing(*id))
+                            .map(|_| {
+                                let security = copy::security_for(self.workspace.locale());
+                                (
+                                    SharedString::from(security.vault_key_missing_chip),
+                                    SharedString::from(security.vault_key_missing_tip),
+                                )
+                            })
+                            .or_else(|| {
+                                saved
+                                    .credential_id()
+                                    .filter(|id| self.security_vault_credential_missing(*id))
+                                    .map(|_| {
+                                        let security = copy::security_for(self.workspace.locale());
+                                        (
+                                            SharedString::from(
+                                                security.vault_credential_missing_chip,
+                                            ),
+                                            SharedString::from(
+                                                security.vault_credential_missing_tip,
+                                            ),
+                                        )
+                                    })
+                            }),
                     }));
                     hosts += 1;
                 }
@@ -2827,6 +2919,16 @@ impl ShelluneView {
                         show_duplicate,
                         show_meta: MetaColumns::default(),
                         selecting: !self.hosts.selected().is_empty(),
+                        vault_missing: saved
+                            .credential_id()
+                            .filter(|id| self.security_vault_credential_missing(*id))
+                            .map(|_| {
+                                let security = copy::security_for(self.workspace.locale());
+                                (
+                                    SharedString::from(security.vault_credential_missing_chip),
+                                    SharedString::from(security.vault_credential_missing_tip),
+                                )
+                            }),
                     }));
                     connections += 1;
                 }
@@ -3773,6 +3875,17 @@ fn host_row_element(
                     .child(components::chip_within(label, Tone::Warning, metrics)),
             );
         }
+        if let Some((label, tip)) = host.vault_missing.clone() {
+            badges = badges.child(
+                div()
+                    .id(SharedString::from(format!("hosts.vault-missing.{number}")))
+                    .debug_selector(move || format!("hosts.vault-missing.{number}"))
+                    .min_w_0()
+                    .flex_shrink()
+                    .tooltip(components::tooltip(tip))
+                    .child(components::chip_within(label, Tone::Warning, metrics)),
+            );
+        }
         Some(badges.into_any_element())
     };
     let last = host
@@ -3924,7 +4037,28 @@ fn connection_row_element(
     } else {
         ControlState::Resting
     };
-    let protocol = components::tag(connection.protocol.clone(), metrics).into_any_element();
+    let protocol = {
+        let mut badges = div()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::HALF))
+            .min_w_0()
+            .child(components::tag(connection.protocol.clone(), metrics));
+        if let Some((label, tip)) = connection.vault_missing.clone() {
+            badges = badges.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "hosts.connection.vault-missing.{number}"
+                    )))
+                    .debug_selector(move || format!("hosts.connection.vault-missing.{number}"))
+                    .min_w_0()
+                    .flex_shrink()
+                    .tooltip(components::tooltip(tip))
+                    .child(components::chip_within(label, Tone::Warning, metrics)),
+            );
+        }
+        badges.into_any_element()
+    };
     let tools = row_tools()
         .child(
             components::icon_only_button(Icon::Pencil, metrics)

@@ -75,6 +75,8 @@ pub enum Icon {
     Key,
     /// A padlock: password sign-in.
     Lock,
+    /// An open padlock: an unlocked vault.
+    Unlock,
     /// A triangle: a command run after connecting.
     Play,
     /// An eye: show a hidden password.
@@ -134,7 +136,7 @@ pub enum Icon {
 
 impl Icon {
     /// Every icon, for the asset listing and the tests.
-    pub const ALL: [Self; 56] = [
+    pub const ALL: [Self; 57] = [
         Self::Terminal,
         Self::Server,
         Self::Layers,
@@ -164,6 +166,7 @@ impl Icon {
         Self::Restore,
         Self::Key,
         Self::Lock,
+        Self::Unlock,
         Self::Play,
         Self::Eye,
         Self::EyeOff,
@@ -225,6 +228,7 @@ impl Icon {
             Self::Restore => "icons/restore.svg",
             Self::Key => "icons/key.svg",
             Self::Lock => "icons/lock.svg",
+            Self::Unlock => "icons/unlock.svg",
             Self::Play => "icons/play.svg",
             Self::Eye => "icons/eye.svg",
             Self::EyeOff => "icons/eye-off.svg",
@@ -326,6 +330,9 @@ impl Icon {
             }
             Self::Lock => {
                 r#"<rect x="4.5" y="10.5" width="15" height="10" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/>"#
+            }
+            Self::Unlock => {
+                r#"<rect x="4.5" y="10.5" width="15" height="10" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 7.6-1.7"/>"#
             }
             Self::Play => r#"<path d="M7 5l12 7-12 7z"/>"#,
             Self::Eye => {

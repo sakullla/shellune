@@ -743,61 +743,157 @@ impl ShelluneView {
                         .text_color(theme::swatch(palette::TEXT_MUTED))
                         .child(security.host_key_pick),
                 );
-            let mut keys = self
-                .security
-                .content()
-                .map(|vault| {
-                    vault
-                        .keys()
-                        .filter(|record| record.meta().is_live())
-                        .map(|record| record.meta().clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            keys.sort_by(|a, b| a.name().cmp(b.name()));
-            if keys.is_empty() {
+            if self.vault_locked() {
+                let locked_note = if chosen.is_some() {
+                    security.host_vault_locked_bound_key
+                } else {
+                    security.host_vault_locked_key
+                };
                 picker = picker.child(
-                    div()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                        .debug_selector(|| "hosts.auth.managed.none".to_owned())
-                        .child(security.method_none),
+                    components::banner(Tone::Warning, metrics)
+                        .debug_selector(|| "hosts.auth.vault.locked".to_owned())
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap(metrics.scale(spacing::TIGHT))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .whitespace_normal()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                .child(locked_note),
+                        )
+                        .child(
+                            components::compact_button(
+                                if self.security_verifying() {
+                                    security.lock_state_verifying
+                                } else {
+                                    security.lock_unlock
+                                },
+                                components::Variant::Primary,
+                                metrics,
+                            )
+                            .id("hosts.auth.vault.unlock")
+                            .debug_selector(|| "hosts.auth.vault.unlock".to_owned())
+                            .on_click(cx.listener(
+                                |this, _event, _window, cx| {
+                                    this.security_begin(Vec::new(), cx);
+                                },
+                            )),
+                        ),
                 );
-            }
-            for (index, meta) in keys.iter().enumerate() {
-                let id = meta.id();
-                let selected = chosen == Some(id);
-                let label = format!("{} · {}", meta.name(), meta.fingerprint());
-                let selector = format!("hosts.auth.managed.key.{index}");
-                let reserved = components::compact_label_reserved_width(&label, metrics);
-                picker = picker.child(
-                    components::compact_button(
-                        SharedString::from(label.clone()),
-                        if selected {
-                            components::Variant::Primary
-                        } else {
-                            components::Variant::Secondary
-                        },
-                        metrics,
-                    )
-                    .min_w(reserved)
-                    .max_w_full()
-                    .flex_shrink()
-                    .whitespace_normal()
-                    .h(gpui::auto())
-                    .min_h(metrics.compact_control_height())
-                    .id(SharedString::from(selector.clone()))
-                    .debug_selector({
-                        let selector = selector.clone();
-                        move || selector.clone()
+            } else {
+                if chosen.is_some_and(|id| self.security_vault_key_missing(id)) {
+                    picker = picker.child(
+                        components::banner(Tone::Warning, metrics)
+                            .debug_selector(|| "hosts.auth.managed.missing".to_owned())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(security.vault_key_missing_tip),
+                    );
+                }
+                let mut keys = self
+                    .security
+                    .content()
+                    .map(|vault| {
+                        vault
+                            .keys()
+                            .filter(|record| record.meta().is_live())
+                            .map(|record| record.meta().clone())
+                            .collect::<Vec<_>>()
                     })
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        if let Some(draft) = this.hosts.draft_mut() {
-                            draft.set_managed_key(Some(id));
-                        }
-                        cx.notify();
-                    })),
-                );
+                    .unwrap_or_default();
+                keys.sort_by(|a, b| a.name().cmp(b.name()));
+                if keys.is_empty() {
+                    picker = picker.child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .debug_selector(|| "hosts.auth.managed.none".to_owned())
+                            .child(security.method_none),
+                    );
+                }
+                for (index, meta) in keys.iter().enumerate() {
+                    let id = meta.id();
+                    let selected = chosen == Some(id);
+                    let label = format!("{} · {}", meta.name(), meta.fingerprint());
+                    let selector = format!("hosts.auth.managed.key.{index}");
+                    let reserved = components::compact_label_reserved_width(&label, metrics);
+                    picker = picker.child(
+                        components::compact_button(
+                            SharedString::from(label.clone()),
+                            if selected {
+                                components::Variant::Primary
+                            } else {
+                                components::Variant::Secondary
+                            },
+                            metrics,
+                        )
+                        .min_w(reserved)
+                        .max_w_full()
+                        .flex_shrink()
+                        .whitespace_normal()
+                        .h(gpui::auto())
+                        .min_h(metrics.compact_control_height())
+                        .id(SharedString::from(selector.clone()))
+                        .debug_selector({
+                            let selector = selector.clone();
+                            move || selector.clone()
+                        })
+                        .on_click(cx.listener(
+                            move |this, _event, _window, cx| {
+                                if let Some(draft) = this.hosts.draft_mut() {
+                                    draft.set_managed_key(Some(id));
+                                }
+                                cx.notify();
+                            },
+                        )),
+                    );
+                }
+                let inline_actions = div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        components::compact_button(
+                            security.generate_key,
+                            components::Variant::Secondary,
+                            metrics,
+                        )
+                        .id("hosts.auth.managed.generate")
+                        .debug_selector(|| "hosts.auth.managed.generate".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.security_open_inline(
+                                    super::security::SecurityAction::Generate,
+                                    super::security::PendingVaultBind::SshManagedKey,
+                                    cx,
+                                );
+                            },
+                        )),
+                    )
+                    .child(
+                        components::compact_button(
+                            security.import_key,
+                            components::Variant::Secondary,
+                            metrics,
+                        )
+                        .id("hosts.auth.managed.import")
+                        .debug_selector(|| "hosts.auth.managed.import".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.security_open_inline(
+                                    super::security::SecurityAction::Import,
+                                    super::security::PendingVaultBind::SshManagedKey,
+                                    cx,
+                                );
+                            },
+                        )),
+                    );
+                picker = picker.child(inline_actions);
             }
             column = column.child(picker);
         }
@@ -808,30 +904,82 @@ impl ShelluneView {
         if auth == AuthMethodKind::Password {
             let security = copy::security_for(self.workspace.locale());
             let chosen = draft.credential_id();
-            let mut shared = self
-                .security
-                .content()
-                .map(|vault| {
-                    vault
-                        .credentials()
-                        .filter(|record| record.meta().is_live())
-                        .map(|record| record.meta().clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            shared.sort_by(|a, b| a.name().cmp(b.name()));
-            if !shared.is_empty() {
-                let mut picker = div()
-                    .flex()
-                    .flex_col()
-                    .gap(metrics.scale(spacing::HAIRLINE))
-                    .debug_selector(|| "hosts.auth.credential.picker".to_owned())
-                    .child(
+            let mut picker = div()
+                .flex()
+                .flex_col()
+                .gap(metrics.scale(spacing::HAIRLINE))
+                .debug_selector(|| "hosts.auth.credential.picker".to_owned());
+            if self.vault_locked() {
+                let locked_note = if chosen.is_some() {
+                    security.host_vault_locked_bound_credential
+                } else {
+                    security.host_vault_locked_credential
+                };
+                picker = picker.child(
+                    components::banner(Tone::Warning, metrics)
+                        .debug_selector(|| "hosts.auth.vault.locked".to_owned())
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap(metrics.scale(spacing::TIGHT))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .whitespace_normal()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                .child(locked_note),
+                        )
+                        .child(
+                            components::compact_button(
+                                if self.security_verifying() {
+                                    security.lock_state_verifying
+                                } else {
+                                    security.lock_unlock
+                                },
+                                components::Variant::Primary,
+                                metrics,
+                            )
+                            .id("hosts.auth.vault.unlock")
+                            .debug_selector(|| "hosts.auth.vault.unlock".to_owned())
+                            .on_click(cx.listener(
+                                |this, _event, _window, cx| {
+                                    this.security_begin(Vec::new(), cx);
+                                },
+                            )),
+                        ),
+                );
+            } else {
+                if chosen.is_some_and(|id| self.security_vault_credential_missing(id)) {
+                    picker = picker.child(
+                        components::banner(Tone::Warning, metrics)
+                            .debug_selector(|| "hosts.auth.credential.missing".to_owned())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(security.vault_credential_missing_tip),
+                    );
+                }
+                let mut shared = self
+                    .security
+                    .content()
+                    .map(|vault| {
+                        vault
+                            .credentials()
+                            .filter(|record| record.meta().is_live())
+                            .map(|record| record.meta().clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                shared.sort_by(|a, b| a.name().cmp(b.name()));
+                if !shared.is_empty() {
+                    picker = picker.child(
                         div()
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_MUTED))
                             .child(security.host_credential_pick),
                     );
+                }
                 for (index, meta) in shared.iter().enumerate() {
                     let id = meta.id();
                     let selected = chosen == Some(id);
@@ -876,27 +1024,45 @@ impl ShelluneView {
                         )),
                     );
                 }
-                if chosen.is_some() {
-                    picker = picker.child(
+                picker = picker.child(
+                    div().flex().items_center().child(
                         components::compact_button(
-                            security.host_credential_clear,
-                            components::Variant::Ghost,
+                            security.new_password,
+                            components::Variant::Secondary,
                             metrics,
                         )
-                        .id("hosts.auth.credential.clear")
-                        .debug_selector(|| "hosts.auth.credential.clear".to_owned())
+                        .id("hosts.auth.credential.new")
+                        .debug_selector(|| "hosts.auth.credential.new".to_owned())
                         .on_click(cx.listener(
                             |this, _event, _window, cx| {
-                                if let Some(draft) = this.hosts.draft_mut() {
-                                    draft.set_credential(None);
-                                }
-                                cx.notify();
+                                this.security_open_inline(
+                                    super::security::SecurityAction::NewCredential,
+                                    super::security::PendingVaultBind::SshSharedCredential,
+                                    cx,
+                                );
                             },
                         )),
-                    );
-                }
-                column = column.child(picker);
+                    ),
+                );
             }
+            if chosen.is_some() {
+                picker = picker.child(
+                    components::compact_button(
+                        security.host_credential_clear,
+                        components::Variant::Ghost,
+                        metrics,
+                    )
+                    .id("hosts.auth.credential.clear")
+                    .debug_selector(|| "hosts.auth.credential.clear".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        if let Some(draft) = this.hosts.draft_mut() {
+                            draft.set_credential(None);
+                        }
+                        cx.notify();
+                    })),
+                );
+            }
+            column = column.child(picker);
         }
 
         if auth.needs_key_path() {
@@ -2041,18 +2207,6 @@ impl ShelluneView {
                     // keep in the system store.
                     let security = copy::security_for(self.workspace.locale());
                     let chosen = draft.credential_id();
-                    let mut shared = self
-                        .security
-                        .content()
-                        .map(|vault| {
-                            vault
-                                .credentials()
-                                .filter(|record| record.meta().is_live())
-                                .map(|record| record.meta().clone())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    shared.sort_by(|a, b| a.name().cmp(b.name()));
                     let mut picker = div()
                         .flex()
                         .flex_col()
@@ -2088,59 +2242,145 @@ impl ShelluneView {
                                     )),
                                 ),
                         );
-                        if shared.is_empty() {
-                            continue;
+                    }
+                    if self.vault_locked() {
+                        let locked_note = if chosen.is_some() {
+                            security.host_vault_locked_bound_credential
+                        } else {
+                            security.host_vault_locked_credential
+                        };
+                        picker = picker.child(
+                            components::banner(Tone::Warning, metrics)
+                                .debug_selector(|| "connection.auth.vault.locked".to_owned())
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .justify_between()
+                                .gap(metrics.scale(spacing::TIGHT))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .whitespace_normal()
+                                        .text_size(metrics.caption_size())
+                                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                        .child(locked_note),
+                                )
+                                .child(
+                                    components::compact_button(
+                                        if self.security_verifying() {
+                                            security.lock_state_verifying
+                                        } else {
+                                            security.lock_unlock
+                                        },
+                                        components::Variant::Primary,
+                                        metrics,
+                                    )
+                                    .id("connection.auth.vault.unlock")
+                                    .debug_selector(|| "connection.auth.vault.unlock".to_owned())
+                                    .on_click(cx.listener(
+                                        |this, _event, _window, cx| {
+                                            this.security_begin(Vec::new(), cx);
+                                        },
+                                    )),
+                                ),
+                        );
+                    } else {
+                        if chosen.is_some_and(|id| self.security_vault_credential_missing(id)) {
+                            picker = picker.child(
+                                components::banner(Tone::Warning, metrics)
+                                    .debug_selector(|| {
+                                        "connection.auth.credential.missing".to_owned()
+                                    })
+                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                    .child(security.vault_credential_missing_tip),
+                            );
+                        }
+                        let mut shared = self
+                            .security
+                            .content()
+                            .map(|vault| {
+                                vault
+                                    .credentials()
+                                    .filter(|record| record.meta().is_live())
+                                    .map(|record| record.meta().clone())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        shared.sort_by(|a, b| a.name().cmp(b.name()));
+                        if !shared.is_empty() {
+                            picker = picker.child(
+                                div()
+                                    .text_size(metrics.caption_size())
+                                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                                    .child(security.host_credential_pick),
+                            );
+                        }
+                        for (index, meta) in shared.iter().enumerate() {
+                            let id = meta.id();
+                            let selected = chosen == Some(id);
+                            let label = match meta.user() {
+                                Some(user) => format!("{} · {}", meta.name(), user),
+                                None => meta.name().to_owned(),
+                            };
+                            let selector = format!("connection.auth.credential.{index}");
+                            let reserved =
+                                components::compact_label_reserved_width(&label, metrics);
+                            picker = picker.child(
+                                components::compact_button(
+                                    SharedString::from(label),
+                                    if selected {
+                                        components::Variant::Primary
+                                    } else {
+                                        components::Variant::Secondary
+                                    },
+                                    metrics,
+                                )
+                                .min_w(reserved)
+                                .max_w_full()
+                                .flex_shrink()
+                                .whitespace_normal()
+                                .h(gpui::auto())
+                                .min_h(metrics.compact_control_height())
+                                .id(SharedString::from(selector.clone()))
+                                .debug_selector({
+                                    let selector = selector.clone();
+                                    move || selector.clone()
+                                })
+                                .on_click(cx.listener(
+                                    move |this, _event, _window, cx| {
+                                        if let Some(draft) = this.hosts.protocol_draft_mut() {
+                                            // Choosing a record again goes back to a
+                                            // typed password, which is the other way a
+                                            // desktop connection signs in.
+                                            let next =
+                                                (draft.credential_id() != Some(id)).then_some(id);
+                                            draft.set_credential(next);
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            );
                         }
                         picker = picker.child(
-                            div()
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .child(security.host_credential_pick),
-                        );
-                    }
-                    for (index, meta) in shared.iter().enumerate() {
-                        let id = meta.id();
-                        let selected = chosen == Some(id);
-                        let label = match meta.user() {
-                            Some(user) => format!("{} · {}", meta.name(), user),
-                            None => meta.name().to_owned(),
-                        };
-                        let selector = format!("connection.auth.credential.{index}");
-                        let reserved = components::compact_label_reserved_width(&label, metrics);
-                        picker = picker.child(
-                            components::compact_button(
-                                SharedString::from(label),
-                                if selected {
-                                    components::Variant::Primary
-                                } else {
-                                    components::Variant::Secondary
-                                },
-                                metrics,
-                            )
-                            .min_w(reserved)
-                            .max_w_full()
-                            .flex_shrink()
-                            .whitespace_normal()
-                            .h(gpui::auto())
-                            .min_h(metrics.compact_control_height())
-                            .id(SharedString::from(selector.clone()))
-                            .debug_selector({
-                                let selector = selector.clone();
-                                move || selector.clone()
-                            })
-                            .on_click(cx.listener(
-                                move |this, _event, _window, cx| {
-                                    if let Some(draft) = this.hosts.protocol_draft_mut() {
-                                        // Choosing a record again goes back to a
-                                        // typed password, which is the other way a
-                                        // desktop connection signs in.
-                                        let next =
-                                            (draft.credential_id() != Some(id)).then_some(id);
-                                        draft.set_credential(next);
-                                    }
-                                    cx.notify();
-                                },
-                            )),
+                            div().flex().items_center().child(
+                                components::compact_button(
+                                    security.new_password,
+                                    components::Variant::Secondary,
+                                    metrics,
+                                )
+                                .id("connection.auth.credential.new")
+                                .debug_selector(|| "connection.auth.credential.new".to_owned())
+                                .on_click(cx.listener(
+                                    |this, _event, _window, cx| {
+                                        this.security_open_inline(
+                                        super::security::SecurityAction::NewCredential,
+                                        super::security::PendingVaultBind::DesktopSharedCredential,
+                                        cx,
+                                    );
+                                    },
+                                )),
+                            ),
                         );
                     }
                     if chosen.is_some() {

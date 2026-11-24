@@ -788,6 +788,28 @@ pub fn button_with_state(
     }
 }
 
+/// [`button_sized`] at [`ButtonSize::Compact`] in a state the caller owns.
+pub fn compact_button_with_state(
+    label: impl Into<SharedString>,
+    variant: Variant,
+    state: ControlState,
+    metrics: Metrics,
+) -> Div {
+    let face = button_face(variant, state);
+    let base = button_frame(ButtonSize::Compact, face, metrics)
+        .when(state != ControlState::Disabled, |el| el.cursor_pointer())
+        .child(label.into());
+    let base = match face.mark_token() {
+        Some(token) => base.child(mark_bar(token, metrics)),
+        None => base,
+    };
+    if face.is_busy() {
+        base.child(loading_indicator(metrics))
+    } else {
+        base
+    }
+}
+
 /// A button that leads with an icon.
 ///
 /// The icon takes the button's text colour, so every variant and hover state works
@@ -3257,6 +3279,28 @@ pub fn sidebar_item(
     metrics: Metrics,
 ) -> Div {
     sidebar_item_in(icon, label, count, selected, None, metrics)
+}
+
+/// A sidebar entry with a short trailing status word (such as "Locked") instead of a numeric count.
+pub fn sidebar_item_status(
+    icon: Icon,
+    label: impl Into<SharedString>,
+    status: impl Into<SharedString>,
+    selected: bool,
+    metrics: Metrics,
+) -> Div {
+    let count_ink = if selected {
+        palette::ACCENT_ON_TINT
+    } else {
+        palette::TEXT_MUTED
+    };
+    sidebar_item_in(icon, label, None, selected, None, metrics).child(
+        div()
+            .flex_none()
+            .text_size(metrics.caption_size())
+            .text_color(theme::swatch(count_ink))
+            .child(line_text(status)),
+    )
 }
 
 /// A sidebar entry whose count gives way while the named group is pointed at.

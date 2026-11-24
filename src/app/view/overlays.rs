@@ -461,6 +461,7 @@ impl ShelluneView {
             current: false,
         });
 
+        let security = copy::security_for(locale);
         for destination in Destination::PAGES {
             entries.push(Entry {
                 command: Command::GoTo(destination),
@@ -473,6 +474,24 @@ impl ShelluneView {
                 current: false,
             });
         }
+        entries.push(Entry {
+            command: Command::OpenVault,
+            group: Group::Navigate,
+            title: security.palette_open_vault.to_owned(),
+            detail: security.palette_open_vault_hint.to_owned(),
+            shortcut: None,
+            icon: Icon::Key,
+            current: false,
+        });
+        entries.push(Entry {
+            command: Command::OpenHostTrust,
+            group: Group::Navigate,
+            title: security.palette_open_trust.to_owned(),
+            detail: security.trust_settings_hint.to_owned(),
+            shortcut: None,
+            icon: Icon::Check,
+            current: false,
+        });
 
         if let Some(id) = self.reconnect_candidate() {
             entries.push(Entry {
@@ -583,6 +602,56 @@ impl ShelluneView {
             icon: Icon::Import,
             current: false,
         });
+        entries.push(Entry {
+            command: Command::NewVaultCredential,
+            group: Group::Actions,
+            title: security.palette_new_password.to_owned(),
+            detail: security.vault_nav_title.to_owned(),
+            shortcut: None,
+            icon: Icon::Lock,
+            current: false,
+        });
+        entries.push(Entry {
+            command: Command::GenerateSshKey,
+            group: Group::Actions,
+            title: security.palette_generate_key.to_owned(),
+            detail: security.vault_nav_title.to_owned(),
+            shortcut: None,
+            icon: Icon::Plus,
+            current: false,
+        });
+        entries.push(Entry {
+            command: Command::ImportSshKey,
+            group: Group::Actions,
+            title: security.palette_import_key.to_owned(),
+            detail: security.vault_nav_title.to_owned(),
+            shortcut: None,
+            icon: Icon::Import,
+            current: false,
+        });
+        if self.security_topbar_lock_shown() {
+            if self.vault_locked() {
+                entries.push(Entry {
+                    command: Command::UnlockVault,
+                    group: Group::Actions,
+                    title: security.palette_unlock_vault.to_owned(),
+                    detail: security.lock_state_locked.to_owned(),
+                    shortcut: None,
+                    icon: Icon::Unlock,
+                    current: false,
+                });
+            } else {
+                entries.push(Entry {
+                    command: Command::LockVault,
+                    group: Group::Actions,
+                    title: security.palette_lock_now.to_owned(),
+                    detail: security.lock_state_open.to_owned(),
+                    shortcut: None,
+                    icon: Icon::Lock,
+                    current: false,
+                });
+            }
+        }
         entries.push(Entry {
             command: Command::ToggleLanguage,
             group: Group::Actions,
@@ -737,6 +806,35 @@ impl ShelluneView {
                 } else {
                     self.select(destination, window, cx);
                 }
+            }
+            Command::OpenVault => {
+                self.select(Destination::Hosts, window, cx);
+                self.show_home_section(crate::app::hosts::HomeSection::Vault, cx);
+            }
+            Command::OpenHostTrust => {
+                self.open_host_trust_settings(window, cx);
+            }
+            Command::NewVaultCredential => {
+                self.select(Destination::Hosts, window, cx);
+                self.show_home_section(crate::app::hosts::HomeSection::Vault, cx);
+                self.security_open_palette_action(
+                    super::security::SecurityAction::NewCredential,
+                    cx,
+                );
+            }
+            Command::GenerateSshKey => {
+                self.select(Destination::Hosts, window, cx);
+                self.show_home_section(crate::app::hosts::HomeSection::Vault, cx);
+                self.security_open_palette_action(super::security::SecurityAction::Generate, cx);
+            }
+            Command::ImportSshKey => {
+                self.select(Destination::Hosts, window, cx);
+                self.show_home_section(crate::app::hosts::HomeSection::Vault, cx);
+                self.security_open_palette_action(super::security::SecurityAction::Import, cx);
+            }
+            Command::LockVault => self.security_lock_now(cx),
+            Command::UnlockVault => {
+                self.security_begin(Vec::new(), cx);
             }
             Command::NewHost => {
                 self.select(Destination::Hosts, window, cx);

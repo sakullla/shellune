@@ -31,6 +31,20 @@ pub enum Command {
     NewHost,
     /// Opens the SSH configuration import.
     ImportSshConfig,
+    /// Opens the vault workbench on the home page.
+    OpenVault,
+    /// Opens the new shared password dialog in the vault.
+    NewVaultCredential,
+    /// Opens the SSH key generation dialog in the vault.
+    GenerateSshKey,
+    /// Opens the SSH private key import dialog in the vault.
+    ImportSshKey,
+    /// Opens the host trust settings page.
+    OpenHostTrust,
+    /// Locks the device vault immediately.
+    LockVault,
+    /// Unlocks the device vault.
+    UnlockVault,
     /// Connects with an address that is not saved as a host first.
     QuickConnect,
     /// Types a saved command into the terminal on screen, without running it (R6).
