@@ -45230,6 +45230,34 @@ async fn vault_wide_master_detail_scrolls_independently_and_row_click_keeps_arro
         "Up + Enter after clicking row 24 selects Deploy Key 23"
     );
 
+    // 2B. Home Vault pure keyboard loop from `security.search`:
+    //     typing a query -> Enter opens top match; typing/focusing search -> Down -> Down -> Up -> Enter
+    //     transfers focus to `security.list_focus` and opens the stepped record without needing Tab!
+    click(cx, "security.search");
+    cx.simulate_input("ops-1");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_detail_name_for_test()),
+        Some("Deploy Key 10".to_owned()),
+        "pressing Enter directly inside security.search opens the top matching record"
+    );
+    click(cx, "security.search");
+    cx.simulate_keystrokes("down");
+    cx.simulate_keystrokes("down");
+    cx.simulate_keystrokes("up");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_detail_name_for_test()),
+        Some("Deploy Key 11".to_owned()),
+        "Down -> Down -> Up -> Enter from security.search moves focus into list and selects Deploy Key 11"
+    );
+    // Clear search via `/` + `Escape` so subsequent Settings steps see all 25 keys.
+    cx.simulate_keystrokes("/");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
     // 3. Finding 4 (Settings): Clicking a row in Settings -> Security -> Keys & Passwords focuses
     //    `security.list_focus`, so Down + Enter steps rows instead of switching Settings categories.
     click(cx, "nav.settings");
@@ -45382,12 +45410,16 @@ async fn vault_warming_epoch_lock_race_and_desktop_every_operation_verification_
         cx.debug_bounds("session.verifying").is_some(),
         "desktop connection started during warming waits cleanly instead of failing with missing credential"
     );
+    // While `warming == true` and `pending` holds the verified desktop session, an overlapping
+    // `requires_verify` request is refused as busy instead of overwriting `pending`!
+    cx.update(|_window, app| view.update(app, |v, cx| v.security_begin_always_for_test(cx)));
+    cx.run_until_parked();
     cx.update(|_window, app| view.update(app, |v, cx| v.security_release_open_for_test(cx)));
     cx.run_until_parked();
     assert_eq!(
         cx.update(|_window, app| view.read(app).desktop_start_count_for_test()),
         1,
-        "releasing warming completes the queued desktop session start"
+        "overlapping requires_verify during warming did not clobber the queued desktop session"
     );
 
     // Close the first tab and open a fresh window to verify EverySensitiveOperation cancel/retry,
@@ -45399,6 +45431,7 @@ async fn vault_warming_epoch_lock_race_and_desktop_every_operation_verification_
         )
         .script([
             Ok(()),
+            Err(shellune_storage::BiometricError::Cancelled),
             Err(shellune_storage::BiometricError::Cancelled),
             Ok(()),
             Err(shellune_storage::BiometricError::Cancelled),
@@ -45427,11 +45460,45 @@ async fn vault_warming_epoch_lock_race_and_desktop_every_operation_verification_
         "vault is unlocked under EverySensitiveOperation"
     );
 
-    // 3. Finding 2A: Under EverySensitiveOperation (unlocked), cancelling verification shows the
-    //    cancellation reason directly in `terminal.failure.reason` WITHOUT opening `Show details`,
-    //    and clicking `terminal.failure.next` retries verification and starts the desktop session!
-    cx.update(|_window, app| view2.update(app, |v, _cx| v.security_hold_verify_for_test(true)));
+    // 3A. Simultaneous `warming == true` + `EverySensitiveOperation` `verifying == true`:
+    //     releasing `vault_open_quietly` FIRST while `verifying` is still in flight MUST NOT
+    //     bypass verification and dial; releasing Cancelled `verify` then fails cleanly in-place!
+    cx.update(|_window, app| {
+        view2.update(app, |v, cx| {
+            v.security_hold_open_for_test(true);
+            v.security_reread_for_test(cx);
+            v.security_hold_verify_for_test(true);
+        });
+    });
+    cx.run_until_parked();
     click(cx, "hosts.connection.connect.0");
+    cx.run_until_parked();
+    cx.update(|_window, app| view2.update(app, |v, cx| v.security_release_open_for_test(cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view2.read(app).desktop_start_count_for_test()),
+        0,
+        "finishing vault_open_quietly while verification is still pending must NEVER bypass verification"
+    );
+    cx.update(|_window, app| view2.update(app, |v, cx| v.security_release_verify_for_test(cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view2.read(app).desktop_start_count_for_test()),
+        0,
+        "cancelled verification after warming finished never dials the desktop session"
+    );
+    assert!(
+        cx.debug_bounds("terminal.failure").is_some()
+            && cx.debug_bounds("terminal.failure.reason").is_some()
+            && cx.debug_bounds("terminal.failure.next").is_some()
+            && cx.debug_bounds("terminal.failure.diagnostic").is_none(),
+        "cancelled verification after warming surfaces reason directly in failure_notice"
+    );
+
+    // 3B. Finding 2A: Reconnecting under EverySensitiveOperation and cancelling again still
+    //     surfaces reason in-place, and clicking `terminal.failure.next` retries and starts!
+    cx.update(|_window, app| view2.update(app, |v, _cx| v.security_hold_verify_for_test(true)));
+    click(cx, "terminal.failure.next");
     cx.run_until_parked();
     cx.update(|_window, app| view2.update(app, |v, cx| v.security_release_verify_for_test(cx)));
     cx.run_until_parked();

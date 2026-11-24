@@ -3820,10 +3820,17 @@ impl ShelluneView {
                     _ => false,
                 };
             }
+            let vault_list_focused = self.security_list_focused(window);
             return match event.keystroke.key.as_str() {
-                "down" => self.security_step_cursor(1, cx),
-                "up" if page_focused => self.security_step_cursor(-1, cx),
-                "/" if page_focused => {
+                "down" if page_focused => {
+                    self.security_focus_list_handle(window);
+                    self.security_step_cursor(1, cx)
+                }
+                "up" if page_focused => {
+                    self.security_focus_list_handle(window);
+                    self.security_step_cursor(-1, cx)
+                }
+                "/" if page_focused || vault_list_focused => {
                     self.focus_hosts_search(window, cx);
                     true
                 }
@@ -5228,21 +5235,20 @@ impl ShelluneView {
         // A shared password the vault holds is a secret read like any other:
         // the lock's gate verifies first when the policy asks, and a locked
         // vault unlocks before the pane may sign in with it (R3).
-        if record.credential_id().is_some() && !self.security.operation_granted {
-            if self.security_verifying() {
+        if record.credential_id().is_some()
+            && !self.security.operation_granted
+            && self.security_begin(vec![SecurityPending::Desktop(session)], cx)
+        {
+            if self.security_verifying_for_desktop(session) {
+                self.workspace.session_starting(session);
+            } else {
                 let busy_text = copy::security_for(self.workspace.locale())
                     .lock_busy
                     .to_owned();
-                self.security_set_notice(Tone::Warning, busy_text.clone(), cx);
                 self.security_fail_desktop(session, busy_text);
-                self.show_terminal_start(session, cx);
-                return;
             }
-            if self.security_begin(vec![SecurityPending::Desktop(session)], cx) {
-                self.workspace.session_starting(session);
-                self.show_terminal_start(session, cx);
-                return;
-            }
+            self.show_terminal_start(session, cx);
+            return;
         }
         self.security.operation_granted = false;
         let password = match self.desktop_password(&record) {
@@ -9313,9 +9319,10 @@ impl ShelluneView {
             if let Some(panel) = self.remote.as_mut() {
                 panel.clear_form_error();
             }
-            let was_other_verifying = self.security_verifying();
             if self.security_begin(vec![SecurityPending::ResumeChain(take_panel)], cx) {
-                if was_other_verifying && let Some(panel) = self.remote.as_mut() {
+                if !self.security_verifying_for_chain()
+                    && let Some(panel) = self.remote.as_mut()
+                {
                     let busy_text = copy::security_for(self.workspace.locale()).lock_busy;
                     panel.set_form_error(busy_text);
                 }

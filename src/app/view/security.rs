@@ -541,6 +541,7 @@ impl SecurityPage {
         });
         cx.observe(&search, |this, _, cx| {
             this.security.revealed = false;
+            this.security.cursor = None;
             cx.notify();
         })
         .detach();
@@ -3160,12 +3161,20 @@ impl ShelluneView {
         match event.keystroke.key.as_str() {
             "down" => {
                 if search_focused {
+                    self.settings_nav.clear_nav_focus();
                     window.focus(&self.security.list_focus);
                 }
                 self.security_step_cursor(1, cx) || list_focused
             }
             "up" if !search_focused => self.security_step_cursor(-1, cx) || list_focused,
-            "enter" if !search_focused => self.security_activate_cursor(cx),
+            "enter" => {
+                let activated = self.security_activate_cursor(cx);
+                if activated && search_focused {
+                    self.settings_nav.clear_nav_focus();
+                    window.focus(&self.security.list_focus);
+                }
+                activated
+            }
             _ => false,
         }
     }
@@ -4452,23 +4461,36 @@ impl ShelluneView {
                     draft.set_managed_key(Some(first));
                 }
                 // An unlock's follow-up steps waited for exactly this
-                // file; they continue now that the vault is open.
-                let waiting = std::mem::take(&mut self.security.lock.pending);
-                if !waiting.is_empty() {
-                    self.security_resume(waiting, cx);
+                // file; they continue now that the vault is open, unless an
+                // active verification prompt has not yet been answered.
+                if !self.security.lock.verifying {
+                    let waiting = std::mem::take(&mut self.security.lock.pending);
+                    if !waiting.is_empty() {
+                        self.security_resume(waiting, cx);
+                    }
                 }
             }
             Ok(None) => {
                 // No vault exists: the steps that needed one simply
-                // find nothing, the way an unlocked machine does.
-                let waiting = std::mem::take(&mut self.security.lock.pending);
-                if !waiting.is_empty() {
-                    self.security_resume(waiting, cx);
+                // find nothing, once no verification prompt is still open.
+                if !self.security.lock.verifying {
+                    let waiting = std::mem::take(&mut self.security.lock.pending);
+                    if !waiting.is_empty() {
+                        self.security_resume(waiting, cx);
+                    }
                 }
             }
             Err(reason) => {
                 // A vault that cannot be opened answers no request;
                 // what waited for it dies with the reason shown.
+                if self.security.lock.verifying {
+                    self.security.verify_epoch = self.security.verify_epoch.wrapping_add(1);
+                    self.security.lock.verifying = false;
+                    #[cfg(test)]
+                    {
+                        self.security.held_verify = None;
+                    }
+                }
                 self.security_abort_pending(&reason);
                 self.security.open_problem = Some(reason);
             }
@@ -4688,10 +4710,10 @@ impl ShelluneView {
         let requires_verify =
             lock.locked || (lock.engaged() && (lock.verifies_every_operation() || always));
         if requires_verify {
-            if lock.verifying {
-                // One prompt at a time; a second request while the system is
-                // asking is refused rather than queued behind a prompt the
-                // user may be about to cancel.
+            if self.security_gate_busy() {
+                // One prompt (or already-verified warming queue) at a time; a
+                // second request while the gate is occupied is refused rather
+                // than overwriting or queueing behind a prompt the user may cancel.
                 let strings = self.security_strings();
                 self.security_set_notice(Tone::Warning, strings.lock_busy.to_owned(), cx);
                 return true;
@@ -4833,7 +4855,7 @@ impl ShelluneView {
     /// operations that always verify anew (R3).
     pub(super) fn security_toggle_biometric(&mut self, on: bool, cx: &mut Context<Self>) {
         let current = self.security.lock.settings.biometric_unlock == Some(true);
-        if on == current || self.security.lock.verifying {
+        if on == current || self.security_gate_busy() {
             return;
         }
         if !on {
@@ -5050,9 +5072,21 @@ impl ShelluneView {
         self.security.lock.engaged() || self.security.lock.locked
     }
 
+    /// Whether a system/biometric verification prompt (or a verified queue waiting on
+    /// background vault warming) currently occupies the security gate.
+    pub(crate) fn security_gate_busy(&self) -> bool {
+        self.security.lock.verifying
+            || (self.security.warming && !self.security.lock.pending.is_empty())
+    }
+
     /// Whether a system/biometric verification prompt is currently in flight.
     pub(crate) fn security_verifying(&self) -> bool {
         self.security.lock.verifying
+    }
+
+    /// Focuses `security.list_focus` without altering the current cursor.
+    pub(crate) fn security_focus_list_handle(&self, window: &mut Window) {
+        window.focus(&self.security.list_focus);
     }
 
     /// Whether an SSH/chain connection attempt is currently waiting on vault verification/open.
