@@ -2198,9 +2198,14 @@ impl ShelluneView {
 
     /// Opens a tool over the current page.
     pub(super) fn open_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
-        if self.tool.is_none() {
-            self.remember_tool_focus_pending = true;
+        if self.batch.view().is_open() {
+            let _ = self.batch.close() || self.batch.hide();
         }
+        if self.tool != Some(Tool::Snippets) || tool != Tool::Snippets {
+            self.snippet_panel.keep();
+            self.snippet_panel.end_edit();
+        }
+        self.remember_tool_focus_pending = true;
         self.tool = Some(tool);
         self.shell_menu_open = false;
         cx.notify();
@@ -2445,7 +2450,11 @@ impl ShelluneView {
             );
             return;
         };
-        let Some(pane) = self.active_pane().cloned() else {
+        let pane = self
+            .shows_terminal(self.workspace.destination())
+            .then(|| self.active_pane().cloned())
+            .flatten();
+        let Some(pane) = pane else {
             self.toast(
                 Tone::Warning,
                 ux.snippet_no_terminal.to_owned(),

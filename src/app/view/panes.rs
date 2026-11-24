@@ -279,37 +279,61 @@ impl ShelluneView {
                 self.start_shell(shell, cx);
             }
             SessionKind::Remote { host } => {
+                if self.form_session.is_some() {
+                    self.park_focused_form();
+                    self.form_session = None;
+                }
+                self.showing_connection_form = false;
                 self.workspace
                     .layout_mut()
                     .split_pending(axis, PaneTarget::remote(host));
                 self.sync_layout_focus(cx);
+                self.focus_return = None;
                 self.restore_focus_pending = true;
                 self.checkpoint_layout();
                 cx.notify();
             }
             SessionKind::Rdp { host } => {
+                if self.form_session.is_some() {
+                    self.park_focused_form();
+                    self.form_session = None;
+                }
+                self.showing_connection_form = false;
                 self.workspace
                     .layout_mut()
                     .split_pending(axis, PaneTarget::rdp(host));
                 self.sync_layout_focus(cx);
+                self.focus_return = None;
                 self.restore_focus_pending = true;
                 self.checkpoint_layout();
                 cx.notify();
             }
             SessionKind::Vnc { host } => {
+                if self.form_session.is_some() {
+                    self.park_focused_form();
+                    self.form_session = None;
+                }
+                self.showing_connection_form = false;
                 self.workspace
                     .layout_mut()
                     .split_pending(axis, PaneTarget::vnc(host));
                 self.sync_layout_focus(cx);
+                self.focus_return = None;
                 self.restore_focus_pending = true;
                 self.checkpoint_layout();
                 cx.notify();
             }
             SessionKind::Serial { host } => {
+                if self.form_session.is_some() {
+                    self.park_focused_form();
+                    self.form_session = None;
+                }
+                self.showing_connection_form = false;
                 self.workspace
                     .layout_mut()
                     .split_pending(axis, PaneTarget::serial(host));
                 self.sync_layout_focus(cx);
+                self.focus_return = None;
                 self.restore_focus_pending = true;
                 self.checkpoint_layout();
                 cx.notify();

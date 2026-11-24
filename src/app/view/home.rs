@@ -1874,6 +1874,9 @@ impl ShelluneView {
                         .on_click(cx.listener(
                             |this, _event, _window, cx| {
                                 this.close_home_menu(cx);
+                                if !this.batch.view().is_open() {
+                                    this.remember_tool_focus_pending = true;
+                                }
                                 this.open_batch_preview(cx);
                             },
                         )),

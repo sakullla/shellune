@@ -188,6 +188,10 @@ impl ShelluneView {
         self.shell_menu_open = false;
         self.tab_menu = None;
         self.host_menu = None;
+        self.home_menu = None;
+        self.session_menu = None;
+        self.session_more = None;
+        self.files_menu = None;
         // The field is made per opening so its placeholder is in the current language
         // and no earlier search is waiting in it.
         let placeholder = self.strings().palette_placeholder;
@@ -209,7 +213,19 @@ impl ShelluneView {
             }
         })
         .detach();
-        self.remember_focus(window, cx);
+        let current = window.focused(cx);
+        self.palette_focus_return = current
+            .as_ref()
+            .filter(|handle| !self.is_page_focus(handle))
+            .map(|handle| handle.downgrade())
+            .or_else(|| {
+                self.focus_return
+                    .as_ref()
+                    .and_then(|handle| handle.upgrade())
+                    .filter(|handle| !self.is_page_focus(handle))
+                    .map(|handle| handle.downgrade())
+            })
+            .or_else(|| current.map(|handle| handle.downgrade()));
         window.focus(field.read(cx).focus_handle());
         self.palette = Some(field);
         self.palette_query.clear();
@@ -223,7 +239,15 @@ impl ShelluneView {
             return;
         }
         self.palette_query.clear();
-        self.restore_overlay_focus(window, cx);
+        if let Some(handle) = self
+            .palette_focus_return
+            .take()
+            .and_then(|handle| handle.upgrade())
+        {
+            window.focus(&handle);
+        } else {
+            self.restore_focus(window, cx);
+        }
         cx.notify();
     }
 
@@ -1283,6 +1307,15 @@ impl ShelluneView {
     }
 
     pub(super) fn open_batch_tool(&mut self, cx: &mut Context<Self>) {
+        if self.tool.is_some() {
+            self.tool = None;
+            self.forwards.close_editor();
+            self.pending_exposure = None;
+            self.forward_confirm = None;
+            self.snippet_panel.keep();
+            self.snippet_panel.end_edit();
+        }
+        self.remember_tool_focus_pending = true;
         if self.batch.show_active_run() {
             cx.notify();
         } else {
@@ -2327,6 +2360,10 @@ impl ShelluneView {
         self.shell_menu_open = false;
         self.tab_menu = None;
         self.host_menu = None;
+        self.home_menu = None;
+        self.session_menu = None;
+        self.session_more = None;
+        self.files_menu = None;
         self.remember_focus(window, cx);
         // The list opens with the keyboard on the tab that is on screen, so Up and Down
         // start from where the user already is and Enter never guesses (R17).

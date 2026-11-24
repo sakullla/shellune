@@ -48605,3 +48605,221 @@ async fn cold_start_local_shells_home_keyboard_loop_group_launcher_focus_and_inl
         "SSH host with inline-generated managed key saves and connects cleanly"
     );
 }
+
+#[gpui::test]
+async fn global_tools_batch_focus_isolation_home_snippet_guard_and_context_split_reconnect(
+    app_cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("global-tools-focus-isolation-and-split-reconnect");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let mut book = shellune_core::SnippetBook::new();
+    book.create("echo safe", "echo safe").expect("snippet");
+    shellune_storage::SnippetStore::at(dir.path())
+        .save(&book)
+        .expect("save snippets");
+
+    let (view, cx) = snippet_view(app_cx, &dir);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(design_window());
+    let session = live_remote(cx, &view);
+    show_remote_terminal(cx, &view, session);
+
+    let terminal_focused = |cx: &mut VisualTestContext| {
+        cx.update(|window, app| {
+            view.read(app)
+                .pane_of(session)
+                .is_some_and(|p| p.read(app).focus_handle().is_focused(window))
+        })
+    };
+    assert!(
+        terminal_focused(cx),
+        "live SSH terminal initially holds focus"
+    );
+
+    // 1. Opening Transfers, Forwards (with editor), or Batch over a live terminal isolates
+    //    keystrokes from leaking into the hidden PTY and restores terminal focus on Escape.
+    let sent_before = snippet_sent(cx, &view, session).len();
+    click(cx, "session.more");
+    click(cx, "session.more.transfers");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        Some(crate::app::view::Tool::Transfers)
+    );
+    cx.simulate_input("echo leaked");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session).len(),
+        sent_before,
+        "typing while Transfers modal is open must never leak into the terminal PTY behind the scrim"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        terminal_focused(cx),
+        "closing Transfers modal with Escape restores focus to the active terminal"
+    );
+
+    click(cx, "session.more");
+    click(cx, "session.more.global_forwards");
+    cx.run_until_parked();
+    click(cx, "forwards.new");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("forwards.form").is_some());
+    cx.simulate_keystrokes("escape"); // close forward editor
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("forwards.form").is_none());
+    cx.simulate_keystrokes("escape"); // close Forwards tool modal
+    cx.run_until_parked();
+    assert!(
+        terminal_focused(cx),
+        "closing Forwards editor and modal with Escape restores focus to the active terminal"
+    );
+
+    click(cx, "session.more");
+    click(cx, "session.more.batch");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("batch.dialog").is_some());
+    type_into(cx, "batch.step.field.0", "uptime");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        terminal_focused(cx),
+        "closing Batch preview after typing in step field restores focus to the active terminal"
+    );
+
+    // 2. Navigating to Home (`Destination::Hosts`) while `session` stays open in the background:
+    //    - Opening Snippets from `hosts.more.snippets` and pressing Enter refuses with
+    //      `snippet_no_terminal` instead of injecting into the hidden background terminal!
+    //    - Opening Batch from `hosts.more` or Command Palette and typing inside Batch preserves
+    //      `hosts.search` focus return on Escape!
+    click(cx, "nav.hosts");
+    cx.run_until_parked();
+    let hosts_search_focused = |cx: &mut VisualTestContext| {
+        let handle = cx.update(|_window, app| view.read(app).hosts_search_focus_for_test(app));
+        cx.update(|window, _app| handle.is_focused(window))
+    };
+    click(cx, "hosts.search");
+    assert!(hosts_search_focused(cx));
+
+    let sent_before_home_snippet = snippet_sent(cx, &view, session).len();
+    click(cx, "hosts.more");
+    click(cx, "hosts.more.snippets");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session).len(),
+        sent_before_home_snippet,
+        "pressing Enter in Snippets on Home page must never inject into a hidden background terminal"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).toast_titles())
+            .iter()
+            .any(|t| t == copy::ENGLISH_UX.snippet_no_terminal),
+        "Snippets on Home page explains that a terminal must be on screen first"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        hosts_search_focused(cx),
+        "closing Snippets on Home page restores focus to hosts.search"
+    );
+
+    go(cx, crate::app::actions::OpenPalette);
+    cx.simulate_input("batch");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("batch.dialog").is_some());
+    type_into(cx, "batch.step.field.0", "whoami");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        hosts_search_focused(cx),
+        "closing Batch opened via Command Palette restores focus to hosts.search"
+    );
+
+    // 3. Return to live SSH terminal, right-click -> `terminal.menu.split_right`:
+    //    the newly created pending pane becomes active (`active_session() == None`), and typing
+    //    must NOT leak into the now-idle left SSH pane.
+    cx.update(|_window, app| view.update(app, |v, cx| v.activate(session, cx)));
+    cx.run_until_parked();
+    show_remote_terminal(cx, &view, session);
+    let sent_before_split = snippet_sent(cx, &view, session).len();
+    right_click(cx, "terminal.viewport");
+    click(cx, "terminal.menu.split_right");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().layout().leaves().len()),
+        2
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        None,
+        "pending right pane becomes active after context-menu split"
+    );
+    assert!(
+        !terminal_focused(cx),
+        "idle left SSH pane must not keep keyboard focus when right pending pane is active"
+    );
+    cx.simulate_input("nope");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session).len(),
+        sent_before_split,
+        "typing while pending split pane is active sends nothing to the idle SSH pane"
+    );
+
+    // 4. One-click Reconnect (`terminal.failure.next`) on an inactive background split pane
+    //    focuses that split pane and opens its reconnect flow in place.
+    let Some((split_view, split_cx, left_id, right_id)) = split_tab(app_cx) else {
+        return;
+    };
+    assert_eq!(
+        split_cx.update(|_window, app| split_view.read(app).active_session()),
+        Some(right_id),
+        "split_tab starts with right_id active and left_id idle in the background"
+    );
+    split_cx.update(|_window, app| {
+        if let Some(left_pane) = split_view.read(app).pane_of(left_id).cloned() {
+            let tag = left_pane.read(app).tag();
+            left_pane.update(app, |p, cx| {
+                p.adopt_events(
+                    tag,
+                    vec![crate::app::terminal::SourceEvent::Lost(
+                        "background channel dropped".to_owned(),
+                    )],
+                    cx,
+                );
+            });
+        }
+        split_view.update(app, |v, cx| {
+            let _ = v
+                .workspace_mut_for_test()
+                .session_failed(left_id, shellune_core::SessionFailure::ConnectionLost);
+            cx.notify();
+        });
+    });
+    split_cx.run_until_parked();
+    click(split_cx, "terminal.failure.next");
+    split_cx.run_until_parked();
+    assert_eq!(
+        split_cx.update(|_window, app| split_view.read(app).active_session()),
+        Some(left_id),
+        "clicking Reconnect on an inactive background split pane activates that pane"
+    );
+    assert_eq!(
+        split_cx
+            .update(|_window, app| { split_view.read(app).workspace().layout().active_session() }),
+        Some(left_id),
+        "layout active_session synchronizes with the reconnecting split pane"
+    );
+}

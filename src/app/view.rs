@@ -1096,6 +1096,10 @@ pub struct ShelluneView {
     was_security_keys_surface_visible: bool,
     /// Focus to return to when an overlay closes. Weak, so a removed field is not kept.
     focus_return: Option<gpui::WeakFocusHandle>,
+    /// Focus to return to when the command palette closes, kept separate from
+    /// [`Self::focus_return`] so opening and cancelling the palette over an open dialog
+    /// restores that dialog's active field without overwriting the pre-dialog focus target.
+    palette_focus_return: Option<gpui::WeakFocusHandle>,
     /// The next draw gives the keyboard back to [`Self::focus_return`].
     restore_focus_pending: bool,
     /// The next draw notes [`Self::focus_return`] once before a newly opened tool claims focus.
@@ -3065,6 +3069,7 @@ impl ShelluneView {
             modal_focus_captured: false,
             was_security_keys_surface_visible: false,
             focus_return: None,
+            palette_focus_return: None,
             restore_focus_pending: false,
             remember_tool_focus_pending: false,
             remote_opened_from_workspace: false,
@@ -5348,9 +5353,11 @@ impl ShelluneView {
         // described by the key the window really answers (R5).
         let shortcuts = terminal::TerminalShortcuts::of(&self.keymap);
         let highlight = self.highlight_output;
+        let focus_mode = self.focus_mode;
         pane.update(cx, |pane, cx| {
             pane.set_shortcuts(shortcuts, cx);
             pane.set_highlight(highlight, cx);
+            pane.set_focus_mode(focus_mode);
         });
         self.panes.push(OpenPane {
             tag,
@@ -5365,6 +5372,7 @@ impl ShelluneView {
                 self.workspace
                     .set_context(shellune_core::PanelSection::None);
             }
+            let _ = self.workspace.layout_mut().focus_session(tag.session);
             self.active = Some(tag.session);
             self.session_terminal = true;
             self.showing_connection_form = false;
@@ -5411,6 +5419,7 @@ impl ShelluneView {
             self.workspace
                 .set_context(shellune_core::PanelSection::None);
         }
+        let _ = self.workspace.layout_mut().focus_session(tag.session);
         self.active = Some(tag.session);
         self.session_terminal = true;
         self.showing_connection_form = false;
@@ -7242,6 +7251,9 @@ impl ShelluneView {
                 // The form that was on screen is parked on its own attempt first: the
                 // cleanup below takes this session's attempt, panel and questions away,
                 // and a different form on screen must not go with them.
+                self.remote_opened_from_workspace = self.workspace.destination()
+                    == Destination::LocalShells
+                    && !self.panes.is_empty();
                 self.park_focused_form();
                 if self.workspace.layout_mut().focus_session(id) {
                     self.active = Some(id);
@@ -7268,6 +7280,9 @@ impl ShelluneView {
             // canvas and asks the server for its own first frame.
             SessionKind::Rdp { .. } | SessionKind::Vnc { .. } => {
                 self.park_focused_form();
+                if self.workspace.layout_mut().focus_session(id) {
+                    self.active = Some(id);
+                }
                 self.end_session_resources(id, ResourceEnd::Restarted, cx);
                 self.drop_pane(id, cx);
                 if !self.workspace.session_reconnecting(id) {
@@ -7286,6 +7301,9 @@ impl ShelluneView {
             // gone is written into the next one.
             SessionKind::Serial { .. } => {
                 self.park_focused_form();
+                if self.workspace.layout_mut().focus_session(id) {
+                    self.active = Some(id);
+                }
                 self.end_session_resources(id, ResourceEnd::Restarted, cx);
                 self.drop_pane(id, cx);
                 if !self.workspace.session_reconnecting(id) {
@@ -9109,6 +9127,9 @@ impl ShelluneView {
     }
 
     fn open_import_at(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.import.is_open() {
+            self.remember_tool_focus_pending = true;
+        }
         self.import.open(path);
         self.hosts.close_editor();
         self.host_fields = None;
@@ -9150,6 +9171,8 @@ impl ShelluneView {
         self.import.close();
         self.import_path = None;
         self.import_search = None;
+        self.modal_focus_captured = false;
+        self.restore_focus_pending = true;
         cx.notify();
     }
 
@@ -9233,6 +9256,9 @@ impl ShelluneView {
                 self.hosts.set_message(message, incomplete);
                 self.import.close();
                 self.import_path = None;
+                self.import_search = None;
+                self.modal_focus_captured = false;
+                self.restore_focus_pending = true;
             }
             // The file did not change, so the preview stays: the same hosts can be
             // applied again once the write is possible. Forwarding rules are not
@@ -14137,9 +14163,42 @@ impl ShelluneView {
     pub(super) fn is_overlay_internal_focus(&self, handle: &FocusHandle, cx: &gpui::App) -> bool {
         handle == &self.snippet_focus
             || handle == &self.paste_focus
+            || handle == &self.tab_list_focus
+            || handle == &self.forward_host_focus
             || self
                 .snippet_panel
                 .search_field()
+                .is_some_and(|field| field.read(cx).focus_handle() == handle)
+            || self.snippet_panel.editor().is_some_and(|editor| {
+                editor.name.read(cx).focus_handle() == handle
+                    || editor.body.read(cx).focus_handle() == handle
+            })
+            || [
+                &self.forward_listen_host,
+                &self.forward_listen_port,
+                &self.forward_target_host,
+                &self.forward_target_port,
+                &self.quick_address,
+                &self.quick_port,
+                &self.quick_user,
+                &self.quick_password,
+                &self.quick_key,
+                &self.quick_passphrase,
+                &self.shell_path,
+            ]
+            .into_iter()
+            .any(|field| field.read(cx).focus_handle() == handle)
+            || self
+                .tab_rename
+                .as_ref()
+                .is_some_and(|rename| rename.field.read(cx).focus_handle() == handle)
+            || self
+                .import_path
+                .as_ref()
+                .is_some_and(|field| field.read(cx).focus_handle() == handle)
+            || self
+                .import_search
+                .as_ref()
                 .is_some_and(|field| field.read(cx).focus_handle() == handle)
             || self
                 .host_fields
@@ -14175,6 +14234,7 @@ impl ShelluneView {
     fn note_content_focus(&mut self, window: &Window, cx: &gpui::App) {
         if self.palette.is_some()
             || self.tool.is_some()
+            || self.batch.view().is_open()
             || self.restore_focus_pending
             || self.pane_focus_pending.is_some()
             || self.quick_open
@@ -14472,6 +14532,10 @@ impl ShelluneView {
                 || self.workspace.destination() == Destination::Forwards)
         {
             self.forwards.close_editor();
+            if self.tool == Some(shell::Tool::Forwards) {
+                let root = self.root_focus.clone();
+                window.focus(&root);
+            }
             cx.notify();
             return true;
         }
@@ -22112,6 +22176,15 @@ impl Render for ShelluneView {
         }
         if std::mem::take(&mut self.remember_tool_focus_pending) {
             self.remember_focus(window, cx);
+            if self.snippet_focus_pending.is_none()
+                && (matches!(
+                    self.tool,
+                    Some(shell::Tool::Transfers | shell::Tool::Forwards)
+                ) || self.batch.view().is_open())
+            {
+                let root = self.root_focus.clone();
+                window.focus(&root);
+            }
         }
         // A command editor that was just opened takes the keyboard in its first field, so
         // the dialog can be written without touching the pointer.
