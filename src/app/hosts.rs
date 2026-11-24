@@ -3330,7 +3330,11 @@ impl GroupEditor {
 
     /// Replaces the typed name.
     pub fn set_name(&mut self, name: impl Into<String>) {
-        self.name = name.into();
+        let next = name.into();
+        if self.name != next {
+            self.name = next;
+            self.error = None;
+        }
     }
 
     /// Where the hosts go: a group path, or blank for "no group".
@@ -3341,7 +3345,11 @@ impl GroupEditor {
 
     /// Replaces the typed destination.
     pub fn set_destination(&mut self, destination: impl Into<String>) {
-        self.destination = destination.into();
+        let next = destination.into();
+        if self.destination != next {
+            self.destination = next;
+            self.error = None;
+        }
     }
 
     /// Why the tree refused the change.

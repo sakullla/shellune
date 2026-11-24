@@ -1230,7 +1230,7 @@ impl ShelluneView {
                     return true;
                 }
                 "escape" => {
-                    let handle = self.destination_focus(Destination::Hosts).clone();
+                    let handle = self.destination_focus(self.workspace.destination()).clone();
                     window.focus(&handle);
                     cx.notify();
                     return true;
@@ -1372,7 +1372,7 @@ impl ShelluneView {
                 true
             }
             (_, "escape") => {
-                let handle = self.destination_focus(Destination::Hosts).clone();
+                let handle = self.destination_focus(self.workspace.destination()).clone();
                 window.focus(&handle);
                 cx.notify();
                 true

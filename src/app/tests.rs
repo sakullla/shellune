@@ -48368,3 +48368,240 @@ async fn vault_and_connection_modals_preserve_outer_focus_return_across_typing_v
         "closing RDP dialog after protocol switch, validation refocus, and inline vault cancel restores hosts.search"
     );
 }
+
+#[gpui::test]
+async fn cold_start_local_shells_home_keyboard_loop_group_launcher_focus_and_inline_validation_clear(
+    app_cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("cold-start-home-keyboard-and-inline-validation");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+
+    let mut book = shellune_storage::HostBook::new();
+    let ssh_host = stored_host("prod-api", "10.10.0.5", 22, "deploy", Some("Ops"));
+    let ssh_id = ssh_host.id();
+    book.insert(ssh_host).expect("insert ssh");
+    let rdp_cfg =
+        shellune_core::RdpConfig::new("ops-desk", "10.10.0.9:3389", Some("alice")).expect("rdp");
+    let rdp_id = rdp_cfg.id();
+    book.insert_connection(shellune_core::ConnectionRecord::Rdp(rdp_cfg))
+        .expect("insert rdp");
+    dir.store().save(&book).expect("save book");
+
+    let store = dir.store();
+    let secret_store: Arc<dyn shellune_storage::SecretStore> = secrets.clone();
+    let (view, cx) = app_cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_secrets_for_test(cx, Workspace::new(), store, secret_store)
+    });
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(size(px(1280.0), px(840.0)));
+    cx.run_until_parked();
+
+    // Without ever clicking `nav.hosts`, destination starts as `LocalShells` showing the home page.
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().destination()),
+        Destination::LocalShells
+    );
+    assert!(cx.update(|_window, app| view.read(app).home_shown()));
+
+    let hosts_search_focused = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|window, app| {
+            view.read(app)
+                .hosts_search_focus_for_test(app)
+                .is_focused(window)
+        })
+    };
+
+    // 1. From cold-start Home page (`Destination::LocalShells`), `/` focuses `hosts.search`,
+    //    `Tab` moves focus to the active home page and sets cursor on row 0, `*` toggles favorite,
+    //    `F2` opens edit dialog and `Escape` returns focus to the list, `Shift+F10` -> `Move to group…`
+    //    preserves focus return when opened from `hosts.search`.
+    cx.simulate_keystrokes("/");
+    cx.run_until_parked();
+    assert!(
+        hosts_search_focused(cx),
+        "pressing '/' on cold-start LocalShells home page focuses hosts.search"
+    );
+    cx.simulate_input("ops");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        crate::app::view::home::home_highlights::ranges_of("ops-desk").is_some(),
+        "typing in hosts.search on cold-start home highlights matching connection name"
+    );
+
+    // Tab from `hosts.search` into the list under `Destination::LocalShells`.
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert!(
+        !hosts_search_focused(cx),
+        "Tab moves focus out of hosts.search to the home list"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_cursor()),
+        Some(ssh_id),
+        "Tab selects the first visible record"
+    );
+
+    // Move down to `ops-desk` (RDP) and toggle favorite via `*`.
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_cursor()),
+        Some(rdp_id)
+    );
+    cx.simulate_keystrokes("*");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).book().is_favorite(rdp_id)),
+        "'*' on cold-start LocalShells home list toggles favorite on RDP row"
+    );
+
+    // Press F2 to open RDP editor and Escape to return to the list.
+    cx.simulate_keystrokes("f2");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().protocol_draft().is_some()),
+        "F2 opens the protocol connection dialog"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+
+    // Focus `hosts.search`, open row menu via `Shift+F10`, pick `Move to group…`, confirm move,
+    // and verify focus returns cleanly to `hosts.search`!
+    click(cx, "hosts.search");
+    assert!(hosts_search_focused(cx));
+    cx.simulate_keystrokes("shift-f10");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("host.menu.move_group").is_some());
+    click(cx, "host.menu.move_group");
+    cx.run_until_parked();
+    cx.simulate_input("Infra");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    redraw(cx);
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .book()
+                .connection(rdp_id)
+                .and_then(|r| r.group_text())
+        }),
+        Some("Infra".to_owned()),
+        "MoveSingle updates RDP record's group"
+    );
+    assert!(
+        hosts_search_focused(cx),
+        "confirming Move to group restores focus back to hosts.search"
+    );
+
+    // 2. Topbar `+` launcher (`header.primary`) opened while `hosts.search` is focused:
+    //    typing in launcher search and pressing Escape restores focus to `hosts.search`.
+    click(cx, "header.primary");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("shell.picker").is_some());
+    cx.simulate_input("ops");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("launcher.host.0").is_some(),
+        "launcher lists matching saved records across protocols"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        hosts_search_focused(cx),
+        "closing topbar '+' launcher with Escape restores focus to hosts.search"
+    );
+
+    // 3. Global tool modal (`Tool::Forwards`) opened over the Home page blocks host shortcuts behind it.
+    cx.simulate_keystrokes("escape"); // clear non-empty `hosts.search`
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape"); // empty `hosts.search` -> focus home list
+    cx.run_until_parked();
+    assert!(!hosts_search_focused(cx));
+    click(cx, "hosts.more");
+    cx.run_until_parked();
+    click(cx, "hosts.more.forwards");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("delete");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().pending_delete().is_none()),
+        "Delete key while global Forwards modal is open must not trigger host deletion behind the modal"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // 4. Subgroup refusal banner clears on edit (`GroupEditor::set_name`), and switching SSH auth
+    //    from Password (with unticked remember + typed secret) to an inline-generated ManagedKey
+    //    never stashes a leftover ephemeral secret on Save & Connect.
+    right_click(cx, "hosts.tree.0");
+    cx.run_until_parked();
+    click(cx, "hosts.group.create_sub.open");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .hosts_state()
+                .group_editor()
+                .map(|e| e.name().to_owned())
+        }),
+        Some("Infra/".to_owned())
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .hosts_state()
+                .group_editor()
+                .and_then(|e| e.error())
+                .is_some()
+        }),
+        "submitting trailing slash 'Infra/' shows group refusal"
+    );
+    cx.simulate_input("Core");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .hosts_state()
+                .group_editor()
+                .and_then(|e| e.error())
+                .is_none()
+        }),
+        "typing subgroup suffix immediately clears stale group dialog refusal"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    click(cx, "hosts.new");
+    cx.run_until_parked();
+    type_into(cx, "hosts.field.address", "127.0.0.1");
+    clear_field(cx, "hosts.field.port", 2);
+    type_into(cx, "hosts.field.port", "1");
+    type_into(cx, "hosts.field.user", "ubuntu");
+    click(cx, "hosts.auth.remote.method.password");
+    type_into(cx, "hosts.field.secret", "leftover-password-not-used");
+    click(cx, "hosts.remember");
+    click(cx, "hosts.auth.remote.method.managed-key");
+    cx.run_until_parked();
+    click(cx, "hosts.auth.managed.generate");
+    cx.run_until_parked();
+    type_into(cx, "security.dialog.name", "inline-ed25519");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    redraw(cx);
+    click(cx, "hosts.save_connect");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.update(app, |v, _cx| v.ephemeral_ssh_secret_count_for_test())),
+        0,
+        "switching away from Password to ManagedKey before Save & Connect never stashes an ephemeral secret"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().draft().is_none()),
+        "SSH host with inline-generated managed key saves and connects cleanly"
+    );
+}

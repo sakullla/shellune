@@ -3852,7 +3852,7 @@ impl ShelluneView {
             self.hosts_scroll
                 .scroll_to_item(row_index, gpui::ScrollStrategy::Top);
         }
-        let handle = self.destination_focus(Destination::Hosts).clone();
+        let handle = self.destination_focus(self.workspace.destination()).clone();
         self.focus_return = None;
         window.focus(&handle);
         cx.notify();
@@ -3880,8 +3880,11 @@ impl ShelluneView {
         let vault_search_focused = self.security_search_focus(cx).is_focused(window);
         let vault_list_focused = self.security_list_focused(window);
         let page_focused = self
-            .destination_focus(Destination::Hosts)
-            .is_focused(window);
+            .destination_focus(self.workspace.destination())
+            .is_focused(window)
+            || self
+                .destination_focus(Destination::Hosts)
+                .is_focused(window);
         if !search_focused && !vault_search_focused && !vault_list_focused && !page_focused {
             return false;
         }
@@ -3903,8 +3906,11 @@ impl ShelluneView {
     /// menu, the palette or a question.
     pub(super) fn hosts_keys_blocked(&self) -> bool {
         self.palette.is_some()
+            || self.tool.is_some()
             || self.batch.view().is_open()
             || self.custom_shell_open
+            || self.tab_rename.is_some()
+            || self.tab_list_open
             || self.host_fields.is_some()
             || self.protocol_fields.is_some()
             || self.hosts.group_editor().is_some()
@@ -4061,7 +4067,7 @@ impl ShelluneView {
                     false
                 }
             }
-            "f2" if page_focused => {
+            "f2" => {
                 if let Some(id) = self.active_hosts_cursor() {
                     self.edit_saved_connection(id, cx);
                     true
@@ -4086,7 +4092,7 @@ impl ShelluneView {
                     false
                 }
             }
-            "contextmenu" | "apps" | "menu" if page_focused => {
+            "contextmenu" | "apps" | "menu" => {
                 if let Some(id) = self.active_hosts_cursor() {
                     let metrics = self.metrics();
                     let pos = gpui::point(
@@ -4252,6 +4258,7 @@ impl ShelluneView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.security_reset_reveal();
         if let Some(session_id) = self
             .workspace
             .sessions()
@@ -4319,6 +4326,7 @@ impl ShelluneView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.remember_focus(window, cx);
         let ux = copy::ux();
         let initial_destination = match &action {
             GroupAction::MoveSingle(id) => self
@@ -4431,6 +4439,7 @@ impl ShelluneView {
         self.hosts.close_group_editor();
         self.group_name_field = None;
         self.group_destination_field = None;
+        self.modal_focus_captured = false;
         self.restore_focus_pending = true;
         cx.notify();
     }
@@ -6200,6 +6209,13 @@ impl ShelluneView {
         // desktop or serial worker that kept running, would describe a session that is
         // over (R17, R18).
         self.x11.remove(&id);
+        if let Some(host) = self.workspace.session(id).and_then(|s| match s.kind() {
+            SessionKind::Remote { host } => Some(*host),
+            _ => None,
+        }) && self.pending_open_files == Some(host)
+        {
+            self.pending_open_files = None;
+        }
         self.forget_session_desktop_secret(id);
         self.security_drop_pending_session(id);
         self.end_session_surface(id, cx);
@@ -8836,6 +8852,7 @@ impl ShelluneView {
         let typed = self
             .hosts
             .draft()
+            .filter(|draft| draft.needs_secret())
             .and_then(|draft| draft.typed_secret().map(shellune_core::SecretString::new));
         let id = self.save_host(cx)?;
         let ephemeral = self
@@ -8892,6 +8909,7 @@ impl ShelluneView {
         let typed = self
             .hosts
             .protocol_draft()
+            .filter(|draft| draft.needs_secret())
             .and_then(|draft| draft.typed_secret().map(shellune_core::SecretString::new));
         let id = self.save_connection(cx)?;
         let ephemeral = self
@@ -10253,6 +10271,7 @@ impl ShelluneView {
         host: HostId,
         reason: &str,
     ) {
+        self.ephemeral_ssh_secrets.remove(&host);
         if self.current_chain_target() == Some((session, host)) {
             if let Some(panel) = self.remote.as_mut() {
                 panel.set_form_error(reason.to_owned());
@@ -14134,6 +14153,18 @@ impl ShelluneView {
                 .protocol_fields
                 .as_ref()
                 .is_some_and(|fields| fields.owns_focus(handle, cx))
+            || self
+                .group_name_field
+                .as_ref()
+                .is_some_and(|field| field.read(cx).focus_handle() == handle)
+            || self
+                .group_destination_field
+                .as_ref()
+                .is_some_and(|field| field.read(cx).focus_handle() == handle)
+            || self
+                .launcher_field
+                .as_ref()
+                .is_some_and(|field| field.read(cx).focus_handle() == handle)
             || self.security_dialog_owns_focus(handle, cx)
     }
 
@@ -14147,6 +14178,8 @@ impl ShelluneView {
             || self.restore_focus_pending
             || self.pane_focus_pending.is_some()
             || self.quick_open
+            || self.shell_menu_open
+            || self.custom_shell_open
             || self.tab_rename.is_some()
             || self.tab_list_open
             || self.import.is_open()
@@ -15130,6 +15163,8 @@ impl ShelluneView {
     fn close_shell_menu(&mut self, cx: &mut Context<Self>) {
         if self.shell_menu_open {
             self.shell_menu_open = false;
+            self.launcher_field = None;
+            self.restore_focus_pending = true;
             cx.notify();
         }
     }
@@ -22035,6 +22070,7 @@ impl Render for ShelluneView {
         }
         let any_form_modal_open = self.host_fields.is_some()
             || self.protocol_fields.is_some()
+            || self.hosts.group_editor().is_some()
             || self.security_dialog_open()
             || self.backup.is_some();
         if !any_form_modal_open {
@@ -22062,7 +22098,10 @@ impl Render for ShelluneView {
             };
             if let Some(handle) = handle {
                 let keep = std::mem::take(&mut self.focus_host_dialog_keep_return);
-                if !keep && !self.modal_focus_captured {
+                if keep {
+                    self.clear_resolved_host_validation(cx);
+                    self.clear_resolved_protocol_validation(cx);
+                } else if !self.modal_focus_captured {
                     self.remember_focus(window, cx);
                 }
                 if any_form_modal_open {
