@@ -236,8 +236,10 @@ impl ShelluneView {
     }
 
     fn add_host_jump(&mut self, id: HostId, cx: &mut Context<Self>) {
-        if let Some(draft) = self.hosts.draft_mut() {
-            draft.add_jump(id);
+        if let Some(draft) = self.hosts.draft_mut()
+            && draft.add_jump(id)
+        {
+            self.clear_resolved_host_validation(cx);
         }
         cx.notify();
     }
@@ -245,6 +247,7 @@ impl ShelluneView {
     fn remove_host_jump(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(draft) = self.hosts.draft_mut() {
             draft.remove_jump(index);
+            self.clear_resolved_host_validation(cx);
         }
         cx.notify();
     }
@@ -569,11 +572,11 @@ impl ShelluneView {
 
     /// Saves the host and, when it was saved, connects to it at once.
     fn save_and_connect(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.save_host_for_connect(cx) else {
+        let Some((id, ephemeral)) = self.save_host_for_connect(cx) else {
             return;
         };
         if let Some(host) = self.book.host(id).cloned() {
-            self.open_remote(&host, cx);
+            self.open_remote_with_ephemeral(&host, ephemeral, cx);
         }
     }
 
@@ -845,8 +848,10 @@ impl ShelluneView {
                         })
                         .on_click(cx.listener(
                             move |this, _event, _window, cx| {
-                                if let Some(draft) = this.hosts.draft_mut() {
-                                    draft.set_managed_key(Some(id));
+                                if let Some(draft) = this.hosts.draft_mut()
+                                    && draft.set_managed_key(Some(id))
+                                {
+                                    this.clear_resolved_host_validation(cx);
                                 }
                                 cx.notify();
                             },
@@ -1018,7 +1023,9 @@ impl ShelluneView {
                                     // password, which is the other way this method
                                     // signs in.
                                     let next = (draft.credential_id() != Some(id)).then_some(id);
-                                    draft.set_credential(next);
+                                    if draft.set_credential(next) {
+                                        this.clear_resolved_host_validation(cx);
+                                    }
                                 }
                                 cx.notify();
                             },
@@ -1056,8 +1063,10 @@ impl ShelluneView {
                     .id("hosts.auth.credential.clear")
                     .debug_selector(|| "hosts.auth.credential.clear".to_owned())
                     .on_click(cx.listener(|this, _event, _window, cx| {
-                        if let Some(draft) = this.hosts.draft_mut() {
-                            draft.set_credential(None);
+                        if let Some(draft) = this.hosts.draft_mut()
+                            && draft.set_credential(None)
+                        {
+                            this.clear_resolved_host_validation(cx);
                         }
                         cx.notify();
                     })),
@@ -1695,21 +1704,31 @@ impl ShelluneView {
         self.group_picker_highlight = 0;
         self.group_picker_scroll.scroll_to_item(0);
         if for_ssh {
-            if let Some(draft) = self.hosts.draft_mut() {
-                draft.set_text(HostField::Group, next.clone());
-            }
+            let changed = self
+                .hosts
+                .draft_mut()
+                .is_some_and(|draft| draft.set_text(HostField::Group, next.clone()));
             if let Some(fields) = self.host_fields.as_ref() {
                 let group_field = fields.group.clone();
                 group_field.update(cx, |f, cx| f.set_text(next, cx));
             }
-        } else {
-            if let Some(draft) = self.hosts.protocol_draft_mut() {
-                draft.set_text(ConnectionFormField::Group, next.clone());
+            if changed {
+                self.set_host_field_invalid(Ok(HostField::Group), false, cx);
+                self.clear_stale_host_validation(Ok(HostField::Group), false, cx);
             }
+        } else {
+            let changed = self
+                .hosts
+                .protocol_draft_mut()
+                .is_some_and(|draft| draft.set_text(ConnectionFormField::Group, next.clone()));
             if let Some(fields) = self.protocol_fields.as_ref()
                 && let Some(group_field) = fields.get(ConnectionFormField::Group).cloned()
             {
                 group_field.update(cx, |f, cx| f.set_text(next, cx));
+            }
+            if changed {
+                self.set_protocol_field_invalid(ConnectionFormField::Group, false, cx);
+                self.clear_stale_protocol_validation(ConnectionFormField::Group, false, cx);
             }
         }
         cx.notify();
@@ -2356,7 +2375,9 @@ impl ShelluneView {
                                             // desktop connection signs in.
                                             let next =
                                                 (draft.credential_id() != Some(id)).then_some(id);
-                                            draft.set_credential(next);
+                                            if draft.set_credential(next) {
+                                                this.clear_resolved_protocol_validation(cx);
+                                            }
                                         }
                                         cx.notify();
                                     },
@@ -2395,8 +2416,10 @@ impl ShelluneView {
                             .debug_selector(|| "connection.auth.credential.clear".to_owned())
                             .on_click(cx.listener(
                                 |this, _event, _window, cx| {
-                                    if let Some(draft) = this.hosts.protocol_draft_mut() {
-                                        draft.set_credential(None);
+                                    if let Some(draft) = this.hosts.protocol_draft_mut()
+                                        && draft.set_credential(None)
+                                    {
+                                        this.clear_resolved_protocol_validation(cx);
                                     }
                                     cx.notify();
                                 },

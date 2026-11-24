@@ -3620,11 +3620,6 @@ pub enum ConnectionFormField {
 
 impl ConnectionFormField {
     /// Every field, once.
-    ///
-    /// Used by the tests that check each field has its own selector and that a protocol
-    /// shows only the fields it has; the forms are built from
-    /// [`Self::of_protocol`], which is why nothing outside a test asks for this list.
-    #[cfg(test)]
     pub const ALL: [Self; 18] = [
         Self::Name,
         Self::Group,
@@ -4239,7 +4234,17 @@ impl ProtocolDraft {
                 _ => (rest, None),
             }
         };
-        if user.is_none() && port.is_none() {
+        let default_port = self
+            .protocol
+            .default_port()
+            .map(|p| p.to_string())
+            .unwrap_or_default();
+        let can_apply_port = port.as_ref().is_some_and(|typed| {
+            self.port.trim().is_empty()
+                || self.port == default_port
+                || self.port.trim() == typed.as_str()
+        });
+        if user.is_none() && !can_apply_port {
             return false;
         }
         self.address = host;
@@ -4248,13 +4253,8 @@ impl ProtocolDraft {
         {
             self.user = user;
         }
-        let default_port = self
-            .protocol
-            .default_port()
-            .map(|p| p.to_string())
-            .unwrap_or_default();
         if let Some(port) = port
-            && (self.port.trim().is_empty() || self.port == default_port)
+            && can_apply_port
         {
             self.port = port;
         }
@@ -4279,18 +4279,23 @@ impl ProtocolDraft {
     /// Returns the sentence of the domain that refused a field, so the dialog keeps what
     /// was typed and names the field to change.
     pub fn build(&self) -> Result<ConnectionEdit, ConnectionProblem> {
-        let group = group_path_from_text(&self.group)
-            .map_err(|reason| ConnectionProblem::new(ConnectionFormField::Group, reason))?;
         let protocol = self.protocol;
         let name = self.name.trim();
-        let record = match protocol {
+        let (record, group) = match protocol {
             ProtocolKind::Rdp => {
+                if self.address.trim().is_empty() {
+                    return Err(problem_of(
+                        shellune_core::ConnectionValidationError::EmptyAddress,
+                    ));
+                }
                 let (address, port) =
                     desktop_endpoint(&self.address, &self.port, shellune_core::DEFAULT_RDP_PORT)?;
                 let name = default_name(name, &address);
                 let mut config =
                     RdpConfig::new(name, address, Some(self.user.trim())).map_err(problem_of)?;
                 config.set_port(port.get().into()).map_err(problem_of)?;
+                let group = group_path_from_text(&self.group)
+                    .map_err(|reason| ConnectionProblem::new(ConnectionFormField::Group, reason))?;
                 let domain = self.domain.trim();
                 config.set_domain((!domain.is_empty()).then_some(domain.to_owned()));
                 config.set_certificate(self.certificate);
@@ -4302,9 +4307,14 @@ impl ProtocolDraft {
                     .map_err(problem_of)?;
                 config.set_credential_id(self.credential_id());
                 config.set_remember_secret(self.keeps_secret());
-                ConnectionRecord::Rdp(config)
+                (ConnectionRecord::Rdp(config), group)
             }
             ProtocolKind::Vnc => {
+                if self.address.trim().is_empty() {
+                    return Err(problem_of(
+                        shellune_core::ConnectionValidationError::EmptyAddress,
+                    ));
+                }
                 let (address, port) =
                     desktop_endpoint(&self.address, &self.port, shellune_core::DEFAULT_VNC_PORT)?;
                 let name = default_name(name, &address);
@@ -4313,19 +4323,27 @@ impl ProtocolDraft {
                 config
                     .set_user(Some(self.user.trim()))
                     .map_err(problem_of)?;
+                let group = group_path_from_text(&self.group)
+                    .map_err(|reason| ConnectionProblem::new(ConnectionFormField::Group, reason))?;
                 config.set_security(self.security);
                 config.set_clipboard(self.clipboard);
                 config.set_credential_id(self.credential_id());
                 config.set_remember_secret(self.keeps_secret());
-                ConnectionRecord::Vnc(config)
+                (ConnectionRecord::Vnc(config), group)
             }
             ProtocolKind::Serial => {
                 let device = self.device.trim();
+                if device.is_empty() {
+                    return Err(problem_of(
+                        shellune_core::ConnectionValidationError::EmptyDevice,
+                    ));
+                }
+                let baud = parse_baud(&self.baud)?;
                 let name = default_name(name, device);
                 let mut config = SerialConfig::new(name, device).map_err(problem_of)?;
-                config
-                    .set_baud(parse_baud(&self.baud)?)
-                    .map_err(problem_of)?;
+                config.set_baud(baud).map_err(problem_of)?;
+                let group = group_path_from_text(&self.group)
+                    .map_err(|reason| ConnectionProblem::new(ConnectionFormField::Group, reason))?;
                 config
                     .set_data_bits(parse_data_bits(&self.data_bits)?)
                     .map_err(problem_of)?;
@@ -4333,7 +4351,7 @@ impl ProtocolDraft {
                 config.set_stop_bits(self.stop_bits);
                 config.set_flow(self.flow);
                 config.set_local_echo(self.local_echo);
-                ConnectionRecord::Serial(config)
+                (ConnectionRecord::Serial(config), group)
             }
             ProtocolKind::Ssh => {
                 return Err(ConnectionProblem::new(
@@ -6433,5 +6451,25 @@ mod tests {
         panel.set_section(&HomeSection::Group(prod));
         panel.open_group_dialog(GroupAction::Create);
         assert_eq!(panel.group_editor().map(GroupEditor::name), Some("Prod/"));
+    }
+
+    #[test]
+    fn blank_protocol_forms_refuse_address_or_device_before_optional_name() {
+        for protocol in [ProtocolKind::Rdp, ProtocolKind::Vnc] {
+            let draft = ProtocolDraft::create(protocol);
+            let err = draft.build().expect_err("blank desktop address is refused");
+            assert_eq!(
+                err.field(),
+                ConnectionFormField::Address,
+                "{protocol:?} refuses required Address before optional Name"
+            );
+        }
+        let serial = ProtocolDraft::create(ProtocolKind::Serial);
+        let err = serial.build().expect_err("blank serial device is refused");
+        assert_eq!(
+            err.field(),
+            ConnectionFormField::Device,
+            "Serial refuses required Device before optional Name"
+        );
     }
 }

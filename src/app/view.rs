@@ -597,8 +597,12 @@ pub struct ShelluneView {
     pending_open_files: Option<HostId>,
     /// Field highlighted by the last SSH host form validation refusal, cleared on edit.
     last_invalid_host_field: Option<Result<HostField, ConnectionField>>,
+    /// Fields whose `TextField` currently holds `invalid == true` on the SSH host form.
+    invalid_host_fields: Vec<Result<HostField, ConnectionField>>,
     /// Field highlighted by the last non-SSH connection form validation refusal, cleared on edit.
     last_invalid_protocol_field: Option<ConnectionFormField>,
+    /// Fields whose `TextField` currently holds `invalid == true` on the non-SSH connection form.
+    invalid_protocol_fields: Vec<ConnectionFormField>,
     /// How many desktop attempts the window started, for the tests that prove one
     /// press opens one connection.
     #[cfg(test)]
@@ -2998,7 +3002,9 @@ impl ShelluneView {
             ephemeral_ssh_secrets: std::collections::HashMap::new(),
             pending_open_files: None,
             last_invalid_host_field: None,
+            invalid_host_fields: Vec::new(),
             last_invalid_protocol_field: None,
+            invalid_protocol_fields: Vec::new(),
             #[cfg(test)]
             desktop_starts: 0,
             theme_choice: theme::ThemeChoice::default(),
@@ -7589,12 +7595,10 @@ impl ShelluneView {
                 );
             }
             if changed {
-                text_field.update(cx, |f, cx| f.set_invalid(false, cx));
-                if split && let Some(fields) = view.host_fields.as_ref() {
-                    let user_field = fields.user.clone();
-                    let port_field = fields.port.clone();
-                    user_field.update(cx, |f, cx| f.set_invalid(false, cx));
-                    port_field.update(cx, |f, cx| f.set_invalid(false, cx));
+                view.set_host_field_invalid(Ok(field), false, cx);
+                if split {
+                    view.set_host_field_invalid(Ok(HostField::User), false, cx);
+                    view.set_host_field_invalid(Ok(HostField::Port), false, cx);
                 }
                 view.clear_stale_host_validation(Ok(field), split, cx);
             }
@@ -7703,6 +7707,7 @@ impl ShelluneView {
         if let Some(draft) = self.hosts.draft_mut()
             && draft.connection_mut().set_choice(choice)
         {
+            self.clear_resolved_host_validation(cx);
             cx.notify();
         }
     }
@@ -7717,10 +7722,7 @@ impl ShelluneView {
         if let Some(draft) = self.hosts.draft_mut()
             && draft.connection_mut().set_text(field, text)
         {
-            if let Some(conn_fields) = self.host_connection_fields.as_ref() {
-                let entity = conn_fields.get(field).clone();
-                entity.update(cx, |f, cx| f.set_invalid(false, cx));
-            }
+            self.set_host_field_invalid(Err(field), false, cx);
             self.clear_stale_host_validation(Err(field), false, cx);
             cx.notify();
         }
@@ -7774,6 +7776,9 @@ impl ShelluneView {
                 // host is shown that the file does not really contain.
                 self.book = HostBook::new();
                 self.host_fields = None;
+                self.host_connection_fields = None;
+                self.invalid_host_fields.clear();
+                self.invalid_protocol_fields.clear();
                 self.jump_picker = None;
                 self.workspace
                     .fail_hosts(Failure::new(error, Recovery::Retry));
@@ -7824,7 +7829,9 @@ impl ShelluneView {
     fn open_host_fields(&mut self, cx: &mut Context<Self>) {
         self.jump_picker = None;
         self.last_invalid_host_field = None;
+        self.invalid_host_fields.clear();
         self.last_invalid_protocol_field = None;
+        self.invalid_protocol_fields.clear();
         // The other protocol's fields belong to a form that is no longer drawn; a
         // switch back to this one builds its fields afresh (R7).
         self.protocol_fields = None;
@@ -8004,6 +8011,8 @@ impl ShelluneView {
         self.jump_picker = None;
         self.host_fields = None;
         self.host_connection_fields = None;
+        self.last_invalid_host_field = None;
+        self.invalid_host_fields.clear();
         self.restore_focus_pending = true;
         cx.notify();
     }
@@ -8061,7 +8070,9 @@ impl ShelluneView {
     /// Builds the fields of the open protocol form and keeps the draft in step.
     fn open_protocol_fields(&mut self, cx: &mut Context<Self>) {
         self.last_invalid_host_field = None;
+        self.invalid_host_fields.clear();
         self.last_invalid_protocol_field = None;
+        self.invalid_protocol_fields.clear();
         let Some(draft) = self.hosts.protocol_draft().cloned() else {
             self.protocol_fields = None;
             return;
@@ -8246,14 +8257,12 @@ impl ShelluneView {
                 );
             }
             if changed {
-                text_field.update(cx, |f, cx| f.set_invalid(false, cx));
-                if split && let Some(fields) = view.protocol_fields.as_ref() {
-                    let user_field = fields.user.clone();
-                    let port_field = fields.port.clone();
-                    user_field.update(cx, |f, cx| f.set_invalid(false, cx));
-                    port_field.update(cx, |f, cx| f.set_invalid(false, cx));
+                view.set_protocol_field_invalid(field, false, cx);
+                if split {
+                    view.set_protocol_field_invalid(ConnectionFormField::User, false, cx);
+                    view.set_protocol_field_invalid(ConnectionFormField::Port, false, cx);
                 }
-                view.clear_stale_protocol_validation(field, split);
+                view.clear_stale_protocol_validation(field, split, cx);
             }
             cx.notify();
         })
@@ -8285,12 +8294,88 @@ impl ShelluneView {
         }
     }
 
+    /// Synchronizes `TextField::set_invalid` and `invalid_host_fields` for one SSH form field.
+    pub(super) fn set_host_field_invalid(
+        &mut self,
+        which: Result<HostField, ConnectionField>,
+        invalid: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = match which {
+            Ok(field) => self
+                .host_fields
+                .as_ref()
+                .map(|fields| fields.get(field).clone()),
+            Err(field) => self
+                .host_connection_fields
+                .as_ref()
+                .map(|fields| fields.get(field).clone()),
+        };
+        if let Some(entity) = entity {
+            entity.update(cx, |f, cx| f.set_invalid(invalid, cx));
+            if invalid {
+                if !self.invalid_host_fields.contains(&which) {
+                    self.invalid_host_fields.push(which);
+                }
+            } else {
+                self.invalid_host_fields.retain(|item| *item != which);
+            }
+        } else if !invalid {
+            self.invalid_host_fields.retain(|item| *item != which);
+        }
+    }
+
+    /// Clears `invalid` on every SSH host and keepalive override `TextField`.
+    pub(super) fn clear_all_host_field_invalids(&mut self, cx: &mut Context<Self>) {
+        for field in HostField::ALL {
+            self.set_host_field_invalid(Ok(field), false, cx);
+        }
+        for field in ConnectionField::ALL {
+            self.set_host_field_invalid(Err(field), false, cx);
+        }
+        self.invalid_host_fields.clear();
+    }
+
+    /// Synchronizes `TextField::set_invalid` and `invalid_protocol_fields` for one protocol field.
+    pub(super) fn set_protocol_field_invalid(
+        &mut self,
+        which: ConnectionFormField,
+        invalid: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(entity) = self
+            .protocol_fields
+            .as_ref()
+            .and_then(|fields| fields.get(which))
+            .cloned()
+        {
+            entity.update(cx, |f, cx| f.set_invalid(invalid, cx));
+            if invalid {
+                if !self.invalid_protocol_fields.contains(&which) {
+                    self.invalid_protocol_fields.push(which);
+                }
+            } else {
+                self.invalid_protocol_fields.retain(|item| *item != which);
+            }
+        } else if !invalid {
+            self.invalid_protocol_fields.retain(|item| *item != which);
+        }
+    }
+
+    /// Clears `invalid` on every non-SSH protocol `TextField`.
+    pub(super) fn clear_all_protocol_field_invalids(&mut self, cx: &mut Context<Self>) {
+        for field in ConnectionFormField::ALL {
+            self.set_protocol_field_invalid(field, false, cx);
+        }
+        self.invalid_protocol_fields.clear();
+    }
+
     /// Clears stale SSH form validation message once the edited field (or the whole form) was updated.
     pub(super) fn clear_stale_host_validation(
         &mut self,
         edited: Result<HostField, ConnectionField>,
         split_address: bool,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         if !self.hosts.message().is_some_and(|m| m.failed()) {
             return;
@@ -8306,12 +8391,13 @@ impl ShelluneView {
             draft.build(saved).is_ok()
         });
         if matches_last || now_valid {
+            self.clear_all_host_field_invalids(cx);
             self.last_invalid_host_field = None;
             self.hosts.clear_message();
         }
     }
 
-    /// Clears SSH validation markers when a non-text choice (like auth method) resolves the error.
+    /// Clears SSH validation markers when a non-text choice (like auth method or keepalive policy) resolves the error.
     pub(super) fn clear_resolved_host_validation(&mut self, cx: &mut Context<Self>) {
         if !self.hosts.message().is_some_and(|m| m.failed()) {
             return;
@@ -8324,22 +8410,18 @@ impl ShelluneView {
                     && current != self.last_invalid_host_field)
         });
         if resolved {
-            if let Some(fields) = self.host_fields.as_ref() {
-                for candidate in HostField::ALL {
-                    let entity = fields.get(candidate).clone();
-                    entity.update(cx, |f, cx| f.set_invalid(false, cx));
-                }
-            }
+            self.clear_all_host_field_invalids(cx);
             self.last_invalid_host_field = None;
             self.hosts.clear_message();
         }
     }
 
-    /// Clears stale protocol form validation message when the offending field is edited.
-    fn clear_stale_protocol_validation(
+    /// Clears stale protocol form validation message and red borders when the offending field is edited.
+    pub(super) fn clear_stale_protocol_validation(
         &mut self,
         edited: ConnectionFormField,
         split_address: bool,
+        cx: &mut Context<Self>,
     ) {
         if !self.hosts.message().is_some_and(|m| m.failed()) {
             return;
@@ -8359,6 +8441,25 @@ impl ShelluneView {
             .protocol_draft()
             .is_some_and(|draft| draft.build().is_ok());
         if matches_last || now_valid {
+            self.clear_all_protocol_field_invalids(cx);
+            self.last_invalid_protocol_field = None;
+            self.hosts.clear_message();
+        }
+    }
+
+    /// Clears protocol validation markers when a non-text choice resolves the error.
+    pub(super) fn clear_resolved_protocol_validation(&mut self, cx: &mut Context<Self>) {
+        if !self.hosts.message().is_some_and(|m| m.failed()) {
+            return;
+        }
+        let resolved = self.hosts.protocol_draft().is_some_and(|draft| {
+            let current = draft.build().err().map(|p| p.field());
+            current.is_none()
+                || (self.last_invalid_protocol_field.is_some()
+                    && current != self.last_invalid_protocol_field)
+        });
+        if resolved {
+            self.clear_all_protocol_field_invalids(cx);
             self.last_invalid_protocol_field = None;
             self.hosts.clear_message();
         }
@@ -8367,19 +8468,27 @@ impl ShelluneView {
     /// Whether an SSH host form text field currently carries the invalid red outline, for tests.
     #[cfg(test)]
     pub fn host_field_invalid_for_test(&self, field: HostField) -> bool {
-        self.host_fields.is_some() && self.last_invalid_host_field == Some(Ok(field))
+        self.host_fields.is_some() && self.invalid_host_fields.contains(&Ok(field))
+    }
+
+    /// Whether an SSH keepalive override text field currently carries the invalid red outline, for tests.
+    #[cfg(test)]
+    pub fn host_connection_field_invalid_for_test(&self, field: ConnectionField) -> bool {
+        self.host_connection_fields.is_some() && self.invalid_host_fields.contains(&Err(field))
     }
 
     /// Whether a protocol form text field currently carries the invalid red outline, for tests.
     #[cfg(test)]
     pub fn protocol_field_invalid_for_test(&self, field: ConnectionFormField) -> bool {
-        self.protocol_fields.is_some() && self.last_invalid_protocol_field == Some(field)
+        self.protocol_fields.is_some() && self.invalid_protocol_fields.contains(&field)
     }
 
     /// Closes the protocol form without touching the saved records.
     fn close_connection_editor(&mut self, cx: &mut Context<Self>) {
         self.hosts.close_connection_editor();
         self.protocol_fields = None;
+        self.last_invalid_protocol_field = None;
+        self.invalid_protocol_fields.clear();
         self.restore_focus_pending = true;
         cx.notify();
     }
@@ -8410,18 +8519,15 @@ impl ShelluneView {
                 // The reason names the field it came from, so the form can show it there
                 // and the banner says which field to change.
                 let bad_field = problem.field();
+                self.clear_all_protocol_field_invalids(cx);
                 self.last_invalid_protocol_field = Some(bad_field);
-                if let Some(fields) = self.protocol_fields.as_ref() {
-                    for candidate in draft.fields() {
-                        if let Some(entity) = fields.get(*candidate).cloned() {
-                            let is_bad = *candidate == bad_field;
-                            if is_bad {
-                                self.field_focus_pending =
-                                    Some(entity.read(cx).focus_handle().clone());
-                            }
-                            entity.update(cx, |f, cx| f.set_invalid(is_bad, cx));
-                        }
-                    }
+                self.set_protocol_field_invalid(bad_field, true, cx);
+                if let Some(entity) = self
+                    .protocol_fields
+                    .as_ref()
+                    .and_then(|fields| fields.get(bad_field))
+                {
+                    self.field_focus_pending = Some(entity.read(cx).focus_handle().clone());
                 }
                 let label = bad_field.label(self.strings());
                 self.hosts.set_message(format!("{label}: {problem}"), true);
@@ -8443,6 +8549,7 @@ impl ShelluneView {
             None => next.insert_connection(edit.record().clone()),
         };
         if let Err(error) = outcome {
+            self.desktop_secrets.remove(&edit.record().id());
             self.hosts.set_message(error.to_string(), true);
             cx.notify();
             return None;
@@ -8450,7 +8557,11 @@ impl ShelluneView {
         let id = edit.record().id();
         let message = self.strings().connection_saved;
         self.commit_hosts(next, message, cx);
-        self.protocol_fields.is_none().then_some(id)
+        if self.protocol_fields.is_some() {
+            self.desktop_secrets.remove(&id);
+            return None;
+        }
+        Some(id)
     }
 
     /// Validates the form and stores it when the domain accepts it.
@@ -8458,20 +8569,6 @@ impl ShelluneView {
     /// Returns the id of the host that was saved, or `None` when the dialog stays open
     /// with the reason it was refused.
     fn save_host(&mut self, cx: &mut Context<Self>) -> Option<HostId> {
-        self.save_host_internal(false, cx)
-    }
-
-    /// Validates and saves the SSH host, keeping an unremembered typed secret in memory
-    /// exclusively for the immediately following connection ("Save & Connect").
-    pub(super) fn save_host_for_connect(&mut self, cx: &mut Context<Self>) -> Option<HostId> {
-        self.save_host_internal(true, cx)
-    }
-
-    fn save_host_internal(
-        &mut self,
-        keep_ephemeral_for_connect: bool,
-        cx: &mut Context<Self>,
-    ) -> Option<HostId> {
         if self.hosts.draft_mut().is_some_and(HostDraft::split_address) {
             self.refill_host_fields(&[HostField::Address, HostField::User, HostField::Port], cx);
         }
@@ -8482,30 +8579,28 @@ impl ShelluneView {
             Err(reason) => {
                 // The form stays open with what the user typed, and the reason names
                 // the field the domain refused.
-                let located = draft.first_problem(saved.as_ref()).map(|(which, _)| which);
+                let problem = draft.first_problem(saved.as_ref());
+                let located = problem.as_ref().map(|(which, _)| *which);
+                let banner_reason = problem.map(|(_, text)| text).unwrap_or(reason);
+                self.clear_all_host_field_invalids(cx);
                 self.last_invalid_host_field = located;
-                if let Some(fields) = self.host_fields.as_ref() {
-                    for candidate in HostField::ALL {
-                        let entity = fields.get(candidate).clone();
-                        let is_bad = located == Some(Ok(candidate));
-                        if is_bad {
-                            self.field_focus_pending = Some(entity.read(cx).focus_handle().clone());
-                        }
-                        entity.update(cx, |f, cx| f.set_invalid(is_bad, cx));
+                if let Some(which) = located {
+                    if which.is_err() {
+                        self.host_advanced = true;
                     }
-                }
-                if let Some(Err(conn_field)) = located {
-                    self.host_advanced = true;
-                    if let Some(conn_fields) = self.host_connection_fields.as_ref() {
-                        for candidate in ConnectionField::ALL {
-                            let entity = conn_fields.get(candidate).clone();
-                            let is_bad = candidate == conn_field;
-                            if is_bad {
-                                self.field_focus_pending =
-                                    Some(entity.read(cx).focus_handle().clone());
-                            }
-                            entity.update(cx, |f, cx| f.set_invalid(is_bad, cx));
-                        }
+                    self.set_host_field_invalid(which, true, cx);
+                    let focus = match which {
+                        Ok(field) => self
+                            .host_fields
+                            .as_ref()
+                            .map(|fields| fields.get(field).read(cx).focus_handle().clone()),
+                        Err(field) => self
+                            .host_connection_fields
+                            .as_ref()
+                            .map(|fields| fields.get(field).read(cx).focus_handle().clone()),
+                    };
+                    if let Some(handle) = focus {
+                        self.field_focus_pending = Some(handle);
                     }
                 }
                 if matches!(
@@ -8519,7 +8614,7 @@ impl ShelluneView {
                     self.host_body_scroll
                         .set_offset(gpui::point(px(0.0), px(0.0)));
                 }
-                self.hosts.set_message(reason, true);
+                self.hosts.set_message(banner_reason, true);
                 cx.notify();
                 return None;
             }
@@ -8531,18 +8626,31 @@ impl ShelluneView {
             cx.notify();
             return None;
         }
-        if !self.store_host_secret(
-            &draft,
-            edit.host(),
-            saved.as_ref(),
-            keep_ephemeral_for_connect,
-            cx,
-        ) {
+        if !self.store_host_secret(&draft, edit.host(), saved.as_ref(), cx) {
             return None;
         }
         self.commit_hosts(next, self.strings().hosts_saved, cx);
         // The dialog closes only when the file was really written.
         self.host_fields.is_none().then(|| edit.id())
+    }
+
+    /// Validates and saves the SSH host, returning an unremembered typed secret only
+    /// when `commit_hosts` succeeded on disk ("Save & Connect").
+    pub(super) fn save_host_for_connect(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(HostId, Option<shellune_core::SecretString>)> {
+        let typed = self
+            .hosts
+            .draft()
+            .and_then(|draft| draft.typed_secret().map(shellune_core::SecretString::new));
+        let id = self.save_host(cx)?;
+        let ephemeral = self
+            .book
+            .host(id)
+            .filter(|host| !host.remembers_secret() && host.credential_id().is_none())
+            .and(typed);
+        Some((id, ephemeral))
     }
 
     /// Puts the secret typed in the form into the system store, or takes it out.
@@ -8555,10 +8663,10 @@ impl ShelluneView {
         draft: &HostDraft,
         host: &HostConfig,
         saved: Option<&HostConfig>,
-        keep_ephemeral_for_connect: bool,
         cx: &mut Context<Self>,
     ) -> bool {
         let strings = self.strings();
+        self.ephemeral_ssh_secrets.remove(&host.id());
         if host.remembers_secret() {
             // Nothing typed keeps what is saved: the draft only remembers when there is
             // something to remember.
@@ -8571,19 +8679,10 @@ impl ShelluneView {
                     return false;
                 }
             }
-            self.ephemeral_ssh_secrets.remove(&host.id());
-        } else {
-            if saved.is_some_and(HostConfig::remembers_secret) {
-                // Turning remembering off removes the secret; a store that cannot be reached
-                // leaves an entry nobody reads, which is not a reason to keep the old flag.
-                let _ = self.secrets.forget(host.id());
-            }
-            if keep_ephemeral_for_connect && let Some(secret) = draft.typed_secret() {
-                self.ephemeral_ssh_secrets
-                    .insert(host.id(), shellune_core::SecretString::new(secret));
-            } else {
-                self.ephemeral_ssh_secrets.remove(&host.id());
-            }
+        } else if saved.is_some_and(HostConfig::remembers_secret) {
+            // Turning remembering off removes the secret; a store that cannot be reached
+            // leaves an entry nobody reads, which is not a reason to keep the old flag.
+            let _ = self.secrets.forget(host.id());
         }
         if let Some(draft) = self.hosts.draft_mut() {
             draft.clear_secret();
@@ -8648,8 +8747,13 @@ impl ShelluneView {
                 self.note_data_changed(cx);
                 self.hosts.close_editor();
                 self.host_fields = None;
+                self.host_connection_fields = None;
                 self.jump_picker = None;
                 self.protocol_fields = None;
+                self.last_invalid_host_field = None;
+                self.invalid_host_fields.clear();
+                self.last_invalid_protocol_field = None;
+                self.invalid_protocol_fields.clear();
                 self.restore_focus_pending = true;
                 self.hosts.set_message(message.to_owned(), false);
                 let items = self.book.hosts().to_vec();
@@ -9370,6 +9474,7 @@ impl ShelluneView {
         // A leftover split or adopt belongs to the action that armed it. Parking a
         // form must not bind that form's session into the waiting pane.
         self.workspace.clear_armed();
+        self.ephemeral_ssh_secrets.clear();
         if let Some(id) = self.form_session {
             if self.attempt_index(id).is_some() {
                 self.stash_focused_panel();
@@ -9634,11 +9739,26 @@ impl ShelluneView {
     /// cancelled, and its session stays. The new form asks only for what this host
     /// still needs.
     pub(crate) fn open_remote(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        self.open_remote_with_ephemeral(host, None, cx);
+    }
+
+    /// Opens the connection form for a host just saved via "Save & Connect", carrying
+    /// an unremembered one-shot secret exclusively for this immediate attempt.
+    pub(super) fn open_remote_with_ephemeral(
+        &mut self,
+        host: &HostConfig,
+        ephemeral: Option<shellune_core::SecretString>,
+        cx: &mut Context<Self>,
+    ) {
         self.pending_open_files = None;
         self.forward_only_dial = false;
         self.pending_forward_rules.clear();
         self.park_focused_form();
-        self.open_remote_after_park(host, cx);
+        self.ephemeral_ssh_secrets.clear();
+        if let Some(secret) = ephemeral {
+            self.ephemeral_ssh_secrets.insert(host.id(), secret);
+        }
+        self.open_remote_after_park_inner(host, cx);
     }
 
     /// Opens a host form after any focused form has been parked.
@@ -9647,6 +9767,11 @@ impl ShelluneView {
     /// that aim by parking first; a pane's own Connect button arms the adopt after
     /// the park, then calls this.
     pub(super) fn open_remote_after_park(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        self.ephemeral_ssh_secrets.clear();
+        self.open_remote_after_park_inner(host, cx);
+    }
+
+    fn open_remote_after_park_inner(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
         self.reconnect = None;
         self.form_session = None;
         self.pending_ephemeral = None;
@@ -9658,6 +9783,44 @@ impl ShelluneView {
         self.sync_remote_fields(cx);
         self.connect_when_ready(host, cx);
         cx.notify();
+    }
+
+    /// Drops any unconsumed one-shot SSH secret whose active connection flow stopped,
+    /// left the screen, or had its vault gate cancelled before reaching the target hop.
+    pub(super) fn reap_aborted_ephemeral_ssh_secrets(&mut self) {
+        if self.ephemeral_ssh_secrets.is_empty() {
+            return;
+        }
+        let Some(panel) = self.remote.as_ref() else {
+            self.ephemeral_ssh_secrets.clear();
+            return;
+        };
+        let Some(draft) = self.chain.as_ref() else {
+            self.ephemeral_ssh_secrets.clear();
+            return;
+        };
+        let target_matches = draft
+            .target_host()
+            .is_some_and(|target| self.ephemeral_ssh_secrets.contains_key(&target.id()));
+        let before_first_hop = draft.next_needed() == draft.order().first().copied();
+        let vault_gate_aborted = before_first_hop
+            && self.chain_reads_vault()
+            && !self.security.operation_granted
+            && !self.security_verifying_for_chain()
+            && panel.form_error().is_some();
+        if !self.showing_connection_form
+            || !target_matches
+            || matches!(panel.status(), RemoteStatus::Failed(_))
+            || vault_gate_aborted
+        {
+            self.ephemeral_ssh_secrets.clear();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn ephemeral_ssh_secret_count_for_test(&mut self) -> usize {
+        self.reap_aborted_ephemeral_ssh_secrets();
+        self.ephemeral_ssh_secrets.len()
     }
 
     /// Fills in what the host remembers and connects when nothing is left to ask.
@@ -9750,6 +9913,7 @@ impl ShelluneView {
     /// current hop. Opening a host does not consume an empty field; it asks for the
     /// first hop that is still missing something.
     fn finish_chain(&mut self, take_panel: bool, cx: &mut Context<Self>) {
+        self.reap_aborted_ephemeral_ssh_secrets();
         if self
             .remote
             .as_ref()
@@ -9791,11 +9955,12 @@ impl ShelluneView {
                 panel.clear_form_error();
             }
             if self.security_begin(vec![SecurityPending::ResumeChain(take_panel)], cx) {
-                if !self.security_verifying_for_chain()
-                    && let Some(panel) = self.remote.as_mut()
-                {
-                    let busy_text = copy::security_for(self.workspace.locale()).lock_busy;
-                    panel.set_form_error(busy_text);
+                if !self.security_verifying_for_chain() {
+                    self.ephemeral_ssh_secrets.clear();
+                    if let Some(panel) = self.remote.as_mut() {
+                        let busy_text = copy::security_for(self.workspace.locale()).lock_busy;
+                        panel.set_form_error(busy_text);
+                    }
                 }
                 cx.notify();
                 return;
@@ -10067,6 +10232,7 @@ impl ShelluneView {
 
     /// Refuses to dial and keeps the form. The host record is not changed.
     fn fail_before_dial(&mut self, reason: String, cx: &mut Context<Self>) {
+        self.ephemeral_ssh_secrets.clear();
         let host = self
             .chain
             .as_ref()
@@ -11304,6 +11470,7 @@ impl ShelluneView {
     /// Other attempts keep running. A reconnect the user abandoned leaves its
     /// session as it was: disconnected, with the reason it ended.
     fn close_remote(&mut self, cx: &mut Context<Self>) {
+        self.ephemeral_ssh_secrets.clear();
         if let Some(id) = self.form_session {
             self.close_session(id, cx);
         } else {
@@ -21237,6 +21404,7 @@ impl Render for ShelluneView {
         // Small views that are not handed the workspace (a text field's menu) read the
         // language from here.
         self.workspace.locale().set_current();
+        self.reap_aborted_ephemeral_ssh_secrets();
         if self.persist_preferences() {
             self.note_data_changed(cx);
         }

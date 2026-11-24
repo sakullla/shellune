@@ -3088,9 +3088,24 @@ impl ShelluneView {
             SnapshotRow::Direct(_) => None,
         });
         let first = groups.next().flatten();
+        let groups_differ = first.is_some_and(|first| groups.any(|group| group != Some(first)))
+            || (first.is_none() && groups.any(|group| group.is_some()));
+        let search_trimmed = self.hosts.search().trim();
+        let in_single_group = matches!(self.hosts.section(), HomeSection::Group(_));
+        let search_shows_tag = !search_trimmed.is_empty()
+            && rows.iter().any(|row| {
+                let group = match row {
+                    SnapshotRow::Host(host) => host.group.as_deref(),
+                    SnapshotRow::Connection(connection) => connection.group.as_deref(),
+                    SnapshotRow::Direct(_) => None,
+                };
+                group.is_some_and(|text| {
+                    !in_single_group
+                        || !crate::app::palette::highlights(text, search_trimmed).is_empty()
+                })
+            });
         let columns = MetaColumns {
-            tag: first.is_some_and(|first| groups.any(|group| group != Some(first)))
-                || (first.is_none() && groups.any(|group| group.is_some())),
+            tag: groups_differ || search_shows_tag,
             time: rows.iter().any(|row| match row {
                 SnapshotRow::Host(host) => host.last.is_some(),
                 SnapshotRow::Connection(connection) => connection.last.is_some(),
@@ -3105,6 +3120,20 @@ impl ShelluneView {
             }
         }
         Rc::new(rows)
+    }
+
+    #[cfg(test)]
+    pub fn home_tag_column_shown_for_test(&self) -> bool {
+        let list = self
+            .hosts
+            .list(&self.book, &self.groups, &|id| self.record_is_open(id));
+        self.host_rows_snapshot(&list).iter().any(|row| match row {
+            SnapshotRow::Host(host) => host.show_meta.tag && host.group.is_some(),
+            SnapshotRow::Connection(connection) => {
+                connection.show_meta.tag && connection.group.is_some()
+            }
+            SnapshotRow::Direct(_) => false,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -3672,7 +3701,7 @@ fn highlighted_tag(
     metrics: Metrics,
 ) -> Div {
     #[cfg(test)]
-    home_highlights::record(label.as_ref(), &marks);
+    home_highlights::record_tag(label.as_ref(), &marks);
     div()
         .flex()
         .flex_none()
@@ -4591,14 +4620,29 @@ fn favorite_star(
 pub(crate) mod home_highlights {
     use std::cell::RefCell;
 
+    type HighlightEntry = (bool, String, Vec<std::ops::Range<usize>>);
+
     thread_local! {
-        static DRAWN: RefCell<Vec<(String, Vec<std::ops::Range<usize>>)>> =
-            const { RefCell::new(Vec::new()) };
+        static DRAWN: RefCell<Vec<HighlightEntry>> = const { RefCell::new(Vec::new()) };
     }
 
     pub(super) fn record(text: &str, ranges: &[std::ops::Range<usize>]) {
         if !ranges.is_empty() {
-            DRAWN.with(|drawn| drawn.borrow_mut().push((text.to_owned(), ranges.to_vec())));
+            DRAWN.with(|drawn| {
+                drawn
+                    .borrow_mut()
+                    .push((false, text.to_owned(), ranges.to_vec()));
+            });
+        }
+    }
+
+    pub(super) fn record_tag(text: &str, ranges: &[std::ops::Range<usize>]) {
+        if !ranges.is_empty() {
+            DRAWN.with(|drawn| {
+                drawn
+                    .borrow_mut()
+                    .push((true, text.to_owned(), ranges.to_vec()));
+            });
         }
     }
 
@@ -4612,8 +4656,19 @@ pub(crate) mod home_highlights {
                 .borrow()
                 .iter()
                 .rev()
-                .find(|(candidate, _)| candidate == text)
-                .map(|(_, ranges)| ranges.clone())
+                .find(|(_, candidate, _)| candidate == text)
+                .map(|(_, _, ranges)| ranges.clone())
+        })
+    }
+
+    pub fn tag_ranges_of(text: &str) -> Option<Vec<std::ops::Range<usize>>> {
+        DRAWN.with(|drawn| {
+            drawn
+                .borrow()
+                .iter()
+                .rev()
+                .find(|(is_tag, candidate, _)| *is_tag && candidate == text)
+                .map(|(_, _, ranges)| ranges.clone())
         })
     }
 }

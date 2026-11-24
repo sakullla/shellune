@@ -45731,16 +45731,25 @@ async fn home_search_highlights_keyboard_loop_and_cursor_row_shortcuts(cx: &mut 
 
     clear_field(cx, "hosts.search", "bastion-0".len());
     crate::app::view::home::home_highlights::clear();
-    type_into(cx, "hosts.search", "Region");
+    type_into(cx, "hosts.search", "Region0");
     redraw(cx);
     assert!(
-        crate::app::view::home::home_highlights::ranges_of("Region0")
+        cx.update(|_window, app| view.read(app).home_tag_column_shown_for_test()),
+        "searching a specific single group name keeps the row group tag column visible"
+    );
+    assert!(
+        cx.debug_bounds("hosts.tag.0").is_some()
+            && cx.debug_bounds("hosts.connection.tag.0").is_some(),
+        "both SSH and RDP rows in Region0 keep their group tag pills drawn"
+    );
+    assert!(
+        crate::app::view::home::home_highlights::tag_ranges_of("Region0")
             .is_some_and(|ranges| !ranges.is_empty()),
-        "group tag and sidebar group row highlight matched search fragment"
+        "row group tag pill highlights matched Region0 fragment"
     );
 
     // Independent sidebar group locator highlights matched group rows too.
-    clear_field(cx, "hosts.search", "Region".len());
+    clear_field(cx, "hosts.search", "Region0".len());
     crate::app::view::home::home_highlights::clear();
     type_into(cx, "hosts.groups.search", "Region3");
     redraw(cx);
@@ -45982,7 +45991,7 @@ async fn ssh_ephemeral_save_and_connect_dials_once_without_persisting_and_dialog
     let dir = TempDir::new("ssh-ephemeral-and-dialog-ux");
     let (view, cx) = hosts_view_with_trust(cx, &dir);
     cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
-    cx.simulate_resize(size(px(1360.0), px(960.0)));
+    cx.simulate_resize(tall_window());
     cx.run_until_parked();
 
     // 1. Validation red border and footer banner clear immediately on editing offending field (SSH).
@@ -46137,4 +46146,281 @@ async fn ssh_ephemeral_save_and_connect_dials_once_without_persisting_and_dialog
         "pasting user@host:port into RDP address splits user, host, and port"
     );
     click(cx, "connection.cancel");
+}
+
+#[gpui::test]
+async fn dialog_validation_targets_required_fields_clears_all_borders_and_aborted_ephemeral_ssh_never_leaks(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("dialog-validation-and-ephemeral-abort");
+    let mut bastion = stored_host("bastion", "10.0.0.1", 22, "jump", None);
+    bastion.set_auth(Some(shellune_core::AuthMethodKind::Password));
+    bastion.set_remember_secret(false);
+    let book = HostBook::from_hosts(vec![bastion]).expect("bastion book");
+    dir.store().save(&book).expect("saved book");
+
+    let mut groups = shellune_core::GroupBook::new();
+    groups
+        .insert(&GroupPath::parse("Prod/East").expect("Prod/East"))
+        .expect("insert group");
+    shellune_storage::GroupStore::at(dir.path())
+        .save(&groups)
+        .expect("saved groups");
+
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+
+    let paste_chord = if cfg!(target_os = "macos") {
+        "cmd-v"
+    } else {
+        "ctrl-v"
+    };
+
+    // 1. Exact R4 RDP acceptance: blank Name + blank Address -> Save targets Address (not Name),
+    //    then pasting `admin@10.0.0.8:3390` splits user/address/port and clears every red border + banner.
+    click(cx, "hosts.new");
+    click(cx, "connection.protocol.rdp");
+    click(cx, "connection.save");
+    assert!(
+        cx.update(|_window, app| {
+            let v = view.read(app);
+            v.protocol_field_invalid_for_test(crate::app::hosts::ConnectionFormField::Address)
+                && !v.protocol_field_invalid_for_test(crate::app::hosts::ConnectionFormField::Name)
+        }),
+        "empty RDP form marks Address invalid rather than optional Name"
+    );
+    assert!(
+        cx.debug_bounds("connection.field.address.problem")
+            .is_some()
+            && cx.debug_bounds("connection.message").is_some()
+    );
+
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+        "admin@10.0.0.8:3390".to_owned(),
+    ));
+    click(cx, "connection.field.address");
+    cx.simulate_keystrokes(paste_chord);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| {
+            let d = view
+                .read(app)
+                .hosts_state()
+                .protocol_draft()
+                .expect("rdp draft");
+            (
+                d.text(crate::app::hosts::ConnectionFormField::User)
+                    .to_owned(),
+                d.text(crate::app::hosts::ConnectionFormField::Address)
+                    .to_owned(),
+                d.text(crate::app::hosts::ConnectionFormField::Port)
+                    .to_owned(),
+            )
+        }),
+        ("admin".to_owned(), "10.0.0.8".to_owned(), "3390".to_owned()),
+    );
+    assert!(
+        cx.update(|_window, app| {
+            let v = view.read(app);
+            crate::app::hosts::ConnectionFormField::ALL
+                .iter()
+                .all(|f| !v.protocol_field_invalid_for_test(*f))
+                && v.hosts_state().message().is_none()
+        }),
+        "pasting admin@10.0.0.8:3390 clears all protocol field invalid outlines and error banner"
+    );
+
+    // 2. Cross-field resolution (`now_valid`) clears invalid border on the OTHER field (`Address`),
+    //    and group dropdown pick clears invalid Group border and error banner on protocol dialog.
+    clear_field(cx, "connection.field.address", "10.0.0.8".len());
+    type_into(cx, "connection.field.address", "10.0.0.8:4000");
+    clear_field(cx, "connection.field.port", "3390".len());
+    type_into(cx, "connection.field.port", "5000");
+    click(cx, "connection.save");
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .protocol_field_invalid_for_test(crate::app::hosts::ConnectionFormField::Address)
+        }),
+        "conflicting address:port marks Address invalid"
+    );
+    clear_field(cx, "connection.field.port", "5000".len());
+    type_into(cx, "connection.field.port", "4000");
+    assert!(
+        cx.update(|_window, app| {
+            let v = view.read(app);
+            !v.protocol_field_invalid_for_test(crate::app::hosts::ConnectionFormField::Address)
+                && v.hosts_state().message().is_none()
+        }),
+        "fixing Port so the whole form becomes valid clears the red border on Address too"
+    );
+
+    type_into(cx, "connection.field.group", "/");
+    click(cx, "connection.save");
+    assert!(cx.update(|_window, app| {
+        view.read(app)
+            .protocol_field_invalid_for_test(crate::app::hosts::ConnectionFormField::Group)
+            && view.read(app).hosts_state().message().is_some()
+    }));
+    click(cx, "connection.field.group");
+    click(cx, "connection.group.pick.0");
+    assert!(
+        cx.update(|_window, app| {
+            let v = view.read(app);
+            !v.protocol_field_invalid_for_test(crate::app::hosts::ConnectionFormField::Group)
+                && v.hosts_state().message().is_none()
+                && v.hosts_state().protocol_draft().map(|d| {
+                    d.text(crate::app::hosts::ConnectionFormField::Group)
+                        .to_owned()
+                }) == Some("Prod/East".to_owned())
+        }),
+        "picking a saved group from the dropdown clears invalid Group border and message"
+    );
+
+    // 3. Serial empty Device with blank Name targets Device (not Name), and typing COM3 clears it.
+    click(cx, "connection.protocol.serial");
+    clear_field(cx, "connection.field.group", "Prod/East".len());
+    click(cx, "connection.save");
+    assert!(
+        cx.update(|_window, app| {
+            let v = view.read(app);
+            v.protocol_field_invalid_for_test(crate::app::hosts::ConnectionFormField::Device)
+                && !v.protocol_field_invalid_for_test(crate::app::hosts::ConnectionFormField::Name)
+        }),
+        "empty Serial form marks Device invalid rather than optional Name"
+    );
+    type_into(cx, "connection.field.device", "COM3");
+    assert!(cx.update(|_window, app| {
+        let v = view.read(app);
+        !v.protocol_field_invalid_for_test(crate::app::hosts::ConnectionFormField::Device)
+            && v.hosts_state().message().is_none()
+    }));
+    click(cx, "connection.cancel");
+
+    // 4. SSH keepalive override error clears when switching back to Inherit, and SSH group picker clears invalid Group.
+    click(cx, "hosts.new");
+    type_into(cx, "hosts.field.address", "10.0.0.20");
+    type_into(cx, "hosts.field.user", "ops");
+    type_into(cx, "hosts.field.group", "/");
+    click(cx, "hosts.save");
+    assert!(cx.update(|_window, app| {
+        view.read(app)
+            .host_field_invalid_for_test(crate::app::hosts::HostField::Group)
+            && view.read(app).hosts_state().message().is_some()
+    }));
+    click(cx, "hosts.field.group");
+    click(cx, "hosts.group.pick.0");
+    assert!(cx.update(|_window, app| {
+        !view
+            .read(app)
+            .host_field_invalid_for_test(crate::app::hosts::HostField::Group)
+            && view.read(app).hosts_state().message().is_none()
+    }));
+
+    click(cx, "hosts.advanced");
+    click(cx, "hosts.editor.connection.override");
+    clear_field(cx, "hosts.connection.keepalive-misses", 1);
+    type_into(cx, "hosts.connection.keepalive-misses", "0");
+    click(cx, "hosts.save");
+    assert!(cx.update(|_window, app| {
+        view.read(app).host_connection_field_invalid_for_test(
+            crate::app::hosts::ConnectionField::KeepaliveMisses,
+        ) && view.read(app).hosts_state().message().is_some()
+    }));
+    click(cx, "hosts.editor.connection.inherit");
+    assert!(
+        cx.update(|_window, app| {
+            let v = view.read(app);
+            !v.host_connection_field_invalid_for_test(
+                crate::app::hosts::ConnectionField::KeepaliveMisses,
+            ) && v.hosts_state().message().is_none()
+        }),
+        "switching SSH keepalive choice back to Inherit clears invalid keepalive border and banner"
+    );
+
+    // 5. Failed `commit_hosts` write during Save & Connect never stores an ephemeral SSH secret.
+    click(cx, "hosts.auth.remote.method.password");
+    type_into(cx, "hosts.field.secret", "never-stored-on-disk-fail");
+    click(cx, "hosts.remember");
+    let hosts_file = dir.path().join(shellune_storage::FILE_NAME);
+    let saved_bytes = std::fs::read(&hosts_file).expect("read hosts.json");
+    std::fs::remove_file(&hosts_file).expect("remove hosts.json");
+    std::fs::create_dir(&hosts_file).expect("replace hosts.json with dir so write fails");
+    click(cx, "hosts.save_connect");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.update(app, |v, _cx| v.ephemeral_ssh_secret_count_for_test())),
+        0,
+        "failed hosts.json write must never leave an unconsumed secret in ephemeral_ssh_secrets"
+    );
+    std::fs::remove_dir(&hosts_file).expect("remove blocking dir");
+    std::fs::write(&hosts_file, saved_bytes).expect("restore hosts.json");
+
+    // 6. Aborting/cancelling a multi-hop Save & Connect on the jump hop clears the one-shot target secret
+    //    so a subsequent connect asks for the target password instead of reusing the cancelled secret.
+    click(cx, "hosts.jump.add");
+    click(cx, "hosts.jump.option.0");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    type_into(cx, "hosts.field.secret", "one-shot-behind-jump");
+    click(cx, "hosts.save_connect");
+    cx.run_until_parked();
+
+    let target_id = cx.update(|_window, app| {
+        view.read(app)
+            .book()
+            .hosts()
+            .iter()
+            .find(|h| h.address() == "10.0.0.20")
+            .expect("target host saved")
+            .id()
+    });
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0,
+        "stopped on jump host bastion asking for jump password"
+    );
+
+    // Cancel the jump-host password prompt (`close_remote`).
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.update(app, |v, _cx| v.ephemeral_ssh_secret_count_for_test())),
+        0,
+        "cancelling the jump prompt immediately clears ephemeral_ssh_secrets"
+    );
+
+    // Connect to the saved target host again and supply bastion's password: target hop must STILL prompt!
+    cx.update(|_window, app| {
+        view.update(app, |v, cx| v.connect_saved_host(target_id, cx));
+    });
+    cx.run_until_parked();
+    type_into(cx, "remote.password", "bastion-pw");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0,
+        "subsequent connection must prompt for target password instead of reusing cancelled one-shot secret"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // 7. `fail_before_dial` (conflicting jump chain + ProxyCommand) also clears ephemeral_ssh_secrets.
+    click(cx, "nav.hosts");
+    cx.update(|_window, app| {
+        view.update(app, |v, cx| v.edit_saved_connection(target_id, cx));
+    });
+    cx.run_until_parked();
+    type_into(cx, "hosts.field.proxy", "nc %h %p");
+    type_into(cx, "hosts.field.secret", "never-survives-fail-before-dial");
+    click(cx, "hosts.save_connect");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.update(app, |v, _cx| v.ephemeral_ssh_secret_count_for_test())),
+        0,
+        "fail_before_dial on jump+ProxyCommand conflict immediately clears ephemeral_ssh_secrets"
+    );
 }
