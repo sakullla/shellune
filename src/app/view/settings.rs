@@ -1994,6 +1994,19 @@ impl ShelluneView {
         self.settings_select_item(Category::Security, index, cx);
     }
 
+    /// Marks `KeysAndPassword` as the active settings item without forcing a scroll jump,
+    /// used when the user interacts directly with the vault workbench inside Settings.
+    pub(crate) fn settings_note_keys_item(&mut self) {
+        let index = Category::Security
+            .items()
+            .iter()
+            .position(|candidate| *candidate == Item::KeysAndPassword)
+            .unwrap_or(0);
+        self.settings_nav.category = Category::Security;
+        self.settings_nav.set_item(Category::Security, index);
+        self.settings_nav.nav_focus = false;
+    }
+
     /// Opens one category, keeping the item it was last on (R16).
     pub(super) fn settings_select_category(&mut self, category: Category, cx: &mut Context<Self>) {
         self.security_reset_reveal();

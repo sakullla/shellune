@@ -47915,6 +47915,214 @@ async fn vault_revealed_password_resets_across_all_workspace_and_launcher_transi
 }
 
 #[gpui::test]
+async fn vault_revealed_password_resets_from_default_local_shells_home_and_restored_pending_tabs(
+    app_cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("vault-reveal-default-local-shells-home");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+
+    let mut book = shellune_storage::HostBook::new();
+    let mut ssh_host =
+        shellune_core::HostConfig::new("agent-ssh", "127.0.0.1", 1, "root").expect("ssh");
+    ssh_host.set_auth(Some(shellune_core::AuthMethodKind::Agent));
+    let ssh_id = ssh_host.id();
+    book.insert(ssh_host.clone()).expect("insert ssh");
+
+    let rdp_cfg =
+        shellune_core::RdpConfig::new("plain-rdp", "127.0.0.1:3389", Some("alice")).expect("rdp");
+    let rdp_id = rdp_cfg.id();
+    book.insert_connection(shellune_core::ConnectionRecord::Rdp(rdp_cfg))
+        .expect("insert rdp");
+
+    let serial_cfg = shellune_core::SerialConfig::new("console-serial", "COM254").expect("serial");
+    let serial_id = serial_cfg.id();
+    book.insert_connection(shellune_core::ConnectionRecord::Serial(serial_cfg))
+        .expect("insert serial");
+
+    dir.store().save(&book).expect("save book");
+
+    // Open in Workspace::new() default state (`Destination::LocalShells`, 0 open tabs -> `home_shown() == true`).
+    let store = dir.store();
+    let secret_store: Arc<dyn shellune_storage::SecretStore> = secrets.clone();
+    let (view, cx) = app_cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_secrets_for_test(cx, Workspace::new(), store, secret_store)
+    });
+    cx.simulate_resize(size(px(1280.0), px(840.0)));
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().destination()),
+        Destination::LocalShells,
+        "cold-start default destination is Destination::LocalShells"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).home_shown()),
+        "with 0 open tabs, Destination::LocalShells renders the home page"
+    );
+
+    let authenticator = Arc::new(
+        shellune_storage::ScriptedAuthenticator::new(
+            shellune_storage::BiometricCapability::Biometrics,
+        )
+        .script([Ok(()), Ok(()), Ok(()), Ok(())]),
+    );
+    let verify_counter = authenticator.clone();
+    cx.update(|_window, app| {
+        view.update(app, |v, cx| {
+            v.security_lock_settings_for_test(
+                shellune_storage::LockPolicy::EverySensitiveOperation,
+                cx,
+            );
+            v.security_set_authenticator_for_test(authenticator);
+        });
+    });
+
+    // Directly click `hosts.view.vault` WITHOUT clicking `nav.hosts` first!
+    click(cx, "hosts.view.vault");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().destination()),
+        Destination::LocalShells,
+        "clicking hosts.view.vault from initial home keeps destination == LocalShells"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).is_security_keys_surface_visible()),
+        "HomeSection::Vault under LocalShells home_shown() must be recognized as visible"
+    );
+
+    // 1. Reveal password (#1 verify), connect SSH host, assert `revealed == false`,
+    //    then `close_session` back to LocalShells Home -> Vault: password stays masked and requires re-verify!
+    click(cx, "security.credential.0");
+    click(cx, "security.detail.reveal");
+    cx.run_until_parked();
+    assert_eq!(verify_counter.verify_calls(), 1);
+    assert!(cx.update(|_window, app| view.read(app).security_password_shown_for_test()));
+
+    cx.update(|_window, app| view.update(app, |v, cx| v.connect_saved_connection(ssh_id, cx)));
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_password_shown_for_test()),
+        "dialling SSH from LocalShells Home -> Vault must immediately reset revealed password"
+    );
+    let ssh_session = cx.update(|_window, app| {
+        view.read(app)
+            .active_session()
+            .expect("SSH session tab opened")
+    });
+    cx.update(|_window, app| view.update(app, |v, cx| v.close_session(ssh_session, cx)));
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).home_shown()));
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_password_shown_for_test()),
+        "closing last SSH tab back to LocalShells Home -> Vault must NOT re-expose plaintext password"
+    );
+
+    // 2. Re-revealing requires a fresh system verification (#2 verify), then non-vault RDP resets it!
+    click(cx, "security.detail.reveal");
+    cx.run_until_parked();
+    assert_eq!(
+        verify_counter.verify_calls(),
+        2,
+        "returning to Home -> Vault requires fresh verification under EverySensitiveOperation"
+    );
+    assert!(cx.update(|_window, app| view.read(app).security_password_shown_for_test()));
+
+    cx.update(|_window, app| view.update(app, |v, cx| v.open_desktop_connection(rdp_id, cx)));
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_password_shown_for_test()),
+        "connecting non-vault RDP from LocalShells Home -> Vault must reset revealed password"
+    );
+    let rdp_session = cx.update(|_window, app| {
+        view.read(app)
+            .active_session()
+            .expect("RDP session tab opened")
+    });
+    cx.update(|_window, app| view.update(app, |v, cx| v.close_session(rdp_session, cx)));
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).home_shown()));
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_password_shown_for_test()),
+        "closing last RDP tab back to LocalShells Home -> Vault keeps password masked"
+    );
+
+    // 3. Re-reveal (#3 verify), then Serial connection resets it and closing serial tab keeps it masked!
+    click(cx, "security.detail.reveal");
+    cx.run_until_parked();
+    assert_eq!(verify_counter.verify_calls(), 3);
+    assert!(cx.update(|_window, app| view.read(app).security_password_shown_for_test()));
+
+    cx.update(|_window, app| view.update(app, |v, cx| v.open_serial_connection(serial_id, cx)));
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_password_shown_for_test()),
+        "connecting Serial from LocalShells Home -> Vault must reset revealed password"
+    );
+    let serial_session = cx.update(|_window, app| {
+        view.read(app)
+            .active_session()
+            .expect("Serial session tab opened")
+    });
+    cx.update(|_window, app| view.update(app, |v, cx| v.close_session(serial_session, cx)));
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).home_shown()));
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_password_shown_for_test()),
+        "closing last Serial tab back to LocalShells Home -> Vault keeps password masked"
+    );
+
+    // 4. Restored pending tab: clicking `session.tab.0` (`select_tab`) from Home -> Vault immediately resets revealed!
+    let pending_dir = TempDir::new("vault-reveal-restored-pending-tab");
+    let pending_secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&pending_dir, &pending_secrets);
+    pending_dir.store().save(&book).expect("save pending book");
+    let pending_tabs = vec![
+        WorkspaceTab::new(
+            "restored-pending",
+            PaneNode::leaf(PaneTarget::remote(ssh_id), TerminalMode::Classic),
+        )
+        .expect("pending tab"),
+    ];
+    let snapshot =
+        WorkspaceSnapshot::new(pending_tabs, PanelConfig::default()).expect("pending snapshot");
+    WorkspaceStore::at(pending_dir.path())
+        .save(&snapshot)
+        .expect("save pending workspace");
+
+    let pending_store = pending_dir.store();
+    let pending_secret_store: Arc<dyn shellune_storage::SecretStore> = pending_secrets.clone();
+    let (pending_view, pending_cx) = app_cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_secrets_for_test(
+            cx,
+            Workspace::new(),
+            pending_store,
+            pending_secret_store,
+        )
+    });
+    pending_cx.simulate_resize(size(px(1280.0), px(840.0)));
+    pending_cx.run_until_parked();
+
+    click(pending_cx, "nav.hosts");
+    click(pending_cx, "hosts.view.vault");
+    pending_cx.run_until_parked();
+    click(pending_cx, "security.credential.0");
+    click(pending_cx, "security.detail.reveal");
+    pending_cx.run_until_parked();
+    assert!(
+        pending_cx.update(|_window, app| pending_view.read(app).security_password_shown_for_test())
+    );
+
+    click(pending_cx, "session.tab.0");
+    pending_cx.run_until_parked();
+    assert!(
+        !pending_cx
+            .update(|_window, app| pending_view.read(app).security_password_shown_for_test()),
+        "selecting a restored pending tab from Home -> Vault must immediately reset revealed password"
+    );
+}
+
+#[gpui::test]
 async fn desktop_unremembered_password_is_strictly_one_shot_on_save_and_connect_only(
     app_cx: &mut TestAppContext,
 ) {

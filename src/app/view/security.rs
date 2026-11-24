@@ -3237,6 +3237,9 @@ impl ShelluneView {
 
     /// Chooses the record whose detail card is drawn.
     fn security_pick(&mut self, record: SecurityRecord, cx: &mut Context<Self>) {
+        if self.workspace.destination() == super::Destination::Settings {
+            self.settings_note_keys_item();
+        }
         self.security.detail = Some(record);
         self.security.cursor = Some(record);
         // A reveal belongs to the record it was asked for, never to the next.
@@ -3253,6 +3256,11 @@ impl ShelluneView {
             return true;
         }
         false
+    }
+
+    /// Whether a shared credential secret is currently revealed in the detail card.
+    pub(crate) fn security_is_revealed(&self) -> bool {
+        self.security.revealed
     }
 
     /// Resets any revealed secret when leaving the vault view.
@@ -4706,6 +4714,9 @@ impl ShelluneView {
     /// (R3): the "every sensitive operation" policy verifies afresh each time,
     /// and a locked vault unlocks first.
     fn security_reveal(&mut self, credential: CredentialId, cx: &mut Context<Self>) {
+        if self.workspace.destination() == super::Destination::Settings {
+            self.settings_note_keys_item();
+        }
         if self.security_begin(vec![SecurityPending::Reveal(credential)], cx) {
             return;
         }
@@ -5061,9 +5072,11 @@ impl ShelluneView {
                     }
                 }
                 SecurityPending::Reveal(credential) => {
-                    self.security.revealed = true;
-                    self.security.detail = Some(SecurityRecord::Credential(credential));
-                    self.security_touch(cx);
+                    if self.is_security_keys_surface_visible() {
+                        self.security.revealed = true;
+                        self.security.detail = Some(SecurityRecord::Credential(credential));
+                        self.security_touch(cx);
+                    }
                 }
                 SecurityPending::Copy(credential) => {
                     if let Some(text) = self

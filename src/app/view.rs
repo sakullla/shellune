@@ -4163,6 +4163,7 @@ impl ShelluneView {
         ephemeral: Option<shellune_core::SecretString>,
         cx: &mut Context<Self>,
     ) {
+        self.security_reset_reveal();
         self.desktop_secrets.clear();
         if let Some(waiting) = self.security_verifying_desktop_session() {
             self.show_terminal_start(waiting, cx);
@@ -4225,6 +4226,7 @@ impl ShelluneView {
     /// that will not open still gets its tab and its reason, which is what the
     /// session record reports.
     pub(super) fn open_serial_connection(&mut self, id: HostId, cx: &mut Context<Self>) {
+        self.security_reset_reveal();
         let Some(record) = self.book.connection(id) else {
             cx.notify();
             return;
@@ -5348,8 +5350,8 @@ impl ShelluneView {
         if focus {
             // A terminal that just opened is what the user asked for: show it, from
             // the hosts home or the settings alike.
+            self.security_reset_reveal();
             if self.workspace.destination() != Destination::LocalShells {
-                self.security_reset_reveal();
                 self.workspace.select(Destination::LocalShells);
                 self.workspace
                     .set_context(shellune_core::PanelSection::None);
@@ -5394,8 +5396,8 @@ impl ShelluneView {
         // `pane.start` runs before this observer is registered, so any failure or stage
         // already reported synchronously is copied into the session record immediately.
         self.sync_desktop(pane, cx);
+        self.security_reset_reveal();
         if self.workspace.destination() != Destination::LocalShells {
-            self.security_reset_reveal();
             self.workspace.select(Destination::LocalShells);
             self.workspace
                 .set_context(shellune_core::PanelSection::None);
@@ -5578,6 +5580,7 @@ impl ShelluneView {
     /// from there into the link: the pane never keeps it, and nothing about it is
     /// logged or drawn.
     pub(super) fn start_desktop_session(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        self.security_reset_reveal();
         let record = self
             .workspace
             .session(session)
@@ -5682,6 +5685,7 @@ impl ShelluneView {
     /// connected - the session record states the failure, and the pane is built in the
     /// failed state rather than looking live with nothing behind it.
     pub(super) fn start_serial_session(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        self.security_reset_reveal();
         let record = self
             .workspace
             .session(session)
@@ -6049,8 +6053,8 @@ impl ShelluneView {
         self.workspace.layout_mut().focus_session(id);
         if self.pane_for(id).is_none() && self.desktop_for(id).is_none() {
             if self.has_session_form(id) {
+                self.security_reset_reveal();
                 if self.workspace.destination() != Destination::LocalShells {
-                    self.security_reset_reveal();
                     self.workspace.select(Destination::LocalShells);
                     self.workspace
                         .set_context(shellune_core::PanelSection::None);
@@ -6068,10 +6072,10 @@ impl ShelluneView {
         self.showing_connection_form = false;
         self.active = Some(id);
         self.session_terminal = true;
+        self.security_reset_reveal();
         // Hosts and transfers are context panels. Coming back from one of them lands
         // on the workspace, which shows whichever session was selected.
         if self.workspace.destination() != Destination::LocalShells {
-            self.security_reset_reveal();
             self.workspace.select(Destination::LocalShells);
             self.workspace
                 .set_context(shellune_core::PanelSection::None);
@@ -6110,6 +6114,7 @@ impl ShelluneView {
         if !self.workspace.layout_mut().select_index(index) {
             return;
         }
+        self.security_reset_reveal();
         self.tab_revealed.set(None);
         self.show_layout_tab(window, cx);
     }
@@ -6139,6 +6144,7 @@ impl ShelluneView {
         for _ in 0..count {
             next = crate::app::palette::step(next, delta, count);
             if self.layout_tab_is_shown(next) {
+                self.security_reset_reveal();
                 self.workspace.layout_mut().select_index(next);
                 self.show_layout_tab(window, cx);
                 return;
@@ -7609,6 +7615,7 @@ impl ShelluneView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.security_reset_reveal();
         let port = target
             .port
             .unwrap_or_else(|| shellune_core::Port::DEFAULT.get())
@@ -9841,11 +9848,11 @@ impl ShelluneView {
         self.active = Some(id);
         self.showing_connection_form = true;
         self.session_terminal = true;
+        self.security_reset_reveal();
         if !matches!(
             self.workspace.destination(),
             Destination::LocalShells | Destination::Sessions | Destination::Hosts
         ) {
-            self.security_reset_reveal();
             self.workspace.select(Destination::LocalShells);
         }
         self.sync_remote_fields(cx);
@@ -9854,6 +9861,7 @@ impl ShelluneView {
 
     /// Opens the quick-connection form on the workspace the user is already in.
     fn open_quick_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.security_reset_reveal();
         self.quick_open = true;
         self.quick_error = None;
         self.shell_menu_open = false;
@@ -10051,8 +10059,8 @@ impl ShelluneView {
         is_unsaved: bool,
         cx: &mut Context<Self>,
     ) {
+        self.security_reset_reveal();
         if self.workspace.destination() != Destination::LocalShells {
-            self.security_reset_reveal();
             self.workspace.select(Destination::LocalShells);
         }
         self.remote_opened_from_workspace = true;
@@ -10089,6 +10097,7 @@ impl ShelluneView {
     }
 
     fn open_remote_after_park_inner(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        self.security_reset_reveal();
         self.reconnect = None;
         self.form_session = None;
         self.pending_ephemeral = None;
@@ -10673,6 +10682,7 @@ impl ShelluneView {
     /// Refuses to dial and keeps the form. The host record is not changed.
     fn fail_before_dial_inner(&mut self, reason: String, background: bool, cx: &mut Context<Self>) {
         if !background {
+            self.security_reset_reveal();
             self.ephemeral_ssh_secrets.clear();
         }
         let host = self
@@ -10845,9 +10855,9 @@ impl ShelluneView {
         // shows the attempt, instead of a dialog over the page that was left. A
         // forward-only dial or a parked background verification resume stays where it was.
         if !forward_only && !background {
+            self.security_reset_reveal();
             self.workspace.layout_mut().focus_session(id);
             if self.workspace.destination() != Destination::LocalShells {
-                self.security_reset_reveal();
                 self.workspace.select(Destination::LocalShells);
             }
         }
@@ -14099,11 +14109,9 @@ impl ShelluneView {
 
     /// Whether a vault keys/passwords workbench surface is currently visible on screen.
     pub(crate) fn is_security_keys_surface_visible(&self) -> bool {
-        match self.workspace.destination() {
-            Destination::Hosts => self.hosts.section() == crate::app::hosts::HomeSection::Vault,
-            Destination::Settings => self.settings_nav.current() == settings::Item::KeysAndPassword,
-            _ => false,
-        }
+        (self.home_shown() && self.hosts.section() == crate::app::hosts::HomeSection::Vault)
+            || (self.workspace.destination() == Destination::Settings
+                && self.settings_nav.current() == settings::Item::KeysAndPassword)
     }
 
     /// Whether `handle` belongs to a persistent overlay/modal control rather than page content.
@@ -14537,11 +14545,7 @@ impl ShelluneView {
         if self.security_clear_search_if_focused(window, cx) {
             return true;
         }
-        if ((self.home_shown() && self.hosts.section() == crate::app::hosts::HomeSection::Vault)
-            || (self.workspace.destination() == Destination::Settings
-                && self.settings_nav.current() == settings::Item::KeysAndPassword))
-            && self.security_close_detail(cx)
-        {
+        if self.is_security_keys_surface_visible() && self.security_close_detail(cx) {
             return true;
         }
         // The banner over an ended or reconnecting terminal is the last thing Escape
@@ -22004,7 +22008,7 @@ impl Render for ShelluneView {
             return crate::app::catalog::design_catalog(self.metrics()).into_any_element();
         }
         let keys_visible = self.is_security_keys_surface_visible();
-        if self.was_security_keys_surface_visible && !keys_visible {
+        if !keys_visible && self.security_is_revealed() {
             self.security_reset_reveal();
         }
         self.was_security_keys_surface_visible = keys_visible;

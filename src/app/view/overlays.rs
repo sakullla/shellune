@@ -838,6 +838,7 @@ impl ShelluneView {
             Command::Switch(id) => self.activate_in(id, window, cx),
             Command::Shell(index) => self.launch_choice(index, window, cx),
             Command::Connect(host) => {
+                self.security_reset_reveal();
                 if let Some(host) = self.book.host(host).cloned() {
                     // The connection belongs to the workspace. The hosts page is the
                     // one place that already shows the form beside the saved record.
@@ -1547,11 +1548,11 @@ impl ShelluneView {
         let kind = session.kind().clone();
         let title = session.title().to_owned();
         // A duplicate is a new tab, not a split of the pane that was armed.
+        self.security_reset_reveal();
         self.workspace.clear_armed();
         match kind {
             SessionKind::Local { shell } => {
                 if self.workspace.destination() != Destination::LocalShells {
-                    self.security_reset_reveal();
                     self.workspace.select(Destination::LocalShells);
                 }
                 self.session_terminal = true;
@@ -1589,7 +1590,6 @@ impl ShelluneView {
             | SessionKind::Serial { host } => {
                 if self.book.connection(host).is_some() {
                     if self.workspace.destination() != Destination::LocalShells {
-                        self.security_reset_reveal();
                         self.workspace.select(Destination::LocalShells);
                     }
                     self.session_terminal = true;
