@@ -391,6 +391,11 @@ impl SettingsNav {
     pub(super) fn current(&self) -> Item {
         self.category.items()[self.item_of(self.category)]
     }
+
+    /// Leaves category-column keyboard mode when focus enters an inner page control.
+    pub(super) fn clear_nav_focus(&mut self) {
+        self.nav_focus = false;
+    }
 }
 
 impl ShelluneView {

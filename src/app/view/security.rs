@@ -200,6 +200,15 @@ pub(crate) struct SecurityPage {
     /// record this window writes and a vault a sync merges agree on who wrote
     /// what, and two app runs never invent two identities for one machine.
     device: String,
+    /// Monotonic generation bumped on every vault open or lock, preventing stale
+    /// background unseals from populating `content` after the user locked.
+    vault_epoch: u64,
+    /// Monotonic generation bumped on every system verification or lock, preventing
+    /// stale verification callbacks from mutating a newer lock state.
+    verify_epoch: u64,
+    /// In-place verification cancellation/failure reason per desktop session, shown
+    /// directly on the session's failure card without expanding raw diagnostics.
+    session_verify_failures: std::collections::HashMap<shellune_core::SessionId, String>,
     /// Whether a test holds the finish of one job, to draw the busy state the
     /// window shows while work is in flight (the same shape as the sync
     /// panel's held finish).
@@ -211,9 +220,15 @@ pub(crate) struct SecurityPage {
     /// Holds the finish of a system verification so tests can assert the waiting UI.
     #[cfg(test)]
     hold_verify: bool,
-    /// The held verification answer, until the test releases it.
+    /// The held verification answer and its epoch, until the test releases it.
     #[cfg(test)]
-    held_verify: Option<Result<(), BiometricError>>,
+    held_verify: Option<(u64, Result<(), BiometricError>)>,
+    /// Holds the finish of `vault_open_quietly` so tests can assert warming/lock races.
+    #[cfg(test)]
+    hold_open: bool,
+    /// The held background vault open result and its epoch, until the test releases it.
+    #[cfg(test)]
+    held_open: Option<(u64, Result<Option<VaultContent>, String>)>,
 }
 
 /// The lock of this one device: what it asks before the vault may be read, and
@@ -500,7 +515,7 @@ impl SecurityPage {
             field.set_clearable(true, cx);
             field
         });
-        let list_focus = cx.focus_handle();
+        let list_focus = cx.focus_handle().tab_stop(true);
         let search_tab_view = cx.entity().downgrade();
         search.update(cx, |field, _cx| {
             field.on_tab(move |shift, window, app| {
@@ -576,6 +591,9 @@ impl SecurityPage {
             job_book: None,
             dialog_scroll: ScrollHandle::new(),
             device: device_name(root),
+            vault_epoch: 0,
+            verify_epoch: 0,
+            session_verify_failures: std::collections::HashMap::new(),
             #[cfg(test)]
             hold_finish: false,
             #[cfg(test)]
@@ -584,6 +602,10 @@ impl SecurityPage {
             hold_verify: false,
             #[cfg(test)]
             held_verify: None,
+            #[cfg(test)]
+            hold_open: false,
+            #[cfg(test)]
+            held_open: None,
         }
     }
 
@@ -900,6 +922,8 @@ impl ShelluneView {
             )
             .child(toolbar_right);
 
+        let independent_split = self.home_vault_independent_split();
+
         div()
             .id("home.vault")
             .debug_selector(|| "home.vault".to_owned())
@@ -927,18 +951,41 @@ impl ShelluneView {
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .overflow_x_hidden()
+                    .when(independent_split, |col| col.overflow_hidden())
+                    .when(!independent_split, |col| {
+                        col.overflow_y_scroll().overflow_x_hidden()
+                    })
                     .px(metrics.scale(spacing::WIDE))
                     .py(metrics.scale(spacing::BASE))
                     .child(self.security_workbench(true, cx)),
             )
     }
 
+    /// Whether the Home vault area is wide enough for the two-column master-detail split.
+    fn home_vault_wide_split(&self) -> bool {
+        let metrics = self.metrics();
+        let sidebar_room = if self.home_sidebar_folded() {
+            super::home::SIDEBAR_FOLDED_WIDTH
+        } else {
+            super::home::SIDEBAR_WIDTH
+        };
+        (self.viewport_width - metrics.scale(sidebar_room + spacing::TIGHT))
+            >= metrics.scale(VAULT_SPLIT_MIN_WIDTH)
+    }
+
+    /// Whether the Home vault area should lock outer vertical scrolling so the left list
+    /// and right detail pane scroll independently within the viewport.
+    fn home_vault_independent_split(&self) -> bool {
+        !self.security.lock.locked
+            && self.viewport_height >= self.metrics().scale(super::home::SHORT_HEIGHT)
+            && self.home_vault_wide_split()
+    }
+
     /// Shared vault workbench body mounted in both Home (`in_home == true`) and Settings.
     fn security_workbench(&self, in_home: bool, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.security_strings();
+        let independent_split = in_home && self.home_vault_independent_split();
         let mut page = div()
             .track_focus(&self.security.list_focus)
             .flex()
@@ -946,6 +993,7 @@ impl ShelluneView {
             .w_full()
             .min_w_0()
             .when(in_home, |el| el.flex_1().min_h_0())
+            .when(independent_split, |el| el.overflow_hidden())
             .gap(metrics.scale(spacing::BASE))
             .debug_selector(|| "security.page".to_owned())
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -1108,14 +1156,7 @@ impl ShelluneView {
             )
             .child(div().flex().min_w_0().max_w_full().child(filters));
 
-        let sidebar_room = if self.home_sidebar_folded() {
-            super::home::SIDEBAR_FOLDED_WIDTH
-        } else {
-            super::home::SIDEBAR_WIDTH
-        };
-        let wide_split = in_home
-            && (self.viewport_width - metrics.scale(sidebar_room + spacing::TIGHT))
-                >= metrics.scale(VAULT_SPLIT_MIN_WIDTH);
+        let wide_split = in_home && self.home_vault_wide_split();
 
         let lists_column = self.security_filtered_lists(cx).child(
             div()
@@ -1150,7 +1191,8 @@ impl ShelluneView {
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
-                    .items_start()
+                    .when(independent_split, |split| split.overflow_hidden())
+                    .when(!independent_split, |split| split.items_start())
                     .gap(metrics.scale(spacing::BASE))
                     .debug_selector(|| "security.split".to_owned())
                     .child(
@@ -1161,9 +1203,13 @@ impl ShelluneView {
                             .flex_col()
                             .flex_1()
                             .min_w_0()
-                            .max_h_full()
-                            .overflow_y_scroll()
-                            .overflow_x_hidden()
+                            .when(independent_split, |col| {
+                                col.min_h_0()
+                                    .h_full()
+                                    .overflow_y_scroll()
+                                    .overflow_x_hidden()
+                            })
+                            .when(!independent_split, |col| col.max_h_full())
                             .child(lists_column),
                     )
                     .child(
@@ -1176,9 +1222,13 @@ impl ShelluneView {
                             .w(metrics.scale(VAULT_DETAIL_WIDTH))
                             .max_w(gpui::relative(0.46))
                             .min_w_0()
-                            .max_h_full()
-                            .overflow_y_scroll()
-                            .overflow_x_hidden()
+                            .when(independent_split, |col| {
+                                col.min_h_0()
+                                    .h_full()
+                                    .overflow_y_scroll()
+                                    .overflow_x_hidden()
+                            })
+                            .when(!independent_split, |col| col.max_h_full())
                             .child(detail_pane),
                     ),
             )
@@ -2008,7 +2058,9 @@ impl ShelluneView {
                             ),
                     )
                     .child(row_actions)
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.settings_nav.clear_nav_focus();
+                        window.focus(&this.security.list_focus);
                         this.security_pick(record, cx);
                     })),
             );
@@ -3104,14 +3156,15 @@ impl ShelluneView {
             .read(cx)
             .focus_handle()
             .is_focused(window);
+        let list_focused = self.security.list_focus.is_focused(window);
         match event.keystroke.key.as_str() {
             "down" => {
                 if search_focused {
                     window.focus(&self.security.list_focus);
                 }
-                self.security_step_cursor(1, cx)
+                self.security_step_cursor(1, cx) || list_focused
             }
-            "up" if !search_focused => self.security_step_cursor(-1, cx),
+            "up" if !search_focused => self.security_step_cursor(-1, cx) || list_focused,
             "enter" if !search_focused => self.security_activate_cursor(cx),
             _ => false,
         }
@@ -3150,13 +3203,18 @@ impl ShelluneView {
         let had_bind = self.security.pending_bind.take();
         self.security.dialog = None;
         self.security.rotation_public_key = None;
-        self.restore_focus_pending = true;
-        if matches!(
-            had_bind,
-            Some(PendingVaultBind::SshManagedKey | PendingVaultBind::SshSharedCredential)
-        ) && self.host_fields.is_some()
-        {
+        let return_to_connection_dialog = match had_bind {
+            Some(PendingVaultBind::SshManagedKey | PendingVaultBind::SshSharedCredential) => {
+                self.host_fields.is_some()
+            }
+            Some(PendingVaultBind::DesktopSharedCredential) => self.protocol_fields.is_some(),
+            None => false,
+        };
+        if return_to_connection_dialog {
             self.focus_host_dialog = true;
+            self.focus_host_dialog_keep_return = true;
+        } else {
+            self.restore_focus_pending = true;
         }
         cx.notify();
     }
@@ -3948,7 +4006,7 @@ impl ShelluneView {
     }
 
     /// Records the page's notice for the operation that just ended.
-    fn security_set_notice(&mut self, tone: Tone, text: String, cx: &mut Context<Self>) {
+    pub(super) fn security_set_notice(&mut self, tone: Tone, text: String, cx: &mut Context<Self>) {
         // An empty sentence is no notice: the quiet reports (a trust mirror
         // behind a connection) draw nothing rather than an empty banner.
         self.security.notice = (!text.is_empty()).then_some((tone, text));
@@ -4137,7 +4195,12 @@ impl ShelluneView {
                             draft.set_auth(shellune_core::AuthMethodKind::ManagedKey);
                             draft.set_managed_key(Some(*id));
                         }
-                        self.focus_host_dialog = true;
+                        if self.host_fields.is_some() {
+                            self.focus_host_dialog = true;
+                            self.focus_host_dialog_keep_return = true;
+                        } else {
+                            self.restore_focus_pending = true;
+                        }
                     }
                     (
                         Some(PendingVaultBind::SshSharedCredential),
@@ -4147,7 +4210,12 @@ impl ShelluneView {
                             draft.set_auth(shellune_core::AuthMethodKind::Password);
                             draft.set_credential(Some(*id));
                         }
-                        self.focus_host_dialog = true;
+                        if self.host_fields.is_some() {
+                            self.focus_host_dialog = true;
+                            self.focus_host_dialog_keep_return = true;
+                        } else {
+                            self.restore_focus_pending = true;
+                        }
                     }
                     (
                         Some(PendingVaultBind::DesktopSharedCredential),
@@ -4156,7 +4224,12 @@ impl ShelluneView {
                         if let Some(draft) = self.hosts.protocol_draft_mut() {
                             draft.set_credential(Some(*id));
                         }
-                        self.restore_focus_pending = true;
+                        if self.protocol_fields.is_some() {
+                            self.focus_host_dialog = true;
+                            self.focus_host_dialog_keep_return = true;
+                        } else {
+                            self.restore_focus_pending = true;
+                        }
                     }
                     (Some(_), _) => {
                         self.restore_focus_pending = true;
@@ -4323,6 +4396,11 @@ impl ShelluneView {
     /// touching the lock: the start-up open of a device without the lock, the
     /// second half of an unlock, and the re-read after a sync applied a vault.
     pub(super) fn vault_open_quietly(&mut self, cx: &mut Context<Self>) {
+        if self.security.lock.locked {
+            return;
+        }
+        self.security.vault_epoch = self.security.vault_epoch.wrapping_add(1);
+        let epoch = self.security.vault_epoch;
         self.security.warming = true;
         let store = VaultStore::at(self.store.root());
         let secrets = self.secrets.clone();
@@ -4336,48 +4414,66 @@ impl ShelluneView {
         cx.spawn(async move |this, cx| {
             let opened = work.await;
             let _ = this.update(cx, |view, cx| {
-                view.security.warming = false;
-                match opened {
-                    Ok(Some(content)) => {
-                        let first_live_key = content
-                            .keys()
-                            .filter(|record| record.meta().is_live())
-                            .min_by(|a, b| a.meta().name().cmp(b.meta().name()))
-                            .map(|record| record.meta().id());
-                        view.security.content = Some(content);
-                        if let Some(first) = first_live_key
-                            && let Some(draft) = view.hosts.draft_mut()
-                            && draft.auth() == shellune_core::AuthMethodKind::ManagedKey
-                            && draft.managed_key_id().is_none()
-                        {
-                            draft.set_managed_key(Some(first));
-                        }
-                        // An unlock's follow-up steps waited for exactly this
-                        // file; they continue now that the vault is open.
-                        let waiting = std::mem::take(&mut view.security.lock.pending);
-                        if !waiting.is_empty() {
-                            view.security_resume(waiting, cx);
-                        }
-                    }
-                    Ok(None) => {
-                        // No vault exists: the steps that needed one simply
-                        // find nothing, the way an unlocked machine does.
-                        let waiting = std::mem::take(&mut view.security.lock.pending);
-                        if !waiting.is_empty() {
-                            view.security_resume(waiting, cx);
-                        }
-                    }
-                    Err(reason) => {
-                        // A vault that cannot be opened answers no request;
-                        // what waited for it dies with the reason shown.
-                        view.security.lock.pending.clear();
-                        view.security.open_problem = Some(reason);
-                    }
-                }
-                cx.notify();
+                view.vault_open_quietly_finished(epoch, opened, cx);
             });
         })
         .detach();
+    }
+
+    fn vault_open_quietly_finished(
+        &mut self,
+        epoch: u64,
+        opened: Result<Option<VaultContent>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.security.vault_epoch != epoch || self.security.lock.locked {
+            return;
+        }
+        #[cfg(test)]
+        if self.security.hold_open {
+            self.security.held_open = Some((epoch, opened));
+            cx.notify();
+            return;
+        }
+        self.security.warming = false;
+        match opened {
+            Ok(Some(content)) => {
+                let first_live_key = content
+                    .keys()
+                    .filter(|record| record.meta().is_live())
+                    .min_by(|a, b| a.meta().name().cmp(b.meta().name()))
+                    .map(|record| record.meta().id());
+                self.security.content = Some(content);
+                if let Some(first) = first_live_key
+                    && let Some(draft) = self.hosts.draft_mut()
+                    && draft.auth() == shellune_core::AuthMethodKind::ManagedKey
+                    && draft.managed_key_id().is_none()
+                {
+                    draft.set_managed_key(Some(first));
+                }
+                // An unlock's follow-up steps waited for exactly this
+                // file; they continue now that the vault is open.
+                let waiting = std::mem::take(&mut self.security.lock.pending);
+                if !waiting.is_empty() {
+                    self.security_resume(waiting, cx);
+                }
+            }
+            Ok(None) => {
+                // No vault exists: the steps that needed one simply
+                // find nothing, the way an unlocked machine does.
+                let waiting = std::mem::take(&mut self.security.lock.pending);
+                if !waiting.is_empty() {
+                    self.security_resume(waiting, cx);
+                }
+            }
+            Err(reason) => {
+                // A vault that cannot be opened answers no request;
+                // what waited for it dies with the reason shown.
+                self.security_abort_pending(&reason);
+                self.security.open_problem = Some(reason);
+            }
+        }
+        cx.notify();
     }
 
     // -----------------------------------------------------------------------
@@ -4407,10 +4503,21 @@ impl ShelluneView {
     /// they already have - a lock governs what may be read from now on, and
     /// never tears a live connection down (R3).
     pub(super) fn security_lock_now(&mut self, cx: &mut Context<Self>) {
+        let cancel_reason = self.security_strings().lock_cancelled.to_owned();
+        self.security.vault_epoch = self.security.vault_epoch.wrapping_add(1);
+        self.security.verify_epoch = self.security.verify_epoch.wrapping_add(1);
+        self.security.warming = false;
+        self.security.lock.verifying = false;
+        #[cfg(test)]
+        {
+            self.security.held_verify = None;
+            self.security.held_open = None;
+        }
+        if !self.security.lock.pending.is_empty() {
+            self.security_abort_pending(&cancel_reason);
+        }
         if !self.security.lock.locked {
             self.security.lock.locked = true;
-            self.security.lock.pending.clear();
-            self.security.lock.verifying = false;
             self.security.lock.idle_deadline = None;
             self.security.lock.idle_generation += 1;
             self.security.operation_granted = false;
@@ -4423,6 +4530,56 @@ impl ShelluneView {
             );
         }
         cx.notify();
+    }
+
+    /// Fails every queued connection step waiting on a verification or vault open.
+    fn security_abort_pending(&mut self, reason: &str) {
+        let aborted = std::mem::take(&mut self.security.lock.pending);
+        for step in aborted {
+            match step {
+                SecurityPending::ResumeChain(_) => {
+                    if let Some(panel) = self.remote.as_mut() {
+                        panel.set_form_error(reason.to_owned());
+                    }
+                }
+                SecurityPending::Desktop(session) => {
+                    self.security_fail_desktop(session, reason.to_owned());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Marks `session` failed due to a vault verification cancellation/failure and
+    /// stores the human-readable reason so `failure_notice` renders it in-place.
+    pub(crate) fn security_fail_desktop(
+        &mut self,
+        session: shellune_core::SessionId,
+        reason: String,
+    ) {
+        self.security
+            .session_verify_failures
+            .insert(session, reason.clone());
+        self.workspace.session_failed(
+            session,
+            shellune_core::SessionFailure::ConnectionFailed { reason },
+        );
+    }
+
+    /// Clears any recorded verification failure reason for `session` when starting anew.
+    pub(crate) fn security_clear_session_failure(&mut self, session: shellune_core::SessionId) {
+        self.security.session_verify_failures.remove(&session);
+    }
+
+    /// Returns the in-place vault verification failure reason recorded for `session`, if any.
+    pub(crate) fn security_session_failure_reason(
+        &self,
+        session: shellune_core::SessionId,
+    ) -> Option<&str> {
+        self.security
+            .session_verify_failures
+            .get(&session)
+            .map(String::as_str)
     }
 
     /// Notes a sensitive use and schedules the idle lock from now (R3). A
@@ -4528,10 +4685,9 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) -> bool {
         let lock = &self.security.lock;
-        if !lock.engaged() && !lock.locked {
-            return false;
-        }
-        if lock.locked || lock.verifies_every_operation() || always {
+        let requires_verify =
+            lock.locked || (lock.engaged() && (lock.verifies_every_operation() || always));
+        if requires_verify {
             if lock.verifying {
                 // One prompt at a time; a second request while the system is
                 // asking is refused rather than queued behind a prompt the
@@ -4549,12 +4705,19 @@ impl ShelluneView {
             self.security_verify(cx);
             return true;
         }
+        if !lock.locked && self.security.content.is_none() && self.security.warming {
+            self.security.lock.pending.extend(steps);
+            cx.notify();
+            return true;
+        }
         false
     }
 
     /// Asks the system to verify the user once, on the background executor:
     /// some platform prompts wait for the person to answer.
     fn security_verify(&mut self, cx: &mut Context<Self>) {
+        self.security.verify_epoch = self.security.verify_epoch.wrapping_add(1);
+        let epoch = self.security.verify_epoch;
         self.security.lock.verifying = true;
         let authenticator = self.security.lock.authenticator.clone();
         let prompt = VerificationPrompt::new(self.security_strings().lock_unlock.to_owned());
@@ -4563,7 +4726,9 @@ impl ShelluneView {
             .spawn(async move { authenticator.verify(&prompt) });
         cx.spawn(async move |this, cx| {
             let answer = work.await;
-            let _ = this.update(cx, |view, cx| view.security_verify_finished(answer, cx));
+            let _ = this.update(cx, |view, cx| {
+                view.security_verify_finished(epoch, answer, cx);
+            });
         })
         .detach();
         cx.notify();
@@ -4574,12 +4739,16 @@ impl ShelluneView {
     /// cancellation, a mismatch or a busy system is never a pass (R3, R4).
     fn security_verify_finished(
         &mut self,
+        epoch: u64,
         answer: Result<(), BiometricError>,
         cx: &mut Context<Self>,
     ) {
+        if self.security.verify_epoch != epoch || !self.security.lock.verifying {
+            return;
+        }
         #[cfg(test)]
         if self.security.hold_verify {
-            self.security.held_verify = Some(answer);
+            self.security.held_verify = Some((epoch, answer));
             cx.notify();
             return;
         }
@@ -4591,7 +4760,6 @@ impl ShelluneView {
                 self.security_resume(queue, cx);
             }
             Err(error) => {
-                let aborted = std::mem::take(&mut self.security.lock.pending);
                 let reason = if error.is_enrollment_changed() {
                     // The biometric set changed, so this device's protection
                     // no longer holds: biometric unlocking is turned off here
@@ -4608,24 +4776,7 @@ impl ShelluneView {
                     }
                 };
                 self.security_set_notice(Tone::Warning, reason.clone(), cx);
-                for step in aborted {
-                    match step {
-                        SecurityPending::ResumeChain(_) => {
-                            if let Some(panel) = self.remote.as_mut() {
-                                panel.set_form_error(reason.clone());
-                            }
-                        }
-                        SecurityPending::Desktop(session) => {
-                            self.workspace.session_failed(
-                                session,
-                                shellune_core::SessionFailure::ConnectionFailed {
-                                    reason: reason.clone(),
-                                },
-                            );
-                        }
-                        _ => {}
-                    }
-                }
+                self.security_abort_pending(&reason);
             }
         }
         cx.notify();
@@ -4776,6 +4927,27 @@ impl ShelluneView {
     fn security_resume(&mut self, queue: Vec<SecurityPending>, cx: &mut Context<Self>) {
         let mut queue = queue.into_iter();
         while let Some(step) = queue.next() {
+            let needs_vault_content = matches!(
+                step,
+                SecurityPending::Reveal(_)
+                    | SecurityPending::Copy(_)
+                    | SecurityPending::ResumeChain(_)
+                    | SecurityPending::Desktop(_)
+                    | SecurityPending::ExportKey
+                    | SecurityPending::OpenAction(_)
+            );
+            if needs_vault_content
+                && !self.security.lock.locked
+                && self.security.content.is_none()
+                && self.security.warming
+            {
+                let mut deferred = Vec::with_capacity(queue.len() + 1);
+                deferred.push(step);
+                deferred.extend(queue);
+                self.security.lock.pending = deferred;
+                cx.notify();
+                return;
+            }
             match step {
                 SecurityPending::Unlock => {
                     if self.security.lock.locked {
@@ -4795,7 +4967,9 @@ impl ShelluneView {
                         // The rest of the queue needs the file open; it waits
                         // for the background read and continues there.
                         self.security.lock.pending = queue.collect();
-                        self.vault_open_quietly(cx);
+                        if !self.security.warming {
+                            self.vault_open_quietly(cx);
+                        }
                         return;
                     }
                 }
@@ -4926,6 +5100,11 @@ impl ShelluneView {
     /// Focus handle of the vault search input.
     pub(crate) fn security_search_focus(&self, cx: &App) -> gpui::FocusHandle {
         self.security.search.read(cx).focus_handle().clone()
+    }
+
+    /// Whether the vault list focus handle currently holds keyboard focus.
+    pub(crate) fn security_list_focused(&self, window: &Window) -> bool {
+        self.security.list_focus.is_focused(window)
     }
 
     /// Clears the vault search input on Escape when it is focused and non-empty.
@@ -5750,9 +5929,53 @@ impl ShelluneView {
     /// Lets a held system verification finish, applying its answer.
     pub fn security_release_verify_for_test(&mut self, cx: &mut Context<Self>) {
         self.security.hold_verify = false;
-        if let Some(answer) = self.security.held_verify.take() {
-            self.security_verify_finished(answer, cx);
+        if let Some((epoch, answer)) = self.security.held_verify.take() {
+            self.security_verify_finished(epoch, answer, cx);
         }
+    }
+
+    /// Holds (or releases) the finish of `vault_open_quietly` for deterministic warming tests.
+    pub fn security_hold_open_for_test(&mut self, hold: bool) {
+        self.security.hold_open = hold;
+    }
+
+    /// Lets a held `vault_open_quietly` finish, applying its result if its epoch is still valid.
+    pub fn security_release_open_for_test(&mut self, cx: &mut Context<Self>) {
+        self.security.hold_open = false;
+        if let Some((epoch, opened)) = self.security.held_open.take() {
+            self.vault_open_quietly_finished(epoch, opened, cx);
+        }
+    }
+
+    /// Returns the vault list scroll handle for tests verifying independent master-detail scroll.
+    pub fn security_list_scroll_for_test(&self) -> ScrollHandle {
+        self.security.list_scroll.clone()
+    }
+
+    /// Returns the name of the currently opened detail record, if any, for tests.
+    pub fn security_detail_name_for_test(&self) -> Option<String> {
+        let vault = self.security.content.as_ref()?;
+        match self.security.detail? {
+            SecurityRecord::Key(id) => vault.key(id).map(|r| r.meta().name().to_owned()),
+            SecurityRecord::Credential(id) => {
+                vault.credential(id).map(|r| r.meta().name().to_owned())
+            }
+        }
+    }
+
+    /// Triggers a background vault re-read (`warming = true`) for tests.
+    pub fn security_reread_for_test(&mut self, cx: &mut Context<Self>) {
+        self.vault_reread(cx);
+    }
+
+    /// Locks the vault immediately for tests.
+    pub fn security_lock_now_for_test(&mut self, cx: &mut Context<Self>) {
+        self.security_lock_now(cx);
+    }
+
+    /// Starts an independent verification prompt (`security_begin_always`) for concurrent-prompt tests.
+    pub fn security_begin_always_for_test(&mut self, cx: &mut Context<Self>) {
+        self.security_begin_always(Vec::new(), cx);
     }
 
     /// Reads the open dialog's `name` field text, when present, for tests.

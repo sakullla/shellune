@@ -64,7 +64,7 @@ const CHEVRON_SIZE: f32 = 18.0;
 const GROUP_ROW: &str = "hosts-tree-row";
 
 /// The window height below which the page scrolls as one column, before zoom.
-const SHORT_HEIGHT: f32 = 320.0;
+pub(super) const SHORT_HEIGHT: f32 = 320.0;
 
 /// Below this width a row leaves out its duplicate tool, before zoom.
 const ROW_DUPLICATE_MIN_WIDTH: f32 = 760.0;

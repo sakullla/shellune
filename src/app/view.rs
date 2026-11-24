@@ -1061,6 +1061,9 @@ pub struct ShelluneView {
     system_reduces_motion: bool,
     /// Whether the host dialog's first field takes the keyboard on the next draw.
     focus_host_dialog: bool,
+    /// Preserves `focus_return` when returning focus from a stacked inline vault dialog
+    /// back to an already-open connection dialog.
+    focus_host_dialog_keep_return: bool,
     /// Focus to return to when an overlay closes. Weak, so a removed field is not kept.
     focus_return: Option<gpui::WeakFocusHandle>,
     /// The next draw gives the keyboard back to [`Self::focus_return`].
@@ -2973,6 +2976,7 @@ impl ShelluneView {
             session_more: None,
             backup: None,
             focus_host_dialog: false,
+            focus_host_dialog_keep_return: false,
             focus_return: None,
             restore_focus_pending: false,
             rail_collapsed: false,
@@ -3748,10 +3752,11 @@ impl ShelluneView {
         }
         let search_focused = self.hosts_search.read(cx).focus_handle().is_focused(window);
         let vault_search_focused = self.security_search_focus(cx).is_focused(window);
+        let vault_list_focused = self.security_list_focused(window);
         let page_focused = self
             .destination_focus(Destination::Hosts)
             .is_focused(window);
-        if !search_focused && !vault_search_focused && !page_focused {
+        if !search_focused && !vault_search_focused && !vault_list_focused && !page_focused {
             return false;
         }
         // Shift+Tab from the search or the list goes to the sidebar's groups, where F2
@@ -5219,16 +5224,25 @@ impl ShelluneView {
             self.show_terminal_start(session, cx);
             return;
         }
+        self.security_clear_session_failure(session);
         // A shared password the vault holds is a secret read like any other:
         // the lock's gate verifies first when the policy asks, and a locked
         // vault unlocks before the pane may sign in with it (R3).
-        if record.credential_id().is_some()
-            && !self.security.operation_granted
-            && self.security_begin(vec![SecurityPending::Desktop(session)], cx)
-        {
-            self.workspace.session_starting(session);
-            self.show_terminal_start(session, cx);
-            return;
+        if record.credential_id().is_some() && !self.security.operation_granted {
+            if self.security_verifying() {
+                let busy_text = copy::security_for(self.workspace.locale())
+                    .lock_busy
+                    .to_owned();
+                self.security_set_notice(Tone::Warning, busy_text.clone(), cx);
+                self.security_fail_desktop(session, busy_text);
+                self.show_terminal_start(session, cx);
+                return;
+            }
+            if self.security_begin(vec![SecurityPending::Desktop(session)], cx) {
+                self.workspace.session_starting(session);
+                self.show_terminal_start(session, cx);
+                return;
+            }
         }
         self.security.operation_granted = false;
         let password = match self.desktop_password(&record) {
@@ -19640,6 +19654,17 @@ impl ShelluneView {
             metrics,
         )
         .debug_selector(|| "terminal.failure".to_owned());
+        if let Some(verify_reason) = self.security_session_failure_reason(id) {
+            banner = banner.child(
+                div()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .debug_selector(|| "terminal.failure.reason".to_owned())
+                    .child(SharedString::from(verify_reason.to_owned())),
+            );
+        }
         let mut actions = div()
             .flex()
             .flex_wrap()
@@ -20816,7 +20841,9 @@ impl Render for ShelluneView {
                 })
             };
             if let Some(handle) = handle {
-                self.remember_focus(window, cx);
+                if !std::mem::take(&mut self.focus_host_dialog_keep_return) {
+                    self.remember_focus(window, cx);
+                }
                 window.focus(&handle);
             }
         }

@@ -45094,14 +45094,15 @@ async fn connection_dialogs_handle_locked_vault_inline_creation_missing_records_
     );
     assert_eq!(auth_counter.verify_calls(), 2);
 
-    // Release cancelled verification -> `terminal.failure` renders in-place with `terminal.failure.unlock` and `terminal.failure.next`!
+    // Release cancelled verification -> `terminal.failure` renders in-place with reason, `terminal.failure.unlock`, and `terminal.failure.next`!
     cx.update(|_window, app| view.update(app, |v, cx| v.security_release_verify_for_test(cx)));
     cx.run_until_parked();
     assert!(
         cx.debug_bounds("terminal.failure").is_some()
+            && cx.debug_bounds("terminal.failure.reason").is_some()
             && cx.debug_bounds("terminal.failure.unlock").is_some()
             && cx.debug_bounds("terminal.failure.next").is_some(),
-        "cancelled desktop verification surfaces in-place failure card with Unlock and Reconnect"
+        "cancelled desktop verification surfaces in-place failure card with visible reason, Unlock, and Reconnect"
     );
 
     // Clicking Unlock on the failure banner passes the 3rd scripted verification and unlocks the vault!
@@ -45137,4 +45138,370 @@ async fn connection_dialogs_handle_locked_vault_inline_creation_missing_records_
         "fresh locked SSH dialog shows locked banner and never renders false 'no key in vault'"
     );
     let _ = fresh_view;
+}
+
+#[gpui::test]
+async fn vault_wide_master_detail_scrolls_independently_and_row_click_keeps_arrow_focus(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("vault-independent-scroll-and-focus");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    {
+        let mut vault = shellune_storage::VaultContent::default();
+        for idx in 0..25 {
+            let suffix = format!("{idx:02}");
+            vault
+                .insert_key(shellune_storage::VaultKeyRecord::new(
+                    shellune_core::ManagedKeyMeta::new(
+                        shellune_core::KeyId::new(),
+                        format!("Deploy Key {suffix}"),
+                        "ssh-ed25519",
+                        format!("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI{suffix}0000000000"),
+                        format!("SHA256:testfingerprint{suffix}"),
+                        Some(format!("ops-{suffix}@prod")),
+                        shellune_core::VaultRecordVersion::new(1, "seed"),
+                    ),
+                    shellune_core::SecretString::new("-----BEGIN OPENSSH PRIVATE KEY-----\nseed\n"),
+                ))
+                .expect("insert key");
+        }
+        shellune_storage::VaultStore::at(dir.path())
+            .save_records(
+                &vault,
+                &[],
+                &[shellune_storage::UnsealSource::LocalMachine],
+                shellune_storage::KdfParams::default(),
+                secrets.as_ref(),
+            )
+            .expect("save seeded 25-key vault");
+    }
+
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    click(cx, "nav.hosts");
+    let viewport = size(px(1280.0), px(720.0));
+    cx.simulate_resize(viewport);
+    click(cx, "hosts.view.vault");
+    cx.run_until_parked();
+
+    // 1. Finding 1: Wide split scrolls the left list independently; scrolling to row 24 and clicking it
+    //    keeps `security.detail.key` inside the viewport without scrolling back to top.
+    let list_scroll = cx.update(|_window, app| view.read(app).security_list_scroll_for_test());
+    let max_offset = list_scroll.max_offset();
+    assert!(
+        max_offset.height > px(0.0),
+        "25 vault keys exceed viewport height so security.list.scroll has positive scroll range ({:?})",
+        max_offset
+    );
+    let wheel_pos = bounds_of(cx, "security.key.0").center();
+    cx.simulate_event(ScrollWheelEvent {
+        position: wheel_pos,
+        delta: ScrollDelta::Pixels(point(px(0.0), -max_offset.height - px(40.0))),
+        modifiers: Modifiers::default(),
+        touch_phase: Default::default(),
+    });
+    cx.run_until_parked();
+    click(cx, "security.key.24");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_detail_name_for_test()),
+        Some("Deploy Key 24".to_owned())
+    );
+    let detail_bounds = bounds_of(cx, "security.detail.key");
+    assert!(
+        detail_bounds.origin.y >= px(0.0) && detail_bounds.bottom() <= viewport.height,
+        "right-hand detail card stays inside viewport ({:?} vs {:?}) when scrolled to bottom of list",
+        detail_bounds,
+        viewport
+    );
+
+    // 2. Finding 4 (Home): Clicking a row focuses `security.list_focus`, so Up + Enter steps within
+    //    the vault list instead of switching Home sidebar sections.
+    cx.simulate_keystrokes("up");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().section()),
+        crate::app::hosts::HomeSection::Vault,
+        "Up arrow after clicking a vault row does not navigate away from HomeSection::Vault"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_detail_name_for_test()),
+        Some("Deploy Key 23".to_owned()),
+        "Up + Enter after clicking row 24 selects Deploy Key 23"
+    );
+
+    // 3. Finding 4 (Settings): Clicking a row in Settings -> Security -> Keys & Passwords focuses
+    //    `security.list_focus`, so Down + Enter steps rows instead of switching Settings categories.
+    click(cx, "nav.settings");
+    click(cx, "settings.category.security");
+    click(cx, "settings.item.keys-and-passwords");
+    cx.run_until_parked();
+    // Collapse the tall detail card carried over from Home so the list rows sit in view.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    click(cx, "security.key.1");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_detail_name_for_test()),
+        Some("Deploy Key 01".to_owned()),
+        "clicking row 1 in Settings opens Deploy Key 01"
+    );
+    cx.simulate_keystrokes("down");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_detail_name_for_test()),
+        Some("Deploy Key 02".to_owned()),
+        "Down + Enter after clicking row 1 in Settings selects Deploy Key 02 without leaving Security"
+    );
+
+    // 4. Finding 5 (P3): Inline credential dialog from RDP connection modal restores focus back to
+    //    the open RDP connection dialog on both Escape cancel and Save completion.
+    click(cx, "nav.hosts");
+    click(cx, "hosts.view.all");
+    click(cx, "hosts.new");
+    click(cx, "connection.protocol.rdp");
+    cx.run_until_parked();
+
+    click(cx, "connection.auth.credential.new");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_input("10.20.");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app).hosts_state().protocol_draft().map(|d| {
+                d.text(crate::app::hosts::ConnectionFormField::Address)
+                    .to_owned()
+            })
+        }),
+        Some("10.20.".to_owned()),
+        "cancelling inline vault dialog returns keyboard focus to the open RDP dialog"
+    );
+
+    click(cx, "connection.auth.credential.new");
+    cx.run_until_parked();
+    cx.simulate_input("RDP Focus Cred");
+    click(cx, "security.dialog.generate.password");
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+    cx.simulate_input("30.40");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app).hosts_state().protocol_draft().map(|d| {
+                d.text(crate::app::hosts::ConnectionFormField::Address)
+                    .to_owned()
+            })
+        }),
+        Some("10.20.30.40".to_owned()),
+        "saving inline vault credential returns keyboard focus to the open RDP dialog"
+    );
+}
+
+#[gpui::test]
+async fn vault_warming_epoch_lock_race_and_desktop_every_operation_verification_ux(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("vault-warming-epoch-and-desktop-verify");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let cred_id = shellune_storage::VaultStore::at(dir.path())
+        .open(
+            &shellune_storage::UnsealSource::LocalMachine,
+            secrets.as_ref(),
+        )
+        .expect("open vault")
+        .credentials()
+        .next()
+        .expect("cred")
+        .meta()
+        .id();
+    let mut rdp = desktop_record("office-rdp");
+    if let shellune_core::ConnectionRecord::Rdp(ref mut cfg) = rdp {
+        cfg.set_credential_id(Some(cred_id));
+    }
+    seed_connections(&dir.store(), vec![rdp]);
+
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    let rdp_host_id = cx.update(|_window, app| view.read(app).book().connections()[0].id());
+    click(cx, "nav.hosts");
+    cx.simulate_resize(size(px(1200.0), px(840.0)));
+    cx.run_until_parked();
+
+    // 1. Finding 3A: Locking while `vault_open_quietly` is in flight invalidates its epoch so
+    //    the stale unsealed `VaultContent` is discarded instead of populating memory while locked.
+    cx.update(|_window, app| {
+        view.update(app, |v, cx| {
+            v.security_hold_open_for_test(true);
+            v.security_reread_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_record_count()),
+        0,
+        "content is cleared while warming reread is held"
+    );
+    cx.update(|_window, app| view.update(app, |v, cx| v.security_lock_now_for_test(cx)));
+    cx.update(|_window, app| view.update(app, |v, cx| v.security_release_open_for_test(cx)));
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| {
+            let v = view.read(app);
+            v.security_locked_for_test() && v.security_record_count() == 0
+        }),
+        "stale background vault open finished after lock_now is dropped and leaves zero secrets in memory"
+    );
+
+    // 2. Finding 3B: Connecting while `warming == true` (right after unlock before background open lands)
+    //    queues onto `pending` and dials once `vault_open_quietly` completes instead of false missing error.
+    let auth_unlock = Arc::new(
+        shellune_storage::ScriptedAuthenticator::new(
+            shellune_storage::BiometricCapability::Biometrics,
+        )
+        .script([Ok(())]),
+    );
+    cx.update(|_window, app| {
+        view.update(app, |v, cx| {
+            v.security_set_authenticator_for_test(auth_unlock);
+            v.security_enable_lock_for_test(shellune_storage::LockPolicy::UnlockVault, 15, cx);
+            v.security_hold_open_for_test(true);
+            v.security_unlock_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_locked_for_test()),
+        "verification unlocked the lock flag while background file open is still warming"
+    );
+    click(cx, "hosts.connection.connect.0");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("session.verifying").is_some(),
+        "desktop connection started during warming waits cleanly instead of failing with missing credential"
+    );
+    cx.update(|_window, app| view.update(app, |v, cx| v.security_release_open_for_test(cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).desktop_start_count_for_test()),
+        1,
+        "releasing warming completes the queued desktop session start"
+    );
+
+    // Close the first tab and open a fresh window to verify EverySensitiveOperation cancel/retry,
+    // concurrent `was_other_verifying`, and mid-verification `security_lock_now` abort with clean debug_bounds.
+    drop(view);
+    let every_op_auth = Arc::new(
+        shellune_storage::ScriptedAuthenticator::new(
+            shellune_storage::BiometricCapability::Biometrics,
+        )
+        .script([
+            Ok(()),
+            Err(shellune_storage::BiometricError::Cancelled),
+            Ok(()),
+            Err(shellune_storage::BiometricError::Cancelled),
+            Err(shellune_storage::BiometricError::Cancelled),
+        ]),
+    );
+    let mut ws2 = Workspace::new();
+    ws2.select(Destination::Hosts);
+    let store2 = dir.store();
+    let secrets2: Arc<dyn shellune_storage::SecretStore> = secrets.clone();
+    let (view2, cx) = cx.add_window_view(move |_window, cx| {
+        let mut v = ShelluneView::with_secrets_for_test(cx, ws2, store2, secrets2);
+        v.security_set_authenticator_for_test(every_op_auth);
+        v.security_enable_lock_for_test(
+            shellune_storage::LockPolicy::EverySensitiveOperation,
+            15,
+            cx,
+        );
+        v.security_unlock_for_test(cx);
+        v
+    });
+    cx.simulate_resize(size(px(1200.0), px(840.0)));
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view2.read(app).security_locked_for_test()),
+        "vault is unlocked under EverySensitiveOperation"
+    );
+
+    // 3. Finding 2A: Under EverySensitiveOperation (unlocked), cancelling verification shows the
+    //    cancellation reason directly in `terminal.failure.reason` WITHOUT opening `Show details`,
+    //    and clicking `terminal.failure.next` retries verification and starts the desktop session!
+    cx.update(|_window, app| view2.update(app, |v, _cx| v.security_hold_verify_for_test(true)));
+    click(cx, "hosts.connection.connect.0");
+    cx.run_until_parked();
+    cx.update(|_window, app| view2.update(app, |v, cx| v.security_release_verify_for_test(cx)));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("terminal.failure").is_some()
+            && cx.debug_bounds("terminal.failure.reason").is_some()
+            && cx.debug_bounds("terminal.failure.next").is_some()
+            && cx.debug_bounds("terminal.failure.diagnostic").is_none(),
+        "EverySensitiveOperation cancel renders reason directly in failure_notice body without Show details"
+    );
+    cx.update(|_window, app| view2.update(app, |v, _cx| v.security_hold_verify_for_test(false)));
+    click(cx, "terminal.failure.next");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view2.read(app).desktop_start_count_for_test()),
+        1,
+        "clicking Reconnect on EverySensitiveOperation failure re-verifies and starts the desktop session"
+    );
+
+    // 4. Finding 2B (concurrent verification): Starting a desktop connection while another verification
+    //    is already in flight marks the desktop session Failed (not stuck in Connecting).
+    cx.update(|_window, app| {
+        view2.update(app, |v, cx| {
+            v.security_hold_verify_for_test(true);
+            // Start an unrelated per-operation verification (e.g. reveal credential).
+            v.security_begin_always_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        view2.update(app, |v, cx| v.connect_saved_connection(rdp_host_id, cx));
+    });
+    cx.run_until_parked();
+    let busy_session = cx
+        .update(|_window, app| view2.read(app).active_session())
+        .expect("active busy session");
+    assert!(
+        matches!(
+            session_state(cx, &view2, busy_session),
+            Some(SessionState::Failed(
+                shellune_core::SessionFailure::ConnectionFailed { .. }
+            ))
+        ),
+        "desktop session started during another active verification fails immediately with busy reason instead of sticking in Connecting"
+    );
+    // Release the unrelated held verification.
+    cx.update(|_window, app| view2.update(app, |v, cx| v.security_release_verify_for_test(cx)));
+    cx.run_until_parked();
+
+    // 5. Finding 2B (lock_now mid-verification): Locking the vault while a desktop session awaits
+    //    verification aborts the pending session into Failed instead of stranding it in Connecting.
+    cx.update(|_window, app| view2.update(app, |v, _cx| v.security_hold_verify_for_test(true)));
+    click(cx, "terminal.failure.next");
+    cx.run_until_parked();
+    assert!(
+        matches!(
+            session_state(cx, &view2, busy_session),
+            Some(SessionState::Connecting)
+        ),
+        "reconnecting desktop session enters Connecting while verification is held"
+    );
+    cx.update(|_window, app| view2.update(app, |v, cx| v.security_lock_now_for_test(cx)));
+    cx.run_until_parked();
+    assert!(
+        matches!(
+            session_state(cx, &view2, busy_session),
+            Some(SessionState::Failed(
+                shellune_core::SessionFailure::ConnectionFailed { .. }
+            ))
+        ) && cx.debug_bounds("terminal.failure.unlock").is_some(),
+        "locking the vault mid-verification transitions the waiting desktop session to Failed with Unlock action"
+    );
 }
