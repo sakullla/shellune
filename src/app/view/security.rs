@@ -6323,6 +6323,9 @@ impl ShelluneView {
     /// a test can change the verifier first and watch what a machine like
     /// that would really do (R3, R4).
     pub fn security_relaunch_for_test(&mut self, cx: &mut Context<Self>) {
+        self.security.vault_epoch = self.security.vault_epoch.wrapping_add(1);
+        self.security.warming = false;
+        self.security.content = None;
         self.security.lock.locked = false;
         self.vault_warm(cx);
     }
