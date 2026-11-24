@@ -22,19 +22,20 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, BoxShadow, ClipboardItem, Context, DispatchPhase, ElementInputHandler,
-    EntityInputHandler, FocusHandle, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString,
-    Size, UTF16Selection, Window, canvas, div, point, px,
+    EntityInputHandler, FocusHandle, FontWeight, KeyDownEvent, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollDelta, ScrollWheelEvent,
+    SharedString, Size, UTF16Selection, Window, canvas, div, point, px,
 };
 use std::ops::Range;
 
 use shellune_core::{EventTag, LocalShell, SessionFailure, TerminalMode};
 use shellune_ssh::{ChainEvent, ChainSession, RemoteEvent, RemoteSession, X11Status};
 use shellune_terminal::core::{LineAnchor, SearchOptions};
+use shellune_terminal::highlight::is_openable_http_url;
 use shellune_terminal::shell::ShellEnvironmentNote;
 use shellune_terminal::{
-    BlockFilter, BlockStatus, CellSize, CommandBlock, CommandBlockId, CursorShape, ExitReport,
-    GridSize, HistoryMatch, Key, KeyModifiers, LocalSession, MouseAction,
+    BlockFilter, BlockStatus, CellSize, CommandBlock, CommandBlockId, CursorShape, DetectedLink,
+    ExitReport, GridSize, HistoryMatch, Key, KeyModifiers, LocalSession, MouseAction,
     MouseButton as TerminalMouseButton, MouseModifiers, PtyEvent, RenderedCell, Rgb, SelectionType,
     Side, Snapshot, TermMode, TerminalCore, TerminalEffects, encode_alternate_scroll, encode_key,
     encode_mouse, encode_paste, encode_text, grid_for, mouse_reporting, palette,
@@ -577,6 +578,10 @@ pub enum PaneRequest {
     PasteImage(gpui::Image),
     /// The server said which operating system it runs.
     Platform(String),
+    /// Open the snippets / shortcut commands manager for this terminal.
+    OpenSnippets,
+    /// Split this terminal's pane along `axis`.
+    Split(shellune_core::SplitAxis),
 }
 
 impl gpui::EventEmitter<PaneRequest> for TerminalPane {}
@@ -678,6 +683,8 @@ pub struct TerminalPane {
     more_menu: Option<gpui::Point<Pixels>>,
     /// Whether the bar carried the session's half at its last draw.
     bar_has_slot: std::cell::Cell<bool>,
+    /// Whether the window is in focus mode, hiding the regular bottom bar.
+    focus_mode: std::cell::Cell<bool>,
     core: TerminalCore,
     source: Option<PaneSource>,
     /// What the pane is running: a program here, or a host over SSH.
@@ -710,6 +717,14 @@ pub struct TerminalPane {
     last_report_cell: Option<(usize, usize)>,
     /// Where the right-click menu is open.
     menu: Option<gpui::Point<Pixels>>,
+    /// Openable `http(s)://` URL under the pointer when the right-click menu opened.
+    menu_link: Option<String>,
+    /// Openable `http(s)://` URL currently hovered while the primary modifier is held.
+    hovered_link: Option<DetectedLink>,
+    /// Last pointer position over the terminal viewport, for modifier-change updates.
+    last_hover_position: Option<gpui::Point<Pixels>>,
+    #[cfg(test)]
+    opened_urls: Vec<String>,
     marked: Option<String>,
     last_copy: Option<String>,
     /// The selection a capture asked for, put back whenever the grid changes size.
@@ -732,6 +747,12 @@ pub struct TerminalPane {
     search_query: String,
     /// Byte offset of the editing caret inside [`Self::search_query`].
     search_cursor: usize,
+    /// Active byte selection inside [`Self::search_query`] (e.g. `Ctrl/Cmd+A`).
+    search_selection: Option<Range<usize>>,
+    /// Measured screen bounds of the search query text container for click caret placement.
+    search_text_bounds: std::cell::Cell<Option<Bounds<Pixels>>>,
+    /// Whether new output arrived on the primary screen while parked in scrollback.
+    unseen_output: bool,
     /// Why the query could not be compiled, in the expression engine's words.
     ///
     /// An unusable expression is its own answer: it is never drawn as "no matches".
@@ -816,6 +837,10 @@ pub struct TerminalShortcuts {
     pub copy: Option<String>,
     /// The paste action, `Ctrl+V` or `⌘V` by default.
     pub paste: Option<String>,
+    /// Split pane right.
+    pub split_right: Option<String>,
+    /// Split pane down.
+    pub split_down: Option<String>,
 }
 
 impl TerminalShortcuts {
@@ -826,6 +851,8 @@ impl TerminalShortcuts {
             search: keymap.label("terminal.search"),
             copy: keymap.label("terminal.copy"),
             paste: keymap.label("terminal.paste"),
+            split_right: keymap.label("pane.split-right"),
+            split_down: keymap.label("pane.split-down"),
         }
     }
 
@@ -931,6 +958,11 @@ impl TerminalPane {
             mouse_held: None,
             last_report_cell: None,
             menu: None,
+            menu_link: None,
+            hovered_link: None,
+            last_hover_position: None,
+            #[cfg(test)]
+            opened_urls: Vec::new(),
             marked: None,
             last_copy: None,
             #[cfg(feature = "ui-capture")]
@@ -945,9 +977,13 @@ impl TerminalPane {
             bar_room: std::cell::Cell::new(BarRoom::default()),
             more_menu: None,
             bar_has_slot: std::cell::Cell::new(false),
+            focus_mode: std::cell::Cell::new(false),
             search_focused: false,
             search_query: String::new(),
             search_cursor: 0,
+            search_selection: None,
+            search_text_bounds: std::cell::Cell::new(None),
+            unseen_output: false,
             search_error: None,
             input_busy: false,
             output_repaint: OutputRepaint::default(),
@@ -1011,6 +1047,11 @@ impl TerminalPane {
             mouse_held: None,
             last_report_cell: None,
             menu: None,
+            menu_link: None,
+            hovered_link: None,
+            last_hover_position: None,
+            #[cfg(test)]
+            opened_urls: Vec::new(),
             marked: None,
             last_copy: None,
             #[cfg(feature = "ui-capture")]
@@ -1025,9 +1066,13 @@ impl TerminalPane {
             bar_room: std::cell::Cell::new(BarRoom::default()),
             more_menu: None,
             bar_has_slot: std::cell::Cell::new(false),
+            focus_mode: std::cell::Cell::new(false),
             search_focused: false,
             search_query: String::new(),
             search_cursor: 0,
+            search_selection: None,
+            search_text_bounds: std::cell::Cell::new(None),
+            unseen_output: false,
             search_error: None,
             input_busy: false,
             output_repaint: OutputRepaint::default(),
@@ -1090,6 +1135,11 @@ impl TerminalPane {
             mouse_held: None,
             last_report_cell: None,
             menu: None,
+            menu_link: None,
+            hovered_link: None,
+            last_hover_position: None,
+            #[cfg(test)]
+            opened_urls: Vec::new(),
             marked: None,
             last_copy: None,
             #[cfg(feature = "ui-capture")]
@@ -1104,9 +1154,13 @@ impl TerminalPane {
             bar_room: std::cell::Cell::new(BarRoom::default()),
             more_menu: None,
             bar_has_slot: std::cell::Cell::new(false),
+            focus_mode: std::cell::Cell::new(false),
             search_focused: false,
             search_query: String::new(),
             search_cursor: 0,
+            search_selection: None,
+            search_text_bounds: std::cell::Cell::new(None),
+            unseen_output: false,
             search_error: None,
             input_busy: false,
             output_repaint: OutputRepaint::default(),
@@ -1253,6 +1307,11 @@ impl TerminalPane {
             mouse_held: None,
             last_report_cell: None,
             menu: None,
+            menu_link: None,
+            hovered_link: None,
+            last_hover_position: None,
+            #[cfg(test)]
+            opened_urls: Vec::new(),
             marked: None,
             last_copy: None,
             #[cfg(feature = "ui-capture")]
@@ -1267,9 +1326,13 @@ impl TerminalPane {
             bar_room: std::cell::Cell::new(BarRoom::default()),
             more_menu: None,
             bar_has_slot: std::cell::Cell::new(false),
+            focus_mode: std::cell::Cell::new(false),
             search_focused: false,
             search_query: String::new(),
             search_cursor: 0,
+            search_selection: None,
+            search_text_bounds: std::cell::Cell::new(None),
+            unseen_output: false,
             search_error: None,
             input_busy: false,
             output_repaint: OutputRepaint::default(),
@@ -1453,6 +1516,11 @@ impl TerminalPane {
             mouse_held: None,
             last_report_cell: None,
             menu: None,
+            menu_link: None,
+            hovered_link: None,
+            last_hover_position: None,
+            #[cfg(test)]
+            opened_urls: Vec::new(),
             marked: None,
             last_copy: None,
             #[cfg(feature = "ui-capture")]
@@ -1467,9 +1535,13 @@ impl TerminalPane {
             bar_room: std::cell::Cell::new(BarRoom::default()),
             more_menu: None,
             bar_has_slot: std::cell::Cell::new(false),
+            focus_mode: std::cell::Cell::new(false),
             search_focused: false,
             search_query: String::new(),
             search_cursor: 0,
+            search_selection: None,
+            search_text_bounds: std::cell::Cell::new(None),
+            unseen_output: false,
             search_error: None,
             input_busy: false,
             output_repaint: OutputRepaint::default(),
@@ -1498,6 +1570,9 @@ impl TerminalPane {
     pub fn feed_for_test(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         let was_alternate = self.alternate_screen();
         let effects = self.core.feed(bytes);
+        if !bytes.is_empty() && !self.alternate_screen() && self.core.display_offset() > 0 {
+            self.unseen_output = true;
+        }
         self.apply_effects(effects, cx);
         self.recount_after_output(was_alternate);
         cx.notify();
@@ -1546,6 +1621,7 @@ impl TerminalPane {
     /// does, for a capture (R6). Nothing in it is run.
     #[cfg(feature = "ui-capture")]
     pub fn capture_open_menu(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        self.menu_link = self.hit_test_http_link(position).map(|link| link.url);
         self.menu = Some(position);
         cx.notify();
     }
@@ -1875,6 +1951,12 @@ impl TerminalPane {
                     output_bytes += bytes.len();
                     self.wake_cursor();
                     let effects = self.core.feed(&bytes);
+                    if !bytes.is_empty()
+                        && !self.alternate_screen()
+                        && self.core.display_offset() > 0
+                    {
+                        self.unseen_output = true;
+                    }
                     self.apply_effects(effects, cx);
                     self.output_search_pending = self.search_open;
                     live = self.state.accepts_input();
@@ -1960,6 +2042,9 @@ impl TerminalPane {
             SourceEvent::Data(bytes) => {
                 let was_alternate = self.alternate_screen();
                 let effects = self.core.feed(&bytes);
+                if !bytes.is_empty() && !self.alternate_screen() && self.core.display_offset() > 0 {
+                    self.unseen_output = true;
+                }
                 self.apply_effects(effects, cx);
                 self.recount_after_output(was_alternate);
                 self.state.accepts_input()
@@ -2134,6 +2219,25 @@ impl TerminalPane {
         self.core.scroll_to_bottom();
         self.scroll_fraction = 0.0;
         self.scroll_gesture_pinned = self.scroll_gesture_active;
+        self.unseen_output = false;
+        cx.notify();
+    }
+
+    /// Clears both the visible primary screen and its scrollback history.
+    pub fn clear_terminal_and_scrollback(&mut self, cx: &mut Context<Self>) {
+        if self.alternate_screen() {
+            return;
+        }
+        self.core.clear_screen_and_scrollback();
+        self.scroll_fraction = 0.0;
+        self.scroll_gesture_pinned = false;
+        self.unseen_output = false;
+        self.hovered_link = None;
+        self.menu_link = None;
+        if self.search_open {
+            self.search_scroll = None;
+            self.refresh_search(false);
+        }
         cx.notify();
     }
 
@@ -2152,6 +2256,7 @@ impl TerminalPane {
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if (self.menu.is_some() || self.more_menu.is_some()) && event.keystroke.key == "escape" {
             self.menu = None;
+            self.menu_link = None;
             self.more_menu = None;
             cx.notify();
             return;
@@ -2186,6 +2291,9 @@ impl TerminalPane {
         if self.search_captures_keyboard() {
             let bar_alt = modifiers.alt && !modifiers.control && !modifiers.platform;
             let ctrl_only = modifiers.control && !modifiers.alt && !modifiers.platform;
+            let secondary_only = ((modifiers.control && !modifiers.platform)
+                || (modifiers.platform && !modifiers.control))
+                && !modifiers.alt;
             match keystroke.key.as_str() {
                 "escape" if plain => {
                     self.close_search(window, cx);
@@ -2217,54 +2325,107 @@ impl TerminalPane {
                     return;
                 }
                 "left" if plain => {
-                    self.clamp_search_cursor();
-                    self.search_cursor = self.prev_search_boundary(self.search_cursor);
+                    if let Some(sel) = self.take_search_selection() {
+                        self.search_cursor = sel.start;
+                    } else {
+                        self.clamp_search_cursor();
+                        self.search_cursor = self.prev_search_boundary(self.search_cursor);
+                    }
                     cx.stop_propagation();
                     cx.notify();
                     return;
                 }
                 "left" if ctrl_only => {
-                    self.clamp_search_cursor();
-                    self.search_cursor = self.prev_search_word_boundary(self.search_cursor);
+                    let start = self.take_search_selection().map_or_else(
+                        || {
+                            self.clamp_search_cursor();
+                            self.search_cursor
+                        },
+                        |sel| sel.start,
+                    );
+                    self.search_cursor = self.prev_search_word_boundary(start);
                     cx.stop_propagation();
                     cx.notify();
                     return;
                 }
                 "right" if plain => {
-                    self.clamp_search_cursor();
-                    self.search_cursor = self.next_search_boundary(self.search_cursor);
+                    if let Some(sel) = self.take_search_selection() {
+                        self.search_cursor = sel.end;
+                    } else {
+                        self.clamp_search_cursor();
+                        self.search_cursor = self.next_search_boundary(self.search_cursor);
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "right" if ctrl_only => {
+                    let start = self.take_search_selection().map_or_else(
+                        || {
+                            self.clamp_search_cursor();
+                            self.search_cursor
+                        },
+                        |sel| sel.end,
+                    );
+                    self.search_cursor = self.next_search_word_boundary(start);
                     cx.stop_propagation();
                     cx.notify();
                     return;
                 }
                 "home" if plain => {
+                    self.search_selection = None;
                     self.search_cursor = 0;
                     cx.stop_propagation();
                     cx.notify();
                     return;
                 }
                 "end" if plain => {
+                    self.search_selection = None;
                     self.search_cursor = self.search_query.len();
                     cx.stop_propagation();
                     cx.notify();
                     return;
                 }
-                "a" if ctrl_only && !modifiers.shift => {
-                    self.search_cursor = 0;
+                "a" if secondary_only && !modifiers.shift => {
+                    if self.search_query.is_empty() {
+                        self.search_selection = None;
+                        self.search_cursor = 0;
+                    } else {
+                        let len = self.search_query.len();
+                        self.search_selection = Some(0..len);
+                        self.search_cursor = len;
+                    }
                     cx.stop_propagation();
                     cx.notify();
                     return;
                 }
+                "c" if secondary_only && !modifiers.shift => {
+                    if let Some(sel) = self.normalized_search_selection() {
+                        let text = self.search_query[sel].to_owned();
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                        self.last_copy = Some(text);
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 "e" if ctrl_only && !modifiers.shift => {
+                    self.search_selection = None;
                     self.search_cursor = self.search_query.len();
                     cx.stop_propagation();
                     cx.notify();
                     return;
                 }
                 "u" if ctrl_only && !modifiers.shift => {
-                    self.clamp_search_cursor();
-                    if self.search_cursor > 0 {
-                        self.search_query.drain(..self.search_cursor);
+                    let cut_to = self.take_search_selection().map_or_else(
+                        || {
+                            self.clamp_search_cursor();
+                            self.search_cursor
+                        },
+                        |sel| sel.end,
+                    );
+                    if cut_to > 0 {
+                        self.search_query.drain(..cut_to);
                         self.search_cursor = 0;
                         self.refresh_search(true);
                         cx.notify();
@@ -2273,9 +2434,16 @@ impl TerminalPane {
                     return;
                 }
                 "k" if ctrl_only && !modifiers.shift => {
-                    self.clamp_search_cursor();
-                    if self.search_cursor < self.search_query.len() {
-                        self.search_query.truncate(self.search_cursor);
+                    let cut_from = self.take_search_selection().map_or_else(
+                        || {
+                            self.clamp_search_cursor();
+                            self.search_cursor
+                        },
+                        |sel| sel.start,
+                    );
+                    if cut_from < self.search_query.len() {
+                        self.search_query.truncate(cut_from);
+                        self.search_cursor = cut_from;
                         self.refresh_search(true);
                         cx.notify();
                     }
@@ -2354,6 +2522,9 @@ impl TerminalPane {
                 }
                 "pagedown" => {
                     self.core.scroll(-page);
+                    if self.core.display_offset() == 0 {
+                        self.unseen_output = false;
+                    }
                     cx.stop_propagation();
                     cx.notify();
                     return;
@@ -2429,6 +2600,15 @@ impl TerminalPane {
     /// The keyboard copy: copies a selection and clears it, so a second press is the
     /// program's interrupt. Returns whether there was anything to copy.
     fn copy_selection_from_key(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.search_captures_keyboard() {
+            if let Some(sel) = self.normalized_search_selection() {
+                let text = self.search_query[sel].to_owned();
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                self.last_copy = Some(text);
+                cx.notify();
+            }
+            return true;
+        }
         if !self
             .core
             .selection_text()
@@ -2734,15 +2914,28 @@ impl TerminalPane {
         self.core.command_blocks().len()
     }
 
-    /// Opens or closes the find bar (R1).
+    /// Opens, re-focuses or closes the find bar (R1).
     ///
     /// A full-screen program owns the screen and its own keys, so an alternate-screen
     /// terminal never opens one: its contents are not this pane's history, and the
-    /// keys the bar would take have to reach the program.
+    /// keys the bar would take have to reach the program. When the bar is already open
+    /// on screen while the terminal holds the keyboard, the shortcut returns focus to
+    /// the query without discarding it; pressing it while the query already holds focus
+    /// closes the bar.
     fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.alternate_screen() {
+            return;
+        }
         if self.search_open {
-            self.close_search(window, cx);
-        } else if !self.alternate_screen() {
+            if self.search_focused {
+                self.close_search(window, cx);
+            } else {
+                self.search_focused = true;
+                self.clamp_search_cursor();
+                window.focus(&self.focus);
+                cx.notify();
+            }
+        } else {
             self.open_search(window, cx);
         }
     }
@@ -2751,12 +2944,29 @@ impl TerminalPane {
         self.search_focused && self.search_open && !self.alternate_screen()
     }
 
-    fn clamp_search_cursor(&mut self) {
-        let mut cursor = self.search_cursor.min(self.search_query.len());
-        while cursor > 0 && !self.search_query.is_char_boundary(cursor) {
-            cursor -= 1;
+    fn clamp_char_boundary(&self, index: usize) -> usize {
+        let mut clamped = index.min(self.search_query.len());
+        while clamped > 0 && !self.search_query.is_char_boundary(clamped) {
+            clamped -= 1;
         }
-        self.search_cursor = cursor;
+        clamped
+    }
+
+    fn clamp_search_cursor(&mut self) {
+        self.search_cursor = self.clamp_char_boundary(self.search_cursor);
+    }
+
+    fn normalized_search_selection(&self) -> Option<Range<usize>> {
+        let sel = self.search_selection.as_ref()?;
+        let start = self.clamp_char_boundary(sel.start.min(sel.end));
+        let end = self.clamp_char_boundary(sel.start.max(sel.end));
+        (start < end).then_some(start..end)
+    }
+
+    fn take_search_selection(&mut self) -> Option<Range<usize>> {
+        let normalized = self.normalized_search_selection();
+        self.search_selection = None;
+        normalized
     }
 
     fn prev_search_boundary(&self, cursor: usize) -> usize {
@@ -2794,7 +3004,36 @@ impl TerminalPane {
         pos
     }
 
+    fn next_search_word_boundary(&self, cursor: usize) -> usize {
+        let len = self.search_query.len();
+        let mut pos = cursor.min(len);
+        while pos < len {
+            let next = self.next_search_boundary(pos);
+            let ch = self.search_query[pos..next].chars().next().unwrap_or(' ');
+            if !ch.is_whitespace() {
+                break;
+            }
+            pos = next;
+        }
+        while pos < len {
+            let next = self.next_search_boundary(pos);
+            let ch = self.search_query[pos..next].chars().next().unwrap_or(' ');
+            if ch.is_whitespace() {
+                break;
+            }
+            pos = next;
+        }
+        pos
+    }
+
     fn delete_search_backward(&mut self, cx: &mut Context<Self>) {
+        if let Some(sel) = self.take_search_selection() {
+            self.search_query.drain(sel.clone());
+            self.search_cursor = sel.start;
+            self.refresh_search(true);
+            cx.notify();
+            return;
+        }
         self.clamp_search_cursor();
         if self.search_cursor == 0 {
             return;
@@ -2807,6 +3046,13 @@ impl TerminalPane {
     }
 
     fn delete_search_word_backward(&mut self, cx: &mut Context<Self>) {
+        if let Some(sel) = self.take_search_selection() {
+            self.search_query.drain(sel.clone());
+            self.search_cursor = sel.start;
+            self.refresh_search(true);
+            cx.notify();
+            return;
+        }
         self.clamp_search_cursor();
         if self.search_cursor == 0 {
             return;
@@ -2819,6 +3065,13 @@ impl TerminalPane {
     }
 
     fn delete_search_forward(&mut self, cx: &mut Context<Self>) {
+        if let Some(sel) = self.take_search_selection() {
+            self.search_query.drain(sel.clone());
+            self.search_cursor = sel.start;
+            self.refresh_search(true);
+            cx.notify();
+            return;
+        }
         self.clamp_search_cursor();
         if self.search_cursor >= self.search_query.len() {
             return;
@@ -2829,9 +3082,21 @@ impl TerminalPane {
         cx.notify();
     }
 
+    fn clear_search_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_query.clear();
+        self.search_cursor = 0;
+        self.search_selection = None;
+        self.marked = None;
+        self.search_focused = true;
+        self.refresh_search(false);
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
     fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_open = true;
         self.search_focused = true;
+        self.search_selection = None;
         self.search_cursor = self.search_query.len();
         // The top row, taken before anything scrolls, so closing puts the reader
         // back on the line they were reading rather than at the bottom of a live
@@ -2849,6 +3114,7 @@ impl TerminalPane {
         self.search_focused = false;
         self.search_query.clear();
         self.search_cursor = 0;
+        self.search_selection = None;
         self.marked = None;
         self.search_hits.clear();
         self.search_at = 0;
@@ -2857,6 +3123,9 @@ impl TerminalPane {
         match self.search_scroll.take() {
             Some(anchor) => self.scroll_to_offset(self.core.offset_of(anchor)),
             None => self.core.scroll_to_bottom(),
+        }
+        if self.core.display_offset() == 0 {
+            self.unseen_output = false;
         }
         // The terminal is where the keyboard was, and where it goes back to.
         window.focus(&self.focus);
@@ -2966,11 +3235,70 @@ impl TerminalPane {
         if text.is_empty() {
             return;
         }
-        self.clamp_search_cursor();
+        if let Some(sel) = self.take_search_selection() {
+            self.search_query.drain(sel.clone());
+            self.search_cursor = sel.start;
+        } else {
+            self.clamp_search_cursor();
+        }
         self.search_query.insert_str(self.search_cursor, text);
         self.search_cursor += text.len();
         self.refresh_search(true);
         cx.notify();
+    }
+
+    /// Updates whether the enclosing window is in distraction-free focus mode.
+    pub fn set_focus_mode(&self, on: bool) {
+        self.focus_mode.set(on);
+        if on {
+            *self.session_slot.borrow_mut() = None;
+            self.bar_has_slot.set(false);
+        }
+    }
+
+    /// Toggles focus mode directly on this pane for isolated unit tests.
+    #[cfg(test)]
+    pub fn set_focus_mode_for_test(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.set_focus_mode(on);
+        if on {
+            self.more_menu = None;
+        }
+        cx.notify();
+    }
+
+    /// Whether new primary-screen output arrived while parked in scrollback.
+    #[cfg(test)]
+    #[must_use]
+    pub fn unseen_output_for_test(&self) -> bool {
+        self.unseen_output
+    }
+
+    /// External URLs opened by this pane during a test.
+    #[cfg(test)]
+    #[must_use]
+    pub fn opened_urls_for_test(&self) -> &[String] {
+        &self.opened_urls
+    }
+
+    /// Currently underlined `Ctrl/⌘`-hovered link URL, if any.
+    #[cfg(test)]
+    #[must_use]
+    pub fn hovered_link_for_test(&self) -> Option<&str> {
+        self.hovered_link.as_ref().map(|link| link.url.as_str())
+    }
+
+    /// Byte offset of the caret inside the search query, for tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn search_cursor_for_test(&self) -> usize {
+        self.search_cursor
+    }
+
+    /// Selected byte range inside the search query, for tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn search_selection_for_test(&self) -> Option<Range<usize>> {
+        self.normalized_search_selection()
     }
 
     /// Counts the matches again after the grid changed.
@@ -3219,6 +3547,78 @@ impl TerminalPane {
         true
     }
 
+    /// Strict cell hit-test inside the measured viewport without clamping outside bounds.
+    fn strict_cell_at(&self, position: gpui::Point<Pixels>) -> Option<(usize, usize)> {
+        let bounds = self.viewport?;
+        if !bounds.contains(&position) {
+            return None;
+        }
+        let cell = self.cell.sanitized();
+        let cols = self.grid.cols.max(1);
+        let rows = self.grid.rows.max(1);
+        let x = f32::from(position.x - bounds.origin.x);
+        let y = f32::from(position.y - bounds.origin.y);
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let row = (y / cell.height) as usize;
+        let column = (x / cell.width) as usize;
+        if row >= rows || column >= cols {
+            return None;
+        }
+        Some((row, column))
+    }
+
+    fn hit_test_http_link(&self, position: gpui::Point<Pixels>) -> Option<DetectedLink> {
+        if self.alternate_screen() {
+            return None;
+        }
+        let (row, column) = self.strict_cell_at(position)?;
+        self.core
+            .http_link_at(row, column)
+            .filter(|link| is_openable_http_url(&link.url))
+    }
+
+    fn link_modifier_active(modifiers: &gpui::Modifiers) -> bool {
+        modifiers.number_of_modifiers() == 1 && modifiers.secondary()
+    }
+
+    fn open_http_link(&mut self, url: &str, cx: &mut Context<Self>) -> bool {
+        if !is_openable_http_url(url) {
+            return false;
+        }
+        #[cfg(test)]
+        self.opened_urls.push(url.to_owned());
+        cx.open_url(url);
+        cx.notify();
+        true
+    }
+
+    fn update_hovered_link(
+        &mut self,
+        position: Option<gpui::Point<Pixels>>,
+        modifiers: &gpui::Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        self.last_hover_position = position;
+        let next = if !self.alternate_screen()
+            && self.drag.is_none()
+            && Self::link_modifier_active(modifiers)
+        {
+            position.and_then(|pos| self.hit_test_http_link(pos))
+        } else {
+            None
+        };
+        if self.hovered_link != next {
+            self.hovered_link = next;
+            cx.notify();
+        }
+    }
+
+    fn on_modifiers_changed(&mut self, event: &ModifiersChangedEvent, cx: &mut Context<Self>) {
+        self.update_hovered_link(self.last_hover_position, &event.modifiers, cx);
+    }
+
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -3227,7 +3627,17 @@ impl TerminalPane {
     ) {
         window.focus(&self.focus);
         self.search_focused = false;
+        self.search_selection = None;
         self.menu = None;
+        self.menu_link = None;
+        if event.click_count == 1
+            && !self.alternate_screen()
+            && Self::link_modifier_active(&event.modifiers)
+            && let Some(link) = self.hit_test_http_link(event.position)
+        {
+            self.open_http_link(&link.url, cx);
+            return;
+        }
         if self.report_mouse(
             TerminalMouseButton::Left,
             MouseAction::Press,
@@ -3324,6 +3734,7 @@ impl TerminalPane {
             self.mouse_held = Some(TerminalMouseButton::Right);
             return;
         }
+        self.menu_link = self.hit_test_http_link(event.position).map(|link| link.url);
         self.menu = Some(event.position);
         cx.notify();
     }
@@ -3352,6 +3763,7 @@ impl TerminalPane {
     /// about. A selection drag follows the pointer through
     /// [`TerminalPane::drag_moved`] instead, wherever in the window it is.
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        self.update_hovered_link(Some(event.position), &event.modifiers, cx);
         if self.drag.is_some() {
             return;
         }
@@ -3419,6 +3831,9 @@ impl TerminalPane {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let target = ((1.0 - ratio) * history as f32).round() as usize;
         self.scroll_to_offset(target.min(history));
+        if self.core.display_offset() == 0 {
+            self.unseen_output = false;
+        }
         cx.notify();
     }
 
@@ -3541,6 +3956,9 @@ impl TerminalPane {
             return false;
         }
         self.core.scroll(lines);
+        if self.core.display_offset() == 0 {
+            self.unseen_output = false;
+        }
         self.drag_to(pointer, cx);
         cx.notify();
         true
@@ -3603,9 +4021,12 @@ impl TerminalPane {
         }
         let before = self.core.display_offset();
         self.core.scroll(lines);
-        if self.core.display_offset() == 0 && lines < 0 {
-            self.scroll_gesture_pinned = self.scroll_gesture_active;
-            self.scroll_fraction = 0.0;
+        if self.core.display_offset() == 0 {
+            self.unseen_output = false;
+            if lines < 0 {
+                self.scroll_gesture_pinned = self.scroll_gesture_active;
+                self.scroll_fraction = 0.0;
+            }
         }
         // A scroll the history could not take leaves nothing behind: the next event
         // starts from where the view really is instead of from where a gesture that
@@ -3616,7 +4037,8 @@ impl TerminalPane {
         cx.notify();
     }
 
-    /// The right-click menu: copy, paste and find.
+    /// The right-click menu: link actions, copy/paste, search, scrollback clear,
+    /// snippets and pane splits.
     fn context_menu(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let position = self.menu?;
         let metrics = theme::metrics();
@@ -3624,6 +4046,8 @@ impl TerminalPane {
         let viewport = window.viewport_size();
         let can_copy = self.core.has_selection();
         let can_search = !self.alternate_screen();
+        let can_clear = !self.alternate_screen();
+        let can_snippets = self.state.accepts_input();
         let can_paste = if self.search_captures_keyboard() {
             cx.read_from_clipboard()
                 .and_then(|item| item.text())
@@ -3670,6 +4094,41 @@ impl TerminalPane {
                     .max(metrics.scale(components::MENU_MIN_WIDTH)),
             )
             .overflow_y_scroll()
+            .when_some(self.menu_link.clone(), |menu, url| {
+                let open_url = url.clone();
+                let copy_url = url;
+                menu.child(
+                    item(
+                        ux.terminal_open_link,
+                        Icon::Globe,
+                        &None,
+                        true,
+                        "terminal.menu.open_link",
+                    )
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.menu = None;
+                        this.menu_link = None;
+                        this.open_http_link(&open_url, cx);
+                    })),
+                )
+                .child(
+                    item(
+                        ux.terminal_copy_link,
+                        Icon::Copy,
+                        &None,
+                        true,
+                        "terminal.menu.copy_link",
+                    )
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
+                        this.last_copy = Some(copy_url.clone());
+                        this.menu = None;
+                        this.menu_link = None;
+                        cx.notify();
+                    })),
+                )
+                .child(components::menu_divider(metrics))
+            })
             .child(
                 item(
                     strings.field_copy,
@@ -3682,6 +4141,7 @@ impl TerminalPane {
                     item.on_click(cx.listener(|this, _event, _window, cx| {
                         this.copy_selection(cx);
                         this.menu = None;
+                        this.menu_link = None;
                         cx.notify();
                     }))
                 }),
@@ -3697,6 +4157,7 @@ impl TerminalPane {
                 .when(can_paste, |item| {
                     item.on_click(cx.listener(|this, _event, window, cx| {
                         this.menu = None;
+                        this.menu_link = None;
                         this.paste(window, cx);
                         cx.notify();
                     }))
@@ -3713,6 +4174,7 @@ impl TerminalPane {
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.core.select_all();
                     this.menu = None;
+                    this.menu_link = None;
                     cx.notify();
                 })),
             )
@@ -3728,6 +4190,7 @@ impl TerminalPane {
                 .when(can_search, |item| {
                     item.on_click(cx.listener(|this, _event, window, cx| {
                         this.menu = None;
+                        this.menu_link = None;
                         this.toggle_search(window, cx);
                     }))
                 }),
@@ -3743,10 +4206,75 @@ impl TerminalPane {
                     )
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.menu = None;
+                        this.menu_link = None;
                         this.reveal_input(cx);
                     })),
                 )
-            });
+            })
+            .child(
+                item(
+                    ux.terminal_clear_scrollback,
+                    Icon::Trash,
+                    &None,
+                    can_clear,
+                    "terminal.menu.clear",
+                )
+                .when(can_clear, |item| {
+                    item.on_click(cx.listener(|this, _event, _window, cx| {
+                        this.menu = None;
+                        this.menu_link = None;
+                        this.clear_terminal_and_scrollback(cx);
+                    }))
+                }),
+            )
+            .child(components::menu_divider(metrics))
+            .child(
+                item(
+                    ux.terminal_snippets_menu,
+                    Icon::Play,
+                    &None,
+                    can_snippets,
+                    "terminal.menu.snippets",
+                )
+                .when(can_snippets, |item| {
+                    item.on_click(cx.listener(|this, _event, _window, cx| {
+                        this.menu = None;
+                        this.menu_link = None;
+                        cx.emit(PaneRequest::OpenSnippets);
+                        cx.notify();
+                    }))
+                }),
+            )
+            .child(
+                item(
+                    strings.pane_split_right,
+                    Icon::SplitRight,
+                    &self.shortcuts.split_right,
+                    true,
+                    "terminal.menu.split_right",
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.menu = None;
+                    this.menu_link = None;
+                    cx.emit(PaneRequest::Split(shellune_core::SplitAxis::LeftRight));
+                    cx.notify();
+                })),
+            )
+            .child(
+                item(
+                    strings.pane_split_down,
+                    Icon::SplitDown,
+                    &self.shortcuts.split_down,
+                    true,
+                    "terminal.menu.split_down",
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.menu = None;
+                    this.menu_link = None;
+                    cx.emit(PaneRequest::Split(shellune_core::SplitAxis::TopBottom));
+                    cx.notify();
+                })),
+            );
         Some(
             gpui::deferred(
                 gpui::anchored().position(gpui::Point::default()).child(
@@ -3762,6 +4290,7 @@ impl TerminalPane {
                                 .occlude()
                                 .on_any_mouse_down(cx.listener(|this, _event, _window, cx| {
                                     this.menu = None;
+                                    this.menu_link = None;
                                     cx.notify();
                                 })),
                         )
@@ -4847,11 +5376,15 @@ impl TerminalPane {
                     }
                 }
             };
+            let hovered_link_cell = self
+                .hovered_link
+                .as_ref()
+                .is_some_and(|link| link.row == index && link.columns.contains(&column));
             let style = TextStyle {
                 ink,
                 bold: rendered.attributes.bold,
                 italic: rendered.attributes.italic,
-                underline: rendered.attributes.underline,
+                underline: rendered.attributes.underline || hovered_link_cell,
                 strike: rendered.attributes.strikethrough,
             };
             let mut characters = rendered.text.chars();
@@ -5093,6 +5626,15 @@ impl TerminalPane {
             .unwrap_or_default()
     }
 
+    fn search_dodges_bottom(&self) -> bool {
+        self.search_open
+            && !self.core.shows_command_blocks()
+            && self.search_hits.get(self.search_at).is_some_and(|hit| {
+                let vrow = hit.line + i32::try_from(self.core.display_offset()).unwrap_or(0);
+                vrow >= i32::try_from(self.grid.rows.saturating_sub(3)).unwrap_or(0)
+            })
+    }
+
     /// The panel under the grid: the find bar and the command blocks (R1).
     ///
     /// The bar and the block list read one query, so a search means the same thing
@@ -5106,16 +5648,18 @@ impl TerminalPane {
     ) -> gpui::Stateful<gpui::Div> {
         let strings = self.locale.strings();
         let blocks = self.listed_blocks();
-        let dodge_bottom = self.search_open
-            && !self.core.shows_command_blocks()
-            && self.search_hits.get(self.search_at).is_some_and(|hit| {
-                let vrow = hit.line + i32::try_from(self.core.display_offset()).unwrap_or(0);
-                vrow >= i32::try_from(self.grid.rows.saturating_sub(3)).unwrap_or(0)
-            });
+        let dodge_bottom = self.search_dodges_bottom();
+        let bottom_inset = if self.focus_mode.get() {
+            metrics.hit_target() + metrics.scale(spacing::BASE)
+        } else {
+            bar_height
+        };
         let mut panel = div()
             .absolute()
             .when(dodge_bottom, |panel| panel.top(px(0.0)).border_b_1())
-            .when(!dodge_bottom, |panel| panel.bottom(bar_height).border_t_1())
+            .when(!dodge_bottom, |panel| {
+                panel.bottom(bottom_inset).border_t_1()
+            })
             .left(px(0.0))
             .right(px(0.0))
             // The bar grows with the text; the panel stops at a height that still
@@ -5161,6 +5705,7 @@ impl TerminalPane {
     /// line instead of running past the pane (R4).
     fn search_bar(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
         let strings = self.locale.strings();
+        let ux = crate::app::copy::ux_for(self.locale);
         let focused = self.search_focused;
         let inline_marked = if self.search_captures_keyboard() {
             self.marked.as_deref().filter(|text| !text.is_empty())
@@ -5168,10 +5713,12 @@ impl TerminalPane {
             None
         };
         let empty_query = self.search_query.is_empty() && inline_marked.is_none();
-        let mut cursor = self.search_cursor.min(self.search_query.len());
-        while cursor > 0 && !self.search_query.is_char_boundary(cursor) {
-            cursor -= 1;
-        }
+        let cursor = self.clamp_char_boundary(self.search_cursor);
+        let selection = if inline_marked.is_none() {
+            self.normalized_search_selection()
+        } else {
+            None
+        };
         let before = &self.search_query[..cursor];
         let after = &self.search_query[cursor..];
         // The count, the empty result and the invalid-expression reason are whole
@@ -5235,6 +5782,49 @@ impl TerminalPane {
                 .text_size(metrics.caption_size())
                 .text_color(theme::swatch(shell_palette::TEXT_MUTED))
                 .child(SharedString::from(strings.terminal_search.to_owned()))
+        } else if let Some(sel) = selection {
+            let sel_before = &self.search_query[..sel.start];
+            let sel_text = &self.search_query[sel.clone()];
+            let sel_after = &self.search_query[sel.end..];
+            div()
+                .flex()
+                .items_center()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .debug_selector(|| "terminal.search.query".to_owned())
+                .font_family(monospace_family())
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
+                .when(!sel_before.is_empty(), |row| {
+                    row.child(SharedString::from(sel_before.to_owned()))
+                })
+                .child(
+                    div()
+                        .flex_none()
+                        .rounded(metrics.scale(spacing::HALF))
+                        .bg(theme::swatch_over(
+                            shell_palette::ACCENT_TINT,
+                            shell_palette::SURFACE,
+                        ))
+                        .text_color(theme::swatch(shell_palette::ACCENT_ON_TINT))
+                        .debug_selector(|| "terminal.search.selection".to_owned())
+                        .child(SharedString::from(sel_text.to_owned())),
+                )
+                .when(focused, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .w(px(CARET_WIDTH))
+                            .h(metrics.caption_size())
+                            .bg(accent)
+                            .debug_selector(|| "terminal.search.caret".to_owned()),
+                    )
+                })
+                .when(!sel_after.is_empty(), |row| {
+                    row.child(SharedString::from(sel_after.to_owned()))
+                })
         } else {
             div()
                 .flex()
@@ -5280,6 +5870,15 @@ impl TerminalPane {
                     row.child(SharedString::from(after.to_owned()))
                 })
         };
+        let weak_field = cx.entity().downgrade();
+        let measure_search_text =
+            move |bounds: Vec<Bounds<Pixels>>, _window: &mut Window, app: &mut App| {
+                let first = bounds.first().copied();
+                let _ = weak_field.update(app, |pane, _cx| {
+                    pane.search_text_bounds.set(first);
+                });
+            };
+        let has_query_to_clear = !self.search_query.is_empty();
         let mut bar = div()
             .flex()
             .flex_wrap()
@@ -5295,15 +5894,43 @@ impl TerminalPane {
             // keys go in words as well (R4).
             .child(
                 div()
+                    .on_children_prepainted(measure_search_text)
                     .id("terminal.search.field")
                     .flex()
                     .items_center()
                     .cursor_text()
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _event: &MouseDownEvent, window, cx| {
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
-                            if !this.search_focused {
+                            if this.search_query.is_empty() {
+                                this.search_selection = None;
+                                this.search_cursor = 0;
+                            } else if event.click_count >= 2 {
+                                let len = this.search_query.len();
+                                this.search_selection = Some(0..len);
+                                this.search_cursor = len;
+                            } else if let Some(bounds) = this.search_text_bounds.get() {
+                                let run = gpui::TextRun {
+                                    len: this.search_query.len(),
+                                    font: gpui::font(monospace_family()),
+                                    color: gpui::Hsla::default(),
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                };
+                                let line = window.text_system().shape_line(
+                                    SharedString::from(this.search_query.clone()),
+                                    metrics.caption_size(),
+                                    &[run],
+                                    None,
+                                );
+                                let rel_x = (event.position.x - bounds.left()).max(px(0.0));
+                                let idx = line.closest_index_for_x(rel_x);
+                                this.search_selection = None;
+                                this.search_cursor = this.clamp_char_boundary(idx);
+                            } else {
+                                this.search_selection = None;
                                 this.search_cursor = this.search_query.len();
                             }
                             this.search_focused = true;
@@ -5338,7 +5965,12 @@ impl TerminalPane {
                             spread_radius: px(SEARCH_FOCUS_HALO),
                         }])
                     })
-                    .px(metrics.scale(spacing::HAIRLINE))
+                    .pl(metrics.scale(spacing::HAIRLINE))
+                    .pr(if has_query_to_clear {
+                        px(0.0)
+                    } else {
+                        metrics.scale(spacing::HAIRLINE)
+                    })
                     .debug_selector(move || {
                         if focused {
                             "terminal.search.keyboard.bar".to_owned()
@@ -5346,7 +5978,23 @@ impl TerminalPane {
                             "terminal.search.keyboard.terminal".to_owned()
                         }
                     })
-                    .child(query_content),
+                    .child(query_content)
+                    .when(has_query_to_clear, |field| {
+                        field.child(
+                            components::icon_only_button(Icon::Close, metrics)
+                                .size(metrics.hit_target())
+                                .id("terminal.search.clear")
+                                .debug_selector(|| "terminal.search.clear".to_owned())
+                                .tooltip(components::tooltip(ux.field_clear))
+                                .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    cx.stop_propagation();
+                                    this.clear_search_query(window, cx);
+                                })),
+                        )
+                    }),
             );
         // The one thing the reader needs next to the field: which key ends the search, or
         // - once the terminal has the keyboard again - where their keys go. The rest of the
@@ -5686,20 +6334,28 @@ impl TerminalPane {
         if offset == 0 {
             return None;
         }
-        let label = crate::app::copy::fill(
-            crate::app::copy::ux_for(self.locale).terminal_jump_bottom,
-            &[("lines", &offset.to_string())],
-        );
+        let ux = crate::app::copy::ux_for(self.locale);
+        let template = if self.unseen_output {
+            ux.terminal_jump_bottom_new
+        } else {
+            ux.terminal_jump_bottom
+        };
+        let label = crate::app::copy::fill(template, &[("lines", &offset.to_string())]);
         let hover = theme::swatch(shell_palette::SURFACE_HOVER);
+        let accent = theme::swatch(shell_palette::ACCENT);
+        let pill_at_top = show_blocks && !self.search_dodges_bottom();
+        let bottom_offset = if self.focus_mode.get() {
+            metrics.hit_target() + metrics.scale(spacing::BASE)
+        } else {
+            metrics.scale(spacing::SNUG)
+        };
         let pill = div()
             .id("terminal.scroll_bottom")
             .debug_selector(|| "terminal.scroll_bottom".to_owned())
             .absolute()
             .right(metrics.scale(spacing::SNUG))
-            .when(show_blocks, |pill| pill.top(metrics.scale(spacing::SNUG)))
-            .when(!show_blocks, |pill| {
-                pill.bottom(metrics.scale(spacing::SNUG))
-            })
+            .when(pill_at_top, |pill| pill.top(metrics.scale(spacing::SNUG)))
+            .when(!pill_at_top, |pill| pill.bottom(bottom_offset))
             .flex()
             .items_center()
             .gap(metrics.scale(spacing::HAIRLINE + 2.0))
@@ -5709,7 +6365,11 @@ impl TerminalPane {
             .rounded(px(theme::radius::LARGE))
             .bg(theme::swatch(shell_palette::RAISED))
             .border_1()
-            .border_color(theme::swatch(shell_palette::BORDER_STRONG))
+            .border_color(if self.unseen_output {
+                accent
+            } else {
+                theme::swatch(shell_palette::BORDER_STRONG)
+            })
             .shadow(theme::Elevation::Overlay.shadows())
             .text_size(metrics.caption_size())
             .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
@@ -5721,16 +6381,25 @@ impl TerminalPane {
             .on_click(cx.listener(|this, _event, _window, cx| {
                 this.reveal_input(cx);
             }))
+            .when(self.unseen_output, |pill| {
+                pill.child(
+                    div()
+                        .size(metrics.scale(spacing::NARROW))
+                        .rounded_full()
+                        .bg(accent)
+                        .debug_selector(|| "terminal.scroll_bottom.new_output".to_owned()),
+                )
+            })
             .child(crate::app::icons::icon(
                 Icon::ChevronDown,
                 metrics.small_icon_size(),
-                theme::swatch(shell_palette::ACCENT),
+                accent,
             ))
             .child(SharedString::from(label));
         Some(pill)
     }
 
-    fn viewport(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+    fn viewport(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let snapshot = self.core.snapshot();
         let focused = self.focus.is_focused(window);
         let weak = cx.entity().downgrade();
@@ -5778,18 +6447,34 @@ impl TerminalPane {
             );
         }
 
+        let link_hovered = self.hovered_link.is_some();
         div()
+            .on_children_prepainted(listener)
+            .id("terminal.viewport.surface")
             .flex_1()
             .relative()
             .min_h_0()
             .overflow_hidden()
             .bg(color_of(palette::BACKGROUND))
-            .cursor_text()
+            .when(link_hovered, |el| el.cursor_pointer())
+            .when(!link_hovered, |el| el.cursor_text())
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                if !*hovered {
+                    this.last_hover_position = None;
+                    if this.hovered_link.take().is_some() {
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_modifiers_changed(cx.listener(
+                |this, event: &ModifiersChangedEvent, _window, cx| {
+                    this.on_modifiers_changed(event, cx);
+                },
+            ))
             // The grid declares its own key context so the application's shortcuts
             // can step aside: inside a terminal Escape belongs to the program.
             .key_context(crate::app::TERMINAL_KEY_CONTEXT)
             .track_focus(&self.focus)
-            .on_children_prepainted(listener)
             .child(rows)
             .child(div().absolute().inset_0().child(canvas(
                 move |bounds, _window, _cx| bounds,
@@ -6409,6 +7094,11 @@ impl Render for TerminalPane {
         let focused = self.focus.is_focused(window);
         self.drive_cursor_blink(focused, cx);
 
+        let focus_mode = self.focus_mode.get();
+        if focus_mode {
+            *self.session_slot.borrow_mut() = None;
+            self.bar_has_slot.set(false);
+        }
         let show_blocks =
             !self.alternate_screen() && (self.search_open || self.core.shows_command_blocks());
         // The pane's own chrome - the status line, the find bar, the menu - is drawn in
@@ -6419,6 +7109,12 @@ impl Render for TerminalPane {
         let window_appearance = theme::appearance();
         theme::set_appearance(theme::terminal_appearance());
         let banner = self.status_banner();
+        let show_serial_strip = !focus_mode
+            || !self.state.accepts_input()
+            || self
+                .serial
+                .as_ref()
+                .is_some_and(|serial| serial.note().is_some());
         let pane = div()
             .flex()
             .flex_col()
@@ -6437,27 +7133,40 @@ impl Render for TerminalPane {
                     .flex_col()
                     .flex_1()
                     .min_h_0()
+                    .debug_selector(move || {
+                        if focus_mode {
+                            "terminal.chrome.focus".to_owned()
+                        } else {
+                            "terminal.chrome.regular".to_owned()
+                        }
+                    })
                     .pl(metrics.scale(spacing::SNUG))
                     .pr(metrics.scale(spacing::HAIRLINE))
                     .py(metrics.scale(spacing::TIGHT))
                     .bg(color_of(palette::BACKGROUND))
                     .child(self.viewport(window, cx))
                     .children(self.scrollback_thumb(cx))
-                    .children(self.scroll_bottom_pill(tools, show_blocks, cx)),
+                    .children(self.scroll_bottom_pill(metrics, show_blocks, cx)),
             )
             // A serial line states itself above the bar: its device, its settings and
             // the two send habits are what a person changes while the session runs, and
             // a port that would not open says why here instead of drawing a terminal
             // that is not connected (R21).
-            .when_some(self.serial_strip(tools, cx), |pane, strip| {
-                pane.child(strip)
+            .when(show_serial_strip, |pane| {
+                pane.when_some(self.serial_strip(tools, cx), |pane, strip| {
+                    pane.child(strip.when(focus_mode, |strip| {
+                        strip.pr(metrics.hit_target() + metrics.scale(spacing::LOOSE))
+                    }))
+                })
             })
-            .child(self.bar(metrics, cx))
+            .when(!focus_mode, |pane| pane.child(self.bar(metrics, cx)))
             .when(show_blocks, |column| {
                 column.child(self.block_overlay(metrics, bar_height, cx))
             })
             .children(self.context_menu(window, cx))
-            .children(self.more_menu(window, cx));
+            .when(!focus_mode, |pane| {
+                pane.children(self.more_menu(window, cx))
+            });
         theme::set_appearance(window_appearance);
         pane
     }
@@ -7004,9 +7713,31 @@ mod search_isolation_tests {
             "bX foo "
         );
 
-        cx.simulate_keystrokes("ctrl-a right ctrl-k");
+        // Home, Ctrl+Right word jump, Ctrl+K, and Ctrl+A select-all replacement.
+        cx.simulate_keystrokes("home ctrl-right");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).search_cursor_for_test()),
+            2
+        );
+        cx.simulate_keystrokes("home right ctrl-k");
         cx.run_until_parked();
         assert_eq!(cx.update(|_, app| pane.read(app).search_state().query), "b");
+
+        cx.simulate_input(" zzq zzw");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-a");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).search_selection_for_test()),
+            Some(0.."b zzq zzw".len())
+        );
+        cx.simulate_input("zzx");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, app| pane.read(app).search_state().query),
+            "zzx"
+        );
 
         cx.simulate_keystrokes("ctrl-e ctrl-u");
         cx.run_until_parked();

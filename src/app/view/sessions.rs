@@ -368,6 +368,7 @@ impl ShelluneView {
         self.shell_menu_open = false;
         self.tab_menu = None;
         self.session_menu = None;
+        self.accent_hover = None;
         self.remember_focus(window, cx);
         self.session_more = Some((id, position));
         // The terminal keeps the keyboard, as it does for the tab menu: Escape is bound
@@ -384,6 +385,7 @@ impl ShelluneView {
 
     pub(super) fn close_session_more(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.session_more.take().is_some() {
+            self.accent_hover = None;
             self.restore_overlay_focus(window, cx);
             cx.notify();
         }
@@ -399,13 +401,24 @@ impl ShelluneView {
         let session = self.workspace.session(id)?;
         let metrics = self.metrics();
         let strings = self.strings();
+        let ux = crate::app::copy::ux();
         let viewport = window.viewport_size();
         let closed = matches!(session.state(), SessionState::Closed);
         let forward_host = match session.kind() {
             SessionKind::Remote { host } if self.book.host(*host).is_some() => Some(*host),
             _ => None,
         };
-        let more_than_one = self.workspace.layout().tabs().len() > 1;
+        let tab = self.workspace.tab_of_session(id);
+        let tab_count = self.workspace.layout().tabs().len();
+        let tab_index = tab.and_then(|tab_id| {
+            self.workspace
+                .layout()
+                .tabs()
+                .iter()
+                .position(|candidate| candidate.id() == tab_id)
+        });
+        let more_than_one = tab_count > 1;
+        let has_right = tab_index.is_some_and(|index| index + 1 < tab_count);
 
         let mut menu = menu_card("session.more.menu", metrics);
         // What a narrow bar had no room for comes first, in the bar's own order: the
@@ -453,10 +466,29 @@ impl ShelluneView {
                 })),
             );
         }
+        if let Some(tab) = tab {
+            menu = menu
+                .child(
+                    menu_entry(
+                        strings.tab_menu_rename,
+                        "session.more.rename",
+                        Some(Icon::Pencil),
+                        true,
+                        false,
+                        metrics,
+                    )
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.close_session_more(window, cx);
+                        this.open_tab_rename(tab, window, cx);
+                    })),
+                )
+                .child(self.tab_accent_choices(tab, super::AccentRow::SessionMore, cx));
+        }
+        menu = menu.child(menu_divider(metrics));
         if let Some(host) = forward_host {
             menu = menu.child(
                 menu_entry(
-                    crate::app::copy::ux().session_forwards,
+                    ux.session_forwards,
                     "session.more.forwards",
                     Some(Icon::Forward),
                     true,
@@ -469,7 +501,64 @@ impl ShelluneView {
                 })),
             );
         }
-        menu = menu.child(menu_divider(metrics));
+        menu = menu
+            .child(
+                menu_entry(
+                    ux.session_global_forwards,
+                    "session.more.global_forwards",
+                    Some(Icon::Forward),
+                    true,
+                    false,
+                    metrics,
+                )
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.close_session_more(window, cx);
+                    this.open_global_forwards(window, cx);
+                })),
+            )
+            .child(
+                menu_entry(
+                    strings.nav_transfers,
+                    "session.more.transfers",
+                    Some(Icon::Transfer),
+                    true,
+                    false,
+                    metrics,
+                )
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.close_session_more(window, cx);
+                    this.open_tool(super::shell::Tool::Transfers, cx);
+                })),
+            )
+            .child(
+                menu_entry(
+                    ux.terminal_snippets_menu,
+                    "session.more.snippets",
+                    Some(Icon::Play),
+                    true,
+                    false,
+                    metrics,
+                )
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.close_session_more(window, cx);
+                    this.open_snippets(false, cx);
+                })),
+            )
+            .child(
+                menu_entry(
+                    ux.hosts_batch_open,
+                    "session.more.batch",
+                    Some(Icon::Layers),
+                    true,
+                    false,
+                    metrics,
+                )
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.close_session_more(window, cx);
+                    this.open_batch_tool(cx);
+                })),
+            )
+            .child(menu_divider(metrics));
         if !closed {
             menu = menu.child(
                 menu_entry(
@@ -491,7 +580,7 @@ impl ShelluneView {
                 menu_entry(
                     strings.tab_menu_close_others,
                     "session.more.close_others",
-                    None,
+                    Some(Icon::Layers),
                     true,
                     false,
                     metrics,
@@ -499,6 +588,22 @@ impl ShelluneView {
                 .on_click(cx.listener(move |this, _event, window, cx| {
                     this.close_session_more(window, cx);
                     this.close_other_tabs(id, cx);
+                })),
+            );
+        }
+        if has_right {
+            menu = menu.child(
+                menu_entry(
+                    strings.tab_menu_close_right,
+                    "session.more.close_right",
+                    Some(Icon::ArrowRight),
+                    true,
+                    false,
+                    metrics,
+                )
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.close_session_more(window, cx);
+                    this.close_tabs_after(id, cx);
                 })),
             );
         }

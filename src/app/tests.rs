@@ -20595,6 +20595,16 @@ async fn the_stacked_split_nudges_are_targets_too(cx: &mut TestAppContext) {
 /// their own right and are drawn over the neighbouring pane's edge instead of being
 /// squeezed to the band (R4).
 fn assert_nudges_of_one_split(cx: &mut VisualTestContext, view: &Entity<ShelluneView>) {
+    assert!(
+        cx.debug_bounds("pane.resize.less").is_none()
+            && cx.debug_bounds("pane.resize.more").is_none(),
+        "split nudge buttons stay quiet at rest so they do not obstruct adjacent scrollbars"
+    );
+    assert!(
+        cx.debug_bounds("pane.divider.line").is_some(),
+        "a quiet 1px centre line marks the split at rest"
+    );
+    hover(cx, "pane.divider");
     let band = bounds_of(cx, "pane.divider");
     let across = band.size.height > band.size.width;
     let normal = if across {
@@ -20657,6 +20667,7 @@ fn assert_nudges_of_one_split(cx: &mut VisualTestContext, view: &Entity<Shellune
         grown[0].1 > start[0].1,
         "the nudge button moved the divider: {start:?} then {grown:?}"
     );
+    hover(cx, "pane.divider");
     click(cx, "pane.resize.less");
     let back = cx.update(|_window, app| view.read(app).layout_ratios_for_test());
     assert_eq!(
@@ -22710,13 +22721,22 @@ async fn the_manager_is_walkable_with_the_keyboard_and_enter_inserts_the_chosen_
         cx.debug_bounds("snippet.row.0").is_some() && cx.debug_bounds("snippet.row.1").is_some(),
         "both saved commands are listed"
     );
+    assert!(
+        cx.update(|window, app| {
+            view.read(app)
+                .snippet_panel()
+                .search_field()
+                .is_some_and(|field| field.read(app).focus_handle().is_focused(window))
+        }),
+        "opening the manager with saved commands focuses the search field immediately"
+    );
 
     cx.simulate_keystrokes("down");
     cx.run_until_parked();
     assert_eq!(
         cx.update(|_window, app| view.read(app).snippet_panel().selected()),
         1,
-        "the arrow key moves the highlighted row"
+        "the arrow key moves the highlighted row while search holds focus"
     );
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
@@ -22725,13 +22745,18 @@ async fn the_manager_is_walkable_with_the_keyboard_and_enter_inserts_the_chosen_
         "echo two",
         "Enter inserts the highlighted command without submitting it"
     );
-
-    cx.simulate_keystrokes("escape");
-    cx.run_until_parked();
     assert_eq!(
         cx.update(|_window, app| view.read(app).tool_for_test()),
         None,
-        "Escape closes the manager"
+        "inserting a command automatically closes the snippet manager"
+    );
+    assert!(
+        cx.update(|window, app| {
+            view.read(app)
+                .pane_of(session)
+                .is_some_and(|pane| pane.read(app).focus_handle().is_focused(window))
+        }),
+        "closing the snippet manager on insert returns keyboard focus to the active terminal"
     );
 }
 
@@ -46422,5 +46447,917 @@ async fn dialog_validation_targets_required_fields_clears_all_borders_and_aborte
         cx.update(|_window, app| view.update(app, |v, _cx| v.ephemeral_ssh_secret_count_for_test())),
         0,
         "fail_before_dial on jump+ProxyCommand conflict immediately clears ephemeral_ssh_secrets"
+    );
+}
+
+// ===========================================================================
+// R5 & R6 — Terminal interaction polish, focus mode, search, URLs, snippets,
+// global tool entry points, pending tabs, SSH duplicate, split & banners (T3)
+// ===========================================================================
+
+#[gpui::test]
+async fn focus_mode_hides_bottom_bars_prevents_overlap_supports_search_and_restores_chrome(
+    cx: &mut TestAppContext,
+) {
+    // 1. Isolated TerminalPane focus_mode toggle + window SSH single-pane focus mode.
+    let (ssh_view, ssh_cx) = remote_view(cx);
+    ssh_cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    ssh_cx.simulate_resize(narrow_window());
+    let ssh_id = live_remote(ssh_cx, &ssh_view);
+    show_remote_terminal(ssh_cx, &ssh_view, ssh_id);
+    let ssh_pane = ssh_cx
+        .update(|_window, app| ssh_view.read(app).pane_of(ssh_id).cloned())
+        .expect("live ssh pane");
+    let mut history = String::new();
+    for i in 0..35 {
+        history.push_str(&format!("line {i} matchable\r\n"));
+    }
+    ssh_cx.update(|_window, app| {
+        ssh_pane.update(app, |pane, cx| {
+            pane.set_focus_mode_for_test(false, cx);
+            pane.feed_for_test(history.as_bytes(), cx);
+        });
+    });
+    ssh_cx.run_until_parked();
+    let bar_before = bounds_of(ssh_cx, "terminal.bar");
+    let smore_before = bounds_of(ssh_cx, "session.more");
+    let vp_before = bounds_of(ssh_cx, "terminal.viewport");
+    assert!(
+        vp_before.origin.y + vp_before.size.height <= bar_before.origin.y + px(1.0),
+        "outside focus mode the viewport ends above terminal.bar: vp={vp_before:?} bar={bar_before:?}"
+    );
+
+    ssh_cx.dispatch_action(crate::app::keymap::ToggleFocusMode);
+    ssh_cx.run_until_parked();
+    redraw(ssh_cx);
+    ssh_cx.run_until_parked();
+    assert!(ssh_cx.update(|_window, app| ssh_view.read(app).focus_mode()));
+    assert!(ssh_cx.debug_bounds("terminal.chrome.focus").is_some());
+    let exit = bounds_of(ssh_cx, "focus.mode.exit");
+    let vp_focus = bounds_of(ssh_cx, "terminal.viewport");
+    assert!(
+        vp_focus.origin.y + vp_focus.size.height > bar_before.origin.y + px(10.0),
+        "focus mode removes terminal.bar so the terminal viewport expands to the bottom edge: before={vp_before:?} focus={vp_focus:?}"
+    );
+    // GPUI retains stale keys in debug_bounds across frames, so verify hitbox absence directly:
+    // clicking where session.more used to sit opens nothing in focus mode.
+    ssh_cx.simulate_click(
+        point(smore_before.origin.x + px(2.0), smore_before.center().y),
+        Modifiers::default(),
+    );
+    ssh_cx.run_until_parked();
+    assert!(
+        !ssh_cx.update(|_window, app| ssh_view.read(app).session_more_open()),
+        "session.more hitbox is absent in focus mode so bottom-right never overlaps focus.mode.exit"
+    );
+
+    // Search overlay works inside focus mode and never overlaps focus.mode.exit.
+    ssh_cx.dispatch_action(crate::app::actions::TerminalSearch);
+    ssh_cx.run_until_parked();
+    ssh_cx.simulate_input("line 5");
+    ssh_cx.run_until_parked();
+    let blocks = bounds_of(ssh_cx, "terminal.blocks");
+    let pill = bounds_of(ssh_cx, "terminal.scroll_bottom");
+    let intersect_blocks = overlap(blocks, exit);
+    assert!(
+        intersect_blocks.size.width <= px(0.5) || intersect_blocks.size.height <= px(0.5),
+        "terminal search overlay must not overlap focus.mode.exit: {blocks:?} vs {exit:?}"
+    );
+    let intersect_pill = overlap(pill, exit);
+    assert!(
+        intersect_pill.size.width <= px(0.5) || intersect_pill.size.height <= px(0.5),
+        "scroll_bottom_pill must not overlap focus.mode.exit: {pill:?} vs {exit:?}"
+    );
+    ssh_cx.simulate_keystrokes("escape");
+    ssh_cx.run_until_parked();
+
+    // Exiting focus mode restores the regular bottom bar immediately.
+    ssh_cx.dispatch_action(crate::app::keymap::ToggleFocusMode);
+    ssh_cx.run_until_parked();
+    assert!(!ssh_cx.update(|_window, app| ssh_view.read(app).focus_mode()));
+    let vp_restored = bounds_of(ssh_cx, "terminal.viewport");
+    let bar_restored = bounds_of(ssh_cx, "terminal.bar");
+    assert!(
+        vp_restored.origin.y + vp_restored.size.height <= bar_restored.origin.y + px(1.0),
+        "exiting focus mode restores the original terminal bottom bar: vp={vp_restored:?} bar={bar_restored:?}"
+    );
+    click(ssh_cx, "session.more");
+    assert!(ssh_cx.update(|_window, app| ssh_view.read(app).session_more_open()));
+    ssh_cx.simulate_keystrokes("escape");
+    ssh_cx.run_until_parked();
+
+    // 2. Multi-pane split tab in focus mode: neither pane renders a bottom bar or terminal.more hitbox.
+    let Some((split_view, split_cx, left_split_id, right_split_id)) = split_tab(cx) else {
+        return;
+    };
+    let left_split_pane = split_cx
+        .update(|_window, app| split_view.read(app).pane_of(left_split_id).cloned())
+        .expect("left split pane");
+    let right_split_pane = split_cx
+        .update(|_window, app| split_view.read(app).pane_of(right_split_id).cloned())
+        .expect("right split pane");
+    let tmore_before = bounds_of(split_cx, "terminal.more");
+    split_cx.dispatch_action(crate::app::keymap::ToggleFocusMode);
+    split_cx.run_until_parked();
+    redraw(split_cx);
+    split_cx.run_until_parked();
+    assert!(split_cx.update(|_window, app| split_view.read(app).focus_mode()));
+    split_cx.simulate_click(tmore_before.center(), Modifiers::default());
+    split_cx.run_until_parked();
+    assert!(
+        !split_cx.update(|_window, app| {
+            left_split_pane.read(app).more_menu_open_for_test()
+                || right_split_pane.read(app).more_menu_open_for_test()
+        }),
+        "inactive split pane hides its bottom bar and terminal.more hitbox in focus mode"
+    );
+    split_cx.dispatch_action(crate::app::keymap::ToggleFocusMode);
+    split_cx.run_until_parked();
+    click(split_cx, "terminal.more");
+    assert!(
+        split_cx.update(|_window, app| {
+            left_split_pane.read(app).more_menu_open_for_test()
+                || right_split_pane.read(app).more_menu_open_for_test()
+        }),
+        "exiting focus mode restores split pane bottom bars and terminal.more"
+    );
+}
+
+#[gpui::test]
+async fn terminal_search_refocus_editing_clear_and_scroll_bottom_pill_ux(cx: &mut TestAppContext) {
+    let mut initial = String::new();
+    for i in 0..40 {
+        initial.push_str(&format!("history line {i}\r\n"));
+    }
+    initial.push_str("alpha beta bottom needle\r\n");
+    let (pane, cx) = pane_with(&initial, cx);
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    // Open search and type query.
+    cx.dispatch_action(crate::app::actions::TerminalSearch);
+    cx.run_until_parked();
+    cx.simulate_input("alpha beta");
+    cx.run_until_parked();
+    assert_eq!(search_state_of(&pane, cx).query, "alpha beta");
+
+    // Click viewport to blur search (search_open && !search_focused), then press TerminalSearch:
+    // must re-focus search and keep the query intact rather than closing!
+    click(cx, "terminal.viewport");
+    let unfocused = search_state_of(&pane, cx);
+    assert!(unfocused.open && !unfocused.focused);
+    cx.dispatch_action(crate::app::actions::TerminalSearch);
+    cx.run_until_parked();
+    let refocused = search_state_of(&pane, cx);
+    assert!(
+        refocused.open && refocused.focused && refocused.query == "alpha beta",
+        "pressing search shortcut while search is open but unfocused re-focuses it and preserves query: {refocused:?}"
+    );
+
+    // Click near the left edge of terminal.search.query to place caret near start instead of end.
+    let query_bounds = bounds_of(cx, "terminal.search.query");
+    cx.simulate_click(
+        point(query_bounds.origin.x + px(2.0), query_bounds.center().y),
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    let clicked_cursor = cx.update(|_window, app| pane.read(app).search_cursor_for_test());
+    assert!(
+        clicked_cursor <= 1,
+        "clicking near the start of the search query places the caret there rather than at the end: {clicked_cursor}"
+    );
+
+    // Ctrl+Right jumps to end of first word ("alpha" -> offset 5).
+    cx.simulate_keystrokes("home ctrl-right");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).search_cursor_for_test()),
+        5,
+        "Ctrl+Right jumps across a word in the search field"
+    );
+
+    // Ctrl/Cmd+A selects all, copies cleanly without shell leak, and typing replaces all.
+    let select_all_stroke = format!("{}-a", Platform::current().keystroke_modifier());
+    cx.simulate_keystrokes(&select_all_stroke);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).search_selection_for_test()),
+        Some(0.."alpha beta".len()),
+    );
+    assert!(cx.debug_bounds("terminal.search.selection").is_some());
+    cx.dispatch_action(crate::app::actions::TerminalCopy);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).last_copy().map(str::to_owned)),
+        Some("alpha beta".to_owned())
+    );
+    cx.simulate_input("bottom needle");
+    cx.run_until_parked();
+    assert_eq!(search_state_of(&pane, cx).query, "bottom needle");
+
+    // Clear button (>= 24x24) clears query while keeping search open and focused.
+    let clear_bounds = bounds_of(cx, "terminal.search.clear");
+    assert!(
+        clear_bounds.size.width >= px(24.0) && clear_bounds.size.height >= px(24.0),
+        "terminal.search.clear meets the 24x24 hit target: {clear_bounds:?}"
+    );
+    click(cx, "terminal.search.clear");
+    let cleared = search_state_of(&pane, cx);
+    assert!(
+        cleared.open && cleared.focused && cleared.query.is_empty(),
+        "clear button empties query and keeps search focused: {cleared:?}"
+    );
+
+    // Dodge-bottom + scroll_bottom_pill non-overlap: scroll up 1 line so display_offset > 0
+    // while "history line 39" sits in the bottom 3 rows of the viewport.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("shift-pageup");
+    cx.run_until_parked();
+    let offset_before = cx.update(|_window, app| pane.read(app).display_offset());
+    assert!(offset_before > 0);
+    // Feed new output while parked in scrollback -> unseen_output indicator appears!
+    assert!(!cx.update(|_window, app| pane.read(app).unseen_output_for_test()));
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.feed_for_test(b"fresh background line\r\n", cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| pane.read(app).unseen_output_for_test()));
+    assert!(
+        cx.debug_bounds("terminal.scroll_bottom.new_output")
+            .is_some(),
+        "scroll_bottom_pill displays explicit new-output indicator when output arrives while scrolled up"
+    );
+
+    // Open search on a match in the bottom rows of the parked viewport so dodge_bottom activates:
+    // terminal.blocks moves to top while terminal.scroll_bottom stays at bottom without overlapping!
+    let bottom_row_text = cx.update(|_window, app| {
+        pane.read(app)
+            .visible_text()
+            .into_iter()
+            .rev()
+            .find(|line| line.contains("history line"))
+            .expect("visible history line near bottom")
+            .trim()
+            .to_owned()
+    });
+    cx.dispatch_action(crate::app::actions::TerminalSearch);
+    cx.run_until_parked();
+    cx.simulate_input(&bottom_row_text);
+    cx.run_until_parked();
+    let blocks = bounds_of(cx, "terminal.blocks");
+    let pill = bounds_of(cx, "terminal.scroll_bottom");
+    let collision = overlap(blocks, pill);
+    assert!(
+        collision.size.width <= px(0.5) || collision.size.height <= px(0.5),
+        "dodge_bottom search bar and scroll_bottom_pill must not overlap: {blocks:?} vs {pill:?}"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Verify scroll_bottom_pill scales with theme::metrics() across Zoom levels, then click to reset.
+    theme::set_zoom(Zoom::Compact);
+    redraw(cx);
+    let compact_pill = bounds_of(cx, "terminal.scroll_bottom");
+    theme::set_zoom(Zoom::Comfortable);
+    redraw(cx);
+    let comfortable_pill = bounds_of(cx, "terminal.scroll_bottom");
+    theme::set_zoom(Zoom::Regular);
+    redraw(cx);
+    assert!(
+        comfortable_pill.size.width > compact_pill.size.width,
+        "scroll_bottom_pill scales with text zoom: compact={compact_pill:?}, comfortable={comfortable_pill:?}"
+    );
+
+    click(cx, "terminal.scroll_bottom");
+    assert_eq!(cx.update(|_window, app| pane.read(app).display_offset()), 0);
+    assert!(
+        !cx.update(|_window, app| pane.read(app).unseen_output_for_test()),
+        "returning to bottom resets unseen_output"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        Vec::<u8>::new(),
+        "none of the search/scroll interactions leaked bytes to the shell"
+    );
+}
+
+#[gpui::test]
+async fn terminal_links_context_menu_and_shell_key_passthrough_invariants(cx: &mut TestAppContext) {
+    let mut content = String::new();
+    for i in 0..60 {
+        content.push_str(&format!("older {i}\r\n"));
+    }
+    content.push_str("Visit https://example.com/guide or ssh://root@10.0.0.1");
+    let (pane, cx) = pane_with(&content, cx);
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    let (cell, row_idx) = cx.update(|_window, app| {
+        let p = pane.read(app);
+        let row_idx = p
+            .visible_text()
+            .iter()
+            .position(|line| line.contains("https://example.com/guide"))
+            .expect("url row on screen");
+        (p.cell_size(), row_idx)
+    });
+    let vp_bounds = bounds_of(cx, "terminal.viewport");
+    let http_point = point(
+        vp_bounds.origin.x + px(cell.width * 10.0),
+        vp_bounds.origin.y + px(cell.height * (row_idx as f32 + 0.5)),
+    );
+    let ssh_point = point(
+        vp_bounds.origin.x + px(cell.width * 40.0),
+        vp_bounds.origin.y + px(cell.height * (row_idx as f32 + 0.5)),
+    );
+    let secondary_mods = if cfg!(target_os = "macos") {
+        Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        }
+    } else {
+        Modifiers {
+            control: true,
+            ..Modifiers::default()
+        }
+    };
+
+    // Plain hover & plain click over http URL neither underline nor open it.
+    cx.simulate_mouse_move(http_point, None, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).hovered_link_for_test().map(str::to_owned)),
+        None
+    );
+    cx.simulate_click(http_point, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| pane.read(app).opened_urls_for_test().is_empty()));
+
+    // Ctrl/Cmd + hover underlines http(s) URL; Ctrl/Cmd + click opens it.
+    cx.simulate_mouse_move(http_point, None, secondary_mods);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).hovered_link_for_test().map(str::to_owned)),
+        Some("https://example.com/guide".to_owned()),
+    );
+    cx.simulate_click(http_point, secondary_mods);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).opened_urls_for_test().to_vec()),
+        vec!["https://example.com/guide".to_owned()],
+    );
+
+    // Non-http(s) scheme (ssh://) is rejected by allowlist on both hover and click.
+    cx.simulate_mouse_move(ssh_point, None, secondary_mods);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).hovered_link_for_test().map(str::to_owned)),
+        None,
+    );
+    cx.simulate_click(ssh_point, secondary_mods);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).opened_urls_for_test().len()),
+        1,
+        "ssh:// scheme must never open via Ctrl/Cmd+click"
+    );
+
+    // Alternate screen disables URL hover & click.
+    cx.update(|_window, app| {
+        pane.update(app, |p, cx| {
+            p.feed_for_test(b"\x1b[?1049h\x1b[HVisit https://example.com/alt", cx);
+        });
+    });
+    cx.run_until_parked();
+    let alt_point = point(
+        vp_bounds.origin.x + px(cell.width * 10.0),
+        vp_bounds.origin.y + px(cell.height * 0.5),
+    );
+    cx.simulate_mouse_move(alt_point, None, secondary_mods);
+    cx.simulate_click(alt_point, secondary_mods);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).opened_urls_for_test().len()),
+        1,
+        "alternate screen must never intercept Ctrl/Cmd+click for URLs"
+    );
+    cx.update(|_window, app| {
+        pane.update(app, |p, cx| p.feed_for_test(b"\x1b[?1049l", cx));
+    });
+    cx.run_until_parked();
+
+    // Right-click over http(s) URL shows Open link & Copy link, plus snippets/split/clear.
+    cx.simulate_mouse_down(http_point, MouseButton::Right, Modifiers::default());
+    cx.simulate_mouse_up(http_point, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    for selector in [
+        "terminal.menu.open_link",
+        "terminal.menu.copy_link",
+        "terminal.menu.clear",
+        "terminal.menu.snippets",
+        "terminal.menu.split_right",
+        "terminal.menu.split_down",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "terminal right-click menu over URL must offer {selector}"
+        );
+    }
+    click(cx, "terminal.menu.copy_link");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).last_copy().map(str::to_owned)),
+        Some("https://example.com/guide".to_owned())
+    );
+
+    // Clear terminal & scrollback wipes both screen and history without seizing Ctrl+L.
+    assert!(cx.update(|_window, app| pane.read(app).history_len()) > 0);
+    right_click(cx, "terminal.viewport");
+    click(cx, "terminal.menu.clear");
+    assert_eq!(cx.update(|_window, app| pane.read(app).history_len()), 0);
+    assert!(
+        cx.update(|_window, app| {
+            pane.read(app)
+                .visible_text()
+                .iter()
+                .all(|line| line.trim().is_empty())
+        }),
+        "clear_terminal_and_scrollback wipes the visible primary screen too"
+    );
+
+    // Strict passthrough invariant: Esc (0x1b), Ctrl+C without selection (0x03), Ctrl+L (0x0c).
+    cx.update(|window, app| window.focus(pane.read(app).focus_handle()));
+    cx.simulate_keystrokes("escape ctrl-c ctrl-l");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        vec![0x1b, 0x03, 0x0c],
+        "Esc, unselected Ctrl+C and Ctrl+L must pass straight through to the shell"
+    );
+}
+
+#[gpui::test]
+async fn snippets_drawer_keyboard_flow_formatted_hint_and_global_tool_entrypoints(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("snippets-and-global-tools");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let mut book = shellune_core::SnippetBook::new();
+    book.create("check disk", "df -h").expect("snippet 1");
+    book.create("check mem", "free -m").expect("snippet 2");
+    book.create("multi step", "echo step1\necho step2")
+        .expect("snippet 3");
+    shellune_storage::SnippetStore::at(dir.path())
+        .save(&book)
+        .expect("save snippets");
+
+    let (view, cx) = snippet_view(cx, &dir);
+    let session = live_remote(cx, &view);
+    show_remote_terminal(cx, &view, session);
+
+    // Right-click terminal -> Snippets… opens Tool::Snippets directly with search focused.
+    right_click(cx, "terminal.viewport");
+    click(cx, "terminal.menu.snippets");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        Some(crate::app::view::Tool::Snippets)
+    );
+    assert!(
+        cx.debug_bounds("snippets.keys.hint").is_some(),
+        "snippet keyboard hint is shown"
+    );
+    // Verify {run_key} placeholder is properly substituted in both locales.
+    for locale in [Locale::English, Locale::Chinese] {
+        let ux = copy::ux_for(locale);
+        let filled = copy::fill(ux.snippet_keys_hint, &[("run_key", "Ctrl+Enter")]);
+        assert!(
+            !filled.contains("{run_key}"),
+            "{locale:?} snippet_keys_hint left {{run_key}} unformatted: {filled}"
+        );
+    }
+
+    // Immediate typing filters to "check mem", and Ctrl/Cmd+Enter executes & closes & returns focus!
+    cx.simulate_input("mem");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .snippet_panel()
+                .filtered_indices(view.read(app).snippets().snippets())
+                .len()
+        }),
+        1
+    );
+    let run_stroke = format!("{}-enter", Platform::current().keystroke_modifier());
+    cx.simulate_keystrokes(&run_stroke);
+    cx.run_until_parked();
+    assert_eq!(
+        String::from_utf8_lossy(&snippet_sent(cx, &view, session)),
+        "free -m\r",
+        "Ctrl/Cmd+Enter runs the filtered snippet once"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        None,
+        "running a snippet auto-closes the snippet drawer"
+    );
+    assert!(
+        cx.update(|window, app| {
+            view.read(app)
+                .pane_of(session)
+                .is_some_and(|p| p.read(app).focus_handle().is_focused(window))
+        }),
+        "auto-closing the snippet drawer returns focus to the active terminal"
+    );
+
+    // Multiline snippet closes drawer and routes through paste confirmation before sending.
+    let before_multi = snippet_sent(cx, &view, session).len();
+    cx.update(|_window, app| view.update(app, |v, cx| v.open_snippets(false, cx)));
+    cx.run_until_parked();
+    cx.simulate_input("multi");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        None
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).paste_prompt_open_for_test(app)),
+        "multiline snippet still opens the paste confirmation dialog"
+    );
+    assert_eq!(
+        snippet_sent(cx, &view, session).len(),
+        before_multi,
+        "nothing is written before paste confirmation"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Global tool entry points: 1) Command Palette ("snippets", "transfers", "forwards", "batch")
+    for (query, expected_tool) in [
+        ("snippets", Some(crate::app::view::Tool::Snippets)),
+        ("transfers", Some(crate::app::view::Tool::Transfers)),
+        ("forwards", Some(crate::app::view::Tool::Forwards)),
+    ] {
+        go(cx, crate::app::actions::OpenPalette);
+        cx.simulate_input(query);
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|_window, app| view.read(app).palette_titles().is_empty()),
+            "palette query {query:?} finds a global entry"
+        );
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_window, app| view.read(app).tool_for_test()),
+            expected_tool,
+            "palette query {query:?} opens {expected_tool:?}"
+        );
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+    }
+    go(cx, crate::app::actions::OpenPalette);
+    cx.simulate_input("batch");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("batch.dialog").is_some(),
+        "palette query 'batch' opens the Batch Tasks center"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Global tool entry points: 2) Terminal session.more menu
+    click(cx, "session.more");
+    for selector in [
+        "session.more.snippets",
+        "session.more.transfers",
+        "session.more.global_forwards",
+        "session.more.batch",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "session.more menu offers {selector}"
+        );
+    }
+    click(cx, "session.more.transfers");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        Some(crate::app::view::Tool::Transfers)
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Global tool entry points: 3) Home hosts.more menu
+    click(cx, "nav.hosts");
+    click(cx, "hosts.more");
+    for selector in [
+        "hosts.more.snippets",
+        "hosts.more.transfers",
+        "hosts.more.forwards",
+        "hosts.batch.open.list",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "hosts.more menu offers {selector}"
+        );
+    }
+    click(cx, "hosts.more.forwards");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        Some(crate::app::view::Tool::Forwards)
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn pending_tab_menu_ssh_duplicate_menu_alignment_split_zoom_and_background_banner(
+    cx: &mut TestAppContext,
+) {
+    // 1. Restored pending tabs answer right-click with tab.menu (connect, duplicate, rename, accents, move, close).
+    let dir = TempDir::new("pending-tab-and-ssh-dup");
+    seed(
+        &dir.store(),
+        vec![stored_host("prod-ssh", "10.0.0.42", 22, "ops", None)],
+    );
+    let host_id = dir.store().load().expect("hosts").hosts()[0].id();
+    let pending_tabs = vec![
+        WorkspaceTab::new(
+            "pending-one",
+            PaneNode::leaf(PaneTarget::remote(host_id), TerminalMode::Classic),
+        )
+        .expect("tab 1"),
+        WorkspaceTab::new(
+            "pending-two",
+            PaneNode::leaf(PaneTarget::remote(host_id), TerminalMode::Classic),
+        )
+        .expect("tab 2"),
+    ];
+    let first_tab_id = pending_tabs[0].id();
+    let snapshot = WorkspaceSnapshot::new(pending_tabs, PanelConfig::default()).expect("snapshot");
+    WorkspaceStore::at(dir.path())
+        .save(&snapshot)
+        .expect("save workspace");
+
+    let (view, vcx) = cx.add_window_view(|_window, cx| {
+        ShelluneView::with_store_and_trust(
+            cx,
+            Workspace::new(),
+            HostStore::at(dir.path()),
+            TrustStore::at(dir.path()),
+        )
+    });
+    vcx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    vcx.simulate_resize(design_window());
+    vcx.run_until_parked();
+
+    right_click(vcx, "session.tab.0");
+    assert!(
+        vcx.debug_bounds("tab.menu").is_some(),
+        "right-clicking a restored pending tab opens tab.menu"
+    );
+    for selector in [
+        "tab.menu.connect",
+        "tab.menu.duplicate",
+        "tab.menu.rename",
+        "tab.menu.forwards",
+        "tab.menu.accents",
+        "tab.menu.move_right",
+        "tab.menu.close",
+        "tab.menu.close_others",
+        "tab.menu.close_right",
+    ] {
+        assert!(
+            vcx.debug_bounds(selector).is_some(),
+            "pending tab right-click menu offers {selector}"
+        );
+    }
+    click(vcx, "tab.menu.move_right");
+    assert_eq!(
+        vcx.update(|_window, app| view.read(app).workspace().layout().tabs()[1].id()),
+        first_tab_id,
+        "Move Right reorders a pending tab cleanly"
+    );
+
+    // 2. SSH duplicate_session stays in Destination::LocalShells and opens/switches to a new tab
+    //    instead of jumping back to Destination::Hosts; tab.menu & session.more align on core items.
+    let (ssh_view, ssh_cx) = remote_view(cx);
+    ssh_cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    ssh_cx.simulate_resize(design_window());
+    let ssh_one = live_remote(ssh_cx, &ssh_view);
+    show_remote_terminal(ssh_cx, &ssh_view, ssh_one);
+
+    // Check alignment between tab.menu and session.more when >1 tabs exist after duplicating.
+    right_click(ssh_cx, "session.tab.0");
+    for selector in [
+        "tab.menu.duplicate",
+        "tab.menu.rename",
+        "tab.menu.forwards",
+        "tab.menu.accents",
+        "tab.menu.close",
+    ] {
+        assert!(
+            ssh_cx.debug_bounds(selector).is_some(),
+            "tab.menu missing {selector}"
+        );
+    }
+    click(ssh_cx, "tab.menu.duplicate");
+    ssh_cx.run_until_parked();
+    assert_eq!(
+        ssh_cx.update(|_window, app| ssh_view.read(app).workspace().destination()),
+        Destination::LocalShells,
+        "duplicating an SSH tab must stay in the terminal workspace instead of jumping to Hosts"
+    );
+    assert_eq!(
+        ssh_cx.update(|_window, app| ssh_view.read(app).workspace().layout().tabs().len()),
+        2,
+        "duplicating an SSH tab immediately creates a second session tab"
+    );
+    let duplicated_active = ssh_cx.update(|_window, app| ssh_view.read(app).active_session());
+    assert!(
+        duplicated_active.is_some() && duplicated_active != Some(ssh_one),
+        "duplicated SSH tab becomes the active session immediately"
+    );
+
+    // Switch back to live ssh_one tab and verify session.more aligns on rename, accents, forwards, close_others, close_right.
+    click(ssh_cx, "session.tab.0");
+    click(ssh_cx, "session.more");
+    for selector in [
+        "session.more.duplicate",
+        "session.more.rename",
+        "session.more.accents",
+        "session.more.forwards",
+        "session.more.close",
+        "session.more.close_others",
+        "session.more.close_right",
+    ] {
+        assert!(
+            ssh_cx.debug_bounds(selector).is_some(),
+            "session.more missing aligned item {selector}"
+        );
+    }
+    ssh_cx.simulate_keystrokes("escape");
+    ssh_cx.run_until_parked();
+
+    // Narrow/short window layout guard across 720x480, 520x480, 440x480 and Dark/Light themes.
+    for appearance in [theme::Appearance::Dark, theme::Appearance::Light] {
+        theme::set_appearance(appearance);
+        for win_size in [
+            size(px(720.0), px(480.0)),
+            size(px(520.0), px(480.0)),
+            size(px(440.0), px(480.0)),
+        ] {
+            ssh_cx.simulate_resize(win_size);
+            ssh_cx.run_until_parked();
+            let vp = ssh_cx.update(|w, _| w.viewport_size());
+            assert_fits_inside(bounds_of(ssh_cx, "terminal.bar"), vp, "terminal.bar");
+            ssh_cx.dispatch_action(crate::app::keymap::ToggleFocusMode);
+            ssh_cx.run_until_parked();
+            assert_fits_inside(bounds_of(ssh_cx, "focus.mode.exit"), vp, "focus.mode.exit");
+            ssh_cx.dispatch_action(crate::app::keymap::ToggleFocusMode);
+            ssh_cx.run_until_parked();
+        }
+    }
+    theme::set_appearance(theme::Appearance::Dark);
+
+    // 3. Split divider keyboard focus, inactive pane 1-click zoom + header double-click zoom,
+    //    and background inactive split pane disconnect banner + 1-click reconnect.
+    let Some((split_view, split_cx, left_id, right_id)) = split_tab(cx) else {
+        return;
+    };
+    let (left_pane_id, _right_pane_id) = split_cx.update(|_window, app| {
+        let leaves = split_view.read(app).workspace().layout().leaves();
+        (leaves[0].id(), leaves[1].id())
+    });
+
+    // Keyboard-focusing the split divider reveals nudge buttons and nudges with arrow keys.
+    assert!(split_cx.debug_bounds("pane.resize.more").is_none());
+    split_cx.update(|window, app| {
+        split_view.update(app, |v, cx| {
+            v.focus_first_split_divider_for_test(window, cx)
+        });
+    });
+    split_cx.run_until_parked();
+    assert!(
+        split_cx.debug_bounds("pane.resize.less").is_some()
+            && split_cx.debug_bounds("pane.resize.more").is_some(),
+        "focusing the split divider reveals the 24x24 nudge buttons"
+    );
+    let ratio_before =
+        split_cx.update(|_window, app| split_view.read(app).layout_ratios_for_test()[0].1);
+    split_cx.simulate_keystrokes("right escape");
+    split_cx.run_until_parked();
+    let ratio_after =
+        split_cx.update(|_window, app| split_view.read(app).layout_ratios_for_test()[0].1);
+    assert!(
+        ratio_after > ratio_before,
+        "Right arrow nudges focused LeftRight divider"
+    );
+
+    // Inactive pane (left_pane_id) offers 1-click Zoom button without pre-activating.
+    let inactive_zoom_sel: &'static str =
+        Box::leak(format!("pane.zoom.{left_pane_id}").into_boxed_str());
+    let zbounds = split_cx
+        .debug_bounds(inactive_zoom_sel)
+        .expect("inactive split pane header exposes one-click zoom button");
+    assert!(zbounds.size.width >= px(24.0) && zbounds.size.height >= px(24.0));
+    split_cx.simulate_click(zbounds.center(), Modifiers::default());
+    split_cx.run_until_parked();
+    assert_eq!(
+        split_cx.update(|_window, app| split_view.read(app).active_session()),
+        Some(left_id),
+        "clicking zoom on an inactive pane focuses it"
+    );
+    assert!(
+        split_cx.update(|_window, app| {
+            split_view
+                .read(app)
+                .workspace()
+                .layout()
+                .active_tab()
+                .and_then(|t| t.zoomed())
+                == Some(left_pane_id)
+        }),
+        "clicking zoom on an inactive pane zooms it in one click"
+    );
+
+    // Double-clicking the pane header toggles zoom back off, and focus returns cleanly.
+    let head_sel: &'static str = Box::leak(format!("pane.head.{left_pane_id}").into_boxed_str());
+    let head_bounds = split_cx.debug_bounds(head_sel).expect("pane header");
+    let head_point = point(head_bounds.origin.x + px(24.0), head_bounds.center().y);
+    split_cx.simulate_event(gpui::MouseDownEvent {
+        position: head_point,
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+        first_mouse: false,
+    });
+    split_cx.simulate_event(gpui::MouseUpEvent {
+        position: head_point,
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+    });
+    split_cx.run_until_parked();
+    assert!(
+        split_cx.update(|_window, app| {
+            split_view
+                .read(app)
+                .workspace()
+                .layout()
+                .active_tab()
+                .and_then(|t| t.zoomed())
+                .is_none()
+        }),
+        "double-clicking a split pane header toggles zoom"
+    );
+
+    // Focus right_id again so left_id is an INACTIVE background split pane, then drop left_id's connection:
+    // top disconnect banner + Reconnect button must appear on left_id immediately BEFORE activation!
+    let right_bounds = bounds_of(split_cx, "pane.idle");
+    split_cx.simulate_click(right_bounds.center(), Modifiers::default());
+    split_cx.run_until_parked();
+    assert_eq!(
+        split_cx.update(|_window, app| split_view.read(app).active_session()),
+        Some(right_id)
+    );
+    split_cx.update(|_window, app| {
+        if let Some(left_pane) = split_view.read(app).pane_of(left_id).cloned() {
+            let tag = left_pane.read(app).tag();
+            left_pane.update(app, |p, cx| {
+                p.adopt_events(
+                    tag,
+                    vec![crate::app::terminal::SourceEvent::Lost(
+                        "background channel dropped".to_owned(),
+                    )],
+                    cx,
+                );
+            });
+        }
+        split_view.update(app, |v, cx| {
+            let _ = v
+                .workspace_mut_for_test()
+                .session_failed(left_id, shellune_core::SessionFailure::ConnectionLost);
+            cx.notify();
+        });
+    });
+    split_cx.run_until_parked();
+    assert_eq!(
+        split_cx.update(|_window, app| split_view.read(app).active_session()),
+        Some(right_id),
+        "right pane is still the active pane"
+    );
+    assert!(
+        split_cx.debug_bounds("terminal.failure").is_some()
+            && split_cx.debug_bounds("terminal.failure.next").is_some(),
+        "inactive background split pane immediately displays its top disconnect banner and Reconnect button"
     );
 }

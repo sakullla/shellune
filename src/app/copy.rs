@@ -3443,6 +3443,20 @@ pub struct UxStrings {
     pub hosts_group_new_host_here: &'static str,
     /// Sidebar group menu action to create a subgroup under that group
     pub hosts_group_new_subgroup: &'static str,
+    /// Floating scroll-to-bottom pill label when new output arrived while scrolled back
+    pub terminal_jump_bottom_new: &'static str,
+    /// Terminal context menu action to open an http(s) URL
+    pub terminal_open_link: &'static str,
+    /// Terminal context menu action to copy an http(s) URL
+    pub terminal_copy_link: &'static str,
+    /// Terminal context menu action to clear visible screen and scrollback buffer
+    pub terminal_clear_scrollback: &'static str,
+    /// Menu action to open the snippets / shortcut commands dialog
+    pub terminal_snippets_menu: &'static str,
+    /// Searchable alias prefix for snippets in the command palette
+    pub snippet_palette_aliases: &'static str,
+    /// Session menu action to open global port forwarding rules
+    pub session_global_forwards: &'static str,
 }
 
 impl UxStrings {
@@ -3955,6 +3969,13 @@ impl UxStrings {
             self.host_open_files,
             self.hosts_group_new_host_here,
             self.hosts_group_new_subgroup,
+            self.terminal_jump_bottom_new,
+            self.terminal_open_link,
+            self.terminal_copy_link,
+            self.terminal_clear_scrollback,
+            self.terminal_snippets_menu,
+            self.snippet_palette_aliases,
+            self.session_global_forwards,
         ]
     }
 }
@@ -4468,6 +4489,13 @@ included",
     host_open_files: "Open files (SFTP)",
     hosts_group_new_host_here: "New host in this group",
     hosts_group_new_subgroup: "New subgroup",
+    terminal_jump_bottom_new: "New output \u{00b7} Jump to bottom ({lines})",
+    terminal_open_link: "Open link",
+    terminal_copy_link: "Copy link",
+    terminal_clear_scrollback: "Clear terminal & scrollback",
+    terminal_snippets_menu: "Snippets\u{2026}",
+    snippet_palette_aliases: "Snippets",
+    session_global_forwards: "All port forwards\u{2026}",
 };
 
 /// Simplified Chinese.
@@ -4976,6 +5004,13 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     host_open_files: "打开文件（SFTP）",
     hosts_group_new_host_here: "在此分组新建主机",
     hosts_group_new_subgroup: "新建子分组",
+    terminal_jump_bottom_new: "有新输出 \u{00b7} 回到底部（{lines} 行）",
+    terminal_open_link: "打开链接",
+    terminal_copy_link: "复制链接",
+    terminal_clear_scrollback: "清空终端与回滚",
+    terminal_snippets_menu: "代码片段\u{2026}",
+    snippet_palette_aliases: "代码片段",
+    session_global_forwards: "全部端口转发\u{2026}",
 };
 
 /// The redesigned-shell strings of the current language.

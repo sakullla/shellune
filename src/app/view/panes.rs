@@ -26,6 +26,9 @@ use crate::app::view::{ShelluneView, SplitDrag};
 /// The width of the band between two split panes that the pointer drags, before zoom.
 const DIVIDER_BAND: f32 = 12.0;
 
+/// The crisp 1px centre hairline drawn inside the split divider band.
+const DIVIDER_LINE: f32 = 1.0;
+
 /// The gap between the grip dots on a split divider, before zoom.
 const DIVIDER_GRIP_GAP: f32 = 1.0;
 
@@ -240,6 +243,66 @@ impl ShelluneView {
         self.checkpoint_layout();
     }
 
+    pub(super) fn split_session_pane(
+        &mut self,
+        id: SessionId,
+        axis: SplitAxis,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.workspace.layout_mut().focus_session(id);
+        self.active = self.workspace.layout().active_session();
+        let Some(session) = self.workspace.session(id) else {
+            return;
+        };
+        match session.kind().clone() {
+            SessionKind::Local { shell } => {
+                let Some(shell) = self.shell_for_split(shell) else {
+                    return;
+                };
+                if !self.workspace.arm_split(axis) {
+                    return;
+                }
+                self.start_shell(shell, cx);
+            }
+            SessionKind::Remote { host } => {
+                self.workspace
+                    .layout_mut()
+                    .split_pending(axis, PaneTarget::remote(host));
+                self.sync_layout_focus(cx);
+                self.restore_focus_pending = true;
+                self.checkpoint_layout();
+                cx.notify();
+            }
+            SessionKind::Rdp { host } => {
+                self.workspace
+                    .layout_mut()
+                    .split_pending(axis, PaneTarget::rdp(host));
+                self.sync_layout_focus(cx);
+                self.restore_focus_pending = true;
+                self.checkpoint_layout();
+                cx.notify();
+            }
+            SessionKind::Vnc { host } => {
+                self.workspace
+                    .layout_mut()
+                    .split_pending(axis, PaneTarget::vnc(host));
+                self.sync_layout_focus(cx);
+                self.restore_focus_pending = true;
+                self.checkpoint_layout();
+                cx.notify();
+            }
+            SessionKind::Serial { host } => {
+                self.workspace
+                    .layout_mut()
+                    .split_pending(axis, PaneTarget::serial(host));
+                self.sync_layout_focus(cx);
+                self.restore_focus_pending = true;
+                self.checkpoint_layout();
+                cx.notify();
+            }
+        }
+    }
+
     fn shell_for_split(&self, program: Option<String>) -> Option<LocalShell> {
         if let Some(program) = program.filter(|program| !program.trim().is_empty()) {
             let name = self
@@ -295,6 +358,18 @@ impl ShelluneView {
     pub(super) fn toggle_active_zoom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.layout_mut().toggle_zoom() {
             self.present_active_pane(window, cx);
+            self.checkpoint_layout();
+            cx.notify();
+        }
+    }
+
+    fn zoom_pane(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace.layout().active_pane() != Some(pane) {
+            let _ = self.workspace.layout_mut().focus_pane(pane);
+        }
+        if self.workspace.layout_mut().toggle_zoom() {
+            self.present_active_pane(window, cx);
+            self.checkpoint_layout();
             cx.notify();
         }
     }
@@ -311,6 +386,36 @@ impl ShelluneView {
     pub(super) fn reorder_tab(&mut self, id: SessionId, delta: isize, cx: &mut Context<Self>) {
         if self.workspace.layout_mut().focus_session(id) {
             self.reorder_active_tab(delta, cx);
+        }
+    }
+
+    pub(super) fn reorder_tab_by_id(&mut self, tab: TabId, delta: isize, cx: &mut Context<Self>) {
+        let prev_active = self.workspace.layout().active_tab().map(|t| t.id());
+        let Some(index) = self
+            .workspace
+            .layout()
+            .tabs()
+            .iter()
+            .position(|candidate| candidate.id() == tab)
+        else {
+            return;
+        };
+        let _ = self.workspace.layout_mut().select_index(index);
+        if self.workspace.layout_mut().reorder_active(delta) {
+            if let Some(prev) = prev_active
+                && prev != tab
+                && let Some(prev_idx) = self
+                    .workspace
+                    .layout()
+                    .tabs()
+                    .iter()
+                    .position(|candidate| candidate.id() == prev)
+            {
+                let _ = self.workspace.layout_mut().select_index(prev_idx);
+            }
+            self.sync_layout_focus(cx);
+            self.checkpoint_layout();
+            cx.notify();
         }
     }
 
@@ -373,6 +478,144 @@ impl ShelluneView {
     pub(super) fn close_tabs_after(&mut self, id: SessionId, cx: &mut Context<Self>) {
         let keep = self.tab_index_of(id);
         self.close_tab_indexes(cx, |index| keep.is_some_and(|keep| index > keep));
+    }
+
+    pub(super) fn close_tab_by_id(&mut self, tab: TabId, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .workspace
+            .layout()
+            .tabs()
+            .iter()
+            .position(|candidate| candidate.id() == tab)
+        else {
+            return;
+        };
+        self.close_tab_indexes(cx, |candidate| candidate == index);
+    }
+
+    pub(super) fn close_other_tabs_by_id(&mut self, tab: TabId, cx: &mut Context<Self>) {
+        let keep = self
+            .workspace
+            .layout()
+            .tabs()
+            .iter()
+            .position(|candidate| candidate.id() == tab);
+        self.close_tab_indexes(cx, |index| keep != Some(index));
+    }
+
+    pub(super) fn close_tabs_after_by_id(&mut self, tab: TabId, cx: &mut Context<Self>) {
+        let keep = self
+            .workspace
+            .layout()
+            .tabs()
+            .iter()
+            .position(|candidate| candidate.id() == tab);
+        self.close_tab_indexes(cx, |index| keep.is_some_and(|keep| index > keep));
+    }
+
+    pub(super) fn pending_tab_can_connect(&self, tab: TabId) -> bool {
+        let Some(tab) = self.workspace.layout().tab(tab) else {
+            return false;
+        };
+        let mut leaves = Vec::new();
+        collect_leaves(tab.root(), &mut leaves);
+        leaves
+            .into_iter()
+            .any(|leaf| leaf.is_pending() && leaf.mark().is_none())
+    }
+
+    pub(super) fn connect_pending_tab_from_menu(
+        &mut self,
+        tab: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .workspace
+            .layout()
+            .tabs()
+            .iter()
+            .position(|candidate| candidate.id() == tab)
+        else {
+            return;
+        };
+        self.select_tab(index, window, cx);
+        if !self.waiting_local_panes().is_empty() {
+            self.connect_waiting_local_panes(window, cx);
+            return;
+        }
+        let first_pane = self.workspace.layout().tab(tab).and_then(|t| {
+            let mut leaves = Vec::new();
+            collect_leaves(t.root(), &mut leaves);
+            leaves
+                .into_iter()
+                .find(|leaf| leaf.is_pending() && leaf.mark().is_none())
+                .map(|leaf| leaf.id())
+        });
+        if let Some(pane) = first_pane {
+            self.connect_leaf(pane, Some(window), cx);
+        }
+    }
+
+    pub(super) fn pending_tab_can_duplicate(&self, tab: TabId) -> bool {
+        let Some(tab) = self.workspace.layout().tab(tab) else {
+            return false;
+        };
+        let mut leaves = Vec::new();
+        collect_leaves(tab.root(), &mut leaves);
+        let Some(leaf) = leaves.first() else {
+            return false;
+        };
+        if leaf.mark().is_some() {
+            return false;
+        }
+        match leaf.target() {
+            PaneTarget::Local { shell } => self.shell_for_split(shell.clone()).is_some(),
+            PaneTarget::Remote { host } => self.book.host(*host).is_some(),
+            PaneTarget::Rdp { host } | PaneTarget::Vnc { host } | PaneTarget::Serial { host } => {
+                self.book.connection(*host).is_some()
+            }
+        }
+    }
+
+    pub(super) fn duplicate_pending_tab(
+        &mut self,
+        tab: TabId,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.workspace.layout().tab(tab).and_then(|t| {
+            let mut leaves = Vec::new();
+            collect_leaves(t.root(), &mut leaves);
+            leaves
+                .first()
+                .filter(|leaf| leaf.mark().is_none())
+                .map(|leaf| leaf.target().clone())
+        }) else {
+            return;
+        };
+        self.workspace.clear_armed();
+        if self.workspace.destination() != Destination::LocalShells {
+            self.workspace.select(Destination::LocalShells);
+        }
+        self.session_terminal = true;
+        match target {
+            PaneTarget::Local { shell } => {
+                if let Some(shell) = self.shell_for_split(shell) {
+                    self.start_shell(shell, cx);
+                }
+            }
+            PaneTarget::Remote { host } => {
+                if let Some(saved) = self.book.host(host).cloned() {
+                    self.open_remote_duplicate(&saved, false, cx);
+                }
+            }
+            PaneTarget::Rdp { host } | PaneTarget::Vnc { host } | PaneTarget::Serial { host } => {
+                if self.book.connection(host).is_some() {
+                    self.connect_saved_connection(host, cx);
+                }
+            }
+        }
     }
 
     fn tab_index_of(&self, id: SessionId) -> Option<usize> {
@@ -888,15 +1131,31 @@ impl ShelluneView {
         } else {
             Direction::Up
         };
+        let show_nudges = self.split_hover_band == Some(id)
+            || self
+                .split_hover_button
+                .is_some_and(|(split, _)| split == id)
+            || self.split_drag.is_some_and(|drag| drag.split == id)
+            || self.split_focused_divider == Some(id);
+        let track_divider_focus = self
+            .workspace
+            .layout()
+            .active_tab()
+            .and_then(|tab| first_split_id(tab.root()))
+            == Some(id);
         // The band keeps its 12 thickness: it is a continuous drag strip, not a
         // button, and a wider strip would take the space of the panes on both sides.
-        // The two nudge buttons it carries are pointer targets in their own right and
-        // are drawn over the neighbouring pane's edge instead (R4).
+        // At rest only a quiet 1px centre line is drawn so adjacent scrollbars stay
+        // unobstructed; hovering or focusing reveals the two 24×24 nudge buttons (R4).
         div()
             .id(SharedString::from(format!("pane.divider.{id}")))
             // The id is per split; the debug name stays one string so a test can
             // measure the band without knowing which split it belongs to.
             .debug_selector(|| "pane.divider".to_owned())
+            .when(track_divider_focus, |bar| {
+                bar.track_focus(&self.divider_focus)
+            })
+            .relative()
             .flex()
             .flex_none()
             .items_center()
@@ -913,13 +1172,73 @@ impl ShelluneView {
                     .w_full()
                     .cursor_row_resize()
             })
-            .bg(theme::swatch(palette::CHROME))
-            .hover(|bar| bar.bg(theme::swatch(palette::SURFACE_HOVER)))
-            .border_color(theme::swatch(palette::BORDER))
-            .when(across, |bar| bar.border_l_1().border_r_1())
-            .when(!across, |bar| bar.border_t_1().border_b_1())
-            .child(self.resize_button(id, shrink, strings.pane_resize_less, "less", cx))
-            .child(self.resize_button(id, grow, strings.pane_resize_more, "more", cx))
+            .when(show_nudges, |bar| {
+                bar.bg(theme::swatch(palette::SURFACE_HOVER))
+            })
+            .when(!show_nudges, |bar| bar.bg(theme::clear()))
+            .child(
+                div()
+                    .absolute()
+                    .bg(if show_nudges {
+                        theme::swatch(palette::BORDER_STRONG)
+                    } else {
+                        theme::swatch(palette::BORDER)
+                    })
+                    .when(across, |line| {
+                        line.top_0()
+                            .bottom_0()
+                            .left((metrics.scale(DIVIDER_BAND) - px(DIVIDER_LINE)) / 2.0)
+                            .w(px(DIVIDER_LINE))
+                    })
+                    .when(!across, |line| {
+                        line.left_0()
+                            .right_0()
+                            .top((metrics.scale(DIVIDER_BAND) - px(DIVIDER_LINE)) / 2.0)
+                            .h(px(DIVIDER_LINE))
+                    })
+                    .debug_selector(|| "pane.divider.line".to_owned()),
+            )
+            .when(show_nudges, |bar| {
+                bar.child(self.resize_button(id, shrink, strings.pane_resize_less, "less", cx))
+                    .child(self.resize_button(id, grow, strings.pane_resize_more, "more", cx))
+            })
+            .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                if *hovered && this.split_hover_band != Some(id) {
+                    this.split_hover_band = Some(id);
+                    cx.notify();
+                } else if !*hovered && this.split_hover_band == Some(id) {
+                    this.split_hover_band = None;
+                    cx.notify();
+                }
+            }))
+            .on_key_down(
+                cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+                    match event.keystroke.key.as_str() {
+                        "left" if across => {
+                            cx.stop_propagation();
+                            this.nudge_split(id, Direction::Left, cx);
+                        }
+                        "right" if across => {
+                            cx.stop_propagation();
+                            this.nudge_split(id, Direction::Right, cx);
+                        }
+                        "up" if !across => {
+                            cx.stop_propagation();
+                            this.nudge_split(id, Direction::Up, cx);
+                        }
+                        "down" if !across => {
+                            cx.stop_propagation();
+                            this.nudge_split(id, Direction::Down, cx);
+                        }
+                        "escape" | "enter" => {
+                            cx.stop_propagation();
+                            this.split_focused_divider = None;
+                            this.present_active_pane(window, cx);
+                        }
+                        _ => {}
+                    }
+                }),
+            )
             .tooltip(crate::app::components::tooltip(
                 crate::app::copy::ux().pane_divider_reset_hint,
             ))
@@ -966,6 +1285,19 @@ impl ShelluneView {
             .id(SharedString::from(format!("pane.resize.{split}.{name}")))
             .debug_selector(move || selector.clone())
             .tooltip(crate::app::components::tooltip(label))
+            .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                let key = Some((split, name));
+                if *hovered && this.split_hover_button != key {
+                    this.split_hover_button = key;
+                    cx.notify();
+                } else if !*hovered && this.split_hover_button == key {
+                    this.split_hover_button = None;
+                    cx.notify();
+                }
+            }))
+            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                cx.stop_propagation();
+            })
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 cx.stop_propagation();
                 this.nudge_split(split, direction, cx);
@@ -1146,6 +1478,7 @@ impl ShelluneView {
         } else if let Some(id) = session
             && let Some(terminal) = self.pane_for(id)
         {
+            terminal.read(cx).set_focus_mode(self.focus_mode);
             // The pane the keys are in carries the session's half of the bar under its
             // grid; the others keep their own bar alone. In focus mode the session chrome
             // is hidden so the terminal keeps maximum room (R1).
@@ -1161,38 +1494,35 @@ impl ShelluneView {
                         pinned: parts.pinned,
                     });
             }
-            // The pane the keys are in carries why its session ended in a banner above
-            // the grid it ended on (ADR-6).
-            if active {
-                self.hand_banner(id, terminal, cx);
-            }
+            // Every visible split pane states why its session ended in a banner above
+            // the grid it ended on, including background panes before activation (ADR-6).
+            self.hand_banner(id, terminal, cx);
             frame = frame.child(terminal.clone());
         } else if let Some(id) = session
             && let Some(screen) = self.reconnect_screen(id).cloned()
         {
             // A remote session that is reconnecting keeps its last screen under the
             // banner that says so, until the new terminal takes its place (ADR-6).
-            if active {
-                if !self.focus_mode
-                    && let Some(parts) = self.session_bar_parts(cx)
-                {
-                    screen
-                        .read(cx)
-                        .set_session_slot(crate::app::terminal::SessionSlot {
-                            left: parts.left.into_any_element(),
-                            controls: parts.controls,
-                            pinned: parts.pinned,
-                        });
-                }
-                self.hand_banner(id, &screen, cx);
+            screen.read(cx).set_focus_mode(self.focus_mode);
+            if active
+                && !self.focus_mode
+                && let Some(parts) = self.session_bar_parts(cx)
+            {
+                screen
+                    .read(cx)
+                    .set_session_slot(crate::app::terminal::SessionSlot {
+                        left: parts.left.into_any_element(),
+                        controls: parts.controls,
+                        pinned: parts.pinned,
+                    });
             }
+            self.hand_banner(id, &screen, cx);
             frame = frame.child(screen);
         } else if let Some(id) = session {
             // No terminal to lay a card over: the card takes the pane's place, centred,
             // on the terminal's own floor.
-            let card = active
-                .then(|| self.active_failure_notice(Some(id), cx))
-                .flatten()
+            let card = self
+                .active_failure_notice(Some(id), cx)
                 .or_else(|| self.session_state_card(id, cx));
             frame = frame.child(self.status_card_floor(
                 SharedString::from(format!("pane.state.{pane}")),
@@ -1221,7 +1551,7 @@ impl ShelluneView {
         leaf: &crate::app::layout::Leaf,
         active: bool,
         cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    ) -> gpui::Stateful<gpui::Div> {
         let metrics = self.metrics();
         let strings = self.strings();
         let pane = leaf.id();
@@ -1235,6 +1565,8 @@ impl ShelluneView {
         // name and the "Active" chip give way with an ellipsis, so zoom and close stay
         // whole inside the pane instead of being cut at its edge.
         div()
+            .id(SharedString::from(format!("pane.head.{pane}")))
+            .debug_selector(move || format!("pane.head.{pane}"))
             .flex()
             .flex_none()
             .items_center()
@@ -1248,6 +1580,14 @@ impl ShelluneView {
             // the weight of a word: the frame around it is the other half of the mark.
             .when(active, |row| row.bg(theme::swatch(palette::SURFACE)))
             .when(!active, |row| row.bg(theme::swatch(palette::CANVAS)))
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    if event.click_count() >= 2 {
+                        cx.stop_propagation();
+                        this.zoom_pane(pane, window, cx);
+                    }
+                }),
+            )
             .child(
                 crate::app::components::accent_mark(active, metrics).when(active, |mark| {
                     mark.debug_selector(|| "pane.active.mark".to_owned())
@@ -1334,7 +1674,30 @@ impl ShelluneView {
                 ))
             })
             .when(!active, |row| {
+                let zoom_tip = match self.keymap.label("pane.zoom") {
+                    Some(shortcut) => format!("{} ({shortcut})", strings.pane_zoom),
+                    None => strings.pane_zoom.to_owned(),
+                };
                 row.child(
+                    crate::app::components::icon_only_button(Icon::Zoom, metrics)
+                        .flex_none()
+                        .w(metrics.hit_target())
+                        .h(metrics.hit_target())
+                        .id(SharedString::from(format!("pane.zoom.{pane}")))
+                        .debug_selector(move || format!("pane.zoom.{pane}"))
+                        .tooltip(crate::app::components::tooltip(SharedString::from(
+                            zoom_tip,
+                        )))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+                        )
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            cx.stop_propagation();
+                            this.zoom_pane(pane, window, cx);
+                        })),
+                )
+                .child(
                     crate::app::components::icon_only_button(Icon::Close, metrics)
                         .flex_none()
                         .w(metrics.hit_target())
@@ -1577,6 +1940,7 @@ impl ShelluneView {
         let metrics = self.metrics();
         let strings = self.strings();
         let tab = self.workspace.layout().tabs().get(index);
+        let tab_id = tab.map(|tab| tab.id());
         let title = tab
             .map(|tab| tab.display_title().to_owned())
             .unwrap_or_else(|| strings.pane_pending.to_owned());
@@ -1611,7 +1975,16 @@ impl ShelluneView {
                 cx.stop_propagation();
                 this.close_pending_tab(index, cx);
             }),
-        );
+        )
+        .when_some(tab_id, |frame, tab_id| {
+            frame.on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_pending_tab_menu(tab_id, event, window, cx);
+                }),
+            )
+        });
         let body = super::tab_body(metrics)
             .child(crate::app::components::pulsing_status_dot(
                 Tone::Neutral,
@@ -1824,6 +2197,11 @@ fn find_node(node: &Node, pane: PaneId) -> Option<&Node> {
     }
 }
 
+fn first_split_id(node: &Node) -> Option<u64> {
+    let (id, _, _, _, _) = node.split()?;
+    Some(id)
+}
+
 fn split_ratio(node: &Node, split: u64) -> Option<u16> {
     let (id, _, ratio, first, second) = node.split()?;
     if id == split {
@@ -1834,6 +2212,22 @@ fn split_ratio(node: &Node, split: u64) -> Option<u16> {
 
 #[cfg(test)]
 impl ShelluneView {
+    pub fn focus_first_split_divider_for_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let split = self
+            .workspace
+            .layout()
+            .active_tab()
+            .and_then(|tab| first_split_id(tab.root()));
+        self.split_focused_divider = split;
+        if split.is_some() {
+            window.focus(&self.divider_focus);
+        }
+        cx.notify();
+    }
     pub fn split_active_for_test(
         &mut self,
         axis: SplitAxis,

@@ -89,6 +89,9 @@ const SEARCH_MIN_WIDTH: f32 = 160.0;
 /// How wide the toolbar's menus are, before zoom.
 const MENU_WIDTH: f32 = 232.0;
 
+/// The shortest height a toolbar menu keeps when the window is cramped, before zoom.
+const MENU_MIN_HEIGHT: f32 = 120.0;
+
 /// How many records the book holds before the recent strip is drawn: fewer than about
 /// a screen of rows are all in view already, and the strip would only repeat them.
 const RECENT_STRIP_MIN_RECORDS: usize = 8;
@@ -1874,6 +1877,55 @@ impl ShelluneView {
                                 this.open_batch_preview(cx);
                             },
                         )),
+                    )
+                    .child(components::menu_divider(metrics))
+                    .child(
+                        components::menu_entry(
+                            ux.terminal_snippets_menu,
+                            "hosts.more.snippets",
+                            Some(Icon::Terminal),
+                            true,
+                            false,
+                            metrics,
+                        )
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.close_home_menu(cx);
+                                this.open_snippets(false, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        components::menu_entry(
+                            strings.nav_transfers,
+                            "hosts.more.transfers",
+                            Some(Icon::Transfer),
+                            true,
+                            false,
+                            metrics,
+                        )
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.close_home_menu(cx);
+                                this.open_tool(super::shell::Tool::Transfers, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        components::menu_entry(
+                            strings.nav_forwards,
+                            "hosts.more.forwards",
+                            Some(Icon::Forward),
+                            true,
+                            false,
+                            metrics,
+                        )
+                        .on_click(cx.listener(
+                            |this, _event, window, cx| {
+                                this.close_home_menu(cx);
+                                this.open_global_forwards(window, cx);
+                            },
+                        )),
                     );
                 // While a group is the place on screen, the same rename and delete the
                 // group's right-click menu offers are here too, so they have a visible
@@ -2074,9 +2126,15 @@ impl ShelluneView {
                             .position(position)
                             .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
                             .child(
-                                div()
-                                    .occlude()
-                                    .child(components::menu_enter(card, "home.menu.enter")),
+                                div().occlude().child(components::menu_enter(
+                                    card.id("home.menu.scroll")
+                                        .max_h(
+                                            (viewport.height - metrics.scale(spacing::LOOSE))
+                                                .max(metrics.scale(MENU_MIN_HEIGHT)),
+                                        )
+                                        .overflow_y_scroll(),
+                                    "home.menu.enter",
+                                )),
                             ),
                     ),
             ),

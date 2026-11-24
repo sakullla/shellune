@@ -75,6 +75,32 @@ static PATTERNS: LazyLock<[(Kind, Regex); 4]> = LazyLock::new(|| {
     ]
 });
 
+/// Whether `url` is an external web link safe to hand to the operating system (`http://` or `https://`).
+///
+/// Other schemes (`ssh://`, `ftp://`, `file://`, custom handlers) are deliberately refused so
+/// terminal output can never trigger arbitrary local commands or protocol handlers.
+#[must_use]
+pub fn is_openable_http_url(url: &str) -> bool {
+    let rest = if url
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
+        &url[7..]
+    } else if url
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        &url[8..]
+    } else {
+        return false;
+    };
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..host_end];
+    !authority.is_empty()
+        && authority.chars().any(|ch| ch.is_ascii_alphanumeric())
+        && !url.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+}
+
 /// The highlighted spans of one line, as byte ranges, in order and without overlap.
 ///
 /// A link wins over the address inside it, and an earlier span over a later one that
@@ -156,5 +182,19 @@ mod tests {
             ]
         );
         assert!(kinds("errorless terror warnings_off").is_empty());
+    }
+
+    #[test]
+    fn only_http_and_https_links_pass_the_openable_allowlist() {
+        assert!(is_openable_http_url("https://example.com/docs?q=1"));
+        assert!(is_openable_http_url("http://10.0.0.5:8080/health"));
+        assert!(is_openable_http_url("HTTPS://EXAMPLE.COM"));
+        assert!(!is_openable_http_url("ssh://root@10.0.0.5"));
+        assert!(!is_openable_http_url("ftp://files.example.com/pub"));
+        assert!(!is_openable_http_url("file:///etc/passwd"));
+        assert!(!is_openable_http_url("javascript:alert(1)"));
+        assert!(!is_openable_http_url("https://"));
+        assert!(!is_openable_http_url("https:///only-path"));
+        assert!(!is_openable_http_url("https://example.com/bad\x07url"));
     }
 }

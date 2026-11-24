@@ -18,7 +18,10 @@
 use std::rc::Rc;
 
 use gpui::prelude::*;
-use gpui::{Context, Div, Entity, FocusHandle, KeyDownEvent, SharedString, Stateful, Window, div};
+use gpui::{
+    Context, Div, Entity, FocusHandle, KeyDownEvent, MouseButton, SharedString, Stateful, Window,
+    div,
+};
 use shellune_core::SessionId;
 
 use super::{ShelluneView, may_reconnect};
@@ -399,9 +402,16 @@ impl ShelluneView {
     ) -> Stateful<Div> {
         let ring = theme::swatch(palette::FOCUS_RING);
         let keyed = press.clone();
+        let active_session = self.bar_session().or(self.active) == Some(id);
         button
-            .track_focus(&self.banner_focus[stop.slot()])
-            .focus(move |style| style.border_2().border_color(ring))
+            .when(active_session, |button| {
+                button
+                    .track_focus(&self.banner_focus[stop.slot()])
+                    .focus(move |style| style.border_2().border_color(ring))
+            })
+            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                cx.stop_propagation();
+            })
             .on_key_down(cx.listener(move |view, event: &KeyDownEvent, window, cx| {
                 let keystroke = &event.keystroke;
                 let modifiers = &keystroke.modifiers;
@@ -442,7 +452,7 @@ impl ShelluneView {
             None => sentence.clone(),
         };
         div()
-            .id(selector)
+            .id(SharedString::from(format!("{selector}.{id:?}")))
             .debug_selector(move || selector.to_owned())
             .flex_1()
             .min_w_0()
@@ -489,7 +499,7 @@ impl ShelluneView {
         let button = components::icon_only_button(Icon::Close, metrics)
             .size(metrics.hit_target())
             .flex_none()
-            .id(selector)
+            .id(SharedString::from(format!("{selector}.{id:?}")))
             .debug_selector(move || selector.to_owned())
             .tooltip(components::tooltip(copy::ux().banner_dismiss));
         self.banner_control(
@@ -505,6 +515,7 @@ impl ShelluneView {
     /// is given, that copies all of it on a click (ADR-6).
     fn copyable_lines(
         &self,
+        id: SessionId,
         selector: &'static str,
         text: &str,
         cx: &mut Context<Self>,
@@ -513,7 +524,7 @@ impl ShelluneView {
         let copied = text.to_owned();
         let hover = theme::swatch(palette::TEXT_PRIMARY);
         div()
-            .id(selector)
+            .id(SharedString::from(format!("{selector}.{id:?}")))
             .debug_selector(move || selector.to_owned())
             // Its whole height inside the box that scrolls it.
             .flex()
@@ -596,7 +607,7 @@ impl ShelluneView {
                 };
                 let button = button
                     .flex_none()
-                    .id("terminal.failure.next")
+                    .id(SharedString::from(format!("terminal.failure.next.{id:?}")))
                     .debug_selector(|| "terminal.failure.next".to_owned())
                     .tooltip(components::tooltip(SharedString::from(tooltip)));
                 row = row.child(self.banner_control(
@@ -614,7 +625,7 @@ impl ShelluneView {
                     components::compact_button(strings.session_close, Variant::Secondary, metrics)
                 }
                 .flex_none()
-                .id("terminal.failure.next")
+                .id(SharedString::from(format!("terminal.failure.next.{id:?}")))
                 .debug_selector(|| "terminal.failure.next".to_owned())
                 .tooltip(components::tooltip(strings.session_close));
                 row = row.child(self.banner_control(
@@ -648,7 +659,9 @@ impl ShelluneView {
             };
             let button = button
                 .flex_none()
-                .id("terminal.failure.details")
+                .id(SharedString::from(format!(
+                    "terminal.failure.details.{id:?}"
+                )))
                 .debug_selector(|| "terminal.failure.details".to_owned())
                 .tooltip(components::tooltip(label));
             row = row.child(self.banner_control(
@@ -681,7 +694,7 @@ impl ShelluneView {
             )
             .h(metrics.compact_control_height())
             .flex_none()
-            .id("terminal.failure.copy")
+            .id(SharedString::from(format!("terminal.failure.copy.{id:?}")))
             .debug_selector(|| "terminal.failure.copy".to_owned());
             let copy_button = self.banner_control(
                 id,
@@ -691,7 +704,9 @@ impl ShelluneView {
                 cx,
             );
             let detail = div()
-                .id("terminal.failure.detail")
+                .id(SharedString::from(format!(
+                    "terminal.failure.detail.{id:?}"
+                )))
                 .debug_selector(|| "terminal.failure.detail".to_owned())
                 .flex()
                 .flex_col()
@@ -728,7 +743,7 @@ impl ShelluneView {
                 .child(
                     // One block per line of the reason, each wrapped at the box's width;
                     // a click anywhere on it copies the whole reason.
-                    self.copyable_lines("terminal.failure.diagnostic", reason, cx),
+                    self.copyable_lines(id, "terminal.failure.diagnostic", reason, cx),
                 );
             // The box keeps to a share of the pane as well as to its own most: in a
             // short pane the details give way before the last screen does.
@@ -768,7 +783,9 @@ impl ShelluneView {
             components::compact_button(ux.banner_cancel, Variant::Secondary, metrics)
         }
         .flex_none()
-        .id("terminal.reconnecting.cancel")
+        .id(SharedString::from(format!(
+            "terminal.reconnecting.cancel.{id:?}"
+        )))
         .debug_selector(|| "terminal.reconnecting.cancel".to_owned())
         .tooltip(components::tooltip(ux.banner_cancel));
         let row = Self::banner_line(
@@ -807,7 +824,9 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) {
         if let Some((banner, focus)) = self.status_banner(id, cx) {
-            pane.read(cx).set_status_banner(banner, Some(focus));
+            let active_session = self.bar_session().or(self.active) == Some(id);
+            pane.read(cx)
+                .set_status_banner(banner, active_session.then_some(focus));
         }
     }
 

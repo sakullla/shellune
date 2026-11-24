@@ -34,8 +34,8 @@ pub use alacritty_terminal::term::TermMode;
 pub use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 pub use blocks::{BlockFilter, BlockStatus, CommandBlock, CommandBlockId, WorkingDirectory};
 pub use core::{
-    CellAttributes, DEFAULT_SCROLLBACK, HistoryMatch, RenderedCell, RenderedCursor, RenderedRow,
-    Snapshot, TerminalCore, TerminalEffects,
+    CellAttributes, DEFAULT_SCROLLBACK, DetectedLink, HistoryMatch, RenderedCell, RenderedCursor,
+    RenderedRow, Snapshot, TerminalCore, TerminalEffects,
 };
 pub use input::{
     Key, KeyModifiers, encode_key, encode_paste, encode_text, paste_needs_confirmation,

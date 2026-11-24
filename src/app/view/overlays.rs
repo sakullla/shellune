@@ -16,8 +16,8 @@ use shellune_core::{
 
 use super::shell::ModalContent;
 use super::{
-    AccentRow, PaneKind, ShelluneView, TabRenameLimit, destination_icon, program_label,
-    session_target,
+    AccentRow, PaneKind, ShelluneView, TabMenuTarget, TabRenameLimit, destination_icon,
+    program_label, session_target,
 };
 use crate::app::components::{self, Variant};
 use crate::app::copy;
@@ -460,7 +460,10 @@ impl ShelluneView {
             command: Command::ManageSnippets,
             group: Group::Snippets,
             title: ux.snippet_manage_action.to_owned(),
-            detail: ux.snippet_manage_hint.to_owned(),
+            detail: format!(
+                "{} · {}",
+                ux.snippet_manage_hint, ux.snippet_palette_aliases
+            ),
             shortcut: None,
             icon: Icon::Terminal,
             current: false,
@@ -488,6 +491,33 @@ impl ShelluneView {
                 current: false,
             });
         }
+        entries.push(Entry {
+            command: Command::OpenTransfers,
+            group: Group::Navigate,
+            title: strings.nav_transfers.to_owned(),
+            detail: strings.nav_transfers_summary.to_owned(),
+            shortcut: None,
+            icon: Icon::Transfer,
+            current: false,
+        });
+        entries.push(Entry {
+            command: Command::GoTo(Destination::Forwards),
+            group: Group::Navigate,
+            title: strings.nav_forwards.to_owned(),
+            detail: strings.nav_forwards_summary.to_owned(),
+            shortcut: None,
+            icon: Icon::Forward,
+            current: false,
+        });
+        entries.push(Entry {
+            command: Command::OpenBatchTasks,
+            group: Group::Actions,
+            title: ux.hosts_batch_open.to_owned(),
+            detail: ux.hosts_batch_open_hint.to_owned(),
+            shortcut: None,
+            icon: Icon::Layers,
+            current: false,
+        });
         entries.push(Entry {
             command: Command::OpenVault,
             group: Group::Navigate,
@@ -863,6 +893,8 @@ impl ShelluneView {
             Command::RunSnippet(id) => self.use_snippet(id, true, cx),
             Command::ManageSnippets => self.open_snippets(false, cx),
             Command::NewSnippet => self.open_snippets(true, cx),
+            Command::OpenTransfers => self.open_tool(super::shell::Tool::Transfers, cx),
+            Command::OpenBatchTasks => self.open_batch_tool(cx),
             Command::CloseTab(id) => self.request_close_session(id, cx),
             Command::Reconnect(id) => {
                 if self.may_reconnect_session(id) {
@@ -1220,9 +1252,32 @@ impl ShelluneView {
         self.shell_menu_open = false;
         self.remember_focus(window, cx);
         self.accent_hover = None;
-        self.tab_menu = Some((id, event.position));
+        self.tab_menu = Some((TabMenuTarget::Session(id), event.position));
         window.focus(&self.root_focus.clone());
         cx.notify();
+    }
+
+    pub(super) fn open_pending_tab_menu(
+        &mut self,
+        tab: TabId,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.shell_menu_open = false;
+        self.remember_focus(window, cx);
+        self.accent_hover = None;
+        self.tab_menu = Some((TabMenuTarget::Tab(tab), event.position));
+        window.focus(&self.root_focus.clone());
+        cx.notify();
+    }
+
+    pub(super) fn open_batch_tool(&mut self, cx: &mut Context<Self>) {
+        if self.batch.show_active_run() {
+            cx.notify();
+        } else {
+            self.open_batch_preview(cx);
+        }
     }
 
     /// Whether a tab menu is open.
@@ -1469,11 +1524,12 @@ impl ShelluneView {
         )
     }
 
-    /// Opens another session like `id`: the same shell, or the same host's form.
+    /// Opens another session like `id`: the same shell, or a new session tab for the
+    /// same host directly inside the terminal workspace.
     pub fn duplicate_session(
         &mut self,
         id: SessionId,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(session) = self.workspace.session(id) else {
@@ -1485,6 +1541,10 @@ impl ShelluneView {
         self.workspace.clear_armed();
         match kind {
             SessionKind::Local { shell } => {
+                if self.workspace.destination() != Destination::LocalShells {
+                    self.workspace.select(Destination::LocalShells);
+                }
+                self.session_terminal = true;
                 let known = self
                     .workspace
                     .shells()
@@ -1506,15 +1566,22 @@ impl ShelluneView {
                 self.start_shell(shell, cx);
             }
             SessionKind::Remote { host } => {
-                if let Some(host) = self.book.host(host).cloned() {
-                    self.select(Destination::Hosts, window, cx);
-                    self.open_remote(&host, cx);
+                if let Some(saved) = self.book.host(host).cloned() {
+                    self.open_remote_duplicate(&saved, false, cx);
+                } else if let Some((_, unsaved)) =
+                    self.unsaved.iter().find(|(sid, _)| *sid == id).cloned()
+                {
+                    self.open_remote_duplicate(&unsaved, true, cx);
                 }
             }
             SessionKind::Rdp { host }
             | SessionKind::Vnc { host }
             | SessionKind::Serial { host } => {
                 if self.book.connection(host).is_some() {
+                    if self.workspace.destination() != Destination::LocalShells {
+                        self.workspace.select(Destination::LocalShells);
+                    }
+                    self.session_terminal = true;
                     self.connect_saved_connection(host, cx);
                 }
             }
@@ -1543,13 +1610,30 @@ impl ShelluneView {
 
     /// The tab menu, where it was opened.
     pub(super) fn tab_menu_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
-        let (id, position) = self.tab_menu?;
+        let (target, position) = self.tab_menu?;
         let metrics = self.metrics();
         let strings = self.strings();
+        let ux = copy::ux();
         let viewport = window.viewport_size();
         let tab_count = self.workspace.layout().tabs().len();
-        let index =
-            (0..tab_count).find(|index| self.workspace.layout().anchor_of(*index) == Some(id))?;
+        let (index, tab, session_opt) = match target {
+            TabMenuTarget::Session(id) => {
+                let index = (0..tab_count)
+                    .find(|index| self.workspace.layout().anchor_of(*index) == Some(id))?;
+                let tab = self.workspace.tab_of_session(id);
+                (index, tab, Some(id))
+            }
+            TabMenuTarget::Tab(tab_id) => {
+                let index = self
+                    .workspace
+                    .layout()
+                    .tabs()
+                    .iter()
+                    .position(|tab| tab.id() == tab_id)?;
+                let anchor = self.workspace.layout().anchor_of(index);
+                (index, Some(tab_id), anchor)
+            }
+        };
         // The shared menu entry, with the shortcut in force at its far end: the tab's
         // menu is the same object as every other menu (R2).
         let item = |label: &'static str,
@@ -1564,24 +1648,70 @@ impl ShelluneView {
 
         let has_others = tab_count > 1;
         let has_right = index + 1 < tab_count;
-        let tab = self.workspace.tab_of_session(id);
+        let forward_host = session_opt
+            .and_then(|id| self.workspace.session(id))
+            .and_then(|session| match session.kind() {
+                SessionKind::Remote { host } if self.book.host(*host).is_some() => Some(*host),
+                _ => None,
+            })
+            .or_else(|| {
+                if session_opt.is_none() {
+                    tab.and_then(|tab_id| self.workspace.layout().tab(tab_id))
+                        .and_then(|t| first_target(t.root()))
+                        .and_then(|target| match target {
+                            PaneTarget::Remote { host } if self.book.host(*host).is_some() => {
+                                Some(*host)
+                            }
+                            _ => None,
+                        })
+                } else {
+                    None
+                }
+            });
         // The tab is known by the pane that has its keyboard, so that is the one a
         // reconnect restarts; the entry is only there when another attempt can help.
-        let reconnect = self.may_reconnect_session(id).then(|| {
-            item(
-                strings.session_reconnect,
-                "tab.menu.reconnect",
-                Icon::Refresh,
-                self.keymap.label("session.reconnect"),
-                true,
-            )
-            .on_click(cx.listener(move |this, _event, window, cx| {
-                this.close_tab_menu(window, cx);
-                if this.may_reconnect_session(id) {
-                    this.reconnect_session(id, cx);
-                }
-            }))
-        });
+        let reconnect = session_opt
+            .filter(|id| self.may_reconnect_session(*id))
+            .map(|id| {
+                item(
+                    strings.session_reconnect,
+                    "tab.menu.reconnect",
+                    Icon::Refresh,
+                    self.keymap.label("session.reconnect"),
+                    true,
+                )
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.close_tab_menu(window, cx);
+                    if this.may_reconnect_session(id) {
+                        this.reconnect_session(id, cx);
+                    }
+                }))
+            });
+        let pending_connect = if session_opt.is_none() {
+            tab.map(|tab_id| {
+                let can_connect = self.pending_tab_can_connect(tab_id);
+                item(
+                    strings.pane_connect,
+                    "tab.menu.connect",
+                    Icon::Plug,
+                    None,
+                    can_connect,
+                )
+                .when(can_connect, |entry| {
+                    entry.on_click(cx.listener(move |this, _event, window, cx| {
+                        this.close_tab_menu(window, cx);
+                        this.connect_pending_tab_from_menu(tab_id, window, cx);
+                    }))
+                })
+            })
+        } else {
+            None
+        };
+        let can_duplicate = match (session_opt, tab) {
+            (Some(_), _) => true,
+            (None, Some(tab_id)) => self.pending_tab_can_duplicate(tab_id),
+            (None, None) => false,
+        };
         // The menu holds more than it used to (a name, the colours and the close
         // actions), so it caps its own height and scrolls: at 200% text in the
         // smallest window the last entry still has to be reachable (R4).
@@ -1596,18 +1726,27 @@ impl ShelluneView {
             .when_some(reconnect, |menu, reconnect| {
                 menu.child(reconnect).child(divider())
             })
+            .when_some(pending_connect, |menu, connect| {
+                menu.child(connect).child(divider())
+            })
             .child(
                 item(
                     strings.tab_menu_duplicate,
                     "tab.menu.duplicate",
                     Icon::Copy,
                     None,
-                    true,
+                    can_duplicate,
                 )
-                .on_click(cx.listener(move |this, _event, window, cx| {
-                    this.close_tab_menu(window, cx);
-                    this.duplicate_session(id, window, cx);
-                })),
+                .when(can_duplicate, |entry| {
+                    entry.on_click(cx.listener(move |this, _event, window, cx| {
+                        this.close_tab_menu(window, cx);
+                        if let Some(id) = session_opt {
+                            this.duplicate_session(id, window, cx);
+                        } else if let Some(tab_id) = tab {
+                            this.duplicate_pending_tab(tab_id, window, cx);
+                        }
+                    }))
+                }),
             )
             .child(
                 item(
@@ -1624,6 +1763,24 @@ impl ShelluneView {
                     }))
                 }),
             )
+            .when_some(forward_host, |menu, host| {
+                menu.child(
+                    item(
+                        ux.session_forwards,
+                        "tab.menu.forwards",
+                        Icon::Forward,
+                        None,
+                        true,
+                    )
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.close_tab_menu(window, cx);
+                        this.show_forwards_scope(
+                            crate::app::forwarding::ForwardScope::Host(host),
+                            cx,
+                        );
+                    })),
+                )
+            })
             .child(divider())
             .children(tab.map(|tab| self.tab_accent_choices(tab, AccentRow::Menu, cx)))
             .child(divider())
@@ -1638,7 +1795,11 @@ impl ShelluneView {
                 .when(index > 0, |item| {
                     item.on_click(cx.listener(move |this, _event, window, cx| {
                         this.close_tab_menu(window, cx);
-                        this.reorder_tab(id, -1, cx);
+                        if let Some(id) = session_opt {
+                            this.reorder_tab(id, -1, cx);
+                        } else if let Some(tab_id) = tab {
+                            this.reorder_tab_by_id(tab_id, -1, cx);
+                        }
                     }))
                 }),
             )
@@ -1653,7 +1814,11 @@ impl ShelluneView {
                 .when(index + 1 < tab_count, |item| {
                     item.on_click(cx.listener(move |this, _event, window, cx| {
                         this.close_tab_menu(window, cx);
-                        this.reorder_tab(id, 1, cx);
+                        if let Some(id) = session_opt {
+                            this.reorder_tab(id, 1, cx);
+                        } else if let Some(tab_id) = tab {
+                            this.reorder_tab_by_id(tab_id, 1, cx);
+                        }
                     }))
                 }),
             )
@@ -1668,7 +1833,11 @@ impl ShelluneView {
                 )
                 .on_click(cx.listener(move |this, _event, window, cx| {
                     this.close_tab_menu(window, cx);
-                    this.request_close_tab_anchor(id, cx);
+                    if let Some(id) = session_opt {
+                        this.request_close_tab_anchor(id, cx);
+                    } else if let Some(tab_id) = tab {
+                        this.close_tab_by_id(tab_id, cx);
+                    }
                 })),
             )
             .child(
@@ -1682,7 +1851,11 @@ impl ShelluneView {
                 .when(has_others, |item| {
                     item.on_click(cx.listener(move |this, _event, window, cx| {
                         this.close_tab_menu(window, cx);
-                        this.close_other_tabs(id, cx);
+                        if let Some(id) = session_opt {
+                            this.close_other_tabs(id, cx);
+                        } else if let Some(tab_id) = tab {
+                            this.close_other_tabs_by_id(tab_id, cx);
+                        }
                     }))
                 }),
             )
@@ -1697,7 +1870,11 @@ impl ShelluneView {
                 .when(has_right, |item| {
                     item.on_click(cx.listener(move |this, _event, window, cx| {
                         this.close_tab_menu(window, cx);
-                        this.close_tabs_after(id, cx);
+                        if let Some(id) = session_opt {
+                            this.close_tabs_after(id, cx);
+                        } else if let Some(tab_id) = tab {
+                            this.close_tabs_after_by_id(tab_id, cx);
+                        }
                     }))
                 }),
             );
@@ -1778,7 +1955,12 @@ impl ShelluneView {
     /// A swatch is a control like the button beside it, so it answers the pointer the
     /// same way: the fill and ring of a hovered or pressed swatch come from
     /// [`theme::accent_swatch_face`], and the chosen one keeps its ring in every state.
-    fn tab_accent_choices(&self, tab: TabId, row: AccentRow, cx: &mut Context<Self>) -> Div {
+    pub(super) fn tab_accent_choices(
+        &self,
+        tab: TabId,
+        row: AccentRow,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
         let locale = self.workspace.locale();
@@ -1924,13 +2106,17 @@ impl ShelluneView {
         {
             self.tab_rename = None;
         }
-        if let Some((id, _)) = self.tab_menu
-            && self
-                .workspace
-                .tab_of_session(id)
-                .is_none_or(|tab| !alive(self, tab))
-        {
-            self.tab_menu = None;
+        if let Some((target, _)) = self.tab_menu {
+            let tab_alive = match target {
+                TabMenuTarget::Session(id) => self
+                    .workspace
+                    .tab_of_session(id)
+                    .is_some_and(|tab| alive(self, tab)),
+                TabMenuTarget::Tab(tab) => alive(self, tab),
+            };
+            if !tab_alive {
+                self.tab_menu = None;
+            }
         }
     }
 

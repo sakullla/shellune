@@ -18,6 +18,7 @@
 //!   characters occupy two columns, and a selection is reported per cell.
 
 use std::hash::{DefaultHasher, Hasher};
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -342,6 +343,17 @@ pub struct Snapshot {
     pub mode: TermMode,
 }
 
+/// An external `http://` or `https://` link recognized on one visible row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetectedLink {
+    /// Viewport row index from the top.
+    pub row: usize,
+    /// Grid column span `[start..end)` covered by the link.
+    pub columns: Range<usize>,
+    /// Matched URL text with trailing sentence punctuation stripped.
+    pub url: String,
+}
+
 impl Snapshot {
     /// The text of one row, trailing blanks removed.
     #[must_use]
@@ -361,6 +373,56 @@ impl Snapshot {
             .filter_map(|row| self.row_text(row))
             .collect()
     }
+
+    /// Returns the openable `http(s)://` link covering `(row, column)` when not on the
+    /// alternate screen.
+    #[must_use]
+    pub fn http_link_at(&self, row: usize, column: usize) -> Option<DetectedLink> {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let rendered = self.rows.get(row)?;
+        http_link_in_cells(row, column, &rendered.cells)
+    }
+}
+
+fn http_link_in_cells(row: usize, column: usize, cells: &[RenderedCell]) -> Option<DetectedLink> {
+    let mut line = String::new();
+    let mut byte_to_cell = Vec::new();
+    let mut cell_columns = Vec::with_capacity(cells.len());
+    let mut col = 0usize;
+    for (index, cell) in cells.iter().enumerate() {
+        let width = cell.width.max(1);
+        cell_columns.push((col, col + width));
+        byte_to_cell.extend(std::iter::repeat_n(index, cell.text.len()));
+        line.push_str(&cell.text);
+        col += width;
+    }
+    for (range, kind) in crate::highlight::spans(&line) {
+        if kind != crate::highlight::Kind::Link || range.is_empty() {
+            continue;
+        }
+        let candidate = &line[range.clone()];
+        if !crate::highlight::is_openable_http_url(candidate) {
+            continue;
+        }
+        let Some(&first_cell) = byte_to_cell.get(range.start) else {
+            continue;
+        };
+        let Some(&last_cell) = byte_to_cell.get(range.end - 1) else {
+            continue;
+        };
+        let start_col = cell_columns[first_cell].0;
+        let end_col = cell_columns[last_cell].1;
+        if (start_col..end_col).contains(&column) {
+            return Some(DetectedLink {
+                row,
+                columns: start_col..end_col,
+                url: candidate.to_owned(),
+            });
+        }
+    }
+    None
 }
 
 // The shell echoes edits asynchronously, especially over SSH. Only fingerprints
@@ -567,6 +629,33 @@ impl TerminalCore {
     /// Jumps back to the live output.
     pub fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// Clears the visible primary screen and scrollback history without writing to the PTY.
+    ///
+    /// Full-screen alternate programs own their screen and are left untouched.
+    pub fn clear_screen_and_scrollback(&mut self) {
+        if self.on_alternate_screen() {
+            return;
+        }
+        self.parser.advance(&mut self.term, b"\x1b[H\x1b[2J\x1b[3J");
+        self.term.scroll_display(Scroll::Bottom);
+        self.term.selection = None;
+        self.blocks = BlockBook::new();
+        self.completion_echo = CompletionEcho::Ready;
+        self.lines_dropped = 0;
+        self.last_history = 0;
+        self.row_addresses.clear();
+    }
+
+    /// Returns the openable `http(s)://` link at viewport `(row, column)` when on the
+    /// primary screen.
+    #[must_use]
+    pub fn http_link_at(&self, row: usize, column: usize) -> Option<DetectedLink> {
+        if self.on_alternate_screen() || row >= self.grid.rows || column >= self.grid.cols {
+            return None;
+        }
+        self.snapshot().http_link_at(row, column)
     }
 
     /// Starts a mouse selection at a viewport row and column.
@@ -3138,5 +3227,52 @@ mod tests {
         terminal.begin_selection_at_anchor(anchor, 0, Side::Left, SelectionType::Simple);
         terminal.extend_selection(0, 5, Side::Right);
         assert!(terminal.has_selection());
+    }
+
+    #[test]
+    fn http_link_hit_testing_aligns_with_wide_cells_and_skips_alternate_or_non_http() {
+        let mut terminal = TerminalCore::new(60, 6, 50);
+        terminal.feed("访问 https://example.com/docs, or ssh://git@host/repo.".as_bytes());
+        // "访问 " is 2 + 2 + 1 = 5 columns; "https://example.com/docs" spans columns 5..29.
+        assert_eq!(terminal.http_link_at(0, 4), None);
+        let link = terminal.http_link_at(0, 5).expect("http link at start col");
+        assert_eq!(link.url, "https://example.com/docs");
+        assert_eq!(link.columns, 5..29);
+        assert_eq!(terminal.http_link_at(0, 28), Some(link));
+        assert_eq!(
+            terminal.http_link_at(0, 29),
+            None,
+            "trailing comma excluded"
+        );
+        // ssh:// is highlighted as text but never openable via external URL launch.
+        for col in 30..59 {
+            assert_eq!(terminal.http_link_at(0, col), None);
+        }
+
+        // Alternate screen never exposes clickable links.
+        terminal.feed(b"\x1b[?1049h\x1b[Hhttps://example.com/alt");
+        assert_eq!(terminal.http_link_at(0, 2), None);
+    }
+
+    #[test]
+    fn clear_screen_and_scrollback_wipes_history_and_screen_only_on_primary_grid() {
+        let mut terminal = TerminalCore::new(40, 4, 50);
+        for index in 0..12 {
+            terminal.feed(format!("line-{index}\r\n").as_bytes());
+        }
+        terminal.scroll(4);
+        assert!(terminal.history() > 0);
+        assert!(terminal.display_offset() > 0);
+
+        terminal.clear_screen_and_scrollback();
+        assert_eq!(terminal.history(), 0);
+        assert_eq!(terminal.display_offset(), 0);
+        let snap = terminal.snapshot();
+        assert!(snap.text().iter().all(String::is_empty));
+        assert_eq!(
+            snap.cursor.map(|c| (c.row, c.column)),
+            Some((0, 0)),
+            "cursor returns to origin"
+        );
     }
 }

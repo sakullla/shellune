@@ -926,7 +926,7 @@ pub struct ShelluneView {
     /// A category the navigation scrolled to and the page has not drawn there yet.
     settings_pending_reveal: std::cell::Cell<bool>,
     /// The tab whose menu is open, and where the pointer opened it.
-    tab_menu: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
+    tab_menu: Option<(TabMenuTarget, gpui::Point<gpui::Pixels>)>,
     /// The tab whose name is being edited, while that dialog is open.
     tab_rename: Option<TabRename>,
     /// The colour swatch the pointer is on, and which of the two rows it is in.
@@ -970,6 +970,14 @@ pub struct ShelluneView {
     layout_error: Option<String>,
     /// The split whose divider is being dragged.
     split_drag: Option<SplitDrag>,
+    /// The split whose divider band is hovered by the pointer.
+    split_hover_band: Option<u64>,
+    /// The split nudge button currently hovered by the pointer.
+    split_hover_button: Option<(u64, &'static str)>,
+    /// The split divider currently focused by keyboard, if any.
+    split_focused_divider: Option<u64>,
+    /// Focus handle for split divider keyboard focus.
+    divider_focus: FocusHandle,
     /// Measured pixel span of each split node along its axis, for 1:1 divider dragging.
     split_spans: RefCell<HashMap<u64, f32>>,
     /// Whether the sessions page shows the selected terminal rather than the list.
@@ -1157,9 +1165,15 @@ struct TabRename {
     shortened: bool,
 }
 
-/// One of the two rows of colour swatches a tab can be coloured from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TabMenuTarget {
+    Session(SessionId),
+    Tab(shellune_core::TabId),
+}
+
+/// One of the rows of colour swatches a tab can be coloured from.
 ///
-/// Both rows draw the same swatches and answer the pointer the same way; the row only
+/// Every row draws the same swatches and answers the pointer the same way; the row only
 /// names which surface a hovered swatch belongs to, so the state a test reads and the
 /// debug selector agree with the row on screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1168,6 +1182,8 @@ pub(crate) enum AccentRow {
     Menu,
     /// The swatches in the tab-name dialog.
     Rename,
+    /// The swatches in the session bar's more menu.
+    SessionMore,
 }
 
 impl AccentRow {
@@ -1177,6 +1193,7 @@ impl AccentRow {
         match self {
             Self::Menu => "tab.menu",
             Self::Rename => "tab.rename",
+            Self::SessionMore => "session.more",
         }
     }
 }
@@ -1988,12 +2005,14 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         let layout = self.workspace.layout();
-        let anchor = (0..layout.tabs().len())
+        let target = (0..layout.tabs().len())
             .filter_map(|index| layout.anchor_of(index))
             .find(|anchor| Some(*anchor) == layout.active_session())
+            .map(TabMenuTarget::Session)
+            .or_else(|| layout.active_tab().map(|tab| TabMenuTarget::Tab(tab.id())))
             .ok_or_else(|| "the tab on screen has no session to open a menu for".to_owned())?;
         self.shell_menu_open = false;
-        self.tab_menu = Some((anchor, position));
+        self.tab_menu = Some((target, position));
         cx.notify();
         Ok(())
     }
@@ -3035,6 +3054,10 @@ impl ShelluneView {
             layout_persist: false,
             layout_error: None,
             split_drag: None,
+            split_hover_band: None,
+            split_hover_button: None,
+            split_focused_divider: None,
+            divider_focus: cx.focus_handle(),
             split_spans: RefCell::new(HashMap::new()),
             session_terminal: false,
             desktop_fullscreen: None,
@@ -4684,9 +4707,30 @@ impl ShelluneView {
     /// Entering hides chrome while keeping the active session and its keyboard focus intact.
     /// Leaving restores the pre-entry single or split layout and returns focus to the active
     /// terminal or desktop surface without recreating or reconnecting anything.
+    fn sync_panes_focus_mode(&mut self, cx: &mut Context<Self>) {
+        let on = self.focus_mode;
+        let panes: Vec<Entity<TerminalPane>> = self
+            .panes
+            .iter()
+            .filter_map(|open| open.content.terminal().cloned())
+            .chain(
+                self.reconnect_screens
+                    .values()
+                    .map(|(pane, _)| pane.clone()),
+            )
+            .collect();
+        for pane in panes {
+            pane.update(cx, |pane, cx| {
+                pane.set_focus_mode(on);
+                cx.notify();
+            });
+        }
+    }
+
     pub(super) fn toggle_focus_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.focus_mode {
             self.focus_mode = false;
+            self.sync_panes_focus_mode(cx);
             self.reclaim_focus(window, cx);
             return;
         }
@@ -4697,14 +4741,16 @@ impl ShelluneView {
         self.shell_menu_open = false;
         self.session_more = None;
         self.tab_menu = None;
+        self.sync_panes_focus_mode(cx);
         self.reclaim_focus(window, cx);
     }
 
     /// Automatically leaves focus mode if the user navigates away from a session page
     /// or no session remains on screen, so the user is never stranded without chrome.
-    fn settle_focus_mode(&mut self) {
+    fn settle_focus_mode(&mut self, cx: &mut Context<Self>) {
         if self.focus_mode && !self.can_focus_mode() {
             self.focus_mode = false;
+            self.sync_panes_focus_mode(cx);
         }
     }
 
@@ -5051,7 +5097,7 @@ impl ShelluneView {
         // terminal behind it, which would take input the person cannot see (R17).
         if self.tool == Some(shell::Tool::Snippets) {
             let handle = self.snippet_panel.editor().map_or_else(
-                || self.snippet_focus.clone(),
+                || self.preferred_snippet_list_focus(cx),
                 |editor| editor.name.read(cx).focus_handle().clone(),
             );
             self.snippet_focus_pending = Some(handle);
@@ -5740,6 +5786,17 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) {
         let locals: Vec<String> = match request {
+            terminal::PaneRequest::OpenSnippets => {
+                if self.workspace.layout_mut().focus_session(id) {
+                    self.active = Some(id);
+                }
+                self.open_snippets(false, cx);
+                return;
+            }
+            terminal::PaneRequest::Split(axis) => {
+                self.split_session_pane(id, axis, cx);
+                return;
+            }
             terminal::PaneRequest::Platform(platform) => {
                 if let Some(SessionKind::Remote { host }) = self
                     .workspace
@@ -6052,7 +6109,10 @@ impl ShelluneView {
         if self.session_more.is_some_and(|(session, _)| session == id) {
             self.session_more = None;
         }
-        if self.tab_menu.is_some_and(|(session, _)| session == id) {
+        if self
+            .tab_menu
+            .is_some_and(|(target, _)| target == TabMenuTarget::Session(id))
+        {
             self.tab_menu = None;
         }
         if self
@@ -7041,6 +7101,9 @@ impl ShelluneView {
                 // cleanup below takes this session's attempt, panel and questions away,
                 // and a different form on screen must not go with them.
                 self.park_focused_form();
+                if self.workspace.layout_mut().focus_session(id) {
+                    self.active = Some(id);
+                }
                 // The last screen stays under the banner that says the session is
                 // coming back, until the new terminal takes its place (ADR-6).
                 self.keep_reconnect_screen(id);
@@ -7277,6 +7340,7 @@ impl ShelluneView {
             // Leaving the session workspace always exits focus mode so Hosts/Settings
             // never open without navigation chrome (ADR-1, R1).
             self.focus_mode = false;
+            self.sync_panes_focus_mode(cx);
         }
         self.workspace.select(destination);
         self.workspace.set_context(match destination {
@@ -9771,6 +9835,49 @@ impl ShelluneView {
         self.open_remote_after_park_inner(host, cx);
     }
 
+    /// Duplicates a remote SSH session directly inside the terminal workspace, opening
+    /// and switching to a new session tab immediately even when interactive credentials
+    /// are requested before dialling.
+    pub(super) fn open_remote_duplicate(
+        &mut self,
+        host: &HostConfig,
+        is_unsaved: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.destination() != Destination::LocalShells {
+            self.workspace.select(Destination::LocalShells);
+        }
+        self.session_terminal = true;
+        self.pending_open_files = None;
+        self.forward_only_dial = false;
+        self.pending_forward_rules.clear();
+        self.park_focused_form();
+        self.ephemeral_ssh_secrets.clear();
+        self.reconnect = None;
+        self.form_session = None;
+        self.pending_ephemeral = is_unsaved.then(|| host.clone());
+        self.chain = Some(if is_unsaved {
+            ChainDraft::single(host.clone())
+        } else {
+            ChainDraft::prepare(self.book.hosts(), host)
+        });
+        self.remote = Some(RemotePanel::new(host));
+        self.remote_more = false;
+        self.remote_edit_auth = false;
+        self.showing_connection_form = true;
+        self.sync_remote_fields(cx);
+        let new_id = self.workspace.register_remote_session(host).id();
+        if is_unsaved {
+            self.unsaved.push((new_id, host.clone()));
+        }
+        self.form_session = Some(new_id);
+        self.active = Some(new_id);
+        self.workspace.layout_mut().focus_session(new_id);
+        self.checkpoint_layout();
+        self.connect_when_ready(host, cx);
+        cx.notify();
+    }
+
     fn open_remote_after_park_inner(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
         self.reconnect = None;
         self.form_session = None;
@@ -10430,7 +10537,11 @@ impl ShelluneView {
             self.workspace.session(*id).is_some_and(|session| {
                 matches!(session.kind(), SessionKind::Remote { host: target } if *target == host.id())
             })
-        }) && self.workspace.session_reconnecting(id)
+        }) && (self
+            .workspace
+            .session(id)
+            .is_some_and(|session| matches!(session.state(), SessionState::Connecting))
+            || self.workspace.session_reconnecting(id))
         {
             return Some(id);
         }
@@ -21591,7 +21702,7 @@ impl Render for ShelluneView {
         // A pane that asked for the whole window keeps it only while it is the one
         // surface on screen (R18).
         self.settle_desktop_fullscreen(window);
-        self.settle_focus_mode();
+        self.settle_focus_mode(cx);
         // In full screen or focus mode the session keeps the whole window: no tab strip
         // and no session bar above the workspace (R1, R18).
         let header = if self.desktop_fullscreen.is_some() {

@@ -2056,6 +2056,7 @@ impl ShelluneView {
             this.forward_confirm = None;
             this.snippet_panel.keep();
             this.snippet_panel.end_edit();
+            this.restore_focus_pending = true;
             cx.notify();
         };
         match tool {
@@ -2248,11 +2249,22 @@ impl ShelluneView {
             self.open_snippet_editor(None, cx);
         } else {
             self.close_snippet_editor(cx);
-            // The list takes the keyboard, so its arrow keys and Enter work without a
-            // pointer. The editor's first field takes it instead when one is opened.
-            self.snippet_focus_pending = Some(self.snippet_focus.clone());
+            // When saved commands exist, the search field takes focus so typing filters
+            // immediately while Up/Down/Enter walk and insert; when empty, the dialog
+            // body takes focus so Escape and keyboard navigation still hold it.
+            self.snippet_focus_pending = Some(self.preferred_snippet_list_focus(cx));
         }
         cx.notify();
+    }
+
+    pub(super) fn preferred_snippet_list_focus(&self, cx: &gpui::App) -> gpui::FocusHandle {
+        if !self.snippets.snippets().is_empty()
+            && let Some(field) = self.snippet_panel.search_field()
+        {
+            field.read(cx).focus_handle().clone()
+        } else {
+            self.snippet_focus.clone()
+        }
     }
 
     /// Opens the editor on one command, or on a command that has not been written yet.
@@ -2310,19 +2322,15 @@ impl ShelluneView {
     /// Puts the editor away without saving anything. What was typed is dropped.
     pub(super) fn close_snippet_editor(&mut self, cx: &mut Context<Self>) {
         if self.snippet_panel.end_edit().is_some() {
-            self.snippet_list_focus();
+            self.snippet_list_focus(cx);
             cx.notify();
         }
     }
 
-    /// Gives the manager's list the keyboard again, once the editor it replaced is gone.
-    ///
-    /// The field that had the keyboard belongs to the editor, so leaving focus on it would
-    /// leave the dialog with nothing to type into; the list is what the next key press is
-    /// about.
-    fn snippet_list_focus(&mut self) {
+    /// Gives the manager's list (or search box) the keyboard again once the editor is gone.
+    fn snippet_list_focus(&mut self, cx: &gpui::App) {
         if self.tool == Some(Tool::Snippets) {
-            self.snippet_focus_pending = Some(self.snippet_focus.clone());
+            self.snippet_focus_pending = Some(self.preferred_snippet_list_focus(cx));
         }
     }
 
@@ -2347,7 +2355,7 @@ impl ShelluneView {
         match outcome {
             Ok(()) => {
                 self.snippet_panel.end_edit();
-                self.snippet_list_focus();
+                self.snippet_list_focus(cx);
                 self.note_data_changed(cx);
                 self.toast(Tone::Positive, copy::ux().snippet_saved, None, cx);
             }
@@ -2374,6 +2382,7 @@ impl ShelluneView {
                 let count = self.snippets.snippets().len();
                 self.snippet_panel
                     .select(self.snippet_panel.selected(), count);
+                self.snippet_list_focus(cx);
                 self.toast(Tone::Positive, copy::ux().snippet_deleted, None, cx);
             }
             Ok(false) => {}
@@ -2431,6 +2440,13 @@ impl ShelluneView {
         let offer = pane.update(cx, |pane, cx| pane.stage_snippet(&body, execute, cx));
         match offer {
             SnippetOffer::Written => {
+                if self.tool == Some(Tool::Snippets) {
+                    self.tool = None;
+                    self.snippet_panel.keep();
+                    self.snippet_panel.end_edit();
+                    self.pane_focus_pending = self.active;
+                    self.restore_focus_pending = true;
+                }
                 self.settle_snippet_note(cx);
                 let title = if execute {
                     ux.snippet_sent
@@ -2438,8 +2454,14 @@ impl ShelluneView {
                     ux.snippet_inserted
                 };
                 self.toast(Tone::Positive, title, None, cx);
+                cx.notify();
             }
             SnippetOffer::Waiting => {
+                if self.tool == Some(Tool::Snippets) {
+                    self.tool = None;
+                    self.snippet_panel.keep();
+                    self.snippet_panel.end_edit();
+                }
                 // Nothing has been written: the corner points at the prompt instead of
                 // reporting a command that did not go anywhere yet, and the note leaves
                 // when the prompt is answered.
@@ -2459,6 +2481,7 @@ impl ShelluneView {
                 if let Some(session) = self.active {
                     self.snippet_note = Some(SnippetNote { session, toast });
                 }
+                cx.notify();
             }
             // A stored body with nothing in it cannot type anything, so nothing is claimed.
             SnippetOffer::Empty => {
@@ -2666,12 +2689,18 @@ impl ShelluneView {
             }
             body = body.child(list);
             if count > 0 {
+                let platform = crate::app::nav::Platform::current();
+                let run_key = crate::app::keymap::keystroke_label(
+                    &format!("{}-enter", platform.keystroke_modifier()),
+                    platform,
+                );
+                let keys_hint = copy::fill(ux.snippet_keys_hint, &[("run_key", &run_key)]);
                 body = body.child(
                     div()
                         .text_size(metrics.caption_size())
                         .text_color(theme::swatch(palette::TEXT_MUTED))
                         .debug_selector(|| "snippets.keys.hint".to_owned())
-                        .child(ux.snippet_keys_hint),
+                        .child(SharedString::from(keys_hint)),
                 );
             }
             if let Some(question) = self.snippet_delete_question(cx) {

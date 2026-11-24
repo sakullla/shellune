@@ -55,6 +55,10 @@ pub enum Command {
     ManageSnippets,
     /// Opens the manager on a command that has not been written yet.
     NewSnippet,
+    /// Opens the global file transfers dialog.
+    OpenTransfers,
+    /// Opens the batch tasks centre.
+    OpenBatchTasks,
     /// Closes the session on screen.
     CloseTab(SessionId),
     /// Starts the ended session of the pane on screen again, in its own tab (R8).
