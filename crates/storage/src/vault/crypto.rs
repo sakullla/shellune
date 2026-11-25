@@ -474,27 +474,26 @@ impl VaultCipher {
     }
 }
 
+/// The format version bound into every authentication tag. It is the version
+/// the cipher was introduced with and stays 2 for good: the file envelope
+/// moved on to format 3 for the host passwords in the body, but the cipher did
+/// not change, and binding the envelope's newer number would make every
+/// existing vault and every synced block fail its tag.
+const CIPHER_BINDING_VERSION: u32 = 2;
+
 const WRAP_LOCAL: &str = "local";
 const WRAP_PASSPHRASE: &str = "passphrase";
 
 /// What the body's tag is bound to: the format, the vault, and the fact that
 /// these bytes are a record body and not a wrap.
 fn body_aad(vault_id: &str) -> Vec<u8> {
-    format!(
-        "shellune-vault/{}/{vault_id}/body",
-        super::VAULT_FORMAT_VERSION
-    )
-    .into_bytes()
+    format!("shellune-vault/{CIPHER_BINDING_VERSION}/{vault_id}/body").into_bytes()
 }
 
 /// What a wrap's tag is bound to: the format, the vault, the wrap kind and the
 /// purpose the wrap answers to.
 fn wrap_aad(vault_id: &str, kind: &str, purpose: &str) -> Vec<u8> {
-    format!(
-        "shellune-vault/{}/{vault_id}/wrap/{kind}/{purpose}",
-        super::VAULT_FORMAT_VERSION
-    )
-    .into_bytes()
+    format!("shellune-vault/{CIPHER_BINDING_VERSION}/{vault_id}/wrap/{kind}/{purpose}").into_bytes()
 }
 
 fn seal_wrap(

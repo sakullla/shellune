@@ -803,6 +803,12 @@ struct WireHostSecret {
     secret: String,
 }
 
+impl Drop for WireHostSecret {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct WireKey {
     meta: ManagedKeyMeta,
@@ -874,9 +880,7 @@ pub(super) fn encode(content: &VaultContent) -> Result<Zeroizing<Vec<u8>>, Vault
     for credential in &mut wire.credentials {
         credential.secret.zeroize();
     }
-    for host_secret in &mut wire.host_secrets {
-        host_secret.secret.zeroize();
-    }
+    // Host passwords are wiped when `wire` drops (`WireHostSecret`'s `Drop`).
     outcome
         .map(Zeroizing::new)
         .map_err(|error| VaultStoreError::Encode {
@@ -919,12 +923,12 @@ pub(super) fn decode(bytes: &mut [u8]) -> Result<VaultContent, VaultStoreError> 
                     other => other,
                 })?;
         }
-        for host_secret in wire.host_secrets {
+        for mut host_secret in wire.host_secrets {
+            // Moved out, not destructured: `WireHostSecret` wipes on drop, so
+            // the passwords not yet reached when an insert fails are wiped too.
+            let secret = SecretString::new(std::mem::take(&mut host_secret.secret));
             content
-                .insert_host_secret(VaultHostSecretRecord::new(
-                    host_secret.meta,
-                    SecretString::new(host_secret.secret),
-                ))
+                .insert_host_secret(VaultHostSecretRecord::new(host_secret.meta.clone(), secret))
                 .map_err(|error| match error {
                     VaultStoreError::Invalid { reason } => corrupt(reason),
                     other => other,

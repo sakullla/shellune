@@ -238,9 +238,29 @@ impl SecretStore for SystemSecrets {
 /// deleted right after, so there is nothing to keep.
 ///
 /// The copies are [`SecretString`] values, wiped when they are dropped.
+///
+/// A read does not hold the lock while it asks the underlying store (that may
+/// wait on the user), so a write, deletion or [`SecretStore::clear_cache`] can
+/// land meanwhile. Every one of them moves a generation counter on, and a read
+/// keeps what it found only if the counter has not moved since it began: a
+/// stale read never overwrites a newer copy or refills a cleared cache.
 pub struct CachedSecrets<S> {
     inner: S,
-    apps: Mutex<HashMap<AppSecret, Option<SecretString>>>,
+    apps: Mutex<AppCopies>,
+}
+
+/// The copies [`CachedSecrets`] keeps, and the generation they belong to.
+#[derive(Default)]
+struct AppCopies {
+    copies: HashMap<AppSecret, Option<SecretString>>,
+    /// Moved on by every write, deletion and clear.
+    generation: u64,
+}
+
+impl AppCopies {
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
 }
 
 impl<S: SecretStore> CachedSecrets<S> {
@@ -249,7 +269,7 @@ impl<S: SecretStore> CachedSecrets<S> {
     pub fn new(inner: S) -> Self {
         Self {
             inner,
-            apps: Mutex::new(HashMap::new()),
+            apps: Mutex::new(AppCopies::default()),
         }
     }
 
@@ -259,20 +279,53 @@ impl<S: SecretStore> CachedSecrets<S> {
         &self.inner
     }
 
+    /// The copy kept for `which`, or the generation a read of it starts from.
+    /// `Err(None)` means the cache is poisoned: read, but keep nothing.
+    fn copy_or_generation(&self, which: AppSecret) -> Result<Option<SecretString>, Option<u64>> {
+        match self.apps.lock() {
+            Ok(apps) => match apps.copies.get(&which) {
+                Some(copy) => Ok(copy.clone()),
+                None => Err(Some(apps.generation)),
+            },
+            Err(_) => Err(None),
+        }
+    }
+
+    /// Keeps what a read found, unless a write, deletion or clear came after
+    /// the read began.
+    fn remember_read(&self, which: AppSecret, started: u64, value: Option<SecretString>) {
+        if let Ok(mut apps) = self.apps.lock()
+            && apps.generation == started
+        {
+            apps.copies.insert(which, value);
+        }
+    }
+
+    /// Keeps what a successful write or deletion left in the store.
     fn remember(&self, which: AppSecret, value: Option<SecretString>) {
-        if let Ok(mut apps) = self.apps.lock() {
-            apps.insert(which, value);
+        match self.apps.lock() {
+            Ok(mut apps) => {
+                apps.invalidate();
+                apps.copies.insert(which, value);
+            }
+            Err(poisoned) => Self::empty(&mut poisoned.into_inner()),
         }
     }
 
     fn drop_copy(&self, which: AppSecret) {
         match self.apps.lock() {
             Ok(mut apps) => {
-                apps.remove(&which);
+                apps.invalidate();
+                apps.copies.remove(&which);
             }
             // A poisoned cache may hold anything; it is emptied as a whole.
-            Err(poisoned) => poisoned.into_inner().clear(),
+            Err(poisoned) => Self::empty(&mut poisoned.into_inner()),
         }
+    }
+
+    fn empty(apps: &mut AppCopies) {
+        apps.invalidate();
+        apps.copies.clear();
     }
 }
 
@@ -320,13 +373,14 @@ impl<S: SecretStore> SecretStore for CachedSecrets<S> {
     }
 
     fn load_app(&self, which: AppSecret) -> Result<Option<SecretString>, SecretError> {
-        if let Ok(apps) = self.apps.lock()
-            && let Some(copy) = apps.get(&which)
-        {
-            return Ok(copy.clone());
-        }
+        let started = match self.copy_or_generation(which) {
+            Ok(copy) => return Ok(copy),
+            Err(started) => started,
+        };
         let loaded = self.inner.load_app(which)?;
-        self.remember(which, loaded.clone());
+        if let Some(started) = started {
+            self.remember_read(which, started, loaded.clone());
+        }
         Ok(loaded)
     }
 
@@ -345,8 +399,8 @@ impl<S: SecretStore> SecretStore for CachedSecrets<S> {
 
     fn clear_cache(&self) {
         match self.apps.lock() {
-            Ok(mut apps) => apps.clear(),
-            Err(poisoned) => poisoned.into_inner().clear(),
+            Ok(mut apps) => Self::empty(&mut apps),
+            Err(poisoned) => Self::empty(&mut poisoned.into_inner()),
         }
         self.inner.clear_cache();
     }
@@ -821,6 +875,195 @@ mod tests {
         assert!(
             cached.load_app(AppSecret::SyncPassphrase).is_err(),
             "a failed write left no copy behind"
+        );
+    }
+
+    /// A store whose first application read stops after reading, until the
+    /// test lets it go, so a write or clear can land in between.
+    struct PausedRead {
+        inner: MemorySecrets,
+        reached: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        resume: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl PausedRead {
+        fn new() -> (
+            Self,
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let store = Self {
+                inner: MemorySecrets::new(),
+                reached: Mutex::new(Some(reached_tx)),
+                resume: Mutex::new(Some(resume_rx)),
+            };
+            (store, reached_rx, resume_tx)
+        }
+    }
+
+    impl SecretStore for PausedRead {
+        fn save(&self, host: HostId, secret: &SecretString) -> Result<(), SecretError> {
+            self.inner.save(host, secret)
+        }
+        fn load(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
+            self.inner.load(host)
+        }
+        fn forget(&self, host: HostId) -> Result<(), SecretError> {
+            self.inner.forget(host)
+        }
+        fn load_legacy_host(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
+            self.inner.load_legacy_host(host)
+        }
+        fn forget_legacy_host(&self, host: HostId) -> Result<(), SecretError> {
+            self.inner.forget_legacy_host(host)
+        }
+        fn save_app(&self, which: AppSecret, secret: &SecretString) -> Result<(), SecretError> {
+            self.inner.save_app(which, secret)
+        }
+        fn load_app(&self, which: AppSecret) -> Result<Option<SecretString>, SecretError> {
+            let loaded = self.inner.load_app(which)?;
+            let reached = self.reached.lock().expect("lock").take();
+            let resume = self.resume.lock().expect("lock").take();
+            if let (Some(reached), Some(resume)) = (reached, resume) {
+                reached.send(()).expect("test is waiting");
+                resume.recv().expect("test resumes the read");
+            }
+            Ok(loaded)
+        }
+        fn forget_app(&self, which: AppSecret) -> Result<(), SecretError> {
+            self.inner.forget_app(which)
+        }
+    }
+
+    /// Reads `which` on another thread, runs `meanwhile` once that read has
+    /// found what the store held, then lets the read finish; returns what the
+    /// stale read answered.
+    fn read_across(
+        cached: &CachedSecrets<PausedRead>,
+        reached: &std::sync::mpsc::Receiver<()>,
+        resume: &std::sync::mpsc::Sender<()>,
+        which: AppSecret,
+        meanwhile: impl FnOnce(),
+    ) -> Option<String> {
+        std::thread::scope(|scope| {
+            let read = scope.spawn(|| {
+                cached
+                    .load_app(which)
+                    .expect("read")
+                    .map(|secret| secret.expose().to_owned())
+            });
+            reached.recv().expect("the read reached the store");
+            meanwhile();
+            resume.send(()).expect("the read is paused");
+            read.join().expect("the read finished")
+        })
+    }
+
+    fn app_loads(cached: &CachedSecrets<PausedRead>, which: AppSecret) -> usize {
+        cached
+            .inner()
+            .inner
+            .accesses()
+            .iter()
+            .filter(|access| *access == &SecretAccess::app(SecretOp::Load, which))
+            .count()
+    }
+
+    #[test]
+    fn a_stale_read_does_not_overwrite_a_newer_write() {
+        let (store, reached, resume) = PausedRead::new();
+        store
+            .inner
+            .save_app(AppSecret::WebDavPassword, &SecretString::new("old"))
+            .expect("saved");
+        let cached = CachedSecrets::new(store);
+
+        let stale = read_across(
+            &cached,
+            &reached,
+            &resume,
+            AppSecret::WebDavPassword,
+            || {
+                cached
+                    .save_app(AppSecret::WebDavPassword, &SecretString::new("new"))
+                    .expect("saved");
+            },
+        );
+        assert_eq!(
+            stale.as_deref(),
+            Some("old"),
+            "the read began before the write"
+        );
+        assert_eq!(
+            cached
+                .load_app(AppSecret::WebDavPassword)
+                .expect("read")
+                .map(|secret| secret.expose().to_owned())
+                .as_deref(),
+            Some("new"),
+            "the write's copy survives the stale read"
+        );
+        assert_eq!(app_loads(&cached, AppSecret::WebDavPassword), 1);
+    }
+
+    #[test]
+    fn a_stale_read_does_not_bring_back_a_forgotten_secret() {
+        let (store, reached, resume) = PausedRead::new();
+        store
+            .inner
+            .save_app(AppSecret::SyncPassphrase, &SecretString::new("old"))
+            .expect("saved");
+        let cached = CachedSecrets::new(store);
+
+        let stale = read_across(
+            &cached,
+            &reached,
+            &resume,
+            AppSecret::SyncPassphrase,
+            || {
+                cached
+                    .forget_app(AppSecret::SyncPassphrase)
+                    .expect("forgotten");
+            },
+        );
+        assert_eq!(stale.as_deref(), Some("old"));
+        assert!(
+            cached
+                .load_app(AppSecret::SyncPassphrase)
+                .expect("read")
+                .is_none(),
+            "the deletion's copy survives the stale read"
+        );
+        assert_eq!(app_loads(&cached, AppSecret::SyncPassphrase), 1);
+    }
+
+    #[test]
+    fn a_read_in_flight_does_not_refill_a_cleared_cache() {
+        let (store, reached, resume) = PausedRead::new();
+        store
+            .inner
+            .save_app(AppSecret::VaultLocalUnseal, &SecretString::new("unseal"))
+            .expect("saved");
+        let cached = CachedSecrets::new(store);
+
+        let stale = read_across(
+            &cached,
+            &reached,
+            &resume,
+            AppSecret::VaultLocalUnseal,
+            || cached.clear_cache(),
+        );
+        assert_eq!(stale.as_deref(), Some("unseal"));
+        cached
+            .load_app(AppSecret::VaultLocalUnseal)
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            app_loads(&cached, AppSecret::VaultLocalUnseal),
+            2,
+            "after the clear the next read asks the store again"
         );
     }
 }
