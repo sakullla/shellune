@@ -79,28 +79,6 @@ impl AppSecret {
 
 /// Where host secrets are kept.
 pub trait SecretStore: Send + Sync {
-    /// Saves the secret of one host, replacing any earlier one.
-    ///
-    /// # Errors
-    ///
-    /// The store is unavailable or refused the write.
-    fn save(&self, host: HostId, secret: &SecretString) -> Result<(), SecretError>;
-
-    /// The secret saved for one host; `Ok(None)` only when the store confirms there is
-    /// none. A store that cannot be read answers `Err`, never "nothing saved".
-    ///
-    /// # Errors
-    ///
-    /// The store is unavailable or could not be read.
-    fn load(&self, host: HostId) -> Result<Option<SecretString>, SecretError>;
-
-    /// Forgets the secret of one host. Forgetting one that was never saved succeeds.
-    ///
-    /// # Errors
-    ///
-    /// The store is unavailable or refused the deletion.
-    fn forget(&self, host: HostId) -> Result<(), SecretError>;
-
     /// The `host-<uuid>` entry an older build saved for one host, read for the
     /// one migration into the vault; `Ok(None)` only when the store confirms
     /// there is none. A store that cannot be read (or a user who refused the
@@ -189,18 +167,6 @@ impl SystemSecrets {
 }
 
 impl SecretStore for SystemSecrets {
-    fn save(&self, host: HostId, secret: &SecretString) -> Result<(), SecretError> {
-        Self::save_entry(&Self::entry(host)?, secret)
-    }
-
-    fn load(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
-        Self::load_entry(&Self::entry(host)?)
-    }
-
-    fn forget(&self, host: HostId) -> Result<(), SecretError> {
-        Self::forget_entry(&Self::entry(host)?)
-    }
-
     fn load_legacy_host(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
         Self::load_entry(&Self::entry(host)?)
     }
@@ -339,18 +305,6 @@ impl<S> std::fmt::Debug for CachedSecrets<S> {
 }
 
 impl<S: SecretStore> SecretStore for CachedSecrets<S> {
-    fn save(&self, host: HostId, secret: &SecretString) -> Result<(), SecretError> {
-        self.inner.save(host, secret)
-    }
-
-    fn load(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
-        self.inner.load(host)
-    }
-
-    fn forget(&self, host: HostId) -> Result<(), SecretError> {
-        self.inner.forget(host)
-    }
-
     fn load_legacy_host(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
         self.inner.load_legacy_host(host)
     }
@@ -545,16 +499,6 @@ impl MemorySecrets {
         }
     }
 
-    fn save_host(&self, host: HostId, secret: &SecretString) -> Result<(), SecretError> {
-        self.log(SecretAccess::host(SecretOp::Save, host));
-        self.check("could not save the password")?;
-        self.secrets
-            .lock()
-            .map_err(|_| SecretError::new("could not save the password", "poisoned"))?
-            .insert(host, secret.expose().to_owned());
-        Ok(())
-    }
-
     fn load_host(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
         self.log(SecretAccess::host(SecretOp::Load, host));
         self.check("could not read the password")?;
@@ -578,18 +522,6 @@ impl MemorySecrets {
 }
 
 impl SecretStore for MemorySecrets {
-    fn save(&self, host: HostId, secret: &SecretString) -> Result<(), SecretError> {
-        self.save_host(host, secret)
-    }
-
-    fn load(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
-        self.load_host(host)
-    }
-
-    fn forget(&self, host: HostId) -> Result<(), SecretError> {
-        self.forget_host(host)
-    }
-
     fn load_legacy_host(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
         self.load_host(host)
     }
@@ -635,19 +567,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_saved_secret_is_read_back_and_forgotten() {
+    fn a_legacy_entry_is_read_back_and_forgotten() {
         let store = MemorySecrets::new();
         let host = HostId::new();
-        assert_eq!(store.load(host).map(|secret| secret.is_some()), Ok(false));
-        store
-            .save(host, &SecretString::new("hunter2"))
-            .expect("saved");
-        let loaded = store.load(host).expect("read").expect("present");
+        assert_eq!(
+            store.load_legacy_host(host).map(|secret| secret.is_some()),
+            Ok(false)
+        );
+        store.seed_legacy_host(host, &SecretString::new("hunter2"));
+        let loaded = store
+            .load_legacy_host(host)
+            .expect("read")
+            .expect("present");
         assert_eq!(loaded.expose(), "hunter2");
-        store.forget(host).expect("forgotten");
-        assert_eq!(store.load(host).map(|secret| secret.is_some()), Ok(false));
+        store.forget_legacy_host(host).expect("forgotten");
+        assert_eq!(
+            store.load_legacy_host(host).map(|secret| secret.is_some()),
+            Ok(false)
+        );
         store
-            .forget(host)
+            .forget_legacy_host(host)
             .expect("forgetting twice is not an error");
     }
 
@@ -656,16 +595,19 @@ mod tests {
         let store = MemorySecrets::unavailable();
         let host = HostId::new();
         assert!(
-            store.load(host).is_err(),
+            store.load_legacy_host(host).is_err(),
             "a failure is not \"nothing saved\""
         );
-        assert!(store.load_legacy_host(host).is_err());
         assert!(store.forget_legacy_host(host).is_err());
-        assert!(store.save(host, &SecretString::new("x")).is_err());
+        assert!(
+            store
+                .save_app(AppSecret::WebDavPassword, &SecretString::new("x"))
+                .is_err()
+        );
         assert!(store.load_app(AppSecret::WebDavPassword).is_err());
         assert_eq!(
             store.accesses().len(),
-            5,
+            4,
             "a failed call has still asked the store"
         );
     }
@@ -904,15 +846,6 @@ mod tests {
     }
 
     impl SecretStore for PausedRead {
-        fn save(&self, host: HostId, secret: &SecretString) -> Result<(), SecretError> {
-            self.inner.save(host, secret)
-        }
-        fn load(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
-            self.inner.load(host)
-        }
-        fn forget(&self, host: HostId) -> Result<(), SecretError> {
-            self.inner.forget(host)
-        }
         fn load_legacy_host(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
             self.inner.load_legacy_host(host)
         }

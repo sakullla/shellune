@@ -634,12 +634,13 @@ fn version_one_document(secrets: &MemorySecrets) -> (ShelluneData, HostId, HostI
     db.set_remember_secret(true);
     let db_id = db.id();
     hosts.insert(db).expect("inserted");
-    secrets
-        .save(web_id, &SecretString::new("web-password"))
-        .expect("saved");
-    secrets
-        .save(db_id, &SecretString::new("key-passphrase"))
-        .expect("saved");
+    // The version 1 build kept the passwords in the system store; the export
+    // that sealed them read them from there.
+    secrets.seed_legacy_host(web_id, &SecretString::new("web-password"));
+    secrets.seed_legacy_host(db_id, &SecretString::new("key-passphrase"));
+    let mut sealed = VaultContent::new();
+    sealed.set_host_secret(web_id, SecretString::new("web-password"), "device-a");
+    sealed.set_host_secret(db_id, SecretString::new("key-passphrase"), "device-a");
     let mut known_hosts = HostTrust::new();
     known_hosts
         .accept("10.0.0.5", 22, &trust_entry(1), 1_700_000_000)
@@ -653,10 +654,10 @@ fn version_one_document(secrets: &MemorySecrets) -> (ShelluneData, HostId, HostI
     let mut options = ExportOptions::new(Platform::Macos);
     options.kdf = cheap_kdf();
     options.created_unix = 1_800_000_000;
-    let outcome = ShelluneData::export(
+    let outcome = ShelluneData::export_from_vault(
         &state,
         &options.with_passphrase(SecretString::new(SYNC_PASSPHRASE)),
-        secrets,
+        Some(&sealed),
         None,
     )
     .expect("exported");
@@ -722,7 +723,7 @@ fn a_v1_document_migrates_read_only_and_a_retry_cannot_double_it() {
     );
     assert_eq!(
         secrets
-            .load(web_id)
+            .load_legacy_host(web_id)
             .expect("read")
             .map(|s| s.expose().to_owned()),
         Some("web-password".to_owned()),
@@ -730,7 +731,7 @@ fn a_v1_document_migrates_read_only_and_a_retry_cannot_double_it() {
     );
     assert_eq!(
         secrets
-            .load(db_id)
+            .load_legacy_host(db_id)
             .expect("read")
             .map(|s| s.expose().to_owned()),
         Some("key-passphrase".to_owned())
@@ -833,7 +834,7 @@ fn a_version_two_document_is_not_migrated_and_a_v1_document_without_passwords_mo
     let mut options = shellune_storage::ExportOptions::new(Platform::Linux);
     options.kdf = cheap_kdf();
     let version_two =
-        ShelluneData::export(&state, &options.clone().with_vault(cipher), &secrets, None)
+        ShelluneData::export_from_vault(&state, &options.clone().with_vault(cipher), None, None)
             .expect("exported")
             .document;
     assert!(matches!(
@@ -843,7 +844,7 @@ fn a_version_two_document_is_not_migrated_and_a_v1_document_without_passwords_mo
     assert!(!store.exists());
 
     // A version 1 document without a password block still moves its trust.
-    let plain = ShelluneData::export(&state, &options, &secrets, None)
+    let plain = ShelluneData::export_from_vault(&state, &options, None, None)
         .expect("exported")
         .document;
     let report = store

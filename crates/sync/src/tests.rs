@@ -1541,6 +1541,183 @@ fn a_host_password_changed_in_the_cloud_merges_with_records_changed_here() {
     assert_eq!(vault_password(&b, web_id).as_deref(), Some("fourth-a"));
 }
 
+/// Adds an SSH host that signs in with a password this machine does not
+/// remember.
+fn add_unremembered_password_host(state: &mut LocalState, name: &str) -> HostId {
+    let id = add_password_host(state, name);
+    let mut host = state.hosts.host(id).expect("added").clone();
+    host.set_remember_secret(false);
+    state.hosts.update(host, id).expect("updated");
+    id
+}
+
+fn remembers(machine: &Machine, host: HostId) -> bool {
+    machine
+        .load()
+        .hosts
+        .connection(host)
+        .is_some_and(|record| record.remembers_secret())
+}
+
+#[test]
+fn a_password_remembered_elsewhere_is_remembered_here_after_a_merge() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let a = Machine::new("merge-remember-a", Platform::Linux);
+    let b = Machine::new("merge-remember-b", Platform::Linux);
+    for machine in [&a, &b] {
+        machine.connect(&server);
+    }
+    let mut web_id = None;
+    a.edit(|state| {
+        web_id = Some(add_unremembered_password_host(state, "web"));
+        add_host(state, "db");
+    });
+    let web_id = web_id.expect("web");
+    create_vault(&a, |_| {});
+    expect_uploaded(a.service.sync());
+    expect_pulled(b.service.sync());
+    assert!(!remembers(&b, web_id));
+
+    // B remembers web's password; the shared records do not change, only the
+    // vault does. A meanwhile changes another record.
+    b.edit(|state| {
+        let mut web = state.hosts.host(web_id).expect("arrived").clone();
+        web.set_remember_secret(true);
+        state.hosts.update(web, web_id).expect("updated");
+    });
+    remember_in_vault(&b, web_id, HOST_PASSWORD, "device-b");
+    expect_uploaded(b.service.sync());
+    a.edit(|state| readdress(state, "db", "10.1.2.3"));
+
+    // A's sync merges the vaults and keeps its record: web's password is in
+    // A's vault, and A remembers it as B does.
+    a.service.sync().expect("A syncs");
+    assert_eq!(vault_password(&a, web_id).as_deref(), Some(HOST_PASSWORD));
+    assert!(remembers(&a, web_id), "A remembers the arrived password");
+    assert_eq!(address_of(&a, "db"), "10.1.2.3");
+    expect_up_to_date(a.service.sync());
+    expect_pulled(b.service.sync());
+    assert_eq!(address_of(&b, "db"), "10.1.2.3");
+    assert!(remembers(&b, web_id));
+    assert_eq!(vault_password(&b, web_id).as_deref(), Some(HOST_PASSWORD));
+    for machine in [&a, &b] {
+        assert!(
+            host_entry_accesses(machine).is_empty(),
+            "{:?}",
+            machine.secrets.accesses()
+        );
+    }
+}
+
+#[test]
+fn a_forgotten_host_password_travels_and_is_removed_on_the_other_machine() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let a = Machine::new("tombstone-a", Platform::Linux);
+    let b = Machine::new("tombstone-b", Platform::Linux);
+    for machine in [&a, &b] {
+        machine.connect(&server);
+    }
+    let mut web_id = None;
+    a.edit(|state| web_id = Some(add_password_host(state, "web")));
+    let web_id = web_id.expect("web");
+    remember_in_vault(&a, web_id, HOST_PASSWORD, "device-a");
+    expect_uploaded(a.service.sync());
+    expect_pulled(b.service.sync());
+    assert_eq!(vault_password(&b, web_id).as_deref(), Some(HOST_PASSWORD));
+
+    // A stops remembering web's password, as the host form does: the record
+    // no longer remembers and the vault keeps a tombstone.
+    a.edit(|state| {
+        let mut web = state.hosts.host(web_id).expect("kept").clone();
+        web.set_remember_secret(false);
+        state.hosts.update(web, web_id).expect("updated");
+    });
+    let mut content = open_vault(&a);
+    assert!(content.remove_host_secret(web_id));
+    save_vault(&a, &content);
+    a.service.sync().expect("A syncs");
+
+    // The deletion travels: B's vault no longer holds the password, and keeps
+    // the tombstone so an older copy cannot bring it back.
+    b.service.sync().expect("B syncs");
+    assert_eq!(vault_password(&b, web_id), None);
+    assert_eq!(
+        open_vault(&b).host_secret_state(web_id),
+        shellune_storage::HostSecretState::Tombstoned
+    );
+    assert!(!remote_text(&server).contains(HOST_PASSWORD));
+    expect_up_to_date(a.service.sync());
+    expect_up_to_date(b.service.sync());
+    assert_eq!(vault_password(&a, web_id), None);
+}
+
+#[test]
+fn a_cloud_vault_that_lost_a_synced_host_password_is_refused() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let a = Machine::new("lost-host-secret-a", Platform::Linux);
+    let b = Machine::new("lost-host-secret-b", Platform::Linux);
+    for machine in [&a, &b] {
+        machine.connect(&server);
+    }
+    let mut web_id = None;
+    a.edit(|state| web_id = Some(add_password_host(state, "web")));
+    let web_id = web_id.expect("web");
+    remember_in_vault(&a, web_id, HOST_PASSWORD, "device-a");
+    expect_uploaded(a.service.sync());
+    expect_pulled(b.service.sync());
+
+    // The cloud's vault is replaced by one of the same vault, at a later
+    // version, that no longer holds web's password record at all: not a
+    // deletion (that would be a tombstone), a lost record.
+    let vault_id = remote_document(&server)
+        .vault()
+        .expect("the vault travelled")
+        .vault_id()
+        .to_owned();
+    let mut lost = VaultContent::new();
+    lost.insert_credential(credential_named(
+        CredentialId::new(),
+        "Other",
+        9,
+        VAULT_SECRET,
+    ))
+    .expect("inserts");
+    let cipher = VaultCipher::seal(
+        &lost,
+        Some(&vault_id),
+        &[KeySource::Passphrase {
+            purpose: PassphrasePurpose::WebDavPassword,
+            value: SecretString::new(DAV_PASSWORD),
+        }],
+        cheap_kdf(),
+    )
+    .expect("seals");
+    let mut options = ExportOptions::new(Platform::Linux);
+    options.kdf = cheap_kdf();
+    let replaced =
+        ShelluneData::export_from_vault(&a.load(), &options.with_vault(cipher), None, None)
+            .expect("exports")
+            .document
+            .to_json()
+            .expect("json");
+    server.put_file(REMOTE_PATH, &replaced);
+
+    let files = data_files(&b.root);
+    match b.service.sync().unwrap_err() {
+        SyncError::Vault(VaultStoreError::Invalid { reason }) => {
+            assert!(reason.contains("no longer holds every record"), "{reason}");
+        }
+        other => panic!("expected the lost record to be refused, got {other:?}"),
+    }
+    assert_eq!(data_files(&b.root), files, "nothing was applied here");
+    assert_eq!(
+        server.file(REMOTE_PATH).expect("the cloud file"),
+        replaced,
+        "the cloud file was not overwritten either"
+    );
+    assert_eq!(vault_password(&b, web_id).as_deref(), Some(HOST_PASSWORD));
+}
+
 #[test]
 fn an_old_settings_file_with_password_sync_off_still_syncs_the_vault() {
     let server = WebDavServer::start(USER, DAV_PASSWORD);

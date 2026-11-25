@@ -48,7 +48,6 @@ use shellune_core::{
 };
 
 use crate::book::{FORMAT_VERSION, HostBook, RecentConnection};
-use crate::credentials::SecretStore;
 use crate::forwarding::ForwardStore;
 use crate::group::GroupStore;
 use crate::preferences::{KeymapEntry, Preferences, PreferencesStore};
@@ -574,9 +573,9 @@ pub struct ExportOutcome {
     pub document: ShelluneData,
     /// The records whose password was sealed into the document.
     pub secrets_included: Vec<HostId>,
-    /// The records that remember a password the credential store could not
-    /// read; only the compatibility [`ShelluneData::export`] reads the store,
-    /// so this stays empty for an export from the vault.
+    /// The records that remember a password that could not be read. Host
+    /// passwords come from the vault alone, which an export either has open
+    /// or not, so this stays empty; it is kept for the reports that list it.
     pub secrets_unreadable: Vec<HostId>,
     /// The records that remember a password the vault does not hold (no vault,
     /// or a host whose old system-store entry was not migrated yet).
@@ -614,50 +613,6 @@ impl ShelluneData {
             None => &empty,
         };
         Self::export_with(local, options, source, base)
-    }
-
-    /// The compatibility form of [`Self::export_from_vault`] for a caller that
-    /// still keeps host passwords in the system credential store: with a
-    /// passphrase, each record that remembers a password has its old entry
-    /// read once ([`SecretStore::load_legacy_host`]); without one, the store is
-    /// never touched. Sync and the vault-backed export do not use it.
-    ///
-    /// # Errors
-    ///
-    /// The errors of [`Self::export_from_vault`].
-    pub fn export(
-        local: &LocalState,
-        options: &ExportOptions,
-        secrets: &dyn SecretStore,
-        base: Option<&ShelluneData>,
-    ) -> Result<ExportOutcome, PortableError> {
-        let mut read = BTreeMap::new();
-        let mut unreadable = Vec::new();
-        let seals = options.vault.is_none()
-            && options
-                .passphrase
-                .as_ref()
-                .is_some_and(|passphrase| !passphrase.expose().trim().is_empty());
-        if seals {
-            for record in local.hosts.records() {
-                if !record.remembers_secret() {
-                    continue;
-                }
-                match secrets.load_legacy_host(record.id()) {
-                    Ok(Some(secret)) => {
-                        read.insert(record.id(), secret);
-                    }
-                    Ok(None) => {}
-                    Err(_) => unreadable.push(record.id()),
-                }
-            }
-        }
-        let mut outcome = Self::export_with(local, options, &read, base)?;
-        outcome
-            .secrets_missing
-            .retain(|id| !unreadable.contains(id));
-        outcome.secrets_unreadable = unreadable;
-        Ok(outcome)
     }
 
     fn export_with(

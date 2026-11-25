@@ -265,6 +265,10 @@ pub(crate) type VaultWriterTask = Box<dyn FnOnce(&mut ShelluneView, &mut Context
 pub(crate) enum PendingHostSecret {
     /// The vault keeps this password for the host.
     Set(SecretString),
+    /// The password read from the host's old entry (R3): the vault keeps it
+    /// only while it still has no record for the host, so a password or a
+    /// deletion a sync brought in meanwhile is not overwritten by it.
+    Migrate(SecretString),
     /// The vault deletes the host's password (a tombstone).
     Remove,
 }
@@ -780,7 +784,9 @@ impl SecurityPage {
             .get(&id)
             .or_else(|| self.host_job.as_ref().and_then(|job| job.changes.get(&id)));
         match waiting {
-            Some(PendingHostSecret::Set(secret)) => Some(secret.clone()),
+            Some(PendingHostSecret::Set(secret) | PendingHostSecret::Migrate(secret)) => {
+                Some(secret.clone())
+            }
             Some(PendingHostSecret::Remove) => None,
             None => self
                 .content
@@ -6341,7 +6347,9 @@ impl ShelluneView {
         };
         if let Some(change) = waiting {
             return Ok(match change {
-                PendingHostSecret::Set(secret) => Some(secret.clone()),
+                PendingHostSecret::Set(secret) | PendingHostSecret::Migrate(secret) => {
+                    Some(secret.clone())
+                }
                 PendingHostSecret::Remove => None,
             });
         }
@@ -6375,7 +6383,7 @@ impl ShelluneView {
             Ok(Some(secret)) => {
                 self.security
                     .pending_host_secrets
-                    .insert(id, PendingHostSecret::Set(secret.clone()));
+                    .insert(id, PendingHostSecret::Migrate(secret.clone()));
                 self.security.legacy_forget.insert(id);
                 self.host_secrets_flush(cx);
                 Some(secret)
@@ -6512,7 +6520,12 @@ impl ShelluneView {
         if form.is_none() && !VaultStore::at(self.store.root()).exists() {
             // Without a vault a deletion has nothing to delete; only a
             // password to keep creates one.
-            changes.retain(|_, change| matches!(change, PendingHostSecret::Set(_)));
+            changes.retain(|_, change| {
+                matches!(
+                    change,
+                    PendingHostSecret::Set(_) | PendingHostSecret::Migrate(_)
+                )
+            });
             if changes.is_empty() {
                 return;
             }
@@ -6529,6 +6542,14 @@ impl ShelluneView {
                 match change {
                     PendingHostSecret::Set(secret) => {
                         content.set_host_secret(id, secret, &device);
+                    }
+                    // The vault opened for this job is the one a sync may
+                    // have written since the old entry was read: a record it
+                    // holds, live or deleted, stands.
+                    PendingHostSecret::Migrate(secret) => {
+                        if content.host_secret_state(id) == HostSecretState::Absent {
+                            content.set_host_secret(id, secret, &device);
+                        }
                     }
                     PendingHostSecret::Remove => {
                         content.remove_host_secret(id);
@@ -6733,8 +6754,14 @@ impl ShelluneView {
             let answer = match change {
                 // A locked window hands out no password, not even one still
                 // waiting for the vault.
-                PendingHostSecret::Set(_) if self.security.lock.locked => continue,
-                PendingHostSecret::Set(secret) => Some(secret.clone()),
+                PendingHostSecret::Set(_) | PendingHostSecret::Migrate(_)
+                    if self.security.lock.locked =>
+                {
+                    continue;
+                }
+                PendingHostSecret::Set(secret) | PendingHostSecret::Migrate(secret) => {
+                    Some(secret.clone())
+                }
                 PendingHostSecret::Remove => None,
             };
             pending.insert(*id, answer);
@@ -6780,7 +6807,7 @@ impl ShelluneView {
             }
             self.security
                 .pending_host_secrets
-                .insert(id, PendingHostSecret::Set(secret));
+                .insert(id, PendingHostSecret::Migrate(secret));
             self.security.legacy_forget.insert(id);
         }
         self.host_secrets_flush(cx);

@@ -2610,16 +2610,11 @@ fn seed_backup_import(root: &Path) -> Result<(), String> {
     let mut options = shellune_storage::ExportOptions::new(shellune_storage::Platform::Macos);
     options.created_unix = 1_794_816_000;
     options.app_version = env!("CARGO_PKG_VERSION").to_owned();
-    shellune_storage::ShelluneData::export(
-        &local,
-        &options,
-        &shellune_storage::MemorySecrets::new(),
-        None,
-    )
-    .map_err(|error| format!("the backup fixture could not be made: {error}"))?
-    .document
-    .write_to(&root.join(BACKUP_FIXTURE))
-    .map_err(|error| format!("the backup fixture could not be written: {error}"))
+    shellune_storage::ShelluneData::export_from_vault(&local, &options, None, None)
+        .map_err(|error| format!("the backup fixture could not be made: {error}"))?
+        .document
+        .write_to(&root.join(BACKUP_FIXTURE))
+        .map_err(|error| format!("the backup fixture could not be written: {error}"))
 }
 
 /// Opens the import preview of the fixture backup over the data category (R6).

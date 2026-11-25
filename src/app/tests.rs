@@ -17233,25 +17233,6 @@ impl FaultySecrets {
 }
 
 impl shellune_storage::SecretStore for FaultySecrets {
-    fn save(
-        &self,
-        host: HostId,
-        secret: &shellune_core::SecretString,
-    ) -> Result<(), shellune_storage::SecretError> {
-        self.inner.save(host, secret)
-    }
-
-    fn load(
-        &self,
-        host: HostId,
-    ) -> Result<Option<shellune_core::SecretString>, shellune_storage::SecretError> {
-        self.inner.load(host)
-    }
-
-    fn forget(&self, host: HostId) -> Result<(), shellune_storage::SecretError> {
-        self.inner.forget(host)
-    }
-
     fn load_legacy_host(
         &self,
         host: HostId,
@@ -45345,6 +45326,88 @@ async fn a_host_password_saved_during_a_sync_is_written_after_it(cx: &mut TestAp
     assert_eq!(host_entry_accesses(&secrets), Vec::new());
 }
 
+/// An old entry read for a connection while a sync runs is moved into the
+/// vault only if the vault the sync left still has no record for the host
+/// (R3, R4): a password the sync pulled for it is not overwritten by the old
+/// one.
+#[gpui::test]
+async fn a_migration_queued_during_a_sync_keeps_the_password_the_sync_pulled(
+    cx: &mut TestAppContext,
+) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let (machine_a, machine_b) = (
+        TempDir::new("migrate-during-sync-a"),
+        TempDir::new("migrate-during-sync-b"),
+    );
+    // A shares two remembered hosts and a vault that holds the first one's
+    // password; B takes both, and the vault, in.
+    let hosts = remembered_hosts(2);
+    let (first, target) = (hosts[0].id(), hosts[1].clone());
+    seed(&machine_a.store(), hosts.clone());
+    let (a, secrets_a) = sync_machine_with_store(&machine_a, &server);
+    add_host_secrets(&machine_a, &secrets_a, &[(first, "pw-first".to_owned())]);
+    let _ = a.sync().expect("A uploads its hosts and vault");
+    let (b, secrets) = sync_machine_with_store(&machine_b, &server);
+    let _ = b.sync().expect("B takes A's hosts and vault in");
+    drop(b);
+    assert_eq!(
+        open_vault(&machine_b, &secrets).host_secret_state(target.id()),
+        shellune_storage::HostSecretState::Absent
+    );
+    // B remembered the target's password before the vault, in its old entry.
+    let mut book = machine_b.store().load().expect("B's hosts read");
+    let mut remembered = book.host(target.id()).expect("arrived").clone();
+    remembered.set_remember_secret(true);
+    book.update(remembered, target.id()).expect("updated");
+    machine_b.store().save(&book).expect("B's hosts written");
+    secrets.seed_legacy_host(target.id(), &shellune_core::SecretString::new("old"));
+    let (view, cx) = sync_window(cx, &machine_b, &secrets, Destination::Hosts);
+    assert_eq!(host_names(&view, cx).len(), 2);
+    // A then remembers the target's password in the vault and uploads it.
+    add_host_secrets(
+        &machine_a,
+        &secrets_a,
+        &[(target.id(), "pw-synced".to_owned())],
+    );
+    let _ = a.sync().expect("A uploads the new password");
+
+    // B's check pulls it; its finish is held, so the sync still runs while B
+    // connects to the host and reads its old entry.
+    hold_sync_finish(&view, cx);
+    after_poll(cx);
+    assert!(sync_finish_held(&view, cx));
+    secrets.clear_accesses();
+    let (_, password) = connect_remembered(&view, cx, &target);
+    assert_eq!(password, "old", "the old entry is used at once");
+    assert!(
+        host_entry_accesses(&secrets)
+            .iter()
+            .any(|access| access.op == shellune_storage::SecretOp::Load),
+        "the old entry was read: {:?}",
+        secrets.accesses()
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_job_running()),
+        "no vault job runs beside the sync"
+    );
+
+    release_sync_finish(&view, cx);
+    cx.run_until_parked();
+    let vault = open_vault(&machine_b, &secrets);
+    assert_eq!(
+        vault
+            .host_secret(target.id())
+            .map(shellune_core::SecretString::expose),
+        Some("pw-synced"),
+        "the pulled password stands"
+    );
+    assert_eq!(
+        vault
+            .host_secret(first)
+            .map(shellune_core::SecretString::expose),
+        Some("pw-first")
+    );
+}
 /// A sync asked for while a vault job runs waits for the job, and starts
 /// when it ends.
 #[gpui::test]

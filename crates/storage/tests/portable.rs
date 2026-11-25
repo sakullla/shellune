@@ -514,45 +514,6 @@ fn passwords_the_vault_does_not_hold_are_listed_and_no_host_entry_is_read() {
 }
 
 #[test]
-fn the_compatibility_export_reads_old_entries_only_with_a_passphrase() {
-    let fixture = windows_machine();
-    let unavailable = MemorySecrets::unavailable();
-    let outcome = ShelluneData::export(
-        &fixture.state,
-        &with_passphrase(Platform::Windows),
-        &unavailable,
-        None,
-    )
-    .expect("the export still succeeds");
-    assert!(outcome.secrets_included.is_empty());
-    assert_eq!(
-        outcome.secrets_unreadable,
-        vec![fixture.password_host, fixture.key_host]
-    );
-    assert!(outcome.secrets_missing.is_empty());
-
-    let partial = MemorySecrets::new();
-    partial.seed_legacy_host(fixture.password_host, &SecretString::new(PASSWORD));
-    let outcome = ShelluneData::export(
-        &fixture.state,
-        &with_passphrase(Platform::Windows),
-        &partial,
-        None,
-    )
-    .expect("exported");
-    assert_eq!(outcome.secrets_included, vec![fixture.password_host]);
-    assert_eq!(outcome.secrets_missing, vec![fixture.key_host]);
-
-    partial.clear_accesses();
-    ShelluneData::export(&fixture.state, &options(Platform::Windows), &partial, None)
-        .expect("exported");
-    assert!(
-        partial.accesses().is_empty(),
-        "without a passphrase the store is not read"
-    );
-}
-
-#[test]
 fn machine_specific_fields_survive_a_trip_between_windows_and_linux() {
     let fixture = windows_machine();
     let from_windows =

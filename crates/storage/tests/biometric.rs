@@ -204,10 +204,10 @@ fn the_three_lock_policies_and_the_idle_setting_stay_on_this_machine() {
 
     // None of it is part of what a backup, a sync or a portable export
     // carries: another machine's policy stays its own.
-    let exported = shellune_storage::ShelluneData::export(
+    let exported = shellune_storage::ShelluneData::export_from_vault(
         &shellune_storage::LocalState::default(),
         &shellune_storage::ExportOptions::new(Platform::Linux),
-        &shellune_storage::MemorySecrets::new(),
+        None,
         None,
     )
     .expect("exports");

@@ -321,9 +321,43 @@ impl ApplyPlan {
         platform: Platform,
         recents: &[RecentConnection],
     ) -> Result<Self, PortableError> {
+        Self::with_recents_and_secrets(local, platform, recents, None)
+    }
+
+    /// [`Self::with_recents`], and every record of `local` that `secrets`
+    /// holds a password for remembers it, as [`Self::new`] marks the records
+    /// of a document: a password another machine remembered and that arrived
+    /// here in the merged vault is one this machine remembers too. Those
+    /// passwords are planned to be saved, which leaves a vault that already
+    /// holds them unchanged. Nothing is forgotten.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::with_recents`].
+    pub fn with_recents_and_secrets(
+        local: &LocalState,
+        platform: Platform,
+        recents: &[RecentConnection],
+        secrets: Option<&SecretBundle>,
+    ) -> Result<Self, PortableError> {
         let mut next = local.clone();
+        let mut records = local.hosts.records();
+        let mut to_save = Vec::new();
+        if let Some(bundle) = secrets {
+            for record in &mut records {
+                let Some(secret) = bundle.get(record.id()) else {
+                    continue;
+                };
+                set_remembers(record, true);
+                // An SSH host that signs in without a password cannot
+                // remember one.
+                if record.remembers_secret() {
+                    to_save.push((record.id(), secret.clone()));
+                }
+            }
+        }
         next.hosts = build_book(
-            &local.hosts.records(),
+            &records,
             recents,
             local.hosts.favorites(),
             local.hosts.unreadable_connections(),
@@ -347,7 +381,7 @@ impl ApplyPlan {
             keymap_changed: false,
             fallbacks: Vec::new(),
             trust_conflicts: Vec::new(),
-            secrets: Vec::new(),
+            secrets: to_save,
             forgets: Vec::new(),
             files: changed_files(local, &next)?,
             base: local.clone(),

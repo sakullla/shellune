@@ -1681,7 +1681,16 @@ impl SyncService {
                     )
                     .map_err(SyncError::RemoteDocument)?
             } else {
-                ApplyPlan::with_recents(local, self.platform, &recents).map_err(SyncError::Local)?
+                // A password another machine remembered and that arrives in the
+                // merged vault is remembered here too, as a document plan marks
+                // it.
+                ApplyPlan::with_recents_and_secrets(
+                    local,
+                    self.platform,
+                    &recents,
+                    Some(&SecretBundle::from_vault(&write.content)),
+                )
+                .map_err(SyncError::Local)?
             };
             return self.upload_document(
                 client,
@@ -1698,6 +1707,14 @@ impl SyncService {
         if let DocumentVault::Carry { cipher, .. } = &vault {
             options = options.with_vault((*cipher).clone());
         }
+        // The vault both sides already hold marks the records whose password it
+        // keeps as remembered here, as the vault adoption does.
+        let held = match &vault {
+            DocumentVault::Carry { settled, .. } => {
+                Some(SecretBundle::from_vault(&settled.content))
+            }
+            _ => None,
+        };
         let (plan, upload) = if from_remote {
             // When the cloud's recents are the later ones it already holds the
             // result, in its own order.
@@ -1716,15 +1733,16 @@ impl SyncService {
             let plan = merged
                 .as_ref()
                 .unwrap_or(document)
-                .plan(local, self.platform, ApplyMode::Replace, None)
+                .plan(local, self.platform, ApplyMode::Replace, held.as_ref())
                 .map_err(SyncError::RemoteDocument)?;
             if let Some(merged) = &mut merged {
                 merged.restamp(&options);
             }
             (plan, merged)
         } else {
-            let plan = ApplyPlan::with_recents(local, self.platform, &recents)
-                .map_err(SyncError::Local)?;
+            let plan =
+                ApplyPlan::with_recents_and_secrets(local, self.platform, &recents, held.as_ref())
+                    .map_err(SyncError::Local)?;
             let export =
                 ShelluneData::export_from_vault(plan.result(), &options, None, Some(document))
                     .map_err(SyncError::Local)?;
@@ -1741,7 +1759,22 @@ impl SyncService {
             }
             None => remote.seen(),
         };
-        let applied = match plan.apply(&self.data, "sync-merge") {
+        let applied = match &vault {
+            // The passwords the plan brings are the ones this vault already
+            // holds, so setting them changes nothing; this machine's vault
+            // stays the settled one the cloud holds and is not written.
+            DocumentVault::Carry {
+                settled, device_id, ..
+            } => plan.apply_with_vault(
+                &self.data,
+                &mut settled.content.clone(),
+                device_id,
+                "sync-merge",
+                &mut |_| Ok(()),
+            ),
+            _ => plan.apply(&self.data, "sync-merge"),
+        };
+        let applied = match applied {
             Err(PortableError::Changed) => return Ok(Step::Retry),
             other => other.map_err(SyncError::Local)?,
         };
