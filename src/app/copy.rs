@@ -2165,7 +2165,7 @@ pub static CHINESE: Strings = Strings {
     host_remember_passphrase: "记住口令",
     host_remember_note: "保存在系统凭据库（钥匙串 / 凭据管理器），不会写入主机文件。",
     host_secret_saved_placeholder: "已保存；留空则保持不变",
-    host_secret_failed: "密码没有保存到保险库",
+    host_secret_failed: "密码没有保存到密码库",
     host_startup_label: "连接后运行",
     host_startup_placeholder: "例如 cd /srv && tmux attach",
     host_startup_note: "每次连接成功后，在远程 Shell 中自动执行一次。",
@@ -5296,10 +5296,10 @@ backup_strings! {
     import_running: "Working…", "正在处理…";
     /// Export checkbox: take the whole vault along
     export_include_vault: "Include the vault (keys, passwords, host trust)",
-        "包含保险库（密钥、密码、主机信任）";
+        "包含密码库（密钥、密码、主机信任）";
     /// Under the vault checkbox: why the sync passphrase is asked for
     export_vault_hint: "A backup with the vault's secrets always needs the non-empty sync passphrase, even when WebDAV has a password.",
-        "包含保险库秘密的备份始终需要非空同步口令，即使 WebDAV 已设置密码。";
+        "包含密码库秘密的备份始终需要非空同步口令，即使 WebDAV 已设置密码。";
     /// The saved sync passphrase is used, no field is drawn
     export_vault_saved: "The saved sync passphrase seals this backup; it is not retyped.",
         "此备份使用已保存的同步口令密封，无需再次输入。";
@@ -5313,24 +5313,24 @@ backup_strings! {
     export_vault_required: "Enter the sync passphrase; it also becomes the one your other devices use.",
         "请输入同步口令；它也会成为其他设备使用的口令。";
     /// What the export wrote, with the vault in it
-    export_done_vault: "The backup carries the encrypted vault.", "备份已包含加密的保险库。";
+    export_done_vault: "The backup carries the encrypted vault.", "备份已包含加密的密码库。";
     /// The vault could not be opened for the export
     export_vault_locked: "The vault could not be opened on this device, so it could not be included.",
-        "无法在此设备上打开保险库，因此无法包含它。";
+        "无法在此设备上打开密码库，因此无法包含它。";
     /// Import stage: the file carries the encrypted vault and asks for the passphrase
     import_vault_locked: "This backup carries the encrypted vault. Enter the sync passphrase it was sealed with.",
-        "这个备份包含加密的保险库，请输入密封时使用的同步口令。";
+        "这个备份包含加密的密码库，请输入密封时使用的同步口令。";
     /// Preview row: what the vault part holds
-    preview_vault: "Vault", "保险库";
+    preview_vault: "Vault", "密码库";
     /// Preview line: the vault part's records and trust
     preview_vault_line: "{keys} keys, {passwords} passwords, {trust} trusted identities",
         "{keys} 把密钥、{passwords} 条密码、{trust} 条信任记录";
     /// Preview line: the vault part replaces this device's vault
     preview_vault_replace: "The file's vault replaces this device's vault.",
-        "文件中的保险库将替换此设备的保险库。";
+        "文件中的密码库将替换此设备的密码库。";
     /// Applied: the vault was restored
     import_done_vault: "The vault was restored with all of its records and trust.",
-        "保险库已连同全部记录与信任恢复。";
+        "密码库已连同全部记录与信任恢复。";
 }
 
 /// The backup strings of one language.
@@ -5569,10 +5569,10 @@ sync_strings! {
     /// Data document: preferences
     doc_preferences: "preferences", "偏好";
     /// Vault conflict dialog title
-    vault_conflict_title: "Vault conflicts", "保险库冲突";
+    vault_conflict_title: "Vault conflicts", "密码库冲突";
     /// Vault conflict dialog intro
     vault_conflict_intro: "Both sides changed these vault records differently. Nothing has been applied; each record is decided on its own, and the vault stays as it is until every one is answered.",
-        "两端对以下保险库记录做了不同修改。目前没有应用任何内容；每条记录单独决定，全部答复之前保险库保持不变。";
+        "两端对以下密码库记录做了不同修改。目前没有应用任何内容；每条记录单独决定，全部答复之前密码库保持不变。";
     /// One record conflict, both sides changed it
     vault_record_label: "{name} \u{b7} changed {count} times", "{name} · 修改了 {count} 次";
     /// One record conflict, one side deleted it
@@ -5593,12 +5593,80 @@ sync_strings! {
     vault_apply: "Apply choices", "应用选择";
     /// The whole-document question waits behind the vault one
     vault_then_document: "The data outside the vault is decided after these records.",
-        "这些记录处理完后，再决定保险库之外的数据。";
+        "这些记录处理完后，再决定密码库之外的数据。";
+    /// Intro of the record-by-record conflict dialog
+    records_conflict_intro: "Changes to different records were merged on their own. Only the places below were changed differently on both sides: choose which value to keep for each. Nothing is written until every one is answered.",
+        "两边对不同记录的修改已自动合并。只有下列位置两边改成了不同的值：请逐项选择保留哪一边。全部选定之前不会写入任何内容。";
+    /// Heading above the list of places that differ
+    records_where: "Where they differ", "差异位置";
+    /// When there is no base: the list is informational
+    records_where_hint: "There is no common version from an earlier sync to compare with, so only a whole side can be kept. These are the records both sides hold with different values:",
+        "没有可对比的上次同步版本，只能整体保留一边。以下是两边都有但内容不同的记录：";
+    /// More places than the list shows
+    records_more: "and {count} more", "以及另外 {count} 处";
+    /// This device's value of one place
+    records_local_value: "This device: {value}", "本机：{value}";
+    /// The cloud's value of one place
+    records_remote_value: "Cloud: {value}", "云端：{value}";
+    /// A value that one side deleted or never set
+    records_absent: "(deleted or not set)", "（已删除或未设置）";
+    /// The whole record differs (one side deleted it)
+    records_whole: "the whole record", "整条记录";
+    /// Button: answer every open place with this device's value
+    records_all_local: "All from this device", "全部用本机";
+    /// Button: answer every open place with the cloud's value
+    records_all_remote: "All from the cloud", "全部用云端";
+    /// Section names of a place
+    section_host: "SSH host", "SSH 主机";
+    /// Section names of a place
+    section_connection: "Connection", "连接";
+    /// Section names of a place
+    section_favorites: "Favourites", "收藏";
+    /// Section names of a place
+    section_groups: "Groups", "分组";
+    /// Section names of a place
+    section_forward: "Forwarding rule", "转发规则";
+    /// Section names of a place
+    section_snippet: "Saved command", "常用命令";
+    /// Section names of a place
+    section_known_host: "Trusted server", "已信任服务器";
+    /// Section names of a place
+    section_preferences: "Preference", "偏好设置";
+    /// Section names of a place
+    section_platform: "This platform's setting", "本平台设置";
+    /// Section names of a place
+    section_other: "Data", "数据";
+    /// Field names of a place
+    field_name: "name", "名称";
+    /// Field names of a place
+    field_address: "address", "地址";
+    /// Field names of a place
+    field_port: "port", "端口";
+    /// Field names of a place
+    field_user: "user", "用户名";
+    /// Field names of a place
+    field_group: "group", "分组";
+    /// Field names of a place
+    field_identity_file: "key file", "密钥文件";
+    /// Field names of a place
+    field_auth: "sign-in method", "登录方式";
+    /// Field names of a place
+    field_managed_key: "vault key", "密码库密钥";
+    /// Field names of a place
+    field_credential: "shared password", "共享密码";
+    /// Field names of a place
+    field_startup: "startup command", "启动命令";
+    /// Field names of a place
+    field_jumps: "jump hosts", "跳板机";
+    /// Field names of a place
+    field_proxy: "proxy command", "代理命令";
+    /// Field names of a place
+    field_keymap: "key bindings", "快捷键";
     /// Automatic sync waits while the vault is locked
-    deferred_locked: "Automatic sync waits until the vault is unlocked", "自动同步等待保险库解锁";
+    deferred_locked: "Automatic sync waits until the vault is unlocked", "自动同步等待密码库解锁";
     /// A pull applied the cloud's vault
     pull_vault: "The cloud's vault was applied (version {version}).",
-        "已应用云端保险库（版本 {version}）。";
+        "已应用云端密码库（版本 {version}）。";
 }
 
 /// The sync strings of one language.
@@ -5943,22 +6011,22 @@ security_strings! {
     settings_item: "Keys & passwords", "密钥与密码";
     /// Under the page's name
     settings_hint: "The SSH keys and connection passwords this app keeps in its own vault",
-        "管理应用自身保险库保存的 SSH 密钥与连接密码";
+        "管理应用自身密码库保存的 SSH 密钥与连接密码";
     /// Sign-in method chooser entry
     method_label: "Application key", "应用密钥";
     /// Under the chooser entry
     method_hint: "Signs in with a private key kept in this app's vault; no key file is read",
-        "使用应用保险库中的私钥登录，不再读取密钥文件";
+        "使用应用密码库中的私钥登录，不再读取密钥文件";
     /// The connection form, when the method is chosen and the vault holds no key yet
     method_none: "The vault holds no application key yet. Import or generate one in Settings.",
-        "保险库中还没有应用密钥，请先在设置中导入或生成。";
+        "密码库中还没有应用密钥，请先在设置中导入或生成。";
     /// The connection form, when the key the host names cannot be handed over
     managed_missing: "The vault cannot hand this key over. Open the keys page and check the vault.",
-        "保险库无法提供这把密钥，请到密钥页检查保险库。";
+        "密码库无法提供这把密钥，请到密钥页检查密码库。";
     /// A desktop connection start, when the shared password it names cannot be
     /// handed over - the vault is locked, or the record is gone
     credential_unavailable: "The vault cannot hand this password over. Open the keys page and check the vault.",
-        "保险库无法提供这个密码，请到密钥页检查保险库。";
+        "密码库无法提供这个密码，请到密钥页检查密码库。";
     /// The connection form, naming the key that will sign
     managed_chosen: "Signing in with: {name}", "登录密钥：{name}";
     /// Search field placeholder of the page
@@ -5969,9 +6037,9 @@ security_strings! {
     /// Section heading
     credentials_title: "Passwords", "密码";
     /// No key is in the vault
-    empty_keys: "No key is in the vault yet.", "保险库中还没有密钥。";
+    empty_keys: "No key is in the vault yet.", "密码库中还没有密钥。";
     /// No password is in the vault
-    empty_credentials: "No password is in the vault yet.", "保险库中还没有密码。";
+    empty_credentials: "No password is in the vault yet.", "密码库中还没有密码。";
     /// Nothing matches the search
     no_match: "No record matches the search.", "没有匹配的记录。";
     /// Chip of a key row
@@ -6034,14 +6102,14 @@ security_strings! {
     /// Page line while a vault task runs on the background executor
     busy: "Working…", "处理中…";
     /// Notice prefix when the vault could not be opened or written
-    vault_failed: "The vault could not be opened", "无法打开保险库";
+    vault_failed: "The vault could not be opened", "无法打开密码库";
     /// Notice prefix when a write was refused
-    vault_refused: "The vault refused the change", "保险库拒绝了本次修改";
+    vault_refused: "The vault refused the change", "密码库拒绝了本次修改";
     /// Import dialog title
     import_title: "Import a private key", "导入私钥";
     /// Import dialog intro
     import_intro: "The key is re-protected by this app's vault. The original file is not changed, moved or read again.",
-        "密钥导入后由应用保险库重新保护。原文件不会被修改、移动或再次读取。";
+        "密钥导入后由应用密码库重新保护。原文件不会被修改、移动或再次读取。";
     /// Import field
     import_pem: "OpenSSH private key text", "OpenSSH 私钥内容";
     /// Import field
@@ -6052,7 +6120,7 @@ security_strings! {
     import_missing: "Paste the private key text and give it a name.", "请粘贴私钥内容并填写名称。";
     /// Import refusal: same public key again, naming the record that holds it
     import_duplicate: "A key with this public key is already in the vault: {name}",
-        "保险库中已有相同公钥的密钥：{name}";
+        "密码库中已有相同公钥的密钥：{name}";
     /// Import refusal: RSA below the floor this build accepts
     import_rsa_weak: "An RSA key of {bits} bits is too weak to import; 2048 is the least this build accepts.",
         "{bits} 位的 RSA 密钥过弱，不予导入；本应用最低接受 2048 位。";
@@ -6168,14 +6236,14 @@ security_strings! {
     unbind_done: "Unbound from {host}", "已解除与 {host} 的绑定";
     /// A vault job overlapped edits the user made meanwhile
     drift_kept: "Your edits to {names} were kept; the vault's reference change was applied on top of them.",
-        "对 {names} 的修改已保留，保险库的引用变更在其之上生效。";
+        "对 {names} 的修改已保留，密码库的引用变更在其之上生效。";
     /// A key record was saved (create, generate or metadata edit)
     key_saved: "Key saved", "密钥已保存";
     /// Hint under the host editor's key picker
     host_key_pick: "The key this host signs in with", "此主机使用的登录密钥";
     /// Hint under the host editor's shared-password picker
     host_credential_pick: "Use a password from the vault instead of typing one",
-        "使用保险库中的共享密码，不再手动输入";
+        "使用密码库中的共享密码，不再手动输入";
     /// Host editor: stop using a vault password
     host_credential_clear: "Type a password instead", "改为手动输入密码";
     /// Settings item: the host trust page
@@ -6193,7 +6261,7 @@ security_strings! {
     /// Nothing matches the search
     trust_no_match: "No accepted identity matches the search.", "没有匹配的信任记录。";
     /// Row caption: where the record came from
-    trust_from_vault: "vault", "保险库";
+    trust_from_vault: "vault", "密码库";
     /// Row caption: where the record came from
     trust_from_this_mac: "this device only", "仅此设备";
     /// Detail label of a trust row
@@ -6213,11 +6281,11 @@ security_strings! {
     lock_settings_item: "Lock & biometrics", "锁定与生物识别";
     /// Under the lock page's name
     lock_settings_hint: "When this device asks you to verify again before opening the vault",
-        "此设备在何时要求重新验证后才能使用保险库";
+        "此设备在何时要求重新验证后才能使用密码库";
     /// Lock status: the vault is open on this device
-    lock_state_open: "Vault unlocked on this device", "保险库在此设备上已解锁";
+    lock_state_open: "Vault unlocked on this device", "密码库在此设备上已解锁";
     /// Lock status: the vault is locked
-    lock_state_locked: "Vault locked", "保险库已锁定";
+    lock_state_locked: "Vault locked", "密码库已锁定";
     /// Lock status while a verification is running
     lock_state_verifying: "Asking the system to verify you\u{2026}", "正在请求系统验证\u{2026}";
     /// Button: lock now
@@ -6246,7 +6314,7 @@ security_strings! {
     lock_policy_every: "Every sensitive operation", "每次敏感操作";
     /// Under the policy control, the unlock-vault choice
     lock_policy_unlock_hint: "One verification opens the vault until it locks again.",
-        "验证一次即解锁保险库，直到再次锁定。";
+        "验证一次即解锁密码库，直到再次锁定。";
     /// Under the policy control, the every-operation choice
     lock_policy_every_hint: "Showing or copying a password, signing with a managed key and exporting each verify again.",
         "显示或复制密码、使用受管密钥认证、导出等每次都重新验证。";
@@ -6261,9 +6329,9 @@ security_strings! {
     lock_settings_problem: "The saved lock choices could not be read; the defaults are in use.",
         "已保存的锁定设置无法读取，正在使用默认值。";
     /// Verification was cancelled; nothing opened
-    lock_cancelled: "Verification was cancelled; the vault stays locked.", "验证已取消，保险库保持锁定。";
+    lock_cancelled: "Verification was cancelled; the vault stays locked.", "验证已取消，密码库保持锁定。";
     /// Verification did not match; nothing opened
-    lock_failed: "Verification did not match; the vault stays locked.", "验证未通过，保险库保持锁定。";
+    lock_failed: "Verification did not match; the vault stays locked.", "验证未通过，密码库保持锁定。";
     /// The system could not ask right now
     lock_busy: "The system could not ask right now; try again in a moment.",
         "系统暂时无法弹出验证，请稍后再试。";
@@ -6272,7 +6340,7 @@ security_strings! {
         "已登记的生物识别发生变化，此设备的生物识别解锁已停用。请用当前 WebDAV 密码或同步口令重新解锁后再开启。";
     /// A sensitive operation was blocked while the vault is locked
     lock_blocked: "The vault is locked. Unlock it in Settings to use this.",
-        "保险库已锁定，请在设置中解锁后再使用。";
+        "密码库已锁定，请在设置中解锁后再使用。";
     /// Re-enabling biometrics after it was reset needs a fresh verification
     lock_reenable_note: "Turning biometrics back on asks the system to verify you once.",
         "重新开启生物识别会请求系统验证一次。";
@@ -6281,7 +6349,7 @@ security_strings! {
         "此设备没有可用的系统验证";
     /// Risk dialog body: what the unlocked-session shape is and is not
     biometric_risk_body: "This device offers no verification this app can call, so the protection is the unlocked session itself: anyone using this device can open the vault. It is not biometric strength. The vault is never locked automatically in this shape, and the choice can be turned off at any time.",
-        "此设备没有可供应用调用的系统验证，因此保护仅来自已解锁的用户会话：使用此设备的任何人都可以打开保险库。这不等同于生物识别强度。此形态下保险库不会自动锁定，且可随时关闭。";
+        "此设备没有可供应用调用的系统验证，因此保护仅来自已解锁的用户会话：使用此设备的任何人都可以打开密码库。这不等同于生物识别强度。此形态下密码库不会自动锁定，且可随时关闭。";
     /// Risk dialog confirm button
     biometric_risk_confirm: "Turn on anyway", "仍然开启";
     /// Home sidebar & Vault workbench title
@@ -6331,8 +6399,6 @@ security_strings! {
     copy_username: "Copy username", "复制用户名";
     /// Tooltip for copying a credential's password
     copy_password: "Copy password", "复制密码";
-    /// Toast title when a password is copied to the clipboard
-    password_copied: "Password copied", "密码已复制";
     /// Button in import private key dialog to choose a local file
     import_browse_file: "Browse file…", "浏览文件…";
     /// Error prefix when a chosen private key file could not be read
@@ -6365,6 +6431,65 @@ security_strings! {
     /// Warning tooltip/message when a bound shared password is missing
     vault_credential_missing_tip: "The shared password bound to this connection is no longer in the vault. Pick another or type a password.",
         "此连接绑定的共享密码已不在密码库中，请重新选择或手动输入密码。";
+    /// Toast after a password copy, with when the clipboard forgets it
+    password_copied_clears: "Password copied · clears in {seconds} s", "密码已复制 · {seconds} 秒后清除";
+    /// Tooltip of the hide button: a shown password hides itself
+    reveal_hides_after: "Hides by itself after {seconds} s", "{seconds} 秒后自动隐藏";
+    /// Filter: records that are worth a look
+    filter_attention: "Needs attention", "需要关注";
+    /// Filter with its count
+    filter_attention_count: "Needs attention ({count})", "需要关注（{count}）";
+    /// Empty state of the needs-attention filter
+    empty_attention: "Nothing needs attention: every key is of a recommended size and every password is at least fair.",
+        "没有需要关注的记录：所有密钥都达到推荐强度，所有密码强度均不低于“一般”。";
+    /// Row chip of a password whose strength is weak
+    weak_chip: "Weak", "弱";
+    /// Row chip of an RSA key below the recommended size
+    legacy_chip: "Legacy size", "长度不足";
+    /// Detail card warning on an RSA key below the recommended size
+    key_legacy_note: "This RSA key is {bits} bits, below the {recommended} this app generates. Rotate the connections that use it to a new key when you can.",
+        "这把 RSA 密钥为 {bits} 位，低于本应用生成的 {recommended} 位。建议尽快把使用它的连接轮换到新密钥。";
+    /// Detail card warning on a weak stored password
+    credential_weak_note: "This password is weak. Generate a longer one and change it on the servers that use it.",
+        "此密码强度较弱。建议生成更长的密码，并在使用它的服务器上同步修改。";
+    /// Strength meter label in the password dialogs
+    strength_label: "Strength: {level}", "强度：{level}";
+    /// Strength meter detail: the estimate in bits
+    strength_bits: "about {bits} bits", "约 {bits} 位";
+    /// Strength levels
+    strength_weak: "Weak", "弱";
+    /// Strength levels
+    strength_fair: "Fair", "一般";
+    /// Strength levels
+    strength_strong: "Strong", "强";
+    /// Strength levels
+    strength_very_strong: "Very strong", "很强";
+    /// Strength hint for a pattern-like password
+    strength_pattern: "a repeated or sequential pattern", "存在重复或连续模式";
+    /// Trust row: copy the full fingerprint
+    trust_copy_fingerprint: "Copy fingerprint", "复制指纹";
+    /// Vault banner: connections that sign in with a file only this device has
+    key_files_banner: "{count} connections sign in with a key file that exists only on this device, so they cannot connect from your other devices. Move the keys into the vault: they are kept encrypted, travel with sync and work on Windows, macOS and Linux alike.",
+        "有 {count} 个连接使用仅存在于本机的密钥文件登录，在其他设备上无法连接。把密钥移入密码库后，它们会加密保存、随同步传输，并可在 Windows、macOS 和 Linux 上通用。";
+    /// Vault banner button
+    key_files_move: "Move keys into vault", "移入密码库";
+    /// After moving key files into the vault
+    key_files_done: "{keys} keys are in the vault; {hosts} connections now sign in with them on every device.",
+        "已有 {keys} 把密钥存入密码库；{hosts} 个连接现在可在所有设备上使用它们登录。";
+    /// After moving, some could not be moved
+    key_files_partly: "{done} Not moved: {skipped}", "{done} 未能移入：{skipped}";
+    /// A key file that could not be read
+    key_file_unreadable: "{path} (the file could not be read)", "{path}（无法读取文件）";
+    /// An encrypted key file no remembered passphrase opens
+    key_file_locked: "{path} (encrypted; open the connection, type its passphrase and choose Move into vault)",
+        "{path}（已加密；请打开该连接，输入口令后点击“移入密码库”）";
+    /// A key file that is not a supported key
+    key_file_refused: "{path} ({reason})", "{path}（{reason}）";
+    /// Host dialog: move the chosen key file into the vault
+    host_key_to_vault: "Move into vault", "移入密码库";
+    /// Host dialog: why
+    host_key_to_vault_hint: "A key file path only works on this device. Move the key into the vault so this connection works on every synced device, on any platform.",
+        "密钥文件路径只在本机有效。把密钥移入密码库后，此连接可在所有同步设备、任何平台上使用。";
 }
 
 /// The security strings of one language.

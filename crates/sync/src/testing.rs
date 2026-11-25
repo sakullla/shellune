@@ -33,6 +33,9 @@ struct Files {
     read_only: bool,
     no_etags: bool,
     fail_next_put: bool,
+    /// Replaces the file a GET read once this many more GETs were served: another
+    /// machine writing in between this one's read and its write.
+    change_after_gets: Option<(usize, Vec<u8>)>,
     log: Vec<String>,
 }
 
@@ -106,6 +109,12 @@ impl WebDavServer {
     /// While off, no entity tag is reported (and `If-Match` never matches).
     pub fn set_etags(&self, etags: bool) {
         self.lock().no_etags = !etags;
+    }
+
+    /// Replaces the stored file with `bytes` right after the `gets`-th GET from
+    /// now: another machine writing between this one's read and its write.
+    pub fn change_after_gets(&self, gets: usize, bytes: &[u8]) {
+        self.lock().change_after_gets = Some((gets, bytes.to_vec()));
     }
 
     /// The next `PUT` is answered with 412 as if the file had just changed.
@@ -343,6 +352,15 @@ fn handle(state: &mut Files, request: &Request) -> Answer {
                 answer.body.clone_from(bytes);
                 if !state.no_etags {
                     answer.headers.push(("ETag", format!("\"e{tag}\"")));
+                }
+                if let Some((left, replacement)) = state.change_after_gets.take() {
+                    if left <= 1 {
+                        state.next_tag += 1;
+                        let tag = state.next_tag;
+                        state.files.insert(path, (replacement, tag));
+                    } else {
+                        state.change_after_gets = Some((left - 1, replacement));
+                    }
                 }
                 answer
             }

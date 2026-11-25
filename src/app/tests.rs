@@ -16851,12 +16851,23 @@ async fn the_tab_identity_rows_stay_inside_their_cards_and_are_reached_by_scroll
 async fn a_restored_strip_of_named_tabs_stays_pending_and_whole(cx: &mut TestAppContext) {
     let dir = TempDir::new("tab-identity-restore");
     seed(&dir.store(), Vec::new());
-    let names = ["build", "staging", "production", "database"];
+    // Six tabs: the pinned hosts tab is only its icon, so the narrow window's strip
+    // has room for four and the list is still needed to reach every one.
+    let names = [
+        "build",
+        "staging",
+        "production",
+        "database",
+        "metrics",
+        "archive",
+    ];
     let accents = [
         shellune_core::TabAccent::Iris,
         shellune_core::TabAccent::Teal,
         shellune_core::TabAccent::Clay,
         shellune_core::TabAccent::Orchid,
+        shellune_core::TabAccent::Violet,
+        shellune_core::TabAccent::Lime,
     ];
     let mut tabs = Vec::new();
     for (index, name) in names.iter().enumerate() {
@@ -22626,13 +22637,12 @@ async fn a_tab_keeps_its_dot_title_and_close_inside_itself_at_any_width(cx: &mut
         );
         let min = cx.update(|_window, app| view.read(app).tab_min_width_for_test());
         assert_hosts_tab_whole(cx, viewport);
-        if !compact {
-            assert_stays_inside_box(
-                bounds_of(cx, "nav.hosts.title"),
-                bounds_of(cx, "nav.hosts"),
-                "the hosts tab's word",
-            );
-        }
+        // The pinned hosts tab is its icon alone at every width; its name is in the
+        // tooltip, and the sidebar of the page it opens names the list.
+        assert!(
+            cx.debug_bounds("nav.hosts.title").is_none(),
+            "the hosts tab draws no word ({viewport:?}, {zoom:?})"
+        );
         // The list of every tab is there exactly when a tab is out of sight (R2).
         let listed = cx.update(|_window, app| view.read(app).tab_list_control_shown_for_test());
         let overflows = cx.update(|_window, app| view.read(app).tab_strip_overflows_for_test());
@@ -36886,15 +36896,28 @@ fn conflicting_machines<'a>(
     let (view, cx) = sync_window(cx, machine_b, &secrets, Destination::Settings);
     assert_eq!(host_names(&view, cx), vec!["alpha"]);
 
-    seed(
-        &machine_a.store(),
-        vec![
-            stored_host("alpha", "10.0.0.1", 22, "root", None),
-            stored_host("from-a", "10.0.0.7", 22, "root", None),
-        ],
-    );
+    // Both sides change the same field of one host - a real conflict; A also
+    // adds a host and B marks a favourite, which alone would merge.
+    let mut book = machine_a.store().load().expect("A's hosts read");
+    let mut alpha_a = book.hosts()[0].clone();
+    alpha_a.set_address("10.0.0.9").expect("a valid address");
+    book.update(alpha_a.clone(), alpha_a.id())
+        .expect("A's alpha changes");
+    book.apply(&HostEdit::create(stored_host(
+        "from-a", "10.0.0.7", 22, "root", None,
+    )))
+    .expect("A adds a host");
+    machine_a.store().save(&book).expect("A saves");
     let _ = a.sync().expect("A uploads its change");
     let alpha = first_host_id(&view, cx);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.edit_connection_for_test(alpha, cx));
+    });
+    cx.run_until_parked();
+    clear_field(cx, "hosts.field.address", "10.0.0.1".len());
+    type_into(cx, "hosts.field.address", "10.0.0.8");
+    click(cx, "hosts.save");
+    cx.run_until_parked();
     toggle_favorite(&view, cx, alpha);
     after_debounce(cx);
     (view, cx, a)
@@ -46255,7 +46278,9 @@ async fn vault_workbench_filters_highlights_master_detail_keyboard_and_copy_toas
     );
     let toasts = cx.update(|_window, app| view.read(app).toast_titles());
     assert!(
-        toasts.iter().any(|t| t == "Password copied")
+        toasts
+            .iter()
+            .any(|t| t == "Password copied · clears in 30 s")
             && !toasts.iter().any(|t| t.contains("shared-secret-value")),
         "copying password emits confirmation toast without leaking secret: {toasts:?}"
     );
@@ -46291,6 +46316,11 @@ async fn vault_workbench_filters_highlights_master_detail_keyboard_and_copy_toas
         "narrow window keeps detail open as a collapsible single-column card"
     );
     assert_within_width(bounds_of(cx, "security.detail"), narrow, "security.detail");
+    // The copy toasts of the steps above stand over the bottom of a window this
+    // short; they are let go first, as a reader would wait for them.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(10));
+    cx.run_until_parked();
     click(cx, "security.detail.close");
     assert!(!cx.update(|_window, app| view.read(app).security_detail_open_for_test()));
     let _ = view;
@@ -50933,5 +50963,256 @@ async fn modal_field_unmount_reclaim_focus_and_async_pane_focus_isolation(
     assert!(
         session_focused(cx, session),
         "closing Transfers focuses the remaining active terminal"
+    );
+}
+
+#[gpui::test]
+async fn a_copied_password_leaves_the_clipboard_and_a_shown_one_hides_by_itself(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("vault-clipboard-clear");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    click(cx, "nav.hosts");
+    cx.simulate_resize(size(px(1280.0), px(840.0)));
+    click(cx, "hosts.view.vault");
+    cx.run_until_parked();
+    let clipboard =
+        |cx: &mut VisualTestContext| cx.read_from_clipboard().and_then(|item| item.text());
+
+    // A copied password is on the clipboard, and gone again after the wait.
+    click(cx, "security.credential.copy-password.0");
+    assert_eq!(clipboard(cx), Some("shared-secret-value".to_owned()));
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(29));
+    cx.run_until_parked();
+    assert_eq!(
+        clipboard(cx),
+        Some("shared-secret-value".to_owned()),
+        "the password stays for the whole wait"
+    );
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(2));
+    cx.run_until_parked();
+    assert_ne!(
+        clipboard(cx),
+        Some("shared-secret-value".to_owned()),
+        "the clipboard forgets the password once the wait is over"
+    );
+
+    // Something the user copied since is never cleared.
+    click(cx, "security.credential.copy-password.0");
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("mine".to_owned()));
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(31));
+    cx.run_until_parked();
+    assert_eq!(clipboard(cx), Some("mine".to_owned()));
+
+    // A shown password hides itself; a second reveal restarts the wait.
+    click(cx, "security.credential.0");
+    click(cx, "security.detail.reveal");
+    assert!(cx.update(|_window, app| view.read(app).security_password_shown_for_test()));
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(20));
+    cx.run_until_parked();
+    click(cx, "security.detail.reveal");
+    click(cx, "security.detail.reveal");
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(20));
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).security_password_shown_for_test()),
+        "the first reveal's timer does not hide the second reveal"
+    );
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(11));
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_password_shown_for_test()),
+        "a shown password hides by itself"
+    );
+}
+
+#[gpui::test]
+async fn a_weak_password_is_measured_flagged_and_kept_by_the_attention_filter(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("vault-weak-password");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    click(cx, "nav.hosts");
+    cx.simulate_resize(size(px(1280.0), px(840.0)));
+    click(cx, "hosts.view.vault");
+    cx.run_until_parked();
+
+    // Nothing in the seeded vault needs attention.
+    click(cx, "security.filter.attention");
+    assert!(cx.debug_bounds("security.attention.empty").is_some());
+    click(cx, "security.filter.all");
+
+    click(cx, "security.action.new-password");
+    cx.simulate_input("Old router");
+    assert!(
+        cx.debug_bounds("security.dialog.strength").is_none(),
+        "an empty password has no meter"
+    );
+    type_into(cx, "security.dialog.secret", "password1");
+    assert!(cx.debug_bounds("security.dialog.strength").is_some());
+    click(cx, "security.dialog.submit");
+    cx.run_until_parked();
+
+    let weak = cx
+        .update(|_window, app| view.read(app).security_credentials_for_test())
+        .into_iter()
+        .find(|(_, name)| name == "Old router")
+        .expect("the weak password was saved")
+        .0;
+    click(cx, "security.filter.attention");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_visible_records(app)),
+        vec![crate::app::view::security::SecurityRecord::Credential(weak)],
+        "only the weak password needs attention"
+    );
+    click(cx, "security.credential.0");
+    assert!(
+        cx.debug_bounds("security.detail.weak").is_some(),
+        "its detail card says why"
+    );
+}
+
+/// A data conflict names every place both sides changed differently - the kind
+/// of record, its name, the field and both values - and each is answered on its
+/// own; "all from …" answers the rest at once, and nothing applies until every
+/// place has an answer.
+#[gpui::test]
+async fn sync_record_conflicts_name_each_place_and_are_answered_one_by_one(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("sync-record-conflict");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.open_sync_record_conflict_for_test(cx))
+    });
+    assert!(sync_conflict_open(&view, cx));
+    for selector in [
+        "sync.records.row.0",
+        "sync.records.row.1",
+        "sync.records.local.value.0",
+        "sync.records.remote.value.0",
+    ] {
+        assert!(cx.debug_bounds(selector).is_some(), "{selector} is drawn");
+    }
+
+    // One answer is not enough.
+    click(cx, "sync.records.local.0");
+    click(cx, "sync.vault.conflict.apply");
+    cx.run_until_parked();
+    assert!(
+        sync_conflict_open(&view, cx),
+        "an open place applies nothing"
+    );
+    let choices = cx.update(|_window, app| view.read(app).sync_document_choices_for_test());
+    assert_eq!(choices[0].1, Some(shellune_storage::MergeSide::Local));
+    assert_eq!(choices[1].1, None);
+
+    // "All from the cloud" answers every place, the first one included.
+    click(cx, "sync.records.all.remote");
+    let choices = cx.update(|_window, app| view.read(app).sync_document_choices_for_test());
+    assert!(
+        choices
+            .iter()
+            .all(|(_, side)| *side == Some(shellune_storage::MergeSide::Remote)),
+        "{choices:?}"
+    );
+    click(cx, "sync.records.local.1");
+    click(cx, "sync.vault.conflict.apply");
+    cx.run_until_parked();
+    assert!(
+        !sync_conflict_open(&view, cx),
+        "every place answered lets the choices go"
+    );
+}
+
+/// A key file only this device has is moved into the vault in one step: the
+/// vault holds the key, its connections sign in with it on every device, and
+/// a file that cannot be read is named and keeps its connection as it was.
+#[gpui::test]
+async fn key_files_move_into_the_vault_and_their_connections_follow(cx: &mut TestAppContext) {
+    let dir = TempDir::new("vault-key-files");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_vault(&dir, &secrets);
+    let key = shellune_ssh::keys::generate(shellune_ssh::ManagedKeyKind::Ed25519)
+        .expect("a key generates");
+    let fingerprint = shellune_ssh::keys::public_data(&key)
+        .expect("public material")
+        .fingerprint;
+    let pem = shellune_ssh::keys::export_private_key(&key, None).expect("a plain export");
+    let key_path = dir.path().join("id_test");
+    std::fs::write(&key_path, pem.expose()).expect("the key file is written");
+    let mut web = shellune_core::HostConfig::new("web", "10.0.0.5", 22, "deploy").expect("valid");
+    web.set_auth(Some(shellune_core::AuthMethodKind::KeyFile));
+    web.set_identity_file(Some(key_path.display().to_string()));
+    let mut gone = shellune_core::HostConfig::new("gone", "10.0.0.6", 22, "deploy").expect("valid");
+    gone.set_auth(Some(shellune_core::AuthMethodKind::KeyFile));
+    gone.set_identity_file(Some(dir.path().join("missing").display().to_string()));
+    let (web_id, gone_id) = (web.id(), gone.id());
+    {
+        let mut book = HostBook::new();
+        book.insert(web).expect("insert");
+        book.insert(gone).expect("insert");
+        dir.store().save(&book).expect("save hosts");
+    }
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    click(cx, "nav.hosts");
+    cx.simulate_resize(size(px(1280.0), px(840.0)));
+    click(cx, "hosts.view.vault");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("security.key-files").is_some(),
+        "the banner says so"
+    );
+
+    click(cx, "security.key-files.move");
+    cx.run_until_parked();
+
+    let keys = cx.update(|_window, app| view.read(app).security_keys_for_test());
+    let (key_id, _, _) = keys
+        .iter()
+        .find(|(_, _, print)| *print == fingerprint)
+        .cloned()
+        .expect("the vault holds the key");
+    let (moved, kept) = cx.update(|_window, app| {
+        let book = view.read(app).book();
+        let find = |id| {
+            book.hosts()
+                .iter()
+                .find(|host| host.id() == id)
+                .cloned()
+                .expect("host")
+        };
+        (find(web_id), find(gone_id))
+    });
+    assert_eq!(
+        moved.auth(),
+        Some(shellune_core::AuthMethodKind::ManagedKey)
+    );
+    assert_eq!(moved.managed_key_id(), Some(key_id));
+    assert_eq!(moved.identity_file(), None, "no path is left to travel");
+    assert_eq!(
+        kept.auth(),
+        Some(shellune_core::AuthMethodKind::KeyFile),
+        "a file that cannot be read keeps its connection as it was"
+    );
+    let (notice, warns) = cx
+        .update(|_window, app| view.read(app).security_notice_for_test())
+        .expect("a notice");
+    assert!(warns, "a skipped file is a warning: {notice}");
+    assert!(
+        notice.contains("missing"),
+        "the skipped file is named: {notice}"
     );
 }

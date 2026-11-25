@@ -66,10 +66,19 @@ pub(crate) enum SecurityFilter {
     Credentials,
     /// Records not referenced by any saved connection.
     Unused,
+    /// Records worth a look: an RSA key below the recommended size, a weak
+    /// password.
+    Attention,
 }
 
 impl SecurityFilter {
-    pub(crate) const ALL: [Self; 4] = [Self::All, Self::Keys, Self::Credentials, Self::Unused];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::All,
+        Self::Keys,
+        Self::Credentials,
+        Self::Unused,
+        Self::Attention,
+    ];
 
     fn selector(self) -> &'static str {
         match self {
@@ -77,6 +86,7 @@ impl SecurityFilter {
             Self::Keys => "security.filter.keys",
             Self::Credentials => "security.filter.credentials",
             Self::Unused => "security.filter.unused",
+            Self::Attention => "security.filter.attention",
         }
     }
 
@@ -86,6 +96,7 @@ impl SecurityFilter {
             Self::Keys => strings.filter_keys,
             Self::Credentials => strings.filter_credentials,
             Self::Unused => strings.filter_unused,
+            Self::Attention => strings.filter_attention,
         }
     }
 }
@@ -118,6 +129,14 @@ const RSA_IMPORT_FLOOR_BITS: usize = 2048;
 /// server still requires while saying nothing about why, and the warning is
 /// what tells the reader a replacement is worth planning.
 const RSA_GENERATED_BITS: usize = 3072;
+
+/// How long a copied password stays on the clipboard before this app clears it
+/// again - only when the clipboard still holds exactly what was copied, so a
+/// later copy of something else is never overwritten.
+const CLIPBOARD_CLEAR_AFTER: Duration = Duration::from_secs(30);
+
+/// How long a shown password stays drawn before it hides by itself.
+const REVEAL_HIDE_AFTER: Duration = Duration::from_secs(30);
 
 /// Width of the security page's dialog, in logical pixels before the text scale.
 const DIALOG_WIDTH: f32 = 560.0;
@@ -181,6 +200,10 @@ pub(crate) struct SecurityPage {
     /// Whether the detail card shows the password. Reset by every move, so a
     /// reveal never survives into the next record or the next visit.
     revealed: bool,
+    /// Bumped by every reveal: the auto-hide timer only hides its own reveal.
+    reveal_generation: u64,
+    /// Bumped by every password copy: the clipboard timer only clears its own.
+    clipboard_generation: u64,
     /// The one dialog the page has open.
     dialog: Option<SecurityDialog>,
     /// The new public key a finished rotation asks the user to deploy, drawn
@@ -726,6 +749,8 @@ impl SecurityPage {
             pending_bind: None,
             detail: None,
             revealed: false,
+            reveal_generation: 0,
+            clipboard_generation: 0,
             dialog: None,
             rotation_public_key: None,
             job_book: None,
@@ -854,6 +879,16 @@ pub(crate) enum SecurityReport {
         /// Where the export went.
         path: PathBuf,
     },
+    /// Key files of this device were moved into the vault and their
+    /// connections now sign in with the vault's keys.
+    KeyFilesAdopted {
+        /// How many distinct keys the moved connections now use.
+        keys: u32,
+        /// How many connections moved.
+        hosts: u32,
+        /// The files that could not be moved, each with why, as the page says it.
+        skipped: Vec<String>,
+    },
     /// An import was accepted with a warning worth reading.
     ImportedWithWarning {
         /// The imported key's identity.
@@ -934,7 +969,8 @@ struct SecurityRow {
     record: SecurityRecord,
     name: String,
     caption: String,
-    chip: String,
+    /// The chip beside the name and its tone, when the row has one.
+    chip: Option<(String, Tone)>,
     hosts: usize,
     host_names: Vec<String>,
     public_key: Option<String>,
@@ -1264,6 +1300,46 @@ impl ShelluneView {
         if let Some(public_key) = &self.security.rotation_public_key {
             page = page.child(self.security_rotation_result(public_key, cx));
         }
+        // Connections that sign in with a file only this device has do not
+        // work anywhere else: the vault is where a key travels (R1).
+        let key_files = self.security_key_file_count();
+        if key_files > 0 {
+            let busy = self.security.busy() || self.security.dialog.is_some();
+            page = page.child(
+                components::banner(Tone::Info, metrics)
+                    .debug_selector(|| "security.key-files".to_owned())
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(metrics.scale(spacing::SPACIOUS * 6.0))
+                            .whitespace_normal()
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(copy::fill(
+                                strings.key_files_banner,
+                                &[("count", &key_files.to_string())],
+                            ))),
+                    )
+                    .child(
+                        components::compact_button(
+                            strings.key_files_move,
+                            Variant::Primary,
+                            metrics,
+                        )
+                        .id("security.key-files.move")
+                        .debug_selector(|| "security.key-files.move".to_owned())
+                        .when(!busy, |button| {
+                            button.on_click(cx.listener(|this, _event, _window, cx| {
+                                this.security_adopt_key_files_now(cx);
+                            }))
+                        }),
+                    ),
+            );
+        }
 
         let disabled = self.security.busy() || self.security.dialog.is_some();
         let mut actions = div()
@@ -1308,11 +1384,21 @@ impl ShelluneView {
             .flex_wrap()
             .max_w_full()
             .debug_selector(|| "security.filter".to_owned());
+        let attention = self.security_attention_count();
         for filter in SecurityFilter::ALL {
             let chosen = self.security.filter == filter;
             let selector = filter.selector();
+            let label: SharedString = if filter == SecurityFilter::Attention && attention > 0 {
+                copy::fill(
+                    strings.filter_attention_count,
+                    &[("count", &attention.to_string())],
+                )
+                .into()
+            } else {
+                filter.label(strings).into()
+            };
             filters = filters.child(
-                components::segment(filter.label(strings), chosen, metrics)
+                components::segment(label, chosen, metrics)
                     .id(SharedString::from(selector))
                     .debug_selector(move || selector.to_owned())
                     .on_click(cx.listener(move |this, _event, _window, cx| {
@@ -1444,21 +1530,23 @@ impl ShelluneView {
             SecurityFilter::Credentials => {
                 col = col.child(self.security_list(false, cx));
             }
-            SecurityFilter::Unused => {
+            filter @ (SecurityFilter::Unused | SecurityFilter::Attention) => {
                 let key_rows = self.security_rows(true, cx);
                 let cred_rows = self.security_rows(false, cx);
                 if key_rows.is_empty() && cred_rows.is_empty() {
                     let narrowed = !self.security.search.read(cx).text().trim().is_empty();
+                    let (selector, empty) = if filter == SecurityFilter::Unused {
+                        ("security.unused.empty", strings.empty_unused)
+                    } else {
+                        ("security.attention.empty", strings.empty_attention)
+                    };
                     col = col.child(
                         div()
+                            .whitespace_normal()
                             .text_size(metrics.label_size())
                             .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .debug_selector(|| "security.unused.empty".to_owned())
-                            .child(if narrowed {
-                                strings.no_match
-                            } else {
-                                strings.empty_unused
-                            }),
+                            .debug_selector(move || selector.to_owned())
+                            .child(if narrowed { strings.no_match } else { empty }),
                     );
                 } else {
                     if !key_rows.is_empty() {
@@ -1651,6 +1739,7 @@ impl ShelluneView {
             );
         }
         let busy = self.security.busy() || self.security.dialog.is_some();
+        let query = self.security.trust_search.read(cx).text().trim().to_owned();
         let count = rows.len();
         let mut card = components::card(metrics).w_full().p(px(0.0)).gap(px(0.0));
         for (index, row) in rows.into_iter().enumerate() {
@@ -1674,6 +1763,7 @@ impl ShelluneView {
             };
             let row_host = host.clone();
             let row_port = port;
+            let copied_fingerprint = fingerprint.clone();
             let delete = components::compact_button(
                 strings.trust_delete_action,
                 Variant::Secondary,
@@ -1741,6 +1831,9 @@ impl ShelluneView {
                                         metrics,
                                     )),
                             )
+                            // The fingerprint itself is what a reader compares
+                            // with the server's own `ssh-keygen -lf`, so it is
+                            // drawn, not only copied (R7).
                             .child(
                                 components::copy_on_click(
                                     div()
@@ -1748,16 +1841,42 @@ impl ShelluneView {
                                         .truncate()
                                         .font_family(crate::app::terminal::monospace_family())
                                         .text_size(metrics.caption_size())
-                                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
                                         .debug_selector(move || {
                                             format!("security.trust.fingerprint.{index}")
                                         }),
-                                    fingerprint,
+                                    fingerprint.clone(),
                                 )
-                                .child(SharedString::from(
-                                    format!("{algorithm} \u{b7} {accepted_line}"),
-                                )),
+                                .child(security_highlighted(&fingerprint, &query)),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(metrics.caption_size())
+                                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                                    .debug_selector(move || format!("security.trust.meta.{index}"))
+                                    .child(SharedString::from(format!(
+                                        "{algorithm} \u{b7} {accepted_line}"
+                                    ))),
                             ),
+                    )
+                    .child(
+                        components::icon_only_button(Icon::Copy, metrics)
+                            .id(SharedString::from(format!("security.trust.copy.{index}")))
+                            .debug_selector(move || format!("security.trust.copy.{index}"))
+                            .tooltip(components::tooltip(strings.trust_copy_fingerprint))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    copied_fingerprint.clone(),
+                                ));
+                                this.toast(
+                                    Tone::Positive,
+                                    copy::ux_for(this.workspace.locale()).toast_copied,
+                                    None,
+                                    cx,
+                                );
+                            })),
                     )
                     .child(delete),
             );
@@ -2212,11 +2331,13 @@ impl ShelluneView {
                                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
                                             .child(security_highlighted(&name, &query)),
                                     )
-                                    .child(components::chip_within(
-                                        SharedString::from(chip),
-                                        Tone::Accent,
-                                        metrics,
-                                    )),
+                                    .children(chip.map(|(label, tone)| {
+                                        components::chip_within(
+                                            SharedString::from(label),
+                                            tone,
+                                            metrics,
+                                        )
+                                    })),
                             )
                             .when(!caption.is_empty(), |col| {
                                 col.child(
@@ -2255,6 +2376,7 @@ impl ShelluneView {
         };
         let strings = self.security_strings();
         let unused_only = self.security.filter == SecurityFilter::Unused;
+        let attention_only = self.security.filter == SecurityFilter::Attention;
         let query = self.security.search.read(cx).text().trim().to_lowercase();
         let needles: Vec<String> = query.split_whitespace().map(str::to_owned).collect();
         let narrowed = !needles.is_empty();
@@ -2291,8 +2413,19 @@ impl ShelluneView {
                 if unused_only && !referencing.is_empty() {
                     continue;
                 }
+                let profile = keys_api::profile(meta.public_key());
+                let legacy = profile
+                    .as_ref()
+                    .is_some_and(keys_api::KeyProfile::is_legacy);
+                if attention_only && !legacy {
+                    continue;
+                }
+                let label = profile
+                    .map(|profile| profile.label)
+                    .unwrap_or_else(|| meta.algorithm().to_owned());
                 let haystacks: Vec<String> = [
                     meta.name().to_lowercase(),
+                    label.to_lowercase(),
                     meta.algorithm().to_lowercase(),
                     meta.fingerprint().to_lowercase(),
                     meta.comment().unwrap_or_default().to_lowercase(),
@@ -2306,8 +2439,8 @@ impl ShelluneView {
                 rows.push(SecurityRow {
                     record: SecurityRecord::Key(meta.id()),
                     name: meta.name().to_owned(),
-                    caption: format!("{} · {}", meta.algorithm(), meta.fingerprint()),
-                    chip: strings.kind_key.to_owned(),
+                    caption: meta.fingerprint().to_owned(),
+                    chip: Some((label, if legacy { Tone::Warning } else { Tone::Neutral })),
                     hosts: referencing.len(),
                     host_names: referencing
                         .iter()
@@ -2336,6 +2469,10 @@ impl ShelluneView {
                 if unused_only && !referencing.is_empty() {
                     continue;
                 }
+                let weak = credential_is_weak(entry);
+                if attention_only && !weak {
+                    continue;
+                }
                 let haystacks: Vec<String> = [
                     meta.name().to_lowercase(),
                     meta.user().unwrap_or_default().to_lowercase(),
@@ -2350,7 +2487,7 @@ impl ShelluneView {
                     record: SecurityRecord::Credential(meta.id()),
                     name: meta.name().to_owned(),
                     caption: meta.user().map(str::to_owned).unwrap_or_default(),
-                    chip: strings.kind_credential.to_owned(),
+                    chip: weak.then(|| (strings.weak_chip.to_owned(), Tone::Warning)),
                     hosts: referencing.len(),
                     host_names: referencing
                         .iter()
@@ -2415,6 +2552,14 @@ impl ShelluneView {
                 let rotate_disabled = referencing
                     .is_empty()
                     .then_some(strings.rotate_disabled_unused);
+                let profile = keys_api::profile(meta.public_key());
+                let legacy_bits = profile
+                    .as_ref()
+                    .filter(|profile| profile.is_legacy())
+                    .and_then(|profile| profile.rsa_bits);
+                let kind_label = profile
+                    .map(|profile| profile.label)
+                    .unwrap_or_else(|| strings.kind_key.to_owned());
                 let mut body = div()
                     .flex()
                     .flex_col()
@@ -2448,13 +2593,32 @@ impl ShelluneView {
                                             .child(SharedString::from(meta.name().to_owned())),
                                     )
                                     .child(components::chip_within(
-                                        SharedString::from(strings.kind_key),
-                                        Tone::Accent,
+                                        SharedString::from(kind_label),
+                                        if legacy_bits.is_some() {
+                                            Tone::Warning
+                                        } else {
+                                            Tone::Accent
+                                        },
                                         metrics,
                                     )),
                             )
                             .child(close_button),
                     );
+                if let Some(bits) = legacy_bits {
+                    body = body.child(
+                        components::banner(Tone::Warning, metrics)
+                            .debug_selector(|| "security.detail.legacy".to_owned())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .whitespace_normal()
+                            .child(SharedString::from(copy::fill(
+                                strings.key_legacy_note,
+                                &[
+                                    ("bits", &bits.to_string()),
+                                    ("recommended", &keys_api::RSA_RECOMMENDED_BITS.to_string()),
+                                ],
+                            ))),
+                    );
+                }
                 if let Some(comment) = meta.comment().filter(|text| !text.trim().is_empty()) {
                     body = body.child(self.security_fact(
                         strings.label_comment,
@@ -2507,6 +2671,7 @@ impl ShelluneView {
                 let entry = content.credential(id)?;
                 let meta = entry.meta();
                 let referencing = self.referencing_records(None, Some(id));
+                let weak = credential_is_weak(entry);
                 let mut body = div()
                     .flex()
                     .flex_col()
@@ -2540,13 +2705,26 @@ impl ShelluneView {
                                             .child(SharedString::from(meta.name().to_owned())),
                                     )
                                     .child(components::chip_within(
-                                        SharedString::from(strings.kind_credential),
-                                        Tone::Accent,
+                                        SharedString::from(if weak {
+                                            strings.weak_chip
+                                        } else {
+                                            strings.kind_credential
+                                        }),
+                                        if weak { Tone::Warning } else { Tone::Accent },
                                         metrics,
                                     )),
                             )
                             .child(close_button),
                     );
+                if weak {
+                    body = body.child(
+                        components::banner(Tone::Warning, metrics)
+                            .debug_selector(|| "security.detail.weak".to_owned())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .whitespace_normal()
+                            .child(strings.credential_weak_note),
+                    );
+                }
                 if let Some(user) = meta.user().filter(|text| !text.trim().is_empty()) {
                     // Copyable the way the fingerprint and the public key are:
                     // a login user name is what a person pastes into the next
@@ -2600,6 +2778,10 @@ impl ShelluneView {
                             )
                             .id("security.detail.reveal")
                             .debug_selector(|| "security.detail.reveal".to_owned())
+                            .tooltip(components::tooltip(copy::fill(
+                                strings.reveal_hides_after,
+                                &[("seconds", &REVEAL_HIDE_AFTER.as_secs().to_string())],
+                            )))
                             .on_click(cx.listener(
                                 |this, _event, _window, cx| {
                                     this.security.revealed = false;
@@ -2826,19 +3008,28 @@ impl ShelluneView {
             } else {
                 ControlState::Resting
             };
-            let button =
-                components::compact_button_with_state(label, Variant::Secondary, state, metrics)
-                    .min_w(reserved)
-                    .max_w_full()
-                    .flex_shrink()
-                    .whitespace_normal()
-                    .h(gpui::auto())
-                    .min_h(metrics.compact_control_height())
-                    .id(SharedString::from(selector.clone()))
-                    .debug_selector({
-                        let selector = selector.clone();
-                        move || selector.clone()
-                    });
+            // Deleting is the one action of the card that cannot be undone, so
+            // it reads as such before the confirmation does.
+            let variant = if matches!(
+                action,
+                SecurityAction::DeleteKey(_) | SecurityAction::DeleteCredential(_)
+            ) {
+                Variant::Danger
+            } else {
+                Variant::Secondary
+            };
+            let button = components::compact_button_with_state(label, variant, state, metrics)
+                .min_w(reserved)
+                .max_w_full()
+                .flex_shrink()
+                .whitespace_normal()
+                .h(gpui::auto())
+                .min_h(metrics.compact_control_height())
+                .id(SharedString::from(selector.clone()))
+                .debug_selector({
+                    let selector = selector.clone();
+                    move || selector.clone()
+                });
             let button = if let Some(reason) = disabled_reason {
                 button.tooltip(components::tooltip(reason))
             } else {
@@ -3202,6 +3393,93 @@ impl ShelluneView {
             .is_none()
     }
 
+    /// How many records of the unlocked vault are worth a look: RSA keys below
+    /// the recommended size and weak passwords. The search does not narrow it,
+    /// so the filter's count says what the whole vault holds.
+    fn security_attention_count(&self) -> usize {
+        let Some(content) = self.security.content.as_ref() else {
+            return 0;
+        };
+        let keys = content
+            .keys()
+            .filter(|record| record.meta().is_live())
+            .filter(|record| {
+                keys_api::profile(record.meta().public_key())
+                    .is_some_and(|profile| profile.is_legacy())
+            })
+            .count();
+        let credentials = content
+            .credentials()
+            .filter(|record| record.meta().is_live() && credential_is_weak(record))
+            .count();
+        keys + credentials
+    }
+
+    /// The strength meter under a password field: four segments and one line
+    /// naming the level and the estimate. Nothing is drawn for an empty field,
+    /// and the password itself is only measured, never drawn.
+    fn security_strength_meter(
+        &self,
+        field: Option<&Entity<TextField>>,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let metrics = self.metrics();
+        let strings = self.security_strings();
+        let estimate = password_strength(field?.read(cx).text())?;
+        let (level, tone, filled) = match estimate.level {
+            Strength::Weak => (strings.strength_weak, Tone::Danger, 1),
+            Strength::Fair => (strings.strength_fair, Tone::Warning, 2),
+            Strength::Strong => (strings.strength_strong, Tone::Positive, 3),
+            Strength::VeryStrong => (strings.strength_very_strong, Tone::Positive, 4),
+        };
+        let mut bar = div()
+            .flex()
+            .w_full()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .debug_selector(|| "security.dialog.strength.bar".to_owned());
+        for index in 0..4 {
+            bar = bar.child(
+                div()
+                    .flex_1()
+                    .h(metrics.scale(spacing::HAIRLINE))
+                    .rounded_full()
+                    .bg(if index < filled {
+                        tone.text()
+                    } else {
+                        theme::swatch(palette::BORDER)
+                    }),
+            );
+        }
+        let mut line = copy::fill(strings.strength_label, &[("level", level)]);
+        line.push_str(" \u{b7} ");
+        line.push_str(&copy::fill(
+            strings.strength_bits,
+            &[("bits", &estimate.bits.to_string())],
+        ));
+        if estimate.pattern {
+            line.push_str(" \u{b7} ");
+            line.push_str(strings.strength_pattern);
+        }
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .min_w_0()
+                .gap(metrics.scale(spacing::HALF))
+                .debug_selector(|| "security.dialog.strength".to_owned())
+                .child(bar)
+                .child(
+                    div()
+                        .whitespace_normal()
+                        .text_size(metrics.caption_size())
+                        .text_color(tone.text())
+                        .debug_selector(|| "security.dialog.strength.label".to_owned())
+                        .child(SharedString::from(line)),
+                ),
+        )
+    }
+
     /// Switches the active [`SecurityFilter`], clearing revealed secrets and any
     /// detail selection that the new filter hides.
     fn security_set_filter(&mut self, filter: SecurityFilter, cx: &mut Context<Self>) {
@@ -3231,7 +3509,7 @@ impl ShelluneView {
         }
         let mut out = Vec::new();
         match self.security.filter {
-            SecurityFilter::All | SecurityFilter::Unused => {
+            SecurityFilter::All | SecurityFilter::Unused | SecurityFilter::Attention => {
                 out.extend(self.security_rows(true, cx).into_iter().map(|r| r.record));
                 out.extend(self.security_rows(false, cx).into_iter().map(|r| r.record));
             }
@@ -3525,11 +3803,21 @@ impl ShelluneView {
                     digits,
                     symbols,
                     ..
-                } => match which {
-                    0 => *letters = !*letters,
-                    1 => *digits = !*digits,
-                    _ => *symbols = !*symbols,
-                },
+                } => {
+                    let chosen =
+                        usize::from(*letters) + usize::from(*digits) + usize::from(*symbols);
+                    let slot = match which {
+                        0 => letters,
+                        1 => digits,
+                        _ => symbols,
+                    };
+                    // The last chosen class stays on: a generator with nothing
+                    // to draw from has no honest answer to give.
+                    if *slot && chosen == 1 {
+                        return;
+                    }
+                    *slot = !*slot;
+                }
                 _ => {}
             },
             cx,
@@ -4328,6 +4616,13 @@ impl ShelluneView {
                                 host.set_auth(post.auth());
                                 host.set_managed_key_id(post.managed_key_id());
                                 host.set_credential_id(post.credential_id());
+                                // A job that moved a key file into the vault
+                                // cleared the path: that is its change too.
+                                if let ConnectionRecord::Ssh(before) = pre
+                                    && before.identity_file() != post.identity_file()
+                                {
+                                    host.set_identity_file(post.identity_file());
+                                }
                             }
                             (ConnectionRecord::Rdp(config), ConnectionRecord::Rdp(post)) => {
                                 config.set_credential_id(post.credential_id());
@@ -4863,10 +5158,65 @@ impl ShelluneView {
         if self.security_begin(vec![SecurityPending::Reveal(credential)], cx) {
             return;
         }
+        self.security_show_password(credential, cx);
+        cx.notify();
+    }
+
+    /// Shows the password of one record on its detail card, and hides it again
+    /// by itself after [`REVEAL_HIDE_AFTER`] - a password left on screen is one
+    /// a passer-by reads. A later reveal, a hide or a move owns the state from
+    /// then on: the timer only hides the reveal it was started for.
+    fn security_show_password(&mut self, credential: CredentialId, cx: &mut Context<Self>) {
         self.security.revealed = true;
         self.security.detail = Some(SecurityRecord::Credential(credential));
+        self.security.reveal_generation = self.security.reveal_generation.wrapping_add(1);
+        let generation = self.security.reveal_generation;
         self.security_touch(cx);
-        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(REVEAL_HIDE_AFTER).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.security.reveal_generation == generation && view.security.revealed {
+                    view.security.revealed = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Puts one password on the clipboard and clears it again after
+    /// [`CLIPBOARD_CLEAR_AFTER`], when the clipboard still holds exactly that
+    /// password - so a clipboard manager or a paste a minute later does not
+    /// find it, and nothing the user copied since is touched.
+    fn security_password_to_clipboard(&mut self, text: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+        self.security.clipboard_generation = self.security.clipboard_generation.wrapping_add(1);
+        let generation = self.security.clipboard_generation;
+        let copied = SecretString::new(text);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CLIPBOARD_CLEAR_AFTER).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.security.clipboard_generation != generation {
+                    return;
+                }
+                let still_ours = cx
+                    .read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .is_some_and(|now| now == copied.expose());
+                if still_ours {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(String::new()));
+                }
+            });
+        })
+        .detach();
+        // One line, so the toast is no taller than any other copy toast: a stack of
+        // them must not grow over the controls of a short window.
+        let strings = self.security_strings();
+        let title = copy::fill(
+            strings.password_copied_clears,
+            &[("seconds", &CLIPBOARD_CLEAR_AFTER.as_secs().to_string())],
+        );
+        self.toast(Tone::Positive, title, None, cx);
     }
 
     /// Copies the password of one record without drawing it, behind the same
@@ -4883,9 +5233,7 @@ impl ShelluneView {
             .and_then(|record| record.secret())
             .map(|secret| secret.expose().to_owned())
         {
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-            let copied_title = self.security_strings().password_copied;
-            self.toast(Tone::Positive, copied_title, None, cx);
+            self.security_password_to_clipboard(text, cx);
         }
         self.security_touch(cx);
     }
@@ -5219,9 +5567,7 @@ impl ShelluneView {
                 }
                 SecurityPending::Reveal(credential) => {
                     if self.is_security_keys_surface_visible() {
-                        self.security.revealed = true;
-                        self.security.detail = Some(SecurityRecord::Credential(credential));
-                        self.security_touch(cx);
+                        self.security_show_password(credential, cx);
                     }
                 }
                 SecurityPending::Copy(credential) => {
@@ -5233,9 +5579,7 @@ impl ShelluneView {
                         .and_then(|record| record.secret())
                         .map(|secret| secret.expose().to_owned())
                     {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-                        let copied_title = self.security_strings().password_copied;
-                        self.toast(Tone::Positive, copied_title, None, cx);
+                        self.security_password_to_clipboard(text, cx);
                         self.security_touch(cx);
                     }
                 }
@@ -5504,6 +5848,60 @@ impl ShelluneView {
         }
         self.security.pending_bind = Some(bind);
         self.security_start(action, cx);
+    }
+
+    /// How many saved SSH connections sign in with a key file only this device
+    /// has ([`host_uses_key_file`]).
+    pub(crate) fn security_key_file_count(&self) -> usize {
+        self.book
+            .hosts()
+            .iter()
+            .filter(|host| host_uses_key_file(host))
+            .count()
+    }
+
+    /// Moves every key file the connections use into the vault, as one job.
+    pub(crate) fn security_adopt_key_files_now(&mut self, cx: &mut Context<Self>) {
+        if self.security.busy()
+            || self.security.dialog.is_some()
+            || self.security.lock.locked
+            || self.security.content.is_none()
+        {
+            return;
+        }
+        let device = self.security.device.clone();
+        let strings = self.security_strings();
+        self.security_run(
+            Box::new(move |content, hosts, _connections| {
+                security_adopt_key_files(content, hosts, &device, strings)
+            }),
+            cx,
+        );
+    }
+
+    /// Opens the import dialog on the key file the open host form names, with
+    /// the passphrase the form holds, and binds the imported key to the form
+    /// once it is saved: the one-host way into the vault, for a key whose
+    /// passphrase the vault does not remember.
+    pub(crate) fn security_import_key_file_for_draft(
+        &mut self,
+        path: &str,
+        passphrase: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.security_open_inline(SecurityAction::Import, PendingVaultBind::SshManagedKey, cx);
+        if !matches!(self.security.dialog, Some(SecurityDialog::ImportKey { .. })) {
+            return;
+        }
+        self.security_load_import_file(&shellune_ssh::auth::expand_home(path), cx);
+        if let Some(text) = passphrase.filter(|text| !text.is_empty())
+            && let Some(SecurityDialog::ImportKey {
+                passphrase: field, ..
+            }) = &self.security.dialog
+        {
+            let field = field.clone();
+            field.update(cx, |field, cx| field.set_text(text, cx));
+        }
     }
 
     /// Opens a vault creation dialog from the Command Palette, unlocking first if locked.
@@ -5831,7 +6229,8 @@ impl ShelluneView {
                         "security.dialog.secret",
                         strings.credential_password,
                         dialog_secret(dialog),
-                    ));
+                    ))
+                    .children(self.security_strength_meter(dialog_secret(dialog), cx));
                 for (which, label, checked) in [
                     (0_u8, strings.charset_letters, *letters),
                     (1, strings.charset_digits, *digits),
@@ -5904,7 +6303,8 @@ impl ShelluneView {
                         "security.dialog.secret",
                         strings.edit_credential_password,
                         dialog_secret(dialog),
-                    ));
+                    ))
+                    .children(self.security_strength_meter(dialog_secret(dialog), cx));
                 for (which, label, checked) in [
                     (0_u8, strings.charset_letters, *letters),
                     (1, strings.charset_digits, *digits),
@@ -7591,6 +7991,27 @@ fn security_report_text(report: &SecurityReport, strings: &SecurityStrings) -> (
             ),
         ),
         SecurityReport::ImportedWithWarning { warning, .. } => (Tone::Warning, warning.clone()),
+        SecurityReport::KeyFilesAdopted {
+            keys,
+            hosts,
+            skipped,
+        } => {
+            let done = copy::fill(
+                strings.key_files_done,
+                &[("keys", &keys.to_string()), ("hosts", &hosts.to_string())],
+            );
+            if skipped.is_empty() {
+                (Tone::Positive, done)
+            } else {
+                (
+                    Tone::Warning,
+                    copy::fill(
+                        strings.key_files_partly,
+                        &[("done", &done), ("skipped", &skipped.join("; "))],
+                    ),
+                )
+            }
+        }
         SecurityReport::TrustForgotten { server } => (
             Tone::Positive,
             copy::fill(strings.trust_deleted_note, &[("server", server)]),
@@ -7691,6 +8112,152 @@ fn security_highlighted(text: &str, query: &str) -> gpui::AnyElement {
         )
         .into_any_element()
     }
+}
+
+/// Whether a host signs in with a key file of this device that the vault can
+/// take over: a key-file method, or the automatic one with a key named.
+pub(crate) fn host_uses_key_file(host: &HostConfig) -> bool {
+    use shellune_core::AuthMethodKind;
+    host.identity_file()
+        .is_some_and(|path| !path.trim().is_empty())
+        && matches!(
+            host.auth(),
+            None | Some(
+                AuthMethodKind::Auto | AuthMethodKind::KeyFile | AuthMethodKind::EncryptedKeyFile
+            )
+        )
+}
+
+/// Moves the key files the connections of this device sign in with into the
+/// vault, and points those connections at the vault's keys (one save).
+///
+/// Each distinct file is read once. An encrypted one is opened with a
+/// passphrase the vault already remembers for one of the connections that use
+/// it; none is ever asked for here. A key the vault already holds (same
+/// fingerprint) is reused rather than stored twice. A file that cannot be
+/// read, opened or accepted is named in the report and its connections keep
+/// their file - nothing is half moved.
+fn security_adopt_key_files(
+    content: &mut VaultContent,
+    hosts: &[HostConfig],
+    device: &str,
+    strings: &SecurityStrings,
+) -> Result<SecurityChange, String> {
+    let mut by_path: BTreeMap<String, Vec<&HostConfig>> = BTreeMap::new();
+    for host in hosts.iter().filter(|host| host_uses_key_file(host)) {
+        if let Some(path) = host.identity_file() {
+            by_path
+                .entry(path.trim().to_owned())
+                .or_default()
+                .push(host);
+        }
+    }
+    let mut moved = Vec::new();
+    let mut keys = BTreeSet::new();
+    let mut skipped = Vec::new();
+    for (path, users) in by_path {
+        let file = shellune_ssh::auth::expand_home(&path);
+        let Ok(pem) = std::fs::read_to_string(&file) else {
+            skipped.push(copy::fill(strings.key_file_unreadable, &[("path", &path)]));
+            continue;
+        };
+        let mut parsed = keys_api::parse_private_key(&pem, None);
+        if parsed == Err(keys_api::ManagedKeyError::EncryptedWithoutPassphrase) {
+            for host in &users {
+                if let Some(passphrase) = content.host_secret(host.id()).cloned()
+                    && let Ok(key) = keys_api::parse_private_key(&pem, Some(&passphrase))
+                {
+                    parsed = Ok(key);
+                    break;
+                }
+            }
+        }
+        let key = match parsed {
+            Ok(key) => key,
+            Err(keys_api::ManagedKeyError::EncryptedWithoutPassphrase)
+            | Err(keys_api::ManagedKeyError::PassphraseRejected) => {
+                skipped.push(copy::fill(strings.key_file_locked, &[("path", &path)]));
+                continue;
+            }
+            Err(error) => {
+                skipped.push(copy::fill(
+                    strings.key_file_refused,
+                    &[("path", &path), ("reason", &error.to_string())],
+                ));
+                continue;
+            }
+        };
+        if let Some(bits) = key.key_data().rsa().map(|rsa| rsa.key_size())
+            && (bits as usize) < RSA_IMPORT_FLOOR_BITS
+        {
+            skipped.push(copy::fill(
+                strings.key_file_refused,
+                &[
+                    ("path", &path),
+                    (
+                        "reason",
+                        &copy::fill(strings.import_rsa_weak, &[("bits", &bits.to_string())]),
+                    ),
+                ],
+            ));
+            continue;
+        }
+        let public = keys_api::public_data(&key).map_err(|error| error.to_string())?;
+        let existing = content
+            .keys()
+            .find(|record| {
+                record.meta().is_live() && record.meta().fingerprint() == public.fingerprint
+            })
+            .map(|record| record.meta().id());
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                let body =
+                    keys_api::export_private_key(&key, None).map_err(|error| error.to_string())?;
+                let id = KeyId::new();
+                let name = std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or(path.as_str())
+                    .to_owned();
+                let meta = ManagedKeyMeta::new(
+                    id,
+                    &name,
+                    public.algorithm,
+                    public.authorized_key,
+                    public.fingerprint,
+                    None,
+                    VaultRecordVersion::new(1, device.to_owned()),
+                );
+                content
+                    .insert_key(VaultKeyRecord::new(meta, body))
+                    .map_err(|error| error.to_string())?;
+                id
+            }
+        };
+        keys.insert(id);
+        for host in users {
+            let mut host = host.clone();
+            host.set_auth(Some(shellune_core::AuthMethodKind::ManagedKey));
+            host.set_managed_key_id(Some(id));
+            host.set_identity_file(None::<String>);
+            // The passphrase a key file needed is not needed any more: the
+            // vault holds the key itself.
+            if content.host_secret(host.id()).is_some() {
+                content.remove_host_secret(host.id());
+            }
+            moved.push(ConnectionRecord::Ssh(host));
+        }
+    }
+    Ok(SecurityChange::Save {
+        report: SecurityReport::KeyFilesAdopted {
+            keys: u32::try_from(keys.len()).unwrap_or(u32::MAX),
+            hosts: u32::try_from(moved.len()).unwrap_or(u32::MAX),
+            skipped,
+        },
+        records: moved,
+    })
 }
 
 /// Rotates one key: the whole transaction is checked on a catalog of the
@@ -8135,6 +8702,140 @@ fn write_private_export(path: &std::path::Path, bytes: &[u8]) -> Result<(), Stri
     Ok(())
 }
 
+/// How strong a password looks to someone guessing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Strength {
+    /// Short, common or patterned: guessed quickly offline.
+    Weak,
+    /// Holds against a casual attempt, not a determined one.
+    Fair,
+    /// Enough for a login a server rate-limits.
+    Strong,
+    /// What the generator produces at its default length.
+    VeryStrong,
+}
+
+/// A strength estimate: the level, the rough entropy behind it, and whether a
+/// repeated or sequential run lowered it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StrengthEstimate {
+    pub(crate) level: Strength,
+    pub(crate) bits: u32,
+    pub(crate) pattern: bool,
+}
+
+/// Passwords and stems that guessing lists try first; one of them with a few
+/// digits or symbols around it is still weak.
+const COMMON_PASSWORDS: &[&str] = &[
+    "password",
+    "passw0rd",
+    "qwerty",
+    "qwertyuiop",
+    "asdfgh",
+    "admin",
+    "administrator",
+    "root",
+    "toor",
+    "letmein",
+    "welcome",
+    "changeme",
+    "default",
+    "iloveyou",
+    "monkey",
+    "dragon",
+    "master",
+    "shadow",
+    "login",
+    "guest",
+    "test",
+    "secret",
+    "abc123",
+    "123456",
+    "12345678",
+    "123456789",
+    "1234567890",
+    "111111",
+    "000000",
+    "ubuntu",
+    "raspberry",
+    "server",
+];
+
+/// Estimates the strength of a password from its length, the character
+/// classes it draws on, and the runs that make it guessable.
+///
+/// It is a deliberately simple estimate - the size of the pool the classes
+/// span, raised to the length that is not a repeat or a +1/-1 run - with a
+/// floor for the common passwords guessing lists try first. It errs on the
+/// side of "weak": it is a nudge in a dialog, not a guarantee. `None` for an
+/// empty password, which has no strength to show.
+pub(crate) fn password_strength(password: &str) -> Option<StrengthEstimate> {
+    if password.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = password.chars().collect();
+    let (mut lower, mut upper, mut digit, mut symbol, mut other) =
+        (false, false, false, false, false);
+    for c in &chars {
+        match c {
+            'a'..='z' => lower = true,
+            'A'..='Z' => upper = true,
+            '0'..='9' => digit = true,
+            c if c.is_ascii() => symbol = true,
+            _ => other = true,
+        }
+    }
+    let pool = 26 * u32::from(lower)
+        + 26 * u32::from(upper)
+        + 10 * u32::from(digit)
+        + 33 * u32::from(symbol)
+        + 100 * u32::from(other);
+    // A character that repeats the one before it, or continues a +1/-1 step,
+    // adds little: "aaaa" and "abcd" are one guess each, not four.
+    let mut effective = 0.0_f64;
+    for (index, c) in chars.iter().enumerate() {
+        let step = |a: char, b: char| i64::from(u32::from(b)) - i64::from(u32::from(a));
+        let patterned = index > 0
+            && (chars[index - 1] == *c
+                || (index > 1
+                    && step(chars[index - 1], *c).abs() == 1
+                    && step(chars[index - 2], chars[index - 1]) == step(chars[index - 1], *c)));
+        effective += if patterned { 0.25 } else { 1.0 };
+    }
+    let pattern = effective < chars.len() as f64 * 0.75;
+    let bits = (effective * f64::from(pool.max(1)).log2()).round() as u32;
+    let stem: String = password
+        .to_lowercase()
+        .trim_matches(|c: char| !c.is_ascii_alphabetic())
+        .to_owned();
+    let common = COMMON_PASSWORDS.contains(&password.to_lowercase().as_str())
+        || (!stem.is_empty() && COMMON_PASSWORDS.contains(&stem.as_str()));
+    let level = if common || chars.len() < PASSWORD_LENGTH_MIN || bits < 45 {
+        Strength::Weak
+    } else if bits < 64 {
+        Strength::Fair
+    } else if bits < 90 {
+        Strength::Strong
+    } else {
+        Strength::VeryStrong
+    };
+    Some(StrengthEstimate {
+        level,
+        bits,
+        pattern: pattern || common,
+    })
+}
+
+/// Whether the vault's password of one record is weak: the lists flag it and
+/// the needs-attention filter keeps it. Only an unlocked vault holds the
+/// value, and only its length and shape are looked at.
+fn credential_is_weak(record: &VaultCredentialRecord) -> bool {
+    record
+        .secret()
+        .and_then(|secret| password_strength(secret.expose()))
+        .is_some_and(|estimate| estimate.level == Strength::Weak)
+}
+
 /// The generator, under the name the tests reach it by.
 #[cfg(test)]
 pub(crate) fn generate_password_for_test(
@@ -8184,12 +8885,29 @@ pub(crate) fn generate_password(
     // each choice uniform over the whole set.
     let limit = (65_536 / count) * count;
     let mut stream = Entropy::new();
-    let mut password = String::with_capacity(length);
-    while password.len() < length {
-        let value = stream.next_uniform(limit);
-        password.push(set[value % count] as char);
+    // A password that leaves out a class the user chose fails the servers whose
+    // policy asks for one of each, so such a draw is thrown away and drawn
+    // again. Rejection keeps every accepted password equally likely; at the
+    // shortest length and with all three classes it is redrawn a few percent
+    // of the time.
+    let wanted: Vec<&[u8]> = [(letters, LETTERS), (digits, DIGITS), (symbols, SYMBOLS)]
+        .into_iter()
+        .filter_map(|(on, class)| on.then_some(class))
+        .collect();
+    loop {
+        let mut password = String::with_capacity(length);
+        while password.len() < length {
+            let value = stream.next_uniform(limit);
+            password.push(set[value % count] as char);
+        }
+        let complete = length < wanted.len()
+            || wanted
+                .iter()
+                .all(|class| password.bytes().any(|byte| class.contains(&byte)));
+        if complete {
+            return password;
+        }
     }
-    password
 }
 
 /// A stream of uniform bytes from the CSPRNG behind `KeyId::new`, skipping the
@@ -8256,4 +8974,60 @@ fn unix_of(at: SystemTime) -> u64 {
     at.duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod strength_tests {
+    use super::{Strength, generate_password, password_strength};
+
+    #[test]
+    fn an_empty_password_has_no_strength() {
+        assert_eq!(password_strength(""), None);
+    }
+
+    #[test]
+    fn short_common_and_patterned_passwords_are_weak() {
+        for password in [
+            "abc",
+            "password",
+            "Password1!",
+            "admin123",
+            "aaaaaaaaaaaa",
+            "abcdefghijkl",
+        ] {
+            let estimate = password_strength(password).expect("a non-empty password");
+            assert_eq!(estimate.level, Strength::Weak, "{password} is weak");
+        }
+        assert!(password_strength("Password1!").expect("measured").pattern);
+        assert!(password_strength("abcdefghijkl").expect("measured").pattern);
+    }
+
+    #[test]
+    fn longer_and_more_varied_passwords_rank_higher() {
+        let fair = password_strength("hunter-gatherer").expect("measured");
+        let generated =
+            password_strength(&generate_password(20, true, true, true)).expect("measured");
+        assert!(fair.level >= Strength::Fair, "{fair:?}");
+        assert_eq!(generated.level, Strength::VeryStrong, "{generated:?}");
+        assert!(generated.bits > fair.bits);
+    }
+
+    #[test]
+    fn a_generated_password_holds_every_chosen_class() {
+        for _ in 0..200 {
+            let password = generate_password(8, true, true, true);
+            assert_eq!(password.len(), 8);
+            assert!(
+                password.bytes().any(|b| b.is_ascii_alphabetic()),
+                "{password}"
+            );
+            assert!(password.bytes().any(|b| b.is_ascii_digit()), "{password}");
+            assert!(
+                password.bytes().any(|b| !b.is_ascii_alphanumeric()),
+                "{password}"
+            );
+        }
+        let digits = generate_password(12, false, true, false);
+        assert!(digits.bytes().all(|b| b.is_ascii_digit()), "{digits}");
+    }
 }

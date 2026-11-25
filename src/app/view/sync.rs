@@ -132,10 +132,13 @@ pub(super) enum SyncJob {
     Pull,
     /// The answer to a conflict.
     Resolve(Resolution),
-    /// The answers to the vault records of a conflict, one per record
-    /// (ADR-5): the engine applies nothing of the vault until every one is
-    /// decided.
-    ResolveVault(Vec<shellune_sync::VaultChoice>),
+    /// The answers to a conflict one place at a time: the vault records
+    /// (ADR-5) and the records and settings of the data, by their keys. The
+    /// engine writes nothing until every one is decided.
+    ResolveRecords(
+        Vec<shellune_sync::VaultChoice>,
+        Vec<(String, shellune_storage::MergeSide)>,
+    ),
 }
 
 impl SyncJob {
@@ -150,7 +153,7 @@ impl SyncJob {
         matches!(
             self,
             Self::Auto | Self::Check | Self::Pull | Self::Resolve(Resolution::UseRemote)
-        ) || matches!(self, Self::ResolveVault(_))
+        ) || matches!(self, Self::ResolveRecords(..))
     }
 }
 
@@ -205,6 +208,9 @@ pub(super) struct SyncCenter {
         shellune_sync::VaultChoiceKey,
         Option<shellune_sync::VaultChoiceSide>,
     )>,
+    /// The per-place answers of the data part of a conflict, in the report's
+    /// order; `None` is a place not decided yet.
+    document_choices: Vec<(String, Option<shellune_storage::MergeSide>)>,
     /// Whether the conflict question is on screen.
     dialog: bool,
     /// The user put the question away; automatic checks do not ask again.
@@ -449,6 +455,40 @@ fn document_name(label: &str, strings: &SyncStrings) -> &'static str {
 }
 
 /// The choice-table key of one vault conflict.
+fn document_choices_of(
+    report: &ConflictReport,
+) -> Vec<(String, Option<shellune_storage::MergeSide>)> {
+    if !report.per_record {
+        return Vec::new();
+    }
+    report
+        .document
+        .iter()
+        .map(|place| (place.key.clone(), None))
+        .collect()
+}
+
+/// A field of a record as a person reads it; an unknown one as it is named.
+fn field_label(field: &str, strings: &SyncStrings) -> String {
+    match field {
+        "name" => strings.field_name,
+        "address" | "host" => strings.field_address,
+        "port" => strings.field_port,
+        "user" | "username" => strings.field_user,
+        "group" | "group_path" => strings.field_group,
+        "identity_file" => strings.field_identity_file,
+        "auth" => strings.field_auth,
+        "managed_key_id" => strings.field_managed_key,
+        "credential_id" => strings.field_credential,
+        "startup_command" => strings.field_startup,
+        "jumps" => strings.field_jumps,
+        "proxy_command" => strings.field_proxy,
+        "keymap" => strings.field_keymap,
+        other => return other.replace('_', " "),
+    }
+    .to_owned()
+}
+
 fn choice_key_of(conflict: &shellune_sync::VaultConflict) -> shellune_sync::VaultChoiceKey {
     match conflict {
         shellune_sync::VaultConflict::Record { kind, id, .. } => {
@@ -556,6 +596,7 @@ impl SyncCenter {
             form_problem: None,
             conflict: None,
             vault_choices: Vec::new(),
+            document_choices: Vec::new(),
             dialog: false,
             conflict_dismissed: false,
             deferred_locked: false,
@@ -719,7 +760,9 @@ impl ShelluneView {
                 SyncJob::Upload => service.upload(),
                 SyncJob::Pull => service.pull(),
                 SyncJob::Resolve(resolution) => service.resolve(resolution),
-                SyncJob::ResolveVault(choices) => service.resolve_vault(&choices),
+                SyncJob::ResolveRecords(vault, document) => {
+                    service.resolve_records(&vault, &document.into_iter().collect())
+                }
             }
         });
         cx.spawn(async move |this, cx| {
@@ -789,6 +832,7 @@ impl ShelluneView {
                     .iter()
                     .map(|conflict| (choice_key_of(conflict), None))
                     .collect();
+                self.sync.document_choices = document_choices_of(&report);
                 self.sync.conflict = Some(report);
                 if ask {
                     self.sync.dialog = true;
@@ -853,10 +897,53 @@ impl ShelluneView {
         cx.notify();
     }
 
-    /// Sends the per-record answers of a vault conflict (ADR-5). Every record
-    /// decided is the engine's own precondition; the button that lands here is
-    /// only drawn when the last open one was answered.
+    /// Answers one place of the data part of a conflict.
+    fn choose_document_side(
+        &mut self,
+        index: usize,
+        side: shellune_storage::MergeSide,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_, chosen)) = self.sync.document_choices.get_mut(index) {
+            *chosen = Some(side);
+        }
+        cx.notify();
+    }
+
+    /// Answers every place of the conflict, vault records included, with one
+    /// side: the quick way through a long list, still applied as one.
+    fn choose_every_side(&mut self, local: bool, cx: &mut Context<Self>) {
+        let (vault, document) = if local {
+            (
+                shellune_sync::VaultChoiceSide::Local,
+                shellune_storage::MergeSide::Local,
+            )
+        } else {
+            (
+                shellune_sync::VaultChoiceSide::Remote,
+                shellune_storage::MergeSide::Remote,
+            )
+        };
+        for (_, chosen) in &mut self.sync.vault_choices {
+            *chosen = Some(vault);
+        }
+        for (_, chosen) in &mut self.sync.document_choices {
+            *chosen = Some(document);
+        }
+        cx.notify();
+    }
+
+    /// Sends the per-place answers of a conflict: the vault records (ADR-5)
+    /// and the data's records and settings. Every place decided is the
+    /// engine's own precondition; the button that lands here is only drawn
+    /// when the last open one was answered.
     pub(super) fn resolve_sync_vault(&mut self, cx: &mut Context<Self>) {
+        let document: Vec<(String, shellune_storage::MergeSide)> = self
+            .sync
+            .document_choices
+            .iter()
+            .filter_map(|(key, side)| side.map(|side| (key.clone(), side)))
+            .collect();
         let choices: Vec<shellune_sync::VaultChoice> = self
             .sync
             .vault_choices
@@ -869,7 +956,7 @@ impl ShelluneView {
             })
             .collect();
         self.sync.dialog = false;
-        self.run_sync_job(SyncJob::ResolveVault(choices), cx);
+        self.run_sync_job(SyncJob::ResolveRecords(choices, document), cx);
         cx.notify();
     }
 
@@ -1867,7 +1954,7 @@ impl ShelluneView {
             return None;
         }
         let report = self.sync.conflict.as_ref()?;
-        if !report.vault.is_empty() {
+        if !report.vault.is_empty() || (report.per_record && !report.document.is_empty()) {
             return Some(self.vault_conflict_overlay(report, window, cx));
         }
         let strings = self.sync_strings();
@@ -1931,6 +2018,10 @@ impl ShelluneView {
                     .debug_selector(|| "sync.conflict.source".to_owned())
                     .child(SharedString::from(source)),
             )
+            .children(
+                (!report.document.is_empty())
+                    .then(|| self.document_places_preview(report, metrics)),
+            )
             .child(paragraph(
                 strings.conflict_remote_hint,
                 "sync.conflict.remote.hint",
@@ -1986,6 +2077,218 @@ impl ShelluneView {
         ))
     }
 
+    /// The name of one place for a person: what kind of record, which one, and
+    /// which field - "SSH host · web · address".
+    fn document_place_title(&self, place: &shellune_storage::DocumentConflict) -> String {
+        use shellune_storage::ConflictSection;
+        let strings = self.sync_strings();
+        let section = match place.section {
+            ConflictSection::Host => strings.section_host,
+            ConflictSection::Connection => strings.section_connection,
+            ConflictSection::Favorites => strings.section_favorites,
+            ConflictSection::Groups => strings.section_groups,
+            ConflictSection::Forward => strings.section_forward,
+            ConflictSection::Snippet => strings.section_snippet,
+            ConflictSection::KnownHost => strings.section_known_host,
+            ConflictSection::Preferences => strings.section_preferences,
+            ConflictSection::ThisPlatform => strings.section_platform,
+            ConflictSection::Other => strings.section_other,
+        };
+        // A machine-specific field of this platform names its host by id; the
+        // book knows its name.
+        let record = place.record.as_ref().map(|record| {
+            self.book
+                .records()
+                .iter()
+                .find(|known| known.id().to_string() == *record)
+                .map_or_else(|| record.clone(), |known| known.name().to_owned())
+        });
+        let field = if place.field.is_empty() {
+            strings.records_whole.to_owned()
+        } else {
+            place
+                .field
+                .split('.')
+                .map(|part| field_label(part, strings))
+                .collect::<Vec<_>>()
+                .join(" \u{b7} ")
+        };
+        let mut parts = vec![section.to_owned()];
+        parts.extend(record);
+        parts.push(field);
+        parts.join(" \u{b7} ")
+    }
+
+    /// One place both sides changed differently, with both values and the two
+    /// ways to answer it.
+    fn document_place_row(
+        &self,
+        index: usize,
+        place: &shellune_storage::DocumentConflict,
+        chosen: Option<shellune_storage::MergeSide>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        use shellune_storage::MergeSide;
+        let strings = self.sync_strings();
+        let metrics = self.metrics();
+        let value = |template: &'static str, value: &Option<String>| {
+            copy::fill(
+                template,
+                &[("value", value.as_deref().unwrap_or(strings.records_absent))],
+            )
+        };
+        let line = |text: String, picked: bool, selector: String| {
+            div()
+                .min_w_0()
+                .truncate()
+                .font_family(crate::app::terminal::monospace_family())
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(if picked {
+                    palette::TEXT_PRIMARY
+                } else {
+                    palette::TEXT_SECONDARY
+                }))
+                .when(picked, |line| line.font_weight(FontWeight::MEDIUM))
+                .debug_selector(move || selector.clone())
+                .child(SharedString::from(text))
+        };
+        let keep = |side: MergeSide, selector: String, label: &'static str| {
+            let picked = chosen == Some(side);
+            components::compact_button(
+                label,
+                if picked {
+                    Variant::Primary
+                } else {
+                    Variant::Secondary
+                },
+                metrics,
+            )
+            .id(SharedString::from(selector.clone()))
+            .debug_selector(move || selector.clone())
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.choose_document_side(index, side, cx);
+            }))
+        };
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .p(metrics.scale(spacing::TIGHT))
+            .rounded(px(radius::MEDIUM))
+            .border_1()
+            .border_color(theme::swatch(if chosen.is_some() {
+                palette::BORDER
+            } else {
+                palette::BORDER_STRONG
+            }))
+            .debug_selector(move || format!("sync.records.row.{index}"))
+            .child(
+                div()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .text_size(metrics.label_size())
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .debug_selector(move || format!("sync.records.title.{index}"))
+                    .child(SharedString::from(self.document_place_title(place))),
+            )
+            .child(line(
+                value(strings.records_local_value, &place.local),
+                chosen == Some(MergeSide::Local),
+                format!("sync.records.local.value.{index}"),
+            ))
+            .child(line(
+                value(strings.records_remote_value, &place.remote),
+                chosen == Some(MergeSide::Remote),
+                format!("sync.records.remote.value.{index}"),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(keep(
+                        MergeSide::Local,
+                        format!("sync.records.local.{index}"),
+                        strings.vault_keep_local,
+                    ))
+                    .child(keep(
+                        MergeSide::Remote,
+                        format!("sync.records.remote.{index}"),
+                        strings.vault_keep_remote,
+                    )),
+            )
+    }
+
+    /// The places that differ, read-only, for a conflict only a whole side can
+    /// settle: the first few, and how many more.
+    fn document_places_preview(
+        &self,
+        report: &ConflictReport,
+        metrics: crate::app::theme::Metrics,
+    ) -> Div {
+        const SHOWN: usize = 6;
+        let strings = self.sync_strings();
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .debug_selector(|| "sync.conflict.places".to_owned())
+            .child(
+                div()
+                    .whitespace_normal()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .child(strings.records_where_hint),
+            );
+        for (index, place) in report.document.iter().take(SHOWN).enumerate() {
+            let local = place.local.as_deref().unwrap_or(strings.records_absent);
+            let remote = place.remote.as_deref().unwrap_or(strings.records_absent);
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .min_w_0()
+                    .debug_selector(move || format!("sync.conflict.place.{index}"))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(metrics.caption_size())
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(self.document_place_title(place))),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(crate::app::terminal::monospace_family())
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .child(SharedString::from(format!("{local}  \u{2192}  {remote}"))),
+                    ),
+            );
+        }
+        if report.document.len() > SHOWN {
+            list = list.child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(SharedString::from(copy::fill(
+                        strings.records_more,
+                        &[("count", &(report.document.len() - SHOWN).to_string())],
+                    ))),
+            );
+        }
+        list
+    }
+
     /// The vault half of a conflict: one row per record or trusted identity,
     /// each kept from this device or from the cloud on its own (ADR-5, R8).
     /// The apply button stays inert until the last open one is answered.
@@ -1998,9 +2301,15 @@ impl ShelluneView {
         use shellune_sync::{VaultChoiceSide, VaultConflict, VaultRecordSide};
         let strings = self.sync_strings();
         let metrics = self.metrics();
+        let only_document = report.vault.is_empty();
         let (header, subtitle) = self.modal_header(
             Some(Icon::Refresh),
-            strings.vault_conflict_title.to_owned(),
+            if only_document {
+                strings.conflict_title
+            } else {
+                strings.vault_conflict_title
+            }
+            .to_owned(),
             None,
             "sync.vault.conflict.close",
             cx,
@@ -2031,7 +2340,11 @@ impl ShelluneView {
                     .whitespace_normal()
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     .debug_selector(|| "sync.vault.conflict.intro".to_owned())
-                    .child(strings.vault_conflict_intro),
+                    .child(if only_document {
+                        strings.records_conflict_intro
+                    } else {
+                        strings.vault_conflict_intro
+                    }),
             )
             .child(
                 div()
@@ -2187,17 +2500,81 @@ impl ShelluneView {
             );
             body = body.child(row);
         }
-        body = body
-            .child(
+        // The data's own places, answered beside the vault's.
+        let answerable = report.per_record && !report.document.is_empty();
+        if answerable {
+            body = body.child(
                 div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap(metrics.scale(spacing::TIGHT))
                     .w_full()
-                    .min_w_0()
-                    .whitespace_normal()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .debug_selector(|| "sync.vault.conflict.then".to_owned())
-                    .child(strings.vault_then_document),
-            )
+                    .child(
+                        div()
+                            .text_size(metrics.label_size())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(strings.records_where),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(metrics.scale(spacing::HAIRLINE))
+                            .child(
+                                components::compact_button(
+                                    strings.records_all_local,
+                                    Variant::Ghost,
+                                    metrics,
+                                )
+                                .id("sync.records.all.local")
+                                .debug_selector(|| "sync.records.all.local".to_owned())
+                                .on_click(cx.listener(
+                                    |this, _event, _window, cx| {
+                                        this.choose_every_side(true, cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                components::compact_button(
+                                    strings.records_all_remote,
+                                    Variant::Ghost,
+                                    metrics,
+                                )
+                                .id("sync.records.all.remote")
+                                .debug_selector(|| "sync.records.all.remote".to_owned())
+                                .on_click(cx.listener(
+                                    |this, _event, _window, cx| {
+                                        this.choose_every_side(false, cx);
+                                    },
+                                )),
+                            ),
+                    ),
+            );
+            for (index, place) in report.document.iter().enumerate() {
+                let chosen = self
+                    .sync
+                    .document_choices
+                    .get(index)
+                    .and_then(|(_, side)| *side);
+                all_answered &= chosen.is_some();
+                body = body.child(self.document_place_row(index, place, chosen, cx));
+            }
+        }
+        body = body
+            .when(!answerable, |body| {
+                body.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .whitespace_normal()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                        .debug_selector(|| "sync.vault.conflict.then".to_owned())
+                        .child(strings.vault_then_document),
+                )
+            })
             .capture_key_down(
                 cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
                     if event.keystroke.key == "escape" {
@@ -2223,10 +2600,17 @@ impl ShelluneView {
                 this.resolve_sync_vault(cx);
             }))
         });
+        // A conflict of the data alone may still be settled by keeping a whole
+        // side; a vault conflict is answered record by record only (ADR-5).
+        let (dialog_selector, cancel_selector) = if only_document {
+            ("sync.conflict.dialog", "sync.conflict.cancel")
+        } else {
+            ("sync.vault.conflict.dialog", "sync.vault.conflict.cancel")
+        };
         let footer = components::modal_footer(metrics)
             .child(
                 self.text_button(
-                    SharedString::from("sync.vault.conflict.cancel"),
+                    SharedString::from(cancel_selector),
                     strings.cancel,
                     Variant::Ghost,
                     cx,
@@ -2234,10 +2618,27 @@ impl ShelluneView {
                 )
                 .h(metrics.control_height()),
             )
+            .when(only_document, |footer| {
+                footer
+                    .child(self.text_button(
+                        SharedString::from("sync.conflict.local"),
+                        strings.use_local,
+                        Variant::Ghost,
+                        cx,
+                        |this, cx| this.resolve_sync_conflict(Resolution::UseLocal, cx),
+                    ))
+                    .child(self.text_button(
+                        SharedString::from("sync.conflict.remote"),
+                        strings.use_remote,
+                        Variant::Ghost,
+                        cx,
+                        |this, cx| this.resolve_sync_conflict(Resolution::UseRemote, cx),
+                    ))
+            })
             .child(apply);
         self.modal(
             window,
-            "sync.vault.conflict.dialog",
+            dialog_selector,
             560.0,
             ModalContent {
                 header,
@@ -2340,6 +2741,8 @@ impl ShelluneView {
             remote_app_version: env!("CARGO_PKG_VERSION").to_owned(),
             remote_created_unix: 1_794_816_000,
             vault: Vec::new(),
+            document: Vec::new(),
+            per_record: false,
         });
         self.sync.dialog = true;
         cx.notify();
@@ -2392,6 +2795,8 @@ impl ShelluneView {
                     remote_created_unix: 1_794_816_000,
                 },
             ],
+            document: Vec::new(),
+            per_record: false,
         };
         self.sync.vault_choices = report
             .vault
@@ -2401,6 +2806,52 @@ impl ShelluneView {
         self.sync.conflict = Some(report);
         self.sync.dialog = true;
         cx.notify();
+    }
+
+    /// Opens a conflict whose data part names two places both sides changed,
+    /// answerable one by one, as a sync with a base reports it.
+    #[cfg(test)]
+    pub fn open_sync_record_conflict_for_test(&mut self, cx: &mut Context<Self>) {
+        use shellune_storage::{ConflictSection, DocumentConflict};
+        let report = ConflictReport {
+            first_sync: false,
+            remote_platform: "windows".to_owned(),
+            remote_app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            remote_created_unix: 1_794_816_000,
+            vault: Vec::new(),
+            document: vec![
+                DocumentConflict {
+                    key: "shared/hosts/hosts/[a]/address".to_owned(),
+                    section: ConflictSection::Host,
+                    record: Some("web".to_owned()),
+                    field: "address".to_owned(),
+                    local: Some("10.0.0.3".to_owned()),
+                    remote: Some("10.0.0.2".to_owned()),
+                },
+                DocumentConflict {
+                    key: "shared/hosts/hosts/[b]".to_owned(),
+                    section: ConflictSection::Host,
+                    record: Some("db".to_owned()),
+                    field: String::new(),
+                    local: None,
+                    remote: Some("{…}".to_owned()),
+                },
+            ],
+            per_record: true,
+        };
+        self.sync.vault_choices = Vec::new();
+        self.sync.document_choices = document_choices_of(&report);
+        self.sync.conflict = Some(report);
+        self.sync.dialog = true;
+        cx.notify();
+    }
+
+    /// The answers chosen so far for the data part of the open conflict.
+    #[cfg(test)]
+    pub fn sync_document_choices_for_test(
+        &self,
+    ) -> Vec<(String, Option<shellune_storage::MergeSide>)> {
+        self.sync.document_choices.clone()
     }
 
     /// Whether an automatic sync is waiting for the vault to be unlocked.
@@ -2465,6 +2916,8 @@ impl ShelluneView {
             remote_app_version: env!("CARGO_PKG_VERSION").to_owned(),
             remote_created_unix: 1_794_816_000,
             vault: Vec::new(),
+            document: Vec::new(),
+            per_record: false,
         });
         self.sync.dialog = true;
         cx.notify();

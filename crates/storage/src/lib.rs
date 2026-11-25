@@ -107,11 +107,12 @@ pub use group::{
 };
 pub use platforms::{FILE_NAME as PLATFORMS_FILE_NAME, PlatformStore};
 pub use portable::{
-    ApplyMode, ApplyOutcome, ApplyPlan, Change, ExportOptions, ExportOutcome, HostOverlay,
-    KdfParams, LocalData, LocalState, PORTABLE_FORMAT, PORTABLE_VAULT_VERSION, PORTABLE_VERSION,
-    Platform, PlatformData, PlatformFallback, PlatformField, PortableError, Rebased,
-    SNAPSHOT_DIRECTORY, SNAPSHOT_LIMIT, SecretBundle, SharedData, SharedPreferences, ShelluneData,
-    Snapshot, SnapshotStore, Touched, TrustConflict, merge_recent_connections, rebase_state,
+    ApplyMode, ApplyOutcome, ApplyPlan, Change, ConflictSection, DocumentConflict, DocumentMerge,
+    ExportOptions, ExportOutcome, HostOverlay, KdfParams, LocalData, LocalState, MergeSide,
+    PORTABLE_FORMAT, PORTABLE_VAULT_VERSION, PORTABLE_VERSION, Platform, PlatformData,
+    PlatformFallback, PlatformField, PortableError, Rebased, SNAPSHOT_DIRECTORY, SNAPSHOT_LIMIT,
+    SecretBundle, SharedData, SharedPreferences, ShelluneData, Snapshot, SnapshotStore, Touched,
+    TrustConflict, merge_documents, merge_recent_connections, rebase_state,
 };
 pub use preferences::{
     FILE_NAME as PREFERENCES_FILE_NAME, KeymapEntry, KeymapPreferences, Preferences,

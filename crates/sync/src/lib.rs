@@ -33,8 +33,8 @@ pub mod testing;
 mod tests;
 
 pub use config::{
-    CONFIG_FILE_NAME, ConfigError, DEFAULT_REMOTE_DIR, LastResult, STATE_FILE_NAME, SyncConfig,
-    SyncConfigStore, SyncState, SyncStateStore, VaultBaseline, VaultRecordBase,
+    BASE_FILE_NAME, CONFIG_FILE_NAME, ConfigError, DEFAULT_REMOTE_DIR, LastResult, STATE_FILE_NAME,
+    SyncConfig, SyncConfigStore, SyncState, SyncStateStore, VaultBaseline, VaultRecordBase,
 };
 pub use engine::{
     ConflictReport, PullReport, Resolution, SyncError, SyncOutcome, SyncService, TrustIdentity,

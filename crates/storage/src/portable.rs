@@ -37,6 +37,7 @@ mod apply;
 mod crypto;
 mod rebase;
 mod snapshot;
+mod sync_merge;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -62,6 +63,9 @@ pub use apply::{
 pub use crypto::{KdfParams, SecretBundle};
 pub use rebase::{Rebased, Touched, rebase_state};
 pub use snapshot::{SNAPSHOT_DIRECTORY, SNAPSHOT_LIMIT, Snapshot, SnapshotStore};
+pub use sync_merge::{
+    ConflictSection, DocumentConflict, DocumentMerge, MergeSide, merge_documents,
+};
 
 use crypto::SecretBlock;
 

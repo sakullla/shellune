@@ -19,6 +19,10 @@ pub const CONFIG_FILE_NAME: &str = "sync.json";
 /// The state file in the data directory.
 pub const STATE_FILE_NAME: &str = "sync-state.json";
 
+/// The file beside the state that keeps the data both sides held after the last
+/// successful sync: the common base a record-by-record merge reads against.
+pub const BASE_FILE_NAME: &str = "sync-base.json";
+
 /// The folder used when none is chosen.
 pub const DEFAULT_REMOTE_DIR: &str = "Shellune";
 
@@ -351,6 +355,12 @@ impl SyncStateStore {
     #[must_use]
     pub fn path(&self) -> PathBuf {
         self.root.join(STATE_FILE_NAME)
+    }
+
+    /// The base of the next merge ([`BASE_FILE_NAME`]).
+    #[must_use]
+    pub fn base_path(&self) -> PathBuf {
+        self.root.join(BASE_FILE_NAME)
     }
 
     /// The saved state. A missing or damaged file reads as no state, which makes

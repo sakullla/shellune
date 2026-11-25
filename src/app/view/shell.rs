@@ -307,7 +307,7 @@ impl ShelluneView {
             .items_center()
             .flex_none()
             .h(height)
-            .child(self.home_tab(compact, cx))
+            .child(self.home_tab(cx))
             .when(has_tabs && !compact, |row| {
                 row.child(
                     div()
@@ -1025,10 +1025,13 @@ impl ShelluneView {
     ///
     /// It has the shape of every other tab (R2) and the parts a page has: no state dot
     /// and no close button, since the home is not a session and cannot be closed. It
-    /// sits outside the scrolling strip, so it is always one click away. In a compact
-    /// row it is its icon alone, as a browser's pinned tab is; the word and the count
-    /// are then in its tooltip, so nothing of it is cut (R2, R9).
-    fn home_tab(&self, compact: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// sits outside the scrolling strip, so it is always one click away.
+    ///
+    /// It is its icon alone at every width, as a browser's pinned tab is: the sidebar
+    /// of the page it opens already heads its list "All hosts", so the word beside the
+    /// icon only repeated it and took the session tabs' room. The name, the count and
+    /// the shortcut are in its tooltip, so nothing of it is lost (R2, R9).
+    fn home_tab(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics();
         let strings = self.strings();
         let selected = self.home_is_shown();
@@ -1050,29 +1053,18 @@ impl ShelluneView {
             None => name,
         };
         super::browser_tab("nav.hosts", "nav.hosts".to_owned(), selected, metrics)
-            // Pinned and always there, so it is only as wide as its word and count (up to
-            // the strip's widest tab): the room it does not take is the session tabs'.
+            // Pinned and always there, so it is only as wide as its icon: the room it
+            // does not take is the session tabs'. The padding is the same on both sides
+            // so the icon sits in the middle of a square-ish target.
             .flex_none()
-            .max_w(metrics.tab_max_width())
+            .justify_center()
+            .min_w(metrics.tab_height())
             .pr(metrics.scale(spacing::SNUG - 2.0))
             .tooltip(components::tooltip(SharedString::from(tooltip)))
             .on_click(cx.listener(|this, _event, window, cx| {
                 this.select(Destination::Hosts, window, cx);
             }))
-            .child(
-                super::tab_body(metrics)
-                    .child(super::tab_icon(Icon::Server, selected, metrics))
-                    // One short word that is never cut, with the count right after it.
-                    .when(!compact, |body| {
-                        body.child(
-                            div()
-                                .flex_none()
-                                .when(selected, |label| label.font_weight(FontWeight::MEDIUM))
-                                .debug_selector(|| "nav.hosts.title".to_owned())
-                                .child(strings.nav_hosts),
-                        )
-                    }),
-            )
+            .child(super::tab_icon(Icon::Server, selected, metrics))
     }
 
     /// "+" opens the default shell in a new tab; the chevron lists every shell, quick

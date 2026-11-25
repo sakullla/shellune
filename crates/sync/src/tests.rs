@@ -151,6 +151,7 @@ fn data_files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
             let relative = path.strip_prefix(root).expect("inside");
             !relative.starts_with("snapshots")
                 && relative != Path::new(crate::STATE_FILE_NAME)
+                && relative != Path::new(crate::BASE_FILE_NAME)
                 && relative != Path::new(crate::CONFIG_FILE_NAME)
         })
         .collect()
@@ -563,19 +564,31 @@ fn a_conflict_waits_for_the_user_and_each_answer_does_what_it_says() {
     expect_uploaded(a.service.sync());
     expect_pulled(b.service.sync());
 
-    // Both change.
+    // Both change, and both change the same field of one record.
     a.edit(|state| {
         add_host(state, "a-only");
+        readdress(state, "shared", "10.0.0.2");
     });
     expect_uploaded(a.service.sync());
     b.edit(|state| {
         add_host(state, "b-only");
+        readdress(state, "shared", "10.0.0.3");
     });
     let b_files = data_files(&b.root);
     let remote_before = server.file(REMOTE_PATH).expect("remote");
     let report = expect_conflict(b.service.sync());
     assert!(!report.first_sync);
     assert_eq!(report.remote_platform, "linux");
+    // The report names exactly where: the record, the field and both values.
+    // The two added hosts are not conflicts.
+    assert!(report.per_record);
+    assert_eq!(report.document.len(), 1, "{:?}", report.document);
+    let place = &report.document[0];
+    assert_eq!(place.section, shellune_storage::ConflictSection::Host);
+    assert_eq!(place.record.as_deref(), Some("shared"));
+    assert_eq!(place.field, "address");
+    assert_eq!(place.local.as_deref(), Some("10.0.0.3"));
+    assert_eq!(place.remote.as_deref(), Some("10.0.0.2"));
     assert_eq!(data_files(&b.root), b_files, "nothing changed here");
     assert_eq!(server.file(REMOTE_PATH).expect("remote"), remote_before);
     assert!(b.service.state().has_conflict());
@@ -614,6 +627,7 @@ fn a_conflict_waits_for_the_user_and_each_answer_does_what_it_says() {
     // A changed meanwhile too: a conflict on its side; use the cloud's data.
     a.edit(|state| {
         add_host(state, "a-two");
+        readdress(state, "shared", "10.0.0.4");
     });
     let a_hosts_before = std::fs::read(a.root.join("hosts.json")).expect("hosts");
     expect_conflict(a.service.sync());
@@ -1249,9 +1263,10 @@ fn both_sides_only_connecting_keep_the_later_entry_per_host() {
 }
 
 #[test]
-fn both_sides_changing_records_is_still_a_conflict() {
+fn both_sides_changing_records_merge_by_record_and_conflict_only_on_one_field() {
     let server = WebDavServer::start(USER, DAV_PASSWORD);
     let (a, b) = synced_pair("merge-conflict", &server);
+    // Different records changed on each side: both changes are kept.
     a.edit(|state| {
         readdress(state, "web", "10.1.1.1");
         connect_to(state, "web", 1_000);
@@ -1261,14 +1276,36 @@ fn both_sides_changing_records_is_still_a_conflict() {
         readdress(state, "db", "10.2.2.2");
         connect_to(state, "db", 2_000);
     });
+    expect_merged(b.service.sync());
+    assert_eq!(address_of(&b, "web"), "10.1.1.1", "A's change arrived");
+    assert_eq!(address_of(&b, "db"), "10.2.2.2", "B's change stayed");
+    expect_pulled(a.service.sync());
+    assert_eq!(a.load().hosts, b.load().hosts);
+
+    // The same field of one host changed on both sides: a conflict that names
+    // it, and nothing is written until it is answered.
+    a.edit(|state| readdress(state, "web", "10.5.5.5"));
+    expect_uploaded(a.service.sync());
+    b.edit(|state| readdress(state, "web", "10.3.3.3"));
     let files = data_files(&b.root);
     let remote_before = server.file(REMOTE_PATH).expect("remote");
-    expect_conflict(b.service.sync());
+    let report = expect_conflict(b.service.sync());
     assert_eq!(data_files(&b.root), files, "nothing changed here");
     assert_eq!(server.file(REMOTE_PATH).expect("remote"), remote_before);
-    // The same host changed on both sides as well.
-    b.edit(|state| readdress(state, "web", "10.3.3.3"));
-    expect_conflict(b.service.sync());
+    assert!(report.per_record);
+    let [place] = report.document.as_slice() else {
+        panic!("one place: {:?}", report.document);
+    };
+    assert_eq!(place.record.as_deref(), Some("web"));
+    assert_eq!(place.field, "address");
+    // Answered on its own: this machine's value is kept and travels.
+    let answers =
+        std::collections::BTreeMap::from([(place.key.clone(), shellune_storage::MergeSide::Local)]);
+    expect_merged(b.service.resolve_records(&[], &answers));
+    assert_eq!(address_of(&b, "web"), "10.3.3.3");
+    expect_pulled(a.service.sync());
+    assert_eq!(address_of(&a, "web"), "10.3.3.3");
+    expect_up_to_date(b.service.sync());
     // "Upload now" and "pull" never merge, even when only recents differ here.
     let c = Machine::new("merge-conflict-c", Platform::Linux);
     c.connect(&server);
@@ -1365,11 +1402,12 @@ fn across_platforms_a_cloud_that_only_connected_merges_with_records_changed_here
     expect_pulled(a.service.sync());
     assert_eq!(a.load().hosts, b.load().hosts);
 
-    // Records changed on both platforms are still a conflict.
-    a.edit(|state| readdress(state, "db", "10.3.0.3"));
+    // One field changed differently on both platforms is still a conflict.
+    a.edit(|state| readdress(state, "web", "10.3.0.3"));
     expect_uploaded(a.service.sync());
     b.edit(|state| readdress(state, "web", "10.3.0.4"));
-    expect_conflict(b.service.sync());
+    let report = expect_conflict(b.service.sync());
+    assert_eq!(report.document.len(), 1, "{:?}", report.document);
 }
 
 #[test]
@@ -2806,4 +2844,54 @@ fn a_version_1_password_block_never_overrides_the_vaults_own_record() {
     let document = remote_document(&server);
     assert!(document.has_vault(), "the cloud carries the vault now");
     assert!(!document.has_secrets());
+}
+
+#[test]
+fn without_entity_tags_a_write_made_meanwhile_is_merged_not_overwritten() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    server.set_etags(false);
+    let (a, b) = synced_pair("no-tags-race", &server);
+    b.edit(|state| {
+        add_host(state, "b-host");
+    });
+    // A writes its own change; the cloud is then put back, and A's file
+    // arrives again right after B's first read - between B's read and its
+    // write, where a server without tags cannot refuse B's upload.
+    let before = server.file(REMOTE_PATH).expect("remote");
+    a.edit(|state| {
+        add_host(state, "a-host");
+    });
+    expect_uploaded(a.service.sync());
+    let from_a = server.file(REMOTE_PATH).expect("remote");
+    server.put_file(REMOTE_PATH, &before);
+    server.change_after_gets(1, &from_a);
+
+    expect_merged(b.service.sync());
+    let names: Vec<String> = remote_document(&server)
+        .shared()
+        .hosts()
+        .records()
+        .iter()
+        .map(|record| record.name().to_owned())
+        .collect();
+    assert!(
+        names.contains(&"a-host".to_owned()) && names.contains(&"b-host".to_owned()),
+        "both machines' hosts are in the cloud: {names:?}"
+    );
+}
+
+#[test]
+fn a_base_that_does_not_match_the_last_sync_is_never_merged_against() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let (a, b) = synced_pair("stale-base", &server);
+    // The base no longer describes the last sync (a damaged or foreign file).
+    std::fs::write(b.root.join(crate::BASE_FILE_NAME), b"{ not a document").expect("written");
+    a.edit(|state| readdress(state, "web", "10.7.0.1"));
+    expect_uploaded(a.service.sync());
+    b.edit(|state| readdress(state, "db", "10.7.0.2"));
+    let report = expect_conflict(b.service.sync());
+    assert!(
+        !report.per_record,
+        "without a trusted base only a whole side can be kept"
+    );
 }

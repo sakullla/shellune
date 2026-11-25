@@ -370,7 +370,7 @@ fn merge_arrays(base: &[Value], ours: &[Value], theirs: &[Value]) -> Vec<Value> 
 /// Keeps a merged host book consistent: a recent connection or a favourite of a
 /// record that is gone is dropped, a host has one recent record (the newest), and
 /// recents are newest first.
-fn repair_hosts(book: &mut Value) {
+pub(super) fn repair_hosts(book: &mut Value) {
     let Some(book) = book.as_object_mut() else {
         return;
     };
@@ -415,7 +415,7 @@ fn repair_hosts(book: &mut Value) {
 
 /// Keeps a merged group tree drawable: a path whose parent the other side removed
 /// gets the parent back, and a path is listed once.
-fn repair_groups(book: &mut Value) {
+pub(super) fn repair_groups(book: &mut Value) {
     let Some(Value::Array(groups)) = book.get_mut("groups") else {
         return;
     };

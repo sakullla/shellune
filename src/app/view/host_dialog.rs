@@ -1113,6 +1113,53 @@ impl ShelluneView {
                         .text_color(theme::swatch(palette::TEXT_MUTED))
                         .child(strings.host_identity_note),
                 )
+                // A path is this device's alone; the vault is how the key
+                // reaches the others (R1). Offered while the vault is open.
+                .when(
+                    !identity_path.is_empty() && !missing_key && !self.vault_locked(),
+                    |col| {
+                        let security = copy::security_for(self.workspace.locale());
+                        let path = identity_path.to_owned();
+                        let passphrase =
+                            has_passphrase.then(|| draft.text(HostField::Secret).to_owned());
+                        col.child(
+                            components::banner(Tone::Info, metrics)
+                                .debug_selector(|| "hosts.identity.vault".to_owned())
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .justify_between()
+                                .gap(metrics.scale(spacing::TIGHT))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .whitespace_normal()
+                                        .text_size(metrics.caption_size())
+                                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                        .child(security.host_key_to_vault_hint),
+                                )
+                                .child(
+                                    components::compact_button(
+                                        security.host_key_to_vault,
+                                        Variant::Secondary,
+                                        metrics,
+                                    )
+                                    .id("hosts.identity.vault.move")
+                                    .debug_selector(|| "hosts.identity.vault.move".to_owned())
+                                    .on_click(cx.listener(
+                                        move |this, _event, _window, cx| {
+                                            this.security_import_key_file_for_draft(
+                                                &path,
+                                                passphrase.clone(),
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                                ),
+                        )
+                    },
+                )
                 .child(
                     checkbox(
                         "hosts.key.passphrase",

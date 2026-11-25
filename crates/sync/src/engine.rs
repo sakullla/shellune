@@ -72,6 +72,7 @@
 //! vault without a baseline is told the version it landed on and claims nothing
 //! about recognising rollbacks of the past.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -82,11 +83,12 @@ use shellune_core::{
     VaultRecordVersion,
 };
 use shellune_storage::{
-    AppSecret, ApplyMode, ApplyOutcome, ApplyPlan, Change, ExportOptions, HostReference,
-    HostSecretState, KdfParams, LocalData, LocalState, PassphrasePurpose, Platform,
-    PlatformFallback, PortableError, SecretBundle, SecretError, SecretStore, ShelluneData,
-    SnapshotStore, TrustConflict, UnsealSource, VaultCipher, VaultContent, VaultCredentialRecord,
-    VaultHostSecretRecord, VaultKeyRecord, VaultStore, VaultStoreError, merge_recent_connections,
+    AppSecret, ApplyMode, ApplyOutcome, ApplyPlan, Change, DocumentConflict, ExportOptions,
+    HostReference, HostSecretState, KdfParams, LocalData, LocalState, MergeSide, PassphrasePurpose,
+    Platform, PlatformFallback, PortableError, SecretBundle, SecretError, SecretStore,
+    ShelluneData, SnapshotStore, TrustConflict, UnsealSource, VaultCipher, VaultContent,
+    VaultCredentialRecord, VaultHostSecretRecord, VaultKeyRecord, VaultStore, VaultStoreError,
+    merge_documents, merge_recent_connections,
 };
 
 use crate::config::{
@@ -280,6 +282,16 @@ pub struct ConflictReport {
     /// nothing of the vault is applied. Empty for document-only conflicts and
     /// for whole-document answers ([`Resolution`]).
     pub vault: Vec<VaultConflict>,
+    /// The records and settings both sides changed differently since the last
+    /// sync, each named by its record and field with both values. Changes to
+    /// different records were already merged and are not listed. On a first
+    /// sync (no common base) these are the records both sides hold with
+    /// different values.
+    pub document: Vec<DocumentConflict>,
+    /// Whether the document conflicts can be answered one by one
+    /// ([`SyncService::resolve_records`]): a base from the last sync exists.
+    /// Without one only a whole side can be kept ([`Resolution`]).
+    pub per_record: bool,
 }
 
 /// Which kind of vault record a conflict or a choice is about.
@@ -712,6 +724,29 @@ impl SyncService {
         self.record(outcome)
     }
 
+    /// Settles a conflict one place at a time: `vault` answers the vault
+    /// conflicts and `document` the record and setting conflicts
+    /// ([`ConflictReport::document`], by [`DocumentConflict::key`]). Every change
+    /// that is not a conflict is merged from both sides; with every conflict
+    /// answered the merged data is uploaded and applied as one, and a conflict
+    /// left without an answer stands with nothing written.
+    ///
+    /// # Errors
+    ///
+    /// See [`SyncError`].
+    pub fn resolve_records(
+        &self,
+        vault: &[VaultChoice],
+        document: &BTreeMap<String, MergeSide>,
+    ) -> Result<SyncOutcome, SyncError> {
+        let outcome = self.connect().and_then(|(_config, client)| {
+            self.repeat(|service| {
+                service.attempt_answered(Direction::Auto, &client, vault, document)
+            })
+        });
+        self.record(outcome)
+    }
+
     fn run(&self, direction: Direction) -> Result<SyncOutcome, SyncError> {
         let outcome = self.connect().and_then(|(_config, client)| {
             self.repeat(|service| service.attempt_with(direction, &client, &[]))
@@ -782,6 +817,17 @@ impl SyncService {
         direction: Direction,
         client: &WebDavClient,
         choices: &[VaultChoice],
+    ) -> Result<Step, SyncError> {
+        self.attempt_answered(direction, client, choices, &BTreeMap::new())
+    }
+
+    /// [`Self::attempt_with`] with the user's answers to document conflicts.
+    fn attempt_answered(
+        &self,
+        direction: Direction,
+        client: &WebDavClient,
+        choices: &[VaultChoice],
+        answers: &BTreeMap<String, MergeSide>,
     ) -> Result<Step, SyncError> {
         let remote_id = client.file_url();
         let state = self.state();
@@ -882,6 +928,7 @@ impl SyncService {
                 document,
                 &mine,
                 choices,
+                answers,
             );
         }
         // A cloud that carried a vault this machine has a baseline for, and no
@@ -908,13 +955,20 @@ impl SyncService {
             core: check,
         };
         let conflict = || -> Result<Step, SyncError> {
-            Ok(Step::Done(SyncOutcome::Conflict(ConflictReport {
-                first_sync: !known,
-                remote_platform: document.source_platform().to_owned(),
-                remote_app_version: document.source_app_version().to_owned(),
-                remote_created_unix: document.created_unix(),
-                vault: Vec::new(),
-            })))
+            self.record_merge(RecordMerge {
+                client,
+                remote_id: &remote_id,
+                state: &state,
+                known,
+                direction,
+                local: &local,
+                remote: &remote,
+                document,
+                answers,
+                vault: DocumentVault::None,
+                held: None,
+                vault_conflicts: Vec::new(),
+            })
         };
         match decide(direction, facts) {
             Action::Nothing => {
@@ -969,6 +1023,7 @@ impl SyncService {
         document: &ShelluneData,
         mine: &Fingerprint,
         choices: &[VaultChoice],
+        answers: &BTreeMap<String, MergeSide>,
     ) -> Result<Step, SyncError> {
         let source = self.vault_source()?;
         let remote_vault = match document.vault() {
@@ -1042,22 +1097,74 @@ impl SyncService {
             same_view: remote.view_hash.as_deref() == Some(mine.view.as_str()) && vault_unchanged,
             core: check,
         };
-        let conflict = |vault: Vec<VaultConflict>| -> Result<Step, SyncError> {
+        let report = |vault: Vec<VaultConflict>, document_conflicts: Vec<DocumentConflict>| {
             Ok(Step::Done(SyncOutcome::Conflict(ConflictReport {
                 first_sync: !known,
                 remote_platform: document.source_platform().to_owned(),
                 remote_app_version: document.source_app_version().to_owned(),
                 remote_created_unix: document.created_unix(),
                 vault,
+                document: document_conflicts,
+                per_record: false,
             })))
         };
         // A conflict left unsettled stops the whole vault: nothing is applied,
-        // here or in the cloud (ADR-5).
+        // here or in the cloud (ADR-5). The document's own conflicts are named
+        // beside it, so the whole picture is answered at once.
         if !merged.conflicts.is_empty() {
             let mut conflicts = merged.conflicts;
             name_host_secret_conflicts(&mut conflicts, local, document);
-            return conflict(conflicts);
+            let local_document = self.local_document(local, document)?;
+            let detail = match self.sync_base(state, known) {
+                Some(base) => {
+                    merge_documents(&base, &local_document, document, self.platform, answers)
+                        .map(|merge| merge.conflicts)
+                        .unwrap_or_default()
+                }
+                None => Vec::new(),
+            };
+            return report(conflicts, detail);
         }
+        // The document half of a conflict: merged record by record against
+        // the last synced base, with the vault travelling as its plan says.
+        let conflict = |_vault: Vec<VaultConflict>| -> Result<Step, SyncError> {
+            let (travel, held) = match &merged.plan {
+                VaultPlan::Write(write) => (
+                    DocumentVault::Write {
+                        write,
+                        source: &source,
+                        device_id: &device_id,
+                    },
+                    Some(SecretBundle::from_vault(&write.content)),
+                ),
+                VaultPlan::Unchanged(settled) => match &remote_vault {
+                    Some(remote_vault) => (
+                        DocumentVault::Carry {
+                            cipher: &remote_vault.cipher,
+                            settled,
+                            device_id: &device_id,
+                        },
+                        Some(SecretBundle::from_vault(&settled.content)),
+                    ),
+                    None => (DocumentVault::None, None),
+                },
+                VaultPlan::Absent => (DocumentVault::None, None),
+            };
+            self.record_merge(RecordMerge {
+                client,
+                remote_id,
+                state,
+                known,
+                direction,
+                local,
+                remote,
+                document,
+                answers,
+                vault: travel,
+                held,
+                vault_conflicts: Vec::new(),
+            })
+        };
         let record_of = |plan: &VaultPlan| -> Option<VaultRemember<'_>> {
             match plan {
                 VaultPlan::Absent => None,
@@ -2122,7 +2229,142 @@ impl SyncService {
             }
         }
         store.save(&state)?;
+        self.save_sync_base();
         Ok(())
+    }
+
+    /// Both sides changed: their records are merged three ways against the
+    /// base of the last successful sync (automatic sync only), and the result
+    /// is uploaded (If-Match) and applied here as one. What both sides changed
+    /// differently is a conflict named record by record; an explicit upload or
+    /// pull, or a sync without a usable base, stops at the conflict with the
+    /// places listed and writes nothing.
+    fn record_merge(&self, merge: RecordMerge<'_>) -> Result<Step, SyncError> {
+        let RecordMerge {
+            client,
+            remote_id,
+            state,
+            known,
+            direction,
+            local,
+            remote,
+            document,
+            answers,
+            vault,
+            held,
+            vault_conflicts,
+        } = merge;
+        let local_document = self.local_document(local, document)?;
+        let base = self.sync_base(state, known);
+        let report = |conflicts: Vec<DocumentConflict>, per_record: bool| {
+            Ok(Step::Done(SyncOutcome::Conflict(ConflictReport {
+                first_sync: !known,
+                remote_platform: document.source_platform().to_owned(),
+                remote_app_version: document.source_app_version().to_owned(),
+                remote_created_unix: document.created_unix(),
+                vault: vault_conflicts.clone(),
+                document: conflicts,
+                per_record,
+            })))
+        };
+        let Some(base) = base else {
+            // No common ancestor (a first sync, or a state from an older
+            // build): the places that differ are still named, read against an
+            // empty base, but only a whole side can be kept.
+            let conflicts = merge_documents(
+                &self.empty_document(),
+                &local_document,
+                document,
+                self.platform,
+                &BTreeMap::new(),
+            )
+            .map(|merge| merge.conflicts)
+            .unwrap_or_default();
+            return report(conflicts, false);
+        };
+        let merged = match merge_documents(&base, &local_document, document, self.platform, answers)
+        {
+            Ok(merged) => merged,
+            // Answers that cannot hold together: nothing is written, and the
+            // places stay listed for another answer or a whole side.
+            Err(_) => {
+                let conflicts = merge_documents(
+                    &base,
+                    &local_document,
+                    document,
+                    self.platform,
+                    &BTreeMap::new(),
+                )
+                .map(|merge| merge.conflicts)
+                .unwrap_or_default();
+                return report(conflicts, false);
+            }
+        };
+        let Some(result) = merged.document.filter(|_| direction == Direction::Auto) else {
+            return report(merged.conflicts, true);
+        };
+        if !vault_conflicts.is_empty() {
+            return report(merged.conflicts, true);
+        }
+        let plan = result
+            .plan(local, self.platform, ApplyMode::Replace, held.as_ref())
+            .map_err(SyncError::RemoteDocument)?;
+        self.upload_document(
+            client,
+            remote_id,
+            local,
+            Some(&plan),
+            Some(remote),
+            vault,
+            "sync-merge",
+        )
+    }
+
+    /// This machine's data as the document it would upload over `remote`.
+    fn local_document(
+        &self,
+        local: &LocalState,
+        remote: &ShelluneData,
+    ) -> Result<ShelluneData, SyncError> {
+        Ok(ShelluneData::export_from_vault(
+            local,
+            &ExportOptions::new(self.platform),
+            None,
+            Some(remote),
+        )
+        .map_err(SyncError::Local)?
+        .document)
+    }
+
+    /// The document both sides held after the last successful sync, when it
+    /// is still the one the state recorded: a base whose view does not match
+    /// the recorded fingerprint (a write that failed, a file from another
+    /// server) is never used, since merging against the wrong base could
+    /// quietly undo a change.
+    fn sync_base(&self, state: &SyncState, known: bool) -> Option<ShelluneData> {
+        if !known {
+            return None;
+        }
+        let expected = state.last_synced_core_hash.as_deref()?;
+        let bytes = std::fs::read(SyncStateStore::at(self.data.root()).base_path()).ok()?;
+        let base = ShelluneData::from_json(&bytes).ok()?;
+        let view = base.core_view(self.platform).ok()?;
+        (hash(&view) == expected).then_some(base)
+    }
+
+    /// Keeps the document this machine holds after a successful sync as the
+    /// base of the next merge. A base that cannot be written is removed, so a
+    /// stale one is never read against a newer state.
+    fn save_sync_base(&self) {
+        let path = SyncStateStore::at(self.data.root()).base_path();
+        let written = self.data.load().ok().and_then(|local| {
+            ShelluneData::export_from_vault(&local, &ExportOptions::new(self.platform), None, None)
+                .ok()
+                .and_then(|export| export.document.write_to(&path).ok())
+        });
+        if written.is_none() {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     /// The fingerprint of the local document: its view and the same view
@@ -2183,6 +2425,25 @@ enum DocumentVault<'a> {
         source: &'a VaultSource,
         device_id: &'a str,
     },
+}
+
+/// Everything one record-by-record merge needs.
+struct RecordMerge<'a> {
+    client: &'a WebDavClient,
+    remote_id: &'a str,
+    state: &'a SyncState,
+    known: bool,
+    direction: Direction,
+    local: &'a LocalState,
+    remote: &'a Remote,
+    document: &'a ShelluneData,
+    answers: &'a BTreeMap<String, MergeSide>,
+    /// How the vault travels with the merged document.
+    vault: DocumentVault<'a>,
+    /// The host passwords the vault the merged document travels with holds.
+    held: Option<SecretBundle>,
+    /// Vault conflicts to report beside the document's.
+    vault_conflicts: Vec<VaultConflict>,
 }
 
 /// What a successful vault-carrying sync records in the state.
@@ -2318,8 +2579,19 @@ fn put(
         None => Precondition::IfAbsent,
         Some(remote) => match &remote.etag {
             Some(etag) if is_strong_etag(etag) => Precondition::IfMatch(etag.clone()),
-            // Without a usable tag the write cannot be made conditional.
-            _ => Precondition::None,
+            // Without a usable tag the write cannot be made conditional, so the
+            // file is read again right before it: one another machine wrote
+            // since this decision was made starts the decision over instead of
+            // being overwritten unseen. A server with a strong tag never needs
+            // this; one without leaves only the moment between the two
+            // requests open.
+            _ => {
+                match client.get()? {
+                    Some(current) if current.bytes == remote.bytes => {}
+                    _ => return Ok(None),
+                }
+                Precondition::None
+            }
         },
     };
     match client.put(bytes, &precondition) {

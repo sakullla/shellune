@@ -230,6 +230,65 @@ pub fn public_data(key: &PrivateKey) -> Result<ManagedKeyPublic, ManagedKeyError
     })
 }
 
+/// The RSA size this build generates and recommends; an RSA key below it still
+/// signs, but is worth replacing (NIST SP 800-57 puts 2048 bits at the end of
+/// its life after 2030).
+pub const RSA_RECOMMENDED_BITS: usize = 3072;
+
+/// What the public half of a key says about its kind and its size: everything a
+/// list can show about a key's strength without opening the vault.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyProfile {
+    /// A short name a person reads, such as `Ed25519`, `RSA 3072` or
+    /// `ECDSA P-256`.
+    pub label: String,
+    /// The modulus size of an RSA key; `None` for every other kind.
+    pub rsa_bits: Option<usize>,
+}
+
+impl KeyProfile {
+    /// Whether the key is of a size worth replacing: an RSA modulus below
+    /// [`RSA_RECOMMENDED_BITS`]. Ed25519 and the ECDSA curves are never legacy.
+    #[must_use]
+    pub fn is_legacy(&self) -> bool {
+        self.rsa_bits
+            .is_some_and(|bits| bits < RSA_RECOMMENDED_BITS)
+    }
+}
+
+/// Reads the kind and size of a key from its `authorized_keys` line.
+///
+/// Returns `None` for a line that does not parse; the caller then shows the
+/// algorithm name the vault stored, which is never wrong, only less specific.
+#[must_use]
+pub fn profile(authorized_key: &str) -> Option<KeyProfile> {
+    let public = ssh_key::PublicKey::from_openssh(authorized_key.trim()).ok()?;
+    let data = public.key_data();
+    if let Some(rsa) = data.rsa() {
+        let bits = rsa.key_size() as usize;
+        return Some(KeyProfile {
+            label: format!("RSA {bits}"),
+            rsa_bits: Some(bits),
+        });
+    }
+    let label = if data.is_ed25519() {
+        "Ed25519".to_owned()
+    } else if let Some(ecdsa) = data.ecdsa() {
+        match ecdsa.curve() {
+            ssh_key::EcdsaCurve::NistP256 => "ECDSA P-256",
+            ssh_key::EcdsaCurve::NistP384 => "ECDSA P-384",
+            ssh_key::EcdsaCurve::NistP521 => "ECDSA P-521",
+        }
+        .to_owned()
+    } else {
+        public.algorithm().as_str().to_owned()
+    };
+    Some(KeyProfile {
+        label,
+        rsa_bits: None,
+    })
+}
+
 /// Exports a private key as OpenSSH text: encrypted with a passphrase, or plain.
 ///
 /// An encrypted export always asks for a non-empty passphrase - an encrypted file
@@ -461,6 +520,48 @@ bDyRAYE9ypThhYUCF2MUAAAADnZlY3Rvci1lZDI1NTE5AQIDBAUGBw==
             error.to_string().contains("ssh-future9"),
             "the refusal names the algorithm: {error}"
         );
+    }
+
+    #[test]
+    fn a_profile_names_the_kind_and_the_rsa_size() {
+        for (pem, label, bits) in [
+            (ED25519_PEM, "Ed25519", None),
+            (ECDSA_PEM, "ECDSA P-256", None),
+        ] {
+            let key = parse_private_key(pem, None).expect("the fixture parses");
+            let public = public_data(&key).expect("public material");
+            let profile = profile(&public.authorized_key).expect("the line parses");
+            assert_eq!(profile.label, label);
+            assert_eq!(profile.rsa_bits, bits);
+            assert!(!profile.is_legacy(), "{label} is never legacy");
+        }
+        let key = parse_private_key(RSA_PEM, None).expect("the RSA fixture parses");
+        let rsa_bits = key.key_data().rsa().expect("an RSA key").key_size() as usize;
+        let public = public_data(&key).expect("public material");
+        let profile = profile(&public.authorized_key).expect("the line parses");
+        assert_eq!(profile.label, format!("RSA {rsa_bits}"));
+        assert_eq!(profile.rsa_bits, Some(rsa_bits));
+        assert_eq!(profile.is_legacy(), rsa_bits < RSA_RECOMMENDED_BITS);
+    }
+
+    #[test]
+    fn an_rsa_key_below_the_recommended_size_is_legacy() {
+        let small = KeyProfile {
+            label: "RSA 2048".to_owned(),
+            rsa_bits: Some(2048),
+        };
+        let enough = KeyProfile {
+            label: "RSA 3072".to_owned(),
+            rsa_bits: Some(3072),
+        };
+        assert!(small.is_legacy());
+        assert!(!enough.is_legacy());
+    }
+
+    #[test]
+    fn a_line_that_does_not_parse_has_no_profile() {
+        assert_eq!(profile("not a public key"), None);
+        assert_eq!(profile(""), None);
     }
 
     #[test]
