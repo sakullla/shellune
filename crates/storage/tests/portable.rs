@@ -11,15 +11,16 @@ use shellune_core::{
     HostConfig, HostId, SecretString, SerialConfig, SnippetBook,
 };
 use shellune_storage::{
-    ApplyMode, ApplyPlan, ExportOptions, GroupStore, HostBook, HostKey, HostStore, HostTrust,
-    KdfParams, KeymapEntry, KeymapPreferences, LocalData, LocalState, MemorySecrets,
+    ApplyMode, ApplyPlan, ExportOptions, GroupStore, HostBook, HostKey, HostSecretState, HostStore,
+    HostTrust, KdfParams, KeymapEntry, KeymapPreferences, LocalData, LocalState, MemorySecrets,
     PORTABLE_VAULT_VERSION, PORTABLE_VERSION, Platform, PlatformField, PortableError, Preferences,
-    PreferencesStore, SNAPSHOT_LIMIT, SecretStore, ShelluneData, TrustConflict, VaultCipher,
-    VaultContent, VaultCredentialRecord, merge_recent_connections,
+    PreferencesStore, SNAPSHOT_LIMIT, ShelluneData, TrustConflict, UnsealSource, VaultCipher,
+    VaultContent, VaultCredentialRecord, VaultStore, merge_recent_connections,
 };
 
 const PASSWORD: &str = "correct-horse-battery-staple";
 const PASSPHRASE: &str = "a passphrase of my own";
+const DEVICE: &str = "device-a";
 
 fn scratch(name: &str) -> PathBuf {
     static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -138,15 +139,30 @@ fn windows_machine() -> Fixture {
     }
 }
 
-fn secrets_for(fixture: &Fixture) -> MemorySecrets {
-    let secrets = MemorySecrets::new();
-    secrets
-        .save(fixture.password_host, &SecretString::new(PASSWORD))
-        .expect("saved");
-    secrets
-        .save(fixture.key_host, &SecretString::new("key-passphrase-123"))
-        .expect("saved");
-    secrets
+/// The vault of the machine of `fixture`: both remembered passwords, as the
+/// application keeps them.
+fn vault_for(fixture: &Fixture) -> VaultContent {
+    let mut vault = VaultContent::new();
+    vault.set_host_secret(fixture.password_host, SecretString::new(PASSWORD), DEVICE);
+    vault.set_host_secret(
+        fixture.key_host,
+        SecretString::new("key-passphrase-123"),
+        DEVICE,
+    );
+    vault
+}
+
+/// The live password the vault holds for host.
+fn password_in(vault: &VaultContent, host: HostId) -> Option<String> {
+    vault
+        .host_secret(host)
+        .map(|secret| secret.expose().to_owned())
+}
+
+/// A commit that keeps the vault in memory, for an apply that only needs the
+/// files written.
+fn keep(_: &VaultContent) -> Result<(), String> {
+    Ok(())
 }
 
 /// The same data on a machine whose credential store holds no password for it.
@@ -202,13 +218,9 @@ fn tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 #[test]
 fn a_document_round_trips_through_json_and_onto_another_machine() {
     let fixture = windows_machine();
-    let outcome = ShelluneData::export(
-        &fixture.state,
-        &options(Platform::Windows),
-        &MemorySecrets::new(),
-        None,
-    )
-    .expect("exported");
+    let outcome =
+        ShelluneData::export_from_vault(&fixture.state, &options(Platform::Windows), None, None)
+            .expect("exported");
     let document = outcome.document;
     assert!(!document.has_secrets());
     assert_eq!(document.source_platform(), "windows");
@@ -237,9 +249,7 @@ fn a_document_round_trips_through_json_and_onto_another_machine() {
     assert_eq!(plan.known_hosts().added, 1);
     assert!(plan.preferences_changed());
     assert!(plan.fallbacks().is_empty(), "{:?}", plan.fallbacks());
-    let applied = plan
-        .apply(&data, &MemorySecrets::new(), "import")
-        .expect("applied");
+    let applied = plan.apply(&data, "import").expect("applied");
     assert_eq!(applied.files_written.len(), 6);
     let loaded = data.load().expect("loads");
     let expected = without_saved_passwords(&fixture.state);
@@ -254,9 +264,7 @@ fn a_document_round_trips_through_json_and_onto_another_machine() {
         .expect("planned");
     assert!(again.is_empty(), "{again:?}");
     let before = tree(&root);
-    let outcome = again
-        .apply(&data, &MemorySecrets::new(), "import")
-        .expect("nothing to do");
+    let outcome = again.apply(&data, "import").expect("nothing to do");
     assert!(outcome.snapshot.is_none());
     assert_eq!(tree(&root), before);
     let _ = std::fs::remove_dir_all(root);
@@ -265,9 +273,14 @@ fn a_document_round_trips_through_json_and_onto_another_machine() {
 #[test]
 fn a_document_without_passwords_holds_no_password_at_all() {
     let fixture = windows_machine();
-    let secrets = secrets_for(&fixture);
-    let outcome = ShelluneData::export(&fixture.state, &options(Platform::Windows), &secrets, None)
-        .expect("exported");
+    let secrets = vault_for(&fixture);
+    let outcome = ShelluneData::export_from_vault(
+        &fixture.state,
+        &options(Platform::Windows),
+        Some(&secrets),
+        None,
+    )
+    .expect("exported");
     assert!(
         outcome.secrets_included.is_empty(),
         "the store is not read without a passphrase"
@@ -281,11 +294,11 @@ fn a_document_without_passwords_holds_no_password_at_all() {
 #[test]
 fn sealed_passwords_are_restored_into_the_credential_store_with_the_right_passphrase() {
     let fixture = windows_machine();
-    let secrets = secrets_for(&fixture);
-    let outcome = ShelluneData::export(
+    let secrets = vault_for(&fixture);
+    let outcome = ShelluneData::export_from_vault(
         &fixture.state,
         &with_passphrase(Platform::Windows),
-        &secrets,
+        Some(&secrets),
         None,
     )
     .expect("exported");
@@ -339,15 +352,41 @@ fn sealed_passwords_are_restored_into_the_credential_store_with_the_right_passph
         )
         .expect("planned");
     assert_eq!(plan.secrets_to_import(), 2);
-    let applied = plan.apply(&data, &target, "import").expect("applied");
+    // The passwords go into the vault, and the vault is saved as part of the
+    // apply: the credential store is asked for the vault's own unseal secret
+    // and for no host's entry (R4).
+    let store = VaultStore::at(&root);
+    let mut vault = VaultContent::new();
+    let applied = plan
+        .apply_with_vault(&data, &mut vault, DEVICE, "import", &mut |content| {
+            store
+                .save_records(
+                    content,
+                    &plan.result().hosts.records(),
+                    &[UnsealSource::LocalMachine],
+                    cheap_kdf(),
+                    &target,
+                )
+                .map_err(|error| error.to_string())
+        })
+        .expect("applied");
     assert_eq!(applied.secrets_saved, 2);
+    let opened = store
+        .open(&UnsealSource::LocalMachine, &target)
+        .expect("the new vault opens");
     assert_eq!(
-        target
-            .load(fixture.password_host)
-            .expect("read")
-            .map(|secret| secret.expose().to_owned()),
-        Some(PASSWORD.to_owned())
+        password_in(&opened, fixture.password_host).as_deref(),
+        Some(PASSWORD)
     );
+    assert!(
+        target
+            .accesses()
+            .iter()
+            .all(|access| !access.is_host_entry()),
+        "{:?}",
+        target.accesses()
+    );
+    assert!(target.is_empty(), "no host-<uuid> entry was written");
     let loaded = data.load().expect("loads");
     assert!(
         loaded
@@ -362,10 +401,10 @@ fn sealed_passwords_are_restored_into_the_credential_store_with_the_right_passph
 #[test]
 fn the_default_key_derivation_seals_and_opens() {
     let fixture = windows_machine();
-    let secrets = secrets_for(&fixture);
+    let secrets = vault_for(&fixture);
     let mut options = with_passphrase(Platform::Windows);
     options.kdf = KdfParams::default();
-    let document = ShelluneData::export(&fixture.state, &options, &secrets, None)
+    let document = ShelluneData::export_from_vault(&fixture.state, &options, Some(&secrets), None)
         .expect("exported")
         .document;
     assert_eq!(document.secrets_kdf(), Some(KdfParams::default()));
@@ -378,11 +417,11 @@ fn the_default_key_derivation_seals_and_opens() {
 #[test]
 fn a_wrong_passphrase_or_changed_bytes_fail_alike_and_write_nothing() {
     let fixture = windows_machine();
-    let secrets = secrets_for(&fixture);
-    let document = ShelluneData::export(
+    let secrets = vault_for(&fixture);
+    let document = ShelluneData::export_from_vault(
         &fixture.state,
         &with_passphrase(Platform::Windows),
-        &secrets,
+        Some(&secrets),
         None,
     )
     .expect("exported")
@@ -430,7 +469,52 @@ fn a_wrong_passphrase_or_changed_bytes_fail_alike_and_write_nothing() {
 }
 
 #[test]
-fn passwords_the_store_cannot_read_are_listed_by_record() {
+fn passwords_the_vault_does_not_hold_are_listed_and_no_host_entry_is_read() {
+    let fixture = windows_machine();
+    // A vault that holds one of the two passwords: the other host was never
+    // migrated, and its old system-store entry is not read to fill the gap.
+    let legacy = MemorySecrets::new();
+    legacy.seed_legacy_host(fixture.key_host, &SecretString::new("key-passphrase-123"));
+    let mut partial = VaultContent::new();
+    partial.set_host_secret(fixture.password_host, SecretString::new(PASSWORD), DEVICE);
+    let outcome = ShelluneData::export_from_vault(
+        &fixture.state,
+        &with_passphrase(Platform::Windows),
+        Some(&partial),
+        None,
+    )
+    .expect("exported");
+    assert_eq!(outcome.secrets_included, vec![fixture.password_host]);
+    assert_eq!(outcome.secrets_missing, vec![fixture.key_host]);
+    assert!(outcome.secrets_unreadable.is_empty());
+    assert!(legacy.accesses().is_empty(), "{:?}", legacy.accesses());
+
+    // Without any vault, every remembered password is missing.
+    let outcome = ShelluneData::export_from_vault(
+        &fixture.state,
+        &with_passphrase(Platform::Windows),
+        None,
+        None,
+    )
+    .expect("the export still succeeds");
+    assert!(outcome.secrets_included.is_empty());
+    assert_eq!(
+        outcome.secrets_missing,
+        vec![fixture.password_host, fixture.key_host]
+    );
+
+    let empty = ShelluneData::export_from_vault(
+        &fixture.state,
+        &options(Platform::Windows).with_passphrase(SecretString::new("")),
+        Some(&partial),
+        None,
+    )
+    .expect_err("an empty passphrase is refused");
+    assert_eq!(empty, PortableError::EmptyPassphrase);
+}
+
+#[test]
+fn the_compatibility_export_reads_old_entries_only_with_a_passphrase() {
     let fixture = windows_machine();
     let unavailable = MemorySecrets::unavailable();
     let outcome = ShelluneData::export(
@@ -445,11 +529,10 @@ fn passwords_the_store_cannot_read_are_listed_by_record() {
         outcome.secrets_unreadable,
         vec![fixture.password_host, fixture.key_host]
     );
+    assert!(outcome.secrets_missing.is_empty());
 
     let partial = MemorySecrets::new();
-    partial
-        .save(fixture.password_host, &SecretString::new(PASSWORD))
-        .expect("saved");
+    partial.seed_legacy_host(fixture.password_host, &SecretString::new(PASSWORD));
     let outcome = ShelluneData::export(
         &fixture.state,
         &with_passphrase(Platform::Windows),
@@ -460,27 +543,22 @@ fn passwords_the_store_cannot_read_are_listed_by_record() {
     assert_eq!(outcome.secrets_included, vec![fixture.password_host]);
     assert_eq!(outcome.secrets_missing, vec![fixture.key_host]);
 
-    let empty = ShelluneData::export(
-        &fixture.state,
-        &options(Platform::Windows).with_passphrase(SecretString::new("")),
-        &partial,
-        None,
-    )
-    .expect_err("an empty passphrase is refused");
-    assert_eq!(empty, PortableError::EmptyPassphrase);
+    partial.clear_accesses();
+    ShelluneData::export(&fixture.state, &options(Platform::Windows), &partial, None)
+        .expect("exported");
+    assert!(
+        partial.accesses().is_empty(),
+        "without a passphrase the store is not read"
+    );
 }
 
 #[test]
 fn machine_specific_fields_survive_a_trip_between_windows_and_linux() {
     let fixture = windows_machine();
-    let from_windows = ShelluneData::export(
-        &fixture.state,
-        &options(Platform::Windows),
-        &MemorySecrets::new(),
-        None,
-    )
-    .expect("exported")
-    .document;
+    let from_windows =
+        ShelluneData::export_from_vault(&fixture.state, &options(Platform::Windows), None, None)
+            .expect("exported")
+            .document;
 
     // A Linux machine that never saw these records: the Windows paths are kept
     // and reported, the Linux key bindings are left alone.
@@ -531,8 +609,7 @@ fn machine_specific_fields_survive_a_trip_between_windows_and_linux() {
     ];
     expected.sort_by_key(|(id, _, _)| *id);
     assert_eq!(fields, expected);
-    plan.apply(&linux, &MemorySecrets::new(), "import")
-        .expect("applied");
+    plan.apply(&linux, "import").expect("applied");
     let mut on_linux = linux.load().expect("loads");
     assert_eq!(on_linux.preferences.keymap, Some(linux_keymap.clone()));
     assert_eq!(
@@ -564,10 +641,10 @@ fn machine_specific_fields_survive_a_trip_between_windows_and_linux() {
         .hosts
         .update_connection(ConnectionRecord::Serial(console), fixture.serial)
         .expect("updated");
-    let from_linux = ShelluneData::export(
+    let from_linux = ShelluneData::export_from_vault(
         &on_linux,
         &options(Platform::Linux),
-        &MemorySecrets::new(),
+        None,
         Some(&from_windows),
     )
     .expect("exported")
@@ -615,7 +692,7 @@ fn machine_specific_fields_survive_a_trip_between_windows_and_linux() {
             None,
         )
         .expect("planned")
-        .apply(&fresh, &MemorySecrets::new(), "import")
+        .apply(&fresh, "import")
         .expect("applied");
     let on_windows = fresh.load().expect("loads");
     assert_eq!(
@@ -652,14 +729,10 @@ fn machine_specific_fields_survive_a_trip_between_windows_and_linux() {
 #[test]
 fn a_section_of_an_unknown_platform_is_carried_over_untouched() {
     let fixture = windows_machine();
-    let document = ShelluneData::export(
-        &fixture.state,
-        &options(Platform::Windows),
-        &MemorySecrets::new(),
-        None,
-    )
-    .expect("exported")
-    .document;
+    let document =
+        ShelluneData::export_from_vault(&fixture.state, &options(Platform::Windows), None, None)
+            .expect("exported")
+            .document;
     let mut value: serde_json::Value =
         serde_json::from_slice(&document.to_json().expect("json")).expect("json");
     value["platforms"]["freebsd"] = serde_json::json!({ "keymap": [], "future_field": 7 });
@@ -667,10 +740,10 @@ fn a_section_of_an_unknown_platform_is_carried_over_untouched() {
         serde_json::json!({ "text_size": 90, "future_field": { "nested": true } });
     let base = ShelluneData::from_json(&serde_json::to_vec(&value).expect("json"))
         .expect("an unknown platform and field are not damage");
-    let next = ShelluneData::export(
+    let next = ShelluneData::export_from_vault(
         &fixture.state,
         &options(Platform::Windows),
-        &MemorySecrets::new(),
+        None,
         Some(&base),
     )
     .expect("exported")
@@ -694,14 +767,10 @@ fn damaged_foreign_and_newer_files_are_refused_and_change_nothing() {
     let root = scratch("refused");
     save_state(&root, &fixture.state);
     let before = tree(&root);
-    let document = ShelluneData::export(
-        &fixture.state,
-        &options(Platform::Windows),
-        &MemorySecrets::new(),
-        None,
-    )
-    .expect("exported")
-    .document;
+    let document =
+        ShelluneData::export_from_vault(&fixture.state, &options(Platform::Windows), None, None)
+            .expect("exported")
+            .document;
     let good: serde_json::Value =
         serde_json::from_slice(&document.to_json().expect("json")).expect("json");
 
@@ -814,14 +883,10 @@ fn merging_keeps_local_records_and_replacing_does_not() {
     let new_id = new_host.id();
     incoming.hosts.insert(new_host).expect("inserted");
     incoming.preferences.theme = None;
-    let document = ShelluneData::export(
-        &incoming,
-        &options(Platform::Windows),
-        &MemorySecrets::new(),
-        None,
-    )
-    .expect("exported")
-    .document;
+    let document =
+        ShelluneData::export_from_vault(&incoming, &options(Platform::Windows), None, None)
+            .expect("exported")
+            .document;
 
     let loaded = data.load().expect("loads");
     let merge = document
@@ -848,9 +913,7 @@ fn merging_keeps_local_records_and_replacing_does_not() {
     );
     assert_eq!(merge.snippets().added, 1);
     assert_eq!(merge.snippets().removed, 0);
-    merge
-        .apply(&data, &MemorySecrets::new(), "merge")
-        .expect("applied");
+    merge.apply(&data, "merge").expect("applied");
     let merged = data.load().expect("loads");
     assert_eq!(
         merged
@@ -904,9 +967,7 @@ fn merging_keeps_local_records_and_replacing_does_not() {
     assert_eq!(replace.known_hosts().updated, 1);
     assert_eq!(replace.trust_conflicts().len(), 1);
     assert_eq!(replace.snippets().removed, 1);
-    replace
-        .apply(&data, &MemorySecrets::new(), "replace")
-        .expect("applied");
+    replace.apply(&data, "replace").expect("applied");
     let replaced = data.load().expect("loads");
     assert!(replaced.hosts.host(mine_id).is_none());
     assert_eq!(replaced.hosts.connection_count(), 4);
@@ -942,14 +1003,10 @@ fn applying_snapshots_the_previous_files_and_keeps_the_newest_ten() {
     let previous_hosts = std::fs::read(root.join("hosts.json")).expect("hosts");
     let previous_preferences = std::fs::read(root.join("preferences.json")).expect("prefs");
 
-    let document = ShelluneData::export(
-        &fixture.state,
-        &options(Platform::Windows),
-        &MemorySecrets::new(),
-        None,
-    )
-    .expect("exported")
-    .document;
+    let document =
+        ShelluneData::export_from_vault(&fixture.state, &options(Platform::Windows), None, None)
+            .expect("exported")
+            .document;
     let plan = document
         .plan(
             &data.load().expect("loads"),
@@ -959,9 +1016,7 @@ fn applying_snapshots_the_previous_files_and_keeps_the_newest_ten() {
         )
         .expect("planned");
     assert_eq!(plan.files().collect::<Vec<_>>(), vec!["preferences.json"]);
-    let outcome = plan
-        .apply(&data, &MemorySecrets::new(), "Import backup")
-        .expect("applied");
+    let outcome = plan.apply(&data, "Import backup").expect("applied");
     let snapshot = outcome.snapshot.expect("a snapshot was made");
     assert!(snapshot.starts_with(root.join("snapshots")));
     assert!(
@@ -984,14 +1039,10 @@ fn applying_snapshots_the_previous_files_and_keeps_the_newest_ten() {
     for round in 0..(SNAPSHOT_LIMIT + 2) {
         let mut changed = fixture.state.clone();
         changed.preferences.terminal_font_size = Some(10.0 + round as f32);
-        let document = ShelluneData::export(
-            &changed,
-            &options(Platform::Windows),
-            &MemorySecrets::new(),
-            None,
-        )
-        .expect("exported")
-        .document;
+        let document =
+            ShelluneData::export_from_vault(&changed, &options(Platform::Windows), None, None)
+                .expect("exported")
+                .document;
         document
             .plan(
                 &data.load().expect("loads"),
@@ -1000,7 +1051,7 @@ fn applying_snapshots_the_previous_files_and_keeps_the_newest_ten() {
                 None,
             )
             .expect("planned")
-            .apply(&data, &MemorySecrets::new(), "pull")
+            .apply(&data, "pull")
             .expect("applied");
     }
     let kept = data.snapshots().list();
@@ -1015,11 +1066,11 @@ fn applying_snapshots_the_previous_files_and_keeps_the_newest_ten() {
 #[test]
 fn a_failed_password_save_puts_the_files_back() {
     let fixture = windows_machine();
-    let secrets = secrets_for(&fixture);
-    let document = ShelluneData::export(
+    let secrets = vault_for(&fixture);
+    let document = ShelluneData::export_from_vault(
         &fixture.state,
         &with_passphrase(Platform::Windows),
-        &secrets,
+        Some(&secrets),
         None,
     )
     .expect("exported")
@@ -1044,9 +1095,12 @@ fn a_failed_password_save_puts_the_files_back() {
             Some(&bundle),
         )
         .expect("planned");
+    let mut vault = VaultContent::new();
     let error = plan
-        .apply(&data, &MemorySecrets::unavailable(), "import")
-        .expect_err("the credential store is unavailable");
+        .apply_with_vault(&data, &mut vault, DEVICE, "import", &mut |_| {
+            Err("the vault could not be written".to_owned())
+        })
+        .expect_err("the vault cannot be saved");
     let PortableError::Apply {
         restored, snapshot, ..
     } = &error
@@ -1055,6 +1109,14 @@ fn a_failed_password_save_puts_the_files_back() {
     };
     assert!(restored, "{error}");
     assert!(snapshot.starts_with(root.join("snapshots")));
+    assert!(!root.join(shellune_storage::VAULT_FILE_NAME).exists());
+
+    // Without a vault to keep them in, the passwords refuse the whole apply
+    // before anything is written.
+    assert!(matches!(
+        plan.apply(&data, "import"),
+        Err(PortableError::Local { .. })
+    ));
     let after: Vec<(PathBuf, Vec<u8>)> = tree(&root)
         .into_iter()
         .filter(|(path, _)| !path.starts_with(root.join("snapshots")))
@@ -1067,17 +1129,13 @@ fn a_failed_password_save_puts_the_files_back() {
 #[test]
 fn the_sync_view_ignores_the_time_stamp_and_other_platforms() {
     let fixture = windows_machine();
-    let first = ShelluneData::export(
-        &fixture.state,
-        &options(Platform::Windows),
-        &MemorySecrets::new(),
-        None,
-    )
-    .expect("exported")
-    .document;
+    let first =
+        ShelluneData::export_from_vault(&fixture.state, &options(Platform::Windows), None, None)
+            .expect("exported")
+            .document;
     let mut later = options(Platform::Windows);
     later.created_unix += 3_600;
-    let second = ShelluneData::export(&fixture.state, &later, &MemorySecrets::new(), Some(&first))
+    let second = ShelluneData::export_from_vault(&fixture.state, &later, None, Some(&first))
         .expect("exported")
         .document;
     assert_eq!(
@@ -1091,14 +1149,9 @@ fn the_sync_view_ignores_the_time_stamp_and_other_platforms() {
     );
     let mut changed = fixture.state.clone();
     changed.snippets.create("new", "ls").expect("snippet");
-    let third = ShelluneData::export(
-        &changed,
-        &options(Platform::Windows),
-        &MemorySecrets::new(),
-        None,
-    )
-    .expect("exported")
-    .document;
+    let third = ShelluneData::export_from_vault(&changed, &options(Platform::Windows), None, None)
+        .expect("exported")
+        .document;
     assert_ne!(
         first.sync_view(Platform::Windows).expect("view"),
         third.sync_view(Platform::Windows).expect("view")
@@ -1109,14 +1162,9 @@ fn the_sync_view_ignores_the_time_stamp_and_other_platforms() {
 fn the_core_view_leaves_out_only_the_recent_connections() {
     let fixture = windows_machine();
     let export = |state: &LocalState| {
-        ShelluneData::export(
-            state,
-            &options(Platform::Windows),
-            &MemorySecrets::new(),
-            None,
-        )
-        .expect("exported")
-        .document
+        ShelluneData::export_from_vault(state, &options(Platform::Windows), None, None)
+            .expect("exported")
+            .document
     };
     let first = export(&fixture.state);
     // Connecting changes the sync view but not the core view.
@@ -1198,14 +1246,10 @@ fn recent_connections_merge_by_host_keeping_the_later_one() {
     );
 
     // A document takes the merged log; an entry whose host is gone is dropped.
-    let document = ShelluneData::export(
-        &fixture.state,
-        &options(Platform::Windows),
-        &MemorySecrets::new(),
-        None,
-    )
-    .expect("exported")
-    .document;
+    let document =
+        ShelluneData::export_from_vault(&fixture.state, &options(Platform::Windows), None, None)
+            .expect("exported")
+            .document;
     let replaced = document.with_recents(&merged).expect("replaced");
     let hosts: Vec<HostId> = replaced
         .shared()
@@ -1241,10 +1285,9 @@ fn a_recents_plan_writes_only_the_host_file_after_a_snapshot() {
     let plan = ApplyPlan::with_recents(&local, Platform::Windows, &merged).expect("planned");
     assert_eq!(plan.files().collect::<Vec<_>>(), vec!["hosts.json"]);
     assert!(plan.hosts().is_empty(), "no record changes");
-    let secrets = MemorySecrets::new();
-    let applied = plan.apply(&data, &secrets, "sync-merge").expect("applied");
+    let applied = plan.apply(&data, "sync-merge").expect("applied");
     assert_eq!(applied.files_written, vec!["hosts.json"]);
-    assert!(secrets.is_empty(), "no password is touched");
+    assert_eq!(applied.secrets_saved, 0, "no password is touched");
     let snapshot = applied.snapshot.expect("a snapshot");
     for (path, bytes) in &before {
         let name = path.file_name().expect("a name");
@@ -1265,7 +1308,7 @@ fn a_recents_plan_writes_only_the_host_file_after_a_snapshot() {
     // Planned against data that changed meanwhile, it writes nothing.
     let stale = ApplyPlan::with_recents(&local, Platform::Windows, &merged).expect("planned");
     assert_eq!(
-        stale.apply(&data, &secrets, "sync-merge").unwrap_err(),
+        stale.apply(&data, "sync-merge").unwrap_err(),
         PortableError::Changed
     );
     let _ = std::fs::remove_dir_all(root);
@@ -1274,14 +1317,15 @@ fn a_recents_plan_writes_only_the_host_file_after_a_snapshot() {
 #[test]
 fn a_document_does_not_say_which_passwords_a_machine_remembers() {
     let fixture = windows_machine();
-    let secrets = secrets_for(&fixture);
+    let secrets = vault_for(&fixture);
     for options in [
         options(Platform::Windows),
         with_passphrase(Platform::Windows),
     ] {
-        let document = ShelluneData::export(&fixture.state, &options, &secrets, None)
-            .expect("exported")
-            .document;
+        let document =
+            ShelluneData::export_from_vault(&fixture.state, &options, Some(&secrets), None)
+                .expect("exported")
+                .document;
         assert!(
             document
                 .shared()
@@ -1302,14 +1346,10 @@ fn remembering_a_password_follows_this_machine_not_the_document() {
 
     // A document that (as another build could write it) says both hosts remember
     // a password, without sealing any.
-    let exported = ShelluneData::export(
-        &fixture.state,
-        &options(Platform::Windows),
-        &MemorySecrets::new(),
-        None,
-    )
-    .expect("exported")
-    .document;
+    let exported =
+        ShelluneData::export_from_vault(&fixture.state, &options(Platform::Windows), None, None)
+            .expect("exported")
+            .document;
     let mut value: serde_json::Value =
         serde_json::from_slice(&exported.to_json().expect("json")).expect("value");
     for host in value["shared"]["hosts"]["hosts"]
@@ -1352,14 +1392,15 @@ fn remembering_a_password_follows_this_machine_not_the_document() {
     let root = scratch("remember-kept");
     let data = LocalData::at(&root);
     save_state(&root, &fixture.state);
-    let store = secrets_for(&fixture);
+    let mut vault = vault_for(&fixture);
     for mode in [ApplyMode::Merge, ApplyMode::Replace] {
         let plan = exported
             .plan(&data.load().expect("loads"), Platform::Windows, mode, None)
             .expect("planned");
         assert!(plan.is_empty(), "{mode:?}: {plan:?}");
         assert_eq!(plan.hosts(), Default::default());
-        plan.apply(&data, &store, "pull").expect("applied");
+        plan.apply_with_vault(&data, &mut vault, DEVICE, "pull", &mut keep)
+            .expect("applied");
         let loaded = data.load().expect("loads");
         assert!(
             loaded
@@ -1376,7 +1417,12 @@ fn remembering_a_password_follows_this_machine_not_the_document() {
                 .remembers_secret()
         );
     }
-    assert_eq!(store.len(), 2, "the saved passwords are still there");
+    assert_eq!(
+        password_in(&vault, fixture.password_host).as_deref(),
+        Some(PASSWORD),
+        "the saved passwords are still there"
+    );
+    assert!(password_in(&vault, fixture.key_host).is_some());
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1394,10 +1440,8 @@ fn passwords_nobody_reads_any_more_are_forgotten() {
     let mine_id = mine.id();
     local.hosts.insert(mine).expect("inserted");
     save_state(&root, &local);
-    let store = secrets_for(&fixture);
-    store
-        .save(mine_id, &SecretString::new("mine-password"))
-        .expect("saved");
+    let mut vault = vault_for(&fixture);
+    vault.set_host_secret(mine_id, SecretString::new("mine-password"), DEVICE);
 
     // The document signs in to the web host with the agent now.
     let mut incoming = fixture.state.clone();
@@ -1411,14 +1455,10 @@ fn passwords_nobody_reads_any_more_are_forgotten() {
         .hosts
         .update(web, fixture.password_host)
         .expect("updated");
-    let document = ShelluneData::export(
-        &incoming,
-        &options(Platform::Windows),
-        &MemorySecrets::new(),
-        None,
-    )
-    .expect("exported")
-    .document;
+    let document =
+        ShelluneData::export_from_vault(&incoming, &options(Platform::Windows), None, None)
+            .expect("exported")
+            .document;
 
     // A merge keeps the local host and its password, and forgets the password
     // the web host no longer uses.
@@ -1431,11 +1471,17 @@ fn passwords_nobody_reads_any_more_are_forgotten() {
         )
         .expect("planned");
     assert_eq!(merge.secrets_to_forget(), &[fixture.password_host]);
-    let outcome = merge.apply(&data, &store, "merge").expect("applied");
+    let outcome = merge
+        .apply_with_vault(&data, &mut vault, DEVICE, "merge", &mut keep)
+        .expect("applied");
     assert_eq!(outcome.secrets_forgotten, 1);
     assert!(outcome.secrets_not_forgotten.is_empty());
-    assert!(store.load(fixture.password_host).expect("read").is_none());
-    assert!(store.load(mine_id).expect("read").is_some());
+    assert_eq!(
+        vault.host_secret_state(fixture.password_host),
+        HostSecretState::Tombstoned,
+        "the deletion is a tombstone that travels with the vault"
+    );
+    assert!(password_in(&vault, mine_id).is_some());
     let merged = data.load().expect("loads");
     assert!(
         !merged
@@ -1453,18 +1499,20 @@ fn passwords_nobody_reads_any_more_are_forgotten() {
             .remembers_secret()
     );
 
-    // A replace removes the local host, so its password goes with it; a store
-    // that refuses only leaves the entry behind and the data is applied anyway.
+    // A replace removes the local host, so its password goes with it.
     let replace = document
         .plan(&merged, Platform::Windows, ApplyMode::Replace, None)
         .expect("planned");
     assert_eq!(replace.hosts().removed, 1);
     assert_eq!(replace.secrets_to_forget(), &[mine_id]);
-    let refused = replace
-        .apply(&data, &MemorySecrets::unavailable(), "replace")
+    let replaced = replace
+        .apply_with_vault(&data, &mut vault, DEVICE, "replace", &mut keep)
         .expect("applied");
-    assert_eq!(refused.secrets_forgotten, 0);
-    assert_eq!(refused.secrets_not_forgotten, vec![mine_id]);
+    assert_eq!(replaced.secrets_forgotten, 1);
+    assert_eq!(
+        vault.host_secret_state(mine_id),
+        HostSecretState::Tombstoned
+    );
     assert!(data.load().expect("loads").hosts.host(mine_id).is_none());
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1475,14 +1523,10 @@ fn a_plan_is_not_applied_over_data_saved_after_it() {
     let root = scratch("stale");
     let data = LocalData::at(&root);
     save_state(&root, &LocalState::default());
-    let document = ShelluneData::export(
-        &fixture.state,
-        &options(Platform::Windows),
-        &MemorySecrets::new(),
-        None,
-    )
-    .expect("exported")
-    .document;
+    let document =
+        ShelluneData::export_from_vault(&fixture.state, &options(Platform::Windows), None, None)
+            .expect("exported")
+            .document;
     let plan = document
         .plan(
             &data.load().expect("loads"),
@@ -1501,9 +1545,7 @@ fn a_plan_is_not_applied_over_data_saved_after_it() {
     save_state(&root, &later);
     let before = tree(&root);
 
-    let error = plan
-        .apply(&data, &MemorySecrets::new(), "import")
-        .expect_err("the data changed");
+    let error = plan.apply(&data, "import").expect_err("the data changed");
     assert_eq!(error, PortableError::Changed);
     assert_eq!(
         tree(&root),
@@ -1520,9 +1562,7 @@ fn a_plan_is_not_applied_over_data_saved_after_it() {
             None,
         )
         .expect("planned");
-    again
-        .apply(&data, &MemorySecrets::new(), "import")
-        .expect("applied");
+    again.apply(&data, "import").expect("applied");
     assert_eq!(data.load().expect("loads").snippets.len(), 2);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1554,7 +1594,7 @@ fn a_version_two_document_carries_the_vault_and_not_the_old_secrets() {
     let cipher = VaultCipher::export_copy(&vault, &sync_passphrase, cheap_kdf()).expect("sealed");
 
     let mut vault_options = options(Platform::Windows).with_vault(cipher);
-    let outcome = ShelluneData::export(&fixture.state, &vault_options, &MemorySecrets::new(), None)
+    let outcome = ShelluneData::export_from_vault(&fixture.state, &vault_options, None, None)
         .expect("exported");
     let document = outcome.document;
     assert_eq!(document.version(), PORTABLE_VAULT_VERSION);
@@ -1608,14 +1648,10 @@ fn a_version_two_document_carries_the_vault_and_not_the_old_secrets() {
         ShelluneData::from_json(&serde_json::to_vec(&mixed).expect("json")),
         Err(PortableError::Corrupt { .. })
     ));
-    let plain = ShelluneData::export(
-        &fixture.state,
-        &options(Platform::Windows),
-        &MemorySecrets::new(),
-        None,
-    )
-    .expect("exported")
-    .document;
+    let plain =
+        ShelluneData::export_from_vault(&fixture.state, &options(Platform::Windows), None, None)
+            .expect("exported")
+            .document;
     let mut v1_with_vault: serde_json::Value =
         serde_json::from_slice(&plain.to_json().expect("json")).expect("json");
     v1_with_vault["vault"] = serde_json::json!({});
@@ -1630,7 +1666,7 @@ fn a_version_two_document_carries_the_vault_and_not_the_old_secrets() {
     vault_options = options(Platform::Windows).with_vault(cipher);
     vault_options.passphrase = Some(SecretString::new(PASSPHRASE));
     assert!(matches!(
-        ShelluneData::export(&fixture.state, &vault_options, &MemorySecrets::new(), None),
+        ShelluneData::export_from_vault(&fixture.state, &vault_options, None, None),
         Err(PortableError::Encrypt { .. })
     ));
 }

@@ -16,7 +16,9 @@
 //!   through a Linux machine.
 //! * `secrets` — optional in a version 1 document: the saved passwords, sealed
 //!   under a passphrase (see [`KdfParams`]). Without it the file holds no
-//!   password at all.
+//!   password at all. The passwords it seals are read from the vault, and the
+//!   passwords it brings are written into the vault (ADR-6): an export or an
+//!   import never asks the system credential store for a host's entry.
 //! * `vault` — optional in a version 2 document: the whole encrypted vault
 //!   ([`VaultCipher`]), which carries the managed key bodies, the shared
 //!   passwords, their metadata and the accepted server identities, and
@@ -53,7 +55,7 @@ use crate::preferences::{KeymapEntry, Preferences, PreferencesStore};
 use crate::snippets::SnippetStore;
 use crate::store::{HostStore, data_directory, write_atomic_file};
 use crate::trust::{HostTrust, TrustStore};
-use crate::vault::VaultCipher;
+use crate::vault::{VaultCipher, VaultContent};
 
 pub use apply::{
     ApplyMode, ApplyOutcome, ApplyPlan, Change, PlatformFallback, PlatformField, TrustConflict,
@@ -96,6 +98,64 @@ const SECRET_KEYS: &[&str] = &[
     "privatekey",
     "private-key",
 ];
+
+/// Where an export reads the remembered host passwords it seals (ADR-6).
+///
+/// The vault is the source: reading a password from it never touches the
+/// system credential store, so an export of hundreds of hosts asks the store
+/// for nothing beyond opening the vault once.
+pub(crate) trait HostSecretSource {
+    /// The remembered password of `host`, when the source holds it.
+    fn get(&self, host: HostId) -> Option<SecretString>;
+}
+
+/// Where an apply writes the remembered host passwords a document brings and
+/// removes the ones nobody reads any more (ADR-6). The changes are in memory
+/// until the apply commits them, so a failed apply leaves nothing behind.
+pub(crate) trait HostSecrets: HostSecretSource {
+    /// Remembers `secret` for `host`; whether anything changed.
+    fn set(&mut self, host: HostId, secret: SecretString) -> bool;
+    /// Forgets the password of `host` (a tombstone in the vault); whether a
+    /// live password was removed.
+    fn remove(&mut self, host: HostId) -> bool;
+}
+
+impl HostSecretSource for VaultContent {
+    fn get(&self, host: HostId) -> Option<SecretString> {
+        self.host_secret(host).cloned()
+    }
+}
+
+/// An unsealed vault being written by one device: the host passwords an apply
+/// sets are versioned under `device_id`, like every other vault record.
+pub(crate) struct VaultHostSecrets<'a> {
+    pub(crate) content: &'a mut VaultContent,
+    pub(crate) device_id: &'a str,
+}
+
+impl HostSecretSource for VaultHostSecrets<'_> {
+    fn get(&self, host: HostId) -> Option<SecretString> {
+        self.content.get(host)
+    }
+}
+
+impl HostSecrets for VaultHostSecrets<'_> {
+    fn set(&mut self, host: HostId, secret: SecretString) -> bool {
+        self.content.set_host_secret(host, secret, self.device_id)
+    }
+
+    fn remove(&mut self, host: HostId) -> bool {
+        self.content.remove_host_secret(host)
+    }
+}
+
+/// Passwords already read, keyed by host: what the compatibility export reads
+/// from the credential store before it seals them.
+impl HostSecretSource for BTreeMap<HostId, SecretString> {
+    fn get(&self, host: HostId) -> Option<SecretString> {
+        BTreeMap::get(self, &host).cloned()
+    }
+}
 
 /// The kind of machine a platform section belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -514,9 +574,12 @@ pub struct ExportOutcome {
     pub document: ShelluneData,
     /// The records whose password was sealed into the document.
     pub secrets_included: Vec<HostId>,
-    /// The records that remember a password the credential store could not read.
+    /// The records that remember a password the credential store could not
+    /// read; only the compatibility [`ShelluneData::export`] reads the store,
+    /// so this stays empty for an export from the vault.
     pub secrets_unreadable: Vec<HostId>,
-    /// The records that remember a password the credential store does not have.
+    /// The records that remember a password the vault does not hold (no vault,
+    /// or a host whose old system-store entry was not migrated yet).
     pub secrets_missing: Vec<HostId>,
 }
 
@@ -529,17 +592,78 @@ impl ShelluneData {
     /// `options.passphrase` is set, and none is written otherwise. Its vault is
     /// carried over the same way — only what `options.vault` names travels.
     ///
-    /// The credential store is only read when a passphrase is given, and only for
-    /// the records that remember a password.
+    /// The passwords a version 1 block seals come from `vault` alone (R4): a
+    /// record that remembers a password the vault does not hold — no vault, or
+    /// a host not migrated yet — is listed in
+    /// [`ExportOutcome::secrets_missing`], and the system credential store is
+    /// never asked for it.
     ///
     /// # Errors
     ///
     /// Returns [`PortableError::EmptyPassphrase`] for a blank passphrase and
     /// [`PortableError::Encrypt`] when the passwords could not be sealed.
+    pub fn export_from_vault(
+        local: &LocalState,
+        options: &ExportOptions,
+        vault: Option<&VaultContent>,
+        base: Option<&ShelluneData>,
+    ) -> Result<ExportOutcome, PortableError> {
+        let empty = BTreeMap::new();
+        let source: &dyn HostSecretSource = match vault {
+            Some(content) => content,
+            None => &empty,
+        };
+        Self::export_with(local, options, source, base)
+    }
+
+    /// The compatibility form of [`Self::export_from_vault`] for a caller that
+    /// still keeps host passwords in the system credential store: with a
+    /// passphrase, each record that remembers a password has its old entry
+    /// read once ([`SecretStore::load_legacy_host`]); without one, the store is
+    /// never touched. Sync and the vault-backed export do not use it.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::export_from_vault`].
     pub fn export(
         local: &LocalState,
         options: &ExportOptions,
         secrets: &dyn SecretStore,
+        base: Option<&ShelluneData>,
+    ) -> Result<ExportOutcome, PortableError> {
+        let mut read = BTreeMap::new();
+        let mut unreadable = Vec::new();
+        let seals = options.vault.is_none()
+            && options
+                .passphrase
+                .as_ref()
+                .is_some_and(|passphrase| !passphrase.expose().trim().is_empty());
+        if seals {
+            for record in local.hosts.records() {
+                if !record.remembers_secret() {
+                    continue;
+                }
+                match secrets.load_legacy_host(record.id()) {
+                    Ok(Some(secret)) => {
+                        read.insert(record.id(), secret);
+                    }
+                    Ok(None) => {}
+                    Err(_) => unreadable.push(record.id()),
+                }
+            }
+        }
+        let mut outcome = Self::export_with(local, options, &read, base)?;
+        outcome
+            .secrets_missing
+            .retain(|id| !unreadable.contains(id));
+        outcome.secrets_unreadable = unreadable;
+        Ok(outcome)
+    }
+
+    fn export_with(
+        local: &LocalState,
+        options: &ExportOptions,
+        secrets: &dyn HostSecretSource,
         base: Option<&ShelluneData>,
     ) -> Result<ExportOutcome, PortableError> {
         let platform = options.platform;
@@ -612,13 +736,12 @@ impl ShelluneData {
                 if !record.remembers_secret() {
                     continue;
                 }
-                match secrets.load(record.id()) {
-                    Ok(Some(secret)) => {
+                match secrets.get(record.id()) {
+                    Some(secret) => {
                         sealed.insert(record.id(), secret);
                         outcome.secrets_included.push(record.id());
                     }
-                    Ok(None) => outcome.secrets_missing.push(record.id()),
-                    Err(_) => outcome.secrets_unreadable.push(record.id()),
+                    None => outcome.secrets_missing.push(record.id()),
                 }
             }
             outcome.document.secrets = Some(SecretBlock::seal(&sealed, passphrase, options.kdf)?);

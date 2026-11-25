@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use shellune_core::{CredentialId, KeyId};
+use shellune_core::{CredentialId, HostId, KeyId};
 
 /// The settings file in the data directory.
 pub const CONFIG_FILE_NAME: &str = "sync.json";
@@ -25,6 +25,13 @@ pub const DEFAULT_REMOTE_DIR: &str = "Shellune";
 const CONFIG_VERSION: u32 = 1;
 
 /// Where and how this machine syncs.
+///
+/// There is no setting for the passwords: with a server set, every sync
+/// carries the encrypted vault — managed keys, shared passwords, remembered
+/// host passwords and accepted server identities — unsealed by the WebDAV
+/// password or, on an account without one, by the sync passphrase (R7). A
+/// `sync_secrets` field an older build wrote is read and ignored, whatever it
+/// said.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncConfig {
@@ -36,15 +43,6 @@ pub struct SyncConfig {
     pub remote_dir: String,
     /// Whether changes are uploaded and the cloud is checked without asking.
     pub auto: bool,
-    /// Whether the secrets travel too. The field keeps its name for the files
-    /// already on machines; its meaning is the vault: with an encrypted vault on
-    /// this machine or in the cloud, the document becomes a version 2 one whose
-    /// vault block carries the managed keys, the shared passwords and the
-    /// accepted server identities, unsealed by the WebDAV password or, on an
-    /// account without one, by the sync passphrase (R5). Without a vault
-    /// anywhere, this stays the version 1 sealed-password arrangement under the
-    /// sync passphrase.
-    pub sync_secrets: bool,
 }
 
 impl Default for SyncConfig {
@@ -54,7 +52,6 @@ impl Default for SyncConfig {
             username: String::new(),
             remote_dir: DEFAULT_REMOTE_DIR.to_owned(),
             auto: true,
-            sync_secrets: false,
         }
     }
 }
@@ -247,9 +244,10 @@ pub struct SyncState {
     /// that only connected to hosts for one that changed records.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_remote_core_hash: Option<String>,
-    /// A keyed fingerprint of the saved passwords as they were last synced; `None`
-    /// when passwords were not synced. Changing a password, the passphrase, or the
-    /// choice to sync passwords is a local change.
+    /// A keyed fingerprint of the version 1 saved passwords as an older build
+    /// last synced them; `None` once a sync of this build succeeded. It only
+    /// tells that the cloud may still hold such a block, which the next sync
+    /// then reads into the vault even when the cloud did not change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_secrets_hash: Option<String>,
     /// The identity of this machine as a writer of vault records (ADR-5): the
@@ -328,6 +326,10 @@ pub struct VaultBaseline {
     pub keys: BTreeMap<KeyId, VaultRecordBase>,
     /// Every shared credential, live and deleted.
     pub credentials: BTreeMap<CredentialId, VaultRecordBase>,
+    /// Every remembered host password, live and deleted, by host. A baseline
+    /// an older build wrote has none.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub host_secrets: BTreeMap<HostId, VaultRecordBase>,
     /// Every accepted server identity, as `host:port` to fingerprint.
     pub trust: BTreeMap<String, String>,
 }
@@ -421,18 +423,41 @@ mod tests {
     }
 
     #[test]
-    fn settings_default_to_automatic_sync_without_passwords() {
+    fn settings_default_to_automatic_sync() {
         let config = SyncConfig::default();
         assert!(config.auto);
-        assert!(!config.sync_secrets);
         assert!(!config.is_configured());
         assert_eq!(config.remote_dir, DEFAULT_REMOTE_DIR);
         // A file that names only the address takes the same defaults.
         let file: ConfigFile =
             serde_json::from_str(r#"{"version":1,"url":"https://dav"}"#).expect("reads");
         assert!(file.config.auto);
-        assert!(!file.config.sync_secrets);
         assert!(file.config.is_configured());
+    }
+
+    #[test]
+    fn an_older_file_with_the_password_switch_still_loads_and_drops_it() {
+        let root = scratch("old-switch");
+        let store = SyncConfigStore::at(&root);
+        std::fs::create_dir_all(&root).expect("directory");
+        for value in ["false", "true"] {
+            std::fs::write(
+                store.path(),
+                format!(
+                    r#"{{"version":1,"url":"https://dav.example.com/","username":"me","remote_dir":"Shellune","auto":false,"sync_secrets":{value}}}"#
+                ),
+            )
+            .expect("written");
+            let config = store.load().expect("readable").expect("configured");
+            let mut expected = SyncConfig::new("https://dav.example.com/", "me");
+            expected.auto = false;
+            assert_eq!(config, expected, "sync_secrets {value} is ignored");
+            // Saving writes the settings without the switch.
+            store.save(&config).expect("saved");
+            let text = std::fs::read_to_string(store.path()).expect("read");
+            assert!(!text.contains("sync_secrets"), "{text}");
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -442,7 +467,6 @@ mod tests {
         assert_eq!(store.load(), Ok(None));
         let mut config = SyncConfig::new("https://dav.example.com/", "me");
         config.auto = false;
-        config.sync_secrets = true;
         store.save(&config).expect("saved");
         assert_eq!(store.load(), Ok(Some(config)));
 
@@ -505,6 +529,14 @@ mod tests {
                 },
             )]),
             trust: BTreeMap::from([("web:22".to_owned(), "SHA256:old".to_owned())]),
+            host_secrets: BTreeMap::from([(
+                HostId::new(),
+                VaultRecordBase {
+                    counter: 2,
+                    device_id: "device-a".to_owned(),
+                    deleted: false,
+                },
+            )]),
         });
         store.save(&with_vault).expect("saved");
         assert_eq!(store.load(), with_vault);

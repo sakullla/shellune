@@ -9,9 +9,10 @@
 //!   sign-in, an unreachable server and a folder that cannot be written apart;
 //!   the file's version, the file, and a write that only happens when the file is
 //!   still the version that was read.
-//! * [`SyncConfig`] / [`SyncConfigStore`] — `sync.json`: server, account, folder,
-//!   automatic sync (on by default) and whether saved passwords travel (off by
-//!   default). The WebDAV password and the sync passphrase are in the system
+//! * [`SyncConfig`] / [`SyncConfigStore`] — `sync.json`: server, account, folder
+//!   and automatic sync (on by default). The encrypted vault, remembered host
+//!   passwords included, travels with every sync; there is no switch for it
+//!   (R7). The WebDAV password and the sync passphrase are in the system
 //!   credential store ([`shellune_storage::AppSecret`]).
 //! * [`SyncState`] / [`SyncStateStore`] — `sync-state.json`: what both sides held
 //!   after the last successful sync, and how the last attempt ended.

@@ -15,9 +15,9 @@ use shellune_core::{
 use shellune_storage::{
     AppSecret, ExportOptions, ForwardStore, GroupStore, HostStore, KdfParams, KeySource,
     KeymapEntry, KeymapPreferences, LocalData, LocalState, MemorySecrets, PassphrasePurpose,
-    Platform, PlatformField, PortableError, PreferencesStore, SecretStore, ShelluneData,
-    SnippetStore, TrustStore, UnsealSource, VaultCipher, VaultContent, VaultCredentialRecord,
-    VaultStore, VaultStoreError,
+    Platform, PlatformField, PortableError, PreferencesStore, SecretAccess, SecretStore,
+    ShelluneData, SnippetStore, TrustStore, UnsealSource, VaultCipher, VaultContent,
+    VaultCredentialRecord, VaultStore, VaultStoreError,
 };
 
 use crate::testing::WebDavServer;
@@ -325,8 +325,8 @@ fn the_settings_file_holds_no_password() {
         .expect("saved");
     let config = machine.config();
     assert!(config.auto, "automatic sync is on by default");
-    assert!(!config.sync_secrets, "passwords are not synced by default");
     let text = std::fs::read_to_string(machine.root.join(crate::CONFIG_FILE_NAME)).expect("file");
+    assert!(!text.contains("sync_secrets"), "no password switch: {text}");
     assert!(!text.contains(DAV_PASSWORD), "{text}");
     assert!(!text.contains(PASSPHRASE), "{text}");
     assert_eq!(
@@ -699,80 +699,36 @@ fn upload_and_pull_only_go_one_way() {
 }
 
 #[test]
-fn passwords_travel_only_when_asked_and_only_sealed() {
+fn remembered_host_passwords_travel_in_the_vault_under_the_webdav_password() {
     let server = WebDavServer::start(USER, DAV_PASSWORD);
     let a = Machine::new("secrets-a", Platform::Windows);
     let b = Machine::new("secrets-b", Platform::Linux);
     a.connect(&server);
     b.connect(&server);
     let mut web_id = None;
-    a.edit(|state| {
-        let mut web = HostConfig::new("web", "10.0.0.5", 22, "deploy").expect("host");
-        web.set_auth(Some(AuthMethodKind::Password));
-        web.set_remember_secret(true);
-        web_id = Some(web.id());
-        state.hosts.insert(web).expect("inserted");
-    });
+    a.edit(|state| web_id = Some(add_password_host(state, "web")));
     let web_id = web_id.expect("web");
-    a.secrets
-        .save(web_id, &SecretString::new(HOST_PASSWORD))
-        .expect("saved");
+    remember_in_vault(&a, web_id, HOST_PASSWORD, "device-a");
+    a.secrets.clear_accesses();
 
-    // Off: no secrets field and no password anywhere in the file.
-    expect_uploaded(a.service.sync());
-    let text = remote_text(&server);
-    assert!(!text.contains("\"secrets\""), "{text}");
-    assert!(!text.contains(HOST_PASSWORD));
-
-    // On without a passphrase: refused, nothing uploaded.
-    a.update_config(|config| config.sync_secrets = true);
-    assert_eq!(a.service.sync().unwrap_err(), SyncError::PassphraseMissing);
-    assert_eq!(remote_text(&server), text);
-
-    // On with a passphrase: the passwords go up sealed.
-    a.service
-        .set_passphrase(Some(&SecretString::new(PASSPHRASE)))
-        .expect("saved");
+    // No sync passphrase is set anywhere: the WebDAV password seals the vault,
+    // and the host password travels in it (R7). No version 1 block is made.
+    assert!(a.service.passphrase().expect("read").is_none());
     let report = expect_uploaded(a.service.sync());
     assert_eq!(report.secrets_included, vec![web_id]);
+    assert!(report.secrets_missing.is_empty());
     let text = remote_text(&server);
-    assert!(text.contains("\"secrets\""), "{text}");
+    assert!(text.contains("\"vault\""), "{text}");
+    assert!(!text.contains("\"secrets\""), "no version 1 block: {text}");
     assert!(!text.contains(HOST_PASSWORD));
+    assert_eq!(remote_document(&server).version(), 2);
     expect_up_to_date(a.service.sync());
 
-    // A machine that does not sync passwords takes the records, not the passwords.
+    // A second machine with the same account and no vault of its own gets the
+    // vault, the password in it, and the host remembers it there.
     let pulled = expect_pulled(b.service.sync());
-    assert!(pulled.secrets_ignored);
-    assert_eq!(pulled.secrets_saved, 0);
-    assert!(b.secrets.is_empty());
-
-    // Switching it on with the wrong passphrase fails and changes nothing.
-    b.update_config(|config| config.sync_secrets = true);
-    b.service
-        .set_passphrase(Some(&SecretString::new("another passphrase")))
-        .expect("saved");
-    let b_files = data_files(&b.root);
-    assert_eq!(
-        b.service.sync().unwrap_err(),
-        SyncError::RemoteDocument(PortableError::WrongPassphrase)
-    );
-    assert_eq!(data_files(&b.root), b_files);
-    assert!(b.secrets.is_empty());
-    assert_eq!(remote_text(&server), text, "nothing was uploaded over them");
-
-    // With the right one the cloud's passwords are taken, not overwritten.
-    b.service
-        .set_passphrase(Some(&SecretString::new(PASSPHRASE)))
-        .expect("saved");
-    let pulled = expect_pulled(b.service.sync());
-    assert_eq!(pulled.secrets_saved, 1);
-    assert_eq!(
-        b.secrets
-            .load(web_id)
-            .expect("read")
-            .map(|secret| secret.expose().to_owned()),
-        Some(HOST_PASSWORD.to_owned())
-    );
+    assert!(pulled.vault_restored.is_some(), "the vault travelled");
+    assert_eq!(vault_password(&b, web_id).as_deref(), Some(HOST_PASSWORD));
     assert!(
         b.load()
             .hosts
@@ -781,29 +737,122 @@ fn passwords_travel_only_when_asked_and_only_sealed() {
     );
     expect_up_to_date(b.service.sync());
 
-    // A changed password is a change.
-    a.secrets
-        .save(web_id, &SecretString::new("a-new-password"))
-        .expect("saved");
+    // A changed password is a change, and travels the same way.
+    remember_in_vault(&a, web_id, "a-new-password", "device-a");
     expect_uploaded(a.service.sync());
     expect_pulled(b.service.sync());
     assert_eq!(
-        b.secrets
-            .load(web_id)
-            .expect("read")
-            .map(|secret| secret.expose().to_owned()),
-        Some("a-new-password".to_owned())
+        vault_password(&b, web_id).as_deref(),
+        Some("a-new-password")
     );
 
-    // Switching it off removes the passwords from the cloud.
-    a.update_config(|config| config.sync_secrets = false);
+    // Neither machine asked the credential store for a host's entry, and none
+    // was written (R4).
+    for machine in [&a, &b] {
+        assert!(
+            host_entry_accesses(machine).is_empty(),
+            "{:?}",
+            machine.secrets.accesses()
+        );
+        assert!(machine.secrets.is_empty());
+    }
+    for machine in [&a, &b] {
+        let state_text =
+            std::fs::read_to_string(machine.root.join(crate::STATE_FILE_NAME)).expect("state");
+        assert!(!state_text.contains(HOST_PASSWORD));
+        assert!(!state_text.contains("a-new-password"));
+    }
+}
+
+#[test]
+fn a_machine_that_never_migrated_a_host_keeps_the_other_machines_password() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let a = Machine::new("unmigrated-a", Platform::Linux);
+    let b = Machine::new("unmigrated-b", Platform::Linux);
+    a.connect(&server);
+    b.connect(&server);
+    // A remembers the host's password only in its old system-store entry and
+    // has no vault at all.
+    let mut web_id = None;
+    a.edit(|state| web_id = Some(add_password_host(state, "web")));
+    let web_id = web_id.expect("web");
+    a.secrets
+        .seed_legacy_host(web_id, &SecretString::new("legacy-password"));
     expect_uploaded(a.service.sync());
+    expect_pulled(b.service.sync());
+
+    // B keeps the password in its vault and syncs it.
+    b.edit(|state| {
+        let mut web = state.hosts.host(web_id).expect("arrived").clone();
+        web.set_remember_secret(true);
+        state.hosts.update(web, web_id).expect("updated");
+    });
+    remember_in_vault(&b, web_id, HOST_PASSWORD, "device-b");
+    expect_uploaded(b.service.sync());
+
+    // A changes a record and syncs: it has no record of the password, which is
+    // not a deletion, so B's password stays everywhere — and A's old entry is
+    // never read for the sync.
+    a.secrets.clear_accesses();
+    a.edit(|state| {
+        add_host(state, "db");
+    });
+    a.service.sync().expect("A syncs");
+    assert!(
+        host_entry_accesses(&a).is_empty(),
+        "{:?}",
+        a.secrets.accesses()
+    );
+    assert!(a.secrets.holds_legacy_host(web_id), "the old entry stays");
+    assert_eq!(
+        vault_password(&a, web_id).as_deref(),
+        Some(HOST_PASSWORD),
+        "A got the vault, with B's password in it"
+    );
+    assert!(
+        a.load()
+            .hosts
+            .connection(web_id)
+            .is_some_and(|record| record.remembers_secret()),
+        "A's mark stays"
+    );
+    b.service.sync().expect("B syncs");
+    assert_eq!(vault_password(&b, web_id).as_deref(), Some(HOST_PASSWORD));
+    assert!(
+        b.load()
+            .hosts
+            .connection(web_id)
+            .is_some_and(|record| record.remembers_secret()),
+        "B's mark stays"
+    );
+    assert!(b.host_names().contains(&"db".to_owned()));
+    expect_up_to_date(a.service.sync());
+    expect_up_to_date(b.service.sync());
+}
+
+#[test]
+fn a_vault_without_any_unseal_secret_for_the_cloud_is_never_uploaded() {
+    let server = WebDavServer::start(USER, "");
+    let a = Machine::new("no-secret-a", Platform::Linux);
+    connect_passwordless(&a, &server);
+    let mut web_id = None;
+    a.edit(|state| web_id = Some(add_password_host(state, "web")));
+    let web_id = web_id.expect("web");
+
+    // Without a vault, the data syncs alone, and no vault is made for it.
+    expect_uploaded(a.service.sync());
+    assert!(!vault_store(&a).exists());
+    let before = remote_text(&server);
+
+    // A password in the vault, no WebDAV password and no passphrase: the
+    // sync stops before uploading anything secret (R7).
+    remember_in_vault(&a, web_id, HOST_PASSWORD, "device-a");
+    assert_eq!(a.service.sync().unwrap_err(), SyncError::PassphraseMissing);
     let text = remote_text(&server);
+    assert_eq!(text, before, "nothing was uploaded");
+    assert!(!text.contains("\"vault\""), "{text}");
     assert!(!text.contains("\"secrets\""), "{text}");
-    let state_text =
-        std::fs::read_to_string(b.root.join(crate::STATE_FILE_NAME)).expect("state file");
-    assert!(!state_text.contains(HOST_PASSWORD));
-    assert!(!state_text.contains("a-new-password"));
+    assert!(!text.contains(HOST_PASSWORD));
 }
 
 #[test]
@@ -1414,133 +1463,110 @@ fn a_failed_or_refused_merge_upload_leaves_this_machine_as_it_was() {
 }
 
 #[test]
-fn with_passwords_synced_a_password_changed_in_the_cloud_is_not_only_recents() {
+fn a_host_password_changed_in_the_cloud_merges_with_records_changed_here() {
     let server = WebDavServer::start(USER, DAV_PASSWORD);
     let a = Machine::new("merge-secrets-a", Platform::Linux);
     let b = Machine::new("merge-secrets-b", Platform::Linux);
     for machine in [&a, &b] {
         machine.connect(&server);
-        machine.update_config(|config| config.sync_secrets = true);
-        machine
-            .service
-            .set_passphrase(Some(&SecretString::new(PASSPHRASE)))
-            .expect("saved");
     }
     let mut web_id = None;
     a.edit(|state| {
-        let mut web = HostConfig::new("web", "10.0.0.5", 22, "deploy").expect("host");
-        web.set_auth(Some(AuthMethodKind::Password));
-        web.set_remember_secret(true);
-        web_id = Some(web.id());
-        state.hosts.insert(web).expect("inserted");
+        web_id = Some(add_password_host(state, "web"));
         add_host(state, "db");
     });
     let web_id = web_id.expect("web");
-    let password_of = |machine: &Machine| {
-        machine
-            .secrets
-            .load(web_id)
-            .expect("read")
-            .map(|secret| secret.expose().to_owned())
-    };
-    a.secrets
-        .save(web_id, &SecretString::new("first"))
-        .expect("saved");
+    remember_in_vault(&a, web_id, "first", "device-a");
     expect_uploaded(a.service.sync());
     expect_pulled(b.service.sync());
-    assert_eq!(password_of(&b).as_deref(), Some("first"));
+    assert_eq!(vault_password(&b, web_id).as_deref(), Some("first"));
 
-    // A changes only the password (the records stay as they were). B changes a
-    // record: the cloud's change is a password, so this is a conflict, not a
-    // merge that would upload B's older password over it.
-    a.secrets
-        .save(web_id, &SecretString::new("second"))
-        .expect("saved");
+    // A changes only the password; B changes a record. The password is a
+    // vault record of its own, so the two changes merge (ADR-6): B keeps its
+    // record and takes the cloud's password, and nothing older travels back.
+    remember_in_vault(&a, web_id, "second", "device-a");
     expect_uploaded(a.service.sync());
     b.edit(|state| {
         readdress(state, "db", "10.1.2.3");
         connect_to(state, "db", 1_000);
     });
-    let remote_before = server.file(REMOTE_PATH).expect("remote");
-    expect_conflict(b.service.sync());
-    assert_eq!(server.file(REMOTE_PATH).expect("remote"), remote_before);
-    assert_eq!(password_of(&b).as_deref(), Some("first"));
-    expect_pulled(b.service.resolve(Resolution::UseRemote));
-    assert_eq!(password_of(&b).as_deref(), Some("second"));
+    expect_merged(b.service.sync());
+    assert_eq!(vault_password(&b, web_id).as_deref(), Some("second"));
+    assert_eq!(address_of(&b, "db"), "10.1.2.3");
+    expect_up_to_date(b.service.sync());
+    expect_pulled(a.service.sync());
+    assert_eq!(address_of(&a, "db"), "10.1.2.3");
+    assert_eq!(vault_password(&a, web_id).as_deref(), Some("second"));
 
     // When B only connected, the cloud's password is taken with the merge.
-    a.secrets
-        .save(web_id, &SecretString::new("third"))
-        .expect("saved");
+    remember_in_vault(&a, web_id, "third", "device-a");
     expect_uploaded(a.service.sync());
     b.edit(|state| connect_to(state, "web", 2_000));
     expect_merged(b.service.sync());
-    assert_eq!(password_of(&b).as_deref(), Some("third"));
+    assert_eq!(vault_password(&b, web_id).as_deref(), Some("third"));
     assert_eq!(recent_of(&b, "web"), Some((2_000, 1)));
     assert_eq!(remote_recent(&server, "web"), Some((2_000, 1)));
     expect_up_to_date(b.service.sync());
     expect_pulled(a.service.sync());
-    assert_eq!(password_of(&a).as_deref(), Some("third"));
+    assert_eq!(vault_password(&a, web_id).as_deref(), Some("third"));
     expect_up_to_date(a.service.sync());
 
-    // A passphrase that does not open the cloud's passwords cannot tell what
-    // changed there: a conflict, nothing written.
-    a.secrets
-        .save(web_id, &SecretString::new("fourth"))
-        .expect("saved");
+    // The same password changed differently on both sides is a conflict the
+    // user settles, named after its host, and nothing is written meanwhile.
+    remember_in_vault(&a, web_id, "fourth-a", "device-a");
     expect_uploaded(a.service.sync());
-    b.service
-        .set_passphrase(Some(&SecretString::new("another passphrase")))
-        .expect("saved");
-    b.edit(|state| connect_to(state, "web", 3_000));
+    remember_in_vault(&b, web_id, "fourth-b", "device-b");
     let files = data_files(&b.root);
-    expect_conflict(b.service.sync());
+    let remote_before = server.file(REMOTE_PATH).expect("remote");
+    let conflicts = expect_vault_conflict(b.service.sync(), 1);
+    match &conflicts[0] {
+        VaultConflict::Record { kind, id, name, .. } => {
+            assert_eq!(*kind, VaultRecordKind::HostSecret);
+            assert_eq!(id, &web_id.to_string());
+            assert_eq!(name, "web");
+        }
+        other => panic!("expected a host password conflict, got {other:?}"),
+    }
     assert_eq!(data_files(&b.root), files);
+    assert_eq!(server.file(REMOTE_PATH).expect("remote"), remote_before);
+    b.service
+        .resolve_vault(&[VaultChoice {
+            key: VaultChoiceKey::Record {
+                kind: VaultRecordKind::HostSecret,
+                id: web_id.to_string(),
+            },
+            side: VaultChoiceSide::Remote,
+        }])
+        .expect("settled");
+    assert_eq!(vault_password(&b, web_id).as_deref(), Some("fourth-a"));
 }
 
 #[test]
-fn turning_password_sync_off_here_is_kept_when_the_cloud_only_connected() {
+fn an_old_settings_file_with_password_sync_off_still_syncs_the_vault() {
     let server = WebDavServer::start(USER, DAV_PASSWORD);
-    let a = Machine::new("merge-secrets-off-a", Platform::Linux);
-    let b = Machine::new("merge-secrets-off-b", Platform::Linux);
+    let a = Machine::new("old-switch-a", Platform::Linux);
+    let b = Machine::new("old-switch-b", Platform::Linux);
     for machine in [&a, &b] {
         machine.connect(&server);
-        machine.update_config(|config| config.sync_secrets = true);
-        machine
-            .service
-            .set_passphrase(Some(&SecretString::new(PASSPHRASE)))
-            .expect("saved");
+        // What an older build wrote with the switch off.
+        std::fs::write(
+            machine.root.join(crate::CONFIG_FILE_NAME),
+            format!(
+                r#"{{"version":1,"url":"{}","username":"{USER}","remote_dir":"Shellune","auto":true,"sync_secrets":false}}"#,
+                server.url()
+            ),
+        )
+        .expect("written");
+        assert!(machine.service.load_config().expect("reads").is_some());
     }
     let mut web_id = None;
-    a.edit(|state| {
-        let mut web = HostConfig::new("web", "10.0.0.5", 22, "deploy").expect("host");
-        web.set_auth(Some(AuthMethodKind::Password));
-        web.set_remember_secret(true);
-        web_id = Some(web.id());
-        state.hosts.insert(web).expect("inserted");
-        add_host(state, "db");
-    });
+    a.edit(|state| web_id = Some(add_password_host(state, "web")));
     let web_id = web_id.expect("web");
-    a.secrets
-        .save(web_id, &SecretString::new(HOST_PASSWORD))
-        .expect("saved");
+    remember_in_vault(&a, web_id, HOST_PASSWORD, "device-a");
     expect_uploaded(a.service.sync());
+    assert!(remote_text(&server).contains("\"vault\""));
     expect_pulled(b.service.sync());
-    assert!(remote_text(&server).contains("\"secrets\""));
-
-    // A turns password sync off (its records match the cloud's); B only
-    // connects and uploads. The merge keeps A's change: the passwords leave
-    // the cloud, and the next sync has nothing left to do.
-    a.update_config(|config| config.sync_secrets = false);
-    b.edit(|state| connect_to(state, "db", 1_000));
-    expect_uploaded(b.service.sync());
-    assert!(remote_text(&server).contains("\"secrets\""));
-    expect_merged(a.service.sync());
-    let text = remote_text(&server);
-    assert!(!text.contains("\"secrets\""), "{text}");
-    assert_eq!(recent_of(&a, "db"), Some((1_000, 1)));
-    assert_eq!(remote_recent(&server, "db"), Some((1_000, 1)));
-    expect_up_to_date(a.service.sync());
+    assert_eq!(vault_password(&b, web_id).as_deref(), Some(HOST_PASSWORD));
 }
 
 // ---------------------------------------------------------------------------
@@ -1704,6 +1730,51 @@ fn connect_passwordless(machine: &Machine, server: &WebDavServer) {
         .expect("settings saved");
 }
 
+/// Adds an SSH host that signs in with a password this machine remembers.
+fn add_password_host(state: &mut LocalState, name: &str) -> HostId {
+    let mut host = HostConfig::new(name, "10.0.0.5", 22, "deploy").expect("host");
+    host.set_auth(Some(AuthMethodKind::Password));
+    host.set_remember_secret(true);
+    let id = host.id();
+    state.hosts.insert(host).expect("inserted");
+    id
+}
+
+/// Remembers `password` for `host` in the machine's vault, the way the
+/// application saves a host form: a new vault when the machine has none.
+fn remember_in_vault(machine: &Machine, host: HostId, password: &str, device: &str) {
+    let mut content = if vault_store(machine).exists() {
+        open_vault(machine)
+    } else {
+        VaultContent::new()
+    };
+    content.set_host_secret(host, SecretString::new(password), device);
+    save_vault(machine, &content);
+}
+
+/// The host's password in the machine's vault; `None` without a vault.
+fn vault_password(machine: &Machine, host: HostId) -> Option<String> {
+    vault_store(machine)
+        .exists()
+        .then(|| open_vault(machine))
+        .and_then(|content| {
+            content
+                .host_secret(host)
+                .map(|secret| secret.expose().to_owned())
+        })
+}
+
+/// Every call the machine's credential store answered for a `host-<uuid>`
+/// entry.
+fn host_entry_accesses(machine: &Machine) -> Vec<SecretAccess> {
+    machine
+        .secrets
+        .accesses()
+        .into_iter()
+        .filter(SecretAccess::is_host_entry)
+        .collect()
+}
+
 /// Two machines, both with the vault travelling, that synced `baseline`.
 fn synced_vault_pair(
     name: &str,
@@ -1714,7 +1785,6 @@ fn synced_vault_pair(
     let b = Machine::new(&format!("{name}-b"), Platform::Linux);
     for machine in [&a, &b] {
         machine.connect(server);
-        machine.update_config(|config| config.sync_secrets = true);
     }
     create_vault(&a, baseline);
     expect_uploaded(a.service.sync());
@@ -1758,7 +1828,6 @@ fn the_vault_travels_sealed_under_the_webdav_password() {
     let b = Machine::new("vault-travel-b", Platform::Linux);
     for machine in [&a, &b] {
         machine.connect(&server);
-        machine.update_config(|config| config.sync_secrets = true);
     }
     let credential = CredentialId::new();
     a.edit(|state| {
@@ -1821,7 +1890,6 @@ fn a_sync_keeps_the_desktop_references_in_the_vault_mirror() {
     let b = Machine::new("vault-desktop-b", Platform::Linux);
     for machine in [&a, &b] {
         machine.connect(&server);
-        machine.update_config(|config| config.sync_secrets = true);
     }
     let credential = CredentialId::new();
     let mut rdp = None;
@@ -1896,7 +1964,6 @@ fn a_passwordless_webdav_requires_a_sync_passphrase_before_the_vault_travels() {
     let server = WebDavServer::start(USER, "");
     let a = Machine::new("passphrase-a", Platform::Linux);
     connect_passwordless(&a, &server);
-    a.update_config(|config| config.sync_secrets = true);
     let credential = CredentialId::new();
     a.edit(|state| {
         add_host_with_credential(state, "web", credential);
@@ -1923,7 +1990,6 @@ fn a_passwordless_webdav_requires_a_sync_passphrase_before_the_vault_travels() {
     // A new device with the same passphrase restores everything.
     let b = Machine::new("passphrase-b", Platform::Linux);
     connect_passwordless(&b, &server);
-    b.update_config(|config| config.sync_secrets = true);
     b.service
         .set_passphrase(Some(&SecretString::new(PASSPHRASE)))
         .expect("saved");
@@ -1936,7 +2002,6 @@ fn a_passwordless_webdav_requires_a_sync_passphrase_before_the_vault_travels() {
     // A wrong passphrase adopts nothing and overwrites nothing.
     let c = Machine::new("passphrase-c", Platform::Linux);
     connect_passwordless(&c, &server);
-    c.update_config(|config| config.sync_secrets = true);
     c.service
         .set_passphrase(Some(&SecretString::new("not the passphrase")))
         .expect("saved");
@@ -2423,10 +2488,10 @@ fn an_empty_cloud_vault_never_overwrites_local_records() {
     .expect("seals");
     let mut options = ExportOptions::new(Platform::Linux);
     options.kdf = cheap_kdf();
-    let document = ShelluneData::export(
+    let document = ShelluneData::export_from_vault(
         &LocalState::default(),
         &options.with_vault(cipher),
-        &*b.secrets,
+        None,
         None,
     )
     .expect("exports")
@@ -2452,93 +2517,113 @@ fn an_empty_cloud_vault_never_overwrites_local_records() {
     );
 }
 
-#[test]
-fn a_version_1_document_still_carrying_passwords_is_not_replaced_quietly() {
-    let server = WebDavServer::start(USER, DAV_PASSWORD);
-    // A legacy machine puts a version 1 document with sealed passwords up.
-    let legacy = Machine::new("vault-legacy", Platform::Linux);
-    legacy.connect(&server);
-    legacy.update_config(|config| config.sync_secrets = true);
-    legacy
-        .service
-        .set_passphrase(Some(&SecretString::new(PASSPHRASE)))
-        .expect("saved");
-    let mut web_id = None;
-    legacy.edit(|state| {
-        let mut web = HostConfig::new("web", "10.0.0.5", 22, "deploy").expect("host");
-        web.set_auth(Some(AuthMethodKind::Password));
-        web.set_remember_secret(true);
-        web_id = Some(web.id());
-        state.hosts.insert(web).expect("inserted");
-    });
-    let web_id = web_id.expect("web");
-    legacy
-        .secrets
-        .save(web_id, &SecretString::new(HOST_PASSWORD))
-        .expect("saved");
-    expect_uploaded(legacy.service.sync());
-    assert!(remote_text(&server).contains("\"secrets\""));
-
-    // A machine with a vault meets it: replacing the document would drop those
-    // passwords from the cloud, so the user decides instead of the sync (R9).
-    let modern = Machine::new("vault-modern", Platform::Linux);
-    modern.connect(&server);
-    modern.update_config(|config| config.sync_secrets = true);
-    create_vault(&modern, |content| {
-        content
-            .insert_credential(credential_named(
-                CredentialId::new(),
-                "Modern login",
-                1,
-                VAULT_SECRET,
-            ))
-            .expect("inserts");
-    });
-    let files = data_files(&modern.root);
-    let remote_before = server.file(REMOTE_PATH).expect("the cloud file");
-    let report = expect_conflict(modern.service.sync());
-    assert!(
-        report.vault.is_empty(),
-        "a document conflict, not vault items"
-    );
-    assert_eq!(data_files(&modern.root), files);
-    assert_eq!(
-        server.file(REMOTE_PATH).expect("the cloud file"),
-        remote_before
-    );
+/// Puts a version 1 document with a sealed password block into the cloud, as
+/// an older build syncing passwords under `PASSPHRASE` wrote it: one host,
+/// `web`, whose password is `HOST_PASSWORD`.
+fn put_legacy_document(server: &WebDavServer) -> HostId {
+    let mut state = LocalState::default();
+    let web_id = add_password_host(&mut state, "web");
+    let mut sealed = VaultContent::new();
+    sealed.set_host_secret(web_id, SecretString::new(HOST_PASSWORD), "device-old");
+    let mut options = ExportOptions::new(Platform::Linux);
+    options.kdf = cheap_kdf();
+    let document = ShelluneData::export_from_vault(
+        &state,
+        &options.with_passphrase(SecretString::new(PASSPHRASE)),
+        Some(&sealed),
+        None,
+    )
+    .expect("exports")
+    .document;
+    assert!(document.has_secrets());
+    assert_eq!(document.version(), 1);
+    server.put_file(REMOTE_PATH, &document.to_json().expect("json"));
+    web_id
 }
 
 #[test]
-fn turning_vault_sync_off_never_deletes_the_clouds_ciphertext() {
+fn a_version_1_password_block_moves_into_the_vault_and_the_cloud_becomes_version_2() {
     let server = WebDavServer::start(USER, DAV_PASSWORD);
-    let credential = CredentialId::new();
-    let (a, b) = synced_vault_pair("vault-off", &server, |content| {
-        content
-            .insert_credential(credential_named(credential, "Prod login", 1, VAULT_SECRET))
-            .expect("inserts");
-    });
-    assert!(remote_text(&server).contains("\"vault\""));
+    let web_id = put_legacy_document(&server);
+    let legacy = server.file(REMOTE_PATH).expect("the cloud file");
 
-    // A turns the vault off and changes its records: the upload keeps the
-    // cloud's ciphertext untouched (R5: deleting it is a separate, explicit
-    // choice of the user, never a side effect).
-    a.update_config(|config| config.sync_secrets = false);
-    a.edit(|state| {
-        add_host(state, "while-off");
-    });
-    expect_uploaded(a.service.sync());
+    // Only the sync passphrase opens the block: without it, nothing is written
+    // anywhere — the cloud keeps its passwords, and no vault is made here.
+    let a = Machine::new("legacy-block-a", Platform::Linux);
+    a.connect(&server);
+    assert_eq!(a.service.sync().unwrap_err(), SyncError::PassphraseMissing);
+    assert_eq!(server.file(REMOTE_PATH).expect("the cloud file"), legacy);
+    assert!(!vault_store(&a).exists());
+    assert!(a.host_names().is_empty());
+
+    // With it, the block's password lands in a new vault here, the host
+    // remembers it, and the cloud carries the vault instead of the block.
+    a.service
+        .set_passphrase(Some(&SecretString::new(PASSPHRASE)))
+        .expect("saved");
+    a.secrets.clear_accesses();
+    a.service.sync().expect("synced");
+    assert_eq!(vault_password(&a, web_id).as_deref(), Some(HOST_PASSWORD));
+    assert!(
+        a.load()
+            .hosts
+            .connection(web_id)
+            .is_some_and(|record| record.remembers_secret())
+    );
+    let document = remote_document(&server);
+    assert_eq!(document.version(), 2);
+    assert!(document.has_vault());
+    assert!(!document.has_secrets());
     let text = remote_text(&server);
-    assert!(text.contains("\"vault\""), "{text}");
-    assert_eq!(remote_document(&server).version(), 2);
-    assert!(!text.contains(VAULT_SECRET));
+    assert!(!text.contains(HOST_PASSWORD), "{text}");
+    assert!(
+        host_entry_accesses(&a).is_empty(),
+        "{:?}",
+        a.secrets.accesses()
+    );
+    assert!(a.secrets.is_empty(), "no host entry was written");
+    expect_up_to_date(a.service.sync());
 
-    // The other machine still sees the vault and its own records.
+    // Another machine with the account's password — and no passphrase — now
+    // gets the password from the vault.
+    let b = Machine::new("legacy-block-b", Platform::Linux);
+    b.connect(&server);
     expect_pulled(b.service.sync());
-    a.edit(|state| {
-        add_host(state, "more");
-    });
-    expect_uploaded(a.service.sync());
-    expect_pulled(b.service.sync());
-    assert!(b.host_names().contains(&"more".to_owned()));
-    expect_up_to_date(b.service.sync());
+    assert_eq!(vault_password(&b, web_id).as_deref(), Some(HOST_PASSWORD));
+}
+
+#[test]
+fn a_version_1_password_block_never_overrides_the_vaults_own_record() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let web_id = put_legacy_document(&server);
+
+    // This machine already holds the same host with a newer password in its
+    // vault: the block only fills what the vault never had.
+    let a = Machine::new("legacy-kept-a", Platform::Linux);
+    a.connect(&server);
+    a.service
+        .set_passphrase(Some(&SecretString::new(PASSPHRASE)))
+        .expect("saved");
+    let document = remote_document(&server);
+    let state = LocalState {
+        hosts: document.shared().hosts().clone(),
+        ..LocalState::default()
+    };
+    a.save(&state);
+    remember_in_vault(&a, web_id, "newer-password", "device-a");
+    // Both sides hold data on a first sync: the user decides, and "use this
+    // machine's data" still keeps nothing of the block that the vault has.
+    expect_conflict(a.service.sync());
+    assert!(
+        remote_document(&server).has_secrets(),
+        "nothing was written"
+    );
+    expect_uploaded(a.service.resolve(Resolution::UseLocal));
+    assert_eq!(
+        vault_password(&a, web_id).as_deref(),
+        Some("newer-password")
+    );
+    let document = remote_document(&server);
+    assert!(document.has_vault(), "the cloud carries the vault now");
+    assert!(!document.has_secrets());
 }

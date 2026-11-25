@@ -34,16 +34,27 @@
 //! version is the newer one in full — deletions included. Applying snapshots the
 //! local data first (see [`shellune_storage::SnapshotStore`]).
 //!
-//! # The encrypted vault (R5, R6, R8)
+//! # The encrypted vault (R5, R6, R8, R7)
 //!
-//! When the user asks for the vault to travel, the document becomes a version 2
-//! one that carries the encrypted vault ([`shellune_storage::VaultCipher`])
-//! instead of the version 1 sealed passwords. The unseal secret is the non-empty
+//! The vault travels with every sync (R7): there is no switch for it. Whenever
+//! this machine or the cloud holds a vault, the document is a version 2 one
+//! that carries the encrypted vault ([`shellune_storage::VaultCipher`]) — the
+//! managed keys, the shared passwords, the remembered host passwords and the
+//! accepted server identities. No version 1 sealed-password block is written
+//! any more. A cloud document an older build wrote with such a block is read
+//! once with the sync passphrase, its host passwords go into this machine's
+//! vault (a new one when there is none), and the document goes back as a
+//! version 2 one; a machine without the passphrase is told so and nothing is
+//! written. Without a vault on either side and without a block, the data syncs
+//! alone and no vault is made. The unseal secret is the non-empty
 //! WebDAV password when there is one, otherwise the sync passphrase a
 //! passwordless account must have first. Reusing the WebDAV password is the
 //! user's confirmed choice: the server sees it in every Basic authorization
 //! header, so it can decrypt and forge valid ciphertext — that mode is not
 //! zero-knowledge towards the WebDAV server, and nothing here may claim it is.
+//!
+//! Host passwords are read from and written to the vault only: a sync never
+//! asks the system credential store for a host's `host-<uuid>` entry (R4).
 //!
 //! The vault has its own decision beside the document's: both sides are opened
 //! and merged record by record and trust entry by trust entry against the
@@ -67,14 +78,15 @@ use std::sync::Arc;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use shellune_core::{
-    CredentialId, CredentialMeta, HostId, KeyId, ManagedKeyMeta, SecretString, VaultRecordVersion,
+    CredentialId, CredentialMeta, HostId, HostSecretMeta, KeyId, ManagedKeyMeta, SecretString,
+    VaultRecordVersion,
 };
 use shellune_storage::{
-    AppSecret, ApplyMode, ApplyOutcome, ApplyPlan, Change, ExportOptions, HostReference, KdfParams,
-    LocalData, LocalState, PassphrasePurpose, Platform, PlatformFallback, PortableError,
-    SecretBundle, SecretError, SecretStore, ShelluneData, SnapshotStore, TrustConflict,
-    UnsealSource, VaultCipher, VaultContent, VaultCredentialRecord, VaultKeyRecord, VaultStore,
-    VaultStoreError, merge_recent_connections,
+    AppSecret, ApplyMode, ApplyOutcome, ApplyPlan, Change, ExportOptions, HostReference,
+    HostSecretState, KdfParams, LocalData, LocalState, PassphrasePurpose, Platform,
+    PlatformFallback, PortableError, SecretBundle, SecretError, SecretStore, ShelluneData,
+    SnapshotStore, TrustConflict, UnsealSource, VaultCipher, VaultContent, VaultCredentialRecord,
+    VaultHostSecretRecord, VaultKeyRecord, VaultStore, VaultStoreError, merge_recent_connections,
 };
 
 use crate::config::{
@@ -101,11 +113,13 @@ pub enum SyncError {
     /// credential store.
     #[error("the sync credentials could not be read: {0}")]
     Credentials(SecretError),
-    /// The vault or the saved passwords are to travel, the WebDAV account has no
-    /// password, and no non-empty sync passphrase is saved on this machine
-    /// (R5: a passwordless account must have one before anything secret syncs).
+    /// The vault travels, the WebDAV account has no password, and no non-empty
+    /// sync passphrase is saved on this machine (R5, R7: a passwordless account
+    /// must have one before anything secret syncs) — or the cloud still holds a
+    /// version 1 password block only the sync passphrase opens. Nothing was
+    /// uploaded.
     #[error(
-        "syncing the vault or saved passwords is on, the WebDAV account has no password, \
+        "the encrypted vault travels with every sync, the WebDAV account has no password, \
          and no sync passphrase is set"
     )]
     PassphraseMissing,
@@ -188,11 +202,13 @@ impl SyncOutcome {
 pub struct UploadReport {
     /// Whether the file did not exist in the cloud before.
     pub created: bool,
-    /// The records whose password was sealed into the file.
+    /// The records whose remembered password travelled in the vault.
     pub secrets_included: Vec<HostId>,
-    /// The records that remember a password the credential store could not read.
+    /// Always empty: a sync reads no host password from the credential store,
+    /// so none can be unreadable. Kept for the interfaces that list it.
     pub secrets_unreadable: Vec<HostId>,
-    /// The records that remember a password the credential store does not have.
+    /// The records that remember a password the vault does not hold (a host
+    /// not migrated from its old system-store entry yet), so it did not travel.
     pub secrets_missing: Vec<HostId>,
     /// Where the cloud file that was replaced was kept, for "use local".
     pub remote_snapshot: Option<PathBuf>,
@@ -229,16 +245,14 @@ pub struct PullReport {
     /// Servers trusted on both sides with different identities; the cloud's now
     /// applies.
     pub trust_conflicts: Vec<TrustConflict>,
-    /// Whether the cloud file carried passwords that were not opened because
-    /// syncing passwords is off on this machine.
-    pub secrets_ignored: bool,
-    /// How many passwords were saved to the credential store.
+    /// How many remembered host passwords were written into the vault.
     pub secrets_saved: usize,
-    /// Records whose saved password was planned to be removed.
+    /// Records whose remembered password was planned to be removed.
     pub secrets_to_forget: Vec<HostId>,
-    /// How many passwords were removed.
+    /// How many remembered passwords became tombstones in the vault.
     pub secrets_forgotten: usize,
-    /// Records whose password could not be removed (an unused entry is left).
+    /// Records whose password could not be removed; always empty, since the
+    /// vault takes every removal.
     pub secrets_not_forgotten: Vec<HostId>,
     /// The cloud's encrypted vault as applied here, when one travelled (R5, R6):
     /// the version the machine landed on, shown for a first adoption too, which
@@ -275,6 +289,9 @@ pub enum VaultRecordKind {
     ManagedKey,
     /// A shared password.
     Credential,
+    /// One host's remembered password. Its identifier is the host's; the name
+    /// of the conflict and of each side is the host's name on that side.
+    HostSecret,
 }
 
 /// One side of a per-record vault conflict, as the interface shows it: public
@@ -431,8 +448,8 @@ struct Facts {
     local_empty: bool,
     remote_empty: bool,
     same_view: bool,
-    /// Known only when both sides changed, the last sync recorded the data
-    /// without recents, and (with passwords synced) the cloud's passwords opened.
+    /// Known only when both sides changed and the last sync recorded the data
+    /// without recents.
     core: Option<CoreChanges>,
 }
 
@@ -470,9 +487,9 @@ struct Remote {
     view_hash: Option<String>,
     /// The fingerprint of the same view without the recent connections.
     core_hash: Option<String>,
-    /// What tells this version from the last synced one: the view, and — when
-    /// this machine syncs passwords — the sealed block too (which the view
-    /// leaves out).
+    /// What tells this version from the last synced one: the view, and the
+    /// sealed blocks the view leaves out (a version 1 password block an older
+    /// build wrote, the encrypted vault).
     mark: String,
 }
 
@@ -499,13 +516,6 @@ struct Seen {
 enum Step {
     Done(SyncOutcome),
     Retry,
-}
-
-/// What a merge needs beyond the decision: which side changed records, and the
-/// cloud's opened passwords (when passwords are synced).
-struct CoreCheck {
-    changes: CoreChanges,
-    bundle: Option<SecretBundle>,
 }
 
 /// Syncs one data directory with the WebDAV folder its settings name.
@@ -675,10 +685,10 @@ impl SyncService {
         if resolution == Resolution::Cancel {
             return self.record(Ok(SyncOutcome::ConflictKept));
         }
-        let outcome = self.connect().and_then(|(config, client)| {
+        let outcome = self.connect().and_then(|(_config, client)| {
             self.repeat(|service| match resolution {
-                Resolution::UseRemote => service.use_remote(&config, &client),
-                Resolution::UseLocal => service.use_local(&config, &client),
+                Resolution::UseRemote => service.use_remote(&client),
+                Resolution::UseLocal => service.use_local(&client),
                 Resolution::Cancel => Ok(Step::Done(SyncOutcome::ConflictKept)),
             })
         });
@@ -696,15 +706,15 @@ impl SyncService {
     ///
     /// See [`SyncError`].
     pub fn resolve_vault(&self, choices: &[VaultChoice]) -> Result<SyncOutcome, SyncError> {
-        let outcome = self.connect().and_then(|(config, client)| {
-            self.repeat(|service| service.attempt_with(Direction::Auto, &config, &client, choices))
+        let outcome = self.connect().and_then(|(_config, client)| {
+            self.repeat(|service| service.attempt_with(Direction::Auto, &client, choices))
         });
         self.record(outcome)
     }
 
     fn run(&self, direction: Direction) -> Result<SyncOutcome, SyncError> {
-        let outcome = self.connect().and_then(|(config, client)| {
-            self.repeat(|service| service.attempt(direction, &config, &client))
+        let outcome = self.connect().and_then(|(_config, client)| {
+            self.repeat(|service| service.attempt_with(direction, &client, &[]))
         });
         self.record(outcome)
     }
@@ -764,22 +774,12 @@ impl SyncService {
         Ok((config, client))
     }
 
-    fn attempt(
-        &self,
-        direction: Direction,
-        config: &SyncConfig,
-        client: &WebDavClient,
-    ) -> Result<Step, SyncError> {
-        self.attempt_with(direction, config, client, &[])
-    }
-
     /// One decision over the data both sides hold. `choices` are the user's
     /// answers to the vault conflicts of the last attempt; without them a
     /// vault conflict stands and nothing of the vault is applied.
     fn attempt_with(
         &self,
         direction: Direction,
-        config: &SyncConfig,
         client: &WebDavClient,
         choices: &[VaultChoice],
     ) -> Result<Step, SyncError> {
@@ -787,35 +787,27 @@ impl SyncService {
         let state = self.state();
         let known = state.knows(&remote_id);
         let local = self.data.load().map_err(SyncError::Local)?;
-        // Opening the vault takes no network, and a vault no secret of this
-        // machine can open is an error rather than an absence: an unusable
-        // vault never counts as an empty one (R5).
-        let local_vault = if config.sync_secrets {
-            self.open_local_vault()?
-        } else {
-            None
-        };
-        let mine = self.fingerprint(config, &local, local_vault.as_ref())?;
-        // Passwords were just switched on here: the cloud may already carry them
-        // (from another machine), and this machine's own set is not newer.
-        let adopting_secrets = known
-            && config.sync_secrets
-            && local_vault.is_none()
-            && state.last_secrets_hash.is_none();
-        let secrets_changed = known && !adopting_secrets && state.last_secrets_hash != mine.secrets;
+        // The vault always travels (R7). Opening it takes no network, and a
+        // vault no secret of this machine can open is an error rather than an
+        // absence: an unusable vault never counts as an empty one (R5).
+        let local_vault = self.open_local_vault()?;
+        let mine = self.fingerprint(&local, local_vault.as_ref())?;
         // The vault has its own half of "this machine changed": a record, a
         // tombstone or a trust entry is a change even when no host record moved.
         // A machine with no vault file is not "changed" for lacking one — a
         // vault that appears is a change, a vault that never existed is not.
         let vault_changed_here = known
-            && config.sync_secrets
             && local_vault.as_ref().is_some_and(|vault| {
                 state.last_vault_hash.as_deref() != Some(vault.fingerprint.as_str())
             });
         let local_changed = !known
             || state.last_synced_hash.as_deref() != Some(mine.view.as_str())
-            || secrets_changed
             || vault_changed_here;
+        // The last sync carried a version 1 password block (an older build
+        // wrote this state): the cloud may still hold it, and its passwords
+        // belong in the vault now, so the cloud is read even when it did not
+        // change.
+        let legacy_block_synced = state.last_secrets_hash.is_some();
 
         let Some(file) = client.stat()? else {
             return match direction {
@@ -829,7 +821,6 @@ impl SyncService {
                         // The first upload with a vault: the document becomes a
                         // version 2 one that carries the ciphertext.
                         let source = self.vault_source()?;
-                        let state = self.state();
                         let device_id = state.device_id.clone().unwrap_or_else(new_device_id);
                         let merged = merge_vault(
                             Some(&local_vault),
@@ -843,7 +834,6 @@ impl SyncService {
                             return Ok(Step::Done(SyncOutcome::UpToDate));
                         };
                         self.upload_document(
-                            config,
                             client,
                             &remote_id,
                             &local,
@@ -857,16 +847,16 @@ impl SyncService {
                             "sync-upload",
                         )
                     } else {
-                        self.upload_to(config, client, &remote_id, &local, &mine, None)
+                        self.upload_to(client, &remote_id, &local, &mine, None)
                     }
                 }
             };
         };
         let etag_unchanged = known && file.etag.is_some() && file.etag == state.last_remote_etag;
-        if etag_unchanged && !local_changed && !adopting_secrets {
+        if etag_unchanged && !local_changed && !legacy_block_synced {
             return Ok(Step::Done(SyncOutcome::UpToDate));
         }
-        let Some(remote) = self.fetch(config, client)? else {
+        let Some(remote) = self.fetch(client)? else {
             // Removed between the two requests.
             return Ok(Step::Retry);
         };
@@ -875,12 +865,12 @@ impl SyncService {
             .as_ref()
             .map_err(|error| SyncError::RemoteDocument(error.clone()))?;
 
-        // The vault travels whenever the user asked for it and one exists on
-        // either side; everything below is the arrangement without one.
-        if config.sync_secrets && (local_vault.is_some() || document.has_vault()) {
+        // The vault travels whenever one exists on either side, and a version
+        // 1 password block in the cloud becomes one; everything below is the
+        // arrangement without any.
+        if local_vault.is_some() || document.has_vault() || document.has_secrets() {
             return self.attempt_vault(
                 direction,
-                config,
                 client,
                 &remote_id,
                 &state,
@@ -897,27 +887,14 @@ impl SyncService {
         // A cloud that carried a vault this machine has a baseline for, and no
         // longer does, is either an abnormal rollback or an old client that
         // overwrote it: neither is applied, and neither is overwritten back.
-        if config.sync_secrets && known && state.vault.is_some() && !document.has_vault() {
+        if known && state.vault.is_some() {
             return Err(vault_gone());
         }
-        if config.sync_secrets {
-            // The sealed-password arrangement needs the passphrase; a machine
-            // that has none is told so here, before anything is written.
-            self.sync_passphrase()?;
-        }
         let remote_hash = remote.view_hash.clone().unwrap_or_default();
-        // Switching passwords on where the cloud has none is this machine's change.
-        let local_changed = local_changed || (adopting_secrets && !document.has_secrets());
         let remote_changed = !known
-            || (adopting_secrets && document.has_secrets())
             || (!etag_unchanged && state.last_remote_hash.as_deref() != Some(remote.mark.as_str()));
-        let check = if direction == Direction::Auto
-            && known
-            && local_changed
-            && remote_changed
-            && !adopting_secrets
-        {
-            self.check_core(config, &state, &mine, secrets_changed, document, &remote)?
+        let check = if direction == Direction::Auto && known && local_changed && remote_changed {
+            check_core_docs(&state, &mine, &remote)
         } else {
             None
         };
@@ -927,8 +904,8 @@ impl SyncService {
             remote_changed,
             local_empty: local.is_empty(),
             remote_empty: document_is_empty(document),
-            same_view: remote_hash == mine.view && !secrets_changed && !adopting_secrets,
-            core: check.as_ref().map(|check| check.changes),
+            same_view: remote_hash == mine.view,
+            core: check,
         };
         let conflict = || -> Result<Step, SyncError> {
             Ok(Step::Done(SyncOutcome::Conflict(ConflictReport {
@@ -944,18 +921,15 @@ impl SyncService {
                 self.remember_vault(&remote_id, &remote.seen(), &mine, None)?;
                 Ok(Step::Done(SyncOutcome::UpToDate))
             }
-            Action::Upload => {
-                self.upload_to(config, client, &remote_id, &local, &mine, Some(&remote))
-            }
-            Action::Pull => self.apply_remote(config, &remote_id, &local, &remote, "sync-pull"),
+            Action::Upload => self.upload_to(client, &remote_id, &local, &mine, Some(&remote)),
+            Action::Pull => self.apply_remote(&remote_id, &local, &remote, "sync-pull"),
             Action::Merge => match check {
-                Some(check) => self.merge(
-                    config,
+                Some(changes) => self.merge(
                     client,
                     &remote_id,
                     &local,
                     &remote,
-                    check,
+                    changes,
                     DocumentVault::None,
                 ),
                 None => conflict(),
@@ -967,10 +941,10 @@ impl SyncService {
     /// A placeholder document for a merge with no cloud side; only its source
     /// facts are read.
     fn empty_document(&self) -> ShelluneData {
-        ShelluneData::export(
+        ShelluneData::export_from_vault(
             &LocalState::default(),
             &ExportOptions::new(self.platform),
-            &*self.secrets,
+            None,
             None,
         )
         .expect("an empty state exports")
@@ -984,7 +958,6 @@ impl SyncService {
     fn attempt_vault(
         &self,
         direction: Direction,
-        config: &SyncConfig,
         client: &WebDavClient,
         remote_id: &str,
         state: &SyncState,
@@ -1013,22 +986,30 @@ impl SyncService {
             None => None,
         };
         let baseline = known.then_some(state.vault.as_ref()).flatten();
-
-        // A version 1 document still carrying sealed passwords has not been
-        // migrated into a vault (R9): replacing it would drop those passwords
-        // from the cloud without anyone deciding to, so the user settles it.
-        if document.has_secrets() {
-            return Ok(Step::Done(SyncOutcome::Conflict(ConflictReport {
-                first_sync: !known,
-                remote_platform: document.source_platform().to_owned(),
-                remote_app_version: document.source_app_version().to_owned(),
-                remote_created_unix: document.created_unix(),
-                vault: Vec::new(),
-            })));
-        }
         self.check_vault_baseline(baseline, local_vault.as_ref(), remote_vault.as_ref())?;
 
         let device_id = state.device_id.clone().unwrap_or_else(new_device_id);
+        // Whether this machine had anything of its own in a vault, before a
+        // version 1 block from the cloud is read into it: what came from the
+        // cloud does not make this machine's side non-empty.
+        let vault_holds_records = |content: &VaultContent| {
+            content.keys().count()
+                + content.credentials().count()
+                + content.host_secret_records().count()
+                > 0
+        };
+        let own_vault_records = local_vault
+            .as_ref()
+            .is_some_and(|vault| vault_holds_records(&vault.content));
+        // A version 1 document still carrying sealed passwords was written by
+        // an older build (R4, R7): its host passwords move into this machine's
+        // vault — a new one when there is none — and the document goes back as
+        // a version 2 one, so they are never dropped from the cloud unseen.
+        let local_vault = if document.has_secrets() {
+            Some(self.adopt_legacy_block(local_vault, document, &device_id)?)
+        } else {
+            local_vault
+        };
         let merged = merge_vault(
             local_vault.as_ref(),
             remote_vault.as_ref(),
@@ -1052,16 +1033,11 @@ impl SyncService {
             } else {
                 None
             };
-        let vault_holds_records =
-            |content: &VaultContent| content.keys().count() + content.credentials().count() > 0;
         let facts = Facts {
             first_sync: !known,
             local_changed: doc_local_changed,
             remote_changed: doc_remote_changed,
-            local_empty: local.is_empty()
-                && !local_vault
-                    .as_ref()
-                    .is_some_and(|vault| vault_holds_records(&vault.content)),
+            local_empty: local.is_empty() && !own_vault_records,
             remote_empty: document_is_empty(document) && remote_vault.is_none(),
             same_view: remote.view_hash.as_deref() == Some(mine.view.as_str()) && vault_unchanged,
             core: check,
@@ -1078,7 +1054,9 @@ impl SyncService {
         // A conflict left unsettled stops the whole vault: nothing is applied,
         // here or in the cloud (ADR-5).
         if !merged.conflicts.is_empty() {
-            return conflict(merged.conflicts);
+            let mut conflicts = merged.conflicts;
+            name_host_secret_conflicts(&mut conflicts, local, document);
+            return conflict(conflicts);
         }
         let record_of = |plan: &VaultPlan| -> Option<VaultRemember<'_>> {
             match plan {
@@ -1104,7 +1082,6 @@ impl SyncService {
                 // stands, in the block the cloud already holds.
                 let remote_vault = remote_vault.expect("an unchanged vault has a cloud side");
                 self.upload_document(
-                    config,
                     client,
                     remote_id,
                     local,
@@ -1122,7 +1099,6 @@ impl SyncService {
                 // This machine's records changed, or only its vault did: the
                 // document is written around the new ciphertext.
                 self.upload_document(
-                    config,
                     client,
                     remote_id,
                     local,
@@ -1175,10 +1151,14 @@ impl SyncService {
                         // the document's plan applies and the merged vault
                         // travels back with it.
                         let plan = document
-                            .plan(local, self.platform, ApplyMode::Replace, None)
+                            .plan(
+                                local,
+                                self.platform,
+                                ApplyMode::Replace,
+                                Some(&SecretBundle::from_vault(&write.content)),
+                            )
                             .map_err(SyncError::RemoteDocument)?;
                         self.upload_document(
-                            config,
                             client,
                             remote_id,
                             local,
@@ -1216,18 +1196,7 @@ impl SyncService {
                     },
                     VaultPlan::Absent => DocumentVault::None,
                 };
-                self.merge(
-                    config,
-                    client,
-                    remote_id,
-                    local,
-                    remote,
-                    CoreCheck {
-                        changes,
-                        bundle: None,
-                    },
-                    travel,
-                )
+                self.merge(client, remote_id, local, remote, changes, travel)
             }
         }
     }
@@ -1294,6 +1263,52 @@ impl SyncService {
         }))
     }
 
+    /// This machine's vault with the host passwords of a version 1 password
+    /// block in `document` added (R4, R7): `local_vault`, or a new vault when
+    /// there is none, which then also takes the document's accepted server
+    /// identities (the vault guards them from version 2 on, so the version 2
+    /// document that goes back carries them there).
+    ///
+    /// Only a host the vault has no record of takes the block's password: a
+    /// password the vault holds, or deleted, is newer than any block an older
+    /// build sealed. The block opens with the sync passphrase alone; without
+    /// one the sync stops with [`SyncError::PassphraseMissing`] before
+    /// anything is written, and a wrong one is the cloud document's error.
+    fn adopt_legacy_block(
+        &self,
+        local_vault: Option<LocalVault>,
+        document: &ShelluneData,
+        device_id: &str,
+    ) -> Result<LocalVault, SyncError> {
+        let passphrase = self.sync_passphrase()?;
+        let bundle = document
+            .open_secrets(&passphrase)
+            .map_err(SyncError::RemoteDocument)?;
+        let (mut content, vault_id) = match local_vault {
+            Some(vault) => (vault.content, vault.vault_id),
+            None => {
+                let mut content = VaultContent::new();
+                content.set_trust(document.shared().known_hosts().clone());
+                (content, String::new())
+            }
+        };
+        let records = document.shared().hosts().records();
+        for id in bundle.ids() {
+            let held = records.iter().any(|record| record.id() == id);
+            if held
+                && content.host_secret_state(id) == HostSecretState::Absent
+                && let Some(secret) = bundle.get(id)
+            {
+                content.set_host_secret(id, secret.clone(), device_id);
+            }
+        }
+        Ok(LocalVault {
+            fingerprint: vault_fingerprint(&content),
+            vault_id,
+            content,
+        })
+    }
+
     /// Seals `content` for the travel: under the selected secret, and under
     /// this machine's own local secret when it has one (a wrap that opens
     /// nothing for anyone without this machine's system credential store).
@@ -1342,12 +1357,7 @@ impl SyncService {
                         applied: base.global_counter,
                     });
                 }
-                if base.keys.keys().any(|id| remote.content.key(*id).is_none())
-                    || base
-                        .credentials
-                        .keys()
-                        .any(|id| remote.content.credential(*id).is_none())
-                {
+                if !holds_baseline(base, &remote.content) {
                     return Err(lost("the cloud document"));
                 }
             }
@@ -1359,12 +1369,7 @@ impl SyncService {
                     .to_owned(),
             })),
             Some(local) => {
-                if base.keys.keys().any(|id| local.content.key(*id).is_none())
-                    || base
-                        .credentials
-                        .keys()
-                        .any(|id| local.content.credential(*id).is_none())
-                {
+                if !holds_baseline(base, &local.content) {
                     return Err(lost("this machine"));
                 }
                 Ok(())
@@ -1375,13 +1380,13 @@ impl SyncService {
     /// Writes the document of `final_state` (or of `plan`, when the local data
     /// is applied as part of the same step) with the vault block `vault` names,
     /// then applies and saves, in the order that keeps a failure harmless: the
-    /// upload first (a refused write decides again), the document apply second
-    /// (snapshotted, refused when the data changed), the vault last — validated
-    /// against the host book before anything was written anywhere.
+    /// upload first (a refused write decides again), then the document apply
+    /// and the vault save as one step (snapshotted, refused when the data
+    /// changed, the files put back when the vault cannot be saved) — the vault
+    /// validated against the host book before anything was written anywhere.
     #[allow(clippy::too_many_arguments)]
     fn upload_document(
         &self,
-        config: &SyncConfig,
         client: &WebDavClient,
         remote_id: &str,
         local: &LocalState,
@@ -1395,15 +1400,12 @@ impl SyncService {
         options.kdf = self.kdf;
         let mut record: Option<VaultRemember<'_>> = None;
         let mut save: Option<(VaultContent, UnsealSource)> = None;
+
         match &vault {
             DocumentVault::None => {
-                if config.sync_secrets {
-                    options = options.with_passphrase(self.sync_passphrase()?);
-                }
-                // A cloud document that carries a vault keeps it when this
-                // machine does not sync the vault: dropping the block would
-                // delete the only ciphertext without the user's explicit
-                // choice (R5).
+                // A cloud document that carries a vault keeps it: dropping the
+                // block would delete the only ciphertext without the user's
+                // explicit choice (R5).
                 let carry = base
                     .and_then(|remote| remote.document.as_ref().ok())
                     .and_then(|document| document.vault().cloned());
@@ -1430,6 +1432,14 @@ impl SyncService {
                 device_id,
             } => {
                 let mut content = write.content.clone();
+                // A password nobody reads any more after the apply becomes a
+                // tombstone before the vault is sealed, so the cloud and this
+                // machine hold the same vault (R1, ADR-6).
+                if let Some(plan) = plan {
+                    for id in plan.secrets_to_forget() {
+                        content.remove_host_secret(*id);
+                    }
+                }
                 let records = connection_book(final_state);
                 content.set_references(&HostReference::snapshot_records(&records));
                 // The whole reference set is validated against the connection
@@ -1450,34 +1460,50 @@ impl SyncService {
                 });
             }
         }
+
         let base_document = base.and_then(|remote| remote.document.as_ref().ok());
-        let export = ShelluneData::export(final_state, &options, &*self.secrets, base_document)
+        let export = ShelluneData::export_from_vault(final_state, &options, None, base_document)
             .map_err(SyncError::Local)?;
         let bytes = export.document.to_json().map_err(SyncError::Local)?;
         let Some(etag) = put(client, base, &bytes)? else {
             return Ok(Step::Retry);
         };
-        let applied = match plan {
-            Some(plan) => Some(match plan.apply(&self.data, &*self.secrets, reason) {
+        let (secrets_included, secrets_missing) =
+            record.as_ref().map_or_else(Default::default, |record| {
+                travelling_secrets(final_state, &record.content)
+            });
+        let applied = match (plan, save) {
+            (Some(plan), Some((mut content, unseal))) => {
+                let device_id = record
+                    .as_ref()
+                    .map_or_else(String::new, |record| record.device_id.to_owned());
+                let outcome = plan.apply_with_vault(
+                    &self.data,
+                    &mut content,
+                    &device_id,
+                    reason,
+                    &mut |content| {
+                        self.save_local_vault(content, plan.result(), &unseal)
+                            .map_err(|error| error.to_string())
+                    },
+                );
+                Some(match outcome {
+                    Err(PortableError::Changed) => return Ok(Step::Retry),
+                    other => other.map_err(SyncError::Local)?,
+                })
+            }
+            (Some(plan), None) => Some(match plan.apply(&self.data, reason) {
                 Err(PortableError::Changed) => return Ok(Step::Retry),
                 other => other.map_err(SyncError::Local)?,
             }),
-            None => None,
+            (None, Some((content, unseal))) => {
+                self.save_local_vault(&content, local, &unseal)?;
+                None
+            }
+            (None, None) => None,
         };
-        if let Some((content, unseal)) = save {
-            let end = applied.as_ref().map_or(local, |applied| &applied.state);
-            VaultStore::at(self.data.root())
-                .save_records(
-                    &content,
-                    &connection_book(end),
-                    &[UnsealSource::LocalMachine, unseal],
-                    self.kdf,
-                    &*self.secrets,
-                )
-                .map_err(SyncError::Vault)?;
-        }
         let seen = self
-            .seen_upload(config, &export.document, etag, &bytes)
+            .seen_upload(&export.document, etag, &bytes)
             .map_err(SyncError::Local)?;
         let end = applied.as_ref().map_or(local, |applied| &applied.state);
         let mut mine = self.document_fingerprint(end)?;
@@ -1494,23 +1520,45 @@ impl SyncService {
             Some(applied) => SyncOutcome::Merged(Box::new(pull_report(
                 plan.expect("an applied document implies its plan"),
                 applied,
-                false,
                 restored,
             ))),
             None => SyncOutcome::Uploaded(UploadReport {
                 created: base.is_none(),
-                secrets_included: export.secrets_included,
-                secrets_unreadable: export.secrets_unreadable,
-                secrets_missing: export.secrets_missing,
+                secrets_included,
+                secrets_unreadable: Vec::new(),
+                secrets_missing,
                 remote_snapshot: None,
             }),
         }))
     }
 
+    /// Saves `content` as this machine's vault, beside the connection book of
+    /// `state`: under the local unseal secret and the travelling one, so this
+    /// machine opens it without asking and the next sync opens it either way.
+    fn save_local_vault(
+        &self,
+        content: &VaultContent,
+        state: &LocalState,
+        unseal: &UnsealSource,
+    ) -> Result<(), SyncError> {
+        VaultStore::at(self.data.root())
+            .save_records(
+                content,
+                &connection_book(state),
+                &[UnsealSource::LocalMachine, unseal.clone()],
+                self.kdf,
+                &*self.secrets,
+            )
+            .map_err(SyncError::Vault)
+    }
+
     /// Applies the cloud document and its vault here, as one replacement: the
     /// vault's reference set is validated against the host book the apply ends
     /// with before anything is written, so a vault whose bindings cannot hold
-    /// fails whole (R8) and this machine keeps what it had.
+    /// fails whole (R8) and this machine keeps what it had. The document apply
+    /// and the vault save are one step: a vault that cannot be saved puts the
+    /// files back. Every host whose password the vault holds remembers it here
+    /// (R4).
     #[allow(clippy::too_many_arguments)]
     fn apply_remote_vault(
         &self,
@@ -1527,31 +1575,43 @@ impl SyncService {
         reason: &str,
     ) -> Result<Step, SyncError> {
         let plan = document
-            .plan(local, self.platform, ApplyMode::Replace, None)
+            .plan(
+                local,
+                self.platform,
+                ApplyMode::Replace,
+                Some(&SecretBundle::from_vault(content)),
+            )
             .map_err(SyncError::RemoteDocument)?;
+        let remote_fingerprint = vault_fingerprint(content);
         let mut content = content.clone();
         let records = connection_book(plan.result());
         content.set_references(&HostReference::snapshot_records(&records));
         content
             .validate_for_records(&records)
             .map_err(SyncError::Vault)?;
-        let applied = match plan.apply(&self.data, &*self.secrets, reason) {
+        let unseal = source.unseal_source();
+        let applied = plan.apply_with_vault(
+            &self.data,
+            &mut content,
+            device_id,
+            reason,
+            &mut |content| {
+                // The local file gets this machine's own wrap beside the
+                // travelling one; a first adoption creates the local unseal
+                // entry on the way. A vault the apply did not change, and that
+                // this machine already holds, is not written again.
+                if save || vault_fingerprint(content) != remote_fingerprint {
+                    self.save_local_vault(content, plan.result(), &unseal)
+                        .map_err(|error| error.to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let applied = match applied {
             Err(PortableError::Changed) => return Ok(Step::Retry),
             other => other.map_err(SyncError::Local)?,
         };
-        if save {
-            // The local file gets this machine's own wrap beside the travelling
-            // one; a first adoption creates the local unseal entry on the way.
-            VaultStore::at(self.data.root())
-                .save_records(
-                    &content,
-                    &connection_book(&applied.state),
-                    &[UnsealSource::LocalMachine, source.unseal_source()],
-                    self.kdf,
-                    &*self.secrets,
-                )
-                .map_err(SyncError::Vault)?;
-        }
         let mut mine = self.document_fingerprint(&applied.state)?;
         mine.vault = Some(vault_fingerprint(&content));
         self.remember_vault(
@@ -1562,7 +1622,7 @@ impl SyncService {
                 device_id,
                 vault_id: vault_id.to_owned(),
                 content: content.clone(),
-                remote_fingerprint: Some(vault_fingerprint(&content)),
+                remote_fingerprint: Some(remote_fingerprint),
             }),
         )?;
         let restored = VaultRestored {
@@ -1576,73 +1636,8 @@ impl SyncService {
         Ok(Step::Done(SyncOutcome::Pulled(Box::new(pull_report(
             &plan,
             applied,
-            false,
             Some(restored),
         )))))
-    }
-
-    /// Tells whether each side changed more than its recent connections since the
-    /// last sync: this machine's data against what it held then, the cloud's
-    /// document against what the cloud held then (the two views differ when
-    /// another platform wrote it). `None` when that cannot be told: the last sync
-    /// was recorded by a build that did not keep the data without recents, or the
-    /// cloud's passwords do not open with this machine's passphrase.
-    ///
-    /// Both sides holding the same records and passwords (only the recents
-    /// differ) counts as neither having changed them, whatever the baseline says:
-    /// a merge then loses nothing.
-    fn check_core(
-        &self,
-        config: &SyncConfig,
-        state: &SyncState,
-        mine: &Fingerprint,
-        secrets_changed: bool,
-        document: &ShelluneData,
-        remote: &Remote,
-    ) -> Result<Option<CoreCheck>, SyncError> {
-        let (Some(baseline), Some(remote_baseline)) = (
-            state.last_synced_core_hash.as_deref(),
-            state.last_remote_core_hash.as_deref(),
-        ) else {
-            return Ok(None);
-        };
-        let mut remote_core = remote.core_hash.as_deref() != Some(remote_baseline);
-        let mut same_core = remote.core_hash.as_deref() == Some(mine.core.as_str());
-        let mut bundle = None;
-        if config.sync_secrets {
-            // The sealed block is sealed afresh on every upload, so whether the
-            // passwords in it changed is only known once it is opened.
-            let passphrase = self.sync_passphrase()?;
-            let Ok(opened) = document.open_secrets(&passphrase) else {
-                return Ok(None);
-            };
-            let records = document.shared().hosts().records();
-            let theirs = secrets_digest(
-                &passphrase,
-                records.iter().filter_map(|record| {
-                    opened.get(record.id()).map(|secret| (record.id(), secret))
-                }),
-            );
-            remote_core |= state.last_secrets_hash.as_deref() != Some(theirs.as_str());
-            same_core &= mine.secrets.as_deref() == Some(theirs.as_str());
-            bundle = Some(opened);
-        } else {
-            // Turning password sync off is a change here (the cloud must drop
-            // the sealed block), even when the records match the cloud's.
-            same_core &= !secrets_changed;
-        }
-        let changes = if same_core {
-            CoreChanges {
-                local: false,
-                remote: false,
-            }
-        } else {
-            CoreChanges {
-                local: mine.core != baseline || secrets_changed,
-                remote: remote_core,
-            }
-        };
-        Ok(Some(CoreCheck { changes, bundle }))
     }
 
     /// Merges both sides when at least one only connected to hosts: the records
@@ -1654,15 +1649,13 @@ impl SyncService {
     /// and decides again. A save made here meanwhile refuses the write and
     /// decides again too. A vault the merge changes rules out carrying the
     /// cloud's document: the result is exported with the new ciphertext.
-    #[allow(clippy::too_many_arguments)]
     fn merge(
         &self,
-        config: &SyncConfig,
         client: &WebDavClient,
         remote_id: &str,
         local: &LocalState,
         remote: &Remote,
-        check: CoreCheck,
+        changes: CoreChanges,
         vault: DocumentVault<'_>,
     ) -> Result<Step, SyncError> {
         let document = remote
@@ -1671,18 +1664,26 @@ impl SyncService {
             .map_err(|error| SyncError::RemoteDocument(error.clone()))?;
         let recents =
             merge_recent_connections(local.hosts.recents(), document.shared().hosts().recents());
-        let from_remote = check.changes.remote || !check.changes.local;
-        if matches!(vault, DocumentVault::Write { .. }) {
+        let from_remote = changes.remote || !changes.local;
+        if let DocumentVault::Write { write, .. } = &vault {
             // The vault changed, so the cloud never already holds the result.
+            // The cloud's records come with the merged recent connections, so
+            // a connection made here is kept with them.
             let plan = if from_remote {
                 document
-                    .plan(local, self.platform, ApplyMode::Replace, None)
+                    .with_recents(&recents)
+                    .map_err(SyncError::RemoteDocument)?
+                    .plan(
+                        local,
+                        self.platform,
+                        ApplyMode::Replace,
+                        Some(&SecretBundle::from_vault(&write.content)),
+                    )
                     .map_err(SyncError::RemoteDocument)?
             } else {
                 ApplyPlan::with_recents(local, self.platform, &recents).map_err(SyncError::Local)?
             };
             return self.upload_document(
-                config,
                 client,
                 remote_id,
                 local,
@@ -1694,16 +1695,8 @@ impl SyncService {
         }
         let mut options = ExportOptions::new(self.platform);
         options.kdf = self.kdf;
-        match &vault {
-            DocumentVault::Carry { cipher, .. } => {
-                options = options.with_vault((*cipher).clone());
-            }
-            DocumentVault::Write { .. } => unreachable!("handled above"),
-            DocumentVault::None => {
-                if config.sync_secrets {
-                    options = options.with_passphrase(self.sync_passphrase()?);
-                }
-            }
+        if let DocumentVault::Carry { cipher, .. } = &vault {
+            options = options.with_vault((*cipher).clone());
         }
         let (plan, upload) = if from_remote {
             // When the cloud's recents are the later ones it already holds the
@@ -1712,9 +1705,8 @@ impl SyncService {
             let mut merged = if theirs == recents {
                 None
             } else {
-                // The cloud's document with the merged recents; its sealed
-                // passwords, its vault block and the other platforms' sections
-                // travel unchanged.
+                // The cloud's document with the merged recents; its vault block
+                // and the other platforms' sections travel unchanged.
                 Some(
                     document
                         .with_recents(&recents)
@@ -1724,12 +1716,7 @@ impl SyncService {
             let plan = merged
                 .as_ref()
                 .unwrap_or(document)
-                .plan(
-                    local,
-                    self.platform,
-                    ApplyMode::Replace,
-                    check.bundle.as_ref(),
-                )
+                .plan(local, self.platform, ApplyMode::Replace, None)
                 .map_err(SyncError::RemoteDocument)?;
             if let Some(merged) = &mut merged {
                 merged.restamp(&options);
@@ -1739,7 +1726,7 @@ impl SyncService {
             let plan = ApplyPlan::with_recents(local, self.platform, &recents)
                 .map_err(SyncError::Local)?;
             let export =
-                ShelluneData::export(plan.result(), &options, &*self.secrets, Some(document))
+                ShelluneData::export_from_vault(plan.result(), &options, None, Some(document))
                     .map_err(SyncError::Local)?;
             (plan, Some(export.document))
         };
@@ -1749,12 +1736,12 @@ impl SyncService {
                 let Some(etag) = put(client, Some(remote), &bytes)? else {
                     return Ok(Step::Retry);
                 };
-                self.seen_upload(config, &upload, etag, &bytes)
+                self.seen_upload(&upload, etag, &bytes)
                     .map_err(SyncError::Local)?
             }
             None => remote.seen(),
         };
-        let applied = match plan.apply(&self.data, &*self.secrets, "sync-merge") {
+        let applied = match plan.apply(&self.data, "sync-merge") {
             Err(PortableError::Changed) => return Ok(Step::Retry),
             other => other.map_err(SyncError::Local)?,
         };
@@ -1771,45 +1758,29 @@ impl SyncService {
                     remote_fingerprint: None,
                 })
             }
-            DocumentVault::None => {
-                // The legacy arrangement: the sealed passwords are part of the
-                // fingerprint, with the passphrase that sealed them.
-                if config.sync_secrets {
-                    mine.secrets =
-                        Some(self.legacy_secrets_digest(&self.sync_passphrase()?, &applied.state));
-                }
-                None
-            }
+            DocumentVault::None => None,
             DocumentVault::Write { .. } => unreachable!("handled above"),
         };
         self.remember_vault(remote_id, &seen, &mine, record)?;
         Ok(Step::Done(SyncOutcome::Merged(Box::new(pull_report(
-            &plan,
-            applied,
-            from_remote && document.has_secrets() && !config.sync_secrets,
-            None,
+            &plan, applied, None,
         )))))
     }
 
-    fn use_remote(&self, config: &SyncConfig, client: &WebDavClient) -> Result<Step, SyncError> {
+    fn use_remote(&self, client: &WebDavClient) -> Result<Step, SyncError> {
         let local = self.data.load().map_err(SyncError::Local)?;
-        let remote = self
-            .fetch(config, client)?
-            .ok_or(SyncError::NothingInCloud)?;
+        let remote = self.fetch(client)?.ok_or(SyncError::NothingInCloud)?;
         let document = remote
             .document
             .as_ref()
             .map_err(|error| SyncError::RemoteDocument(error.clone()))?;
-        let local_vault = if config.sync_secrets {
-            self.open_local_vault()?
-        } else {
-            None
-        };
+        let remote_id = client.file_url();
+        let local_vault = self.open_local_vault()?;
         // The user chose the cloud as a whole; the vault follows that choice.
         // A wrong secret, a vanished vault and an abnormal rollback still
         // refuse — an explicit "use the cloud" is not a choice to roll back to
         // an older one (R6).
-        if config.sync_secrets && (local_vault.is_some() || document.has_vault()) {
+        if local_vault.is_some() || document.has_vault() || document.has_secrets() {
             let source = self.vault_source()?;
             let remote_vault = match document.vault() {
                 Some(cipher) => {
@@ -1826,16 +1797,16 @@ impl SyncService {
                 None => None,
             };
             let state = self.state();
-            let known = state.knows(&client.file_url());
+            let known = state.knows(&remote_id);
             let baseline = known.then_some(state.vault.as_ref()).flatten();
             self.check_vault_baseline(baseline, local_vault.as_ref(), remote_vault.as_ref())?;
+            let device_id = state.device_id.clone().unwrap_or_else(new_device_id);
             if let Some(remote_vault) = remote_vault {
-                let device_id = state.device_id.clone().unwrap_or_else(new_device_id);
                 let save = local_vault
                     .as_ref()
                     .is_none_or(|vault| vault.fingerprint != remote_vault.fingerprint);
                 return self.apply_remote_vault(
-                    &client.file_url(),
+                    &remote_id,
                     &local,
                     &remote,
                     document,
@@ -1848,23 +1819,52 @@ impl SyncService {
                     "sync-use-remote",
                 );
             }
-            // No vault in the cloud and none here: the plain document applies.
+            if document.has_secrets() {
+                // The cloud's data applies as a whole; its version 1 passwords
+                // go into this machine's vault, and the cloud takes the
+                // version 2 document that carries them (R4, R7).
+                let adopted = self.adopt_legacy_block(local_vault, document, &device_id)?;
+                let merged = merge_vault(Some(&adopted), None, None, &[], &device_id, document)?;
+                if let VaultPlan::Write(write) = merged.plan {
+                    let plan = document
+                        .plan(
+                            &local,
+                            self.platform,
+                            ApplyMode::Replace,
+                            Some(&SecretBundle::from_vault(&write.content)),
+                        )
+                        .map_err(SyncError::RemoteDocument)?;
+                    let step = self.upload_document(
+                        client,
+                        &remote_id,
+                        &local,
+                        Some(&plan),
+                        Some(&remote),
+                        DocumentVault::Write {
+                            write: &write,
+                            source: &source,
+                            device_id: &device_id,
+                        },
+                        "sync-use-remote",
+                    )?;
+                    // What the user asked for is a pull, and a pull is what
+                    // happened here.
+                    return Ok(match step {
+                        Step::Done(SyncOutcome::Merged(report)) => {
+                            Step::Done(SyncOutcome::Pulled(report))
+                        }
+                        other => other,
+                    });
+                }
+            }
+            // No vault in the cloud and one here: the plain document applies.
         }
-        if config.sync_secrets && local_vault.is_none() {
-            self.sync_passphrase()?;
-        }
-        self.apply_remote(
-            config,
-            &client.file_url(),
-            &local,
-            &remote,
-            "sync-use-remote",
-        )
+        self.apply_remote(&remote_id, &local, &remote, "sync-use-remote")
     }
 
-    fn use_local(&self, config: &SyncConfig, client: &WebDavClient) -> Result<Step, SyncError> {
+    fn use_local(&self, client: &WebDavClient) -> Result<Step, SyncError> {
         let local = self.data.load().map_err(SyncError::Local)?;
-        let remote = self.fetch(config, client)?;
+        let remote = self.fetch(client)?;
         let remote_snapshot = match &remote {
             Some(remote) => Some(
                 SnapshotStore::at(self.data.root())
@@ -1877,24 +1877,29 @@ impl SyncService {
             ),
             None => None,
         };
-        let local_vault = if config.sync_secrets {
-            self.open_local_vault()?
-        } else {
-            None
-        };
-        let cloud_has_vault = remote
+        let local_vault = self.open_local_vault()?;
+        let cloud = remote
             .as_ref()
-            .and_then(|remote| remote.document.as_ref().ok())
-            .is_some_and(ShelluneData::has_vault);
-        if config.sync_secrets && (local_vault.is_some() || cloud_has_vault) {
+            .and_then(|remote| remote.document.as_ref().ok());
+        let cloud_has_vault = cloud.is_some_and(ShelluneData::has_vault);
+        let cloud_block = cloud.filter(|document| document.has_secrets());
+        if local_vault.is_some() || cloud_has_vault || cloud_block.is_some() {
             // The vault travels: "use local" must carry this machine's vault —
-            // or the choice would delete the only ciphertext in passing (R5).
-            let Some(local_vault) = local_vault else {
-                return Err(vault_gone());
-            };
+            // or the choice would delete the only ciphertext in passing (R5) —
+            // and a version 1 block the cloud still holds moves into it first,
+            // so its passwords are not dropped by the choice either (R7).
             let source = self.vault_source()?;
             let state = self.state();
             let device_id = state.device_id.clone().unwrap_or_else(new_device_id);
+            let local_vault = match cloud_block {
+                Some(document) => {
+                    Some(self.adopt_legacy_block(local_vault, document, &device_id)?)
+                }
+                None => local_vault,
+            };
+            let Some(local_vault) = local_vault else {
+                return Err(vault_gone());
+            };
             let stamped = stamped_content(
                 &local_vault.content,
                 &device_id,
@@ -1906,7 +1911,6 @@ impl SyncService {
                 origin: VaultOrigin::LocalOnly,
             };
             let step = self.upload_document(
-                config,
                 client,
                 &client.file_url(),
                 &local,
@@ -1921,23 +1925,12 @@ impl SyncService {
             )?;
             return Ok(attach_snapshot(step, remote_snapshot));
         }
-        let mine = self.fingerprint(config, &local, None)?;
-        let step = self.upload_to(
-            config,
-            client,
-            &client.file_url(),
-            &local,
-            &mine,
-            remote.as_ref(),
-        )?;
+        let mine = self.fingerprint(&local, None)?;
+        let step = self.upload_to(client, &client.file_url(), &local, &mine, remote.as_ref())?;
         Ok(attach_snapshot(step, remote_snapshot))
     }
 
-    fn fetch(
-        &self,
-        config: &SyncConfig,
-        client: &WebDavClient,
-    ) -> Result<Option<Remote>, SyncError> {
+    fn fetch(&self, client: &WebDavClient) -> Result<Option<Remote>, SyncError> {
         let Some(download) = client.get()? else {
             return Ok(None);
         };
@@ -1957,11 +1950,7 @@ impl SyncService {
             ),
             Err(_) => (None, None),
         };
-        let mark = remote_mark(
-            view_hash.as_deref().unwrap_or_default(),
-            &download.bytes,
-            config.sync_secrets,
-        );
+        let mark = remote_mark(view_hash.as_deref().unwrap_or_default(), &download.bytes);
         Ok(Some(Remote {
             etag: download.etag,
             bytes: download.bytes,
@@ -1979,11 +1968,10 @@ impl SyncService {
             .ok_or(SyncError::PassphraseMissing)
     }
 
-    /// Writes the local data to the cloud, keeping the other platforms' sections
-    /// of `base`.
+    /// Writes the local data to the cloud without a vault (there is none on
+    /// either side), keeping the other platforms' sections of `base`.
     fn upload_to(
         &self,
-        config: &SyncConfig,
         client: &WebDavClient,
         remote_id: &str,
         local: &LocalState,
@@ -1992,12 +1980,9 @@ impl SyncService {
     ) -> Result<Step, SyncError> {
         let mut options = ExportOptions::new(self.platform);
         options.kdf = self.kdf;
-        if config.sync_secrets {
-            options = options.with_passphrase(self.sync_passphrase()?);
-        }
-        // A cloud document that carries a vault keeps it when this machine does
-        // not sync the vault: dropping the block would delete the only
-        // ciphertext without the user's explicit choice (R5).
+        // A cloud document that carries a vault keeps it: dropping the block
+        // would delete the only ciphertext without the user's explicit choice
+        // (R5).
         let carry = base
             .and_then(|remote| remote.document.as_ref().ok())
             .and_then(|document| document.vault().cloned());
@@ -2005,29 +1990,29 @@ impl SyncService {
             options = options.with_vault(cipher);
         }
         let base_document = base.and_then(|remote| remote.document.as_ref().ok());
-        let export = ShelluneData::export(local, &options, &*self.secrets, base_document)
+        let export = ShelluneData::export_from_vault(local, &options, None, base_document)
             .map_err(SyncError::Local)?;
         let bytes = export.document.to_json().map_err(SyncError::Local)?;
         let Some(etag) = put(client, base, &bytes)? else {
             return Ok(Step::Retry);
         };
         let seen = self
-            .seen_upload(config, &export.document, etag, &bytes)
+            .seen_upload(&export.document, etag, &bytes)
             .map_err(SyncError::Local)?;
         self.remember_vault(remote_id, &seen, mine, None)?;
         Ok(Step::Done(SyncOutcome::Uploaded(UploadReport {
             created: base.is_none(),
-            secrets_included: export.secrets_included,
-            secrets_unreadable: export.secrets_unreadable,
-            secrets_missing: export.secrets_missing,
+            secrets_included: Vec::new(),
+            secrets_unreadable: Vec::new(),
+            secrets_missing: Vec::new(),
             remote_snapshot: None,
         })))
     }
 
-    /// Applies the cloud document over the local data (a replacement).
+    /// Applies the cloud document over the local data (a replacement), when
+    /// neither side holds a vault.
     fn apply_remote(
         &self,
-        config: &SyncConfig,
         remote_id: &str,
         local: &LocalState,
         remote: &Remote,
@@ -2037,36 +2022,23 @@ impl SyncService {
             .document
             .as_ref()
             .map_err(|error| SyncError::RemoteDocument(error.clone()))?;
-        let bundle = if config.sync_secrets && document.has_secrets() {
-            Some(
-                document
-                    .open_secrets(&self.sync_passphrase()?)
-                    .map_err(SyncError::RemoteDocument)?,
-            )
-        } else {
-            None
-        };
         let plan = document
-            .plan(local, self.platform, ApplyMode::Replace, bundle.as_ref())
+            .plan(local, self.platform, ApplyMode::Replace, None)
             .map_err(SyncError::RemoteDocument)?;
-        let applied = match plan.apply(&self.data, &*self.secrets, reason) {
+        let applied = match plan.apply(&self.data, reason) {
             Err(PortableError::Changed) => return Ok(Step::Retry),
             other => other.map_err(SyncError::Local)?,
         };
-        let mine = self.fingerprint(config, &applied.state, None)?;
+        let mine = self.fingerprint(&applied.state, None)?;
         self.remember_vault(remote_id, &remote.seen(), &mine, None)?;
         Ok(Step::Done(SyncOutcome::Pulled(Box::new(pull_report(
-            &plan,
-            applied,
-            document.has_secrets() && !config.sync_secrets,
-            None,
+            &plan, applied, None,
         )))))
     }
 
     /// What the cloud holds after this machine wrote `document` as `bytes`.
     fn seen_upload(
         &self,
-        config: &SyncConfig,
         document: &ShelluneData,
         etag: Option<String>,
         bytes: &[u8],
@@ -2074,7 +2046,7 @@ impl SyncService {
         let view = hash(&document.sync_view(self.platform)?);
         Ok(Seen {
             etag,
-            mark: remote_mark(&view, bytes, config.sync_secrets),
+            mark: remote_mark(&view, bytes),
             core_hash: Some(hash(&document.core_view(self.platform)?)),
         })
     }
@@ -2083,6 +2055,7 @@ impl SyncService {
     /// vault half when one travelled: the baseline both sides now share, the
     /// stamped global counter and the device identity that wrote it. Without
     /// one, the vault baseline is cleared — the arrangement has no vault in it.
+    /// Either way no version 1 password block is in play any more.
     fn remember_vault(
         &self,
         remote_id: &str,
@@ -2098,12 +2071,10 @@ impl SyncService {
         state.last_remote_core_hash.clone_from(&seen.core_hash);
         state.last_synced_hash = Some(mine.view.clone());
         state.last_synced_core_hash = Some(mine.core.clone());
+        state.last_secrets_hash = None;
         match record {
             Some(record) => {
                 state.device_id = Some(record.device_id.to_owned());
-                // The version 1 sealed-password block never travels beside a
-                // vault; what it held is the vault's business now.
-                state.last_secrets_hash = None;
                 state.last_vault_hash = Some(vault_fingerprint(&record.content));
                 state.last_remote_vault_hash = Some(
                     record
@@ -2113,7 +2084,6 @@ impl SyncService {
                 state.vault = Some(baseline_of(&record.content, &record.vault_id));
             }
             None => {
-                state.last_secrets_hash.clone_from(&mine.secrets);
                 state.last_vault_hash.clone_from(&mine.vault);
                 state.vault = None;
             }
@@ -2125,13 +2095,9 @@ impl SyncService {
     /// The fingerprint of the local document: its view and the same view
     /// without the recent connections.
     fn document_fingerprint(&self, local: &LocalState) -> Result<Fingerprint, SyncError> {
-        let export = ShelluneData::export(
-            local,
-            &ExportOptions::new(self.platform),
-            &*self.secrets,
-            None,
-        )
-        .map_err(SyncError::Local)?;
+        let export =
+            ShelluneData::export_from_vault(local, &ExportOptions::new(self.platform), None, None)
+                .map_err(SyncError::Local)?;
         let view = hash(
             &export
                 .document
@@ -2147,58 +2113,21 @@ impl SyncService {
         Ok(Fingerprint {
             view,
             core,
-            secrets: None,
             vault: None,
         })
     }
 
-    /// The keyed fingerprint of the saved passwords, as the version 1 sealed
-    /// block arrangement compares them.
-    fn legacy_secrets_digest(&self, passphrase: &SecretString, local: &LocalState) -> String {
-        let saved: Vec<(HostId, SecretString)> = local
-            .hosts
-            .records()
-            .iter()
-            .filter(|record| record.remembers_secret())
-            .filter_map(|record| match self.secrets.load(record.id()) {
-                Ok(Some(secret)) => Some((record.id(), secret)),
-                _ => None,
-            })
-            .collect();
-        secrets_digest(passphrase, saved.iter().map(|(id, secret)| (*id, secret)))
-    }
-
     /// The fingerprint of the local data as this platform syncs it: the view of
-    /// the document it would upload, the public fingerprint of its vault when
-    /// the user asked for the vault to travel, and — when the version 1 sealed
-    /// passwords are the arrangement — a fingerprint of them keyed by the sync
-    /// passphrase (so the state file holds nothing a password could be guessed
-    /// from without it).
-    ///
-    /// A machine without a passphrase computes no password fingerprint and
-    /// fails here for no one: whether the sealed-password arrangement is even
-    /// in play is only known once the cloud document is read, and the vault
-    /// arrangement may need no passphrase at all (a WebDAV password travels
-    /// instead).
+    /// the document it would upload and the public fingerprint of its vault
+    /// (of nothing, for a machine without a vault file).
     fn fingerprint(
         &self,
-        config: &SyncConfig,
         local: &LocalState,
         local_vault: Option<&LocalVault>,
     ) -> Result<Fingerprint, SyncError> {
         let mut mine = self.document_fingerprint(local)?;
-        mine.vault = config
-            .sync_secrets
-            .then(|| local_vault.map_or_else(|| hash(NO_VAULT), |vault| vault.fingerprint.clone()));
-        if config.sync_secrets
-            && local_vault.is_none()
-            && let Some(passphrase) = self
-                .passphrase()
-                .map_err(SyncError::Credentials)?
-                .filter(|passphrase| !passphrase.expose().trim().is_empty())
-        {
-            mine.secrets = Some(self.legacy_secrets_digest(&passphrase, local));
-        }
+        mine.vault =
+            Some(local_vault.map_or_else(|| hash(NO_VAULT), |vault| vault.fingerprint.clone()));
         Ok(mine)
     }
 }
@@ -2206,8 +2135,7 @@ impl SyncService {
 /// What a written document carries as its vault block, and what happens to
 /// this machine's own vault file.
 enum DocumentVault<'a> {
-    /// No vault travels (the legacy arrangement); a cloud block is carried
-    /// untouched when the machine does not sync the vault.
+    /// No vault travels: neither side holds one.
     None,
     /// The cloud's block, carried unchanged; both sides hold `settled`.
     Carry {
@@ -2234,9 +2162,10 @@ struct VaultRemember<'a> {
     remote_fingerprint: Option<String>,
 }
 
-/// Whether each side changed more than its recent connections, for the vault
-/// arrangement (no sealed-password block to open): `None` when the state
-/// predates the fingerprints without recents.
+/// Whether each side changed more than its recent connections: `None` when the
+/// state predates the fingerprints without recents. Both sides holding the
+/// same records (only the recents differ) counts as neither having changed
+/// them, whatever the baseline says: a merge then loses nothing.
 fn check_core_docs(state: &SyncState, mine: &Fingerprint, remote: &Remote) -> Option<CoreChanges> {
     let (Some(baseline), Some(remote_baseline)) = (
         state.last_synced_core_hash.as_deref(),
@@ -2267,6 +2196,71 @@ fn vault_gone() -> SyncError {
                  refusing to apply or overwrite it"
             .to_owned(),
     })
+}
+
+/// Whether `content` still holds every record the baseline names, live or as
+/// a tombstone: a deletion is a tombstone, never a disappearance (R6, ADR-6).
+fn holds_baseline(base: &VaultBaseline, content: &VaultContent) -> bool {
+    base.keys.keys().all(|id| content.key(*id).is_some())
+        && base
+            .credentials
+            .keys()
+            .all(|id| content.credential(*id).is_some())
+        && base
+            .host_secrets
+            .keys()
+            .all(|id| content.host_secret_record(*id).is_some())
+}
+
+/// Which records of `state` that remember a password have it in the vault
+/// that travelled, and which do not (a host not migrated from its old
+/// system-store entry yet), in the book's order.
+fn travelling_secrets(state: &LocalState, content: &VaultContent) -> (Vec<HostId>, Vec<HostId>) {
+    let mut included = Vec::new();
+    let mut missing = Vec::new();
+    for record in state.hosts.records() {
+        if !record.remembers_secret() {
+            continue;
+        }
+        if content.host_secret(record.id()).is_some() {
+            included.push(record.id());
+        } else {
+            missing.push(record.id());
+        }
+    }
+    (included, missing)
+}
+
+/// Names the host password conflicts after their hosts: the conflict by the
+/// name this machine knows (the cloud's when only the cloud has the host), and
+/// each side by its own book, so the interface can say which host it is.
+fn name_host_secret_conflicts(
+    conflicts: &mut [VaultConflict],
+    local: &LocalState,
+    document: &ShelluneData,
+) {
+    let name_in = |book: &shellune_storage::HostBook, id: HostId| {
+        book.connection(id).map(|record| record.name().to_owned())
+    };
+    for conflict in conflicts {
+        if let VaultConflict::Record {
+            kind: VaultRecordKind::HostSecret,
+            id,
+            name,
+            local: here,
+            remote: there,
+        } = conflict
+        {
+            let Ok(host) = uuid::Uuid::parse_str(id).map(HostId::from_uuid) else {
+                continue;
+            };
+            let local_name = name_in(&local.hosts, host);
+            let remote_name = name_in(document.shared().hosts(), host);
+            here.name = local_name.clone().unwrap_or_default();
+            there.name = remote_name.clone().unwrap_or_default();
+            *name = local_name.or(remote_name).unwrap_or_default();
+        }
+    }
 }
 
 /// Puts a kept copy of the replaced cloud file into an upload report.
@@ -2305,7 +2299,6 @@ fn put(
 fn pull_report(
     plan: &ApplyPlan,
     applied: ApplyOutcome,
-    secrets_ignored: bool,
     vault_restored: Option<VaultRestored>,
 ) -> PullReport {
     PullReport {
@@ -2323,7 +2316,6 @@ fn pull_report(
         keymap_changed: plan.keymap_changed(),
         fallbacks: plan.fallbacks().to_vec(),
         trust_conflicts: plan.trust_conflicts().to_vec(),
-        secrets_ignored,
         secrets_saved: applied.secrets_saved,
         secrets_to_forget: plan.secrets_to_forget().to_vec(),
         secrets_forgotten: applied.secrets_forgotten,
@@ -2332,37 +2324,15 @@ fn pull_report(
     }
 }
 
-/// A fingerprint of saved passwords keyed by the sync passphrase, so the state
-/// file holds nothing a password could be guessed from without it. The same
-/// for this machine's credential store and for the cloud's opened block when
-/// both hold the same passwords for the same records in the same order.
-fn secrets_digest<'a>(
-    passphrase: &SecretString,
-    saved: impl IntoIterator<Item = (HostId, &'a SecretString)>,
-) -> String {
-    let mut digest = Sha256::new();
-    digest.update(passphrase.expose().as_bytes());
-    digest.update([0]);
-    for (id, secret) in saved {
-        digest.update(id.to_string().as_bytes());
-        digest.update([0]);
-        digest.update(secret.expose().as_bytes());
-        digest.update([0]);
-    }
-    hex(&digest.finalize())
-}
-
 /// What this machine holds, as sync compares it.
 struct Fingerprint {
     /// The fingerprint of the document view.
     view: String,
     /// The fingerprint of the view without the recent connections.
     core: String,
-    /// The keyed fingerprint of the saved passwords, when they are synced.
-    secrets: Option<String>,
-    /// The fingerprint of the public part of this machine's vault, when the
-    /// vault travels (`None` while it does not, `Some` of the content — or of
-    /// nothing, for a machine with no vault file).
+    /// The fingerprint of the public part of this machine's vault (`Some` of
+    /// the content — or of nothing, for a machine with no vault file), once it
+    /// is known.
     vault: Option<String>,
 }
 
@@ -2378,16 +2348,15 @@ fn set_app_secret(
 }
 
 /// The view fingerprint, followed by a fingerprint of the sealed password block
-/// when passwords are synced here (a new password changes only the block), and
-/// always by one of the encrypted vault block when the document carries one
-/// (even a machine that does not sync the vault must notice another device
-/// changing it, so it never writes a stale ciphertext over a newer one).
-fn remote_mark(view_hash: &str, document: &[u8], with_secrets: bool) -> String {
+/// an older build wrote, when the document carries one, and of the encrypted
+/// vault block when it carries that: a block the view leaves out is still a
+/// change, so this machine never writes a stale ciphertext over a newer one.
+fn remote_mark(view_hash: &str, document: &[u8]) -> String {
     let Some(value) = serde_json::from_slice::<serde_json::Value>(document).ok() else {
         return view_hash.to_owned();
     };
     let mut mark = view_hash.to_owned();
-    if with_secrets && let Some(secrets) = value.get("secrets") {
+    if let Some(secrets) = value.get("secrets") {
         mark.push('+');
         mark.push_str(&hash(secrets.to_string().as_bytes()));
     }
@@ -2582,11 +2551,31 @@ impl RecordView for VaultCredentialRecord {
     }
 }
 
+impl RecordView for VaultHostSecretRecord {
+    fn state(&self) -> RecordState<'_> {
+        RecordState {
+            counter: self.meta().version().counter(),
+            device_id: self.meta().version().device_id(),
+            deleted: !self.meta().is_live(),
+        }
+    }
+    /// A host password has no name of its own; the conflict takes the host's
+    /// ([`name_host_secret_conflicts`]).
+    fn meta_name(&self) -> &str {
+        ""
+    }
+    fn same_body_as(&self, other: &Self) -> bool {
+        self.meta() == other.meta()
+            && self.secret().map(SecretString::expose) == other.secret().map(SecretString::expose)
+    }
+}
+
 /// The fingerprint of the public part of a vault: the metadata of every record
 /// (version and tombstone included) and the accepted server identities. No
 /// secret, and no host-reference mirror: references are a function of the
 /// connection book, which [`VaultContent::validate_for_records`] checks as a
-/// whole at every write.
+/// whole at every write. The remembered host passwords are named only when the
+/// vault holds any, so a vault from before them keeps the fingerprint it had.
 fn vault_fingerprint(content: &VaultContent) -> String {
     // The metadata serializes with its name, timestamps, version and possible
     // tombstone; the canonical form of the whole set is the fingerprint.
@@ -2608,11 +2597,23 @@ fn vault_fingerprint(content: &VaultContent) -> String {
             )
         })
         .collect();
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
         "keys": keys,
         "credentials": credentials,
         "trust": serde_json::to_value(content.trust()).unwrap_or_default(),
     });
+    if content.has_host_secret_records() {
+        let host_secrets: Vec<(String, serde_json::Value)> = content
+            .host_secret_records()
+            .map(|r| {
+                (
+                    r.meta().host().to_string(),
+                    serde_json::to_value(r.meta()).unwrap_or_default(),
+                )
+            })
+            .collect();
+        value["host_secrets"] = serde_json::json!(host_secrets);
+    }
     hash(&serde_json::to_vec(&value).unwrap_or_default())
 }
 
@@ -2628,6 +2629,11 @@ fn vault_global(content: &VaultContent) -> u64 {
                 .credentials()
                 .map(|record| record.meta().version().counter()),
         )
+        .chain(
+            content
+                .host_secret_records()
+                .map(|record| record.meta().version().counter()),
+        )
         .max()
         .unwrap_or(0)
 }
@@ -2636,6 +2642,10 @@ fn vault_global(content: &VaultContent) -> u64 {
 fn vault_live_records(content: &VaultContent) -> usize {
     content.keys().filter(|r| r.meta().is_live()).count()
         + content.credentials().filter(|r| r.meta().is_live()).count()
+        + content
+            .host_secret_records()
+            .filter(|r| r.meta().is_live())
+            .count()
 }
 
 /// The baseline of a vault state, for the state file. Public facts only.
@@ -2655,6 +2665,15 @@ fn baseline_of(content: &VaultContent, vault_id: &str) -> VaultBaseline {
         credentials: content
             .credentials()
             .map(|record| (record.meta().id(), base(&CredentialMetaView(record.meta()))))
+            .collect(),
+        host_secrets: content
+            .host_secret_records()
+            .map(|record| {
+                (
+                    record.meta().host(),
+                    base(&HostSecretMetaView(record.meta())),
+                )
+            })
             .collect(),
         trust: content
             .trust()
@@ -2694,6 +2713,21 @@ impl RecordMetaView for KeyMeta<'_> {
 
 /// The credential kind's adapter.
 struct CredentialMetaView<'a>(&'a CredentialMeta);
+
+/// The host password kind's adapter.
+struct HostSecretMetaView<'a>(&'a HostSecretMeta);
+
+impl RecordMetaView for HostSecretMetaView<'_> {
+    fn version_counter(&self) -> u64 {
+        self.0.version().counter()
+    }
+    fn version_device_id(&self) -> &str {
+        self.0.version().device_id()
+    }
+    fn is_live(&self) -> bool {
+        self.0.is_live()
+    }
+}
 
 impl RecordMetaView for CredentialMetaView<'_> {
     fn version_counter(&self) -> u64 {
@@ -2806,6 +2840,20 @@ fn merge_vault(
                 .map_err(SyncError::Vault)?;
         }
     }
+    let host_secret_outcomes = host_secret_decisions(
+        local_content,
+        remote_content,
+        baseline,
+        choices,
+        &mut conflicts,
+    );
+    for (_id, record, _changed) in &host_secret_outcomes {
+        if let Some(record) = record {
+            content
+                .insert_host_secret((*record).clone())
+                .map_err(SyncError::Vault)?;
+        }
+    }
     content.set_trust(merged_trust(
         local_content,
         remote_content,
@@ -2851,6 +2899,12 @@ fn merge_vault(
                         .iter()
                         .find(|(_id, _record, changed)| *changed)
                         .map(|(id, _record, _changed)| StampRecord::Credential(*id))
+                })
+                .or_else(|| {
+                    host_secret_outcomes
+                        .iter()
+                        .find(|(_id, _record, changed)| *changed)
+                        .map(|(id, _record, _changed)| StampRecord::HostSecret(*id))
                 })
                 .unwrap_or_else(|| top_record(&content));
             stamped_content(&content, device_id, stamp)?
@@ -2925,6 +2979,50 @@ fn credential_decisions<'a>(
                 remote.and_then(|content| content.credential(id)),
                 baseline.and_then(|base| base.credentials.get(&id)),
                 VaultRecordKind::Credential,
+                choices,
+                conflicts,
+            );
+            (id, record, changed)
+        })
+        .collect()
+}
+
+/// The remembered host passwords of the merged vault, in host order: the
+/// record, and whether the merge changed it. The same three-way rules as the
+/// shared credentials (ADR-6): a record only one side holds and no baseline
+/// names is that side's, so a device that never migrated a host does not
+/// delete another device's password of it (R4).
+fn host_secret_decisions<'a>(
+    local: Option<&'a VaultContent>,
+    remote: Option<&'a VaultContent>,
+    baseline: Option<&VaultBaseline>,
+    choices: &[VaultChoice],
+    conflicts: &mut Vec<VaultConflict>,
+) -> Vec<(HostId, Option<&'a VaultHostSecretRecord>, bool)> {
+    let mut ids: Vec<HostId> = local
+        .map(|content| {
+            content
+                .host_secret_records()
+                .map(|record| record.meta().host())
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(content) = remote {
+        ids.extend(
+            content
+                .host_secret_records()
+                .map(|record| record.meta().host()),
+        );
+    }
+    make_unique(&mut ids);
+    ids.into_iter()
+        .map(|id| {
+            let (record, changed) = record_decision(
+                id,
+                local.and_then(|content| content.host_secret_record(id)),
+                remote.and_then(|content| content.host_secret_record(id)),
+                baseline.and_then(|base| base.host_secrets.get(&id)),
+                VaultRecordKind::HostSecret,
                 choices,
                 conflicts,
             );
@@ -3179,6 +3277,8 @@ enum StampRecord {
     Key(KeyId),
     /// A shared credential.
     Credential(CredentialId),
+    /// A host's remembered password.
+    HostSecret(HostId),
 }
 
 /// The record of the highest version counter, for a write that changed no
@@ -3194,6 +3294,11 @@ fn top_record(content: &VaultContent) -> StampRecord {
     for record in content.credentials() {
         if record.meta().version().counter() == global {
             return StampRecord::Credential(record.meta().id());
+        }
+    }
+    for record in content.host_secret_records() {
+        if record.meta().version().counter() == global {
+            return StampRecord::HostSecret(record.meta().host());
         }
     }
     // An empty vault has no record to stamp; `stamped_content` keeps it.
@@ -3243,6 +3348,21 @@ fn stamped_content(
             .unwrap_or_else(|| SecretString::new(""));
         stamped
             .insert_credential(VaultCredentialRecord::new(meta, body))
+            .map_err(SyncError::Vault)?;
+    }
+    for record in content.host_secret_records() {
+        let meta = record.meta();
+        let meta = if stamp == StampRecord::HostSecret(meta.host()) {
+            with_version(meta, version.clone())?
+        } else {
+            meta.clone()
+        };
+        let body = record
+            .secret()
+            .map(|secret| SecretString::new(secret.expose()))
+            .unwrap_or_else(|| SecretString::new(""));
+        stamped
+            .insert_host_secret(VaultHostSecretRecord::new(meta, body))
             .map_err(SyncError::Vault)?;
     }
     stamped.set_references(content.references());

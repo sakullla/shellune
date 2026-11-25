@@ -4,8 +4,10 @@
 //! user confirms, the private-key paths that came from another machine — without
 //! touching a file. [`ApplyPlan::apply`] then writes exactly what was previewed:
 //! it copies every data file into a snapshot first, writes the changed files one
-//! by one, saves the opened passwords, and puts every earlier write back when a
-//! later one fails.
+//! by one, and puts every earlier write back when a later one fails.
+//! [`ApplyPlan::apply_with_vault`] does the same and then writes the opened
+//! passwords into the vault and saves it, putting the files back when the vault
+//! cannot be saved (R4, ADR-6).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -19,14 +21,14 @@ use shellune_core::{
 };
 
 use super::{
-    HostOverlay, LocalData, LocalState, Platform, PlatformData, PortableError, SecretBundle,
-    ShelluneData, now_unix,
+    HostOverlay, HostSecrets, LocalData, LocalState, Platform, PlatformData, PortableError,
+    SecretBundle, ShelluneData, VaultHostSecrets, now_unix,
 };
 use crate::book::{FORMAT_VERSION, HostBook, RecentConnection, UnreadableConnection};
-use crate::credentials::SecretStore;
 use crate::preferences::Preferences;
 use crate::store::write_atomic_file;
 use crate::trust::{HostTrust, TRUST_FORMAT_VERSION, TrustEntry};
+use crate::vault::VaultContent;
 
 /// Every data file a document covers, in the order they are written: the host
 /// records first, because they are what a user cannot recreate.
@@ -42,6 +44,9 @@ const DATA_FILES: [&str; 6] = [
 /// Writes one data file (directory, name, bytes); replaced in tests to make a
 /// chosen write fail.
 type FileWriter<'a> = dyn FnMut(&Path, &str, &[u8]) -> Result<(), String> + 'a;
+
+/// Saves the host passwords an apply wrote, once the files are in place.
+type HostCommit<'a, H> = dyn FnMut(&H) -> Result<(), String> + 'a;
 
 /// How a document meets the local data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,13 +175,15 @@ pub struct ApplyOutcome {
     pub snapshot: Option<PathBuf>,
     /// The data files that were written.
     pub files_written: Vec<&'static str>,
-    /// How many passwords were saved to the credential store.
+    /// How many passwords were written into the vault (a password the vault
+    /// already held as it is does not count).
     pub secrets_saved: usize,
-    /// How many passwords were removed from the credential store because their
-    /// record is gone or no longer remembers one.
+    /// How many passwords became tombstones in the vault because their record
+    /// is gone or no longer remembers one.
     pub secrets_forgotten: usize,
-    /// Records whose password should have been removed but the credential store
-    /// refused; the entry is left behind and nothing reads it.
+    /// Records whose password should have been removed but could not be; an
+    /// apply that writes into the vault always removes them, so this stays
+    /// empty and is kept for the interfaces that list it.
     pub secrets_not_forgotten: Vec<HostId>,
     /// The local data as it now is, for the interface to reload.
     pub state: LocalState,
@@ -190,7 +197,7 @@ impl ApplyPlan {
     /// to be saved, and its record is marked as remembering it.
     ///
     /// Whether a record remembers its password is a fact about this machine's
-    /// credential store, so it never comes from the document: a record remembers
+    /// vault, so it never comes from the document: a record remembers
     /// when a password from `secrets` is saved for it, or when this machine's own
     /// record already remembered (and its sign-in method still reads a secret);
     /// otherwise it does not. A password this machine kept for a record that is
@@ -390,8 +397,8 @@ impl ApplyPlan {
         self.secrets.len()
     }
 
-    /// Records whose saved password applying removes from the credential store:
-    /// the record is removed, or its sign-in method no longer reads a secret.
+    /// Records whose saved password applying removes from the vault: the
+    /// record is removed, or its sign-in method no longer reads a secret.
     #[must_use]
     pub fn secrets_to_forget(&self) -> &[HostId] {
         &self.forgets
@@ -468,7 +475,8 @@ impl ApplyPlan {
         self.files.is_empty() && self.secrets.is_empty() && self.forgets.is_empty()
     }
 
-    /// Writes the plan into the data directory.
+    /// Writes the plan into the data directory, for a plan that brings no
+    /// password (see [`Self::apply_with_vault`] for one that does).
     ///
     /// The data files are first read again and compared with the data the plan
     /// was made from; when they differ (something was saved after the preview)
@@ -476,127 +484,183 @@ impl ApplyPlan {
     ///
     /// Every data file is copied into a new snapshot (named after `reason`)
     /// before the first write; the changed files are then written one by one,
-    /// each atomically, and the planned passwords are saved. When a step fails,
-    /// every file already written gets its previous bytes back (or is removed if
-    /// it did not exist) and every password already saved gets its previous value
-    /// back, so the data is what it was before. Last, the passwords nobody uses
-    /// any more are forgotten; a credential store that refuses only leaves an
-    /// unused entry behind, which is reported and does not undo the rest.
+    /// each atomically. When a step fails, every file already written gets its
+    /// previous bytes back (or is removed if it did not exist), so the data is
+    /// what it was before. The system credential store is never touched: a
+    /// record that stopped remembering its password is only reported in
+    /// [`Self::secrets_to_forget`].
     ///
     /// # Errors
     ///
     /// Returns [`PortableError::Changed`] when the data changed after planning
-    /// (nothing was written), [`PortableError::Local`] when it cannot be read,
-    /// [`PortableError::Snapshot`] when the snapshot could not be made (nothing
-    /// was written), and [`PortableError::Apply`] when a later step failed.
-    pub fn apply(
-        &self,
-        data: &LocalData,
-        secrets: &dyn SecretStore,
-        reason: &str,
-    ) -> Result<ApplyOutcome, PortableError> {
-        self.apply_with(data, secrets, reason, &mut |root, name, bytes| {
-            write_atomic_file(root, name, bytes).map_err(|error| error.to_string())
-        })
+    /// (nothing was written), [`PortableError::Local`] when it cannot be read
+    /// or when the plan brings passwords and there is no vault to keep them in
+    /// (nothing was written), [`PortableError::Snapshot`] when the snapshot
+    /// could not be made (nothing was written), and [`PortableError::Apply`]
+    /// when a later step failed.
+    pub fn apply(&self, data: &LocalData, reason: &str) -> Result<ApplyOutcome, PortableError> {
+        self.apply_files(data, reason, &mut write_file)
     }
 
-    fn apply_with(
+    /// Writes the plan into the data directory and its passwords into `vault`,
+    /// as one step (R4, ADR-6).
+    ///
+    /// The files are written as [`Self::apply`] writes them. Then every
+    /// password the plan brings is set in `vault` as written by `device_id`,
+    /// every record that stopped remembering its password gets a tombstone,
+    /// and `commit` saves the vault — a vault that holds a record's password
+    /// and the file that marks the record as remembering it are written
+    /// together. When `commit` fails, every file already written is put back
+    /// and [`PortableError::Apply`] says so; `vault` then holds changes that
+    /// were never saved, and the caller drops it. `commit` is called whenever
+    /// the data is unchanged since planning, even when the plan writes no
+    /// file, so a caller can save a vault it changed beside the plan.
+    ///
+    /// The system credential store is never touched for a host's password.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::apply`], and [`PortableError::Apply`] when
+    /// `commit` failed.
+    pub fn apply_with_vault(
         &self,
         data: &LocalData,
-        secret_store: &dyn SecretStore,
+        vault: &mut VaultContent,
+        device_id: &str,
+        reason: &str,
+        commit: &mut dyn FnMut(&VaultContent) -> Result<(), String>,
+    ) -> Result<ApplyOutcome, PortableError> {
+        let mut secrets = VaultHostSecrets {
+            content: vault,
+            device_id,
+        };
+        let mut save = |secrets: &VaultHostSecrets<'_>| commit(&*secrets.content);
+        self.apply_inner(
+            data,
+            Some((&mut secrets, &mut save)),
+            reason,
+            &mut write_file,
+        )
+    }
+
+    fn apply_files(
+        &self,
+        data: &LocalData,
+        reason: &str,
+        write: &mut FileWriter<'_>,
+    ) -> Result<ApplyOutcome, PortableError> {
+        self.apply_inner::<VaultHostSecrets<'_>>(data, None, reason, write)
+    }
+
+    fn apply_inner<H: HostSecrets>(
+        &self,
+        data: &LocalData,
+        vault: Option<(&mut H, &mut HostCommit<'_, H>)>,
         reason: &str,
         write: &mut FileWriter<'_>,
     ) -> Result<ApplyOutcome, PortableError> {
         if data.load()? != self.base {
             return Err(PortableError::Changed);
         }
-        if self.is_empty() {
-            return Ok(ApplyOutcome {
-                snapshot: None,
-                files_written: Vec::new(),
-                secrets_saved: 0,
-                secrets_forgotten: 0,
-                secrets_not_forgotten: Vec::new(),
-                state: self.next.clone(),
+        if vault.is_none() && !self.secrets.is_empty() {
+            return Err(PortableError::Local {
+                label: "encrypted vault",
+                reason: "the passwords to import need a vault to be kept in; nothing was changed"
+                    .to_owned(),
             });
         }
         let root = data.root();
-        let mut previous: Vec<(&'static str, Option<Vec<u8>>)> = Vec::new();
-        for name in DATA_FILES {
-            let path = root.join(name);
-            match std::fs::read(&path) {
-                Ok(bytes) => previous.push((name, Some(bytes))),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    previous.push((name, None));
-                }
-                Err(error) => {
-                    return Err(PortableError::Snapshot {
-                        path,
-                        reason: error.to_string(),
-                    });
-                }
-            }
-        }
-        let copies: Vec<(&str, &[u8])> = previous
-            .iter()
-            .filter_map(|(name, bytes)| bytes.as_deref().map(|bytes| (*name, bytes)))
-            .collect();
-        let snapshot = data.snapshots().create(reason, now_unix(), &copies)?;
-
         let mut written: Vec<&'static str> = Vec::new();
-        for (name, bytes) in &self.files {
-            if let Err(reason) = write(root, name, bytes) {
-                let restored = restore_files(root, &written, &previous);
-                return Err(PortableError::Apply {
-                    step: format!("Writing {name}"),
-                    reason,
-                    restored,
-                    snapshot,
+        let mut previous: Vec<(&'static str, Option<Vec<u8>>)> = Vec::new();
+        let snapshot = if self.files.is_empty() {
+            if vault.is_none() {
+                return Ok(ApplyOutcome {
+                    snapshot: None,
+                    files_written: Vec::new(),
+                    secrets_saved: 0,
+                    secrets_forgotten: 0,
+                    secrets_not_forgotten: Vec::new(),
+                    state: self.next.clone(),
                 });
             }
-            written.push(name);
-        }
-
-        let mut saved: Vec<(HostId, Option<SecretString>)> = Vec::new();
-        for (id, secret) in &self.secrets {
-            let outcome = secret_store
-                .load(*id)
-                .and_then(|before| secret_store.save(*id, secret).map(|()| before));
-            match outcome {
-                Ok(before) => saved.push((*id, before)),
-                Err(error) => {
-                    let secrets_restored = restore_secrets(secret_store, &saved);
-                    let files_restored = restore_files(root, &written, &previous);
+            None
+        } else {
+            for name in DATA_FILES {
+                let path = root.join(name);
+                match std::fs::read(&path) {
+                    Ok(bytes) => previous.push((name, Some(bytes))),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        previous.push((name, None));
+                    }
+                    Err(error) => {
+                        return Err(PortableError::Snapshot {
+                            path,
+                            reason: error.to_string(),
+                        });
+                    }
+                }
+            }
+            let copies: Vec<(&str, &[u8])> = previous
+                .iter()
+                .filter_map(|(name, bytes)| bytes.as_deref().map(|bytes| (*name, bytes)))
+                .collect();
+            let snapshot = data.snapshots().create(reason, now_unix(), &copies)?;
+            for (name, bytes) in &self.files {
+                if let Err(reason) = write(root, name, bytes) {
+                    let restored = restore_files(root, &written, &previous);
                     return Err(PortableError::Apply {
-                        step: "Saving the passwords".to_owned(),
-                        reason: error.to_string(),
-                        restored: secrets_restored && files_restored,
+                        step: format!("Writing {name}"),
+                        reason,
+                        restored,
                         snapshot,
                     });
                 }
+                written.push(name);
             }
-        }
+            Some(snapshot)
+        };
 
-        // The data is in place; a password left behind is only an unused entry,
-        // the same as when the application forgets one on deleting a record.
+        let mut secrets_saved = 0;
         let mut secrets_forgotten = 0;
-        let mut secrets_not_forgotten = Vec::new();
-        for id in &self.forgets {
-            match secret_store.forget(*id) {
-                Ok(()) => secrets_forgotten += 1,
-                Err(_) => secrets_not_forgotten.push(*id),
+        if let Some((secrets, commit)) = vault {
+            for (id, secret) in &self.secrets {
+                if secrets.set(*id, secret.clone()) {
+                    secrets_saved += 1;
+                }
+            }
+            // A password nobody reads any more becomes a tombstone, so the
+            // deletion travels with the vault like every other one.
+            for id in &self.forgets {
+                if secrets.remove(*id) {
+                    secrets_forgotten += 1;
+                }
+            }
+            if let Err(reason) = commit(&*secrets) {
+                let restored = restore_files(root, &written, &previous);
+                return Err(PortableError::Apply {
+                    step: "Saving the encrypted vault".to_owned(),
+                    reason,
+                    restored,
+                    snapshot: snapshot
+                        .unwrap_or_else(|| root.join(super::snapshot::SNAPSHOT_DIRECTORY)),
+                });
             }
         }
 
         Ok(ApplyOutcome {
-            snapshot: Some(snapshot),
+            snapshot,
             files_written: written,
-            secrets_saved: saved.len(),
+            secrets_saved,
             secrets_forgotten,
-            secrets_not_forgotten,
+            secrets_not_forgotten: Vec::new(),
             state: self.next.clone(),
         })
     }
+}
+
+/// Writes one data file atomically: what an apply does outside of tests.
+fn write_file(root: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+    write_atomic_file(root, name, bytes).map_err(|error| error.to_string())
 }
 
 /// Puts back the files written so far; true when every one was restored.
@@ -623,20 +687,7 @@ fn restore_files(
     restored
 }
 
-/// Puts back the passwords saved so far; true when every one was restored.
-fn restore_secrets(store: &dyn SecretStore, saved: &[(HostId, Option<SecretString>)]) -> bool {
-    let mut restored = true;
-    for (id, before) in saved.iter().rev() {
-        let outcome = match before {
-            Some(secret) => store.save(*id, secret),
-            None => store.forget(*id),
-        };
-        restored &= outcome.is_ok();
-    }
-    restored
-}
-
-/// The combined host book and what changes in the credential store with it.
+/// The combined host book and what changes in the vault with it.
 struct BookPlan {
     book: HostBook,
     /// Passwords from the document to save.
@@ -1220,7 +1271,6 @@ fn changed_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credentials::MemorySecrets;
     use crate::portable::ExportOptions;
 
     fn scratch(name: &str) -> PathBuf {
@@ -1262,10 +1312,10 @@ mod tests {
 
         let mut incoming = state_with(&["new-a", "new-b"]);
         incoming.preferences.theme = Some("light".to_owned());
-        let document = ShelluneData::export(
+        let document = ShelluneData::export_from_vault(
             &incoming,
             &ExportOptions::new(Platform::Windows),
-            &MemorySecrets::new(),
+            None,
             None,
         )
         .expect("exported")
@@ -1281,18 +1331,13 @@ mod tests {
         // Hosts and snippets are written for real; the preferences write fails.
         let mut calls = Vec::new();
         let error = plan
-            .apply_with(
-                &data,
-                &MemorySecrets::new(),
-                "import",
-                &mut |root, name, bytes| {
-                    calls.push(name.to_owned());
-                    if name == "preferences.json" {
-                        return Err("the disk is full".to_owned());
-                    }
-                    write_atomic_file(root, name, bytes).map_err(|error| error.to_string())
-                },
-            )
+            .apply_files(&data, "import", &mut |root, name, bytes| {
+                calls.push(name.to_owned());
+                if name == "preferences.json" {
+                    return Err("the disk is full".to_owned());
+                }
+                write_atomic_file(root, name, bytes).map_err(|error| error.to_string())
+            })
             .expect_err("the third write fails");
         assert_eq!(
             calls,
@@ -1339,10 +1384,10 @@ mod tests {
         std::fs::create_dir_all(&root).expect("dir");
         // A file where the snapshot directory belongs.
         std::fs::write(root.join(crate::portable::SNAPSHOT_DIRECTORY), b"x").expect("blocker");
-        let document = ShelluneData::export(
+        let document = ShelluneData::export_from_vault(
             &state_with(&["a"]),
             &ExportOptions::new(Platform::Linux),
-            &MemorySecrets::new(),
+            None,
             None,
         )
         .expect("exported")
@@ -1357,7 +1402,7 @@ mod tests {
             .expect("planned");
         let mut writes = 0;
         let error = plan
-            .apply_with(&data, &MemorySecrets::new(), "import", &mut |_, _, _| {
+            .apply_files(&data, "import", &mut |_, _, _| {
                 writes += 1;
                 Ok(())
             })
@@ -1366,6 +1411,88 @@ mod tests {
         assert_eq!(writes, 0);
         assert!(!root.join("hosts.json").exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_vault_that_cannot_be_saved_puts_every_written_file_back() {
+        let root = scratch("vault-commit");
+        let data = LocalData::at(&root);
+        let local = state_with(&["old"]);
+        crate::HostStore::at(&root)
+            .save(&local.hosts)
+            .expect("hosts");
+        crate::SnippetStore::at(&root)
+            .save(&local.snippets)
+            .expect("snippets");
+        crate::PreferencesStore::at(&root)
+            .save(&local.preferences)
+            .expect("preferences");
+        let local = data.load().expect("loads");
+        let before = data_files(&root);
+
+        let document = ShelluneData::export_from_vault(
+            &state_with(&["new"]),
+            &ExportOptions::new(Platform::Linux),
+            None,
+            None,
+        )
+        .expect("exported")
+        .document;
+        let plan = document
+            .plan(&local, Platform::Linux, ApplyMode::Replace, None)
+            .expect("planned");
+        let mut vault = VaultContent::new();
+        let mut commits = 0;
+        let error = plan
+            .apply_with_vault(&data, &mut vault, "device-a", "import", &mut |_| {
+                commits += 1;
+                Err("the vault file is locked".to_owned())
+            })
+            .expect_err("the vault save fails");
+        assert_eq!(commits, 1);
+        let PortableError::Apply {
+            restored, reason, ..
+        } = &error
+        else {
+            panic!("{error}");
+        };
+        assert!(restored, "{error}");
+        assert_eq!(reason, "the vault file is locked");
+        assert_eq!(data_files(&root), before, "every data file is as it was");
+        assert_eq!(data.load().expect("loads"), local);
+
+        // An unchanged plan still commits, so a vault changed beside it is saved.
+        let same = document
+            .plan(&local, Platform::Linux, ApplyMode::Replace, None)
+            .expect("planned");
+        let mut saved = 0;
+        let applied = same
+            .apply_with_vault(&data, &mut vault, "device-a", "import", &mut |_| {
+                saved += 1;
+                Ok(())
+            })
+            .expect("applied");
+        assert_eq!(saved, 1);
+        assert!(!applied.files_written.is_empty());
+        let unchanged =
+            ApplyPlan::with_recents(&applied.state, Platform::Linux, &[]).expect("planned");
+        let mut saved = 0;
+        let outcome = unchanged
+            .apply_with_vault(&data, &mut vault, "device-a", "import", &mut |_| {
+                saved += 1;
+                Ok(())
+            })
+            .expect("applied");
+        assert_eq!(saved, 1, "a plan that writes no file still commits");
+        assert!(outcome.snapshot.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn data_files(root: &Path) -> Vec<(&'static str, Option<Vec<u8>>)> {
+        DATA_FILES
+            .iter()
+            .map(|name| (*name, std::fs::read(root.join(name)).ok()))
+            .collect()
     }
 
     #[test]

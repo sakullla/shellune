@@ -377,4 +377,22 @@ impl SecretBundle {
     pub fn ids(&self) -> impl Iterator<Item = HostId> + '_ {
         self.secrets.keys().copied()
     }
+
+    /// The remembered host passwords a vault holds live, as the bundle a plan
+    /// reads (ADR-6): a record whose password travels in the vault is marked
+    /// as remembering it once applied, the same as one whose password came in
+    /// a version 1 block. Tombstones bring nothing.
+    #[must_use]
+    pub fn from_vault(content: &crate::vault::VaultContent) -> Self {
+        Self {
+            secrets: content
+                .host_secret_records()
+                .filter_map(|record| {
+                    record
+                        .secret()
+                        .map(|secret| (record.meta().host(), secret.clone()))
+                })
+                .collect(),
+        }
+    }
 }
