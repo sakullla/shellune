@@ -2895,3 +2895,78 @@ fn a_base_that_does_not_match_the_last_sync_is_never_merged_against() {
         "without a trusted base only a whole side can be kept"
     );
 }
+
+#[test]
+fn a_machine_behind_choosing_its_own_data_never_rolls_the_others_back() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let credential = CredentialId::new();
+    let (a, b) = synced_vault_pair("vault-use-local-floor", &server, |content| {
+        content
+            .insert_credential(credential_named(credential, "Prod login", 1, VAULT_SECRET))
+            .expect("inserts");
+    });
+    // A moves the vault on twice; B does not hear of it.
+    replace_credential(&a, credential, |record| {
+        credential_at(&record, 2, "device-a", VAULT_SECRET_2)
+    });
+    expect_uploaded(a.service.sync());
+    replace_credential(&a, credential, |record| {
+        credential_at(&record, 3, "device-a", "third-secret")
+    });
+    expect_uploaded(a.service.sync());
+
+    // B keeps its own data over the cloud: what it writes must land above
+    // every version A already applied, or A refuses it as a rollback forever.
+    expect_uploaded(b.service.resolve(Resolution::UseLocal));
+    let outcome = a.service.sync();
+    assert!(
+        !matches!(outcome, Err(SyncError::Rollback { .. })),
+        "A takes B's choice instead of refusing it: {outcome:?}"
+    );
+    outcome.expect("A syncs");
+    assert_eq!(
+        secret_of(&open_vault(&a), credential).as_deref(),
+        Some(VAULT_SECRET),
+        "the data B chose to keep reached A"
+    );
+}
+
+#[test]
+fn a_rolled_back_cloud_is_repaired_by_merging_both_vaults() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let credential = CredentialId::new();
+    let (a, b) = synced_vault_pair("vault-rollback-repair", &server, |content| {
+        content
+            .insert_credential(credential_named(credential, "Prod login", 1, VAULT_SECRET))
+            .expect("inserts");
+    });
+    let older = server.file(REMOTE_PATH).expect("the first upload");
+    replace_credential(&a, credential, |record| {
+        credential_at(&record, 2, "device-a", VAULT_SECRET_2)
+    });
+    expect_uploaded(a.service.sync());
+    expect_pulled(b.service.sync());
+    server.put_file(REMOTE_PATH, &older);
+    assert!(matches!(
+        b.service.sync().unwrap_err(),
+        SyncError::Rollback { .. }
+    ));
+
+    // The repair merges record by record: B's newer copy of the record wins
+    // over the stale one, and the result lands above both versions.
+    b.service.repair_rollback().expect("the repair syncs");
+    assert_eq!(
+        secret_of(&open_vault(&b), credential).as_deref(),
+        Some(VAULT_SECRET_2)
+    );
+    expect_up_to_date(b.service.sync());
+    let outcome = a.service.sync();
+    assert!(
+        !matches!(outcome, Err(SyncError::Rollback { .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        secret_of(&open_vault(&a), credential).as_deref(),
+        Some(VAULT_SECRET_2)
+    );
+}

@@ -139,6 +139,8 @@ pub(super) enum SyncJob {
         Vec<shellune_sync::VaultChoice>,
         Vec<(String, shellune_storage::MergeSide)>,
     ),
+    /// The merge that repairs a cloud vault older than this computer's.
+    RepairRollback,
 }
 
 impl SyncJob {
@@ -153,7 +155,7 @@ impl SyncJob {
         matches!(
             self,
             Self::Auto | Self::Check | Self::Pull | Self::Resolve(Resolution::UseRemote)
-        ) || matches!(self, Self::ResolveRecords(..))
+        ) || matches!(self, Self::ResolveRecords(..) | Self::RepairRollback)
     }
 }
 
@@ -301,9 +303,13 @@ fn sync_error_text(error: &SyncError, strings: &SyncStrings) -> String {
             strings.error_remote_document,
             detail(&error.to_string())
         ),
-        SyncError::Rollback { .. } => {
-            format!("{} {}", strings.error_server, detail(&error.to_string()))
-        }
+        SyncError::Rollback { found, applied } => copy::fill(
+            strings.error_rollback,
+            &[
+                ("found", &found.to_string()),
+                ("applied", &applied.to_string()),
+            ],
+        ),
         SyncError::Remote(error) => webdav_error_text(error, strings),
         SyncError::RemoteDocument(PortableError::WrongPassphrase) => {
             strings.error_remote_passphrase.to_owned()
@@ -378,6 +384,15 @@ fn saved_reason_text(reason: &str, strings: &SyncStrings) -> String {
     if let Some((_, text)) = exact.iter().find(|(said, _)| said == reason) {
         return (*text).to_owned();
     }
+    if let Some((found, applied)) = rollback_versions(reason) {
+        return copy::fill(
+            strings.error_rollback,
+            &[
+                ("found", &found.to_string()),
+                ("applied", &applied.to_string()),
+            ],
+        );
+    }
     if reason.starts_with(&without_status(
         &WebDavError::Auth { status: 0 }.to_string(),
     )) {
@@ -440,6 +455,26 @@ fn saved_reason_text(reason: &str, strings: &SyncStrings) -> String {
         return format!("{} {}", strings.error_credentials, detail(rest));
     }
     format!("{} {}", strings.error_last_failed, detail(reason))
+}
+
+/// The two versions of a saved rollback failure (the engine's sentence), when
+/// `reason` is one.
+fn rollback_versions(reason: &str) -> Option<(u64, u64)> {
+    let template = SyncError::Rollback {
+        found: 0,
+        applied: 0,
+    }
+    .to_string();
+    let lead = template.split("(version").next()?;
+    if !reason.starts_with(lead) {
+        return None;
+    }
+    let mut numbers = reason.split("(version ").skip(1).filter_map(|part| {
+        part.split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|digits| digits.parse::<u64>().ok())
+    });
+    Some((numbers.next()?, numbers.next()?))
 }
 
 /// A data document as the window names it.
@@ -760,6 +795,7 @@ impl ShelluneView {
                 SyncJob::Upload => service.upload(),
                 SyncJob::Pull => service.pull(),
                 SyncJob::Resolve(resolution) => service.resolve(resolution),
+                SyncJob::RepairRollback => service.repair_rollback(),
                 SyncJob::ResolveRecords(vault, document) => {
                     service.resolve_records(&vault, &document.into_iter().collect())
                 }
@@ -1883,7 +1919,37 @@ impl ShelluneView {
             self.sync_line(status, tone, "settings.sync.status")
                 .font_weight(FontWeight::MEDIUM),
         );
-        if self.sync.configured() && self.sync.has_failure() && self.sync.running.is_none() {
+        let rollback = self.sync_rollback_pending();
+        if rollback && self.sync.running.is_none() {
+            // Retrying never mends a rolled-back cloud; the repair does.
+            rows.push(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .px(metrics.scale(spacing::LOOSE))
+                    .py(metrics.scale(spacing::SNUG))
+                    .debug_selector(|| "settings.sync.repair.row".to_owned())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .child(strings.repair_hint),
+                    )
+                    .child(self.text_button(
+                        SharedString::from("settings.sync.repair"),
+                        strings.repair_button,
+                        Variant::Primary,
+                        cx,
+                        |this, cx| this.request_sync(SyncJob::RepairRollback, cx),
+                    )),
+            );
+        } else if self.sync.configured() && self.sync.has_failure() && self.sync.running.is_none() {
             rows.push(self.sync_line(strings.retry_note, None, "settings.sync.retry"));
         }
         if self.sync.deferred_locked {
@@ -1894,6 +1960,15 @@ impl ShelluneView {
             ));
         }
         self.settings_card("sync", rows)
+    }
+
+    /// Whether the last sync stopped at a cloud vault older than this
+    /// computer's, which only the merge repair settles.
+    pub(super) fn sync_rollback_pending(&self) -> bool {
+        matches!(
+            &self.sync.state.last_result,
+            Some(LastResult::Failed { reason }) if rollback_versions(reason).is_some()
+        )
     }
 
     /// What the top row says while the last sync failed or a conflict waits: the
@@ -3011,6 +3086,22 @@ mod tests {
         let unknown = saved_reason_text("something new went wrong", zh);
         assert!(unknown.starts_with(zh.error_last_failed), "{unknown}");
         assert!(unknown.contains("something new went wrong"));
+    }
+
+    #[test]
+    fn a_saved_rollback_is_recognised_and_said_with_both_versions() {
+        let saved = shellune_sync::SyncError::Rollback {
+            found: 4,
+            applied: 5,
+        }
+        .to_string();
+        assert_eq!(super::rollback_versions(&saved), Some((4, 5)));
+        assert_eq!(super::rollback_versions("the data kept changing"), None);
+        let text = super::saved_reason_text(&saved, copy::sync_for(copy::Locale::Chinese));
+        assert!(
+            text.contains('4') && text.contains('5') && !text.contains("cloud holds"),
+            "{text}"
+        );
     }
 
     #[test]

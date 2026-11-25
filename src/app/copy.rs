@@ -5594,6 +5594,14 @@ sync_strings! {
     /// The whole-document question waits behind the vault one
     vault_then_document: "The data outside the vault is decided after these records.",
         "这些记录处理完后，再决定密码库之外的数据。";
+    /// The cloud's vault is older than the one this computer applied
+    error_rollback: "The cloud's vault (version {found}) is older than the one this computer already applied (version {applied}): another device probably wrote older data over it. Nothing was changed.",
+        "云端密码库（版本 {found}）比本机已应用的版本（{applied}）旧：很可能是另一台设备用较旧的数据覆盖了云端。本机与云端都未被修改。";
+    /// What the repair does
+    repair_hint: "Merge repair combines both vaults record by record - each record keeps its newer version, and a record changed differently on both sides is yours to choose - then writes the result above every version, so every device can sync again.",
+        "「合并修复」会逐条合并两边的密码库：每条记录保留版本更新的一边，两边各自改成不同内容的记录由你选择；随后以高于所有版本的版本号写回云端，所有设备即可继续同步。";
+    /// The repair button
+    repair_button: "Merge repair", "合并修复";
     /// Intro of the record-by-record conflict dialog
     records_conflict_intro: "Changes to different records were merged on their own. Only the places below were changed differently on both sides: choose which value to keep for each. Nothing is written until every one is answered.",
         "两边对不同记录的修改已自动合并。只有下列位置两边改成了不同的值：请逐项选择保留哪一边。全部选定之前不会写入任何内容。";

@@ -747,6 +747,45 @@ impl SyncService {
         self.record(outcome)
     }
 
+    /// Recovers from a [`SyncError::Rollback`]: the cloud's vault is older than
+    /// the one this machine applied - usually another machine wrote stale data
+    /// over it. This machine's vault baseline is set aside and one sync merges
+    /// both vaults record by record (each record keeps its own version), with
+    /// records both sides changed asked about one by one, and the result is
+    /// written above every version either side has seen. Nothing of either side
+    /// is dropped without a choice; the document merges as any sync does.
+    ///
+    /// # Errors
+    ///
+    /// See [`SyncError`].
+    pub fn repair_rollback(&self) -> Result<SyncOutcome, SyncError> {
+        let outcome = self.connect().and_then(|(_config, client)| {
+            let local = self.open_local_vault()?;
+            let remote = match self.fetch(&client)? {
+                Some(remote) => match remote.document.as_ref().ok().and_then(ShelluneData::vault) {
+                    Some(cipher) => Some(
+                        cipher
+                            .open(&self.vault_source()?.key_source())
+                            .map_err(SyncError::Vault)?,
+                    ),
+                    None => None,
+                },
+                None => None,
+            };
+            let store = SyncStateStore::at(self.data.root());
+            let mut state = store.load();
+            state.vault = match (&local, &remote) {
+                (Some(local), Some(remote)) => {
+                    Some(repair_baseline(&local.content, remote, &local.vault_id))
+                }
+                _ => None,
+            };
+            store.save(&state)?;
+            self.repeat(|service| service.attempt_with(Direction::Auto, &client, &[]))
+        });
+        self.record(outcome)
+    }
+
     fn run(&self, direction: Direction) -> Result<SyncOutcome, SyncError> {
         let outcome = self.connect().and_then(|(_config, client)| {
             self.repeat(|service| service.attempt_with(direction, &client, &[]))
@@ -875,6 +914,7 @@ impl SyncService {
                             choices,
                             &device_id,
                             &self.empty_document(),
+                            applied_floor(&state),
                         )?;
                         let VaultPlan::Write(write) = merged.plan else {
                             return Ok(Step::Done(SyncOutcome::UpToDate));
@@ -1072,6 +1112,7 @@ impl SyncService {
             choices,
             &device_id,
             document,
+            applied_floor(state),
         )?;
 
         // The document facts, without the vault: the vault has its own plan,
@@ -1964,7 +2005,15 @@ impl SyncService {
                 // go into this machine's vault, and the cloud takes the
                 // version 2 document that carries them (R4, R7).
                 let adopted = self.adopt_legacy_block(local_vault, document, &device_id)?;
-                let merged = merge_vault(Some(&adopted), None, None, &[], &device_id, document)?;
+                let merged = merge_vault(
+                    Some(&adopted),
+                    None,
+                    None,
+                    &[],
+                    &device_id,
+                    document,
+                    applied_floor(&state),
+                )?;
                 if let VaultPlan::Write(write) = merged.plan {
                     let plan = document
                         .plan(
@@ -2040,10 +2089,20 @@ impl SyncService {
             let Some(local_vault) = local_vault else {
                 return Err(vault_gone());
             };
+            // The version this write lands on is above everything either side
+            // has seen: the cloud's vault (opened when the secret still opens
+            // it), and what this machine last applied. Stamping from this
+            // machine's vault alone could land below the cloud, and every
+            // machine that applied the cloud would refuse it as a rollback.
+            let cloud_global = cloud
+                .and_then(ShelluneData::vault)
+                .and_then(|cipher| cipher.open(&source.key_source()).ok())
+                .map_or(0, |content| vault_global(&content));
             let stamped = stamped_content(
                 &local_vault.content,
                 &device_id,
                 top_record(&local_vault.content),
+                cloud_global.max(applied_floor(&state)),
             )?;
             let write = WriteVault {
                 content: stamped,
@@ -2994,6 +3053,38 @@ fn baseline_of(content: &VaultContent, vault_id: &str) -> VaultBaseline {
     }
 }
 
+/// The baseline a rollback repair merges against: for every record both vaults
+/// hold, the older of the two versions, so the side holding the newer version
+/// is the one that changed it and its version is kept; a record only one side
+/// holds has no base and is kept as an addition; two different versions at the
+/// same counter stay a conflict to answer. A trusted identity is a base only
+/// where both sides trust the same one. The global counter is none, which is
+/// what lets the repair look past the rollback once.
+fn repair_baseline(local: &VaultContent, remote: &VaultContent, vault_id: &str) -> VaultBaseline {
+    let mut base = baseline_of(local, vault_id);
+    let remote_base = baseline_of(remote, vault_id);
+    fn older<K: Ord + Copy>(
+        mine: &mut BTreeMap<K, VaultRecordBase>,
+        theirs: &BTreeMap<K, VaultRecordBase>,
+    ) {
+        mine.retain(|id, _| theirs.contains_key(id));
+        for (id, record) in mine.iter_mut() {
+            if let Some(other) = theirs.get(id)
+                && other.counter < record.counter
+            {
+                *record = other.clone();
+            }
+        }
+    }
+    older(&mut base.keys, &remote_base.keys);
+    older(&mut base.credentials, &remote_base.credentials);
+    older(&mut base.host_secrets, &remote_base.host_secrets);
+    base.trust
+        .retain(|server, print| remote_base.trust.get(server) == Some(print));
+    base.global_counter = 0;
+    base
+}
+
 /// The metadata surface the baseline builder reads, over both kinds.
 trait RecordMetaView {
     fn version_counter(&self) -> u64;
@@ -3105,7 +3196,17 @@ fn merge_vault(
     choices: &[VaultChoice],
     device_id: &str,
     document: &ShelluneData,
+    floor: u64,
 ) -> Result<VaultMerge, SyncError> {
+    let floor = [
+        floor,
+        local.map_or(0, |vault| vault_global(&vault.content)),
+        remote.map_or(0, |vault| vault_global(&vault.content)),
+        baseline.map_or(0, |base| base.global_counter),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
     if local.is_none() && remote.is_none() {
         return Ok(VaultMerge {
             plan: VaultPlan::Absent,
@@ -3212,7 +3313,7 @@ fn merge_vault(
                         .map(|(id, _record, _changed)| StampRecord::HostSecret(*id))
                 })
                 .unwrap_or_else(|| top_record(&content));
-            stamped_content(&content, device_id, stamp)?
+            stamped_content(&content, device_id, stamp, floor)?
         };
         VaultPlan::Write(Box::new(WriteVault {
             content,
@@ -3586,6 +3687,11 @@ enum StampRecord {
     HostSecret(HostId),
 }
 
+/// The highest vault version this machine has applied, from its baseline.
+fn applied_floor(state: &SyncState) -> u64 {
+    state.vault.as_ref().map_or(0, |base| base.global_counter)
+}
+
 /// The record of the highest version counter, for a write that changed no
 /// record (a trust entry or the reference mirror): the stamp still belongs on
 /// some record, and the top one is the deterministic choice.
@@ -3611,19 +3717,24 @@ fn top_record(content: &VaultContent) -> StampRecord {
 }
 
 /// Rebuilds `content` with `stamp` raised to the new global version, written
-/// by `device_id` (ADR-5: the merge's counter is both sides' maximum plus one,
-/// and the device that writes it is named). An empty vault has nothing to
-/// stamp; its version stays zero.
+/// by `device_id` (ADR-5: the counter is the maximum of everything either side
+/// has seen, plus one, and the device that writes it is named). `floor` is the
+/// highest counter known beyond `content` itself - the cloud's vault and this
+/// machine's baseline - so a write that keeps an older copy of a record never
+/// lands at or below a version another machine already applied, which that
+/// machine would refuse as a rollback. An empty vault has nothing to stamp;
+/// its version stays zero.
 fn stamped_content(
     content: &VaultContent,
     device_id: &str,
     stamp: StampRecord,
+    floor: u64,
 ) -> Result<VaultContent, SyncError> {
     let global = vault_global(content);
     if global == 0 {
         return Ok(content.clone());
     }
-    let version = VaultRecordVersion::new(global + 1, device_id);
+    let version = VaultRecordVersion::new(global.max(floor) + 1, device_id);
     let mut stamped = VaultContent::new();
     for record in content.keys() {
         let meta = record.meta();
