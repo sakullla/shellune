@@ -164,6 +164,41 @@ impl MethodChoice {
     }
 }
 
+/// A server that presented another identity than the one trusted for it.
+///
+/// Carried beside the failure so the card can show both fingerprints and offer the
+/// one honest way forward: drop the old record for exactly this address and port, and
+/// connect again so the new identity is shown and accepted (or refused) like a first
+/// contact. Nothing is trusted on the user's behalf.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityChange {
+    /// The address that was dialled (the hop's, in a jump chain).
+    pub address: String,
+    /// The port that was dialled.
+    pub port: u16,
+    /// The fingerprint trusted before.
+    pub stored: String,
+    /// The algorithm of the identity presented now.
+    pub algorithm: String,
+    /// The fingerprint presented now.
+    pub presented: String,
+}
+
+impl IdentityChange {
+    fn of(address: &str, port: u16, error: &ConnectError) -> Option<Self> {
+        match error {
+            ConnectError::HostKeyChanged { stored, presented } => Some(Self {
+                address: address.to_owned(),
+                port,
+                stored: stored.clone(),
+                algorithm: presented.algorithm.clone(),
+                presented: presented.fingerprint.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Why the last attempt failed, and whether trying again can help.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteFailure {
@@ -172,6 +207,8 @@ pub struct RemoteFailure {
     retryable: bool,
     /// Whether choosing another way to sign in can fix it.
     sign_in: bool,
+    /// The changed server identity behind the failure, when that is what it was.
+    identity_change: Option<IdentityChange>,
 }
 
 impl RemoteFailure {
@@ -183,7 +220,24 @@ impl RemoteFailure {
             next_step: error.next_step().to_owned(),
             retryable: error.is_retryable(),
             sign_in: error.is_sign_in(),
+            identity_change: None,
         }
+    }
+
+    /// A failure of a direct connection to `address:port`, which is how a changed
+    /// identity is tied to the record it contradicts.
+    #[must_use]
+    pub fn from_server_error(address: &str, port: u16, error: &ConnectError) -> Self {
+        Self {
+            identity_change: IdentityChange::of(address, port, error),
+            ..Self::from_error(error)
+        }
+    }
+
+    /// The changed server identity behind this failure, if that is what it was.
+    #[must_use]
+    pub fn identity_change(&self) -> Option<&IdentityChange> {
+        self.identity_change.as_ref()
     }
 
     /// A jump-chain failure. The reason is the chain's own text, which names the hop.
@@ -210,11 +264,16 @@ impl RemoteFailure {
                 true,
             ),
         };
+        let identity_change = match failure {
+            ChainFailure::Hop { hop, error } => IdentityChange::of(&hop.address, hop.port, error),
+            _ => None,
+        };
         Self {
             reason: failure.to_string(),
             next_step,
             retryable,
             sign_in,
+            identity_change,
         }
     }
 
@@ -228,6 +287,7 @@ impl RemoteFailure {
             retryable,
             // The shell's own failures name no layer; the form stays, as it always did.
             sign_in: true,
+            identity_change: None,
         }
     }
 

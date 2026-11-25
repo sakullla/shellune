@@ -186,23 +186,23 @@ pub mod dark {
     pub const SEGMENT_TRACK: u32 = 0x0f1115;
     pub const SEGMENT_THUMB: u32 = 0x2b2e36;
     pub const TEXT_PRIMARY: u32 = 0xeff1f5;
-    pub const TEXT_SECONDARY: u32 = 0xc6cad2;
-    pub const TEXT_MUTED: u32 = 0xa7acb5;
+    pub const TEXT_SECONDARY: u32 = 0xcfd3da;
+    pub const TEXT_MUTED: u32 = 0xb3b8c1;
     /// The hint inside an empty field: a step below muted, so a hint is never read as
     /// a value that was typed.
     pub const TEXT_PLACEHOLDER: u32 = 0x777c85;
-    pub const ACCENT: u32 = 0x7fa6ff;
-    pub const ACCENT_HOVER: u32 = 0x96b6ff;
-    pub const ACCENT_PRESSED: u32 = 0x6b95f7;
+    pub const ACCENT: u32 = 0x92b4ff;
+    pub const ACCENT_HOVER: u32 = 0xa0bcff;
+    pub const ACCENT_PRESSED: u32 = 0x84a8fb;
     pub const ON_ACCENT: u32 = 0x0b0d12;
     /// The accent 20% over the panel.
     pub const ACCENT_TINT: u32 = 0x2b344a;
     pub const ACCENT_ON_TINT: u32 = 0xc7d9ff;
     pub const POSITIVE: u32 = 0x6fd3a0;
     pub const WARNING: u32 = 0xe6bb69;
-    pub const DANGER: u32 = 0xf7958f;
-    pub const INFO: u32 = 0x7fb9f7;
-    pub const PLANNED: u32 = 0xa7acb5;
+    pub const DANGER: u32 = 0xfaa59f;
+    pub const INFO: u32 = 0x86bdf8;
+    pub const PLANNED: u32 = 0xb3b8c1;
     /// Each status colour 14% over the panel.
     pub const POSITIVE_TINT: u32 = 0x22322f;
     pub const WARNING_TINT: u32 = 0x332f28;
@@ -215,15 +215,15 @@ pub mod dark {
     pub const TRACK_ON: u32 = 0x3f73e0;
     pub const TRACK_ON_HOVER: u32 = 0x4b7fea;
     pub const KNOB: u32 = 0xf2f4f8;
-    pub const FOCUS_RING: u32 = 0x96b6ff;
+    pub const FOCUS_RING: u32 = 0xa0bcff;
     pub const DISABLED_SURFACE: u32 = 0x1b1d23;
     pub const DISABLED_TEXT: u32 = 0x878c95;
     pub const LOADING_TRACK: u32 = 0x2a2d35;
-    pub const LOADING_FILL: u32 = 0x7fa6ff;
+    pub const LOADING_FILL: u32 = 0x92b4ff;
     pub const SCRIM: u32 = 0x000000;
     pub const SHADOW: u32 = 0x000000;
     /// The terminal's selection: the accent 32% over the terminal's background.
-    pub const SELECTION: u32 = 0x32405f;
+    pub const SELECTION: u32 = 0x38445f;
     /// The ink of a host tile's letters or system mark, one hue every 30 degrees,
     /// built in OKLCH at one lightness and a low chroma (L 0.80, C 0.085). The tile
     /// itself stays neutral; only the mark carries the hue, so a list is told apart
@@ -313,21 +313,21 @@ pub mod light {
         (0x0e1014, 0xfafbfc), // background
         (0x8eb8fe, 0x2756cf), // cursor
         (0x353941, 0x393d46), // black
-        (0xf68882, 0xba3538), // red
+        (0xf89892, 0xba3538), // red
         (0x6bc987, 0x137d41), // green
         (0xe1b856, 0x996103), // yellow
-        (0x77abf7, 0x1c65c8), // blue
-        (0xce90dc, 0x9240a4), // magenta
+        (0x86b4f8, 0x1c65c8), // blue
+        (0xd8a0e4, 0x9240a4), // magenta
         (0x59c4d4, 0x067a87), // cyan
-        (0xbabec4, 0x656971), // white
-        (0x818690, 0x50555e), // bright black
+        (0xbabec4, 0xd3d6db), // white
+        (0x9499a3, 0x737882), // bright black
         (0xfea6a0, 0x9b1c24), // bright red
         (0x71e194, 0x016430), // bright green
         (0xfbcc5a, 0x7a4d04), // bright yellow
         (0x96c0fe, 0x024da9), // bright blue
         (0xe7a1f7, 0x772a88), // bright magenta
         (0x52ddf0, 0x01616b), // bright cyan
-        (0xf0f2f5, 0x44484f), // bright white
+        (0xf0f2f5, 0xeef0f3), // bright white
     ];
 }
 
@@ -1226,6 +1226,16 @@ pub fn terminal_color(color: u32) -> u32 {
     }
 }
 
+/// The light terminal's colour for a dark default, for the renderer's tests.
+#[cfg(test)]
+#[must_use]
+pub fn terminal_light_for_test(dark: u32) -> u32 {
+    light::TERMINAL
+        .iter()
+        .find(|(from, _)| *from == dark)
+        .map_or(dark, |(_, to)| *to)
+}
+
 /// A colour at a reduced opacity, for borders and hairlines that should recede.
 pub fn faded(color: Rgba, alpha: f32) -> Rgba {
     Rgba { a: alpha, ..color }
@@ -1669,6 +1679,36 @@ pub mod contrast {
         0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
     }
 
+    /// APCA lightness contrast (SAPC 0.0.98G) of `text` on `background`.
+    ///
+    /// Positive for dark text on a light background, negative for light on dark;
+    /// |Lc| 90 is ideal body text, 75 the floor for body text, 60 for other content
+    /// text, 45 for large text and glyph-like icons, 30 for placeholder text.
+    #[cfg(test)]
+    pub fn apca(text: u32, background: u32) -> f64 {
+        let screen = |hex: u32| {
+            let [_, r, g, b] = hex.to_be_bytes();
+            let c = |v: u8| (f64::from(v) / 255.0).powf(2.4);
+            let y = 0.212_672_9 * c(r) + 0.715_152_2 * c(g) + 0.072_175 * c(b);
+            if y > 0.022 {
+                y
+            } else {
+                y + (0.022 - y).powf(1.414)
+            }
+        };
+        let (text, background) = (screen(text), screen(background));
+        if (background - text).abs() < 0.0005 {
+            return 0.0;
+        }
+        if background > text {
+            let s = (background.powf(0.56) - text.powf(0.57)) * 1.14;
+            if s < 0.1 { 0.0 } else { (s - 0.027) * 100.0 }
+        } else {
+            let s = (background.powf(0.65) - text.powf(0.62)) * 1.14;
+            if s > -0.1 { 0.0 } else { (s + 0.027) * 100.0 }
+        }
+    }
+
     /// Contrast ratio between two colours, from 1.0 to 21.0.
     pub fn ratio(foreground: u32, background: u32) -> f64 {
         let foreground = relative_luminance(foreground);
@@ -2020,6 +2060,7 @@ mod tests {
         light::{self, TERMINAL},
         palette, radius, spacing, type_scale,
     };
+    use contrast::apca;
     use gpui::prelude::*;
     use gpui::px;
 
@@ -2712,12 +2753,31 @@ mod tests {
             "light terminal cursor is {:.2}:1 on background",
             contrast::ratio(light_cursor, light_bg)
         );
-        for (index, color) in shellune_terminal::palette::ANSI.iter().enumerate() {
-            let light_ansi = light_terminal_color(rgb_u32(*color));
-            let ratio = contrast::ratio(light_ansi, light_bg);
+        let ansi =
+            |slot: usize| light_terminal_color(rgb_u32(shellune_terminal::palette::ANSI[slot]));
+        // The colours programs write text in: APCA Lc 60, the floor for content text.
+        for slot in (1..=6).chain(9..=14) {
+            let lc = apca(ansi(slot), light_bg);
             assert!(
-                ratio >= BODY,
-                "light terminal ANSI[{index}] ({light_ansi:06x}) is {ratio:.2}:1 on background ({light_bg:06x})"
+                lc >= 60.0,
+                "light terminal ANSI[{slot}] ({:06x}) is Lc {lc:.1} on the background",
+                ansi(slot)
+            );
+        }
+        // Bright black is the quiet grey of hints and autosuggestions: readable, and
+        // clearly quieter than the default text.
+        let quiet = apca(ansi(8), light_bg);
+        assert!(
+            (45.0..apca(light_fg, light_bg) - 15.0).contains(&quiet),
+            "bright black is Lc {quiet:.1}"
+        );
+        // Black stays dark and white stays light, so the pairs a prompt or a status
+        // line paints (white on black, black on white) read in the light terminal too.
+        for (black, white) in [(0, 7), (0, 15), (8, 15)] {
+            let lc = apca(ansi(white), ansi(black)).abs();
+            assert!(
+                lc >= 60.0,
+                "ANSI[{white}] on ANSI[{black}] is Lc {lc:.1} in the light terminal"
             );
         }
     }

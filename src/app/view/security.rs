@@ -97,8 +97,6 @@ pub(crate) enum PendingVaultBind {
     SshManagedKey,
     /// Bind the created `CredentialId` to the open SSH host draft.
     SshSharedCredential,
-    /// Bind the created `CredentialId` to the open RDP/VNC connection draft.
-    DesktopSharedCredential,
 }
 
 /// The widest the public key line of a detail card is drawn.
@@ -3405,7 +3403,6 @@ impl ShelluneView {
             Some(PendingVaultBind::SshManagedKey | PendingVaultBind::SshSharedCredential) => {
                 self.host_fields.is_some()
             }
-            Some(PendingVaultBind::DesktopSharedCredential) => self.protocol_fields.is_some(),
             None => false,
         };
         if return_to_connection_dialog {
@@ -3947,7 +3944,7 @@ impl ShelluneView {
     /// file, so a restart finds nothing left to restore. No password, no
     /// biometric prompt - the local unseal this machine already holds is the
     /// only thing the change ever needs.
-    fn security_forget_trust(&mut self, host: &str, port: u16, cx: &mut Context<Self>) {
+    pub(super) fn security_forget_trust(&mut self, host: &str, port: u16, cx: &mut Context<Self>) {
         let server = format!("{host}:{port}");
         let file_host = host.to_owned();
         let file_port = port;
@@ -4428,20 +4425,6 @@ impl ShelluneView {
                             draft.set_credential(Some(*id));
                         }
                         if self.host_fields.is_some() {
-                            self.focus_host_dialog = true;
-                            self.focus_host_dialog_keep_return = true;
-                        } else {
-                            self.restore_focus_pending = true;
-                        }
-                    }
-                    (
-                        Some(PendingVaultBind::DesktopSharedCredential),
-                        SecurityReport::CredentialSaved(id),
-                    ) => {
-                        if let Some(draft) = self.hosts.protocol_draft_mut() {
-                            draft.set_credential(Some(*id));
-                        }
-                        if self.protocol_fields.is_some() {
                             self.focus_host_dialog = true;
                             self.focus_host_dialog_keep_return = true;
                         } else {
@@ -5336,6 +5319,11 @@ impl ShelluneView {
     pub(crate) fn security_gate_busy(&self) -> bool {
         self.security.lock.verifying
             || (self.security.warming && !self.security.lock.pending.is_empty())
+    }
+
+    /// Whether a vault job is in flight.
+    pub(crate) fn security_busy(&self) -> bool {
+        self.security.busy()
     }
 
     /// Whether a system/biometric verification prompt is currently in flight.
@@ -6632,6 +6620,7 @@ impl ShelluneView {
     /// What runs once a vault job ended: a backup import that waited for it
     /// first, else the host passwords that waited, else a sync that waited.
     fn security_job_idle(&mut self, cx: &mut Context<Self>) {
+        self.settle_trust_replace_retry(cx);
         if !self.security.busy
             && let Some(task) = self.security.import_waiting.take()
         {

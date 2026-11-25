@@ -2432,7 +2432,6 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             terminal_paste_lines,
             terminal_paste_runs,
             terminal_paste_run_confirm,
-            terminal_paste_safe,
             terminal_no_blocks,
             terminal_blocks_failed,
             terminal_filter_all,
@@ -3383,6 +3382,88 @@ async fn confirming_a_multiline_paste_writes_only_the_active_pane(cx: &mut TestA
         cx.update(|_window, app| left.read(app).sent().to_vec()),
         left_sent,
         "confirming the other pane does not write into the first session"
+    );
+}
+
+#[gpui::test]
+async fn a_waiting_paste_can_be_edited_and_its_final_break_removed_before_it_is_sent(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("paste-edit");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let (view, cx) = snippet_view(cx, &dir);
+    let session = live_remote(cx, &view);
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(session).cloned())
+        .expect("the session has a terminal");
+    let before = snippet_sent(cx, &view, session);
+
+    // A single line copied with its newline: the dialog says it would run, and one
+    // press takes the break away so it is only typed.
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.stage_paste("test-e3eae56f\n", cx));
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("terminal.paste.trailing").is_some());
+    click(cx, "terminal.paste.trim");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).paste_editor_text_for_test(app)),
+        Some("test-e3eae56f".to_owned()),
+        "the final break is gone from what will be written"
+    );
+    click(cx, "terminal.paste.confirm");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session),
+        [
+            before.clone(),
+            encode_paste("test-e3eae56f", TermMode::empty())
+        ]
+        .concat(),
+        "the text is typed without the break that would have run it"
+    );
+
+    // Typed into: clicking the text gives it the keyboard, keys go into the text and
+    // not to the terminal, and the edited text is what is written.
+    let before = snippet_sent(cx, &view, session);
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.stage_paste("echo one\necho two", cx));
+    });
+    cx.run_until_parked();
+    click(cx, "terminal.paste.preview");
+    cx.run_until_parked();
+    cx.simulate_input(" && echo three");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session),
+        before,
+        "typing in the dialog writes nothing to the terminal"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).paste_editor_text_for_test(app)),
+        Some("echo one\necho two && echo three".to_owned())
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_w, app| view.read(app).paste_prompt_open_for_test(app)),
+        "Enter in the editor is a line break, not the answer"
+    );
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.set_paste_editor_text_for_test("echo edited", cx);
+        });
+    });
+    click(cx, "terminal.paste.confirm");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session),
+        [before, encode_paste("echo edited", TermMode::empty())].concat(),
+        "the edited text is written, not the original"
     );
 }
 
@@ -8660,6 +8741,76 @@ async fn a_changed_identity_is_blocked_without_offering_a_retry(cx: &mut TestApp
         cx.debug_bounds("remote.trust").is_none(),
         "the new identity is never offered for acceptance in the same step"
     );
+}
+
+#[gpui::test]
+async fn a_changed_identity_can_be_forgotten_and_verified_again(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remote-changed-replace");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let old = presented_key(6);
+    let mut trust = shellune_storage::HostTrust::new();
+    trust
+        .accept(
+            "10.0.0.5",
+            22,
+            &shellune_storage::HostKey::new(old.algorithm, old.fingerprint.clone(), old.public_key)
+                .expect("a well-formed identity"),
+            1_700_000_000,
+        )
+        .expect("accepted");
+    TrustStore::at(dir.path())
+        .save(&trust)
+        .expect("trust saved");
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    click(cx, "hosts.connect.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.fail_remote_for_test(
+                shellune_ssh::ConnectError::HostKeyChanged {
+                    stored: old.fingerprint.clone(),
+                    presented: presented_key(7),
+                },
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    // Both fingerprints are on the card, so they can be compared before anything else.
+    assert!(cx.debug_bounds("remote.identity.stored").is_some());
+    assert!(cx.debug_bounds("remote.identity.presented").is_some());
+    let change = cx.update(|_window, app| {
+        view.read(app)
+            .remote_state()
+            .and_then(|panel| panel.status().failure())
+            .and_then(|failure| failure.identity_change().cloned())
+            .expect("the failure names the changed identity")
+    });
+    assert_eq!(change.address, "10.0.0.5");
+    assert_eq!(change.port, 22);
+    assert_eq!(change.presented, presented_key(7).fingerprint);
+
+    click(cx, "remote.identity.replace");
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert!(
+            view.trust().entry("10.0.0.5", 22).is_none(),
+            "the old record is gone, so the next attempt asks afresh"
+        );
+        assert!(
+            view.trust().is_empty(),
+            "nothing was trusted on the user's behalf"
+        );
+        assert!(
+            view.remote_state()
+                .is_some_and(|panel| panel.status().failure().is_none()),
+            "the form connects again instead of staying on the failure"
+        );
+    });
 }
 
 /// Runs the remote poll loop until the panel says the attempt reached a state.
@@ -46356,35 +46507,16 @@ async fn connection_dialogs_handle_locked_vault_inline_creation_missing_records_
         "saving the healed binding resolves the missing-key warning"
     );
 
-    // 3. Inline shared password creation from an RDP connection dialog auto-binds too.
+    // 3. An RDP connection signs in with its own typed password or a saved one; it does
+    //    not offer to create a vault record from inside the form.
     click(cx, "hosts.connection.edit.0");
     cx.run_until_parked();
-    click(cx, "connection.auth.credential.new");
-    cx.run_until_parked();
-    type_into(cx, "security.dialog.name", "Inline RDP cred");
-    click(cx, "security.dialog.generate.password");
-    click(cx, "security.dialog.submit");
-    cx.run_until_parked();
-    let inline_cred_id = cx
-        .update(|_window, app| {
-            view.read(app)
-                .security_credentials_for_test()
-                .into_iter()
-                .find(|(_, name)| name == "Inline RDP cred")
-                .map(|(id, _)| id)
-        })
-        .expect("inline credential saved");
-    assert_eq!(
-        cx.update(|_window, app| {
-            view.read(app)
-                .hosts_state()
-                .protocol_draft()
-                .and_then(|d| d.credential_id())
-        }),
-        Some(inline_cred_id),
-        "inline-created shared password auto-binds to the open RDP draft"
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("connection.auth.credential.new").is_none(),
+        "the RDP form has no inline new-password button"
     );
-    click(cx, "connection.save");
+    cx.simulate_keystrokes("escape");
     cx.run_until_parked();
 
     // 4. Lock the vault: SSH & RDP dialogs show locked banner + inline unlock + clear option,
@@ -46659,50 +46791,6 @@ async fn vault_wide_master_detail_scrolls_independently_and_row_click_keeps_arro
         cx.update(|_window, app| view.read(app).security_detail_name_for_test()),
         Some("Deploy Key 02".to_owned()),
         "Down + Enter after clicking row 1 in Settings selects Deploy Key 02 without leaving Security"
-    );
-
-    // 4. Finding 5 (P3): Inline credential dialog from RDP connection modal restores focus back to
-    //    the open RDP connection dialog on both Escape cancel and Save completion.
-    click(cx, "nav.hosts");
-    click(cx, "hosts.view.all");
-    click(cx, "hosts.new");
-    click(cx, "connection.protocol.rdp");
-    cx.run_until_parked();
-
-    click(cx, "connection.auth.credential.new");
-    cx.run_until_parked();
-    cx.simulate_keystrokes("escape");
-    cx.run_until_parked();
-    cx.simulate_input("10.20.");
-    cx.run_until_parked();
-    assert_eq!(
-        cx.update(|_window, app| {
-            view.read(app).hosts_state().protocol_draft().map(|d| {
-                d.text(crate::app::hosts::ConnectionFormField::Address)
-                    .to_owned()
-            })
-        }),
-        Some("10.20.".to_owned()),
-        "cancelling inline vault dialog returns keyboard focus to the open RDP dialog"
-    );
-
-    click(cx, "connection.auth.credential.new");
-    cx.run_until_parked();
-    cx.simulate_input("RDP Focus Cred");
-    click(cx, "security.dialog.generate.password");
-    click(cx, "security.dialog.submit");
-    cx.run_until_parked();
-    cx.simulate_input("30.40");
-    cx.run_until_parked();
-    assert_eq!(
-        cx.update(|_window, app| {
-            view.read(app).hosts_state().protocol_draft().map(|d| {
-                d.text(crate::app::hosts::ConnectionFormField::Address)
-                    .to_owned()
-            })
-        }),
-        Some("10.20.30.40".to_owned()),
-        "saving inline vault credential returns keyboard focus to the open RDP dialog"
     );
 }
 
@@ -49655,7 +49743,7 @@ async fn vault_and_connection_modals_preserve_outer_focus_return_across_typing_v
     );
 
     // 4. Home page: focus `hosts.search`, open New -> switch to RDP, trigger validation failure +
-    //    inline `PendingVaultBind::DesktopSharedCredential` cancel + close RDP dialog ->
+    //    close RDP dialog ->
     //    focus must return to `hosts.search`!
     click(cx, "hosts.search");
     assert!(hosts_search_focused(cx));
@@ -49664,18 +49752,12 @@ async fn vault_and_connection_modals_preserve_outer_focus_return_across_typing_v
     cx.run_until_parked();
     click(cx, "connection.save");
     cx.run_until_parked();
-    click(cx, "connection.auth.credential.new");
-    cx.run_until_parked();
-    cx.simulate_input("Cancelled inline RDP cred");
-    cx.simulate_keystrokes("escape");
-    cx.run_until_parked();
-    redraw(cx);
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     redraw(cx);
     assert!(
         hosts_search_focused(cx),
-        "closing RDP dialog after protocol switch, validation refocus, and inline vault cancel restores hosts.search"
+        "closing RDP dialog after protocol switch and validation refocus restores hosts.search"
     );
 }
 

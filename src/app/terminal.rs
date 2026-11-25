@@ -867,6 +867,21 @@ impl TerminalShortcuts {
     }
 }
 
+/// What a pane's reader waits on between drains.
+enum Ready {
+    Ssh(shellune_ssh::OutputReady),
+    Local(shellune_terminal::LocalOutputReady),
+}
+
+impl Ready {
+    async fn wait(&self) {
+        match self {
+            Self::Ssh(ready) => ready.wait().await,
+            Self::Local(ready) => ready.wait().await,
+        }
+    }
+}
+
 /// A paste held until the user confirms the session it names.
 struct PendingPaste {
     text: String,
@@ -937,7 +952,7 @@ impl TerminalPane {
     ) -> Self {
         let font_size = sanitize_font_size(font_size);
         let grid = grid.clamped();
-        let core = TerminalCore::new(grid.cols, grid.rows, shellune_terminal::DEFAULT_SCROLLBACK);
+        let core = new_core(grid, shellune_terminal::DEFAULT_SCROLLBACK);
         let environment_notes = session.environment().notes().to_vec();
         let mut pane = Self {
             tag,
@@ -1028,7 +1043,7 @@ impl TerminalPane {
         let font_size = sanitize_font_size(font_size);
         let grid = grid.clamped();
         let target = target.into();
-        let core = TerminalCore::new(grid.cols, grid.rows, shellune_terminal::DEFAULT_SCROLLBACK);
+        let core = new_core(grid, shellune_terminal::DEFAULT_SCROLLBACK);
         let mut pane = Self {
             tag,
             core,
@@ -1117,7 +1132,7 @@ impl TerminalPane {
         let font_size = sanitize_font_size(font_size);
         let grid = grid.clamped();
         let target = target.into();
-        let core = TerminalCore::new(grid.cols, grid.rows, shellune_terminal::DEFAULT_SCROLLBACK);
+        let core = new_core(grid, shellune_terminal::DEFAULT_SCROLLBACK);
         let mut pane = Self {
             tag,
             core,
@@ -1287,7 +1302,7 @@ impl TerminalPane {
         let grid = grid.clamped();
         Self {
             tag,
-            core: TerminalCore::new(grid.cols, grid.rows, shellune_terminal::DEFAULT_SCROLLBACK),
+            core: new_core(grid, shellune_terminal::DEFAULT_SCROLLBACK),
             source: None,
             origin: PaneOrigin::Serial {
                 device: device.to_owned(),
@@ -1503,7 +1518,7 @@ impl TerminalPane {
         let grid = grid.clamped();
         Self {
             tag,
-            core: TerminalCore::new(grid.cols, grid.rows, 1000),
+            core: new_core(grid, 1000),
             source: None,
             origin: PaneOrigin::Local(shell),
             state: PaneState::Live,
@@ -1834,17 +1849,26 @@ impl TerminalPane {
         if self.poll_task.is_some() {
             return;
         }
+        // A source that says when it has something waits for that; only a serial line,
+        // which has no such signal, is polled. An idle shell then wakes nothing.
         let ready = match self.source.as_ref() {
-            Some(PaneSource::Remote(session)) => Some(session.output_ready()),
-            Some(PaneSource::Chain(session)) => Some(session.output_ready()),
+            Some(PaneSource::Remote(session)) => Some(Ready::Ssh(session.output_ready())),
+            Some(PaneSource::Chain(session)) => Some(Ready::Ssh(session.output_ready())),
+            Some(PaneSource::Local(session)) => Some(Ready::Local(session.output_ready())),
             Some(_) => None,
             None => return,
         };
         self.poll_task = Some(cx.spawn(async move |this, cx| {
             let mut search_pending = false;
+            // A drain that ran out of time may have left events behind; the next one
+            // follows on a timer rather than waiting for a wakeup already spent.
+            let mut hurry = false;
             let mut busy = Duration::ZERO;
             loop {
-                if let Some(ready) = &ready
+                if hurry && ready.is_some() {
+                    // The yield after the busy drain already let input and painting
+                    // run; go straight on to what was left behind.
+                } else if let Some(ready) = &ready
                     && !search_pending
                 {
                     ready.wait().await;
@@ -1857,6 +1881,7 @@ impl TerminalPane {
                 });
                 let Ok((true, pending)) = result else { break };
                 search_pending = pending;
+                hurry = started.elapsed() >= SSH_DRAIN_BUDGET;
                 // A full queue wakes synchronously. A short timer leaves the native
                 // event loop idle long enough to dispatch input and paint messages.
                 busy += started.elapsed();
@@ -1915,6 +1940,9 @@ impl TerminalPane {
             return false;
         };
         let ssh = matches!(source, PaneSource::Remote(_) | PaneSource::Chain(_));
+        // A source that wakes its reader drains until it is empty (within the budget):
+        // the wakeup that brought this drain may stand for more than one batch.
+        let drains_all = ssh || matches!(source, PaneSource::Local(_));
         let deadline = std::time::Instant::now() + SSH_DRAIN_BUDGET;
         let mut events = source.drain();
         // What the line itself reported - a refused send, a frame the driver cut short,
@@ -1971,7 +1999,7 @@ impl TerminalPane {
                     live = self.handle_event(event, cx);
                 }
             }
-            if !ssh || !live || std::time::Instant::now() >= deadline {
+            if !drains_all || !live || std::time::Instant::now() >= deadline {
                 break;
             }
             let Some(source) = self.source.as_mut() else {
@@ -2806,6 +2834,26 @@ impl TerminalPane {
             self.write_snippet(&pending.text, true, cx);
         } else {
             self.write_paste(&pending.text, cx);
+        }
+        cx.notify();
+        true
+    }
+
+    /// Writes `text` in place of the held paste: the user changed it in the dialog.
+    ///
+    /// What the dialog showed is what is written; an empty text writes nothing and
+    /// drops the paste. Returns whether a paste was waiting.
+    pub fn confirm_edited_paste(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        let Some(mut pending) = self.set_pending_paste(None) else {
+            return false;
+        };
+        if !text.is_empty() {
+            pending.text = text.to_owned();
+            if pending.execute {
+                self.write_snippet(&pending.text, true, cx);
+            } else {
+                self.write_paste(&pending.text, cx);
+            }
         }
         cx.notify();
         true
@@ -6645,6 +6693,29 @@ pub fn quote_posix_path(path: &str) -> String {
     }
 }
 
+/// A terminal core that answers colour queries with the palette this window draws.
+fn new_core(grid: GridSize, scrollback: usize) -> TerminalCore {
+    let mut core = TerminalCore::new(grid.cols, grid.rows, scrollback);
+    core.set_shown_colors(shown_color);
+    core
+}
+
+/// A default palette colour as the terminal draws it now (dark, or its light mapping).
+///
+/// Read when a program asks (OSC 10/11/4): TUIs such as editors and coding agents pick
+/// their light or dark theme from the answer, and without one they assume a dark
+/// background and paint dark panels over a light terminal.
+fn shown_color(color: Rgb) -> Rgb {
+    let value = theme::terminal_color(
+        u32::from(color.r) << 16 | u32::from(color.g) << 8 | u32::from(color.b),
+    );
+    Rgb {
+        r: (value >> 16) as u8,
+        g: (value >> 8) as u8,
+        b: value as u8,
+    }
+}
+
 fn color_of(color: Rgb) -> gpui::Rgba {
     let value = u32::from(color.r) << 16 | u32::from(color.g) << 8 | u32::from(color.b);
     gpui::rgb(theme::terminal_color(value))
@@ -6663,9 +6734,16 @@ fn cell_background(cell: &RenderedCell, canvas: gpui::Rgba) -> Option<gpui::Rgba
     (background != canvas).then_some(background)
 }
 
-/// The least contrast text keeps against its background, and dimmed text.
-const TEXT_CONTRAST_FLOOR: f32 = 3.0;
-const DIM_CONTRAST_FLOOR: f32 = 2.0;
+/// The least APCA lightness contrast (|Lc|) text keeps against its background, and
+/// dimmed text.
+///
+/// Lc 45 is APCA's floor for text that must still be read (it sits about where WCAG's
+/// 3:1 does for mid-tones, but is fair to dark backgrounds, where WCAG overstates
+/// contrast); Lc 30 is its floor for any text at all, which dimmed text is allowed to
+/// sink to. The palettes themselves are tuned well above these, so the floor only
+/// moves colours a program picked for the other kind of terminal.
+const TEXT_CONTRAST_FLOOR: f32 = 45.0;
+const DIM_CONTRAST_FLOOR: f32 = 30.0;
 
 /// The colour a character is drawn in.
 ///
@@ -6688,29 +6766,32 @@ fn ink(foreground: gpui::Rgba, background: gpui::Rgba, dim: bool) -> gpui::Rgba 
     } else {
         TEXT_CONTRAST_FLOOR
     };
-    if contrast(foreground, background) >= floor {
+    if apca(foreground, background).abs() >= floor {
         return foreground;
     }
-    // Towards black on a light background, towards white on a dark one.
-    let target = if luminance(background) > 0.4 {
-        gpui::Rgba {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: 1.0,
-        }
+    // Towards black on a light background, towards white on a dark one: whichever
+    // end can reach the floor at all, preferring the one away from the background.
+    let black = gpui::Rgba {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: 1.0,
+    };
+    let white = gpui::Rgba {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: 1.0,
+    };
+    let target = if apca(black, background).abs() >= apca(white, background).abs() {
+        black
     } else {
-        gpui::Rgba {
-            r: 1.0,
-            g: 1.0,
-            b: 1.0,
-            a: 1.0,
-        }
+        white
     };
     let (mut low, mut high) = (0.0_f32, 1.0_f32);
     for _ in 0..12 {
         let middle = (low + high) / 2.0;
-        if contrast(mix(foreground, target, middle), background) >= floor {
+        if apca(mix(foreground, target, middle), background).abs() >= floor {
             high = middle;
         } else {
             low = middle;
@@ -6730,23 +6811,33 @@ fn mix(from: gpui::Rgba, to: gpui::Rgba, amount: f32) -> gpui::Rgba {
     }
 }
 
-/// WCAG relative luminance.
-fn luminance(color: gpui::Rgba) -> f32 {
-    let channel = |value: f32| {
-        if value <= 0.039_28 {
-            value / 12.92
-        } else {
-            ((value + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+/// APCA screen luminance (SAPC 0.0.98G), with the soft clamp for near-black.
+fn apca_luminance(color: gpui::Rgba) -> f32 {
+    let y = 0.212_672_9 * color.r.max(0.0).powf(2.4)
+        + 0.715_152_2 * color.g.max(0.0).powf(2.4)
+        + 0.072_175 * color.b.max(0.0).powf(2.4);
+    if y > 0.022 {
+        y
+    } else {
+        y + (0.022 - y).powf(1.414)
+    }
 }
 
-/// WCAG contrast ratio, from 1 to 21.
-fn contrast(a: gpui::Rgba, b: gpui::Rgba) -> f32 {
-    let (a, b) = (luminance(a), luminance(b));
-    let (light, dark) = if a > b { (a, b) } else { (b, a) };
-    (light + 0.05) / (dark + 0.05)
+/// APCA lightness contrast of `text` on `background`, about -108 to 106.
+///
+/// Positive is dark text on a light background, negative light text on a dark one.
+fn apca(text: gpui::Rgba, background: gpui::Rgba) -> f32 {
+    let (text, background) = (apca_luminance(text), apca_luminance(background));
+    if (background - text).abs() < 0.0005 {
+        return 0.0;
+    }
+    if background > text {
+        let s = (background.powf(0.56) - text.powf(0.57)) * 1.14;
+        if s < 0.1 { 0.0 } else { (s - 0.027) * 100.0 }
+    } else {
+        let s = (background.powf(0.65) - text.powf(0.62)) * 1.14;
+        if s > -0.1 { 0.0 } else { (s + 0.027) * 100.0 }
+    }
 }
 
 /// How a stretch of text is drawn.
@@ -7422,7 +7513,11 @@ mod output_repaint_tests {
 
 #[cfg(test)]
 mod ink_tests {
-    use super::{contrast, ink};
+    use super::{apca, ink};
+
+    fn contrast(text: gpui::Rgba, background: gpui::Rgba) -> f32 {
+        apca(text, background).abs()
+    }
 
     fn rgb(hex: u32) -> gpui::Rgba {
         gpui::rgb(hex)
@@ -7432,13 +7527,31 @@ mod ink_tests {
     fn a_pale_colour_on_a_light_canvas_is_made_legible() {
         // A grey chosen for a dark terminal, on the light one.
         let drawn = ink(rgb(0xe6e6e6), rgb(0xfcfcfd), false);
-        assert!(contrast(drawn, rgb(0xfcfcfd)) >= 2.99);
+        assert!(contrast(drawn, rgb(0xfcfcfd)) >= 44.9);
     }
 
     #[test]
     fn a_dark_colour_on_a_dark_canvas_is_made_legible() {
         let drawn = ink(rgb(0x1a1c22), rgb(0x0b0c10), false);
-        assert!(contrast(drawn, rgb(0x0b0c10)) >= 2.99);
+        assert!(contrast(drawn, rgb(0x0b0c10)) >= 44.9);
+    }
+
+    #[test]
+    fn white_text_on_a_black_cell_stays_readable_in_the_light_terminal() {
+        // The pair a status line or a prompt segment paints: the light terminal keeps
+        // black dark and white light, so the pair reads without any correction.
+        let black = rgb(crate::app::theme::terminal_light_for_test(0x353941));
+        let white = rgb(crate::app::theme::terminal_light_for_test(0xbabec4));
+        assert!(contrast(white, black) >= 60.0);
+        assert_eq!(ink(white, black, false), white);
+    }
+
+    #[test]
+    fn apca_matches_the_reference_values() {
+        // Reference pairs from the APCA documentation.
+        assert!((apca(rgb(0x888888), rgb(0xffffff)) - 63.1).abs() < 0.2);
+        assert!((apca(rgb(0xffffff), rgb(0x888888)) + 68.5).abs() < 0.2);
+        assert!((apca(rgb(0x000000), rgb(0xaaaaaa)) - 58.1).abs() < 0.2);
     }
 
     #[test]
@@ -7453,7 +7566,7 @@ mod ink_tests {
         let regular = ink(rgb(0xe6e9f0), canvas, false);
         let dim = ink(rgb(0xe6e9f0), canvas, true);
         assert!(contrast(dim, canvas) < contrast(regular, canvas));
-        assert!(contrast(dim, canvas) >= 1.99);
+        assert!(contrast(dim, canvas) >= 29.9);
     }
 
     #[test]

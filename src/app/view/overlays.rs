@@ -3065,61 +3065,105 @@ impl ShelluneView {
                 pane.pending_paste_runs(),
             )
         };
-        let lines = paste_preview(&text, 1).0;
+        let ux = copy::ux();
+        // What will be written is the editor's text when the user changed it.
+        let editor = self
+            .paste_editor
+            .as_ref()
+            .filter(|editor| editor.session == id)
+            .map(|editor| editor.area.clone());
+        let editing = editor
+            .as_ref()
+            .is_some_and(|area| area.read(cx).focus_handle().is_focused(window));
+        let current = editor
+            .as_ref()
+            .map_or_else(|| text.clone(), |area| area.read(cx).text().to_owned());
+        // A final break is what submits the text; it is counted as what it does, not as
+        // an extra empty line.
+        let trailing = current.ends_with('\n') || current.ends_with('\r');
+        let body_text = current.trim_end_matches(['\n', '\r']);
+        let lines = if body_text.is_empty() {
+            0
+        } else {
+            paste_preview(body_text, 1).0
+        };
         let session = self.tab_title(id);
-        let (header, hint) = self.modal_header(
+        let (header, _hint) = self.modal_header(
             Some(Icon::Terminal),
             strings.terminal_paste_title.to_owned(),
-            Some(format!("{session} · {target}")),
+            None,
             "terminal.paste.close",
             cx,
             |this, cx| {
                 this.cancel_paste_prompt(cx);
             },
         );
-        let labelled = |label: &'static str, selector: &'static str, value: String| {
-            div()
-                .flex()
-                .items_center()
-                .gap(metrics.scale(spacing::TIGHT))
-                .min_w_0()
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(colors::TEXT_MUTED))
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .font_family(crate::app::terminal::monospace_family())
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(colors::TEXT_PRIMARY))
-                        .debug_selector(move || selector.to_owned())
-                        .child(SharedString::from(value)),
-                )
+        // One line names where the text goes: the tab, then the target it is connected
+        // to, unless they are the same words.
+        let destination = if session == target {
+            target
+        } else {
+            format!("{session} · {target}")
         };
-        // The whole block, scrolled inside the dialog: a long paste is read here rather
+        let destination = div()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .min_w_0()
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(colors::TEXT_MUTED))
+                    .child(strings.terminal_paste_target),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(crate::app::terminal::monospace_family())
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(colors::TEXT_PRIMARY))
+                    .debug_selector(|| "terminal.paste.target".to_owned())
+                    .child(SharedString::from(destination)),
+            );
+        // The whole block, editable: a long paste is read and corrected here rather
         // than cut down to a preview that hides what would be written (R17).
         let preview = div()
             .id("terminal.paste.preview")
             .debug_selector(|| "terminal.paste.preview".to_owned())
             .w_full()
             .min_w_0()
-            .max_h(px(PASTE_PREVIEW_MAX_HEIGHT).min(window.viewport_size().height * 0.4))
-            .overflow_y_scroll()
-            .track_scroll(&self.paste_scroll)
-            .rounded(px(radius::MEDIUM))
-            .border_1()
-            .border_color(theme::swatch(colors::BORDER))
-            .bg(theme::swatch(colors::CANVAS))
-            .p(metrics.scale(spacing::TIGHT))
             .font_family(crate::app::terminal::monospace_family())
             .text_size(metrics.caption_size())
-            .text_color(theme::swatch(colors::TEXT_PRIMARY))
-            .child(SharedString::from(text));
+            .when_some(editor, |preview, area| preview.child(area))
+            .when(
+                self.paste_editor.as_ref().is_none_or(|e| e.session != id),
+                |preview| {
+                    preview
+                        .max_h(
+                            px(PASTE_PREVIEW_MAX_HEIGHT).min(window.viewport_size().height * 0.4),
+                        )
+                        .overflow_y_scroll()
+                        .track_scroll(&self.paste_scroll)
+                        .rounded(px(radius::MEDIUM))
+                        .border_1()
+                        .border_color(theme::swatch(colors::BORDER))
+                        .bg(theme::swatch(colors::CANVAS))
+                        .p(metrics.scale(spacing::TIGHT))
+                        .text_color(theme::swatch(colors::TEXT_PRIMARY))
+                        .child(SharedString::from(text.clone()))
+                },
+            );
+        let confirm_key = match crate::app::nav::Platform::current() {
+            crate::app::nav::Platform::MacOs => "\u{2318}\u{21a9}",
+            _ => "Ctrl+Enter",
+        };
+        let hint = if editing {
+            copy::fill(ux.paste_editing_hint, &[("confirm", confirm_key)])
+        } else {
+            ux.paste_edit_hint.to_owned()
+        };
         let body = div()
             .flex()
             .flex_col()
@@ -3130,13 +3174,10 @@ impl ShelluneView {
             .pb(metrics.scale(spacing::LOOSE))
             // The dialog holds the keyboard while it is up; the window's keystroke
             // interceptor turns the keys into answers, so nothing behind it is typed
-            // into and no bound shortcut runs through it (R17).
+            // into and no bound shortcut runs through it (R17). The editor takes the
+            // keyboard only when it is clicked.
             .track_focus(&self.paste_focus)
-            .child(labelled(
-                strings.terminal_paste_target,
-                "terminal.paste.target",
-                target,
-            ))
+            .child(destination)
             .child(
                 div()
                     .flex()
@@ -3158,6 +3199,29 @@ impl ShelluneView {
                             components::chip(strings.terminal_paste_runs, Tone::Warning, metrics)
                                 .debug_selector(|| "terminal.paste.runs".to_owned()),
                         )
+                    })
+                    // A paste that ends in a line break runs the moment it lands; that
+                    // is usually a copied newline nobody meant, so it can go in one press.
+                    .when(trailing && !runs, |row| {
+                        row.child(
+                            components::chip(ux.paste_trailing_break, Tone::Warning, metrics)
+                                .debug_selector(|| "terminal.paste.trailing".to_owned()),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            components::compact_button(
+                                ux.paste_trim_break,
+                                Variant::Ghost,
+                                metrics,
+                            )
+                            .id("terminal.paste.trim")
+                            .debug_selector(|| "terminal.paste.trim".to_owned())
+                            .on_click(cx.listener(
+                                |this, _event, _window, cx| {
+                                    this.trim_paste_break(cx);
+                                },
+                            )),
+                        )
                     }),
             )
             .child(preview)
@@ -3166,7 +3230,7 @@ impl ShelluneView {
                     .debug_selector(|| "terminal.paste.safe".to_owned())
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(colors::TEXT_SECONDARY))
-                    .child(strings.terminal_paste_safe),
+                    .child(SharedString::from(hint)),
             )
             .into_any_element();
         let footer = components::modal_footer(metrics)
@@ -3201,11 +3265,22 @@ impl ShelluneView {
             620.0,
             ModalContent {
                 header,
-                subtitle: hint,
+                subtitle: None,
                 body,
                 footer: Some(footer),
             },
         ))
+    }
+
+    /// Drops the final line breaks of the waiting paste, so it is typed and not run.
+    fn trim_paste_break(&mut self, cx: &mut Context<Self>) {
+        if let Some(editor) = self.paste_editor.as_ref() {
+            editor.area.update(cx, |area, cx| {
+                let trimmed = area.text().trim_end_matches(['\n', '\r']).to_owned();
+                area.replace_all(&trimmed, cx);
+            });
+        }
+        cx.notify();
     }
 }
 

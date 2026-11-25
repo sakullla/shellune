@@ -93,7 +93,7 @@ type TabHandler = Box<dyn Fn(bool, &mut Window, &mut App) -> bool + 'static>;
 pub struct LineModel {
     text: String,
     selection: Range<usize>,
-    reversed: bool,
+    pub(crate) reversed: bool,
     /// Whether a line break is text this field keeps, as a snippet body does.
     keeps_line_breaks: bool,
 }

@@ -90,9 +90,24 @@ impl TerminalEffects {
     }
 }
 
+/// A colour query (OSC 4, 10, 11 or 12) a program asked during one chunk.
+///
+/// The answer is written in place, among the chunk's other replies: a program that
+/// sends OSC 11 and then a device-attributes query uses the second answer to know the
+/// first will never come, so the order the questions were asked in is kept.
+struct ColorQuery {
+    /// Where in the chunk's replies the answer goes.
+    offset: usize,
+    /// The palette slot asked about: 0-255, or 256+ for the named colours.
+    index: usize,
+    /// Turns the colour into the escape sequence the program expects.
+    format: Arc<dyn Fn(Rgb) -> String + Send + Sync>,
+}
+
 #[derive(Default)]
 struct SinkState {
     effects: TerminalEffects,
+    queries: Vec<ColorQuery>,
 }
 
 /// Event sink that records what the terminal asked for.
@@ -102,9 +117,12 @@ struct EffectSink {
 }
 
 impl EffectSink {
-    fn take_effects(&self) -> TerminalEffects {
+    fn take_effects(&self) -> (TerminalEffects, Vec<ColorQuery>) {
         let mut state = self.state.lock().expect("the effect sink is not poisoned");
-        std::mem::take(&mut state.effects)
+        (
+            std::mem::take(&mut state.effects),
+            std::mem::take(&mut state.queries),
+        )
     }
 }
 
@@ -116,6 +134,16 @@ impl EventListener for EffectSink {
             Event::Title(title) => state.effects.title = Some(title),
             Event::ClipboardStore(_, text) => state.effects.clipboard = Some(text),
             Event::Bell => state.effects.bell = true,
+            // Answered once the chunk is parsed, from the colours really on screen;
+            // a program left without an answer guesses a dark background (R8).
+            Event::ColorRequest(index, format) => {
+                let offset = state.effects.writes.len();
+                state.queries.push(ColorQuery {
+                    offset,
+                    index,
+                    format,
+                });
+            }
             // Everything else is either a hint for the windowing layer (cursor
             // blinking, mouse shape) or an exit notice the PTY supervisor reports
             // with a real exit status, which is more accurate than this event.
@@ -479,6 +507,12 @@ pub struct TerminalCore {
     /// and then rotates.
     scrollback: usize,
     row_addresses: Vec<usize>,
+    /// How a palette colour is shown, for the answers to colour queries.
+    ///
+    /// The window may draw the grid in another palette than the one cells are
+    /// resolved in (a light terminal maps every default slot); a program asking
+    /// for the background must hear the colour the user sees.
+    shown: fn(Rgb) -> Rgb,
 }
 
 impl TerminalCore {
@@ -508,7 +542,34 @@ impl TerminalCore {
             last_history: 0,
             scrollback,
             row_addresses: Vec::new(),
+            shown: |color| color,
         }
+    }
+
+    /// Sets how a palette colour is shown, so colour queries are answered with what
+    /// is on screen rather than the dark defaults.
+    pub fn set_shown_colors(&mut self, shown: fn(Rgb) -> Rgb) {
+        self.shown = shown;
+    }
+
+    /// The colour a program asking about palette slot `index` is told.
+    ///
+    /// A colour the program set itself (OSC 4/10/11/12) is returned as set; any other
+    /// is the default as the window draws it.
+    fn queried_color(&self, index: usize) -> Option<Rgb> {
+        use alacritty_terminal::vte::ansi::NamedColor;
+        let colors = self.term.colors();
+        if let Some(set) = colors[index] {
+            return Some(set);
+        }
+        let default = match index {
+            0..=255 => palette::indexed(index as u8),
+            i if i == NamedColor::Foreground as usize => palette::FOREGROUND,
+            i if i == NamedColor::Background as usize => palette::BACKGROUND,
+            i if i == NamedColor::Cursor as usize => palette::CURSOR,
+            _ => return None,
+        };
+        Some((self.shown)(default))
     }
 
     /// Parses a chunk of output and returns what the application must do about it.
@@ -555,7 +616,15 @@ impl TerminalCore {
 
     fn feed_grid(&mut self, bytes: &[u8], plain_ascii: bool) -> TerminalEffects {
         self.advance_bytes(bytes, plain_ascii);
-        let effects = self.sink.take_effects();
+        let (mut effects, queries) = self.sink.take_effects();
+        // Later answers first, so each earlier offset still points where it did.
+        for query in queries.into_iter().rev() {
+            if let Some(color) = self.queried_color(query.index) {
+                let answer = (query.format)(color);
+                let at = query.offset.min(effects.writes.len());
+                effects.writes.splice(at..at, answer.into_bytes());
+            }
+        }
         if let Some(title) = &effects.title {
             self.title = Some(title.clone());
         }
@@ -2517,6 +2586,54 @@ mod tests {
             String::from_utf8_lossy(&effects.writes)
         );
         assert!(terminal.feed(b"x").is_empty(), "no reply for plain text");
+    }
+
+    #[test]
+    fn a_background_query_is_answered_with_the_colour_on_screen() {
+        let mut terminal = core();
+        let effects = terminal.feed(b"\x1b]11;?\x1b\\");
+        assert_eq!(
+            String::from_utf8_lossy(&effects.writes),
+            "\x1b]11;rgb:0e0e/1010/1414\x1b\\",
+            "the dark default background is reported"
+        );
+
+        terminal.set_shown_colors(|_| Rgb {
+            r: 0xfa,
+            g: 0xfb,
+            b: 0xfc,
+        });
+        let effects = terminal.feed(b"\x1b]11;?\x07");
+        assert_eq!(
+            String::from_utf8_lossy(&effects.writes),
+            "\x1b]11;rgb:fafa/fbfb/fcfc\x07",
+            "a light window reports its light background"
+        );
+    }
+
+    #[test]
+    fn colour_answers_keep_their_place_among_other_replies() {
+        let mut terminal = core();
+        let effects = terminal.feed(b"\x1b]10;?\x07\x1b[c\x1b]4;1;?\x07");
+        let reply = String::from_utf8_lossy(&effects.writes).into_owned();
+        let foreground = reply.find("\x1b]10;").expect("foreground answered");
+        let attributes = reply.find("\x1b[?").expect("attributes answered");
+        let slot = reply.find("\x1b]4;1;").expect("palette slot answered");
+        assert!(
+            foreground < attributes && attributes < slot,
+            "answers follow the order of the questions: {reply:?}"
+        );
+    }
+
+    #[test]
+    fn a_colour_the_program_set_is_reported_as_set() {
+        let mut terminal = core();
+        terminal.set_shown_colors(|_| Rgb { r: 1, g: 1, b: 1 });
+        let effects = terminal.feed(b"\x1b]11;rgb:12/34/56\x07\x1b]11;?\x07");
+        assert_eq!(
+            String::from_utf8_lossy(&effects.writes),
+            "\x1b]11;rgb:1212/3434/5656\x07"
+        );
     }
 
     #[test]

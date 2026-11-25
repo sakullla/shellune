@@ -50,5 +50,8 @@ pub use mouse::{
     mouse_reporting,
 };
 pub use palette::{ANSI, BACKGROUND, CURSOR, FOREGROUND, indexed, named_color, resolve, to_hex};
-pub use pty::{ExitReport, LocalSession, PtyEvent, ShellLaunchError, TERM_VALUE};
+pub use pty::{
+    ExitReport, LocalSession, OutputReady as LocalOutputReady, PtyEvent, ShellLaunchError,
+    TERM_VALUE,
+};
 pub use shell::{discover, discover_with, platform_default, program_exists};

@@ -196,6 +196,8 @@ pub struct LocalSession {
     stopped: Arc<AtomicBool>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     events: Option<Receiver<PtyEvent>>,
+    /// Woken after every event the threads put in the channel.
+    ready: OutputReady,
     grid: GridSize,
     /// What was added to the shell's own environment, and what could not be.
     environment: ShellEnvironment,
@@ -272,6 +274,11 @@ impl LocalSession {
             .map_err(|error| classify(error.as_ref(), program))?;
 
         let (sender, receiver) = sync_channel(128);
+        let ready = OutputReady::default();
+        let sender = EventSender {
+            tx: sender,
+            ready: ready.clone(),
+        };
         let stopped = Arc::new(AtomicBool::new(false));
         let writer = spawn_writer(writer, sender.clone(), stopped.clone());
         let progress = Arc::new(ReaderProgress::new());
@@ -285,6 +292,7 @@ impl LocalSession {
             stopped,
             killer,
             events: Some(receiver),
+            ready,
             grid,
             environment: ShellEnvironment::default(),
             closed: false,
@@ -350,6 +358,13 @@ impl LocalSession {
             .map_err(|error| error.to_string())?;
         self.grid = grid;
         Ok(())
+    }
+
+    /// A wakeup for whoever drains this session: it fires after the shell wrote, exited
+    /// or failed, so an idle shell costs its window nothing.
+    #[must_use]
+    pub fn output_ready(&self) -> OutputReady {
+        self.ready.clone()
     }
 
     /// A bounded batch of pending events; poll again to consume remaining output.
@@ -506,9 +521,52 @@ impl ReaderProgress {
     }
 }
 
+/// A coalesced wakeup for the one consumer of a local shell's events.
+///
+/// A wakeup sent while nobody waits is remembered, so an event that lands between a
+/// drain and the next wait is never slept through.
+#[derive(Clone, Default)]
+pub struct OutputReady(Arc<tokio::sync::Notify>);
+
+impl OutputReady {
+    /// Waits until there may be something to drain.
+    pub async fn wait(&self) {
+        self.0.notified().await;
+    }
+
+    fn wake(&self) {
+        self.0.notify_one();
+    }
+}
+
+/// The channel the PTY threads report into, waking the consumer after each event.
+#[derive(Clone)]
+struct EventSender {
+    tx: SyncSender<PtyEvent>,
+    ready: OutputReady,
+}
+
+#[cfg(test)]
+impl From<SyncSender<PtyEvent>> for EventSender {
+    fn from(tx: SyncSender<PtyEvent>) -> Self {
+        Self {
+            tx,
+            ready: OutputReady::default(),
+        }
+    }
+}
+
+impl EventSender {
+    fn send(&self, event: PtyEvent) -> Result<(), std::sync::mpsc::SendError<PtyEvent>> {
+        let sent = self.tx.send(event);
+        self.ready.wake();
+        sent
+    }
+}
+
 fn spawn_writer(
     mut writer: Box<dyn Write + Send>,
-    events: SyncSender<PtyEvent>,
+    events: EventSender,
     stopped: Arc<AtomicBool>,
 ) -> Sender<InputChunk> {
     let (sender, receiver) = channel::<InputChunk>();
@@ -531,7 +589,7 @@ fn spawn_writer(
 
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
-    sender: SyncSender<PtyEvent>,
+    sender: EventSender,
     progress: Arc<ReaderProgress>,
 ) {
     thread::Builder::new()
@@ -572,7 +630,7 @@ fn spawn_reader(
 
 fn spawn_waiter(
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    sender: SyncSender<PtyEvent>,
+    sender: EventSender,
     progress: Arc<ReaderProgress>,
 ) {
     thread::Builder::new()
@@ -641,13 +699,37 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn every_event_wakes_the_consumer_even_when_it_was_not_waiting_yet() {
+        let (tx, rx) = sync_channel(4);
+        let ready = OutputReady::default();
+        let sender = EventSender {
+            tx,
+            ready: ready.clone(),
+        };
+        sender.send(PtyEvent::Data(b"hi".to_vec())).expect("sent");
+        // The wakeup was sent before anyone waited, and is still there to be taken.
+        let woke = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = woke.clone();
+        let waiter = thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a runtime")
+                .block_on(async { ready.wait().await });
+            flag.store(true, Ordering::Release);
+        });
+        waiter.join().expect("the waiter returns");
+        assert!(woke.load(Ordering::Acquire));
+        assert!(matches!(rx.try_recv(), Ok(PtyEvent::Data(_))));
+    }
+
+    #[test]
     fn reader_backpressure_preserves_bytes_and_drop_unblocks_it() {
         let data = vec![b'x'; 2 * 1024 * 1024];
         let (tx, rx) = sync_channel(128);
         let progress = Arc::new(ReaderProgress::new());
         spawn_reader(
             Box::new(std::io::Cursor::new(data.clone())),
-            tx,
+            tx.into(),
             progress.clone(),
         );
         thread::sleep(Duration::from_millis(30));
@@ -660,7 +742,11 @@ mod tests {
 
         let (tx, rx) = sync_channel(1);
         let progress = Arc::new(ReaderProgress::new());
-        spawn_reader(Box::new(std::io::Cursor::new(data)), tx, progress.clone());
+        spawn_reader(
+            Box::new(std::io::Cursor::new(data)),
+            tx.into(),
+            progress.clone(),
+        );
         drop(rx);
         let deadline = Instant::now() + Duration::from_secs(2);
         while !progress.done.load(Ordering::Acquire) && Instant::now() < deadline {
@@ -709,7 +795,7 @@ mod tests {
                 entered,
                 release: gate,
             }),
-            events,
+            events.into(),
             Arc::new(AtomicBool::new(false)),
         );
         let budget = InputBudget::default();

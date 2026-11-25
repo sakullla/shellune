@@ -2397,26 +2397,6 @@ impl ShelluneView {
                                 )),
                             );
                         }
-                        picker = picker.child(
-                            div().flex().items_center().child(
-                                components::compact_button(
-                                    security.new_password,
-                                    components::Variant::Secondary,
-                                    metrics,
-                                )
-                                .id("connection.auth.credential.new")
-                                .debug_selector(|| "connection.auth.credential.new".to_owned())
-                                .on_click(cx.listener(
-                                    |this, _event, _window, cx| {
-                                        this.security_open_inline(
-                                        super::security::SecurityAction::NewCredential,
-                                        super::security::PendingVaultBind::DesktopSharedCredential,
-                                        cx,
-                                    );
-                                    },
-                                )),
-                            ),
-                        );
                     }
                     if chosen.is_some() {
                         picker = picker.child(

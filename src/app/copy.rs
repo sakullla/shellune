@@ -1142,8 +1142,6 @@ pub struct Strings {
     pub terminal_paste_runs: &'static str,
     /// Confirms a saved command that will run once it is written.
     pub terminal_paste_run_confirm: &'static str,
-    /// What leaving the confirmation does: nothing is written.
-    pub terminal_paste_safe: &'static str,
     /// Enhanced mode, but the shell has not emitted integration markers.
     pub terminal_no_blocks: &'static str,
     /// Integration was seen and then stopped being trustworthy.
@@ -1743,7 +1741,6 @@ pub static ENGLISH: Strings = Strings {
     terminal_paste_lines: "lines",
     terminal_paste_runs: "Runs once you confirm",
     terminal_paste_run_confirm: "Run this command",
-    terminal_paste_safe: "Esc or Do not paste writes nothing and keeps the keyboard in the terminal.",
     terminal_no_blocks: "This shell has not reported command blocks. The grid is unchanged.",
     terminal_blocks_failed: "Shell integration failed. The classic grid was kept.",
     terminal_filter_all: "All commands",
@@ -2309,7 +2306,6 @@ pub static CHINESE: Strings = Strings {
     terminal_paste_lines: "行",
     terminal_paste_runs: "确认后执行",
     terminal_paste_run_confirm: "执行这条命令",
-    terminal_paste_safe: "按 Esc 或「不粘贴」不会写入任何内容，键盘回到终端。",
     terminal_no_blocks: "这个 Shell 没有报告命令块。网格保持原样。",
     terminal_blocks_failed: "Shell 集成已失效。经典网格已保留。",
     terminal_filter_all: "全部命令",
@@ -2885,6 +2881,22 @@ pub struct UxStrings {
     pub connect_more_options: &'static str,
     /// Connection failure that was not about signing in: open the sign-in form anyway
     pub connect_change_sign_in: &'static str,
+    /// Paste dialog: a final line break will run the text as soon as it lands
+    pub paste_trailing_break: &'static str,
+    /// Paste dialog: drops the final line break so nothing runs on its own
+    pub paste_trim_break: &'static str,
+    /// Paste dialog: how the text can be changed and confirmed
+    pub paste_edit_hint: &'static str,
+    /// Paste dialog, while the text is being edited
+    pub paste_editing_hint: &'static str,
+    /// Changed server identity: the label of the fingerprint trusted before
+    pub identity_stored: &'static str,
+    /// Changed server identity: the label of the fingerprint presented now
+    pub identity_presented: &'static str,
+    /// Changed server identity: what to check before replacing the record
+    pub identity_replace_hint: &'static str,
+    /// Changed server identity: drop the old record and verify the new one
+    pub identity_replace: &'static str,
     /// Sign-in method: try what the computer has
     pub auth_auto: &'static str,
     /// What the automatic sign-in tries
@@ -3690,6 +3702,14 @@ impl UxStrings {
             self.connect_step_terminal,
             self.connect_more_options,
             self.connect_change_sign_in,
+            self.paste_trailing_break,
+            self.paste_trim_break,
+            self.paste_edit_hint,
+            self.paste_editing_hint,
+            self.identity_stored,
+            self.identity_presented,
+            self.identity_replace_hint,
+            self.identity_replace,
             self.auth_auto,
             self.auth_auto_hint,
             self.host_dialog_intro,
@@ -4210,6 +4230,14 @@ included",
     connect_step_terminal: "Open the terminal",
     connect_more_options: "More options…",
     connect_change_sign_in: "Change how to sign in…",
+    paste_trailing_break: "Ends with a line break: runs as soon as it is pasted",
+    paste_trim_break: "Remove final line break",
+    paste_edit_hint: "Click the text to edit it. Enter pastes, Esc pastes nothing.",
+    paste_editing_hint: "Editing: Enter adds a line, {confirm} pastes, Esc pastes nothing.",
+    identity_stored: "Trusted",
+    identity_presented: "Now",
+    identity_replace_hint: "Continue only if you know why it changed - the server was reinstalled or its keys were replaced - or you checked the new fingerprint with its administrator. You will be asked to accept it once more.",
+    identity_replace: "Remove old fingerprint and verify…",
     auth_auto: "Automatic",
     host_dialog_intro: "An address and a user are enough; everything else can wait.",
     host_name_optional: "Name (optional)",
@@ -4725,6 +4753,14 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     connect_step_terminal: "打开终端",
     connect_more_options: "更多选项…",
     connect_change_sign_in: "修改登录方式…",
+    paste_trailing_break: "末尾有换行：粘贴后会立即执行",
+    paste_trim_break: "去掉末尾换行",
+    paste_edit_hint: "点击内容即可修改。Enter 粘贴，Esc 不粘贴。",
+    paste_editing_hint: "正在编辑：Enter 换行，{confirm} 粘贴，Esc 不粘贴。",
+    identity_stored: "原指纹",
+    identity_presented: "现指纹",
+    identity_replace_hint: "仅在你清楚变化原因（服务器重装、更换了主机密钥）或已向管理员核对新指纹时继续。继续后会再次展示新指纹，由你确认是否信任。",
+    identity_replace: "移除旧指纹并重新核验…",
     auth_auto: "自动",
     host_dialog_intro: "填好地址和用户名就能连接，其余都可以以后再说。",
     host_name_optional: "名称（可选）",

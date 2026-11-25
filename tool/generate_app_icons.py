@@ -165,6 +165,11 @@ def main():
     image.save(targets[0], optimize=True)
     image.save(targets[1], sizes=[(s, s) for s in (16, 24, 32, 48, 64, 128, 256)])
     image.save(targets[2], format="ICNS")
+    # The in-app logo: drawn at most 64pt (128px on a Retina display, 256px at the
+    # largest text size), so the window decodes a 256px image, not the 1024px one.
+    mark = ICONS / "shellune-mark.png"
+    image.resize((256, 256), Image.Resampling.LANCZOS).save(mark, optimize=True)
+    targets.append(mark)
     for target in targets:
         print(target)
 

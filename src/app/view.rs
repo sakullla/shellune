@@ -72,6 +72,7 @@ use crate::app::remote::{
 };
 use crate::app::snippets::{SnippetLibrary, SnippetsPanel};
 use crate::app::terminal::{self, PaneState, SourceEvent, TerminalAttention, TerminalPane};
+use crate::app::text_area::TextArea;
 use crate::app::text_field::{Browse, TextField};
 use crate::app::theme::{self, Elevated, Metrics, Tone, palette, spacing};
 #[cfg(test)]
@@ -508,6 +509,20 @@ pub(crate) fn close_intent(platform: Platform, app_close_confirmed: bool) -> Clo
     }
 }
 
+/// The tallest the paste dialog's editor grows before it scrolls, in logical pixels.
+const PASTE_EDITOR_MAX_HEIGHT: f32 = 220.0;
+
+/// The paste dialog's editable copy of one waiting paste.
+pub(super) struct PasteEditor {
+    /// The session whose pane holds the paste.
+    session: SessionId,
+    /// The text as the pane holds it, to tell a new paste from this one.
+    original: String,
+    area: Entity<TextArea>,
+    /// Redraws the dialog as the text changes: its line count and its warning follow it.
+    _watch: gpui::Subscription,
+}
+
 /// The application shell view.
 pub struct ShelluneView {
     workspace: Workspace,
@@ -750,6 +765,10 @@ pub struct ShelluneView {
     remote_more: bool,
     /// Whether a failure that was not about signing in still shows the sign-in form.
     remote_edit_auth: bool,
+    /// The form reconnects once the vault job that forgets a changed server identity
+    /// is done, so the next attempt asks about the new identity instead of failing on
+    /// the old record again.
+    pub(super) trust_replace_retry: bool,
     /// Rules waiting for that dial to authenticate.
     pending_forward_rules: Vec<ForwardId>,
     /// A non-loopback listen waiting for confirmation. Nothing is bound.
@@ -963,6 +982,11 @@ pub struct ShelluneView {
     /// The preview holds the whole block, so a long paste is read by scrolling it in
     /// the dialog rather than by truncating it (R17).
     paste_scroll: gpui::ScrollHandle,
+    /// The editable copy of the waiting paste, so it can be corrected before it is sent.
+    ///
+    /// It belongs to one pane's one paste: a new paste, or the paste of another pane,
+    /// gets a fresh editor holding its own text.
+    pub(super) paste_editor: Option<PasteEditor>,
     /// Whether this draw laid a dialog over the page. [`shell`]'s `modal` sets it, and
     /// the end of the draw reads and clears it.
     modal_drawn: std::cell::Cell<bool>,
@@ -2998,6 +3022,7 @@ impl ShelluneView {
             forward_host_focus: cx.focus_handle(),
             remote_more: false,
             remote_edit_auth: false,
+            trust_replace_retry: false,
             pending_forward_rules: Vec::new(),
             pending_exposure: None,
             forward_confirm: None,
@@ -3070,6 +3095,7 @@ impl ShelluneView {
             paste_focus: cx.focus_handle(),
             paste_watch: None,
             paste_scroll: gpui::ScrollHandle::new(),
+            paste_editor: None,
             modal_drawn: std::cell::Cell::new(false),
             question_watch: None,
             session_menu: None,
@@ -5174,11 +5200,75 @@ impl ShelluneView {
         let Some((id, pane)) = self.paste_prompt(cx) else {
             return false;
         };
-        pane.update(cx, |pane, cx| {
-            pane.confirm_paste(cx);
+        let edited = self
+            .paste_editor
+            .take()
+            .filter(|editor| editor.session == id)
+            .map(|editor| editor.area.read(cx).text().to_owned());
+        pane.update(cx, |pane, cx| match edited {
+            Some(text) => {
+                pane.confirm_edited_paste(&text, cx);
+            }
+            None => {
+                pane.confirm_paste(cx);
+            }
         });
         self.settle_after_paste_answer(id, cx);
         true
+    }
+
+    /// Whether the paste dialog's text is being edited: then keys type into it.
+    fn paste_editing(&self, window: &Window, cx: &gpui::App) -> bool {
+        self.paste_editor
+            .as_ref()
+            .is_some_and(|editor| editor.area.read(cx).focus_handle().is_focused(window))
+    }
+
+    /// Keeps the paste dialog's editor on the paste that is waiting now.
+    fn sync_paste_editor(&mut self, cx: &mut Context<Self>) {
+        let waiting = self.paste_prompt(cx).and_then(|(id, pane)| {
+            pane.read(cx)
+                .pending_paste_text()
+                .map(|text| (id, text.to_owned()))
+        });
+        match waiting {
+            Some((id, text)) => {
+                let current = self
+                    .paste_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.session == id && editor.original == text);
+                if !current {
+                    let height = px(PASTE_EDITOR_MAX_HEIGHT);
+                    let area = cx.new(|cx| TextArea::new(text.clone(), height, cx));
+                    let watch = cx.observe(&area, |_view, _area, cx| cx.notify());
+                    self.paste_editor = Some(PasteEditor {
+                        session: id,
+                        original: text,
+                        area,
+                        _watch: watch,
+                    });
+                }
+            }
+            None => self.paste_editor = None,
+        }
+    }
+
+    /// The text in the paste dialog's editor, for a test.
+    #[cfg(test)]
+    pub fn paste_editor_text_for_test(&self, cx: &gpui::App) -> Option<String> {
+        self.paste_editor
+            .as_ref()
+            .map(|editor| editor.area.read(cx).text().to_owned())
+    }
+
+    /// Replaces the text in the paste dialog's editor, for a test.
+    #[cfg(test)]
+    pub fn set_paste_editor_text_for_test(&mut self, text: &str, cx: &mut Context<Self>) {
+        if let Some(editor) = self.paste_editor.as_ref() {
+            editor
+                .area
+                .update(cx, |area, cx| area.set_text_for_test(text, cx));
+        }
     }
 
     /// Drops the waiting paste without writing anything.
@@ -5187,6 +5277,7 @@ impl ShelluneView {
             return false;
         };
         pane.update(cx, |pane, cx| pane.cancel_paste(cx));
+        self.paste_editor = None;
         self.settle_after_paste_answer(id, cx);
         true
     }
@@ -5196,9 +5287,52 @@ impl ShelluneView {
     /// Escape and Enter are the two answers; every other combination is spent here so
     /// neither the terminal behind the dialog nor a shortcut of the window acts on a
     /// key that was pressed at a dialog (R17).
-    fn answer_paste_key(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) -> bool {
+    fn answer_paste_key(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        editing: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if !self.paste_prompt_open(cx) {
             return false;
+        }
+        if editing {
+            let mac = Platform::current() == Platform::MacOs;
+            let modifiers = &keystroke.modifiers;
+            let command = if mac {
+                modifiers.platform
+            } else {
+                modifiers.control
+            };
+            match keystroke.key.as_str() {
+                "escape" if !modifiers.modified() => {
+                    self.cancel_paste_prompt(cx);
+                }
+                "enter" if command => {
+                    self.confirm_paste_prompt(cx);
+                }
+                // The editor's own keys go to it; any other combination with the
+                // command key is spent here, so no shortcut of the window runs behind
+                // the dialog while it is being typed into.
+                key if command
+                    && !matches!(
+                        key,
+                        "a" | "c"
+                            | "x"
+                            | "v"
+                            | "left"
+                            | "right"
+                            | "up"
+                            | "down"
+                            | "home"
+                            | "end"
+                            | "backspace"
+                            | "delete"
+                    ) => {}
+                _ => return false,
+            }
+            self.paste_key_spent = true;
+            return true;
         }
         match keystroke.key.as_str() {
             "escape" => {
@@ -11518,8 +11652,10 @@ impl ShelluneView {
     ) {
         // An attempt that never connected has no bridge, so the bar must not claim one.
         self.x11.remove(&id);
-        let failure = RemoteFailure::from_error(error);
         if let Some(panel) = self.panel_for_mut(id) {
+            let host = panel.host();
+            let failure =
+                RemoteFailure::from_server_error(host.address(), host.port().get(), error);
             panel.fail(failure);
         }
         self.workspace.session_failed(id, error.session_failure());
@@ -12085,6 +12221,44 @@ impl ShelluneView {
     }
 
     /// Tries again with whatever the form holds now.
+    /// Drops the record of a server identity that changed and connects again (R7).
+    ///
+    /// The user asked for it from the failure card, after seeing both fingerprints.
+    /// Nothing new is trusted here: the next attempt meets the server as a first
+    /// contact and shows its identity for an explicit accept or refuse. The record
+    /// lives in this device's file and in the vault; the vault half is a background
+    /// job, so the retry waits for it rather than failing on the old record again.
+    pub(super) fn replace_changed_identity(
+        &mut self,
+        address: &str,
+        port: u16,
+        cx: &mut Context<Self>,
+    ) {
+        self.security_forget_trust(address, port, cx);
+        if self.security_busy() {
+            self.trust_replace_retry = true;
+        } else {
+            self.retry_remote(cx);
+        }
+        cx.notify();
+    }
+
+    /// Connects again after a changed identity was forgotten, once no vault job is
+    /// left that could still restore it.
+    pub(super) fn settle_trust_replace_retry(&mut self, cx: &mut Context<Self>) {
+        if self.trust_replace_retry && !self.security_busy() {
+            self.trust_replace_retry = false;
+            let waiting = self
+                .remote
+                .as_ref()
+                .and_then(|panel| panel.status().failure())
+                .is_some_and(|failure| failure.identity_change().is_some());
+            if waiting {
+                self.retry_remote(cx);
+            }
+        }
+    }
+
     fn retry_remote(&mut self, cx: &mut Context<Self>) {
         if let Some(panel) = self.remote.as_mut() {
             panel.set_status(RemoteStatus::Idle);
@@ -12958,6 +13132,51 @@ impl ShelluneView {
                             .debug_selector(|| "remote.failure.next".to_owned())
                             .child(SharedString::from(next_step)),
                     )
+                    .when_some(failure.identity_change().cloned(), |banner, change| {
+                        // Both fingerprints, side by side and copyable, so they can be
+                        // compared with what the administrator says; then the one way
+                        // forward, which still ends in the normal trust question.
+                        let ux = copy::ux();
+                        banner
+                            .child(self.trust_line(
+                                ux.identity_stored,
+                                "remote.identity.stored",
+                                change.stored.clone(),
+                            ))
+                            .child(self.trust_line(
+                                ux.identity_presented,
+                                "remote.identity.presented",
+                                format!("{} {}", change.algorithm, change.presented),
+                            ))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .whitespace_normal()
+                                    .text_size(metrics.caption_size())
+                                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                    .child(ux.identity_replace_hint),
+                            )
+                            .child(
+                                div().flex().w_full().justify_end().child(
+                                    components::compact_button(
+                                        ux.identity_replace,
+                                        Variant::Danger,
+                                        metrics,
+                                    )
+                                    .id("remote.identity.replace")
+                                    .debug_selector(|| "remote.identity.replace".to_owned())
+                                    .on_click(cx.listener(
+                                        move |view, _event, _window, cx| {
+                                            view.replace_changed_identity(
+                                                &change.address,
+                                                change.port,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                                ),
+                            )
+                    })
                     .child(
                         components::copy_on_click(
                             div()
@@ -14314,6 +14533,10 @@ impl ShelluneView {
     pub(super) fn is_overlay_internal_focus(&self, handle: &FocusHandle, cx: &gpui::App) -> bool {
         handle == &self.snippet_focus
             || handle == &self.paste_focus
+            || self
+                .paste_editor
+                .as_ref()
+                .is_some_and(|editor| editor.area.read(cx).focus_handle() == handle)
             || handle == &self.tab_list_focus
             || handle == &self.forward_host_focus
             || self
@@ -21881,9 +22104,29 @@ impl ShelluneView {
         // The letters of every saved record, worked out once for the strip: a remote
         // tab wears its host's tile, and the letters are the list's own.
         let monograms = self.monograms();
-        for index in (0..layout.tabs().len()).filter(|index| shown(*index)) {
+        let count = layout.tabs().len();
+        let current = |index: usize| active == Some(index);
+        let gap = metrics.scale(spacing::HALF);
+        for index in (0..count).filter(|index| shown(*index)) {
+            // A faint rule between two tabs that are neither current gives a resting tab
+            // an edge of its own; beside the current tab its raised pill is the edge.
+            let ruled = !compact && index + 1 < count && !current(index) && !current(index + 1);
             if let Some(id) = layout.anchor_of(index) {
-                scroller = scroller.child(self.session_tab(id, index, &monograms, window, cx));
+                scroller = scroller.child(
+                    self.session_tab(id, index, &monograms, window, cx)
+                        .when(ruled, |tab| {
+                            tab.child(
+                                div()
+                                    .absolute()
+                                    .top(gpui::relative(0.5))
+                                    .mt(-metrics.scale(shell::TAB_RULE_HEIGHT) / 2.0)
+                                    .right(-(gap + px(components::HAIRLINE_WIDTH)) / 2.0)
+                                    .w(px(components::HAIRLINE_WIDTH))
+                                    .h(metrics.scale(shell::TAB_RULE_HEIGHT))
+                                    .bg(theme::swatch(palette::BORDER_STRONG)),
+                            )
+                        }),
+                );
             } else {
                 scroller = scroller.child(self.pending_tab(index, window, cx));
             }
@@ -22636,18 +22879,23 @@ impl Render for ShelluneView {
         // The paste confirmation holds the keyboard while it is up. Nothing behind it
         // is typed into, and no key reaches a program through the dialog; the root is
         // what answers Escape and Enter for it (R17).
+        self.sync_paste_editor(cx);
         if self.paste_prompt_open(cx) {
-            if !self.paste_focus.is_focused(window) {
+            // The dialog keeps the keyboard; the editor inside it may have it instead.
+            if !self.paste_focus.is_focused(window) && !self.paste_editing(window, cx) {
                 window.focus(&self.paste_focus);
             }
             if self.paste_watch.is_none() {
                 let view = cx.entity().downgrade();
                 // Everything typed while the dialog is up belongs to the dialog: bound
                 // shortcuts included, so no action runs behind an unanswered paste.
-                let watch = cx.intercept_keystrokes(move |event, _window, app| {
+                let watch = cx.intercept_keystrokes(move |event, window, app| {
                     let keystroke = event.keystroke.clone();
                     let answered = view
-                        .update(app, |view, cx| view.answer_paste_key(&keystroke, cx))
+                        .update(app, |view, cx| {
+                            let editing = view.paste_editing(window, cx);
+                            view.answer_paste_key(&keystroke, editing, cx)
+                        })
                         .unwrap_or(false);
                     // Only a key that reached the dialog is spent on it; once the answer
                     // is in, the next keystroke belongs to the terminal again.
@@ -22744,6 +22992,11 @@ impl Render for ShelluneView {
                 // confirms it, and every other key is spent on the dialog rather than
                 // typed into a program the user cannot see past it (R17).
                 if this.paste_prompt_open(cx) {
+                    // Typing in the dialog's editor: the interceptor already answered
+                    // Escape and the confirm key, and every other key is the editor's.
+                    if this.paste_editing(window, cx) {
+                        return;
+                    }
                     match event.keystroke.key.as_str() {
                         "escape" => {
                             this.cancel_paste_prompt(cx);

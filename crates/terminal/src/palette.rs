@@ -43,6 +43,11 @@ pub const CURSOR: Rgb = Rgb {
 /// colour shouts over the others. Each bright slot is the same hue a clear step
 /// lighter, not a paler copy. The tests check that every colour a program can use
 /// as text stays readable on `BACKGROUND` and that the bright variants are lighter.
+///
+/// Readable is measured with APCA, which judges light-on-dark text fairly where WCAG
+/// overstates it: every colour reaches Lc 60 (APCA's floor for content text) on the
+/// background, and bright black - the grey of hints, comments and autosuggestions -
+/// reaches Lc 45, so it reads as quieter than text without vanishing.
 pub const ANSI: [Rgb; 16] = [
     Rgb {
         r: 0x35,
@@ -50,9 +55,9 @@ pub const ANSI: [Rgb; 16] = [
         b: 0x41,
     },
     Rgb {
-        r: 0xf6,
-        g: 0x88,
-        b: 0x82,
+        r: 0xf8,
+        g: 0x98,
+        b: 0x92,
     },
     Rgb {
         r: 0x6b,
@@ -65,14 +70,14 @@ pub const ANSI: [Rgb; 16] = [
         b: 0x56,
     },
     Rgb {
-        r: 0x77,
-        g: 0xab,
-        b: 0xf7,
+        r: 0x86,
+        g: 0xb4,
+        b: 0xf8,
     },
     Rgb {
-        r: 0xce,
-        g: 0x90,
-        b: 0xdc,
+        r: 0xd8,
+        g: 0xa0,
+        b: 0xe4,
     },
     Rgb {
         r: 0x59,
@@ -85,9 +90,9 @@ pub const ANSI: [Rgb; 16] = [
         b: 0xc4,
     },
     Rgb {
-        r: 0x81,
-        g: 0x86,
-        b: 0x90,
+        r: 0x94,
+        g: 0x99,
+        b: 0xa3,
     },
     Rgb {
         r: 0xfe,
@@ -261,6 +266,44 @@ mod tests {
                 "ANSI colour {index} is {ratio:.2}:1 on the terminal background"
             );
         }
+    }
+
+    fn apca(text: Rgb, background: Rgb) -> f64 {
+        let screen = |c: Rgb| {
+            let ch = |v: u8| (f64::from(v) / 255.0).powf(2.4);
+            let y = 0.212_672_9 * ch(c.r) + 0.715_152_2 * ch(c.g) + 0.072_175 * ch(c.b);
+            if y > 0.022 {
+                y
+            } else {
+                y + (0.022 - y).powf(1.414)
+            }
+        };
+        let (text, background) = (screen(text), screen(background));
+        if background > text {
+            let s = (background.powf(0.56) - text.powf(0.57)) * 1.14;
+            if s < 0.1 { 0.0 } else { (s - 0.027) * 100.0 }
+        } else {
+            let s = (background.powf(0.65) - text.powf(0.62)) * 1.14;
+            if s > -0.1 { 0.0 } else { (s + 0.027) * 100.0 }
+        }
+    }
+
+    #[test]
+    fn every_ansi_colour_meets_the_apca_content_floor() {
+        for slot in (1..=7).chain(9..=15) {
+            let lc = apca(ANSI[slot], BACKGROUND).abs();
+            assert!(
+                lc >= 60.0,
+                "ANSI colour {slot} is Lc {lc:.1} on the background"
+            );
+        }
+        let quiet = apca(ANSI[8], BACKGROUND).abs();
+        assert!(
+            quiet >= 45.0,
+            "bright black is Lc {quiet:.1} on the background"
+        );
+        let text = apca(FOREGROUND, BACKGROUND).abs();
+        assert!(text >= 75.0, "the default text is Lc {text:.1}");
     }
 
     #[test]

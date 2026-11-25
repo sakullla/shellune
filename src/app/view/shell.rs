@@ -52,6 +52,10 @@ const SESSION_ACTION_HEIGHT: f32 = 22.0;
 /// The edge of a square icon button of the top bar, before zoom.
 const BAR_ICON_SIZE: f32 = 30.0;
 
+/// The height of the short rule between the pinned hosts tab and the session tabs, and
+/// between two session tabs that are neither current.
+pub(super) const TAB_RULE_HEIGHT: f32 = 16.0;
+
 /// The padding a segmented control's floor reserves on each side: the track's own
 /// padding and a pixel of rounding room.
 const SEGMENTED_FLOOR_PADDING: f32 = 3.0;
@@ -295,12 +299,26 @@ impl ShelluneView {
         // The tabs stand in the middle of the head (ADR-7). The hosts tab is pinned and
         // never cut: the row's narrowest is at least its width. The session tabs scroll
         // beside it once they do not fit, and only they give up room (R2).
+        // A short rule sets the pinned page apart from the sessions, as a browser sets
+        // its pinned tabs apart: the hosts tab is a place, the others are connections.
+        let has_tabs = !self.workspace.layout().tabs().is_empty();
         let home = div()
             .flex()
             .items_center()
             .flex_none()
             .h(height)
-            .child(self.home_tab(compact, cx));
+            .child(self.home_tab(compact, cx))
+            .when(has_tabs && !compact, |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .mx(metrics.scale(spacing::HALF))
+                        .w(px(components::HAIRLINE_WIDTH))
+                        .h(metrics.scale(TAB_RULE_HEIGHT))
+                        .bg(theme::swatch(palette::BORDER_STRONG))
+                        .debug_selector(|| "nav.hosts.rule".to_owned()),
+                )
+            });
         let tabs = div()
             .flex()
             .items_center()
@@ -1020,7 +1038,9 @@ impl ShelluneView {
         // described as it really is (R5).
         let shortcut = crate::app::keymap::page_action(Destination::Hosts)
             .and_then(|spec| self.keymap.label(spec.id));
-        let name = if compact && count > 0 {
+        // The count of saved records is the sidebar's: beside the word it read as part
+        // of the name ("Hosts 1"), so the tab names the page and its tooltip counts.
+        let name = if count > 0 {
             format!("{} ({count})", strings.nav_hosts)
         } else {
             strings.nav_hosts.to_owned()
@@ -1050,15 +1070,6 @@ impl ShelluneView {
                                 .when(selected, |label| label.font_weight(FontWeight::MEDIUM))
                                 .debug_selector(|| "nav.hosts.title".to_owned())
                                 .child(strings.nav_hosts),
-                        )
-                    })
-                    .when(count > 0 && !compact, |body| {
-                        body.child(
-                            div()
-                                .flex_none()
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .child(SharedString::from(count.to_string())),
                         )
                     }),
             )

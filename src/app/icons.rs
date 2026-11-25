@@ -418,13 +418,18 @@ impl Icon {
 /// Serves the embedded icons to GPUI.
 pub struct Assets;
 
-pub const APP_ICON: &str = "icons/shellune.png";
+/// The logo drawn inside the window.
+///
+/// A 256px copy of the application icon: the window draws it at 64pt at most, and the
+/// decoded image stays cached (and uploaded to the GPU) for as long as the window
+/// lives, so the 1024px icon would hold 4 MB twice over for nothing.
+pub const APP_ICON: &str = "icons/shellune-mark.png";
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
         if path == APP_ICON {
             return Ok(Some(Cow::Borrowed(include_bytes!(
-                "../../assets/icons/shellune.png"
+                "../../assets/icons/shellune-mark.png"
             ))));
         }
         if let Some(document) = crate::app::os_icons::svg(path) {

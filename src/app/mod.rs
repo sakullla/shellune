@@ -46,6 +46,7 @@ pub mod scrollbar;
 pub mod serial;
 pub mod snippets;
 pub mod terminal;
+pub mod text_area;
 pub mod text_field;
 pub mod theme;
 pub mod transfers;
