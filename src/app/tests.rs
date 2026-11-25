@@ -634,7 +634,7 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_the_large_text(
                     "settings.sync.password",
                     "settings.sync.remote-dir",
                     "settings.sync.auto",
-                    "settings.sync.secrets",
+                    "settings.sync.passphrase",
                     "settings.sync.save",
                     "settings.sync.test",
                     "settings.sync.upload",
@@ -9672,7 +9672,6 @@ fn connected_remote_tab<'a>(
     SessionId,
     impl FnOnce(),
 ) {
-    use shellune_storage::SecretStore as _;
     let mut host = stored_host("mirror", "127.0.0.1", 1, "deploy", None);
     host.set_auth(Some(shellune_core::AuthMethodKind::Password));
     host.set_remember_secret(true);
@@ -9727,9 +9726,8 @@ fn connected_remote_tab<'a>(
         .expect("the connected session is on screen");
     assert_eq!(session_state(cx, &view, id), Some(SessionState::Connected));
     let remember = move || {
-        secrets
-            .save(host_id, &shellune_core::SecretString::new("hunter2-secret"))
-            .expect("the password is kept");
+        // An entry an older build saved: the reconnect migrates it (R3).
+        secrets.seed_legacy_host(host_id, &shellune_core::SecretString::new("hunter2-secret"));
     };
     (view, cx, id, remember)
 }
@@ -17150,6 +17148,466 @@ async fn unticking_remember_or_deleting_the_host_forgets_the_secret(cx: &mut Tes
     );
 }
 
+// ---------------------------------------------------------------------------
+// Remembered passwords live in the vault (R1, R2, R3)
+// ---------------------------------------------------------------------------
+
+/// A window on the hosts page whose credential store is `secrets`.
+fn remembered_window<'a>(
+    cx: &'a mut TestAppContext,
+    dir: &TempDir,
+    secrets: Arc<dyn shellune_storage::SecretStore>,
+) -> (Entity<ShelluneView>, &'a mut VisualTestContext) {
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Hosts);
+    let store = dir.store();
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_secrets_for_test(cx, workspace, store, secrets)
+    });
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    (view, cx)
+}
+
+/// `count` hosts that sign in with a remembered password, on `127.0.0.1:1`.
+fn remembered_hosts(count: usize) -> Vec<HostConfig> {
+    (0..count)
+        .map(|index| {
+            let mut host = stored_host(&format!("r{index:03}"), "127.0.0.1", 1, "deploy", None);
+            host.set_auth(Some(shellune_core::AuthMethodKind::Password));
+            host.set_remember_secret(true);
+            host
+        })
+        .collect()
+}
+
+/// Opens the connection of `host` and says whether it started dialling at once,
+/// with the password the form then holds.
+fn connect_remembered(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+    host: &HostConfig,
+) -> (bool, String) {
+    cx.update(|_window, app| view.update(app, |view, cx| view.open_remote(host, cx)));
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        let panel = view
+            .read(app)
+            .remote_state()
+            .expect("the connection form exists");
+        (panel.status().is_busy(), panel.password().to_owned())
+    })
+}
+
+/// The calls on `host-<uuid>` entries the store answered.
+fn host_entry_accesses(
+    secrets: &shellune_storage::MemorySecrets,
+) -> Vec<shellune_storage::SecretAccess> {
+    secrets
+        .accesses()
+        .into_iter()
+        .filter(shellune_storage::SecretAccess::is_host_entry)
+        .collect()
+}
+
+/// A credential store that refuses what a test asks it to and hands everything
+/// else to `inner`: a denied read of an old host entry, or a vault that cannot
+/// be saved because its unseal secret cannot be reached.
+struct FaultySecrets {
+    inner: Arc<shellune_storage::MemorySecrets>,
+    refused: shellune_storage::MemorySecrets,
+    deny_host_reads: bool,
+    deny_app: bool,
+}
+
+impl FaultySecrets {
+    fn new(inner: &Arc<shellune_storage::MemorySecrets>) -> Self {
+        Self {
+            inner: inner.clone(),
+            refused: shellune_storage::MemorySecrets::unavailable(),
+            deny_host_reads: false,
+            deny_app: false,
+        }
+    }
+}
+
+impl shellune_storage::SecretStore for FaultySecrets {
+    fn save(
+        &self,
+        host: HostId,
+        secret: &shellune_core::SecretString,
+    ) -> Result<(), shellune_storage::SecretError> {
+        self.inner.save(host, secret)
+    }
+
+    fn load(
+        &self,
+        host: HostId,
+    ) -> Result<Option<shellune_core::SecretString>, shellune_storage::SecretError> {
+        self.inner.load(host)
+    }
+
+    fn forget(&self, host: HostId) -> Result<(), shellune_storage::SecretError> {
+        self.inner.forget(host)
+    }
+
+    fn load_legacy_host(
+        &self,
+        host: HostId,
+    ) -> Result<Option<shellune_core::SecretString>, shellune_storage::SecretError> {
+        if self.deny_host_reads {
+            return self.refused.load_legacy_host(host);
+        }
+        self.inner.load_legacy_host(host)
+    }
+
+    fn forget_legacy_host(&self, host: HostId) -> Result<(), shellune_storage::SecretError> {
+        self.inner.forget_legacy_host(host)
+    }
+
+    fn save_app(
+        &self,
+        which: shellune_storage::AppSecret,
+        secret: &shellune_core::SecretString,
+    ) -> Result<(), shellune_storage::SecretError> {
+        if self.deny_app {
+            return self.refused.save_app(which, secret);
+        }
+        self.inner.save_app(which, secret)
+    }
+
+    fn load_app(
+        &self,
+        which: shellune_storage::AppSecret,
+    ) -> Result<Option<shellune_core::SecretString>, shellune_storage::SecretError> {
+        if self.deny_app {
+            return self.refused.load_app(which);
+        }
+        self.inner.load_app(which)
+    }
+
+    fn forget_app(
+        &self,
+        which: shellune_storage::AppSecret,
+    ) -> Result<(), shellune_storage::SecretError> {
+        if self.deny_app {
+            return self.refused.forget_app(which);
+        }
+        self.inner.forget_app(which)
+    }
+}
+
+/// The vault of `dir`, opened the way this machine opens it.
+fn open_vault(
+    dir: &TempDir,
+    secrets: &shellune_storage::MemorySecrets,
+) -> shellune_storage::VaultContent {
+    shellune_storage::VaultStore::at(dir.path())
+        .open(&shellune_storage::UnsealSource::LocalMachine, secrets)
+        .expect("the vault opens")
+}
+
+/// Saving a host that remembers its password writes the password into the
+/// vault - created for it - and asks the credential store for no `host-<uuid>`
+/// entry at all (R1).
+#[gpui::test]
+async fn saving_a_remembered_password_fills_the_vault_and_no_host_entry(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remembered-save");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    let (view, cx) = remembered_window(cx, &dir, secrets.clone());
+    fill_new_host(cx);
+    click(cx, "hosts.auth.remote.method.password");
+    type_into(cx, "hosts.field.secret", "s3cret-pass");
+    click(cx, "hosts.save");
+    cx.run_until_parked();
+
+    assert!(
+        !cx.update(|_window, app| view.read(app).hosts_state().is_editing()),
+        "the form closes once the vault holds the password"
+    );
+    let host = cx
+        .update(|_window, app| view.read(app).book().hosts().first().cloned())
+        .expect("the host was saved");
+    assert!(host.remembers_secret());
+    assert_eq!(names_on_disk(&dir), vec!["box"]);
+    assert_eq!(
+        open_vault(&dir, &secrets)
+            .host_secret(host.id())
+            .map(shellune_core::SecretString::expose),
+        Some("s3cret-pass"),
+        "the vault on disk holds the password"
+    );
+    assert!(
+        host_entry_accesses(&secrets).is_empty(),
+        "no host-<uuid> entry was written or read"
+    );
+    assert!(secrets.is_empty());
+}
+
+/// A vault that cannot be saved refuses the form save: the reason is on the
+/// form, the form stays open with what was typed, and the host file is what it
+/// was - never a host marked "remembered" whose password is nowhere (R1).
+#[gpui::test]
+async fn a_vault_that_cannot_be_saved_keeps_the_form_and_the_host_file(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remembered-save-fails");
+    seed(
+        &dir.store(),
+        vec![stored_host("alpha", "10.0.0.1", 22, "root", None)],
+    );
+    let hosts_file = dir.path().join(shellune_storage::FILE_NAME);
+    let before = std::fs::read(&hosts_file).expect("the host file exists");
+    let memory = Arc::new(shellune_storage::MemorySecrets::new());
+    let mut faulty = FaultySecrets::new(&memory);
+    faulty.deny_app = true;
+    let (view, cx) = remembered_window(cx, &dir, Arc::new(faulty));
+    fill_new_host(cx);
+    click(cx, "hosts.auth.remote.method.password");
+    type_into(cx, "hosts.field.secret", "s3cret-pass");
+    click(cx, "hosts.save");
+    cx.run_until_parked();
+
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().is_editing()),
+        "the form stays open"
+    );
+    let message = cx
+        .update(|_window, app| {
+            view.read(app)
+                .hosts_state()
+                .message()
+                .map(|message| message.text().to_owned())
+        })
+        .expect("the reason is shown");
+    assert!(
+        message.starts_with(copy::ENGLISH.host_secret_failed),
+        "the form says the password could not be kept: {message}"
+    );
+    assert_eq!(
+        std::fs::read(&hosts_file).expect("the host file exists"),
+        before,
+        "the host file is unchanged"
+    );
+    assert!(
+        !shellune_storage::VaultStore::at(dir.path()).exists(),
+        "no vault was left behind"
+    );
+    assert!(memory.is_empty(), "and no host-<uuid> entry either");
+}
+
+/// With 300 hosts remembering their passwords and the vault open, connecting
+/// to any of them asks the credential store for nothing (R2).
+#[gpui::test]
+async fn three_hundred_remembered_hosts_connect_from_the_open_vault_without_the_store(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("remembered-300");
+    let hosts = remembered_hosts(300);
+    let passwords: Vec<(HostId, String)> = hosts
+        .iter()
+        .map(|host| (host.id(), format!("pw-{}", host.name())))
+        .collect();
+    seed(&dir.store(), hosts.clone());
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    let pairs: Vec<(HostId, &str)> = passwords
+        .iter()
+        .map(|(id, secret)| (*id, secret.as_str()))
+        .collect();
+    seed_host_secrets(&dir, secrets.as_ref(), &pairs);
+    let (view, cx) = remembered_window(cx, &dir, secrets.clone());
+    secrets.clear_accesses();
+
+    for host in hosts.iter().step_by(23) {
+        let (dialling, password) = connect_remembered(&view, cx, host);
+        assert!(dialling, "{} dials at once", host.name());
+        assert_eq!(password, format!("pw-{}", host.name()));
+    }
+    assert!(
+        secrets.accesses().is_empty(),
+        "the open vault answered every one: {:?}",
+        secrets.accesses()
+    );
+}
+
+/// A locked vault asks for one unlock when a remembered password is needed;
+/// after it, every other remembered host connects without asking again (R2).
+#[gpui::test]
+async fn a_locked_vault_asks_once_and_then_every_remembered_host_connects(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remembered-locked");
+    let hosts = remembered_hosts(3);
+    seed(&dir.store(), hosts.clone());
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    let pairs: Vec<(HostId, &str)> = hosts.iter().map(|host| (host.id(), "pw")).collect();
+    seed_host_secrets(&dir, secrets.as_ref(), &pairs);
+    let (view, cx) = remembered_window(cx, &dir, secrets.clone());
+    let authenticator = Arc::new(
+        shellune_storage::ScriptedAuthenticator::new(
+            shellune_storage::BiometricCapability::Biometrics,
+        )
+        .script([Ok(())]),
+    );
+    let verifier = authenticator.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_set_authenticator_for_test(authenticator);
+            view.security_enable_lock_for_test(shellune_storage::LockPolicy::UnlockVault, 15, cx);
+        })
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).security_locked_for_test()));
+
+    let (dialling, password) = connect_remembered(&view, cx, &hosts[0]);
+    assert_eq!(
+        verifier.verify_calls(),
+        1,
+        "the locked vault asked for one unlock"
+    );
+    assert!(dialling, "the unlock let the connection go on");
+    assert_eq!(password, "pw");
+    for host in &hosts[1..] {
+        let (dialling, _) = connect_remembered(&view, cx, host);
+        assert!(dialling, "{} dials without another prompt", host.name());
+    }
+    assert_eq!(verifier.verify_calls(), 1, "no second prompt");
+    assert!(host_entry_accesses(&secrets).is_empty());
+}
+
+/// A host an older build remembered in the credential store is migrated the
+/// first time its password is used: the old entry is read once, the password
+/// moves into the vault, the entry is deleted after the vault was saved, and
+/// the next connection asks the store for nothing (R3).
+#[gpui::test]
+async fn an_old_entry_is_read_once_moved_into_the_vault_and_deleted(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remembered-migrate");
+    let hosts = remembered_hosts(1);
+    let id = hosts[0].id();
+    seed(&dir.store(), hosts.clone());
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    secrets.seed_legacy_host(id, &shellune_core::SecretString::new("old-password"));
+    let (view, cx) = remembered_window(cx, &dir, secrets.clone());
+    assert!(
+        host_entry_accesses(&secrets).is_empty(),
+        "starting asks for no host entry"
+    );
+
+    let (dialling, password) = connect_remembered(&view, cx, &hosts[0]);
+    assert!(dialling, "the connection used the old password");
+    assert_eq!(password, "old-password");
+    assert_eq!(
+        host_entry_accesses(&secrets),
+        vec![
+            shellune_storage::SecretAccess::host(shellune_storage::SecretOp::Load, id),
+            shellune_storage::SecretAccess::host(shellune_storage::SecretOp::Forget, id),
+        ],
+        "one read, then the deletion once the vault held it"
+    );
+    assert!(!secrets.holds_legacy_host(id), "the old entry is gone");
+    assert_eq!(
+        open_vault(&dir, &secrets)
+            .host_secret(id)
+            .map(shellune_core::SecretString::expose),
+        Some("old-password")
+    );
+
+    secrets.clear_accesses();
+    let (dialling, password) = connect_remembered(&view, cx, &hosts[0]);
+    assert!(dialling);
+    assert_eq!(password, "old-password");
+    assert!(
+        secrets.accesses().is_empty(),
+        "the second connection reads the vault only: {:?}",
+        secrets.accesses()
+    );
+}
+
+/// An old entry whose read is refused is "not saved" for now: the form asks
+/// for the password, and the entry and the flag are kept for the next try (R3).
+#[gpui::test]
+async fn a_refused_old_entry_asks_for_the_password_and_keeps_the_entry(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remembered-denied");
+    let hosts = remembered_hosts(1);
+    let id = hosts[0].id();
+    seed(&dir.store(), hosts.clone());
+    let memory = Arc::new(shellune_storage::MemorySecrets::new());
+    memory.seed_legacy_host(id, &shellune_core::SecretString::new("old-password"));
+    let mut faulty = FaultySecrets::new(&memory);
+    faulty.deny_host_reads = true;
+    let (view, cx) = remembered_window(cx, &dir, Arc::new(faulty));
+
+    let (dialling, password) = connect_remembered(&view, cx, &hosts[0]);
+    assert!(!dialling, "the form asks for the password");
+    assert!(password.is_empty());
+    assert!(memory.holds_legacy_host(id), "the old entry is kept");
+    assert!(
+        cx.update(|_window, app| view
+            .read(app)
+            .book()
+            .host(id)
+            .map(HostConfig::remembers_secret))
+            .unwrap_or(false),
+        "the host still remembers its password"
+    );
+    assert!(
+        !shellune_storage::VaultStore::at(dir.path()).exists(),
+        "nothing was migrated"
+    );
+}
+
+/// A vault that cannot be saved keeps the old entry: the connection still uses
+/// the password it read, and nothing is deleted (R3).
+#[gpui::test]
+async fn a_vault_save_that_fails_keeps_the_old_entry_and_still_connects(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remembered-vault-fails");
+    let hosts = remembered_hosts(1);
+    let id = hosts[0].id();
+    seed(&dir.store(), hosts.clone());
+    let memory = Arc::new(shellune_storage::MemorySecrets::new());
+    memory.seed_legacy_host(id, &shellune_core::SecretString::new("old-password"));
+    let mut faulty = FaultySecrets::new(&memory);
+    faulty.deny_app = true;
+    let (view, cx) = remembered_window(cx, &dir, Arc::new(faulty));
+
+    let (dialling, password) = connect_remembered(&view, cx, &hosts[0]);
+    assert!(dialling, "the connection used the password it read");
+    assert_eq!(password, "old-password");
+    assert!(memory.holds_legacy_host(id), "the old entry is kept");
+    assert_eq!(
+        host_entry_accesses(&memory),
+        vec![shellune_storage::SecretAccess::host(
+            shellune_storage::SecretOp::Load,
+            id
+        )],
+        "read once, never deleted"
+    );
+    assert!(!shellune_storage::VaultStore::at(dir.path()).exists());
+}
+
+/// Starting with 300 hosts an older build remembered, and showing and
+/// searching their list, asks the credential store for no host entry (R3, R5).
+#[gpui::test]
+async fn starting_and_listing_three_hundred_old_hosts_reads_no_host_entry(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remembered-startup");
+    let hosts = remembered_hosts(300);
+    seed(&dir.store(), hosts.clone());
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    for host in &hosts {
+        secrets.seed_legacy_host(host.id(), &shellune_core::SecretString::new("old"));
+    }
+    let (view, cx) = remembered_window(cx, &dir, secrets.clone());
+    click(cx, "nav.hosts");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).book().hosts().len()),
+        300
+    );
+    click(cx, "hosts.edit.0");
+    cx.run_until_parked();
+    assert!(
+        host_entry_accesses(&secrets).is_empty(),
+        "no host-<uuid> entry was asked for: {:?}",
+        host_entry_accesses(&secrets)
+    );
+}
 #[gpui::test]
 async fn the_dialog_shows_the_fields_of_the_chosen_sign_in_and_closes_on_escape(
     cx: &mut TestAppContext,
@@ -27278,6 +27736,58 @@ fn a_route_names_why_a_host_cannot_be_reached() {
     assert!(!error.is_empty());
 }
 
+/// A batch run reads remembered passwords from the vault copy it started with
+/// and never asks the credential store for them; a host the vault does not
+/// know has its old entry read once, however many targets use it, and the
+/// password is handed back for the window to migrate (R2, R3).
+#[test]
+fn a_batch_route_reads_remembered_passwords_from_the_vault_and_migrates_the_rest() {
+    use crate::app::batch::StoredRoutes;
+    use shellune_ssh::batch::RouteSource;
+
+    let mut migrated = remembered_hosts(2);
+    let old = migrated.pop().expect("two hosts");
+    let kept = migrated.pop().expect("two hosts");
+    let book = HostBook::from_hosts(vec![kept.clone(), old.clone()]).expect("distinct hosts");
+    let trust = shellune_storage::HostTrust::new();
+    let secrets = std::sync::Arc::new(shellune_storage::MemorySecrets::new());
+    secrets.seed_legacy_host(old.id(), &shellune_core::SecretString::new("old-pw"));
+    let mut vault = shellune_storage::VaultContent::new();
+    vault.set_host_secret(kept.id(), shellune_core::SecretString::new("vault-pw"), "a");
+    let routes = StoredRoutes::new(&book, &trust, secrets.clone())
+        .with_vault(Some(vault))
+        .with_remembered(std::collections::BTreeMap::new(), true);
+    let defaults = shellune_core::ConnectionDefaults::default();
+
+    let target = shellune_core::BatchTarget::snapshot(&kept, defaults).expect("snapshot");
+    routes.take_route(&target).expect("the vault signs it in");
+    assert!(
+        secrets.accesses().is_empty(),
+        "the vault answered without the store"
+    );
+
+    let target = shellune_core::BatchTarget::snapshot(&old, defaults).expect("snapshot");
+    routes
+        .take_route(&target)
+        .expect("the old entry signs it in");
+    routes.take_route(&target).expect("and again");
+    assert_eq!(
+        secrets.accesses(),
+        vec![shellune_storage::SecretAccess::host(
+            shellune_storage::SecretOp::Load,
+            old.id()
+        )],
+        "the old entry is read once per run"
+    );
+    let migrations = routes.migrations();
+    let read = migrations.lock().expect("not poisoned");
+    assert_eq!(
+        read.get(&old.id()).map(shellune_core::SecretString::expose),
+        Some("old-pw"),
+        "the window gets it to move into the vault"
+    );
+    assert!(!read.contains_key(&kept.id()));
+}
 #[gpui::test]
 async fn enter_in_the_host_search_connects_the_first_match_and_only_while_searching(
     cx: &mut TestAppContext,
@@ -34990,6 +35500,28 @@ fn write_backup(
     );
 }
 
+/// Writes a vault holding these remembered host passwords, sealed for the
+/// machine whose store `secrets` is: where a remembered password lives (R1).
+fn seed_host_secrets(
+    dir: &TempDir,
+    secrets: &dyn shellune_storage::SecretStore,
+    passwords: &[(HostId, &str)],
+) {
+    let mut content = shellune_storage::VaultContent::new();
+    for (id, secret) in passwords {
+        content.set_host_secret(*id, shellune_core::SecretString::new(*secret), "seed");
+    }
+    shellune_storage::VaultStore::at(dir.path())
+        .save_records(
+            &content,
+            &[],
+            &[shellune_storage::UnsealSource::LocalMachine],
+            shellune_storage::KdfParams::new(8, 1, 1).expect("cheap parameters"),
+            secrets,
+        )
+        .expect("the vault is written");
+}
+
 /// Writes a backup of a whole local state, as a machine of `platform` exports it.
 fn write_backup_of(
     path: &std::path::Path,
@@ -34998,19 +35530,17 @@ fn write_backup_of(
     passphrase: Option<&str>,
     secrets: &[(HostId, &str)],
 ) {
-    use shellune_storage::SecretStore as _;
-    let store = shellune_storage::MemorySecrets::new();
+    // The exporting machine keeps its remembered passwords in its vault (R4).
+    let mut vault = shellune_storage::VaultContent::new();
     for (id, secret) in secrets {
-        store
-            .save(*id, &shellune_core::SecretString::new(*secret))
-            .expect("the password is kept");
+        vault.set_host_secret(*id, shellune_core::SecretString::new(*secret), "exporter");
     }
     let mut options = shellune_storage::ExportOptions::new(platform);
     options.kdf = shellune_storage::KdfParams::new(8, 1, 1).expect("a cheap cost is accepted");
     if let Some(passphrase) = passphrase {
         options = options.with_passphrase(shellune_core::SecretString::new(passphrase));
     }
-    shellune_storage::ShelluneData::export(local, &options, &store, None)
+    shellune_storage::ShelluneData::export_from_vault(local, &options, Some(&vault), None)
         .expect("the backup is made")
         .document
         .write_to(path)
@@ -35055,14 +35585,10 @@ async fn exporting_a_backup_asks_for_one_passphrase_twice_and_names_unreadable_p
     let prod_id = prod.id();
     seed(&dir.store(), vec![prod, lab]);
     let (view, cx) = settings_view(cx, &dir);
-    // Only prod's password is in the credential store; lab remembers one the store does
-    // not have, which the export reports by name rather than silently leaving out.
-    cx.update(|_window, app| {
-        view.read(app)
-            .secrets_for_test()
-            .save(prod_id, &shellune_core::SecretString::new("hunter2-secret"))
-            .expect("the password is kept");
-    });
+    // Only prod's password is in the vault; lab remembers one the vault does not
+    // have, which the export reports by name rather than silently leaving out.
+    let secrets = cx.update(|_window, app| view.read(app).secrets_for_test());
+    seed_host_secrets(&dir, secrets.as_ref(), &[(prod_id, "hunter2-secret")]);
 
     click(cx, "settings.category.data");
     click(cx, "settings.backup.export");
@@ -35159,12 +35685,8 @@ async fn an_export_without_passwords_writes_none(cx: &mut TestAppContext) {
     let prod_id = prod.id();
     seed(&dir.store(), vec![prod]);
     let (view, cx) = settings_view(cx, &dir);
-    cx.update(|_window, app| {
-        view.read(app)
-            .secrets_for_test()
-            .save(prod_id, &shellune_core::SecretString::new("hunter2-secret"))
-            .expect("the password is kept");
-    });
+    let secrets = cx.update(|_window, app| view.read(app).secrets_for_test());
+    seed_host_secrets(&dir, secrets.as_ref(), &[(prod_id, "hunter2-secret")]);
     click(cx, "settings.category.data");
     click(cx, "settings.backup.export");
     click(cx, "backup.export.save");
@@ -35367,16 +35889,35 @@ async fn a_wrong_passphrase_stays_on_the_question_and_changes_nothing(cx: &mut T
         .expect("the preview is on screen");
     assert_eq!(secrets, 1);
     click(cx, "backup.import.apply");
+    cx.run_until_parked();
     assert_eq!(backup_stage(&view, cx), Some("import.applied"));
-    let saved = cx.update(|_window, app| {
-        view.read(app)
-            .secrets_for_test()
-            .load(alpha_id)
-            .expect("the store answers")
-    });
+    // The imported password lands in this machine's vault, created for it, and
+    // the credential store gets no `host-<uuid>` entry (R4).
+    let secrets = cx.update(|_window, app| view.read(app).secrets_for_test());
+    let vault = shellune_storage::VaultStore::at(dir.path())
+        .open(
+            &shellune_storage::UnsealSource::LocalMachine,
+            secrets.as_ref(),
+        )
+        .expect("the import created the vault");
     assert_eq!(
-        saved.as_ref().map(shellune_core::SecretString::expose),
+        vault
+            .host_secret(alpha_id)
+            .map(shellune_core::SecretString::expose),
         Some("alpha-password")
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).saved_secret_for_test(alpha_id))
+            .as_deref(),
+        Some("alpha-password"),
+        "the window reads it from the vault"
+    );
+    assert!(
+        secrets
+            .load_legacy_host(alpha_id)
+            .expect("the store answers")
+            .is_none(),
+        "no host entry was written"
     );
     assert_eq!(host_names(&view, cx), vec!["alpha", "gamma"]);
 }
@@ -35476,12 +36017,15 @@ async fn a_replace_removes_the_passwords_of_connections_it_drops_and_names_them(
         &[],
     );
     let (view, cx) = settings_view(cx, &dir);
-    cx.update(|_window, app| {
-        view.read(app)
-            .secrets_for_test()
-            .save(prod_id, &shellune_core::SecretString::new("prod-password"))
-            .expect("the password is kept");
-    });
+    let secrets = cx.update(|_window, app| view.read(app).secrets_for_test());
+    seed_host_secrets(&dir, secrets.as_ref(), &[(prod_id, "prod-password")]);
+    cx.update(|_window, app| view.update(app, |view, cx| view.security_reread_for_test(cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).saved_secret_for_test(prod_id))
+            .as_deref(),
+        Some("prod-password")
+    );
     read_backup(&view, cx, &backup);
 
     // A merge keeps prod, and with it its password.
@@ -35509,13 +36053,23 @@ async fn a_replace_removes_the_passwords_of_connections_it_drops_and_names_them(
         Some((0, Vec::new())),
         "nothing was saved and the store removed what it was asked to"
     );
-    let left = cx.update(|_window, app| {
-        view.read(app)
-            .secrets_for_test()
-            .load(prod_id)
-            .expect("the store answers")
-    });
-    assert!(left.is_none(), "prod's password is gone with prod");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).saved_secret_for_test(prod_id))
+            .is_none(),
+        "prod's password is gone with prod"
+    );
+    let vault = shellune_storage::VaultStore::at(dir.path())
+        .open(
+            &shellune_storage::UnsealSource::LocalMachine,
+            secrets.as_ref(),
+        )
+        .expect("the vault opens");
+    assert_eq!(
+        vault.host_secret_state(prod_id),
+        shellune_storage::HostSecretState::Tombstoned,
+        "the vault keeps a tombstone, not the password"
+    );
     assert_eq!(host_names(&view, cx), vec!["alpha"]);
 }
 
@@ -35865,16 +36419,19 @@ async fn the_sync_page_tests_the_connection_and_keeps_the_password_out_of_the_fi
 }
 
 #[gpui::test]
-async fn syncing_passwords_needs_a_passphrase_before_it_is_saved(cx: &mut TestAppContext) {
+async fn the_sync_passphrase_is_asked_for_only_without_a_webdav_password(cx: &mut TestAppContext) {
     let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
-    // A WebDAV with a password reuses it for the vault: no second secret is
-    // asked for, and the switch saves on its own (R2, R5).
+    // The vault always travels with WebDAV (R7): there is no switch for it,
+    // and a WebDAV with a password reuses it, so no second secret is asked for.
     let dir = TempDir::new("sync-passphrase");
     let secrets = Arc::new(shellune_storage::MemorySecrets::new());
     configure_sync(&dir, &secrets, &server, false);
     let (view, cx) = sync_window(cx, &dir, &secrets, Destination::Settings);
     click(cx, "settings.category.sync");
-    click(cx, "settings.sync.secrets");
+    assert!(
+        cx.debug_bounds("settings.sync.secrets").is_none(),
+        "the page has no switch for syncing passwords"
+    );
     assert!(cx.debug_bounds("settings.sync.passphrase").is_some());
     click(cx, "settings.sync.save");
     cx.run_until_parked();
@@ -35883,24 +36440,22 @@ async fn syncing_passwords_needs_a_passphrase_before_it_is_saved(cx: &mut TestAp
         problem.is_none(),
         "a WebDAV password asks for no second secret"
     );
-    let config = shellune_sync::SyncConfigStore::at(dir.path())
-        .load()
-        .expect("reads")
-        .expect("configured");
     assert!(
-        config.sync_secrets,
-        "a WebDAV password is enough for the vault to travel"
+        shellune_sync::SyncConfigStore::at(dir.path())
+            .load()
+            .expect("reads")
+            .is_some(),
+        "the settings were saved"
     );
 
-    // A passwordless WebDAV is the other rule: the vault does not travel until
-    // a non-empty sync passphrase exists (R5).
+    // A passwordless WebDAV is the other rule: the vault cannot travel until
+    // a non-empty sync passphrase exists (R7).
     let bare = TempDir::new("sync-passphrase-bare");
     let bare_secrets = Arc::new(shellune_storage::MemorySecrets::new());
     let (view, cx) = sync_window(cx, &bare, &bare_secrets, Destination::Settings);
     click(cx, "settings.category.sync");
     type_into(cx, "settings.sync.url", &server.url());
     type_into(cx, "settings.sync.username", SYNC_USER);
-    click(cx, "settings.sync.secrets");
     click(cx, "settings.sync.save");
     assert_eq!(
         cx.update(|_window, app| view.read(app).sync_status_for_test().1),
@@ -35915,7 +36470,6 @@ async fn syncing_passwords_needs_a_passphrase_before_it_is_saved(cx: &mut TestAp
     );
     let _ = view;
 }
-
 #[gpui::test]
 async fn with_automatic_sync_off_a_change_stays_local_until_upload_now(cx: &mut TestAppContext) {
     let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
@@ -36441,7 +36995,7 @@ fn exit_waiting(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> bool
 /// window already showed must reach the disk before the window goes. The close waits
 /// for the job, the held edits - a new host with a remembered password among them -
 /// are written when it ends, and only then is the window removed, so the password in
-/// the credential store belongs to a host that is saved.
+/// the vault belongs to a host that is saved.
 #[gpui::test]
 async fn closing_while_saves_are_held_writes_them_before_the_window_goes(cx: &mut TestAppContext) {
     let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
@@ -36473,6 +37027,7 @@ async fn closing_while_saves_are_held_writes_them_before_the_window_goes(cx: &mu
     click(cx, "hosts.auth.remote.method.password");
     type_into(cx, "hosts.field.secret", "s3cret-pass");
     click(cx, "hosts.save");
+    cx.run_until_parked();
     let added = cx
         .update(|_window, app| {
             view.read(app)
@@ -36488,11 +37043,15 @@ async fn closing_while_saves_are_held_writes_them_before_the_window_goes(cx: &mu
         vec!["alpha"],
         "the saves are held back"
     );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).saved_secret_for_test(added))
+            .as_deref(),
+        Some("s3cret-pass"),
+        "the password is in the vault already"
+    );
     assert!(
-        shellune_storage::SecretStore::load(&*secrets, added)
-            .expect("reads")
-            .is_some(),
-        "the password is in the credential store already"
+        !secrets.holds_legacy_host(added),
+        "and not in the credential store (R1)"
     );
 
     // The close waits for the sync instead of dropping what is held.
@@ -44167,7 +44726,6 @@ async fn a_locked_vault_defers_automatic_sync_until_the_unlock(cx: &mut TestAppC
         use shellune_storage::SecretStore as _;
         let mut config = shellune_sync::SyncConfig::new(server.url(), SYNC_USER);
         config.auto = true;
-        config.sync_secrets = true;
         shellune_sync::SyncConfigStore::at(dir.path())
             .save(&config)
             .expect("the sync settings are written");

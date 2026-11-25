@@ -2113,11 +2113,21 @@ fn move_swap(len: usize, index: usize, up: bool) -> Option<(usize, usize)> {
     }
 }
 
+/// The remembered host passwords one batch run read from the old `host-<uuid>`
+/// entries, by host: the window moves them into the vault as one job once the
+/// run has ended (R3, ADR-5).
+pub type BatchMigrations = Arc<std::sync::Mutex<BTreeMap<HostId, shellune_core::SecretString>>>;
+
 /// Where a run's credentials and saved hosts come from.
 ///
-/// It resolves one target at a time, from the book and the credential store this window
+/// It resolves one target at a time, from the book and the vault copy this window
 /// already uses, and it asks for nothing over the network: a missing sign-in is reported
 /// for that host, and the other hosts keep going.
+///
+/// A remembered password comes from the vault the run started with (R2). Only a
+/// host the vault holds no record of - one not migrated yet - has its old system
+/// store entry read, once per run, on the worker; what was read is collected in
+/// [`Self::migrations`] for the window to move into the vault after the run.
 pub struct StoredRoutes {
     hosts: Vec<HostConfig>,
     trust: HostTrust,
@@ -2126,10 +2136,23 @@ pub struct StoredRoutes {
     /// target that signs in with a managed key or a shared password resolves
     /// its body from there, exactly as a single connection does (R1).
     vault: Option<shellune_storage::VaultContent>,
+    /// Remembered passwords the window holds for the vault but has not saved
+    /// yet: they answer before the vault does.
+    pending: BTreeMap<HostId, Option<shellune_core::SecretString>>,
+    /// Whether a host without a vault record may have its old entry read:
+    /// only when the vault the run started with was open, or there is none.
+    legacy: bool,
+    /// What the old entries answered this run, so a host used as a jump by
+    /// several targets is read once.
+    legacy_read: std::sync::Mutex<BTreeMap<HostId, Option<shellune_core::SecretString>>>,
+    /// The passwords read from old entries, for the window to migrate.
+    migrations: BatchMigrations,
 }
 
 impl StoredRoutes {
-    /// The routes a book, a trust file and a credential store describe.
+    /// The routes a book, a trust file and a credential store describe. Without a
+    /// vault ([`Self::with_vault`]) the old entries are read the way a machine with
+    /// no vault file does.
     #[must_use]
     pub fn new(book: &HostBook, trust: &HostTrust, secrets: Arc<dyn SecretStore>) -> Self {
         Self {
@@ -2137,6 +2160,10 @@ impl StoredRoutes {
             trust: trust.clone(),
             secrets,
             vault: None,
+            pending: BTreeMap::new(),
+            legacy: true,
+            legacy_read: std::sync::Mutex::new(BTreeMap::new()),
+            migrations: Arc::default(),
         }
     }
 
@@ -2145,6 +2172,26 @@ impl StoredRoutes {
     pub fn with_vault(mut self, vault: Option<shellune_storage::VaultContent>) -> Self {
         self.vault = vault;
         self
+    }
+
+    /// The same routes, with the remembered password changes the window has not
+    /// saved into the vault yet (`None` is a deletion), and whether a host the vault
+    /// does not know may have its old entry read.
+    #[must_use]
+    pub fn with_remembered(
+        mut self,
+        pending: BTreeMap<HostId, Option<shellune_core::SecretString>>,
+        legacy: bool,
+    ) -> Self {
+        self.pending = pending;
+        self.legacy = legacy;
+        self
+    }
+
+    /// The passwords this run read from old entries, filled while it runs.
+    #[must_use]
+    pub fn migrations(&self) -> BatchMigrations {
+        self.migrations.clone()
     }
 
     fn host(&self, id: HostId) -> Result<HostConfig, String> {
@@ -2168,9 +2215,50 @@ impl StoredRoutes {
         if !host.remembers_secret() {
             return None;
         }
-        self.secrets.load(host.id()).ok().flatten()
+        if let Some(pending) = self.pending.get(&host.id()) {
+            return pending.clone();
+        }
+        if let Some(vault) = &self.vault {
+            match vault.host_secret_state(host.id()) {
+                shellune_storage::HostSecretState::Live => {
+                    return vault.host_secret(host.id()).cloned();
+                }
+                // A deleted password is not one to look for elsewhere.
+                shellune_storage::HostSecretState::Tombstoned => return None,
+                shellune_storage::HostSecretState::Absent => {}
+            }
+        }
+        self.legacy_secret(host.id())
     }
 
+    /// The old entry of one host the vault holds no record of, read at most once
+    /// per run. A read that fails is "not saved" for this run and keeps the entry.
+    fn legacy_secret(&self, id: HostId) -> Option<shellune_core::SecretString> {
+        if !self.legacy {
+            return None;
+        }
+        let mut read = match self.legacy_read.lock() {
+            Ok(read) => read,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(answer) = read.get(&id) {
+            return answer.clone();
+        }
+        let answer = self.secrets.load_legacy_host(id).ok().flatten();
+        read.insert(id, answer.clone());
+        drop(read);
+        if let Some(secret) = &answer {
+            match self.migrations.lock() {
+                Ok(mut migrations) => {
+                    migrations.insert(id, secret.clone());
+                }
+                Err(poisoned) => {
+                    poisoned.into_inner().insert(id, secret.clone());
+                }
+            }
+        }
+        answer
+    }
     fn auth(&self, host: &HostConfig) -> Result<shellune_core::AuthMethod, String> {
         let secret = self.secret(host);
         remote::stored_auth(host, secret.as_ref(), self.vault.as_ref()).ok_or_else(|| {

@@ -88,7 +88,7 @@ use crate::app::{components, theme::radius};
 use shellune_storage::KeymapPreferences;
 // The lock's pending-operation queue: the connection and desktop paths name
 // their steps through it (R3).
-use self::security::SecurityPending;
+use self::security::{HostFormEdit, HostFormSave, SecurityPending};
 
 mod backup;
 pub(crate) mod banner;
@@ -4964,7 +4964,7 @@ impl ShelluneView {
         // first, then a typed one, then a kept one. The hook exists for the link, so
         // a vault problem the real start would refuse is reported as no password
         // here rather than as a panic.
-        let password = self.desktop_password(record).ok().flatten();
+        let password = self.desktop_password(record, cx).ok().flatten();
         pane.update(cx, |pane, cx| pane.start(password.as_deref(), cx));
         self.attach_desktop(tag, pane, cx);
         session.id()
@@ -5600,12 +5600,13 @@ impl ShelluneView {
     /// start is refused with a sentence instead of quietly falling back to a secret
     /// that is not the one the record chose. Otherwise a password typed in the form
     /// and not kept is used first: it was typed for this connection, and the form
-    /// closed before the attempt began. Only then is the system store asked, and only
-    /// when the record says it keeps one. Nothing is kept in the pane, logged or
-    /// drawn.
+    /// closed before the attempt began. Only then is the remembered password read,
+    /// from the vault ([`Self::remembered_secret`]), and only when the record says
+    /// it keeps one. Nothing is kept in the pane, logged or drawn.
     fn desktop_password(
         &mut self,
         record: &shellune_core::ConnectionRecord,
+        cx: &mut Context<Self>,
     ) -> Result<Option<String>, String> {
         if let Some(credential) = record.credential_id() {
             let held = self
@@ -5624,15 +5625,8 @@ impl ShelluneView {
         if let Some(secret) = self.desktop_secrets.remove(&record.id()) {
             return Ok(Some(secret.expose().to_owned()));
         }
-        if record.remembers_secret() {
-            return Ok(self
-                .secrets
-                .load(record.id())
-                .ok()
-                .flatten()
-                .map(|secret| secret.expose().to_owned()));
-        }
-        Ok(None)
+        let remembered = self.remembered_secret(record.id(), record.remembers_secret(), cx)?;
+        Ok(remembered.map(|secret| secret.expose().to_owned()))
     }
 
     /// Starts the saved desktop connection of one session.
@@ -5668,8 +5662,14 @@ impl ShelluneView {
         self.security_clear_session_failure(session);
         // A shared password the vault holds is a secret read like any other:
         // the lock's gate verifies first when the policy asks, and a locked
-        // vault unlocks before the pane may sign in with it (R3).
-        if record.credential_id().is_some()
+        // vault unlocks before the pane may sign in with it (R3). A remembered
+        // password lives in the vault too: a vault that is locked or still
+        // opening is waited for (and unlocked) first (R2).
+        let remembered_waits = record.credential_id().is_none()
+            && record.remembers_secret()
+            && !self.desktop_secrets.contains_key(&record.id())
+            && !self.vault_content_ready();
+        if (record.credential_id().is_some() || remembered_waits)
             && !self.security.operation_granted
             && self.security_begin(vec![SecurityPending::Desktop(session)], cx)
         {
@@ -5685,7 +5685,7 @@ impl ShelluneView {
             return;
         }
         self.security.operation_granted = false;
-        let password = match self.desktop_password(&record) {
+        let password = match self.desktop_password(&record, cx) {
             Ok(password) => password,
             // A shared password the vault cannot hand over is a start that cannot
             // sign in: the session says so instead of dialling with nothing and
@@ -7435,13 +7435,12 @@ impl ShelluneView {
             .map(|fields| fields.secret.read(cx).is_revealed())
     }
 
-    /// What the credential store holds for a host, for tests.
+    /// The remembered password the vault (or a change waiting for it) holds for a
+    /// host, for tests. Never asks the credential store.
     #[cfg(test)]
     pub fn saved_secret_for_test(&self, id: HostId) -> Option<String> {
-        self.secrets
-            .load(id)
-            .ok()
-            .flatten()
+        self.security
+            .host_secret_for_test(id)
             .map(|secret| secret.expose().to_owned())
     }
 
@@ -8769,6 +8768,15 @@ impl ShelluneView {
     /// The record is written before the list adopts it: a failed write leaves the saved
     /// connections exactly as they were and keeps the form open with the reason.
     fn save_connection(&mut self, cx: &mut Context<Self>) -> Option<HostId> {
+        self.save_connection_inner(false, cx)
+    }
+
+    /// [`Self::save_connection`], with whether a save that waits for the vault connects
+    /// once it is written.
+    fn save_connection_inner(&mut self, connect: bool, cx: &mut Context<Self>) -> Option<HostId> {
+        if self.host_form_save_pending() {
+            return None;
+        }
         if self
             .hosts
             .protocol_draft_mut()
@@ -8811,9 +8819,6 @@ impl ShelluneView {
             }
         };
         let saved = draft.editing().and_then(|id| self.book.connection(id));
-        if !self.store_connection_secret(&draft, edit.record(), saved.as_ref(), cx) {
-            return None;
-        }
         let mut next = self.book.clone();
         let outcome = match edit.replaces() {
             Some(id) => next.update_connection(edit.record().clone(), id),
@@ -8826,20 +8831,56 @@ impl ShelluneView {
             return None;
         }
         let id = edit.record().id();
+        self.desktop_secrets.remove(&id);
+        let typed = draft.typed_secret().map(shellune_core::SecretString::new);
+        if edit.record().remembers_secret()
+            && let Some(secret) = typed
+        {
+            // The password goes into the vault first; the record is written
+            // once the vault holds it, and the form stays open until then (R1).
+            let save = HostFormSave {
+                edit: HostFormEdit::Connection(edit),
+                editing: draft.editing(),
+                connect,
+            };
+            self.begin_host_form_save(save, secret, cx);
+            return None;
+        }
+        let forgets = !edit.record().remembers_secret()
+            && saved
+                .as_ref()
+                .is_some_and(shellune_core::ConnectionRecord::remembers_secret);
         let message = self.strings().connection_saved;
         self.commit_hosts(next, message, cx);
         if self.protocol_fields.is_some() {
-            self.desktop_secrets.remove(&id);
             return None;
+        }
+        if let Some(draft) = self.hosts.protocol_draft_mut() {
+            draft.clear_secret();
+        }
+        if forgets {
+            // Turning remembering off takes the password out of the vault.
+            self.host_secrets_forget(&[id], cx);
         }
         Some(id)
     }
 
     /// Validates the form and stores it when the domain accepts it.
     ///
-    /// Returns the id of the host that was saved, or `None` when the dialog stays open
-    /// with the reason it was refused.
+    /// Returns the id of the host that was saved, or `None` when the dialog stays open:
+    /// refused with the reason, or waiting for the vault to hold the password it
+    /// remembers.
     fn save_host(&mut self, cx: &mut Context<Self>) -> Option<HostId> {
+        self.save_host_inner(false, cx)
+    }
+
+    /// [`Self::save_host`], with whether a save that waits for the vault connects once
+    /// it is written.
+    fn save_host_inner(&mut self, connect: bool, cx: &mut Context<Self>) -> Option<HostId> {
+        if self.host_form_save_pending() {
+            // The save already asked is still waiting for the vault.
+            return None;
+        }
         if self.hosts.draft_mut().is_some_and(HostDraft::split_address) {
             self.refill_host_fields(&[HostField::Address, HostField::User, HostField::Port], cx);
         }
@@ -8897,16 +8938,117 @@ impl ShelluneView {
             cx.notify();
             return None;
         }
-        if !self.store_host_secret(&draft, edit.host(), saved.as_ref(), cx) {
+        let host = edit.host();
+        self.ephemeral_ssh_secrets.remove(&host.id());
+        if host.remembers_secret()
+            && let Some(secret) = draft.typed_secret()
+        {
+            // The password goes into the vault first; the record is written
+            // once the vault holds it, and the form stays open until then (R1).
+            let save = HostFormSave {
+                edit: HostFormEdit::Ssh(edit.clone()),
+                editing: draft.editing(),
+                connect,
+            };
+            self.begin_host_form_save(save, shellune_core::SecretString::new(secret), cx);
             return None;
         }
+        let forgets =
+            !host.remembers_secret() && saved.as_ref().is_some_and(HostConfig::remembers_secret);
         self.commit_hosts(next, self.strings().hosts_saved, cx);
         // The dialog closes only when the file was really written.
-        self.host_fields.is_none().then(|| edit.id())
+        if self.host_fields.is_some() {
+            return None;
+        }
+        if let Some(draft) = self.hosts.draft_mut() {
+            draft.clear_secret();
+        }
+        if forgets {
+            // Turning remembering off takes the password out of the vault.
+            self.host_secrets_forget(&[edit.id()], cx);
+        }
+        Some(edit.id())
+    }
+
+    /// Writes the record of a form whose password the vault now holds (R1): the
+    /// form's change goes onto the book as it stands now, the file is written, and
+    /// the form - when it is still the one that asked - closes. Save & Connect
+    /// connects. An error leaves the book and the file as they were, and the caller
+    /// puts the vault back.
+    pub(super) fn finish_host_form_save(
+        &mut self,
+        form: HostFormSave,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let mut next = self.book.clone();
+        let (id, ssh) = match &form.edit {
+            HostFormEdit::Ssh(edit) => {
+                next.apply(edit).map_err(|error| error.to_string())?;
+                (edit.id(), true)
+            }
+            HostFormEdit::Connection(edit) => {
+                match edit.replaces() {
+                    Some(id) => next.update_connection(edit.record().clone(), id),
+                    None => next.insert_connection(edit.record().clone()),
+                }
+                .map_err(|error| error.to_string())?;
+                (edit.record().id(), false)
+            }
+        };
+        let open = if ssh {
+            self.host_fields.is_some()
+                && self.hosts.draft().map(HostDraft::editing) == Some(form.editing)
+        } else {
+            self.protocol_fields.is_some()
+                && self.hosts.protocol_draft().map(ProtocolDraft::editing) == Some(form.editing)
+        };
+        self.write_hosts_file(&next)
+            .map_err(|error| error.to_string())?;
+        if open {
+            if ssh {
+                if let Some(draft) = self.hosts.draft_mut() {
+                    draft.clear_secret();
+                }
+            } else if let Some(draft) = self.hosts.protocol_draft_mut() {
+                draft.clear_secret();
+            }
+            let message = if ssh {
+                self.strings().hosts_saved
+            } else {
+                self.strings().connection_saved
+            };
+            self.adopt_written_hosts(next, message, true, cx);
+        } else {
+            self.adopt_written_hosts(next, "", false, cx);
+        }
+        if open && form.connect {
+            self.connect_after_save(id, cx);
+        }
+        Ok(())
+    }
+
+    /// Connects to a record the form has just saved ("Save & Connect"), the way the
+    /// form's own button does once the record is written.
+    fn connect_after_save(&mut self, id: HostId, cx: &mut Context<Self>) {
+        if let Some(host) = self.book.host(id).cloned() {
+            self.open_remote_with_ephemeral(&host, None, cx);
+            return;
+        }
+        let Some(protocol) = self.book.connection(id).map(|record| record.protocol()) else {
+            return;
+        };
+        match protocol {
+            ProtocolKind::Rdp | ProtocolKind::Vnc => {
+                self.open_desktop_connection_with_ephemeral(id, None, cx);
+            }
+            ProtocolKind::Serial => self.open_serial_connection(id, cx),
+            ProtocolKind::Ssh => self.connect_saved_host(id, cx),
+        }
     }
 
     /// Validates and saves the SSH host, returning an unremembered typed secret only
-    /// when `commit_hosts` succeeded on disk ("Save & Connect").
+    /// when `commit_hosts` succeeded on disk ("Save & Connect"). A host whose newly
+    /// typed password waits for the vault returns `None` and connects once written.
     pub(super) fn save_host_for_connect(
         &mut self,
         cx: &mut Context<Self>,
@@ -8916,50 +9058,13 @@ impl ShelluneView {
             .draft()
             .filter(|draft| draft.needs_secret())
             .and_then(|draft| draft.typed_secret().map(shellune_core::SecretString::new));
-        let id = self.save_host(cx)?;
+        let id = self.save_host_inner(true, cx)?;
         let ephemeral = self
             .book
             .host(id)
             .filter(|host| !host.remembers_secret() && host.credential_id().is_none())
             .and(typed);
         Some((id, ephemeral))
-    }
-
-    /// Puts the secret typed in the form into the system store, or takes it out.
-    ///
-    /// Runs before the record is written: a host whose file says "remembered" must have
-    /// its secret in the store. Returns whether saving the record may go on; when the
-    /// store refuses, the dialog stays open with the reason.
-    fn store_host_secret(
-        &mut self,
-        draft: &HostDraft,
-        host: &HostConfig,
-        saved: Option<&HostConfig>,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let strings = self.strings();
-        self.ephemeral_ssh_secrets.remove(&host.id());
-        if host.remembers_secret() {
-            // Nothing typed keeps what is saved: the draft only remembers when there is
-            // something to remember.
-            if let Some(secret) = draft.typed_secret() {
-                let secret = shellune_core::SecretString::new(secret);
-                if let Err(error) = self.secrets.save(host.id(), &secret) {
-                    self.hosts
-                        .set_message(format!("{}: {error}", strings.host_secret_failed), true);
-                    cx.notify();
-                    return false;
-                }
-            }
-        } else if saved.is_some_and(HostConfig::remembers_secret) {
-            // Turning remembering off removes the secret; a store that cannot be reached
-            // leaves an entry nobody reads, which is not a reason to keep the old flag.
-            let _ = self.secrets.forget(host.id());
-        }
-        if let Some(draft) = self.hosts.draft_mut() {
-            draft.clear_secret();
-        }
-        true
     }
 
     /// Validates and saves the non-SSH connection, returning an unremembered typed secret
@@ -8973,7 +9078,7 @@ impl ShelluneView {
             .protocol_draft()
             .filter(|draft| draft.needs_secret())
             .and_then(|draft| draft.typed_secret().map(shellune_core::SecretString::new));
-        let id = self.save_connection(cx)?;
+        let id = self.save_connection_inner(true, cx)?;
         let ephemeral = self
             .book
             .connection(id)
@@ -8986,69 +9091,50 @@ impl ShelluneView {
         Some((id, ephemeral))
     }
 
-    /// Puts a kept password typed in the connection form into the system store, or forgets
-    /// a previously kept one when remembering is turned off. Unremembered passwords are
-    /// never cached here on "Save"; only "Save & Connect" forwards a one-shot secret.
-    fn store_connection_secret(
-        &mut self,
-        draft: &ProtocolDraft,
-        record: &shellune_core::ConnectionRecord,
-        saved: Option<&shellune_core::ConnectionRecord>,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let typed = draft.typed_secret().map(shellune_core::SecretString::new);
-        let id = record.id();
-        self.desktop_secrets.remove(&id);
-        if record.remembers_secret() {
-            if let Some(secret) = &typed
-                && let Err(error) = self.secrets.save(id, secret)
-            {
-                let message = format!("{}: {error}", self.strings().host_secret_failed);
-                self.hosts.set_message(message, true);
-                cx.notify();
-                return false;
-            }
-        } else if saved.is_some_and(shellune_core::ConnectionRecord::remembers_secret) {
-            // Turning remembering off removes what the store held; a store that cannot
-            // be reached leaves an entry nobody reads, which is not a reason to fail.
-            let _ = self.secrets.forget(id);
-        }
-        if let Some(draft) = self.hosts.protocol_draft_mut() {
-            draft.clear_secret();
-        }
-        true
-    }
-
     /// Saves the records, and only then adopts them as the current state.
     fn commit_hosts(&mut self, next: HostBook, message: &str, cx: &mut Context<Self>) {
         match self.write_hosts_file(&next) {
-            Ok(()) => {
-                self.book = next;
-                self.key_presence.forget();
-                self.note_data_changed(cx);
-                self.hosts.close_editor();
-                self.host_fields = None;
-                self.host_connection_fields = None;
-                self.jump_picker = None;
-                self.protocol_fields = None;
-                self.last_invalid_host_field = None;
-                self.invalid_host_fields.clear();
-                self.last_invalid_protocol_field = None;
-                self.invalid_protocol_fields.clear();
-                self.modal_focus_captured = false;
-                self.restore_focus_pending = true;
-                self.hosts.set_message(message.to_owned(), false);
-                let items = self.book.hosts().to_vec();
-                self.workspace.replace_hosts(SectionStatus::Ready, items);
-                self.recheck_open_hosts();
-            }
+            Ok(()) => self.adopt_written_hosts(next, message, true, cx),
             // The records on disk did not change, so neither does the list: the
             // message carries the reason the write produced.
-            Err(error) => self.hosts.set_message(error.to_string(), true),
+            Err(error) => {
+                self.hosts.set_message(error.to_string(), true);
+                cx.notify();
+            }
         }
-        cx.notify();
     }
 
+    /// Adopts records already written to disk as the current state; `close` puts the
+    /// form away with `message`, the way a save from the form does.
+    fn adopt_written_hosts(
+        &mut self,
+        next: HostBook,
+        message: &str,
+        close: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.book = next;
+        self.key_presence.forget();
+        self.note_data_changed(cx);
+        if close {
+            self.hosts.close_editor();
+            self.host_fields = None;
+            self.host_connection_fields = None;
+            self.jump_picker = None;
+            self.protocol_fields = None;
+            self.last_invalid_host_field = None;
+            self.invalid_host_fields.clear();
+            self.last_invalid_protocol_field = None;
+            self.invalid_protocol_fields.clear();
+            self.modal_focus_captured = false;
+            self.restore_focus_pending = true;
+            self.hosts.set_message(message.to_owned(), false);
+        }
+        let items = self.book.hosts().to_vec();
+        self.workspace.replace_hosts(SectionStatus::Ready, items);
+        self.recheck_open_hosts();
+        cx.notify();
+    }
     /// Asks the deletion question for one host.
     fn ask_delete_host(&mut self, id: HostId, cx: &mut Context<Self>) {
         self.host_fields = None;
@@ -9103,10 +9189,13 @@ impl ShelluneView {
         // A deleted connection's secret has nobody left to use it, wherever it waits.
         self.desktop_secrets.remove(&id);
         self.ephemeral_ssh_secrets.remove(&id);
-        if remembers_secret {
-            let _ = self.secrets.forget(id);
-        }
+        // The file is written at once, whatever the vault's state; the password
+        // leaves the vault in a job of its own, after an unlock when it is
+        // locked (R1, ADR-4).
         self.commit_hosts(next, message, cx);
+        if remembers_secret && self.book.connection(id).is_none() {
+            self.host_secrets_forget(&[id], cx);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -10517,17 +10606,25 @@ impl ShelluneView {
 
     /// Whether the chain on screen signs in with something only the vault can
     /// hand over - a managed key or a shared password - which is what the lock
-    /// has a say about. A chain of typed passwords and key files is not the
-    /// vault's business and never prompts (R3).
+    /// has a say about, or with a remembered password while the vault cannot be
+    /// read yet (locked, or still opening): the remembered passwords live in the
+    /// vault too, so one unlock opens them all (R2). A chain of typed passwords
+    /// and key files is not the vault's business and never prompts (R3).
     fn chain_reads_vault(&self) -> bool {
         let panel = self
             .remote
             .as_ref()
             .is_some_and(|panel| panel.method() == remote::MethodChoice::ManagedKey);
+        let ready = self.vault_content_ready();
         let chain = self.chain.as_ref().is_some_and(|draft| {
             draft.order().iter().any(|hop| {
                 draft.host(*hop).is_some_and(|host| {
-                    host.managed_key_id().is_some() || host.credential_id().is_some()
+                    host.managed_key_id().is_some()
+                        || host.credential_id().is_some()
+                        || (!ready
+                            && host.remembers_secret()
+                            && !draft.has_auth(*hop)
+                            && !self.ephemeral_ssh_secrets.contains_key(hop))
                 })
             })
         });
@@ -10605,7 +10702,7 @@ impl ShelluneView {
             {
                 continue;
             }
-            match self.saved_secret(&host) {
+            match self.saved_secret(&host, cx) {
                 Err(reason) => {
                     self.show_hop_inner(host, background, cx);
                     if let Some(panel) = self.remote.as_mut() {
@@ -10659,14 +10756,16 @@ impl ShelluneView {
         }
     }
 
-    /// The remembered secret, or an error when the store cannot be read.
+    /// The remembered secret, or an error when the vault cannot be read.
     ///
     /// A host that names a shared credential of the vault reads the password
-    /// from there, which is the one place a shared password lives; the system
-    /// store is only asked for the secrets it has always kept.
+    /// from there, which is the one place a shared password lives; a remembered
+    /// password comes from the vault as well, through
+    /// [`Self::remembered_secret`] (R2, R3).
     fn saved_secret(
-        &self,
+        &mut self,
         host: &HostConfig,
+        cx: &mut Context<Self>,
     ) -> Result<Option<shellune_core::SecretString>, String> {
         if let Some(credential) = host.credential_id()
             && let Some(body) = self
@@ -10677,11 +10776,7 @@ impl ShelluneView {
         {
             return Ok(Some(body.clone()));
         }
-        if !host.remembers_secret() {
-            return Ok(None);
-        }
-        self.secrets
-            .load(host.id())
+        self.remembered_secret(host.id(), host.remembers_secret(), cx)
             .map_err(|error| format!("{}: {error}", self.strings().remote_saved_secret_failed))
     }
 
@@ -12030,7 +12125,7 @@ impl ShelluneView {
         if !empty {
             return;
         }
-        let Ok(Some(secret)) = self.saved_secret(&host) else {
+        let Ok(Some(secret)) = self.saved_secret(&host, cx) else {
             return;
         };
         if secret.expose().is_empty() {
@@ -13898,12 +13993,14 @@ impl ShelluneView {
             self.desktop_secrets.remove(id);
             self.ephemeral_ssh_secrets.remove(id);
         }
-        for id in remembered {
-            let _ = self.secrets.forget(id);
-        }
         let count_str = ids.len().to_string();
         let message = copy::fill(copy::ux().hosts_deleted_many, &[("count", &count_str)]);
         self.commit_hosts(next, &message, cx);
+        // One vault job takes every deleted host's password out (R1, ADR-4).
+        remembered.retain(|id| self.book.connection(*id).is_none());
+        if !remembered.is_empty() {
+            self.host_secrets_forget(&remembered, cx);
+        }
     }
 
     pub(super) fn host_batch_delete_overlay(
@@ -23775,10 +23872,15 @@ fn default_store() -> HostStore {
     scratch_store()
 }
 
-/// The credential store the shell keeps remembered secrets in.
+/// The credential store the shell keeps its application secrets in, behind the
+/// session cache: the window and the sync engine share this one instance, so the
+/// local unseal secret of the vault is read once per unlock, not once per save
+/// (ADR-3). Locking the vault drops the cache.
 #[cfg(not(test))]
 fn default_secrets() -> std::sync::Arc<dyn SecretStore> {
-    std::sync::Arc::new(shellune_storage::SystemSecrets)
+    std::sync::Arc::new(shellune_storage::CachedSecrets::new(
+        shellune_storage::SystemSecrets,
+    ))
 }
 
 /// The updater of the running copy; an unusable update setting is kept as the reason

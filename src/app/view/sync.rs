@@ -177,8 +177,6 @@ pub(super) struct SyncCenter {
     passphrase: Entity<TextField>,
     /// The automatic switch as shown (saved at once when a server is saved).
     draft_auto: bool,
-    /// The password switch as shown (saved with the form, since it needs a passphrase).
-    draft_secrets: bool,
     password_saved: bool,
     passphrase_saved: bool,
     /// The job on the background executor.
@@ -538,7 +536,6 @@ impl SyncCenter {
         Self {
             service,
             draft_auto: shown.auto,
-            draft_secrets: shown.sync_secrets,
             config,
             state,
             url,
@@ -631,10 +628,7 @@ impl ShelluneView {
     /// raise the system's own prompt behind the user's back (ADR-4). A manual
     /// sync is the user's own decision and always runs.
     fn automatic_sync_blocked_by_lock(&self) -> bool {
-        self.sync
-            .config
-            .as_ref()
-            .is_some_and(|config| config.sync_secrets)
+        self.sync.configured()
             && shellune_storage::VaultStore::at(self.store.root()).exists()
             && self.vault_locked()
     }
@@ -1250,9 +1244,6 @@ impl ShelluneView {
                 &[("count", &report.trust_conflicts.len().to_string())],
             ));
         }
-        if report.secrets_ignored {
-            notes.push(strings.pull_secrets_ignored.to_owned());
-        }
         if !report.secrets_not_forgotten.is_empty() {
             notes.push(copy::fill(
                 strings.pull_not_forgotten,
@@ -1288,7 +1279,6 @@ impl ShelluneView {
                 remote_dir
             },
             auto: self.sync.draft_auto,
-            sync_secrets: self.sync.draft_secrets,
         }
     }
 
@@ -1311,11 +1301,7 @@ impl ShelluneView {
                 .ok()
                 .flatten()
                 .is_some_and(|saved| !saved.expose().trim().is_empty());
-        if draft.sync_secrets
-            && !webdav_password
-            && !self.sync.passphrase_saved
-            && passphrase.trim().is_empty()
-        {
+        if !webdav_password && !self.sync.passphrase_saved && passphrase.trim().is_empty() {
             self.sync.form_problem = Some(strings.passphrase_required.to_owned());
             cx.notify();
             return;
@@ -1330,7 +1316,7 @@ impl ShelluneView {
                     .set_password(Some(&SecretString::new(password.clone())))
                     .map_err(|error| sync_error_text(&SyncError::Credentials(error), strings))?;
             }
-            if draft.sync_secrets && !passphrase.trim().is_empty() {
+            if !passphrase.trim().is_empty() {
                 service
                     .set_passphrase(Some(&SecretString::new(passphrase.clone())))
                     .map_err(|error| sync_error_text(&SyncError::Credentials(error), strings))?;
@@ -1343,7 +1329,7 @@ impl ShelluneView {
                 if !password.is_empty() {
                     self.sync.password_saved = true;
                 }
-                if draft.sync_secrets && !passphrase.trim().is_empty() {
+                if !passphrase.trim().is_empty() {
                     self.sync.passphrase_saved = true;
                 }
                 self.sync.config = Some(draft);
@@ -1395,17 +1381,6 @@ impl ShelluneView {
                     ));
                 }
             }
-        }
-        cx.notify();
-    }
-
-    /// Turns syncing passwords on or off in the form; Save applies it, since turning it
-    /// on needs the passphrase.
-    pub(super) fn set_sync_secrets(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.sync.draft_secrets = on;
-        self.sync.form_problem = None;
-        if on {
-            self.field_focus_pending = Some(self.sync.passphrase.read(cx).focus_handle().clone());
         }
         cx.notify();
     }
@@ -1665,27 +1640,13 @@ impl ShelluneView {
                     Self::set_sync_auto,
                 ),
             ),
-            self.settings_row(
-                "sync-secrets",
-                strings.secrets,
-                strings.secrets_hint,
-                switch(
-                    self,
-                    "settings.sync.secrets",
-                    self.sync.draft_secrets,
-                    cx,
-                    Self::set_sync_secrets,
-                ),
-            ),
-        ];
-        if self.sync.draft_secrets {
-            rows.push(self.sync_field_row(
+            self.sync_field_row(
                 "sync-passphrase",
                 strings.passphrase,
                 strings.passphrase_hint,
                 &self.sync.passphrase,
-            ));
-        }
+            ),
+        ];
         let unsaved = {
             let draft = self.sync_draft(cx);
             let typed_password = !self.sync.password.read(cx).text().is_empty();
@@ -1695,7 +1656,6 @@ impl ShelluneView {
                     draft.url != saved.url
                         || draft.username != saved.username
                         || draft.remote_dir != saved.remote_dir
-                        || draft.sync_secrets != saved.sync_secrets
                         || typed_password
                         || typed_passphrase
                 }

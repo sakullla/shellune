@@ -859,7 +859,7 @@ pub struct Strings {
     pub host_remember_note: &'static str,
     /// Host dialog: placeholder of the secret field when one is saved.
     pub host_secret_saved_placeholder: &'static str,
-    /// Host dialog: the system store refused the secret; the reason follows.
+    /// Host dialog: the vault refused the secret; the reason follows.
     pub host_secret_failed: &'static str,
     /// Host dialog: label of the startup command.
     pub host_startup_label: &'static str,
@@ -1602,7 +1602,7 @@ pub static ENGLISH: Strings = Strings {
     host_remember_passphrase: "Remember passphrase",
     host_remember_note: "Kept in the system credential store (Keychain or Credential Manager), never in the host file.",
     host_secret_saved_placeholder: "Saved; leave empty to keep it",
-    host_secret_failed: "The password was not saved to the system credential store",
+    host_secret_failed: "The password was not saved to the vault",
     host_startup_label: "Run after connecting",
     host_startup_placeholder: "For example cd /srv && tmux attach",
     host_startup_note: "Typed into the remote shell once, each time the connection opens.",
@@ -2168,7 +2168,7 @@ pub static CHINESE: Strings = Strings {
     host_remember_passphrase: "记住口令",
     host_remember_note: "保存在系统凭据库（钥匙串 / 凭据管理器），不会写入主机文件。",
     host_secret_saved_placeholder: "已保存；留空则保持不变",
-    host_secret_failed: "密码没有保存到系统凭据库",
+    host_secret_failed: "密码没有保存到保险库",
     host_startup_label: "连接后运行",
     host_startup_placeholder: "例如 cd /srv && tmux attach",
     host_startup_note: "每次连接成功后，在远程 Shell 中自动执行一次。",
@@ -5367,17 +5367,14 @@ sync_strings! {
     on: "On", "开";
     /// A switch that is off
     off: "Off", "关";
-    /// Switch: sync saved passwords
-    secrets: "Sync saved passwords", "同步已保存的密码";
-    /// Under it
-    secrets_hint: "Off: the cloud holds no password. On: they are encrypted with the sync passphrase, which every computer needs.",
-        "关闭时云端不含任何密码；开启后用同步口令加密，每台电脑都需要设置同一口令。";
     /// Field: the sync passphrase
     passphrase: "Sync passphrase", "同步口令";
     /// Under it
-    passphrase_hint: "Kept in this computer's credential store", "保存在本机凭据库中";
+    passphrase_hint: "Needed only when the WebDAV account has no password: saved passwords are encrypted with it. Kept in this computer's credential store.",
+        "仅在 WebDAV 账户没有密码时需要，用于加密已保存的密码；保存在本机凭据库中。";
     /// Saving refused: no passphrase
-    passphrase_required: "Enter the sync passphrase to sync passwords", "要同步密码，请输入同步口令";
+    passphrase_required: "The WebDAV account has no password; enter a sync passphrase to encrypt the saved passwords",
+        "WebDAV 账户没有密码，请输入用于加密已保存密码的同步口令";
     /// Refused: no address
     url_required: "Enter the server address first", "请先输入服务器地址";
     /// Refused: nothing saved yet
@@ -5436,9 +5433,6 @@ sync_strings! {
     /// After a pull: trusted keys replaced
     pull_trust: "{count} servers had a different trusted key; the cloud's is used now.",
         "{count} 台服务器的已信任指纹与云端不同，现已使用云端的。";
-    /// After a pull: passwords in the cloud not used
-    pull_secrets_ignored: "The cloud holds encrypted passwords; turn on syncing passwords to use them.",
-        "云端含有加密的密码；开启“同步已保存的密码”后才会使用。";
     /// After a pull: passwords that could not be removed
     pull_not_forgotten: "{count} passwords no longer used could not be removed from the credential store.",
         "{count} 个已不再使用的密码未能从凭据库移除。";

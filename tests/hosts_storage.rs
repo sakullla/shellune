@@ -942,7 +942,10 @@ fn a_cycle_and_a_deleted_jump_are_local_and_the_book_still_loads() {
 use shellune_core::{
     AuthMethodKind, GroupBookError, GroupPath, MAX_GROUP_SEGMENT_CHARS, SecretString,
 };
-use shellune_storage::{GROUP_FILE_NAME, GroupError, GroupService, MemorySecrets, SecretStore};
+use shellune_storage::{
+    GROUP_FILE_NAME, GroupError, GroupService, KdfParams, MemorySecrets, UnsealSource,
+    VaultContent, VaultStore,
+};
 
 impl TempDir {
     fn group_file(&self) -> PathBuf {
@@ -1170,10 +1173,19 @@ fn renaming_a_group_keeps_every_host_and_its_credential_reference() {
     web.set_jumps(vec![api.id()]);
     let web = saved(&dir.store(), web);
 
+    // The remembered password lives in the vault, filed under the host (R1).
     let secrets = MemorySecrets::new();
-    secrets
-        .save(web.id(), &SecretString::new("hunter2"))
-        .expect("the test store keeps a secret");
+    let mut vault = VaultContent::new();
+    vault.set_host_secret(web.id(), SecretString::new("hunter2"), "test");
+    VaultStore::at(dir.path())
+        .save_records(
+            &vault,
+            &[],
+            &[UnsealSource::LocalMachine],
+            KdfParams::new(8, 1, 1).expect("cheap parameters"),
+            &secrets,
+        )
+        .expect("the vault is written");
 
     let (book, groups) = service.load().expect("both documents load");
     let groups = service
@@ -1209,13 +1221,22 @@ fn renaming_a_group_keeps_every_host_and_its_credential_reference() {
     assert_eq!(restored.jumps(), [api.id()], "the jump chain is unchanged");
     assert!(groups.contains(&group_path("Production")));
     assert!(!groups.contains(&group_path("Prod")));
+    let vault = VaultStore::at(dir.path())
+        .open(&UnsealSource::LocalMachine, &secrets)
+        .expect("the vault opens");
     assert_eq!(
-        secrets
-            .load(web.id())
-            .expect("the test store reads")
+        vault
+            .host_secret(web.id())
             .expect("the secret is still filed under the same host")
             .expose(),
         "hunter2"
+    );
+    assert!(
+        secrets
+            .accesses()
+            .iter()
+            .all(|access| !access.is_host_entry()),
+        "no host-<uuid> entry was ever asked for"
     );
 }
 
@@ -2594,7 +2615,7 @@ fn export_from(
 ) -> ShelluneData {
     let mut options = ExportOptions::new(platform);
     options.created_unix = 1_800_000_000;
-    ShelluneData::export(state, &options, &MemorySecrets::new(), base)
+    ShelluneData::export_from_vault(state, &options, None, base)
         .expect("exported")
         .document
 }
@@ -3044,4 +3065,100 @@ fn recent_connections_record_list_persist_and_clean_up_across_all_protocols() {
         .map(|(record, _, _)| record.id())
         .collect();
     assert_eq!(remaining, vec![wall.id(), web.id()]);
+}
+
+// ---------------------------------------------------------------------------
+// Remembered passwords live in the vault (R1, R4)
+// ---------------------------------------------------------------------------
+
+/// A version 1 backup of 300 hosts whose passwords the exporting machine's vault
+/// held is imported into an empty machine: every password lands in the new
+/// machine's vault, saved once with the files, and the credential store is only
+/// asked for the vault's own unseal secret - no `host-<uuid>` entry is read or
+/// written on either side.
+#[test]
+fn importing_three_hundred_remembered_passwords_fills_the_vault_and_no_host_entry() {
+    let kdf = KdfParams::new(8, 1, 1).expect("cheap parameters");
+    let mut state = LocalState::default();
+    let mut exporter = VaultContent::new();
+    let mut ids = Vec::new();
+    for index in 0..300_u32 {
+        let mut record = host(
+            &format!("host-{index}"),
+            &format!("10.1.{}.{}", index / 200, index % 200 + 1),
+            22,
+            "deploy",
+            None,
+        );
+        record.set_auth(Some(AuthMethodKind::Password));
+        record.set_remember_secret(true);
+        exporter.set_host_secret(
+            record.id(),
+            SecretString::new(format!("password-{index}")),
+            "exporter",
+        );
+        ids.push(record.id());
+        state
+            .hosts
+            .apply(&HostEdit::create(record))
+            .expect("the host is inserted");
+    }
+    let mut options =
+        ExportOptions::new(Platform::current()).with_passphrase(SecretString::new("bundle"));
+    options.kdf = kdf;
+    let outcome =
+        ShelluneData::export_from_vault(&state, &options, Some(&exporter), None).expect("exported");
+    assert!(
+        outcome.secrets_missing.is_empty(),
+        "the vault held every one"
+    );
+    let bundle = outcome
+        .document
+        .open_secrets(&SecretString::new("bundle"))
+        .expect("the passphrase opens the block");
+
+    let dir = TempDir::new("vault-import-300");
+    let data = shellune_storage::LocalData::at(dir.path());
+    let local = data.load().expect("an empty machine loads");
+    let plan = outcome
+        .document
+        .plan(&local, Platform::current(), ApplyMode::Merge, Some(&bundle))
+        .expect("planned");
+    let records = plan.result().hosts.records();
+    let secrets = MemorySecrets::new();
+    let store = VaultStore::at(dir.path());
+    let mut content = VaultContent::new();
+    let mut saves = 0;
+    plan.apply_with_vault(&data, &mut content, "importer", "import", &mut |vault| {
+        saves += 1;
+        store
+            .save_records(
+                vault,
+                &records,
+                &[UnsealSource::LocalMachine],
+                kdf,
+                &secrets,
+            )
+            .map_err(|error| error.to_string())
+    })
+    .expect("applied");
+    assert_eq!(saves, 1, "the 300 passwords are one vault save");
+
+    let opened = store
+        .open(&UnsealSource::LocalMachine, &secrets)
+        .expect("the vault opens");
+    for (index, id) in ids.iter().enumerate() {
+        assert_eq!(
+            opened.host_secret(*id).map(SecretString::expose),
+            Some(format!("password-{index}").as_str())
+        );
+    }
+    let accesses = secrets.accesses();
+    assert!(
+        accesses
+            .iter()
+            .all(|access| access.user == "vault-local-unseal"),
+        "only the vault's unseal secret was asked for: {accesses:?}"
+    );
+    assert!(secrets.is_empty(), "no host-<uuid> entry exists");
 }

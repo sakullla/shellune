@@ -256,13 +256,32 @@ impl ShelluneView {
     /// interactive connection does. Nothing here dials: the runner does, one host at a
     /// time, and only after this returns.
     pub(super) fn confirm_batch(&mut self, cx: &mut Context<Self>) {
+        // A target or jump that remembers its password reads it from the
+        // vault: a vault that is locked or still opening is waited for (and
+        // unlocked) first, once for the whole run (R2).
+        let remembers = self.batch.targets().iter().any(|target| {
+            std::iter::once(target.host_id())
+                .chain(target.jumps().iter().copied())
+                .any(|id| {
+                    self.book.host(id).is_some_and(|host| {
+                        host.remembers_secret() && host.credential_id().is_none()
+                    })
+                })
+        });
+        if remembers && self.security_wait_for_vault(super::security::SecurityPending::Batch, cx) {
+            cx.notify();
+            return;
+        }
         // The run signs in the way a single connection would: a target that
         // names a managed key or a shared password of the vault resolves its
         // body from the same unlocked copy the window holds, and trusts the
         // servers the vault says are trusted (R1, ADR-6).
         let trust = self.effective_trust();
+        let (pending, legacy) = self.batch_remembered();
         let routes = crate::app::batch::StoredRoutes::new(&self.book, &trust, self.secrets.clone())
-            .with_vault(self.security.content().cloned());
+            .with_vault(self.security.content().cloned())
+            .with_remembered(pending, legacy);
+        let migrations = routes.migrations();
         let factory: std::sync::Arc<dyn shellune_ssh::batch::TransportFactory> =
             std::sync::Arc::new(shellune_ssh::batch::SshTransports::new(
                 std::sync::Arc::new(routes),
@@ -271,6 +290,7 @@ impl ShelluneView {
             cx.notify();
             return;
         }
+        self.batch_started_with(migrations);
         self.hosts.clear_selection();
         self.watch_batch(cx);
         cx.notify();
@@ -358,6 +378,9 @@ impl ShelluneView {
         let watching = self.batch.pump();
         if !watching {
             self.batch_polling = false;
+            // What the run read from old entries moves into the vault now, as
+            // one job (R3).
+            self.batch_finished_migrations(cx);
             // The run this window was driving just ended, and its summary was written as
             // it ended. A history page that is already on screen would otherwise keep
             // listing the runs from before it, so staying on it does not mean a stale
