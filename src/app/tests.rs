@@ -37167,36 +37167,25 @@ async fn closing_while_saves_are_held_writes_them_before_the_window_goes(cx: &mu
     assert!(!exit_waiting(&view, cx));
 
     // The window saves a favourite and a new host with a password meanwhile.
+    // The password waits for the sync: a vault job never runs beside one (R4).
     toggle_favorite(&view, cx, alpha);
     fill_new_host(cx);
     click(cx, "hosts.auth.remote.method.password");
     type_into(cx, "hosts.field.secret", "s3cret-pass");
     click(cx, "hosts.save");
     cx.run_until_parked();
-    let added = cx
-        .update(|_window, app| {
-            view.read(app)
-                .book()
-                .hosts()
-                .iter()
-                .find(|host| host.name() == "box")
-                .map(shellune_core::HostConfig::id)
-        })
-        .expect("the host shows as saved");
+    assert!(
+        cx.update(|_window, app| view.read(app).host_form_save_pending()),
+        "the form save waits for the sync"
+    );
     assert_eq!(
         names_on_disk(&dir),
         vec!["alpha"],
         "the saves are held back"
     );
-    assert_eq!(
-        cx.update(|_window, app| view.read(app).saved_secret_for_test(added))
-            .as_deref(),
-        Some("s3cret-pass"),
-        "the password is in the vault already"
-    );
     assert!(
-        !secrets.holds_legacy_host(added),
-        "and not in the credential store (R1)"
+        host_entry_accesses(&secrets).is_empty(),
+        "and nothing goes to the credential store (R1)"
     );
 
     // The close waits for the sync instead of dropping what is held.
@@ -37218,9 +37207,22 @@ async fn closing_while_saves_are_held_writes_them_before_the_window_goes(cx: &mu
     assert_eq!(names_on_disk(&dir), vec!["alpha", "box"]);
     let on_disk = dir.store().load().expect("reads");
     assert!(on_disk.is_favorite(alpha), "the favourite reached the disk");
+    let added = on_disk
+        .hosts()
+        .iter()
+        .find(|host| host.name() == "box")
+        .map(shellune_core::HostConfig::id)
+        .expect("the new host is saved");
+    assert_eq!(
+        open_vault(&dir, &secrets)
+            .host_secret(added)
+            .map(shellune_core::SecretString::expose),
+        Some("s3cret-pass"),
+        "the password in the vault belongs to a saved host"
+    );
     assert!(
-        on_disk.hosts().iter().any(|host| host.id() == added),
-        "the password belongs to a saved host"
+        host_entry_accesses(&secrets).is_empty(),
+        "no old entry was touched (R1)"
     );
     assert!(
         cx.windows().is_empty(),
@@ -45132,6 +45134,273 @@ async fn a_password_import_waits_for_the_running_vault_job(cx: &mut TestAppConte
         "the imported password is there too"
     );
     assert!(!secrets.holds_legacy_host(old_id));
+}
+
+/// Machine A: a sync service over `dir` with its own credential store, which
+/// the test keeps so it can write A's vault.
+fn sync_machine_with_store(
+    dir: &TempDir,
+    server: &shellune_sync::testing::WebDavServer,
+) -> (
+    shellune_sync::SyncService,
+    Arc<shellune_storage::MemorySecrets>,
+) {
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    configure_sync(dir, &secrets, server, true);
+    let service = shellune_sync::SyncService::new(
+        shellune_storage::LocalData::at(dir.path()),
+        shellune_storage::Platform::current(),
+        secrets.clone(),
+    )
+    .with_kdf(shellune_storage::KdfParams::new(8, 1, 1).expect("cheap parameters"));
+    (service, secrets)
+}
+
+/// Puts these host passwords into the vault of the machine over `dir`, as a
+/// migration there would, keeping what the vault already held.
+fn add_host_secrets(
+    dir: &TempDir,
+    secrets: &shellune_storage::MemorySecrets,
+    passwords: &[(HostId, String)],
+) {
+    let store = shellune_storage::VaultStore::at(dir.path());
+    let mut content = match store.open(&shellune_storage::UnsealSource::LocalMachine, secrets) {
+        Ok(content) => content,
+        Err(shellune_storage::VaultStoreError::Missing { .. }) => {
+            shellune_storage::VaultContent::new()
+        }
+        Err(error) => panic!("the vault opens: {error}"),
+    };
+    for (id, secret) in passwords {
+        content.set_host_secret(*id, shellune_core::SecretString::new(secret.clone()), "a");
+    }
+    let records = dir.store().load().expect("the hosts read").records();
+    store
+        .save_records(
+            &content,
+            &records,
+            &[shellune_storage::UnsealSource::LocalMachine],
+            shellune_storage::KdfParams::new(8, 1, 1).expect("cheap parameters"),
+            secrets,
+        )
+        .expect("the vault is written");
+}
+
+/// B's window over the shared hosts, its credential store and A's passwords.
+type MigratedCloud<'a> = (
+    Entity<ShelluneView>,
+    &'a mut VisualTestContext,
+    Arc<shellune_storage::MemorySecrets>,
+    Vec<(HostId, String)>,
+);
+
+/// Two machines share `count` remembered hosts: B took them in from the cloud,
+/// then A moved their passwords into its vault and uploaded it. Returns B's
+/// window, its store and A's passwords, which B's next sync pulls.
+fn machines_with_migrated_cloud<'a>(
+    cx: &'a mut TestAppContext,
+    server: &shellune_sync::testing::WebDavServer,
+    machine_a: &TempDir,
+    machine_b: &TempDir,
+    count: usize,
+) -> MigratedCloud<'a> {
+    let hosts = remembered_hosts(count);
+    seed(&machine_a.store(), hosts.clone());
+    let (a, secrets_a) = sync_machine_with_store(machine_a, server);
+    let _ = a.sync().expect("A uploads its hosts");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    configure_sync(machine_b, &secrets, server, true);
+    let (view, cx) = sync_window(cx, machine_b, &secrets, Destination::Hosts);
+    assert_eq!(host_names(&view, cx).len(), count, "B took A's hosts in");
+    let passwords: Vec<(HostId, String)> = hosts
+        .iter()
+        .map(|host| (host.id(), format!("pw-{}", host.name())))
+        .collect();
+    add_host_secrets(machine_a, &secrets_a, &passwords);
+    let _ = a.sync().expect("A uploads its vault");
+    secrets.clear_accesses();
+    (view, cx, secrets, passwords)
+}
+
+/// A sync that brings the passwords of many hosts this machine never
+/// migrated touches none of their old entries (R4): the vault's live record
+/// is read first, and each old entry goes only with its host's own deletion
+/// or untick. One sync never becomes one system prompt per host.
+#[gpui::test]
+async fn a_sync_bringing_many_unmigrated_passwords_touches_no_old_entry(cx: &mut TestAppContext) {
+    const COUNT: usize = 25;
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let (machine_a, machine_b) = (TempDir::new("many-live-a"), TempDir::new("many-live-b"));
+    // Both machines hold the same remembered hosts. A moved their passwords
+    // into its vault and uploaded it; B never connected to them, so each one
+    // still has its old entry and B has no vault.
+    let hosts = remembered_hosts(COUNT);
+    seed(&machine_a.store(), hosts.clone());
+    seed(&machine_b.store(), hosts.clone());
+    let (a, secrets_a) = sync_machine_with_store(&machine_a, &server);
+    let passwords: Vec<(HostId, String)> = hosts
+        .iter()
+        .map(|host| (host.id(), format!("pw-{}", host.name())))
+        .collect();
+    add_host_secrets(&machine_a, &secrets_a, &passwords);
+    let _ = a.sync().expect("A uploads its hosts and vault");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    for host in &hosts {
+        secrets.seed_legacy_host(host.id(), &shellune_core::SecretString::new("old"));
+    }
+    configure_sync(&machine_b, &secrets, &server, true);
+    assert!(!shellune_storage::VaultStore::at(machine_b.path()).exists());
+
+    // B's window starts, and its first sync brings A's vault.
+    let (view, cx) = sync_window(cx, &machine_b, &secrets, Destination::Hosts);
+    cx.run_until_parked();
+    // Neither side has synced before, so the window asks; taking the cloud's
+    // side writes A's vault here.
+    assert!(sync_conflict_open(&view, cx));
+    click(cx, "sync.conflict.remote");
+    cx.run_until_parked();
+    let vault = open_vault(&machine_b, &secrets);
+    for (id, secret) in &passwords {
+        assert_eq!(
+            vault
+                .host_secret(*id)
+                .map(shellune_core::SecretString::expose),
+            Some(secret.as_str()),
+            "the sync brought every password"
+        );
+    }
+    assert_eq!(
+        host_entry_accesses(&secrets),
+        Vec::new(),
+        "no old entry was read or deleted"
+    );
+    for (id, _) in &passwords {
+        assert!(secrets.holds_legacy_host(*id), "the old entries stay");
+    }
+    // The window reads the synced password, not the old entry.
+    let first = passwords[0].0;
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).saved_secret_for_test(first))
+            .as_deref(),
+        Some(passwords[0].1.as_str())
+    );
+    assert_eq!(host_entry_accesses(&secrets), Vec::new());
+}
+
+/// A host password saved while a sync runs waits for it (R4): the sync's
+/// vault and the window's job never write at once, and the job is written
+/// onto what the sync left, so the passwords it pulled are kept.
+#[gpui::test]
+async fn a_host_password_saved_during_a_sync_is_written_after_it(cx: &mut TestAppContext) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let (machine_a, machine_b) = (TempDir::new("during-sync-a"), TempDir::new("during-sync-b"));
+    let (view, cx, secrets, passwords) =
+        machines_with_migrated_cloud(cx, &server, &machine_a, &machine_b, 3);
+
+    // The check pulls A's vault; its finish is held, so the sync still runs.
+    hold_sync_finish(&view, cx);
+    after_poll(cx);
+    assert!(sync_finish_held(&view, cx));
+
+    fill_new_host(cx);
+    click(cx, "hosts.auth.remote.method.password");
+    type_into(cx, "hosts.field.secret", "box-password");
+    click(cx, "hosts.save");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).host_form_save_pending()),
+        "the save waits for the sync"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).security_job_running()),
+        "no vault job runs beside the sync"
+    );
+
+    release_sync_finish(&view, cx);
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).host_form_save_pending()));
+    let book = machine_b.store().load().expect("B's hosts read");
+    let added = book
+        .hosts()
+        .iter()
+        .find(|host| host.name() == "box")
+        .map(shellune_core::HostConfig::id)
+        .expect("the new host is saved after the sync");
+    let vault = open_vault(&machine_b, &secrets);
+    assert_eq!(
+        vault
+            .host_secret(added)
+            .map(shellune_core::SecretString::expose),
+        Some("box-password")
+    );
+    for (id, secret) in &passwords {
+        assert_eq!(
+            vault
+                .host_secret(*id)
+                .map(shellune_core::SecretString::expose),
+            Some(secret.as_str()),
+            "the pulled passwords are kept"
+        );
+    }
+    assert_eq!(host_entry_accesses(&secrets), Vec::new());
+}
+
+/// A sync asked for while a vault job runs waits for the job, and starts
+/// when it ends.
+#[gpui::test]
+async fn a_sync_waits_for_the_running_vault_job(cx: &mut TestAppContext) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let (machine_a, machine_b) = (TempDir::new("sync-waits-a"), TempDir::new("sync-waits-b"));
+    let (view, cx, secrets, passwords) =
+        machines_with_migrated_cloud(cx, &server, &machine_a, &machine_b, 2);
+    let (before, _, _) = sync_progress(&view, cx);
+
+    // A vault job runs; its finish is held.
+    cx.update(|_window, app| {
+        view.update(app, |view, _cx| view.security_hold_finish_for_test(true))
+    });
+    fill_new_host(cx);
+    click(cx, "hosts.auth.remote.method.password");
+    type_into(cx, "hosts.field.secret", "box-password");
+    click(cx, "hosts.save");
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).security_job_running()));
+
+    after_poll(cx);
+    let (during, _, _) = sync_progress(&view, cx);
+    assert_eq!(during, before, "the sync waits for the vault job");
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.security_release_finish_for_test(cx))
+    });
+    cx.run_until_parked();
+    let (after, _, _) = sync_progress(&view, cx);
+    assert!(after > before, "the sync ran once the job ended");
+    let vault = open_vault(&machine_b, &secrets);
+    for (id, secret) in &passwords {
+        assert_eq!(
+            vault
+                .host_secret(*id)
+                .map(shellune_core::SecretString::expose),
+            Some(secret.as_str())
+        );
+    }
+    let added = machine_b
+        .store()
+        .load()
+        .expect("B's hosts read")
+        .hosts()
+        .iter()
+        .find(|host| host.name() == "box")
+        .map(shellune_core::HostConfig::id)
+        .expect("the new host is saved");
+    assert_eq!(
+        vault
+            .host_secret(added)
+            .map(shellune_core::SecretString::expose),
+        Some("box-password"),
+        "the sync kept what the job wrote"
+    );
 }
 
 /// An automatic sync never starts while this device's vault is locked and the

@@ -251,6 +251,10 @@ pub(crate) struct SecurityPage {
     import_writing: bool,
     /// A backup import that waits for the running vault job to end.
     import_waiting: Option<VaultWriterTask>,
+    /// A sync job runs and may write the vault file: no vault job starts
+    /// until it ended and its vault was re-read, so a host password save
+    /// cannot drop the passwords the sync pulled (R4).
+    sync_writing: bool,
 }
 
 /// Work that writes the vault outside a vault job, started once none runs.
@@ -747,6 +751,7 @@ impl SecurityPage {
             batch_migrations: None,
             import_writing: false,
             import_waiting: None,
+            sync_writing: false,
         }
     }
 
@@ -760,10 +765,10 @@ impl SecurityPage {
         &self.device
     }
 
-    /// Whether a vault job, the start-up open or a backup import writing the
-    /// vault is in flight.
+    /// Whether a vault job, the start-up open, or a backup import or a sync
+    /// writing the vault is in flight.
     pub(crate) fn busy(&self) -> bool {
-        self.busy || self.warming || self.import_writing
+        self.busy || self.warming || self.import_writing || self.sync_writing
     }
 
     /// The remembered password of a host as the window sees it: a change not
@@ -4660,10 +4665,9 @@ impl ShelluneView {
                     .filter(|record| record.meta().is_live())
                     .min_by(|a, b| a.meta().name().cmp(b.meta().name()))
                     .map(|record| record.meta().id());
-                // An old entry whose password the opened vault holds is
-                // deleted now: one a sync or an import brought in, or one
-                // whose deletion failed before (R1, R3).
-                self.host_legacy_cleanup(&content, cx);
+                // Re-reading what a sync or an import wrote touches no old
+                // `host-<uuid>` entry (R4): those go with the host's own
+                // deletion, untick, form save or use-time migration.
                 self.security.content = Some(content);
                 if let Some(first) = first_live_key
                     && let Some(draft) = self.hosts.draft_mut()
@@ -6392,6 +6396,17 @@ impl ShelluneView {
                 .is_some_and(|job| job.form.is_some())
     }
 
+    /// Whether a form save is on its way to the vault and will finish without
+    /// the user: a close waits for it, so the record its password belongs to is
+    /// written first. One waiting for an unlock is the user's to finish.
+    pub(crate) fn host_form_save_in_flight(&self) -> bool {
+        self.security
+            .host_job
+            .as_ref()
+            .is_some_and(|job| job.form.is_some())
+            || (self.security.host_form_save.is_some() && !self.security.lock.locked)
+    }
+
     /// Saves a form whose record remembers a newly typed password (R1): the
     /// password goes into the vault first, and the record is written only once
     /// the vault holds it. A locked vault is unlocked first.
@@ -6540,6 +6555,8 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) {
         self.security.job_book = None;
+        let had_form = job.form.is_some();
+        let mut form_saved = false;
         match result {
             SecurityResult::Applied {
                 content, previous, ..
@@ -6559,7 +6576,10 @@ impl ShelluneView {
                     None => Ok(()),
                 };
                 match written {
-                    Ok(()) => self.host_legacy_forget(migrated, cx),
+                    Ok(()) => {
+                        form_saved = true;
+                        self.host_legacy_forget(migrated, cx);
+                    }
                     Err(reason) => {
                         self.security_rollback(*previous, cx);
                         self.host_form_message(&reason);
@@ -6569,7 +6589,7 @@ impl ShelluneView {
             SecurityResult::Refused(reason) | SecurityResult::Failed(reason) => {
                 // Nothing was written: a migrated password stays in its old
                 // entry, and a form keeps what was typed.
-                if job.form.is_some() {
+                if had_form {
                     self.host_form_message(&reason);
                 } else {
                     self.security_set_notice(
@@ -6580,11 +6600,16 @@ impl ShelluneView {
                 }
             }
         }
+        if had_form {
+            // A close that waited for this form goes now, or is called off
+            // so the reason can be read.
+            self.exit_after_form_save(form_saved, cx);
+        }
         cx.notify();
     }
 
     /// What runs once a vault job ended: a backup import that waited for it
-    /// first, else the host passwords that waited.
+    /// first, else the host passwords that waited, else a sync that waited.
     fn security_job_idle(&mut self, cx: &mut Context<Self>) {
         if !self.security.busy
             && let Some(task) = self.security.import_waiting.take()
@@ -6593,6 +6618,17 @@ impl ShelluneView {
             return;
         }
         self.host_secrets_flush(cx);
+        if !self.security.busy {
+            self.resume_sync_after_vault_job(cx);
+        }
+    }
+
+    /// Marks a sync job as running, or ends the mark: while it holds, no vault
+    /// job starts. Ending it does not flush the host passwords that waited;
+    /// the sync's finish does, after its vault re-read started, so they are
+    /// written onto what the sync left (R4).
+    pub(crate) fn security_set_sync_writing(&mut self, writing: bool) {
+        self.security.sync_writing = writing;
     }
 
     /// Runs `task` - a backup import that writes the vault file itself - once
@@ -6624,32 +6660,6 @@ impl ShelluneView {
     /// Whether a vault job runs now (the start-up open does not count).
     pub(crate) fn security_job_running(&self) -> bool {
         self.security.busy
-    }
-
-    /// Notes the hosts of the book as it stands whose old entry may still
-    /// exist - they remember a password the vault does not hold live - so the
-    /// entry is deleted once a vault written by a sync or an import holds the
-    /// password (R1). With the vault locked nothing is known and nothing is
-    /// noted: deleting the host or unticking it still deletes the entry.
-    pub(crate) fn host_legacy_expect_from_writer(&mut self) {
-        let vault_missing = !VaultStore::at(self.store.root()).exists();
-        let content = match (&self.security.content, vault_missing) {
-            (Some(content), _) => Some(content),
-            (None, true) => None,
-            (None, false) => return,
-        };
-        let candidates: Vec<HostId> = self
-            .book
-            .records()
-            .iter()
-            .filter(|record| record.remembers_secret())
-            .map(ConnectionRecord::id)
-            .filter(|id| {
-                content
-                    .is_none_or(|content| content.host_secret_state(*id) != HostSecretState::Live)
-            })
-            .collect();
-        self.security.legacy_forget.extend(candidates);
     }
 
     /// Why the vault's records cannot be read now, when they cannot: what a

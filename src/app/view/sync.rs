@@ -695,7 +695,9 @@ impl ShelluneView {
             return;
         }
         self.sync.deferred_locked = false;
-        if self.sync_slot_busy() {
+        // A vault job running now saves what it opened: a sync writing the
+        // vault meanwhile would lose to it, so the sync waits for it (R4).
+        if self.sync_slot_busy() || self.security_job_running() {
             self.sync.queued = match self.sync.queued.take() {
                 waiting @ Some(_) if job == SyncJob::Auto => waiting,
                 _ => Some(job),
@@ -703,11 +705,11 @@ impl ShelluneView {
             return;
         }
         self.sync.running = Some(job.clone());
+        // Every job may write the vault (an upload adopts a legacy block into
+        // it): no vault job starts until this one ended (R4).
+        self.security_set_sync_writing(true);
         if job.writes_local() {
             self.hold_data_writes();
-            // A host whose old entry may still exist here has it deleted once
-            // the vault the sync leaves holds its password (R1).
-            self.host_legacy_expect_from_writer();
         }
         let service = self.sync.service.clone();
         let ran = job.clone();
@@ -741,6 +743,7 @@ impl ShelluneView {
             return;
         }
         self.sync.running = None;
+        self.security_set_sync_writing(false);
         self.sync.finished += 1;
         self.sync.state = self.sync.service.state();
         // What the window saved while the job ran is merged onto what the job left on
@@ -807,6 +810,9 @@ impl ShelluneView {
             }
         }
         self.settle_held_writes(held, adopted, cx);
+        // The vault jobs that waited for this sync go now, onto what it left:
+        // after the re-read of a vault it applied, which they wait for.
+        self.host_secrets_flush(cx);
         self.start_next_in_sync_slot(cx);
         cx.notify();
     }
@@ -896,6 +902,17 @@ impl ShelluneView {
         }
     }
 
+    /// Starts the sync that waited for a vault job, once the job ended and
+    /// nothing else holds the slot.
+    pub(super) fn resume_sync_after_vault_job(&mut self, cx: &mut Context<Self>) {
+        if self.sync_slot_busy() || self.security_job_running() {
+            return;
+        }
+        if let Some(next) = self.sync.queued.take() {
+            self.run_sync_job(next, cx);
+        }
+    }
+
     /// Runs `task` (a backup import) when the slot is free: now, or when the running
     /// job ends. A later request replaces one that still waits.
     pub(super) fn when_sync_slot_free(&mut self, task: SlotTask, cx: &mut Context<Self>) {
@@ -938,7 +955,10 @@ impl ShelluneView {
         exit: PendingExit,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.held_writes_pending() {
+        // A form save that waits for the running writer is held back like the
+        // saves above.
+        let form_waits = self.host_form_save_in_flight() && self.sync_slot_busy();
+        if !self.held_writes_pending() && !form_waits {
             return false;
         }
         let first = self.exit_after_held_writes.is_none();
@@ -962,7 +982,9 @@ impl ShelluneView {
     /// Closes the window, or quits, when that waited for the held saves and they are
     /// written now. Returns whether the exit was carried out.
     fn finish_exit_after_held_writes(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.sync.gate.is_some() {
+        // A form whose password is on its way to the vault writes its record
+        // first; its finish carries the exit out.
+        if self.sync.gate.is_some() || self.host_form_save_in_flight() {
             return false;
         }
         let Some(exit) = self.exit_after_held_writes.take() else {
@@ -988,6 +1010,24 @@ impl ShelluneView {
             }
         }
         true
+    }
+
+    /// Carries out a close that waited for a form's save, now that the save
+    /// ended: when it was written and nothing else holds the exit, or calls
+    /// the close off when it was not, so the reason can be read.
+    pub(super) fn exit_after_form_save(&mut self, saved: bool, cx: &mut Context<Self>) {
+        if self.exit_after_held_writes.is_none() {
+            return;
+        }
+        if !saved {
+            self.exit_after_held_writes = None;
+            cx.notify();
+            return;
+        }
+        if self.sync_slot_busy() {
+            return;
+        }
+        self.finish_exit_after_held_writes(cx);
     }
 
     /// Starts holding the window's saves back, remembering the data as the window

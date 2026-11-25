@@ -248,9 +248,25 @@ fn restore_into_vault(
     let store = VaultStore::at(root);
     let records = preview.plan.result().hosts.records();
     // This machine's vault as it stands: the window's open copy, else the
-    // file. One that cannot be read keeps nothing, which is what the restore
-    // did before.
-    let local = local_vault.or_else(|| store.open(&UnsealSource::LocalMachine, secrets).ok());
+    // file. One that exists but cannot be read fails the restore before any
+    // file is written: treating it as absent would drop the host passwords
+    // only this machine holds (R4).
+    let local = match local_vault {
+        Some(content) => Some(content),
+        None => match store.open(&UnsealSource::LocalMachine, secrets) {
+            Ok(content) => Some(content),
+            Err(shellune_storage::VaultStoreError::Missing { .. }) => None,
+            Err(error) => {
+                return (
+                    Err(PortableError::Local {
+                        label: "vault",
+                        reason: error.to_string(),
+                    }),
+                    BackupVaultOutcome::NotInFile,
+                );
+            }
+        },
+    };
     let mut content = restored_vault(&vault.content, local.as_ref(), &records);
     let sources = [
         UnsealSource::LocalMachine,
@@ -1298,9 +1314,10 @@ impl ShelluneView {
             return;
         }
         if writes_vault {
-            // The hosts whose old entry may still exist on this machine have
-            // it deleted once the written vault holds their password (R1).
-            self.host_legacy_expect_from_writer();
+            // The old entries of hosts the import keeps are left alone: an
+            // import never touches `host-<uuid>` entries (R4). A live vault
+            // record is read before any of them, and the entry goes at the
+            // host's next deletion or untick.
             self.security_set_import_writing(true, cx);
         }
         self.set_backup_in_sync_slot(true);
