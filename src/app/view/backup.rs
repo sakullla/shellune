@@ -227,6 +227,95 @@ fn apply_into_vault(
     }
 }
 
+/// Applies a version 2 backup: the files are written, then the backup's vault
+/// is saved as one piece with this machine's host passwords the backup has no
+/// record of (see [`restored_vault`]), sealed for this machine and for the
+/// passphrase that opened it (R4, R9). The plan marks the records whose
+/// password the backup's vault holds as remembering it, and gives a tombstone
+/// to those that stopped. A vault that cannot be saved leaves the files
+/// applied and says why, as the restore always did.
+#[allow(clippy::too_many_arguments)]
+fn restore_into_vault(
+    preview: &BackupPreview,
+    vault: &BackupVault,
+    data: &LocalData,
+    root: &std::path::Path,
+    device: &str,
+    reason: &str,
+    secrets: &dyn shellune_storage::SecretStore,
+    local_vault: Option<VaultContent>,
+) -> (Result<ApplyOutcome, PortableError>, BackupVaultOutcome) {
+    let store = VaultStore::at(root);
+    let records = preview.plan.result().hosts.records();
+    // This machine's vault as it stands: the window's open copy, else the
+    // file. One that cannot be read keeps nothing, which is what the restore
+    // did before.
+    let local = local_vault.or_else(|| store.open(&UnsealSource::LocalMachine, secrets).ok());
+    let mut content = restored_vault(&vault.content, local.as_ref(), &records);
+    let sources = [
+        UnsealSource::LocalMachine,
+        UnsealSource::SyncPassphrase(vault.passphrase.clone()),
+    ];
+    let mut saved: Option<Result<(), String>> = None;
+    let outcome = {
+        let mut commit = |written: &VaultContent| {
+            let mut written = written.clone();
+            written.set_references(&HostReference::snapshot_records(&records));
+            written.prune_host_secrets(&records);
+            saved = Some(
+                store
+                    .save_records(&written, &records, &sources, backup_kdf(), secrets)
+                    .map_err(|error| error.to_string()),
+            );
+            // The files stay applied whatever the vault did; the outcome
+            // below says what that was.
+            Ok(())
+        };
+        preview
+            .plan
+            .apply_with_vault(data, &mut content, device, reason, &mut commit)
+    };
+    let vault_outcome = match (&outcome, saved) {
+        // The window re-reads the file this wrote, so the outcome carries the
+        // fact and not a second copy of the secrets.
+        (Ok(_), Some(Ok(()))) => BackupVaultOutcome::Restored,
+        (Ok(_), Some(Err(reason))) => BackupVaultOutcome::Failed(reason),
+        _ => BackupVaultOutcome::NotInFile,
+    };
+    (outcome, vault_outcome)
+}
+
+/// The vault a version 2 backup restores, against the book the apply ends
+/// with: the backup's vault whole, plus every host password record of this
+/// machine's vault the backup holds no record of, live or deleted (R4).
+///
+/// A backup made where a host was not migrated yet says nothing about that
+/// host's password; that is not a deletion. Merging keeps the passwords of
+/// hosts only this machine has, and replacing keeps those of hosts the result
+/// still remembers - otherwise a host would stay marked "remembered" with its
+/// password nowhere, its old entry already deleted by the migration. What the
+/// result no longer remembers becomes a tombstone, so a sync sees a deletion
+/// and not an absence. Where both sides hold a record the backup's wins, the
+/// same rule the merge applies to the host records themselves.
+fn restored_vault(
+    backup: &VaultContent,
+    local: Option<&VaultContent>,
+    records: &[shellune_core::ConnectionRecord],
+) -> VaultContent {
+    let mut content = backup.clone();
+    if let Some(local) = local {
+        for record in local.host_secret_records() {
+            if content.host_secret_record(record.meta().host()).is_none() {
+                // Absent from the backup, so the insertion cannot collide.
+                let _ = content.insert_host_secret(record.clone());
+            }
+        }
+    }
+    content.set_references(&HostReference::snapshot_records(records));
+    content.prune_host_secrets(records);
+    content
+}
+
 impl BackupPreview {
     /// The name of a record on this machine or in the result, for a sentence.
     fn name_of(&self, id: HostId) -> String {
@@ -549,6 +638,20 @@ impl ShelluneView {
             return;
         }
         self.security.operation_granted = false;
+        // A version 1 file seals host passwords the vault holds: they are read
+        // from the window's open vault only, so a locked vault asks for its one
+        // unlock first, and one still opening is waited for (R4).
+        let seals_passwords = self.backup.as_ref().is_some_and(|dialog| {
+            matches!(dialog, BackupDialog::Export(dialog)
+                if dialog.include_secrets && !dialog.include_vault)
+        });
+        if seals_passwords && self.security_wait_for_vault(SecurityPending::BackupSecretsExport, cx)
+        {
+            return;
+        }
+        if seals_passwords && self.vault_open_for(SecurityPending::BackupSecretsExport, cx) {
+            return;
+        }
         if let Some(BackupDialog::Export(dialog)) = self.backup.as_mut() {
             dialog.choosing = true;
         }
@@ -606,9 +709,11 @@ impl ShelluneView {
         let root = self.store.root().to_path_buf();
         let secrets = self.secrets.clone();
         // The passwords a version 1 file seals come from the vault alone (R4):
-        // the copy this window holds when it is open, otherwise the file read
-        // with this machine's own unseal secret. Nothing is asked per host.
+        // the copy this window holds open. A vault that cannot be read now
+        // (locked, or one that could not be opened) is not read behind the
+        // lock's back; the export says why instead. Nothing is asked per host.
         let unlocked = self.security.content().cloned();
+        let unreadable = self.vault_unreadable_reason();
         let app_version = self.version().to_owned();
         if let Some(BackupDialog::Export(dialog)) = self.backup.as_mut() {
             dialog.running = true;
@@ -647,20 +752,15 @@ impl ShelluneView {
             }
             let base = ShelluneData::read(&target).ok();
             let sealed = if with_secrets && options.vault().is_none() {
-                match unlocked {
-                    Some(content) => Some(content),
-                    None => match VaultStore::at(&root)
-                        .open(&UnsealSource::LocalMachine, secrets.as_ref())
-                    {
-                        Ok(content) => Some(content),
-                        Err(shellune_storage::VaultStoreError::Missing { .. }) => None,
-                        Err(error) => {
-                            return Err(PortableError::Local {
-                                label: "vault",
-                                reason: error.to_string(),
-                            });
-                        }
-                    },
+                match (unlocked, unreadable) {
+                    (Some(content), _) => Some(content),
+                    (None, None) => None,
+                    (None, Some(reason)) => {
+                        return Err(PortableError::Local {
+                            label: "vault",
+                            reason,
+                        });
+                    }
                 }
             } else {
                 None
@@ -857,9 +957,16 @@ impl ShelluneView {
             Ok(local) => local,
             Err(error) => return ImportStage::Refused(backup_error_text(&error, strings)),
         };
+        // The remembered passwords a version 2 backup's vault holds mark their
+        // records as remembering, as a version 1 block does (ADR-6): without
+        // that, a restored password would belong to a record that never
+        // reads it, and the next save would drop it.
+        let from_vault = vault
+            .as_ref()
+            .map(|vault| SecretBundle::from_vault(&vault.content));
         let bundle = match &secrets {
             Secrets::Opened(bundle) => Some(bundle),
-            Secrets::NotInFile | Secrets::Skipped => None,
+            Secrets::NotInFile | Secrets::Skipped => from_vault.as_ref(),
         };
         match document.plan(&local, DataPlatform::current(), mode, bundle) {
             Ok(plan) => ImportStage::Preview(Box::new(BackupPreview {
@@ -1174,12 +1281,37 @@ impl ShelluneView {
             self.start_next_in_sync_slot(cx);
             return;
         }
+        // An apply that writes the vault file waits for the vault job running
+        // now, holding the slot meanwhile, and holds every other vault job
+        // back until it ends: two writers each saving what they opened would
+        // drop the other's host passwords (R4).
+        let writes_vault = preview.vault.is_some() || preview.plan.has_secrets();
+        if writes_vault && self.security_job_running() {
+            self.set_backup_in_sync_slot(true);
+            self.security_when_no_job(
+                Box::new(move |view, cx| {
+                    view.set_backup_in_sync_slot(false);
+                    view.start_backup_apply(preview, cx);
+                }),
+                cx,
+            );
+            return;
+        }
+        if writes_vault {
+            // The hosts whose old entry may still exist on this machine have
+            // it deleted once the written vault holds their password (R1).
+            self.host_legacy_expect_from_writer();
+            self.security_set_import_writing(true, cx);
+        }
         self.set_backup_in_sync_slot(true);
         self.hold_data_writes();
         let data = LocalData::at(self.store.root());
         let secrets = self.secrets.clone();
         let root = self.store.root().to_path_buf();
         let device = self.security.device().to_owned();
+        // The vault this machine holds as the window has it open: a restore
+        // keeps the host passwords the backup says nothing about.
+        let local_vault = self.security.content().cloned();
         let reason = match preview.mode {
             ApplyMode::Merge => "backup-merge",
             ApplyMode::Replace => "backup-replace",
@@ -1211,32 +1343,25 @@ impl ShelluneView {
                     apply_into_vault(&preview, &data, &root, &device, reason, secrets.as_ref());
                 return (preview, outcome, vault_outcome);
             }
-            let outcome = preview.plan.apply(&data, reason);
-            // The document applied; the vault follows as one piece, sealed for
-            // this machine and for the passphrase that opened it (R9).
-            let vault_outcome = match (&outcome, preview.vault.as_ref()) {
-                (Ok(_), Some(vault)) => {
-                    let records = preview.plan.result().hosts.records();
-                    let mut content = vault.content.clone();
-                    content.set_references(&HostReference::snapshot_records(&records));
-                    match VaultStore::at(&root).save_records(
-                        &content,
-                        &records,
-                        &[
-                            UnsealSource::LocalMachine,
-                            UnsealSource::SyncPassphrase(vault.passphrase.clone()),
-                        ],
-                        backup_kdf(),
-                        &*secrets,
-                    ) {
-                        // The window re-reads the file this wrote, so the
-                        // outcome carries the fact and not a second copy of
-                        // the secrets.
-                        Ok(()) => BackupVaultOutcome::Restored,
-                        Err(error) => BackupVaultOutcome::Failed(error.to_string()),
-                    }
-                }
-                _ => BackupVaultOutcome::NotInFile,
+            let (outcome, vault_outcome) = match preview.vault.as_ref() {
+                // The document applies; the vault follows as one piece,
+                // sealed for this machine and for the passphrase that opened
+                // it (R9), keeping this machine's host passwords the backup
+                // has no record of (R4).
+                Some(vault) => restore_into_vault(
+                    &preview,
+                    vault,
+                    &data,
+                    &root,
+                    &device,
+                    reason,
+                    secrets.as_ref(),
+                    local_vault,
+                ),
+                None => (
+                    preview.plan.apply(&data, reason),
+                    BackupVaultOutcome::NotInFile,
+                ),
             };
             (preview, outcome, vault_outcome)
         });
@@ -1264,6 +1389,9 @@ impl ShelluneView {
         let held = self.release_data_writes();
         let changed = outcome.is_ok() && !preview.plan.is_empty();
         self.show_backup_apply(preview, outcome, vault_outcome, cx);
+        // The vault file is no longer being written: the vault jobs that
+        // waited (the deletions this import queued among them) go now.
+        self.security_set_import_writing(false, cx);
         self.settle_held_writes(held, false, cx);
         // The imported data is a change like any other: with automatic sync on it is
         // uploaded after the debounce (R8).

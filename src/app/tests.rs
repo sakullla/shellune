@@ -17028,7 +17028,7 @@ fn fill_new_host(cx: &mut VisualTestContext) {
 }
 
 #[gpui::test]
-async fn a_remembered_password_goes_to_the_credential_store_not_the_file(cx: &mut TestAppContext) {
+async fn a_remembered_password_goes_to_the_vault_not_the_file(cx: &mut TestAppContext) {
     let (view, cx, dir) = dialog_view(cx, Vec::new());
     fill_new_host(cx);
     // These are about the password method, which is no longer the default.
@@ -17578,6 +17578,151 @@ async fn a_vault_save_that_fails_keeps_the_old_entry_and_still_connects(cx: &mut
             id
         )],
         "read once, never deleted"
+    );
+    assert!(!shellune_storage::VaultStore::at(dir.path()).exists());
+}
+
+/// Types a new password into the form of the first host and saves it.
+fn resave_first_host(cx: &mut VisualTestContext, password: &str) {
+    click(cx, "hosts.edit.0");
+    type_into(cx, "hosts.field.secret", password);
+    click(cx, "hosts.save");
+    cx.run_until_parked();
+}
+
+/// A host an older build remembered whose password is typed again in its form:
+/// the old entry is deleted once the vault holds the new password, and a later
+/// deletion of the host leaves no entry behind (R1).
+#[gpui::test]
+async fn resaving_an_old_host_then_deleting_it_leaves_no_old_entry(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remembered-resave");
+    let hosts = remembered_hosts(1);
+    let id = hosts[0].id();
+    seed(&dir.store(), hosts.clone());
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    secrets.seed_legacy_host(id, &shellune_core::SecretString::new("old-password"));
+    let (view, cx) = remembered_window(cx, &dir, secrets.clone());
+
+    resave_first_host(cx, "new-password");
+    assert!(
+        !cx.update(|_window, app| view.read(app).hosts_state().is_editing()),
+        "the form closed once the vault held the password"
+    );
+    assert_eq!(
+        open_vault(&dir, &secrets)
+            .host_secret(id)
+            .map(shellune_core::SecretString::expose),
+        Some("new-password"),
+        "the vault on disk holds the new password"
+    );
+    assert!(
+        !secrets.holds_legacy_host(id),
+        "the old entry went once the vault held the password"
+    );
+    assert_eq!(
+        host_entry_accesses(&secrets),
+        vec![shellune_storage::SecretAccess::host(
+            shellune_storage::SecretOp::Forget,
+            id
+        )],
+        "the old entry was deleted, never read"
+    );
+
+    click(cx, "hosts.delete.0");
+    click(cx, "hosts.confirm.delete");
+    cx.run_until_parked();
+    assert!(!secrets.holds_legacy_host(id));
+    assert_eq!(
+        open_vault(&dir, &secrets).host_secret_state(id),
+        shellune_storage::HostSecretState::Tombstoned,
+        "the deletion left a tombstone in the vault"
+    );
+}
+
+/// A host whose password the vault already holds - synced or imported there -
+/// while its old entry is still on this machine: deleting the host, or
+/// unticking "remember", deletes the old entry too (R1).
+#[gpui::test]
+async fn deleting_or_unticking_a_host_the_vault_holds_deletes_its_old_entry(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("remembered-forget-old");
+    let hosts = remembered_hosts(2);
+    let (first, second) = (hosts[0].id(), hosts[1].id());
+    seed(&dir.store(), hosts.clone());
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_host_secrets(
+        &dir,
+        secrets.as_ref(),
+        &[(first, "synced-one"), (second, "synced-two")],
+    );
+    secrets.seed_legacy_host(first, &shellune_core::SecretString::new("old-one"));
+    secrets.seed_legacy_host(second, &shellune_core::SecretString::new("old-two"));
+    let (_view, cx) = remembered_window(cx, &dir, secrets.clone());
+
+    // Untick the first host's "remember".
+    click(cx, "hosts.edit.0");
+    click(cx, "hosts.remember");
+    click(cx, "hosts.save");
+    cx.run_until_parked();
+    assert!(
+        !secrets.holds_legacy_host(first),
+        "unticking deleted the old entry"
+    );
+    assert_eq!(
+        open_vault(&dir, &secrets).host_secret_state(first),
+        shellune_storage::HostSecretState::Tombstoned
+    );
+    assert!(
+        secrets.holds_legacy_host(second),
+        "the other host is untouched"
+    );
+
+    // Delete the second host.
+    click(cx, "hosts.delete.1");
+    click(cx, "hosts.confirm.delete");
+    cx.run_until_parked();
+    assert!(
+        !secrets.holds_legacy_host(second),
+        "deleting the host deleted its old entry"
+    );
+    assert_eq!(
+        open_vault(&dir, &secrets).host_secret_state(second),
+        shellune_storage::HostSecretState::Tombstoned
+    );
+    assert!(
+        host_entry_accesses(&secrets)
+            .iter()
+            .all(|access| access.op == shellune_storage::SecretOp::Forget),
+        "no old entry was read: {:?}",
+        host_entry_accesses(&secrets)
+    );
+}
+
+/// A form save whose vault cannot be saved keeps the old entry of a host an
+/// older build remembered: nothing is deleted before the vault holds the new
+/// password (R1, R3).
+#[gpui::test]
+async fn a_resave_whose_vault_fails_keeps_the_old_entry(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remembered-resave-fails");
+    let hosts = remembered_hosts(1);
+    let id = hosts[0].id();
+    seed(&dir.store(), hosts.clone());
+    let memory = Arc::new(shellune_storage::MemorySecrets::new());
+    memory.seed_legacy_host(id, &shellune_core::SecretString::new("old-password"));
+    let mut faulty = FaultySecrets::new(&memory);
+    faulty.deny_app = true;
+    let (view, cx) = remembered_window(cx, &dir, Arc::new(faulty));
+
+    resave_first_host(cx, "new-password");
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().is_editing()),
+        "the form stays open with the reason"
+    );
+    assert!(memory.holds_legacy_host(id), "the old entry is kept");
+    assert!(
+        host_entry_accesses(&memory).is_empty(),
+        "the old entry was neither read nor deleted"
     );
     assert!(!shellune_storage::VaultStore::at(dir.path()).exists());
 }
@@ -44712,6 +44857,281 @@ async fn a_vault_backup_round_trips_through_the_sync_passphrase(cx: &mut TestApp
         "a repeated restore makes no duplicate records"
     );
     let _ = view;
+}
+
+/// Writes a version 2 backup of `hosts` carrying `vault`, sealed under
+/// `passphrase`: what a machine that exports its whole vault writes (R9).
+fn write_vault_backup(
+    path: &std::path::Path,
+    hosts: Vec<HostConfig>,
+    vault: &shellune_storage::VaultContent,
+    passphrase: &str,
+) {
+    let mut local = shellune_storage::LocalState::default();
+    for host in hosts {
+        local
+            .hosts
+            .apply(&HostEdit::create(host))
+            .expect("the host is inserted");
+    }
+    let kdf = shellune_storage::KdfParams::new(8, 1, 1).expect("a cheap cost is accepted");
+    let cipher = shellune_storage::VaultCipher::export_copy(
+        vault,
+        &shellune_core::SecretString::new(passphrase),
+        kdf,
+    )
+    .expect("the vault is sealed");
+    let mut options = shellune_storage::ExportOptions::new(shellune_storage::Platform::current());
+    options.kdf = kdf;
+    options = options.with_vault(cipher);
+    shellune_storage::ShelluneData::export_from_vault(&local, &options, None, None)
+        .expect("the backup is made")
+        .document
+        .write_to(path)
+        .expect("the backup is written");
+}
+
+/// Reads a version 2 backup into the window and opens its vault, leaving the
+/// preview on screen.
+fn open_vault_backup(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+    path: &std::path::Path,
+    passphrase: &str,
+) {
+    read_backup(view, cx, path);
+    assert_eq!(backup_stage(view, cx), Some("import.vault-locked"));
+    type_into(cx, "backup.import.vault.passphrase", passphrase);
+    click(cx, "backup.import.vault.unlock");
+    cx.run_until_parked();
+    assert_eq!(backup_stage(view, cx), Some("import.preview"));
+}
+
+/// Merging a version 2 backup keeps the remembered passwords of hosts only this
+/// machine has: the backup says nothing about them, which is no deletion, and
+/// their old entries are long gone (R4).
+#[gpui::test]
+async fn merging_a_vault_backup_keeps_the_passwords_only_this_machine_has(cx: &mut TestAppContext) {
+    let dir = TempDir::new("vault-backup-merge");
+    let mine = password_host("mine", "10.0.0.1");
+    let theirs = password_host("theirs", "10.0.0.2");
+    let (mine_id, theirs_id) = (mine.id(), theirs.id());
+    seed(&dir.store(), vec![mine]);
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_host_secrets(&dir, secrets.as_ref(), &[(mine_id, "mine-password")]);
+    let mut backup_vault = shellune_storage::VaultContent::new();
+    backup_vault.set_host_secret(
+        theirs_id,
+        shellune_core::SecretString::new("theirs-password"),
+        "exporter",
+    );
+    let backup = dir.path().join("merge.json");
+    write_vault_backup(&backup, vec![theirs], &backup_vault, "correct horse");
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+
+    open_vault_backup(&view, cx, &backup, "correct horse");
+    click(cx, "backup.import.apply");
+    cx.run_until_parked();
+    assert_eq!(backup_stage(&view, cx), Some("import.applied"));
+    assert_eq!(host_names(&view, cx), vec!["mine", "theirs"]);
+    let vault = open_vault(&dir, &secrets);
+    assert_eq!(
+        vault
+            .host_secret(mine_id)
+            .map(shellune_core::SecretString::expose),
+        Some("mine-password"),
+        "the password only this machine had is kept"
+    );
+    assert_eq!(
+        vault
+            .host_secret(theirs_id)
+            .map(shellune_core::SecretString::expose),
+        Some("theirs-password"),
+        "the backup's password arrived"
+    );
+    assert!(host_entry_accesses(&secrets).is_empty());
+}
+
+/// Replacing with a version 2 backup takes the backup's vault, but a host the
+/// result still remembers whose password the backup has no record of keeps
+/// this machine's password; a host the result drops leaves a tombstone (R4).
+#[gpui::test]
+async fn replacing_with_a_vault_backup_never_leaves_a_remembered_host_without_its_password(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("vault-backup-replace");
+    let shared = password_host("shared", "10.0.0.1");
+    let dropped = password_host("dropped", "10.0.0.2");
+    let arriving = password_host("arriving", "10.0.0.3");
+    let (shared_id, dropped_id, arriving_id) = (shared.id(), dropped.id(), arriving.id());
+    seed(&dir.store(), vec![shared.clone(), dropped]);
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_host_secrets(
+        &dir,
+        secrets.as_ref(),
+        &[
+            (shared_id, "shared-password"),
+            (dropped_id, "dropped-password"),
+        ],
+    );
+    // The exporting machine had not migrated `shared` yet: its vault holds no
+    // record of it, while the host still remembers its password.
+    let mut backup_vault = shellune_storage::VaultContent::new();
+    backup_vault.set_host_secret(
+        arriving_id,
+        shellune_core::SecretString::new("arriving-password"),
+        "exporter",
+    );
+    let backup = dir.path().join("replace.json");
+    write_vault_backup(
+        &backup,
+        vec![shared, arriving],
+        &backup_vault,
+        "correct horse",
+    );
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+
+    open_vault_backup(&view, cx, &backup, "correct horse");
+    click(cx, "backup.mode.1");
+    click(cx, "backup.import.apply");
+    click(cx, "backup.import.apply");
+    cx.run_until_parked();
+    assert_eq!(backup_stage(&view, cx), Some("import.applied"));
+    assert_eq!(host_names(&view, cx), vec!["arriving", "shared"]);
+    let vault = open_vault(&dir, &secrets);
+    assert_eq!(
+        vault
+            .host_secret(shared_id)
+            .map(shellune_core::SecretString::expose),
+        Some("shared-password"),
+        "the remembered host keeps the password the backup says nothing about"
+    );
+    assert_eq!(
+        vault
+            .host_secret(arriving_id)
+            .map(shellune_core::SecretString::expose),
+        Some("arriving-password")
+    );
+    assert_eq!(
+        vault.host_secret_state(dropped_id),
+        shellune_storage::HostSecretState::Tombstoned,
+        "the host the backup replaced away leaves a tombstone, not an absence"
+    );
+}
+
+/// A version 1 export that seals host passwords reads them from the open vault
+/// only: a locked vault asks for its one unlock before the file is chosen, and
+/// the passwords are then in the file (R4).
+#[gpui::test]
+async fn a_password_backup_export_unlocks_a_locked_vault_first(cx: &mut TestAppContext) {
+    let dir = TempDir::new("backup-v1-locked");
+    let prod = password_host("prod", "10.0.0.1");
+    let prod_id = prod.id();
+    seed(&dir.store(), vec![prod]);
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    seed_host_secrets(&dir, secrets.as_ref(), &[(prod_id, "hunter2-secret")]);
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+    let authenticator = Arc::new(
+        shellune_storage::ScriptedAuthenticator::new(
+            shellune_storage::BiometricCapability::Biometrics,
+        )
+        .script([Ok(())]),
+    );
+    let verifier = authenticator.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.security_set_authenticator_for_test(authenticator);
+            view.security_enable_lock_for_test(shellune_storage::LockPolicy::UnlockVault, 15, cx);
+        })
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).security_locked_for_test()));
+
+    click(cx, "settings.category.data");
+    click(cx, "settings.backup.export");
+    click(cx, "backup.export.secrets");
+    type_into(cx, "backup.export.passphrase", "pass-one");
+    type_into(cx, "backup.export.confirm", "pass-one");
+    click(cx, "backup.export.save");
+    assert_eq!(verifier.verify_calls(), 1, "the locked vault asked once");
+    assert!(
+        cx.did_prompt_for_new_path(),
+        "the file is chosen after the unlock"
+    );
+    let target = dir.path().join("v1.json");
+    let chosen = target.clone();
+    cx.simulate_new_path_selection(move |_directory| Some(chosen));
+    cx.run_until_parked();
+    let (_, sealed, ..) = cx
+        .update(|_window, app| view.read(app).export_report_for_test())
+        .expect("the export wrote its report");
+    assert_eq!(sealed, Some(1), "prod's password is in the file");
+    assert!(host_entry_accesses(&secrets).is_empty());
+}
+
+/// A version 1 import that brings host passwords waits for the vault job
+/// running now - a migration here - so neither save drops what the other
+/// wrote: both passwords are in the vault at the end (R3, R4).
+#[gpui::test]
+async fn a_password_import_waits_for_the_running_vault_job(cx: &mut TestAppContext) {
+    let dir = TempDir::new("backup-v1-waits");
+    let hosts = remembered_hosts(1);
+    let old_id = hosts[0].id();
+    seed(&dir.store(), hosts.clone());
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    secrets.seed_legacy_host(old_id, &shellune_core::SecretString::new("old-password"));
+    let arriving = password_host("arriving", "10.0.0.9");
+    let arriving_id = arriving.id();
+    let backup = dir.path().join("v1-import.json");
+    write_backup(
+        &backup,
+        vec![arriving],
+        Some("right horse"),
+        &[(arriving_id, "arriving-password")],
+    );
+    let (view, cx) = vault_window(cx, &dir, &secrets);
+
+    // The migration's job runs; its finish is held, so the job stays running.
+    cx.update(|_window, app| {
+        view.update(app, |view, _cx| view.security_hold_finish_for_test(true))
+    });
+    let (dialling, _) = connect_remembered(&view, cx, &hosts[0]);
+    assert!(dialling);
+
+    read_backup(&view, cx, &backup);
+    type_into(cx, "backup.import.passphrase", "right horse");
+    click(cx, "backup.import.unlock");
+    cx.run_until_parked();
+    assert_eq!(backup_stage(&view, cx), Some("import.preview"));
+    click(cx, "backup.import.apply");
+    cx.run_until_parked();
+    assert_eq!(
+        backup_stage(&view, cx),
+        Some("import.applying"),
+        "the import waits for the running vault job"
+    );
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.security_release_finish_for_test(cx))
+    });
+    cx.run_until_parked();
+    assert_eq!(backup_stage(&view, cx), Some("import.applied"));
+    let vault = open_vault(&dir, &secrets);
+    assert_eq!(
+        vault
+            .host_secret(old_id)
+            .map(shellune_core::SecretString::expose),
+        Some("old-password"),
+        "the migrated password is kept"
+    );
+    assert_eq!(
+        vault
+            .host_secret(arriving_id)
+            .map(shellune_core::SecretString::expose),
+        Some("arriving-password"),
+        "the imported password is there too"
+    );
+    assert!(!secrets.holds_legacy_host(old_id));
 }
 
 /// An automatic sync never starts while this device's vault is locked and the

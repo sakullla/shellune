@@ -246,7 +246,15 @@ pub(crate) struct SecurityPage {
     /// The passwords the running batch read from old entries, moved into the
     /// vault as one job when the run ends (ADR-5).
     batch_migrations: Option<crate::app::batch::BatchMigrations>,
+    /// A backup import is writing the vault file: no vault job starts until
+    /// it ends, so neither save drops what the other wrote.
+    import_writing: bool,
+    /// A backup import that waits for the running vault job to end.
+    import_waiting: Option<VaultWriterTask>,
 }
+
+/// Work that writes the vault outside a vault job, started once none runs.
+pub(crate) type VaultWriterTask = Box<dyn FnOnce(&mut ShelluneView, &mut Context<ShelluneView>)>;
 
 /// One remembered host password change waiting for the vault.
 #[derive(Clone, Debug)]
@@ -352,6 +360,9 @@ pub(crate) enum SecurityPending {
     /// Start the backup export whose vault checkbox is on, after its fresh
     /// verification (the whole vault would otherwise leave the machine).
     BackupVaultExport,
+    /// Start the backup export that seals host passwords from the vault,
+    /// once the vault's records can be read (R4).
+    BackupSecretsExport,
     /// Turn the biometric switch on, after one fresh verification.
     EnableBiometric,
     /// Turn the biometric switch off, after one fresh verification.
@@ -734,6 +745,8 @@ impl SecurityPage {
             host_job: None,
             legacy_forget: BTreeSet::new(),
             batch_migrations: None,
+            import_writing: false,
+            import_waiting: None,
         }
     }
 
@@ -747,9 +760,10 @@ impl SecurityPage {
         &self.device
     }
 
-    /// Whether a vault job or the start-up open is in flight.
+    /// Whether a vault job, the start-up open or a backup import writing the
+    /// vault is in flight.
     pub(crate) fn busy(&self) -> bool {
-        self.busy || self.warming
+        self.busy || self.warming || self.import_writing
     }
 
     /// The remembered password of a host as the window sees it: a change not
@@ -4241,7 +4255,7 @@ impl ShelluneView {
         self.security.busy = false;
         if let Some(job) = self.security.host_job.take() {
             self.host_secrets_finished(job, result, cx);
-            self.host_secrets_flush(cx);
+            self.security_job_idle(cx);
             return;
         }
         let strings = self.security_strings();
@@ -4476,7 +4490,7 @@ impl ShelluneView {
             }
         }
         // Host passwords that waited for this job go next, as one more job.
-        self.host_secrets_flush(cx);
+        self.security_job_idle(cx);
     }
 
     /// Rewrites the vault's reference mirror against the book as it now
@@ -4525,7 +4539,7 @@ impl ShelluneView {
                         cx,
                     ),
                 }
-                view.host_secrets_flush(cx);
+                view.security_job_idle(cx);
                 cx.notify();
             });
         })
@@ -4566,7 +4580,7 @@ impl ShelluneView {
                         cx,
                     ),
                 }
-                view.host_secrets_flush(cx);
+                view.security_job_idle(cx);
                 cx.notify();
             });
         })
@@ -4646,6 +4660,10 @@ impl ShelluneView {
                     .filter(|record| record.meta().is_live())
                     .min_by(|a, b| a.meta().name().cmp(b.meta().name()))
                     .map(|record| record.meta().id());
+                // An old entry whose password the opened vault holds is
+                // deleted now: one a sync or an import brought in, or one
+                // whose deletion failed before (R1, R3).
+                self.host_legacy_cleanup(&content, cx);
                 self.security.content = Some(content);
                 if let Some(first) = first_live_key
                     && let Some(draft) = self.hosts.draft_mut()
@@ -5167,6 +5185,7 @@ impl ShelluneView {
                     | SecurityPending::OpenAction(_)
                     | SecurityPending::HostSecrets
                     | SecurityPending::Batch
+                    | SecurityPending::BackupSecretsExport
             );
             if needs_vault_content
                 && !self.security.lock.locked
@@ -5258,6 +5277,10 @@ impl ShelluneView {
                     self.security_touch(cx);
                     self.choose_backup_export_path(cx);
                     self.security.operation_granted = false;
+                }
+                SecurityPending::BackupSecretsExport => {
+                    self.security_touch(cx);
+                    self.choose_backup_export_path(cx);
                 }
                 SecurityPending::EnableBiometric => {
                     self.security_set_biometric(true, cx);
@@ -6259,6 +6282,26 @@ impl ShelluneView {
         false
     }
 
+    /// Opens a vault file this window has not read yet - written by another
+    /// writer since the start, with no lock engaged - and holds `step` until
+    /// it is open. Returns whether the step waits.
+    pub(crate) fn vault_open_for(&mut self, step: SecurityPending, cx: &mut Context<Self>) -> bool {
+        if self.security.lock.locked
+            || self.security.content.is_some()
+            || self.security.warming
+            || self.security.open_problem.is_some()
+            || !VaultStore::at(self.store.root()).exists()
+        {
+            return false;
+        }
+        if !self.security.lock.pending.contains(&step) {
+            self.security.lock.pending.push(step);
+        }
+        self.vault_open_quietly(cx);
+        cx.notify();
+        true
+    }
+
     /// The password one record remembers, for the connection about to use it
     /// (R2). The one place a remembered password is read:
     ///
@@ -6280,12 +6323,19 @@ impl ShelluneView {
         if !remembers {
             return Ok(None);
         }
-        if let Some(change) = self.security.pending_host_secrets.get(&id).or_else(|| {
-            self.security
-                .host_job
-                .as_ref()
-                .and_then(|job| job.changes.get(&id))
-        }) {
+        // A locked window answers no password, not even one still waiting for
+        // the vault: the lock governs every secret read (R2).
+        let waiting = if self.security.lock.locked {
+            None
+        } else {
+            self.security.pending_host_secrets.get(&id).or_else(|| {
+                self.security
+                    .host_job
+                    .as_ref()
+                    .and_then(|job| job.changes.get(&id))
+            })
+        };
+        if let Some(change) = waiting {
             return Ok(match change {
                 PendingHostSecret::Set(secret) => Some(secret.clone()),
                 PendingHostSecret::Remove => None,
@@ -6352,6 +6402,21 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) {
         let id = save.edit.record().id();
+        // A host this machine remembered before the vault held its password
+        // may still have its old entry: it is deleted once the vault holds the
+        // new one, never before (R1).
+        let unmigrated = self
+            .book
+            .connection(id)
+            .is_some_and(|record| record.remembers_secret())
+            && self
+                .security
+                .content
+                .as_ref()
+                .is_none_or(|content| content.host_secret_state(id) != HostSecretState::Live);
+        if unmigrated {
+            self.security.legacy_forget.insert(id);
+        }
         self.security
             .pending_host_secrets
             .insert(id, PendingHostSecret::Set(secret));
@@ -6384,9 +6449,10 @@ impl ShelluneView {
     }
 
     /// The passwords of records the book no longer remembers - deleted, or no
-    /// longer remembering - leave the vault (R1). Each old entry still there is
-    /// deleted as well; a host the vault already holds was migrated, so its old
-    /// entry is gone already.
+    /// longer remembering - leave the vault (R1). The old entry of each is
+    /// deleted as well, whatever the vault holds: a password re-saved, synced
+    /// or imported into the vault does not prove the old entry is gone, and
+    /// this is the user's own action, asked for once per host.
     pub(crate) fn host_secrets_forget(&mut self, ids: &[HostId], cx: &mut Context<Self>) {
         let vault_known =
             self.security.content.is_some() || self.security.lock.locked || self.security.warming;
@@ -6409,16 +6475,10 @@ impl ShelluneView {
                     .pending_host_secrets
                     .insert(*id, PendingHostSecret::Remove);
             }
-            let migrated = matches!(
-                state,
-                Some(HostSecretState::Live | HostSecretState::Tombstoned)
-            );
-            if !migrated || self.security.legacy_forget.remove(id) {
-                // A store that cannot be reached leaves an entry nobody reads,
-                // which is not a reason to keep the record.
-                let _ = self.secrets.forget_legacy_host(*id);
-            }
         }
+        // A store that cannot be reached leaves an entry nobody reads, which
+        // is not a reason to keep the record.
+        self.host_legacy_forget(ids.to_vec(), cx);
         self.host_secrets_flush(cx);
     }
 
@@ -6523,6 +6583,91 @@ impl ShelluneView {
         cx.notify();
     }
 
+    /// What runs once a vault job ended: a backup import that waited for it
+    /// first, else the host passwords that waited.
+    fn security_job_idle(&mut self, cx: &mut Context<Self>) {
+        if !self.security.busy
+            && let Some(task) = self.security.import_waiting.take()
+        {
+            task(self, cx);
+            return;
+        }
+        self.host_secrets_flush(cx);
+    }
+
+    /// Runs `task` - a backup import that writes the vault file itself - once
+    /// no vault job runs: now, or when the running one ends. A later request
+    /// replaces one that still waits. Returns whether it waits.
+    pub(crate) fn security_when_no_job(
+        &mut self,
+        task: VaultWriterTask,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.security.busy {
+            self.security.import_waiting = Some(task);
+            return true;
+        }
+        task(self, cx);
+        false
+    }
+
+    /// Marks a backup import as writing the vault, or ends the mark: while
+    /// it holds, no vault job starts, and the host passwords that waited are
+    /// written once it ends.
+    pub(crate) fn security_set_import_writing(&mut self, writing: bool, cx: &mut Context<Self>) {
+        self.security.import_writing = writing;
+        if !writing {
+            self.host_secrets_flush(cx);
+        }
+    }
+
+    /// Whether a vault job runs now (the start-up open does not count).
+    pub(crate) fn security_job_running(&self) -> bool {
+        self.security.busy
+    }
+
+    /// Notes the hosts of the book as it stands whose old entry may still
+    /// exist - they remember a password the vault does not hold live - so the
+    /// entry is deleted once a vault written by a sync or an import holds the
+    /// password (R1). With the vault locked nothing is known and nothing is
+    /// noted: deleting the host or unticking it still deletes the entry.
+    pub(crate) fn host_legacy_expect_from_writer(&mut self) {
+        let vault_missing = !VaultStore::at(self.store.root()).exists();
+        let content = match (&self.security.content, vault_missing) {
+            (Some(content), _) => Some(content),
+            (None, true) => None,
+            (None, false) => return,
+        };
+        let candidates: Vec<HostId> = self
+            .book
+            .records()
+            .iter()
+            .filter(|record| record.remembers_secret())
+            .map(ConnectionRecord::id)
+            .filter(|id| {
+                content
+                    .is_none_or(|content| content.host_secret_state(*id) != HostSecretState::Live)
+            })
+            .collect();
+        self.security.legacy_forget.extend(candidates);
+    }
+
+    /// Why the vault's records cannot be read now, when they cannot: what a
+    /// writer that needs them (a backup export sealing host passwords) says
+    /// instead of reading the file behind the lock. `None` when they can, or
+    /// when this machine has no vault.
+    pub(crate) fn vault_unreadable_reason(&self) -> Option<String> {
+        if self.security.content.is_some() || !VaultStore::at(self.store.root()).exists() {
+            return None;
+        }
+        Some(
+            self.security
+                .open_problem
+                .clone()
+                .unwrap_or_else(|| self.security_strings().lock_state_locked.to_owned()),
+        )
+    }
+
     /// Deletes the old entries of hosts the saved vault now holds, after any
     /// successful job: a deletion that failed earlier is tried again here.
     fn host_legacy_cleanup(&mut self, content: &VaultContent, cx: &mut Context<Self>) {
@@ -6539,7 +6684,7 @@ impl ShelluneView {
     /// Deletes these hosts' old entries off the UI thread (a deletion may wait
     /// on the system's own prompt). One that fails is kept for the next try;
     /// the connection it served was never affected.
-    fn host_legacy_forget(&mut self, ids: Vec<HostId>, cx: &mut Context<Self>) {
+    pub(crate) fn host_legacy_forget(&mut self, ids: Vec<HostId>, cx: &mut Context<Self>) {
         if ids.is_empty() {
             return;
         }
@@ -6575,13 +6720,14 @@ impl ShelluneView {
             .iter()
             .flat_map(|job| job.changes.iter());
         for (id, change) in in_flight.chain(self.security.pending_host_secrets.iter()) {
-            pending.insert(
-                *id,
-                match change {
-                    PendingHostSecret::Set(secret) => Some(secret.clone()),
-                    PendingHostSecret::Remove => None,
-                },
-            );
+            let answer = match change {
+                // A locked window hands out no password, not even one still
+                // waiting for the vault.
+                PendingHostSecret::Set(_) if self.security.lock.locked => continue,
+                PendingHostSecret::Set(secret) => Some(secret.clone()),
+                PendingHostSecret::Remove => None,
+            };
+            pending.insert(*id, answer);
         }
         let legacy = match self.security.content {
             Some(_) => true,

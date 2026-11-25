@@ -705,6 +705,9 @@ impl ShelluneView {
         self.sync.running = Some(job.clone());
         if job.writes_local() {
             self.hold_data_writes();
+            // A host whose old entry may still exist here has it deleted once
+            // the vault the sync leaves holds its password (R1).
+            self.host_legacy_expect_from_writer();
         }
         let service = self.sync.service.clone();
         let ran = job.clone();
@@ -1231,6 +1234,11 @@ impl ShelluneView {
         );
         self.key_presence.forget();
         self.sync.applying = false;
+        if !report.secrets_to_forget.is_empty() {
+            // The vault took the deletions; an old entry of those hosts that
+            // is still on this machine goes with them (R1).
+            self.host_legacy_forget(report.secrets_to_forget.clone(), cx);
+        }
         let mut notes = Vec::new();
         if let Some(restored) = &report.vault_restored {
             notes.push(copy::fill(
