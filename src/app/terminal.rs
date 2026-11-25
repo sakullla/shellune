@@ -870,6 +870,7 @@ impl TerminalShortcuts {
 /// What a pane's reader waits on between drains.
 enum Ready {
     Ssh(shellune_ssh::OutputReady),
+    #[cfg_attr(test, allow(dead_code))]
     Local(shellune_terminal::LocalOutputReady),
 }
 
@@ -1854,6 +1855,11 @@ impl TerminalPane {
         let ready = match self.source.as_ref() {
             Some(PaneSource::Remote(session)) => Some(Ready::Ssh(session.output_ready())),
             Some(PaneSource::Chain(session)) => Some(Ready::Ssh(session.output_ready())),
+            // GPUI's test executor never fires timers, so the tests have always driven
+            // a real shell's output by hand; a wakeup from the PTY's own thread would
+            // drain whatever the platform's shell prints in the middle of a test. The
+            // wakeup itself is tested where it is made (`pty.rs`).
+            #[cfg(not(test))]
             Some(PaneSource::Local(session)) => Some(Ready::Local(session.output_ready())),
             Some(_) => None,
             None => return,
