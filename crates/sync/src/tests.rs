@@ -2624,7 +2624,10 @@ fn a_tampered_cloud_vault_is_refused_whole_and_nothing_changes() {
         .expect("the sealed body")
         .to_owned();
     let mut bytes: Vec<u8> = ciphertext.into_bytes();
-    bytes.swap(0, 1);
+    // Replace the first character with a different base64 character, so the
+    // body always changes (swapping two characters is a no-op when they are
+    // equal, which a random ciphertext sometimes has).
+    bytes[0] = if bytes[0] == b'A' { b'B' } else { b'A' };
     document["vault"]["ciphertext"] =
         serde_json::Value::String(String::from_utf8(bytes).expect("still base64 text"));
     let tampered = serde_json::to_vec(&document).expect("json");
