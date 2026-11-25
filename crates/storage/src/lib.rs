@@ -96,7 +96,10 @@ pub use book::{
     FORMAT_VERSION, Group, HostBook, HostEdit, LegacyGroupLabel, RecentConnection, RecentHost,
     UnreadableConnection, host_matches,
 };
-pub use credentials::{AppSecret, MemorySecrets, SERVICE, SecretError, SecretStore, SystemSecrets};
+pub use credentials::{
+    AppSecret, CachedSecrets, MemorySecrets, SERVICE, SecretAccess, SecretError, SecretOp,
+    SecretStore, SystemSecrets, host_entry_user,
+};
 pub use error::{BookError, PersistError, StorageError};
 pub use forwarding::{FILE_NAME as FORWARD_FILE_NAME, ForwardStore};
 pub use group::{
@@ -130,8 +133,9 @@ pub use trust::{
     TrustVerdict, is_sha256_fingerprint,
 };
 pub use vault::{
-    HostReference, KeySource, MigrationReport, PassphrasePurpose, UnsealSource, VAULT_FILE_NAME,
-    VAULT_FORMAT, VAULT_FORMAT_VERSION, VaultCipher, VaultContent, VaultCredentialRecord,
-    VaultKeyRecord, VaultStore, VaultStoreError, WrapRecord,
+    HostReference, HostSecretState, KeySource, MigrationReport, PassphrasePurpose, UnsealSource,
+    VAULT_BASE_FORMAT_VERSION, VAULT_FILE_NAME, VAULT_FORMAT, VAULT_FORMAT_VERSION, VaultCipher,
+    VaultContent, VaultCredentialRecord, VaultHostSecretRecord, VaultKeyRecord, VaultStore,
+    VaultStoreError, WrapRecord,
 };
 pub use workspace::{FILE_NAME as WORKSPACE_FILE_NAME, WorkspaceStore};

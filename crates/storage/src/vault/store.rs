@@ -40,7 +40,7 @@ pub const VAULT_FILE_NAME: &str = "vault.json";
 /// What tells the vault file from any other JSON.
 pub const VAULT_FORMAT: &str = "shellune-vault";
 
-/// The format this build writes and the newest it reads.
+/// The newest format this build reads and writes.
 ///
 /// There is no version 1 of this file: the version 1 format is the portable
 /// data document, whose sealed passwords and shared trust records are the only
@@ -48,7 +48,19 @@ pub const VAULT_FORMAT: &str = "shellune-vault";
 /// `vault.json`; an old client meets a version 2 portable document and refuses
 /// it by the version check it already has, which is what keeps the new secrets
 /// from being downgraded or dropped.
-pub const VAULT_FORMAT_VERSION: u32 = 2;
+///
+/// Format 3 is format 2 with remembered host passwords in the sealed body. A
+/// build that knows only format 2 would open such a body, ignore the field and
+/// drop every password on its next save, so the file says 3 exactly when the
+/// vault holds a host password record (a tombstone included) and that build
+/// refuses it instead. A vault without any stays at
+/// [`VAULT_BASE_FORMAT_VERSION`], so a machine that never remembered a host
+/// password in the vault can still go back to an older build. Both are read.
+pub const VAULT_FORMAT_VERSION: u32 = 3;
+
+/// The oldest format this build reads, and the one it still writes for a vault
+/// that holds no host password record.
+pub const VAULT_BASE_FORMAT_VERSION: u32 = 2;
 
 /// The snapshot reason of a vault save, so the copies are named in the folder
 /// the portable data already keeps.
@@ -398,7 +410,7 @@ impl VaultStore {
             if let Some(bytes) = &previous_bytes {
                 self.snapshot_previous(bytes)?;
             }
-            self.write(&cipher)
+            self.write(&cipher, format_version_for(content))
         })();
         if outcome.is_err() && created_local_secret {
             let _ = secrets.forget_app(AppSecret::VaultLocalUnseal);
@@ -554,7 +566,7 @@ impl VaultStore {
             .map(|_| ())
     }
 
-    fn write(&self, cipher: &VaultCipher) -> Result<(), VaultStoreError> {
+    fn write(&self, cipher: &VaultCipher, version: u32) -> Result<(), VaultStoreError> {
         // The last gate before the file: nothing this build refuses to read
         // back may be written, because a vault that cannot be opened by its
         // own writer is locked for good — later saves keep the last good file
@@ -564,7 +576,7 @@ impl VaultStore {
             .map_err(|reason| VaultStoreError::Invalid { reason })?;
         let file = VaultFile {
             format: VAULT_FORMAT.to_owned(),
-            version: VAULT_FORMAT_VERSION,
+            version,
             cipher: cipher.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&file).map_err(|error| VaultStoreError::Encode {
@@ -633,6 +645,16 @@ impl VaultStore {
     }
 }
 
+/// The format a save of `content` writes: 3 when it holds a host password
+/// record, live or deleted, and 2 otherwise (see [`VAULT_FORMAT_VERSION`]).
+fn format_version_for(content: &VaultContent) -> u32 {
+    if content.has_host_secret_records() {
+        VAULT_FORMAT_VERSION
+    } else {
+        VAULT_BASE_FORMAT_VERSION
+    }
+}
+
 /// Reads a vault file, refusing anything this build does not recognise.
 fn parse_vault_file(path: &Path, bytes: &[u8]) -> Result<VaultFile, VaultStoreError> {
     let corrupt = |reason: String| VaultStoreError::Corrupt { reason };
@@ -658,7 +680,7 @@ fn parse_vault_file(path: &Path, bytes: &[u8]) -> Result<VaultFile, VaultStoreEr
             supported: VAULT_FORMAT_VERSION,
         });
     }
-    if version != VAULT_FORMAT_VERSION {
+    if version < VAULT_BASE_FORMAT_VERSION {
         return Err(corrupt(format!(
             "vault format {version} was never written by Shellune; the version 1 format is the portable data file"
         )));
@@ -706,6 +728,14 @@ mod tests {
         };
         let bytes = serde_json::to_vec(&file).expect("serializes");
         parse_vault_file(Path::new("vault.json"), &bytes).expect("this build's file reads");
+
+        let mut base: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        base["version"] = serde_json::json!(VAULT_BASE_FORMAT_VERSION);
+        parse_vault_file(
+            Path::new("vault.json"),
+            &serde_json::to_vec(&base).expect("json"),
+        )
+        .expect("a format 2 file still reads");
 
         let mut newer: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         newer["version"] = serde_json::json!(VAULT_FORMAT_VERSION + 1);

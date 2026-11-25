@@ -81,8 +81,8 @@ pub use task::{
     TransferState, TransferUpdate, TransferUpdateError, partial_path,
 };
 pub use vault::{
-    CredentialMeta, KeyRotation, ManagedKeyMeta, VaultCatalog, VaultError, VaultRecordVersion,
-    VaultTombstone,
+    CredentialMeta, HostSecretMeta, KeyRotation, ManagedKeyMeta, VaultCatalog, VaultError,
+    VaultRecordVersion, VaultTombstone,
 };
 pub use workspace::{
     MAX_TAB_NAME_CHARS, PaneNode, PaneTarget, PanelConfig, PanelSection, PendingConnection,

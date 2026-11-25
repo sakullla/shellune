@@ -13,10 +13,11 @@ use shellune_core::{
     SecretString, VaultRecordVersion,
 };
 use shellune_storage::{
-    AppSecret, HostKey, HostReference, HostTrust, KdfParams, KeySource, MemorySecrets,
-    PassphrasePurpose, Platform, SNAPSHOT_DIRECTORY, SecretStore, ShelluneData, UnsealSource,
-    VAULT_FILE_NAME, VaultCipher, VaultContent, VaultCredentialRecord, VaultKeyRecord, VaultStore,
-    VaultStoreError, WrapRecord,
+    AppSecret, CachedSecrets, HostKey, HostReference, HostSecretState, HostTrust, KdfParams,
+    KeySource, MemorySecrets, PassphrasePurpose, Platform, SNAPSHOT_DIRECTORY, SecretOp,
+    SecretStore, ShelluneData, UnsealSource, VAULT_BASE_FORMAT_VERSION, VAULT_FILE_NAME,
+    VAULT_FORMAT_VERSION, VaultCipher, VaultContent, VaultCredentialRecord, VaultKeyRecord,
+    VaultStore, VaultStoreError, WrapRecord,
 };
 
 const WEBDAV_PASSWORD: &str = "the webdav account password";
@@ -967,6 +968,320 @@ fn an_unusable_stored_local_secret_fails_the_save_and_writes_nothing() {
             .map(|secret| secret.expose().to_owned()),
         Some("not base64".to_owned()),
         "the pre-existing entry is left to its owner"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A version 2 vault file written by the build before host passwords moved
+/// into the vault: one shared credential "Fixture login" (password
+/// `fixture-secret`), sealed for the WebDAV password `fixture passphrase`
+/// alone, with the cheap test KDF. It pins the cipher format: a build that
+/// cannot open it has broken every vault already on disk.
+const VERSION_TWO_FIXTURE: &str = r#"{
+  "format": "shellune-vault",
+  "version": 2,
+  "cipher": {
+    "vault_id": "a3950f53c64dcce9097c1d702d4f7622",
+    "wraps": [
+      {
+        "kind": "passphrase",
+        "purpose": "web_dav_password",
+        "kdf": {
+          "algorithm": "argon2id",
+          "memory_kib": 64,
+          "iterations": 1,
+          "parallelism": 1
+        },
+        "salt": "BSyCQIo0/C65zNC+uwbIfA==",
+        "nonce": "41qGrvCDHp5RRTMl",
+        "ciphertext": "QB/sXAB8+d0UwHOZGM81pzBdh42ipdNM9ZcKyiVyvvg4Z/h+5e9LOwTY94kN6xpi"
+      }
+    ],
+    "nonce": "P9+gAwSsnft8eAFI",
+    "ciphertext": "DGNnv2oX622KsiTg3I3IHJpK54ljbMIrTWTnQ9sMpbc0pl0zhch6DpdtwyRorS4Vv5zTNp0aXlztPJssy5cDdWulpTN3LxaPX/Q2QsHAfVYJV0xURUdLrKGD9X+3017Q7k5WeNlQ1lCzGaTKkw3EOyOFaV1g2zHqXW3YoVxVpKfNEeM3+Beq8eiXHs88jqZcWXXaq2eBfqA+PJXyC30zbhDTq5CGuLW5NYEU1/Q9bXhe7j+W/dfZ5tut1q2o9O4RhaXroSvY/aO0AiRrFamixXRSJrezI8WqjYrrLN2TfehoLUXFUivoxEyKwPIngzClvey2tBwz7YYEVe2eqd86LUlps4FyJIYMkmV0vxPyi2iRDOEe77RAWRCHDpJQbgAhYPBCFg4s1DE+QsowRmIbCJYQWZ1Cg//8WhmJloTOfhFV6yGVA/3YFCXg1bYzX/agyhW4rtYNyolV3b1BWtMIXsEkFqGA2FmouFopleKOtAqJhaAQabDw+0YbQ3hHiydbUlPyJW61pirxf7OUcDcSo8/cDfvyCI6lRBNpJA=="
+  }
+}"#;
+
+const FIXTURE_PASSPHRASE: &str = "fixture passphrase";
+const FIXTURE_CREDENTIAL: &str = "6f1c2a9e-5b7d-4c3e-9a1f-2d8e7b6c5a40";
+
+fn file_version(store: &VaultStore) -> u64 {
+    let document: serde_json::Value = serde_json::from_str(&file_text(store)).expect("json");
+    document["version"].as_u64().expect("a version")
+}
+
+/// A host that remembers its own password.
+fn remembering_host(name: &str) -> HostConfig {
+    let mut host = HostConfig::new(name, "10.0.0.8", 22, "deploy").expect("host");
+    host.set_auth(Some(AuthMethodKind::Password));
+    host.set_remember_secret(true);
+    host
+}
+
+#[test]
+fn host_passwords_round_trip_and_make_the_file_format_three() {
+    let root = scratch("host-secrets");
+    let store = VaultStore::at(&root);
+    let secrets = MemorySecrets::new();
+    let (mut vault, mut hosts) = content();
+    let remembered = remembering_host("db");
+    let gone = HostId::new();
+    hosts.push(remembered.clone());
+
+    // No host password record yet: the file stays format 2.
+    store
+        .save(
+            &vault,
+            &hosts,
+            &[UnsealSource::LocalMachine],
+            cheap_kdf(),
+            &secrets,
+        )
+        .expect("saved");
+    assert_eq!(file_version(&store), u64::from(VAULT_BASE_FORMAT_VERSION));
+
+    vault.set_host_secret(
+        remembered.id(),
+        SecretString::new("db-password"),
+        "device-a",
+    );
+    vault.set_host_secret(gone, SecretString::new("orphan-password"), "device-a");
+    secrets.clear_accesses();
+    store
+        .save(
+            &vault,
+            &hosts,
+            &[UnsealSource::LocalMachine],
+            cheap_kdf(),
+            &secrets,
+        )
+        .expect("an orphan host password does not block the save");
+    assert_eq!(file_version(&store), u64::from(VAULT_FORMAT_VERSION));
+    assert_eq!(VAULT_FORMAT_VERSION, 3);
+    let text = file_text(&store);
+    assert!(!text.contains("db-password"), "no password in the clear");
+
+    let opened = store
+        .open(&UnsealSource::LocalMachine, &secrets)
+        .expect("opens");
+    assert_eq!(
+        opened
+            .host_secret(remembered.id())
+            .map(|secret| secret.expose().to_owned())
+            .as_deref(),
+        Some("db-password")
+    );
+    assert_eq!(opened.host_secret_state(gone), HostSecretState::Live);
+    assert!(
+        secrets
+            .accesses()
+            .iter()
+            .all(|access| !access.is_host_entry()),
+        "saving and opening host passwords never touches a host-<uuid> entry: {:?}",
+        secrets.accesses()
+    );
+
+    // Pruning tombstones the orphan; a tombstone is still a record, so the
+    // file stays format 3 and the deletion travels.
+    let mut pruned = opened;
+    let records: Vec<shellune_core::ConnectionRecord> = hosts
+        .iter()
+        .cloned()
+        .map(shellune_core::ConnectionRecord::Ssh)
+        .collect();
+    assert_eq!(pruned.prune_host_secrets(&records), 1);
+    store
+        .save_records(
+            &pruned,
+            &records,
+            &[UnsealSource::LocalMachine],
+            cheap_kdf(),
+            &secrets,
+        )
+        .expect("saved");
+    assert_eq!(file_version(&store), u64::from(VAULT_FORMAT_VERSION));
+    let reopened = store
+        .open(&UnsealSource::LocalMachine, &secrets)
+        .expect("opens");
+    assert_eq!(
+        reopened.host_secret_state(gone),
+        HostSecretState::Tombstoned
+    );
+    assert!(reopened.host_secret(gone).is_none());
+    assert_eq!(
+        reopened
+            .host_secret(remembered.id())
+            .map(|secret| secret.expose().to_owned())
+            .as_deref(),
+        Some("db-password")
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_version_two_file_of_the_earlier_build_still_opens_and_stays_two_without_host_passwords() {
+    let root = scratch("version-two");
+    std::fs::create_dir_all(&root).expect("scratch");
+    let store = VaultStore::at(&root);
+    std::fs::write(store.path(), VERSION_TWO_FIXTURE).expect("write");
+    let secrets = MemorySecrets::new();
+    let source = UnsealSource::WebDavPassword(SecretString::new(FIXTURE_PASSPHRASE));
+
+    let opened = store
+        .open(&source, &secrets)
+        .expect("a version 2 file opens");
+    let credential: CredentialId =
+        serde_json::from_str(&format!("\"{FIXTURE_CREDENTIAL}\"")).expect("id");
+    assert_eq!(
+        opened
+            .credential(credential)
+            .and_then(VaultCredentialRecord::secret)
+            .map(|secret| secret.expose().to_owned())
+            .as_deref(),
+        Some("fixture-secret")
+    );
+    assert!(!opened.has_host_secret_records());
+
+    // Saved again without host passwords, it is still a file an older build reads.
+    store
+        .save(
+            &opened,
+            &[],
+            std::slice::from_ref(&source),
+            cheap_kdf(),
+            &secrets,
+        )
+        .expect("saved");
+    assert_eq!(file_version(&store), 2);
+
+    let mut with_host = opened;
+    let host = HostId::new();
+    with_host.set_host_secret(host, SecretString::new("pw"), "device-a");
+    store
+        .save(
+            &with_host,
+            &[],
+            std::slice::from_ref(&source),
+            cheap_kdf(),
+            &secrets,
+        )
+        .expect("saved");
+    assert_eq!(file_version(&store), 3);
+    let reopened = store.open(&source, &secrets).expect("opens");
+    assert_eq!(
+        reopened
+            .host_secret(host)
+            .map(|secret| secret.expose().to_owned())
+            .as_deref(),
+        Some("pw")
+    );
+    assert!(
+        reopened
+            .credential(credential)
+            .and_then(VaultCredentialRecord::secret)
+            .is_some()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_file_newer_than_format_three_is_refused_and_kept() {
+    let root = scratch("version-four");
+    std::fs::create_dir_all(&root).expect("scratch");
+    let store = VaultStore::at(&root);
+    let mut document: serde_json::Value = serde_json::from_str(VERSION_TWO_FIXTURE).expect("json");
+    document["version"] = serde_json::json!(4);
+    let newer = serde_json::to_string_pretty(&document).expect("json");
+    std::fs::write(store.path(), &newer).expect("write");
+    let secrets = MemorySecrets::new();
+    let source = UnsealSource::WebDavPassword(SecretString::new(FIXTURE_PASSPHRASE));
+    assert!(matches!(
+        store.open(&source, &secrets),
+        Err(VaultStoreError::UnsupportedVersion {
+            found: 4,
+            supported: 3,
+            ..
+        })
+    ));
+    assert!(matches!(
+        store.save(
+            &VaultContent::new(),
+            &[],
+            std::slice::from_ref(&source),
+            cheap_kdf(),
+            &secrets
+        ),
+        Err(VaultStoreError::UnsupportedVersion { .. })
+    ));
+    assert_eq!(file_text(&store), newer, "the refused save changed nothing");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_cached_store_reads_the_local_unseal_secret_once_per_unlock() {
+    let root = scratch("cached");
+    let store = VaultStore::at(&root);
+    let secrets = CachedSecrets::new(MemorySecrets::new());
+    let (mut vault, hosts) = content();
+    for _ in 0..300 {
+        vault.set_host_secret(HostId::new(), SecretString::new("pw"), "device-a");
+    }
+    store
+        .save(
+            &vault,
+            &hosts,
+            &[UnsealSource::LocalMachine],
+            cheap_kdf(),
+            &secrets,
+        )
+        .expect("saved");
+    for _ in 0..3 {
+        let opened = store
+            .open(&UnsealSource::LocalMachine, &secrets)
+            .expect("opens");
+        assert_eq!(opened.host_secret_records().count(), 300);
+        store
+            .save(
+                &opened,
+                &hosts,
+                &[UnsealSource::LocalMachine],
+                cheap_kdf(),
+                &secrets,
+            )
+            .expect("saved");
+    }
+    let local_reads = |secrets: &CachedSecrets<MemorySecrets>| {
+        secrets
+            .inner()
+            .accesses()
+            .iter()
+            .filter(|access| {
+                access.op == SecretOp::Load && access.user == AppSecret::VaultLocalUnseal.user()
+            })
+            .count()
+    };
+    assert_eq!(
+        local_reads(&secrets),
+        1,
+        "one read for the first save, every later use answered from memory: {:?}",
+        secrets.inner().accesses()
+    );
+    assert!(
+        secrets
+            .inner()
+            .accesses()
+            .iter()
+            .all(|access| !access.is_host_entry())
+    );
+
+    secrets.clear_cache();
+    store
+        .open(&UnsealSource::LocalMachine, &secrets)
+        .expect("opens");
+    assert_eq!(
+        local_reads(&secrets),
+        2,
+        "locking makes the next unlock read again"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

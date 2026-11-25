@@ -4,6 +4,8 @@
 //! algorithm, fingerprint, timestamps, the record version and a possible
 //! tombstone — with the one secret that must never be public: the OpenSSH
 //! private material of a managed key or the password of a shared credential.
+//! From format 3 on it also holds the remembered password of a host, keyed by
+//! the host and versioned like every other record.
 //! The secret travels only inside the sealed body (see [`super::crypto`]) and
 //! lives as a [`SecretString`], so it is wiped when the record is dropped.
 //!
@@ -21,8 +23,9 @@ use std::time::SystemTime;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use shellune_core::{
-    AuthMethodKind, ConnectionRecord, CredentialId, CredentialMeta, HostConfig, HostId, KeyId,
-    ManagedKeyMeta, SecretString, VaultCatalog, VaultRecordVersion, VaultTombstone,
+    AuthMethodKind, ConnectionRecord, CredentialId, CredentialMeta, HostConfig, HostId,
+    HostSecretMeta, KeyId, ManagedKeyMeta, SecretString, VaultCatalog, VaultRecordVersion,
+    VaultTombstone,
 };
 use zeroize::Zeroize as _;
 use zeroize::Zeroizing;
@@ -85,6 +88,54 @@ impl VaultCredentialRecord {
     pub fn secret(&self) -> Option<&SecretString> {
         self.meta.is_live().then_some(&self.secret)
     }
+}
+
+/// One host's remembered password: its public metadata and the password.
+///
+/// The record is keyed by the host's identifier and belongs to that host
+/// alone; a tombstone keeps the metadata and holds an empty body.
+#[derive(Clone, Debug)]
+pub struct VaultHostSecretRecord {
+    meta: HostSecretMeta,
+    secret: SecretString,
+}
+
+impl VaultHostSecretRecord {
+    /// A record with this metadata. The body of a tombstone is dropped, so a
+    /// deleted record never carries a password, whatever the caller passed.
+    #[must_use]
+    pub fn new(meta: HostSecretMeta, secret: SecretString) -> Self {
+        let secret = if meta.is_live() {
+            secret
+        } else {
+            SecretString::new("")
+        };
+        Self { meta, secret }
+    }
+
+    /// The public metadata.
+    #[must_use]
+    pub fn meta(&self) -> &HostSecretMeta {
+        &self.meta
+    }
+
+    /// The password, when the record is live.
+    #[must_use]
+    pub fn secret(&self) -> Option<&SecretString> {
+        self.meta.is_live().then_some(&self.secret)
+    }
+}
+
+/// What the vault knows about one host's remembered password.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostSecretState {
+    /// The vault holds the password.
+    Live,
+    /// The password was deleted; the tombstone says so, and there is nothing
+    /// to read or to migrate.
+    Tombstoned,
+    /// The vault has never held a record for this host.
+    Absent,
 }
 
 /// The mirror of one host's vault references.
@@ -199,6 +250,7 @@ impl HostReference {
 pub struct VaultContent {
     keys: BTreeMap<KeyId, VaultKeyRecord>,
     credentials: BTreeMap<CredentialId, VaultCredentialRecord>,
+    host_secrets: BTreeMap<HostId, VaultHostSecretRecord>,
     references: Vec<HostReference>,
     trust: HostTrust,
 }
@@ -395,6 +447,129 @@ impl VaultContent {
         }
     }
 
+    /// Every remembered host password record, live and deleted, ordered by
+    /// host. This is what a sync merge or an export walks.
+    pub fn host_secret_records(&self) -> impl Iterator<Item = &VaultHostSecretRecord> {
+        self.host_secrets.values()
+    }
+
+    /// The remembered password record of this host, live or deleted.
+    #[must_use]
+    pub fn host_secret_record(&self, host: HostId) -> Option<&VaultHostSecretRecord> {
+        self.host_secrets.get(&host)
+    }
+
+    /// The remembered password of this host, when the vault holds it live.
+    #[must_use]
+    pub fn host_secret(&self, host: HostId) -> Option<&SecretString> {
+        self.host_secrets
+            .get(&host)
+            .and_then(VaultHostSecretRecord::secret)
+    }
+
+    /// Whether the vault holds this host's password, deleted it, or never
+    /// had a record of it — the last one is the only state in which an old
+    /// system-store entry may still be worth reading.
+    #[must_use]
+    pub fn host_secret_state(&self, host: HostId) -> HostSecretState {
+        match self.host_secrets.get(&host) {
+            Some(record) if record.meta.is_live() => HostSecretState::Live,
+            Some(_) => HostSecretState::Tombstoned,
+            None => HostSecretState::Absent,
+        }
+    }
+
+    /// Adds a host password record as it is, for a reader that rebuilds a
+    /// vault record by record (the decoder, a sync merge).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultStoreError::Invalid`] when the vault already holds a
+    /// record of this host.
+    pub fn insert_host_secret(
+        &mut self,
+        record: VaultHostSecretRecord,
+    ) -> Result<(), VaultStoreError> {
+        let host = record.meta.host();
+        if self.host_secrets.contains_key(&host) {
+            return Err(VaultStoreError::Invalid {
+                reason: format!("the vault already holds the password of host {host}"),
+            });
+        }
+        self.host_secrets.insert(host, record);
+        Ok(())
+    }
+
+    /// Remembers `secret` as the password of `host`, written by `device_id`.
+    /// Whether anything changed.
+    ///
+    /// A host without a record gets one at version 1; a record that exists,
+    /// live or deleted, is replaced at its next version. Saving the password
+    /// the vault already holds live is no change and keeps the version, so a
+    /// form saved twice does not look like an edit to a sync merge.
+    pub fn set_host_secret(&mut self, host: HostId, secret: SecretString, device_id: &str) -> bool {
+        let meta = match self.host_secrets.get(&host) {
+            Some(record) if record.meta.is_live() && record.secret.expose() == secret.expose() => {
+                return false;
+            }
+            Some(record) => record.meta.revised(device_id),
+            None => HostSecretMeta::new(host, VaultRecordVersion::new(1, device_id)),
+        };
+        // The record replaced here drops, and its password is wiped with it.
+        self.host_secrets
+            .insert(host, VaultHostSecretRecord::new(meta, secret));
+        true
+    }
+
+    /// Deletes the remembered password of `host`, keeping a tombstone with an
+    /// empty body, at the version the record had — the same rule as every
+    /// other vault deletion. Whether a live record was deleted: a tombstone
+    /// stays as it is, and a host the vault never held gets no record, since
+    /// there is no deletion for a merge to carry.
+    pub fn remove_host_secret(&mut self, host: HostId) -> bool {
+        match self.host_secrets.get_mut(&host) {
+            Some(record) if record.meta.is_live() => {
+                let meta = record.meta.tombstone();
+                // Assigning drops the old body, which wipes the password.
+                *record = VaultHostSecretRecord::new(meta, SecretString::new(""));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Deletes every live host password the connection book no longer asks
+    /// for: the host is gone, or it stopped remembering its password. How
+    /// many records became tombstones.
+    ///
+    /// This is the sweep that keeps the vault from holding passwords nobody
+    /// can see; [`Self::validate_for_records`] does not refuse the orphans it
+    /// would remove, so deleting a host is never blocked on it.
+    pub fn prune_host_secrets(&mut self, records: &[ConnectionRecord]) -> usize {
+        let wanted: std::collections::BTreeSet<HostId> = records
+            .iter()
+            .filter(|record| record.remembers_secret())
+            .map(ConnectionRecord::id)
+            .collect();
+        let stale: Vec<HostId> = self
+            .host_secrets
+            .values()
+            .filter(|record| record.meta.is_live() && !wanted.contains(&record.meta.host()))
+            .map(|record| record.meta.host())
+            .collect();
+        stale
+            .into_iter()
+            .filter(|host| self.remove_host_secret(*host))
+            .count()
+    }
+
+    /// Whether the vault holds any host password record, live or deleted,
+    /// which is what makes its file format 3.
+    #[must_use]
+    pub fn has_host_secret_records(&self) -> bool {
+        !self.host_secrets.is_empty()
+    }
+
     /// The reference snapshot the vault holds.
     #[must_use]
     pub fn references(&self) -> &[HostReference] {
@@ -478,6 +653,11 @@ impl VaultContent {
     /// live — a reference to a record that is gone or deleted is a binding that
     /// cannot hold, and is refused — and the reference snapshot has to be the
     /// snapshot of exactly these records.
+    ///
+    /// Remembered host passwords are not checked against the book: a password
+    /// whose host is gone or no longer remembers it is an orphan for
+    /// [`Self::prune_host_secrets`] to sweep, never a reason to refuse a save,
+    /// so deleting a host cannot be blocked by the password it left behind.
     ///
     /// # Errors
     ///
@@ -610,6 +790,17 @@ struct WireBody {
     references: Vec<HostReference>,
     #[serde(default)]
     trust: HostTrust,
+    /// The remembered host passwords, added with format 3. A body without
+    /// them is an older vault and reads as one that holds none; a body that
+    /// holds none writes no field, so it stays the body format 2 wrote.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    host_secrets: Vec<WireHostSecret>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireHostSecret {
+    meta: HostSecretMeta,
+    secret: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -663,6 +854,18 @@ pub(super) fn encode(content: &VaultContent) -> Result<Zeroizing<Vec<u8>>, Vault
             .collect(),
         references: content.references.clone(),
         trust: content.trust.clone(),
+        host_secrets: content
+            .host_secrets
+            .values()
+            .map(|record| WireHostSecret {
+                meta: record.meta.clone(),
+                secret: if record.meta.is_live() {
+                    record.secret.expose().to_owned()
+                } else {
+                    String::new()
+                },
+            })
+            .collect(),
     };
     let outcome = serde_json::to_vec(&wire);
     for key in &mut wire.keys {
@@ -670,6 +873,9 @@ pub(super) fn encode(content: &VaultContent) -> Result<Zeroizing<Vec<u8>>, Vault
     }
     for credential in &mut wire.credentials {
         credential.secret.zeroize();
+    }
+    for host_secret in &mut wire.host_secrets {
+        host_secret.secret.zeroize();
     }
     outcome
         .map(Zeroizing::new)
@@ -707,6 +913,17 @@ pub(super) fn decode(bytes: &mut [u8]) -> Result<VaultContent, VaultStoreError> 
                 .insert_credential(VaultCredentialRecord::new(
                     credential.meta,
                     SecretString::new(credential.secret),
+                ))
+                .map_err(|error| match error {
+                    VaultStoreError::Invalid { reason } => corrupt(reason),
+                    other => other,
+                })?;
+        }
+        for host_secret in wire.host_secrets {
+            content
+                .insert_host_secret(VaultHostSecretRecord::new(
+                    host_secret.meta,
+                    SecretString::new(host_secret.secret),
                 ))
                 .map_err(|error| match error {
                     VaultStoreError::Invalid { reason } => corrupt(reason),
@@ -1086,5 +1303,197 @@ mod tests {
             .expect("the tombstone travels");
         assert!(record.meta().deleted().is_some());
         assert!(record.secret().is_none());
+    }
+
+    fn remembering_host(name: &str) -> HostConfig {
+        let mut host = host(name);
+        host.set_auth(Some(AuthMethodKind::Password));
+        host.set_remember_secret(true);
+        assert!(host.remembers_secret());
+        host
+    }
+
+    #[test]
+    fn a_host_secret_is_set_revised_and_tombstoned_under_its_version() {
+        let host = HostId::new();
+        let mut content = VaultContent::new();
+        assert_eq!(content.host_secret_state(host), HostSecretState::Absent);
+        assert!(!content.remove_host_secret(host), "nothing to delete");
+        assert_eq!(
+            content.host_secret_state(host),
+            HostSecretState::Absent,
+            "deleting what was never held writes no record"
+        );
+        assert!(!content.has_host_secret_records());
+
+        assert!(content.set_host_secret(host, SecretString::new("hunter2"), "device-a"));
+        assert_eq!(content.host_secret_state(host), HostSecretState::Live);
+        assert_eq!(
+            content.host_secret(host).map(SecretString::expose),
+            Some("hunter2")
+        );
+        let record = content.host_secret_record(host).expect("the record");
+        assert_eq!(
+            record.meta().version(),
+            &VaultRecordVersion::new(1, "device-a")
+        );
+
+        assert!(
+            !content.set_host_secret(host, SecretString::new("hunter2"), "device-b"),
+            "the same password again is no change"
+        );
+        assert_eq!(
+            content
+                .host_secret_record(host)
+                .map(|record| record.meta().version().clone()),
+            Some(VaultRecordVersion::new(1, "device-a"))
+        );
+
+        assert!(content.set_host_secret(host, SecretString::new("correct horse"), "device-b"));
+        assert_eq!(
+            content
+                .host_secret_record(host)
+                .map(|record| record.meta().version().clone()),
+            Some(VaultRecordVersion::new(2, "device-b"))
+        );
+
+        assert!(content.remove_host_secret(host));
+        assert_eq!(content.host_secret_state(host), HostSecretState::Tombstoned);
+        assert!(content.host_secret(host).is_none());
+        let record = content.host_secret_record(host).expect("the tombstone");
+        assert!(record.secret().is_none());
+        assert_eq!(
+            record.secret.expose(),
+            "",
+            "a tombstone holds an empty body"
+        );
+        assert_eq!(
+            record.meta().version(),
+            &VaultRecordVersion::new(2, "device-b"),
+            "a deletion keeps the version it had"
+        );
+        assert!(
+            !content.remove_host_secret(host),
+            "deleting twice changes nothing"
+        );
+        assert!(content.has_host_secret_records(), "a tombstone is a record");
+
+        assert!(content.set_host_secret(host, SecretString::new("again"), "device-a"));
+        assert_eq!(content.host_secret_state(host), HostSecretState::Live);
+        assert_eq!(
+            content
+                .host_secret_record(host)
+                .map(|record| record.meta().version().clone()),
+            Some(VaultRecordVersion::new(3, "device-a"))
+        );
+    }
+
+    #[test]
+    fn pruning_tombstones_the_passwords_the_book_no_longer_asks_for() {
+        let kept = remembering_host("kept");
+        let mut forgetful = remembering_host("forgetful");
+        forgetful.set_remember_secret(false);
+        let mut desktop = RdpConfig::new("office", "10.0.0.9", Some("alice")).expect("valid");
+        desktop.set_remember_secret(true);
+        let gone = HostId::new();
+        let records = vec![
+            ConnectionRecord::Ssh(kept.clone()),
+            ConnectionRecord::Ssh(forgetful.clone()),
+            ConnectionRecord::Rdp(desktop.clone()),
+        ];
+
+        let mut content = VaultContent::new();
+        for id in [kept.id(), forgetful.id(), desktop.id(), gone] {
+            content.set_host_secret(id, SecretString::new(format!("pw-{id}")), "device-a");
+        }
+        // Orphans are not a reason to refuse a save.
+        content
+            .validate_for_records(&records)
+            .expect("orphan host passwords pass the book check");
+
+        assert_eq!(content.prune_host_secrets(&records), 2);
+        assert_eq!(content.host_secret_state(kept.id()), HostSecretState::Live);
+        assert_eq!(
+            content.host_secret_state(desktop.id()),
+            HostSecretState::Live
+        );
+        assert_eq!(
+            content.host_secret_state(forgetful.id()),
+            HostSecretState::Tombstoned
+        );
+        assert_eq!(content.host_secret_state(gone), HostSecretState::Tombstoned);
+        assert_eq!(
+            content.prune_host_secrets(&records),
+            0,
+            "pruning twice is no change"
+        );
+        assert_eq!(content.host_secret_records().count(), 4);
+    }
+
+    #[test]
+    fn host_secrets_travel_in_the_sealed_body_and_an_older_body_reads_without_them() {
+        let live = HostId::new();
+        let deleted = HostId::new();
+        let mut content = VaultContent::new();
+        content.set_host_secret(live, SecretString::new("hunter2"), "device-a");
+        content.set_host_secret(deleted, SecretString::new("swordfish"), "device-a");
+        content.remove_host_secret(deleted);
+
+        let mut bytes = encode(&content).expect("encodes");
+        let text = std::str::from_utf8(&bytes).expect("json").to_owned();
+        assert!(text.contains("\"host_secrets\""), "{text}");
+        assert!(
+            !text.contains("swordfish"),
+            "a tombstone carries no password"
+        );
+        let back = decode(bytes.as_mut()).expect("decodes");
+        assert!(bytes.iter().all(|byte| *byte == 0), "the buffer is wiped");
+        assert_eq!(
+            back.host_secret(live).map(SecretString::expose),
+            Some("hunter2")
+        );
+        assert_eq!(back.host_secret_state(deleted), HostSecretState::Tombstoned);
+        assert_eq!(
+            back.host_secret_record(live)
+                .map(|record| record.meta().clone()),
+            content
+                .host_secret_record(live)
+                .map(|record| record.meta().clone())
+        );
+
+        // A body without host passwords writes no field at all, which is the
+        // body format 2 wrote, and a format 2 body reads as holding none.
+        let empty = encode(&VaultContent::new()).expect("encodes");
+        assert!(
+            !std::str::from_utf8(&empty)
+                .expect("json")
+                .contains("host_secrets")
+        );
+        let mut older = b"{\"keys\":[],\"credentials\":[]}".to_vec();
+        let read = decode(&mut older).expect("an older body reads");
+        assert!(!read.has_host_secret_records());
+    }
+
+    #[test]
+    fn a_body_with_two_records_of_one_host_is_corrupt() {
+        let host = HostId::new();
+        let meta = serde_json::to_value(HostSecretMeta::new(
+            host,
+            VaultRecordVersion::new(1, "device-a"),
+        ))
+        .expect("serializes");
+        let body = serde_json::json!({
+            "keys": [],
+            "credentials": [],
+            "host_secrets": [
+                { "meta": meta, "secret": "one" },
+                { "meta": meta, "secret": "two" },
+            ],
+        });
+        let mut bytes = serde_json::to_vec(&body).expect("json");
+        assert!(matches!(
+            decode(&mut bytes),
+            Err(VaultStoreError::Corrupt { .. })
+        ));
     }
 }

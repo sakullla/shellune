@@ -2,13 +2,19 @@
 //!
 //! The host file never holds a secret: it rejects any field it does not know, and a
 //! password is not one of them. A host whose password the user asked Shellune to
-//! remember keeps only a flag; the secret itself goes to the store the operating system
-//! provides for exactly this — the Windows Credential Manager, the macOS keychain, or
-//! the Secret Service on Linux — under the host's id.
+//! remember keeps only a flag. Older builds put the secret itself in the store the
+//! operating system provides for exactly this — the Windows Credential Manager, the
+//! macOS keychain, or the Secret Service on Linux — under the host's id
+//! (`host-<uuid>`); the remembered passwords now live in the encrypted vault, and
+//! those entries are only read once and deleted when a host is migrated
+//! ([`SecretStore::load_legacy_host`], [`SecretStore::forget_legacy_host`]).
 //!
 //! A few secrets belong to the application rather than to a host — the WebDAV
-//! password and the sync passphrase ([`AppSecret`]). They live in the same store,
-//! under their own fixed names, so no configuration file ever holds them either.
+//! password, the sync passphrase and the local unseal secret of the vault
+//! ([`AppSecret`]). They live in the same store, under their own fixed names, so no
+//! configuration file ever holds them either. Every read of the system store can
+//! cost the user an authorization prompt, so [`CachedSecrets`] keeps what it read
+//! for the session.
 //!
 //! [`SecretStore`] is the boundary, so the window can be tested with
 //! [`MemorySecrets`] and never touches the real store of the machine running the tests.
@@ -20,6 +26,12 @@ use shellune_core::{HostId, SecretString};
 
 /// The service name entries are filed under in the system store.
 pub const SERVICE: &str = "com.shellune.Shellune";
+
+/// The user name a host's entry is filed under in the system store.
+#[must_use]
+pub fn host_entry_user(host: HostId) -> String {
+    format!("host-{host}")
+}
 
 /// Why the credential store could not do what was asked.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -89,6 +101,24 @@ pub trait SecretStore: Send + Sync {
     /// The store is unavailable or refused the deletion.
     fn forget(&self, host: HostId) -> Result<(), SecretError>;
 
+    /// The `host-<uuid>` entry an older build saved for one host, read for the
+    /// one migration into the vault; `Ok(None)` only when the store confirms
+    /// there is none. A store that cannot be read (or a user who refused the
+    /// prompt) answers `Err`, never "nothing saved".
+    ///
+    /// # Errors
+    ///
+    /// The store is unavailable or could not be read.
+    fn load_legacy_host(&self, host: HostId) -> Result<Option<SecretString>, SecretError>;
+
+    /// Deletes the `host-<uuid>` entry an older build saved for one host.
+    /// Deleting one that does not exist succeeds.
+    ///
+    /// # Errors
+    ///
+    /// The store is unavailable or refused the deletion.
+    fn forget_legacy_host(&self, host: HostId) -> Result<(), SecretError>;
+
     /// Saves an application secret, replacing any earlier one.
     ///
     /// # Errors
@@ -109,6 +139,11 @@ pub trait SecretStore: Send + Sync {
     ///
     /// The store is unavailable or refused the deletion.
     fn forget_app(&self, which: AppSecret) -> Result<(), SecretError>;
+
+    /// Drops whatever this store kept in memory of what it read, so the next
+    /// read asks the underlying store again. A store without a cache has
+    /// nothing to drop.
+    fn clear_cache(&self) {}
 }
 
 /// The operating system's credential store.
@@ -117,7 +152,7 @@ pub struct SystemSecrets;
 
 impl SystemSecrets {
     fn entry(host: HostId) -> Result<keyring::Entry, SecretError> {
-        Self::named(&format!("host-{host}"))
+        Self::named(&host_entry_user(host))
     }
 
     fn named(user: &str) -> Result<keyring::Entry, SecretError> {
@@ -166,6 +201,14 @@ impl SecretStore for SystemSecrets {
         Self::forget_entry(&Self::entry(host)?)
     }
 
+    fn load_legacy_host(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
+        Self::load_entry(&Self::entry(host)?)
+    }
+
+    fn forget_legacy_host(&self, host: HostId) -> Result<(), SecretError> {
+        Self::forget_entry(&Self::entry(host)?)
+    }
+
     fn save_app(&self, which: AppSecret, secret: &SecretString) -> Result<(), SecretError> {
         Self::save_entry(&Self::named(which.user())?, secret)
     }
@@ -179,11 +222,194 @@ impl SecretStore for SystemSecrets {
     }
 }
 
+/// A store that keeps the application secrets it read for the session (ADR-3).
+///
+/// Every read of the system store may cost the user an authorization prompt —
+/// on macOS, one per entry and process — so the local unseal secret, the WebDAV
+/// password and the sync passphrase are read once and then answered from
+/// memory. A confirmed absence is kept too. Writes and deletions go to the
+/// underlying store first and update the copy only when they succeed; a failed
+/// write forgets the copy, because the store's state is then unknown. A failed
+/// read is never kept.
+///
+/// [`SecretStore::clear_cache`] drops every copy, which is what locking the
+/// application does, so the next unlock reads the store again. Host entries
+/// pass straight through: they are read once per host for the migration and
+/// deleted right after, so there is nothing to keep.
+///
+/// The copies are [`SecretString`] values, wiped when they are dropped.
+pub struct CachedSecrets<S> {
+    inner: S,
+    apps: Mutex<HashMap<AppSecret, Option<SecretString>>>,
+}
+
+impl<S: SecretStore> CachedSecrets<S> {
+    /// A cache in front of `inner`, empty until the first read.
+    #[must_use]
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            apps: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The store the cache reads through to.
+    #[must_use]
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    fn remember(&self, which: AppSecret, value: Option<SecretString>) {
+        if let Ok(mut apps) = self.apps.lock() {
+            apps.insert(which, value);
+        }
+    }
+
+    fn drop_copy(&self, which: AppSecret) {
+        match self.apps.lock() {
+            Ok(mut apps) => {
+                apps.remove(&which);
+            }
+            // A poisoned cache may hold anything; it is emptied as a whole.
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
+    }
+}
+
+impl<S> std::fmt::Debug for CachedSecrets<S> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Names only: neither the copies nor whether they are present.
+        formatter
+            .debug_struct("CachedSecrets")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: SecretStore> SecretStore for CachedSecrets<S> {
+    fn save(&self, host: HostId, secret: &SecretString) -> Result<(), SecretError> {
+        self.inner.save(host, secret)
+    }
+
+    fn load(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
+        self.inner.load(host)
+    }
+
+    fn forget(&self, host: HostId) -> Result<(), SecretError> {
+        self.inner.forget(host)
+    }
+
+    fn load_legacy_host(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
+        self.inner.load_legacy_host(host)
+    }
+
+    fn forget_legacy_host(&self, host: HostId) -> Result<(), SecretError> {
+        self.inner.forget_legacy_host(host)
+    }
+
+    fn save_app(&self, which: AppSecret, secret: &SecretString) -> Result<(), SecretError> {
+        match self.inner.save_app(which, secret) {
+            Ok(()) => {
+                self.remember(which, Some(secret.clone()));
+                Ok(())
+            }
+            Err(error) => {
+                self.drop_copy(which);
+                Err(error)
+            }
+        }
+    }
+
+    fn load_app(&self, which: AppSecret) -> Result<Option<SecretString>, SecretError> {
+        if let Ok(apps) = self.apps.lock()
+            && let Some(copy) = apps.get(&which)
+        {
+            return Ok(copy.clone());
+        }
+        let loaded = self.inner.load_app(which)?;
+        self.remember(which, loaded.clone());
+        Ok(loaded)
+    }
+
+    fn forget_app(&self, which: AppSecret) -> Result<(), SecretError> {
+        match self.inner.forget_app(which) {
+            Ok(()) => {
+                self.remember(which, None);
+                Ok(())
+            }
+            Err(error) => {
+                self.drop_copy(which);
+                Err(error)
+            }
+        }
+    }
+
+    fn clear_cache(&self) {
+        match self.apps.lock() {
+            Ok(mut apps) => apps.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
+        self.inner.clear_cache();
+    }
+}
+
+/// What a call asked of the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SecretOp {
+    /// A write.
+    Save,
+    /// A read.
+    Load,
+    /// A deletion.
+    Forget,
+}
+
+/// One call [`MemorySecrets`] answered: what was asked and of which entry, by
+/// the user name the system store files it under (`host-<uuid>`,
+/// `vault-local-unseal`, …). This is what a test counts to prove how often
+/// the real store would have been touched — and so prompted the user.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SecretAccess {
+    /// What was asked.
+    pub op: SecretOp,
+    /// The entry it was asked of.
+    pub user: String,
+}
+
+impl SecretAccess {
+    /// A call on one host's entry.
+    #[must_use]
+    pub fn host(op: SecretOp, host: HostId) -> Self {
+        Self {
+            op,
+            user: host_entry_user(host),
+        }
+    }
+
+    /// A call on an application entry.
+    #[must_use]
+    pub fn app(op: SecretOp, which: AppSecret) -> Self {
+        Self {
+            op,
+            user: which.user().to_owned(),
+        }
+    }
+
+    /// Whether the call was on a host's `host-<uuid>` entry.
+    #[must_use]
+    pub fn is_host_entry(&self) -> bool {
+        self.user.starts_with("host-")
+    }
+}
+
 /// Secrets kept in memory only, for tests.
+///
+/// Every call is logged, failed ones included, because a call that fails on a
+/// real store has still asked it — and maybe the user — for the entry.
 #[derive(Debug, Default)]
 pub struct MemorySecrets {
     secrets: Mutex<HashMap<HostId, String>>,
     apps: Mutex<HashMap<AppSecret, String>>,
+    accesses: Mutex<Vec<SecretAccess>>,
     /// When set, every call fails, as an unavailable system store does.
     unavailable: bool,
 }
@@ -216,6 +442,47 @@ impl MemorySecrets {
         self.len() == 0
     }
 
+    /// Every call answered so far, in order.
+    #[must_use]
+    pub fn accesses(&self) -> Vec<SecretAccess> {
+        self.accesses
+            .lock()
+            .map_or_else(|poisoned| poisoned.into_inner().clone(), |log| log.clone())
+    }
+
+    /// Forgets the calls logged so far, so a test can count from here.
+    pub fn clear_accesses(&self) {
+        match self.accesses.lock() {
+            Ok(mut log) => log.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
+    }
+
+    /// Puts an entry an older build would have saved for `host`, without
+    /// logging it: the test's setup is not a call of the code under test.
+    pub fn seed_legacy_host(&self, host: HostId, secret: &SecretString) {
+        let mut secrets = match self.secrets.lock() {
+            Ok(secrets) => secrets,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        secrets.insert(host, secret.expose().to_owned());
+    }
+
+    /// Whether the store holds an entry for `host`, without logging the look.
+    #[must_use]
+    pub fn holds_legacy_host(&self, host: HostId) -> bool {
+        self.secrets
+            .lock()
+            .is_ok_and(|secrets| secrets.contains_key(&host))
+    }
+
+    fn log(&self, access: SecretAccess) {
+        match self.accesses.lock() {
+            Ok(mut log) => log.push(access),
+            Err(poisoned) => poisoned.into_inner().push(access),
+        }
+    }
+
     fn check(&self, action: &'static str) -> Result<(), SecretError> {
         if self.unavailable {
             Err(SecretError::new(action, "no credential service is running"))
@@ -223,10 +490,9 @@ impl MemorySecrets {
             Ok(())
         }
     }
-}
 
-impl SecretStore for MemorySecrets {
-    fn save(&self, host: HostId, secret: &SecretString) -> Result<(), SecretError> {
+    fn save_host(&self, host: HostId, secret: &SecretString) -> Result<(), SecretError> {
+        self.log(SecretAccess::host(SecretOp::Save, host));
         self.check("could not save the password")?;
         self.secrets
             .lock()
@@ -235,7 +501,8 @@ impl SecretStore for MemorySecrets {
         Ok(())
     }
 
-    fn load(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
+    fn load_host(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
+        self.log(SecretAccess::host(SecretOp::Load, host));
         self.check("could not read the password")?;
         Ok(self
             .secrets
@@ -245,7 +512,8 @@ impl SecretStore for MemorySecrets {
             .map(|secret| SecretString::new(secret.clone())))
     }
 
-    fn forget(&self, host: HostId) -> Result<(), SecretError> {
+    fn forget_host(&self, host: HostId) -> Result<(), SecretError> {
+        self.log(SecretAccess::host(SecretOp::Forget, host));
         self.check("could not delete the password")?;
         self.secrets
             .lock()
@@ -253,8 +521,31 @@ impl SecretStore for MemorySecrets {
             .remove(&host);
         Ok(())
     }
+}
+
+impl SecretStore for MemorySecrets {
+    fn save(&self, host: HostId, secret: &SecretString) -> Result<(), SecretError> {
+        self.save_host(host, secret)
+    }
+
+    fn load(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
+        self.load_host(host)
+    }
+
+    fn forget(&self, host: HostId) -> Result<(), SecretError> {
+        self.forget_host(host)
+    }
+
+    fn load_legacy_host(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
+        self.load_host(host)
+    }
+
+    fn forget_legacy_host(&self, host: HostId) -> Result<(), SecretError> {
+        self.forget_host(host)
+    }
 
     fn save_app(&self, which: AppSecret, secret: &SecretString) -> Result<(), SecretError> {
+        self.log(SecretAccess::app(SecretOp::Save, which));
         self.check("could not save the password")?;
         self.apps
             .lock()
@@ -264,6 +555,7 @@ impl SecretStore for MemorySecrets {
     }
 
     fn load_app(&self, which: AppSecret) -> Result<Option<SecretString>, SecretError> {
+        self.log(SecretAccess::app(SecretOp::Load, which));
         self.check("could not read the password")?;
         Ok(self
             .apps
@@ -274,6 +566,7 @@ impl SecretStore for MemorySecrets {
     }
 
     fn forget_app(&self, which: AppSecret) -> Result<(), SecretError> {
+        self.log(SecretAccess::app(SecretOp::Forget, which));
         self.check("could not delete the password")?;
         self.apps
             .lock()
@@ -312,8 +605,15 @@ mod tests {
             store.load(host).is_err(),
             "a failure is not \"nothing saved\""
         );
+        assert!(store.load_legacy_host(host).is_err());
+        assert!(store.forget_legacy_host(host).is_err());
         assert!(store.save(host, &SecretString::new("x")).is_err());
         assert!(store.load_app(AppSecret::WebDavPassword).is_err());
+        assert_eq!(
+            store.accesses().len(),
+            5,
+            "a failed call has still asked the store"
+        );
     }
 
     #[test]
@@ -364,6 +664,163 @@ mod tests {
         assert_ne!(
             AppSecret::VaultLocalUnseal.user(),
             AppSecret::SyncPassphrase.user()
+        );
+    }
+
+    #[test]
+    fn a_legacy_entry_is_seeded_silently_then_read_and_deleted_on_the_log() {
+        let store = MemorySecrets::new();
+        let host = HostId::new();
+        store.seed_legacy_host(host, &SecretString::new("old"));
+        assert!(store.accesses().is_empty(), "seeding is not a call");
+        assert!(store.holds_legacy_host(host));
+
+        let loaded = store
+            .load_legacy_host(host)
+            .expect("read")
+            .expect("present");
+        assert_eq!(loaded.expose(), "old");
+        store.forget_legacy_host(host).expect("deleted");
+        assert!(!store.holds_legacy_host(host));
+        assert_eq!(
+            store.load_legacy_host(host).expect("read").map(|_| ()),
+            None
+        );
+        store.load_app(AppSecret::VaultLocalUnseal).expect("read");
+
+        let user = format!("host-{host}");
+        assert_eq!(
+            store.accesses(),
+            vec![
+                SecretAccess {
+                    op: SecretOp::Load,
+                    user: user.clone()
+                },
+                SecretAccess {
+                    op: SecretOp::Forget,
+                    user: user.clone()
+                },
+                SecretAccess {
+                    op: SecretOp::Load,
+                    user
+                },
+                SecretAccess::app(SecretOp::Load, AppSecret::VaultLocalUnseal),
+            ]
+        );
+        assert!(store.accesses()[0].is_host_entry());
+        assert!(!store.accesses()[3].is_host_entry());
+        store.clear_accesses();
+        assert!(store.accesses().is_empty());
+    }
+
+    #[test]
+    fn the_cache_reads_an_application_secret_once_until_it_is_cleared() {
+        let cached = CachedSecrets::new(MemorySecrets::new());
+        cached
+            .inner()
+            .save_app(AppSecret::VaultLocalUnseal, &SecretString::new("unseal"))
+            .expect("saved");
+        cached.inner().clear_accesses();
+
+        for _ in 0..3 {
+            let loaded = cached
+                .load_app(AppSecret::VaultLocalUnseal)
+                .expect("read")
+                .expect("present");
+            assert_eq!(loaded.expose(), "unseal");
+        }
+        // A confirmed absence is kept as well.
+        for _ in 0..2 {
+            assert!(
+                cached
+                    .load_app(AppSecret::WebDavPassword)
+                    .expect("read")
+                    .is_none()
+            );
+        }
+        let loads = |user: &str| {
+            cached
+                .inner()
+                .accesses()
+                .iter()
+                .filter(|access| access.op == SecretOp::Load && access.user == user)
+                .count()
+        };
+        assert_eq!(loads("vault-local-unseal"), 1);
+        assert_eq!(loads("webdav"), 1);
+
+        // A write updates the copy; it is answered without another read.
+        cached
+            .save_app(AppSecret::WebDavPassword, &SecretString::new("dav"))
+            .expect("saved");
+        assert_eq!(
+            cached
+                .load_app(AppSecret::WebDavPassword)
+                .expect("read")
+                .map(|secret| secret.expose().to_owned())
+                .as_deref(),
+            Some("dav")
+        );
+        cached
+            .forget_app(AppSecret::WebDavPassword)
+            .expect("forgotten");
+        assert!(
+            cached
+                .load_app(AppSecret::WebDavPassword)
+                .expect("read")
+                .is_none()
+        );
+        assert_eq!(loads("webdav"), 1, "writes keep the copy current");
+
+        // Locking clears the cache: the next unlock reads the store again.
+        cached.clear_cache();
+        cached
+            .load_app(AppSecret::VaultLocalUnseal)
+            .expect("read")
+            .expect("present");
+        cached
+            .load_app(AppSecret::VaultLocalUnseal)
+            .expect("read")
+            .expect("present");
+        assert_eq!(loads("vault-local-unseal"), 2);
+
+        // Host entries pass straight through, every time.
+        let host = HostId::new();
+        cached
+            .inner()
+            .seed_legacy_host(host, &SecretString::new("old"));
+        cached.load_legacy_host(host).expect("read");
+        cached.load_legacy_host(host).expect("read");
+        cached.forget_legacy_host(host).expect("deleted");
+        assert_eq!(
+            cached
+                .inner()
+                .accesses()
+                .iter()
+                .filter(|access| access.is_host_entry())
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_failed_read_is_not_kept_and_a_failed_write_drops_the_copy() {
+        let cached = CachedSecrets::new(MemorySecrets::unavailable());
+        assert!(cached.load_app(AppSecret::SyncPassphrase).is_err());
+        assert!(cached.load_app(AppSecret::SyncPassphrase).is_err());
+        assert_eq!(
+            cached.inner().accesses().len(),
+            2,
+            "an error is asked again, not remembered"
+        );
+        assert!(
+            cached
+                .save_app(AppSecret::SyncPassphrase, &SecretString::new("x"))
+                .is_err()
+        );
+        assert!(
+            cached.load_app(AppSecret::SyncPassphrase).is_err(),
+            "a failed write left no copy behind"
         );
     }
 }

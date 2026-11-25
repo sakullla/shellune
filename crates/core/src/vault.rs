@@ -317,6 +317,99 @@ impl CredentialMeta {
     }
 }
 
+/// The public metadata of one host's remembered password.
+///
+/// A host whose password the user asked Shellune to remember keeps only the flag;
+/// the password lives in the encrypted vault under the host's identifier, and this
+/// is what a list, a log line or a sync merge may see of it. There is no name and
+/// no field that could grow a secret: the record belongs to its host and to
+/// nothing else, so it is never offered as a shared credential.
+///
+/// A deletion keeps the version the record had, exactly as the other vault
+/// records do: the tombstone beside the version is what tells a deletion from a
+/// record that did not change, and two devices that delete the same password do
+/// not disagree about anything.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostSecretMeta {
+    host: HostId,
+    updated_at: SystemTime,
+    version: VaultRecordVersion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deleted: Option<VaultTombstone>,
+}
+
+impl HostSecretMeta {
+    /// A live record of `host`, written at `version`.
+    #[must_use]
+    pub fn new(host: HostId, version: VaultRecordVersion) -> Self {
+        Self {
+            host,
+            updated_at: SystemTime::now(),
+            version,
+            deleted: None,
+        }
+    }
+
+    /// The host the password belongs to, which is also the record's identifier.
+    #[must_use]
+    pub fn host(&self) -> HostId {
+        self.host
+    }
+
+    /// When the record last changed, deletion included.
+    #[must_use]
+    pub fn updated_at(&self) -> SystemTime {
+        self.updated_at
+    }
+
+    /// The version of the record.
+    #[must_use]
+    pub fn version(&self) -> &VaultRecordVersion {
+        &self.version
+    }
+
+    /// The deletion, when the record is a tombstone.
+    #[must_use]
+    pub fn deleted(&self) -> Option<&VaultTombstone> {
+        self.deleted.as_ref()
+    }
+
+    /// Whether the record exists, as opposed to having been deleted.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        self.deleted.is_none()
+    }
+
+    /// The live record that replaces this one, live or deleted, when
+    /// `device_id` writes a new password: the counter goes up by one and the
+    /// writer is named.
+    #[must_use]
+    pub fn revised(&self, device_id: impl Into<String>) -> Self {
+        Self {
+            host: self.host,
+            updated_at: SystemTime::now(),
+            version: VaultRecordVersion::new(self.version.counter() + 1, device_id),
+            deleted: None,
+        }
+    }
+
+    /// This record as a tombstone, deleted now. The version stays the one the
+    /// record had; a tombstone stays as it is.
+    #[must_use]
+    pub fn tombstone(&self) -> Self {
+        if self.deleted.is_some() {
+            return self.clone();
+        }
+        let now = SystemTime::now();
+        Self {
+            host: self.host,
+            updated_at: now,
+            version: self.version.clone(),
+            deleted: Some(VaultTombstone::new(now, self.version.clone())),
+        }
+    }
+}
+
 /// One key rotation as a single transaction: the key that takes over, the hosts
 /// moved onto it and the key they stop using.
 ///
@@ -664,6 +757,50 @@ mod tests {
             encoded, "{\"counter\":7,\"device_id\":\"device-c\"}",
             "{encoded}"
         );
+    }
+
+    #[test]
+    fn a_host_secret_record_is_revised_and_tombstoned_under_its_host() {
+        let host = HostId::new();
+        let live = HostSecretMeta::new(host, VaultRecordVersion::new(1, "device-a"));
+        assert!(live.is_live());
+        assert_eq!(live.host(), host);
+
+        let back: HostSecretMeta =
+            serde_json::from_str(&serde_json::to_string(&live).expect("serializes"))
+                .expect("reads");
+        assert_eq!(back, live);
+        let encoded = serde_json::to_string(&live).expect("serializes");
+        assert!(
+            !encoded.contains("deleted"),
+            "a live record says nothing of deletion"
+        );
+
+        let revised = live.revised("device-b");
+        assert!(revised.is_live());
+        assert_eq!(revised.version(), &VaultRecordVersion::new(2, "device-b"));
+
+        let deleted = revised.tombstone();
+        assert!(!deleted.is_live());
+        assert_eq!(deleted.host(), host);
+        assert_eq!(
+            deleted.version(),
+            revised.version(),
+            "a deletion keeps the version it had"
+        );
+        assert_eq!(
+            deleted.deleted().map(VaultTombstone::version),
+            Some(revised.version())
+        );
+        assert_eq!(deleted.tombstone(), deleted, "a tombstone stays as it is");
+        let back: HostSecretMeta =
+            serde_json::from_str(&serde_json::to_string(&deleted).expect("serializes"))
+                .expect("reads");
+        assert_eq!(back, deleted);
+
+        let again = deleted.revised("device-a");
+        assert!(again.is_live(), "a new password revives the record");
+        assert_eq!(again.version(), &VaultRecordVersion::new(3, "device-a"));
     }
 
     #[test]

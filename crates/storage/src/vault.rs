@@ -1,6 +1,7 @@
-//! The encrypted vault: managed key bodies, shared passwords, the host
-//! references that use them and the accepted server identities, sealed in one
-//! authenticated ciphertext (R2, R9, ADR-2, ADR-5, ADR-6).
+//! The encrypted vault: managed key bodies, shared passwords, remembered host
+//! passwords, the host references that use them and the accepted server
+//! identities, sealed in one authenticated ciphertext (R2, R9, ADR-2, ADR-5,
+//! ADR-6).
 //!
 //! The vault is one JSON document, `vault.json`, whose entire body is sealed
 //! with AES-256-GCM under a data key (DEK) drawn from the system random source.
@@ -23,7 +24,7 @@
 //! passphrase alone and independent of any WebDAV password.
 //!
 //! The record kind, the wrap kind and its purpose, the vault identity and the
-//! format version are all bound into the authentication data, so a block
+//! cipher format version (2, whichever format the file envelope says) are all bound into the authentication data, so a block
 //! cannot be lifted into another vault or another kind of document and opened
 //! there. A fresh data key, salt and nonce are drawn for every sealing, so the
 //! same content sealed twice shares no ciphertext.
@@ -42,9 +43,12 @@ mod content;
 mod crypto;
 mod store;
 
-pub use content::{HostReference, VaultContent, VaultCredentialRecord, VaultKeyRecord};
+pub use content::{
+    HostReference, HostSecretState, VaultContent, VaultCredentialRecord, VaultHostSecretRecord,
+    VaultKeyRecord,
+};
 pub use crypto::{KeySource, PassphrasePurpose, VaultCipher, WrapRecord};
 pub use store::{
-    MigrationReport, UnsealSource, VAULT_FILE_NAME, VAULT_FORMAT, VAULT_FORMAT_VERSION, VaultStore,
-    VaultStoreError,
+    MigrationReport, UnsealSource, VAULT_BASE_FORMAT_VERSION, VAULT_FILE_NAME, VAULT_FORMAT,
+    VAULT_FORMAT_VERSION, VaultStore, VaultStoreError,
 };
