@@ -3465,6 +3465,24 @@ pub struct UxStrings {
     pub terminal_link_refused_scheme: &'static str,
     /// Toast when an OSC 8 link target was malformed and not opened
     pub terminal_link_refused_malformed: &'static str,
+    /// Terminal menu/palette: start logging output as plain text
+    pub terminal_log_start_plain: &'static str,
+    /// Terminal menu/palette: start logging output byte for byte
+    pub terminal_log_start_raw: &'static str,
+    /// Terminal menu/palette: stop the running session log
+    pub terminal_log_stop: &'static str,
+    /// Toast when a session log starts; {name}
+    pub terminal_log_started: &'static str,
+    /// Toast when a session log stops; {name}
+    pub terminal_log_stopped: &'static str,
+    /// Toast when writing a session log failed; {name}
+    pub terminal_log_failed: &'static str,
+    /// Toast when a session log could not be created
+    pub terminal_log_start_failed: &'static str,
+    /// Toast detail when output was dropped because the disk fell behind; {bytes}
+    pub terminal_log_dropped: &'static str,
+    /// Badge on a terminal whose output is being logged
+    pub terminal_log_indicator: &'static str,
     /// Desktop notification title when a long command succeeded; {session}
     pub notify_command_done: &'static str,
     /// Desktop notification title when a long command failed; {session}, {code}
@@ -4020,6 +4038,15 @@ impl UxStrings {
             self.terminal_copy_link,
             self.terminal_link_refused_scheme,
             self.terminal_link_refused_malformed,
+            self.terminal_log_start_plain,
+            self.terminal_log_start_raw,
+            self.terminal_log_stop,
+            self.terminal_log_started,
+            self.terminal_log_stopped,
+            self.terminal_log_failed,
+            self.terminal_log_start_failed,
+            self.terminal_log_dropped,
+            self.terminal_log_indicator,
             self.notify_command_done,
             self.notify_command_failed,
             self.notify_command_ended,
@@ -4561,6 +4588,15 @@ included",
     terminal_copy_link: "Copy link",
     terminal_link_refused_scheme: "Didn't open a {scheme}: link",
     terminal_link_refused_malformed: "Didn't open a link with an unusable address",
+    terminal_log_start_plain: "Start session log (plain text)…",
+    terminal_log_start_raw: "Start session log (raw)…",
+    terminal_log_stop: "Stop session log",
+    terminal_log_started: "Logging to {name}",
+    terminal_log_stopped: "Session log saved: {name}",
+    terminal_log_failed: "Session log stopped: couldn't write {name}",
+    terminal_log_start_failed: "Couldn't start the session log",
+    terminal_log_dropped: "{bytes} bytes were not written because the disk could not keep up.",
+    terminal_log_indicator: "Logging",
     notify_command_done: "Command finished · {session}",
     notify_command_failed: "Command failed (exit {code}) · {session}",
     notify_command_ended: "Command ended · {session}",
@@ -5097,6 +5133,15 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     terminal_copy_link: "复制链接",
     terminal_link_refused_scheme: "未打开 {scheme}: 链接",
     terminal_link_refused_malformed: "链接地址无法使用，未打开",
+    terminal_log_start_plain: "开始记录会话（纯文本）…",
+    terminal_log_start_raw: "开始记录会话（原始）…",
+    terminal_log_stop: "停止记录会话",
+    terminal_log_started: "正在记录到 {name}",
+    terminal_log_stopped: "会话日志已保存：{name}",
+    terminal_log_failed: "会话日志已停止：无法写入 {name}",
+    terminal_log_start_failed: "无法开始记录会话",
+    terminal_log_dropped: "磁盘写入跟不上，有 {bytes} 字节未写入。",
+    terminal_log_indicator: "记录中",
     notify_command_done: "命令已完成 · {session}",
     notify_command_failed: "命令失败（退出码 {code}）· {session}",
     notify_command_ended: "命令已结束 · {session}",

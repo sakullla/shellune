@@ -13,6 +13,7 @@
 //! * [`palette`] resolves named, indexed and direct colours;
 //! * [`pty`] starts a real shell and reports its output, its size changes and its
 //!   exit status;
+//! * [`session_log`] writes a terminal's output to a file while it runs;
 //! * [`shell`] lists the shells that actually exist on this machine.
 //!
 //! Nothing here depends on GPUI, so a failure in this crate is a terminal problem
@@ -26,6 +27,7 @@ pub mod metrics;
 pub mod mouse;
 pub mod palette;
 pub mod pty;
+pub mod session_log;
 pub mod shell;
 
 pub use alacritty_terminal::index::Side;
@@ -59,4 +61,5 @@ pub use pty::{
     ExitReport, LocalSession, OutputReady as LocalOutputReady, PtyEvent, ShellLaunchError,
     TERM_VALUE,
 };
+pub use session_log::{LogFormat, LogReport, PlainText, SessionLog};
 pub use shell::{discover, discover_with, platform_default, program_exists};

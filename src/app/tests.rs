@@ -22153,6 +22153,386 @@ async fn the_notification_settings_are_switched_on_their_page_and_read_back_in_r
     assert!(cx.debug_bounds("settings.notify.threshold.5").is_some());
 }
 
+// ---------------------------------------------------------------------------
+// Session logs (R3)
+// ---------------------------------------------------------------------------
+
+/// A fresh directory for one test's log files.
+fn log_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("shellune-logs-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    dir
+}
+
+/// Stops one session's log through the window, as the menu does.
+fn stop_log(cx: &mut VisualTestContext, view: &Entity<ShelluneView>, id: SessionId) {
+    cx.update(|_window, app| view.update(app, |view, cx| view.stop_session_log(id, cx)));
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn a_plain_log_keeps_what_the_terminal_showed_and_never_the_unechoed_keys(
+    cx: &mut TestAppContext,
+) {
+    let (pane, cx) = pane_with("", cx);
+    let dir = log_dir("pane-plain");
+    let path = dir.join("pane.log");
+    let started = cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.start_log(&path, shellune_terminal::LogFormat::Plain, cx)
+        })
+    });
+    assert_eq!(started, Ok(()));
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.feed_for_test(b"\x1b[32mok\x1b[0m done\r\n", cx);
+            // Typed without an echo: the program never showed it.
+            pane.type_text("hunter2", cx);
+            pane.feed_for_test(b"next line\r\n", cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| pane.read(app).sent().is_empty()),
+        "the keys did reach the program"
+    );
+    let report = cx
+        .update(|_window, app| pane.update(app, |pane, cx| pane.stop_log(cx)))
+        .expect("a log was running");
+    assert_eq!(report.error, None);
+    let text = std::fs::read_to_string(&path).expect("the log was written");
+    assert_eq!(text, "ok done\nnext line\n");
+    assert!(!text.contains("hunter2"), "unechoed keys are never logged");
+    assert!(cx.update(|_window, app| pane.read(app).logging().is_none()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui::test]
+async fn a_local_terminal_logs_through_its_menu_and_shows_that_it_does(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let id = cx
+        .update(|_window, app| view.read(app).active_session())
+        .expect("a shell");
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("its terminal");
+    let dir = log_dir("local-menu");
+    let target = dir.join("local.raw");
+
+    // The right-click menu offers both formats while nothing is logged.
+    let viewport = bounds_of(cx, "terminal.viewport");
+    let inside = point(viewport.origin.x + px(40.0), viewport.origin.y + px(40.0));
+    cx.simulate_mouse_down(inside, MouseButton::Right, Modifiers::default());
+    cx.simulate_mouse_up(inside, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("terminal.menu.log_plain").is_some());
+    click(cx, "terminal.menu.log_raw");
+    assert!(
+        cx.did_prompt_for_new_path(),
+        "the user picks where the log goes"
+    );
+    let offered = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let seen = offered.clone();
+    let chosen = target.clone();
+    cx.simulate_new_path_selection(move |directory| {
+        *seen.borrow_mut() = Some(directory.to_owned());
+        Some(chosen)
+    });
+    cx.run_until_parked();
+    assert!(offered.borrow().is_some(), "a directory was offered");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).logging().map(|(p, f)| (p.to_owned(), f))),
+        Some((target.clone(), shellune_terminal::LogFormat::Raw))
+    );
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("terminal.log.indicator").is_some(),
+        "a logging terminal says so"
+    );
+
+    feed_session(cx, &view, id, b"\x1b[1mraw\x1b[0m bytes\r\n");
+    // While logging, the menu offers the stop instead.
+    cx.simulate_mouse_down(inside, MouseButton::Right, Modifiers::default());
+    cx.simulate_mouse_up(inside, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    click(cx, "terminal.menu.log_stop");
+    assert!(cx.update(|_window, app| pane.read(app).logging().is_none()));
+    let written = std::fs::read(&target).expect("the log was written");
+    assert!(
+        written.ends_with(b"\x1b[1mraw\x1b[0m bytes\r\n"),
+        "a raw log is the bytes as they arrived: {written:?}"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).toast_titles())
+            .iter()
+            .any(|title| title.contains("local.raw")),
+        "stopping says where the log is"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui::test]
+async fn the_palette_offers_the_log_entries_of_the_terminal_on_screen(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let id = cx
+        .update(|_window, app| view.read(app).active_session())
+        .expect("a shell");
+    cx.simulate_keystrokes(palette_keystroke());
+    cx.run_until_parked();
+    let titles = cx.update(|_window, app| view.read(app).palette_titles());
+    assert!(
+        titles
+            .iter()
+            .any(|title| title == copy::ux_for(Locale::English).terminal_log_start_plain)
+    );
+    assert!(
+        titles
+            .iter()
+            .any(|title| title == copy::ux_for(Locale::English).terminal_log_start_raw)
+    );
+    assert!(
+        !titles
+            .iter()
+            .any(|title| title == copy::ux_for(Locale::English).terminal_log_stop)
+    );
+    cx.simulate_keystrokes("escape");
+
+    let dir = log_dir("palette");
+    let path = dir.join("p.log");
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("its terminal");
+    let _ = cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.start_log(&path, shellune_terminal::LogFormat::Plain, cx)
+        })
+    });
+    cx.simulate_keystrokes(palette_keystroke());
+    cx.run_until_parked();
+    let titles = cx.update(|_window, app| view.read(app).palette_titles());
+    assert!(
+        titles
+            .iter()
+            .any(|title| title == copy::ux_for(Locale::English).terminal_log_stop)
+    );
+    assert!(
+        !titles
+            .iter()
+            .any(|title| title == copy::ux_for(Locale::English).terminal_log_start_plain)
+    );
+    cx.simulate_keystrokes("escape");
+    stop_log(cx, &view, id);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui::test]
+async fn a_serial_terminal_logs_what_the_device_sent_and_its_local_echo(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let (link, device, _peer) = scripted_serial();
+    let id = mount_scripted_serial(&view, cx, "bench", "/dev/ttyFAKE0", true, link);
+    let dir = log_dir("serial");
+    let path = dir.join("serial.log");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.start_session_log(id, shellune_terminal::LogFormat::Plain, cx);
+        })
+    });
+    let chosen = path.clone();
+    cx.simulate_new_path_selection(move |_directory| Some(chosen));
+    cx.run_until_parked();
+
+    device.push_from_device(b"boot ok\r\n");
+    pump_serial_until(&view, cx, id, |pane| {
+        pane.visible_text()
+            .iter()
+            .any(|line| line.contains("boot ok"))
+    });
+    // Typed with local echo on: the echo is on screen, so it is in the log.
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("its terminal");
+    cx.update(|_window, app| pane.update(app, |pane, cx| pane.type_text("AT\r", cx)));
+    cx.run_until_parked();
+    stop_log(cx, &view, id);
+    let text = std::fs::read_to_string(&path).expect("the log was written");
+    assert!(
+        text.contains("boot ok\n"),
+        "device output is logged: {text:?}"
+    );
+    assert!(text.contains("AT"), "the local echo is logged: {text:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui::test]
+async fn an_ssh_terminal_logs_what_the_server_sent(cx: &mut TestAppContext) {
+    let dir = TempDir::new("ssh-log");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let workspace = Workspace::new();
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    click(cx, "nav.hosts");
+    click(cx, "hosts.connect.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::Connected,
+                    shellune_ssh::RemoteEvent::Data(b"$ ".to_vec()),
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    cx.run_until_parked();
+    let id = cx
+        .update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .sessions()
+                .items()
+                .iter()
+                .find(|session| session.kind().is_remote())
+                .map(|session| session.id())
+        })
+        .expect("the remote session");
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the remote terminal");
+
+    let logs = log_dir("ssh");
+    let path = logs.join("ssh.log");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.start_session_log(id, shellune_terminal::LogFormat::Plain, cx);
+        })
+    });
+    let chosen = path.clone();
+    cx.simulate_new_path_selection(move |_directory| Some(chosen));
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| pane.read(app).logging().is_some()));
+
+    assert!(cx.update(|_window, app| {
+        view.read(app).push_scripted_for_test(
+            id,
+            shellune_ssh::RemoteEvent::Data(b"\x1b[34mfrom the server\x1b[0m\r\n".to_vec()),
+        )
+    }));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline
+        && !cx.update(|_window, app| {
+            pane.read(app)
+                .visible_text()
+                .iter()
+                .any(|line| line.contains("from the server"))
+        })
+    {
+        cx.update(|_window, app| pane.update(app, |pane, cx| pane.pump_once(cx)));
+        cx.run_until_parked();
+    }
+    stop_log(cx, &view, id);
+    let text = std::fs::read_to_string(&path).expect("the log was written");
+    assert!(
+        text.contains("from the server\n"),
+        "server output is logged: {text:?}"
+    );
+    assert!(
+        !text.contains("\x1b"),
+        "a plain log has no escape sequences"
+    );
+    let _ = std::fs::remove_dir_all(logs);
+}
+
+#[gpui::test]
+async fn a_log_that_fails_to_write_stops_and_the_terminal_carries_on(cx: &mut TestAppContext) {
+    if !std::path::Path::new("/dev/full").exists() {
+        return;
+    }
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let id = cx
+        .update(|_window, app| view.read(app).active_session())
+        .expect("a shell");
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("its terminal");
+    let started = cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.start_log(
+                std::path::Path::new("/dev/full"),
+                shellune_terminal::LogFormat::Raw,
+                cx,
+            )
+        })
+    });
+    assert_eq!(started, Ok(()));
+    let chunk = vec![b'x'; 64 * 1024];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline
+        && cx.update(|_window, app| pane.read(app).logging().is_some())
+    {
+        feed_session(cx, &view, id, &chunk);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(
+        cx.update(|_window, app| pane.read(app).logging().is_none()),
+        "the failed log stopped"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).toast_titles())
+            .iter()
+            .any(|title| title.contains("full")),
+        "the window says the log stopped and which file"
+    );
+    feed_session(cx, &view, id, b"still here\r\n");
+    assert!(
+        cx.update(|_window, app| pane.read(app).visible_text())
+            .iter()
+            .any(|line| line.contains("still here")),
+        "the terminal carries on"
+    );
+}
+
+#[test]
+fn a_log_is_named_after_its_source_and_time_with_nothing_a_file_system_refuses() {
+    use crate::app::terminal::default_log_name;
+    // 2026-11-27 03:15:42 UTC
+    let now = 1_795_749_342;
+    let name = default_log_name("root@db:2222", now);
+    assert!(name.starts_with("root_db_2222-"), "{name}");
+    assert!(name.ends_with("Z.log"), "{name}");
+    assert!(
+        !name.contains(['/', '\\', ':', '@', ' ']),
+        "no separator or reserved character: {name}"
+    );
+    let stamp = name
+        .trim_start_matches("root_db_2222-")
+        .trim_end_matches("Z.log");
+    assert_eq!(stamp.len(), "YYYYMMDD-HHMMSS".len(), "{name}");
+    assert_eq!(
+        default_log_name("../..", now).split('-').next(),
+        Some("session")
+    );
+    assert!(default_log_name("COM3", now).starts_with("COM3-"));
+}
+
 #[gpui::test]
 async fn a_bell_in_a_background_tab_marks_it_without_taking_the_screen(cx: &mut TestAppContext) {
     let Some((view, cx)) = two_shells(cx) else {

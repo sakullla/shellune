@@ -197,6 +197,10 @@ impl ShelluneView {
             .active
             .and_then(|id| self.pane_for(id))
             .is_some_and(|pane| pane.read(cx).can_search());
+        self.palette_logging = self
+            .active
+            .and_then(|id| self.pane_for(id))
+            .is_some_and(|pane| pane.read(cx).logging().is_some());
         // The field is made per opening so its placeholder is in the current language
         // and no earlier search is waiting in it.
         let placeholder = self.strings().palette_placeholder;
@@ -887,6 +891,41 @@ impl ShelluneView {
                 current: false,
             });
         }
+        // Logging the terminal on screen, local, SSH or serial alike (R3).
+        if on_screen
+            && let Some(id) = self.active
+            && self.pane_for(id).is_some()
+        {
+            if self.palette_logging {
+                entries.push(Entry {
+                    command: Command::StopSessionLog(id),
+                    group: Group::Actions,
+                    title: ux.terminal_log_stop.to_owned(),
+                    detail: tab_title.clone(),
+                    shortcut: None,
+                    icon: Icon::Stop,
+                    current: false,
+                });
+            } else {
+                for (format, title) in [
+                    (
+                        shellune_terminal::LogFormat::Plain,
+                        ux.terminal_log_start_plain,
+                    ),
+                    (shellune_terminal::LogFormat::Raw, ux.terminal_log_start_raw),
+                ] {
+                    entries.push(Entry {
+                        command: Command::StartSessionLog(id, format),
+                        group: Group::Actions,
+                        title: title.to_owned(),
+                        detail: tab_title.clone(),
+                        shortcut: None,
+                        icon: Icon::File,
+                        current: false,
+                    });
+                }
+            }
+        }
         if self.focus_mode || self.can_focus_mode() {
             entries.push(Entry {
                 command: Command::ToggleFocusMode,
@@ -1152,6 +1191,8 @@ impl ShelluneView {
                     pane.update(cx, |pane, cx| pane.toggle_search(window, cx));
                 }
             }
+            Command::StartSessionLog(id, format) => self.start_session_log(id, format, cx),
+            Command::StopSessionLog(id) => self.stop_session_log(id, cx),
             Command::ToggleLanguage => self.toggle_locale(cx),
             Command::CycleTheme => self.cycle_theme(cx),
             Command::CycleMotion => self.cycle_motion(cx),

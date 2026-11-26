@@ -83,6 +83,10 @@ pub enum Command {
     ToggleSidebar,
     /// Opens the search bar of the terminal on screen.
     SearchTerminal(SessionId),
+    /// Starts logging the output of the terminal on screen (R3).
+    StartSessionLog(SessionId, shellune_terminal::LogFormat),
+    /// Stops logging the output of the terminal on screen (R3).
+    StopSessionLog(SessionId),
     /// Switches the interface language.
     ToggleLanguage,
     /// Steps the interface text size.

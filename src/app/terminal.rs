@@ -41,7 +41,9 @@ use shellune_terminal::{
     encode_mouse, encode_paste, encode_text, grid_for, mouse_reporting, palette,
     paste_needs_confirmation, sanitize_font_size, step_font_size,
 };
-use shellune_terminal::{FinishedCommand, LinkKind, ProgramNotice};
+use shellune_terminal::{
+    FinishedCommand, LinkKind, LogFormat, LogReport, ProgramNotice, SessionLog,
+};
 
 use crate::app::actions::{TerminalCopy, TerminalPaste, TerminalSearch};
 use crate::app::components;
@@ -583,6 +585,17 @@ pub enum PaneRequest {
     OpenSnippets,
     /// Split this terminal's pane along `axis`.
     Split(shellune_core::SplitAxis),
+    /// Start writing this terminal's output to a file the user picks (R3).
+    StartLog(LogFormat),
+    /// Stop the running log; the window says where it was saved (R3).
+    StopLog,
+    /// The log stopped because writing failed; the terminal goes on (R3).
+    LogFailed {
+        /// The file it was writing.
+        path: std::path::PathBuf,
+        /// Why writing failed.
+        reason: String,
+    },
     /// An OSC 8 link was not opened: its scheme (named), or a malformed target (R1).
     LinkRefused(Option<String>),
 }
@@ -705,6 +718,8 @@ pub struct TerminalPane {
     source: Option<PaneSource>,
     /// What the pane is running: a program here, or a host over SSH.
     origin: PaneOrigin,
+    /// The file this terminal's output is being written to, while it is (R3).
+    log: Option<SessionLog>,
     state: PaneState,
     /// Bytes written to the shell, kept so what the user typed can be inspected.
     ///
@@ -1044,6 +1059,7 @@ impl TerminalPane {
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
             system_notices: Vec::new(),
+            log: None,
             x11: None,
             directory: None,
             environment_notes,
@@ -1137,6 +1153,7 @@ impl TerminalPane {
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
             system_notices: Vec::new(),
+            log: None,
             x11: None,
             directory: None,
             environment_notes: Vec::new(),
@@ -1229,6 +1246,7 @@ impl TerminalPane {
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
             system_notices: Vec::new(),
+            log: None,
             x11: None,
             directory: None,
             environment_notes: Vec::new(),
@@ -1402,6 +1420,7 @@ impl TerminalPane {
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
             system_notices: Vec::new(),
+            log: None,
             x11: None,
             directory: None,
             environment_notes: Vec::new(),
@@ -1468,6 +1487,8 @@ impl TerminalPane {
     /// the moment the pane is dropped - a tab that disappears with the reason still
     /// inside it says nothing to anyone (R21).
     pub fn close(&mut self, cx: &mut Context<Self>) -> Option<SerialClose> {
+        // The log is written to the end of what arrived before the source goes (R3).
+        drop(self.log.take());
         let mut closed = None;
         match self.source.as_mut() {
             Some(PaneSource::Serial(link)) => {
@@ -1501,6 +1522,7 @@ impl TerminalPane {
         let Some(PaneSource::Serial(link)) = self.source.as_mut() else {
             return None;
         };
+        drop(self.log.take());
         let report = link.close();
         self.source = None;
         self.poll_task = None;
@@ -1618,6 +1640,7 @@ impl TerminalPane {
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
             system_notices: Vec::new(),
+            log: None,
             x11: None,
             directory: None,
             environment_notes: Vec::new(),
@@ -1629,6 +1652,7 @@ impl TerminalPane {
     #[cfg(any(test, feature = "ui-capture"))]
     pub fn feed_for_test(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         let was_alternate = self.alternate_screen();
+        self.record_output(bytes);
         let effects = self.core.feed(bytes);
         if !bytes.is_empty() && !self.alternate_screen() && self.core.display_offset() > 0 {
             self.unseen_output = true;
@@ -2054,6 +2078,7 @@ impl TerminalPane {
                     }
                     output_bytes += bytes.len();
                     self.wake_cursor();
+                    self.record_output(&bytes);
                     let effects = self.core.feed(&bytes);
                     if !bytes.is_empty()
                         && !self.alternate_screen()
@@ -2145,6 +2170,7 @@ impl TerminalPane {
         match event {
             SourceEvent::Data(bytes) => {
                 let was_alternate = self.alternate_screen();
+                self.record_output(&bytes);
                 let effects = self.core.feed(&bytes);
                 if !bytes.is_empty() && !self.alternate_screen() && self.core.display_offset() > 0 {
                     self.unseen_output = true;
@@ -2178,6 +2204,9 @@ impl TerminalPane {
     }
 
     fn apply_effects(&mut self, effects: TerminalEffects, cx: &mut Context<Self>) {
+        // A failed log write is noticed with the next output, which is when it
+        // happened; the terminal itself carries on (R3).
+        self.check_log(cx);
         // Read the background flags before the clipboard text is moved out: the notice
         // is two booleans and never anything the terminal printed (R7).
         let notices = TerminalAttention {
@@ -2221,6 +2250,68 @@ impl TerminalPane {
     /// does not touch the grid, the blocks or the session state.
     pub fn take_attention(&mut self) -> TerminalAttention {
         std::mem::take(&mut self.attention)
+    }
+
+    /// Hands output to the running log, if there is one (R3). Called with every chunk
+    /// the grid receives, before it is parsed, so the log is the same stream.
+    fn record_output(&self, bytes: &[u8]) {
+        if let Some(log) = &self.log {
+            log.write(bytes);
+        }
+    }
+
+    /// Stops a log whose writing failed and tells the window why (R3). The terminal
+    /// is not touched: the session goes on, only the file stops growing.
+    fn check_log(&mut self, cx: &mut Context<Self>) {
+        let Some(reason) = self.log.as_mut().and_then(SessionLog::poll_error) else {
+            return;
+        };
+        if let Some(log) = self.log.take() {
+            let path = log.path().to_owned();
+            drop(log.stop());
+            cx.emit(PaneRequest::LogFailed { path, reason });
+            cx.notify();
+        }
+    }
+
+    /// Starts writing this terminal's output to `path` (R3), replacing a log that
+    /// was running.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the file could not be created; nothing is started then.
+    pub fn start_log(
+        &mut self,
+        path: &std::path::Path,
+        format: LogFormat,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        drop(self.log.take());
+        let log = SessionLog::start(path, format).map_err(|error| error.to_string())?;
+        self.log = Some(log);
+        cx.notify();
+        Ok(())
+    }
+
+    /// Stops the running log, writing what it was given (R3).
+    pub fn stop_log(&mut self, cx: &mut Context<Self>) -> Option<LogReport> {
+        let report = self.log.take().map(SessionLog::stop);
+        cx.notify();
+        report
+    }
+
+    /// The file this terminal is logging to and how, while it is (R3).
+    #[must_use]
+    pub fn logging(&self) -> Option<(&std::path::Path, LogFormat)> {
+        self.log.as_ref().map(|log| (log.path(), log.format()))
+    }
+
+    /// The name a new log of this terminal is offered under (R3):
+    /// `<source>-YYYYMMDD-HHMMSSZ.log`, the time in UTC and the source label
+    /// reduced to characters every file system takes.
+    #[must_use]
+    pub fn default_log_name(&self, now_unix: u64) -> String {
+        default_log_name(self.origin.label(), now_unix)
     }
 
     /// Keeps one notification for the window, dropping the oldest past a small bound.
@@ -2307,6 +2398,9 @@ impl TerminalPane {
             return;
         }
         let was_alternate = self.alternate_screen();
+        // The local echo is part of what the terminal shows, so it is part of the
+        // log too; keys that were not echoed never are (R3).
+        self.record_output(bytes);
         let effects = self.core.feed(bytes);
         self.apply_effects(effects, cx);
         self.recount_after_output(was_alternate);
@@ -4472,7 +4566,59 @@ impl TerminalPane {
                     cx.emit(PaneRequest::Split(shellune_core::SplitAxis::TopBottom));
                     cx.notify();
                 })),
-            );
+            )
+            // Logging this terminal's output, the same three entries for a local, an
+            // SSH and a serial terminal (R3).
+            .child(components::menu_divider(metrics))
+            .when(self.log.is_some(), |menu| {
+                menu.child(
+                    item(
+                        ux.terminal_log_stop,
+                        Icon::Stop,
+                        &None,
+                        true,
+                        "terminal.menu.log_stop",
+                    )
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.menu = None;
+                        this.menu_link = None;
+                        cx.emit(PaneRequest::StopLog);
+                        cx.notify();
+                    })),
+                )
+            })
+            .when(self.log.is_none(), |menu| {
+                menu.child(
+                    item(
+                        ux.terminal_log_start_plain,
+                        Icon::File,
+                        &None,
+                        true,
+                        "terminal.menu.log_plain",
+                    )
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.menu = None;
+                        this.menu_link = None;
+                        cx.emit(PaneRequest::StartLog(LogFormat::Plain));
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    item(
+                        ux.terminal_log_start_raw,
+                        Icon::File,
+                        &None,
+                        true,
+                        "terminal.menu.log_raw",
+                    )
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.menu = None;
+                        this.menu_link = None;
+                        cx.emit(PaneRequest::StartLog(LogFormat::Raw));
+                        cx.notify();
+                    })),
+                )
+            });
         Some(
             gpui::deferred(
                 gpui::anchored().position(gpui::Point::default()).child(
@@ -6518,6 +6664,41 @@ impl TerminalPane {
         )
     }
 
+    /// A small badge at the top left of the grid while this terminal's output is
+    /// being logged, with the file in its tooltip (R3).
+    fn log_badge(&self, metrics: Metrics) -> Option<gpui::Stateful<gpui::Div>> {
+        let (path, _format) = self.logging()?;
+        let ux = crate::app::copy::ux_for(self.locale);
+        let path = path.display().to_string();
+        Some(
+            div()
+                .id("terminal.log.indicator")
+                .debug_selector(|| "terminal.log.indicator".to_owned())
+                .absolute()
+                .left(metrics.scale(spacing::SNUG))
+                .top(metrics.scale(spacing::SNUG))
+                .flex()
+                .items_center()
+                .gap(metrics.scale(spacing::HALF))
+                .px(metrics.scale(spacing::SNUG))
+                .py(metrics.scale(spacing::HAIRLINE + 1.0))
+                .rounded(px(theme::radius::LARGE))
+                .bg(theme::swatch(shell_palette::RAISED))
+                .border_1()
+                .border_color(theme::swatch(shell_palette::BORDER_STRONG))
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(shell_palette::TEXT_MUTED))
+                .child(
+                    div()
+                        .size(metrics.scale(spacing::NARROW))
+                        .rounded_full()
+                        .bg(theme::swatch(shell_palette::DANGER)),
+                )
+                .child(ux.terminal_log_indicator)
+                .tooltip(components::tooltip(SharedString::from(path))),
+        )
+    }
+
     /// The target of the OSC 8 link under the pointer, at the bottom left of the grid,
     /// so a person can read where a link goes before opening it (R1).
     fn link_target_hint(&self, metrics: Metrics) -> Option<gpui::Stateful<gpui::Div>> {
@@ -6854,6 +7035,38 @@ pub fn quote_posix_path(path: &str) -> String {
     } else {
         format!("'{}'", path.replace('\'', "'\\''"))
     }
+}
+
+/// The name a new log is offered under (R3): `<label>-YYYYMMDD-HHMMSSZ.log`.
+///
+/// The label keeps letters, digits, `-`, `_` and `.`; anything else (a path
+/// separator, a colon, a space) becomes `_`, so a host such as `root@db:2222` cannot
+/// name a directory or a drive. The time is UTC, marked with `Z`.
+#[must_use]
+pub fn default_log_name(label: &str, now_unix: u64) -> String {
+    let mut source: String = label
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = source.trim_matches(|ch| ch == '.' || ch == '_').to_owned();
+    source = if trimmed.is_empty() {
+        "session".to_owned()
+    } else {
+        trimmed.chars().take(64).collect()
+    };
+    // "2026-11-27 03:15 UTC" -> "202611270315", then the seconds.
+    let minutes: String = crate::app::hosts::format_unix(now_unix)
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect();
+    let (date, time) = minutes.split_at(minutes.len().min(8));
+    format!("{source}-{date}-{time}{:02}Z.log", now_unix % 60)
 }
 
 /// A terminal core that answers colour queries with the palette this window draws.
@@ -7427,7 +7640,8 @@ impl Render for TerminalPane {
                     .child(self.viewport(window, cx))
                     .children(self.scrollback_thumb(cx))
                     .children(self.scroll_bottom_pill(metrics, show_blocks, cx))
-                    .children(self.link_target_hint(metrics)),
+                    .children(self.link_target_hint(metrics))
+                    .children(self.log_badge(metrics)),
             )
             // A serial line states itself above the bar: its device, its settings and
             // the two send habits are what a person changes while the session runs, and

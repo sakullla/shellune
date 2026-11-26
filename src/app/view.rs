@@ -157,6 +157,22 @@ impl PaneKind {
     }
 }
 
+/// Where a session log is offered when none was saved yet (R3): the Downloads folder
+/// of the home directory when there is one, else the home directory itself.
+fn default_log_dir() -> std::path::PathBuf {
+    let home = shellune_storage::home_directory().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let downloads = home.join("Downloads");
+    if downloads.is_dir() { downloads } else { home }
+}
+
+/// A file's own name, for a message; the whole path when it has none.
+fn file_label(path: &std::path::Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
 /// How long after a desktop notification coming back to the window goes to the
 /// terminal that raised it (R2).
 const NOTIFIED_FOCUS_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
@@ -953,6 +969,8 @@ pub struct ShelluneView {
     /// Whether the terminal on screen could open its search bar when the palette was
     /// opened; read once there because the entries are listed without the app.
     palette_search_ready: bool,
+    /// Whether the terminal on screen was logging when the palette was opened (R3).
+    palette_logging: bool,
     /// Keeps the highlighted palette entry in view.
     palette_scroll: gpui::ScrollHandle,
     /// The settings page, which scrolls through every category.
@@ -1137,6 +1155,8 @@ pub struct ShelluneView {
     /// This view's window, once it has been drawn: a notification click brings it
     /// forward (R2).
     window_handle: Option<gpui::AnyWindowHandle>,
+    /// Where the last session log was saved; the next one is offered there (R3).
+    last_log_dir: Option<std::path::PathBuf>,
     /// Whether the operating system asks for reduced motion, as last read. Combined with
     /// the user's preference on every draw; re-read when the window comes back to the
     /// front, which is when a setting changed elsewhere can have changed.
@@ -3107,6 +3127,7 @@ impl ShelluneView {
             focus_lost_watch: None,
             palette_selected: 0,
             palette_search_ready: false,
+            palette_logging: false,
             files_type_ahead: None,
             palette_scroll: gpui::ScrollHandle::new(),
             settings_scroll: gpui::ScrollHandle::new(),
@@ -3182,6 +3203,7 @@ impl ShelluneView {
             window_active: true,
             notified_focus: None,
             window_handle: None,
+            last_log_dir: None,
             system_reduces_motion: false,
             layout_persist: false,
             layout_error: None,
@@ -6175,6 +6197,20 @@ impl ShelluneView {
             }
             terminal::PaneRequest::Split(axis) => {
                 self.split_session_pane(id, axis, cx);
+                return;
+            }
+            terminal::PaneRequest::StartLog(format) => {
+                self.start_session_log(id, format, cx);
+                return;
+            }
+            terminal::PaneRequest::StopLog => {
+                self.stop_session_log(id, cx);
+                return;
+            }
+            terminal::PaneRequest::LogFailed { path, reason } => {
+                let ux = copy::ux();
+                let title = copy::fill(ux.terminal_log_failed, &[("name", &file_label(&path))]);
+                self.toast(Tone::Danger, title, Some(reason), cx);
                 return;
             }
             terminal::PaneRequest::LinkRefused(scheme) => {
@@ -12165,6 +12201,17 @@ impl ShelluneView {
         cx.notify();
     }
 
+    /// Reports one more event on a scripted session, as its transport would after it
+    /// connected.
+    #[cfg(test)]
+    pub(crate) fn push_scripted_for_test(&self, id: SessionId, event: RemoteEvent) -> bool {
+        self.scripted
+            .iter()
+            .find(|(session, _)| *session == id)
+            .map(|(_, scripted)| scripted.push(event))
+            .is_some()
+    }
+
     /// Ends the attempt behind an open question, the way a connection thread that
     /// stopped would: the question stays on screen, but nothing can answer it.
     #[cfg(test)]
@@ -12847,6 +12894,74 @@ impl ShelluneView {
             }
         })
         .detach();
+    }
+
+    /// Asks where to save a log of one terminal's output, then starts it there (R3).
+    ///
+    /// The same for local, SSH and serial terminals: the right-click menu and the
+    /// palette both end here. Cancelling the dialog starts nothing.
+    pub(crate) fn start_session_log(
+        &mut self,
+        id: SessionId,
+        format: shellune_terminal::LogFormat,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.pane_for(id).cloned() else {
+            return;
+        };
+        let directory = self.last_log_dir.clone().unwrap_or_else(default_log_dir);
+        let name = pane
+            .read(cx)
+            .default_log_name(crate::app::remote::now_unix());
+        let answer = cx.prompt_for_new_path(&directory, Some(&name));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = answer.await else {
+                return;
+            };
+            let _ = this.update(cx, |view, cx| {
+                view.last_log_dir = path.parent().map(std::path::Path::to_owned);
+                let started = pane.update(cx, |pane, cx| pane.start_log(&path, format, cx));
+                let ux = copy::ux();
+                match started {
+                    Ok(()) => {
+                        let title =
+                            copy::fill(ux.terminal_log_started, &[("name", &file_label(&path))]);
+                        view.toast(Tone::Positive, title, None, cx);
+                    }
+                    Err(reason) => {
+                        view.toast(Tone::Danger, ux.terminal_log_start_failed, Some(reason), cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Stops one terminal's log and says where it is (R3).
+    pub(crate) fn stop_session_log(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane_for(id).cloned() else {
+            return;
+        };
+        let Some(report) = pane.update(cx, |pane, cx| pane.stop_log(cx)) else {
+            return;
+        };
+        let ux = copy::ux();
+        let title = copy::fill(
+            ux.terminal_log_stopped,
+            &[("name", &file_label(&report.path))],
+        );
+        let detail = (report.dropped > 0).then(|| {
+            copy::fill(
+                ux.terminal_log_dropped,
+                &[("bytes", &report.dropped.to_string())],
+            )
+        });
+        let tone = if report.error.is_some() {
+            Tone::Danger
+        } else {
+            Tone::Positive
+        };
+        self.toast(tone, title, report.error.or(detail), cx);
     }
 
     /// Goes to the terminal whose notification was clicked (R2), if it is still open.
