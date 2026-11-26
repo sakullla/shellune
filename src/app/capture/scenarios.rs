@@ -2962,6 +2962,38 @@ fn terminal_menu_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
     Ok(())
 }
 
+/// A program's OSC 8 link under a resting pointer: underlined, its target shown (R1).
+fn show_terminal_link(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let shell = LocalShell::new(SHOT_SHELL, SHOT_SHELL);
+    let content = format!(
+        "{TRANSCRIPT}\r\nBuild finished: \x1b]8;;https://ci.example.com/runs/4821\x1b\\run #4821\x1b]8;;\x1b\\ passed\r\n"
+    );
+    let id = view.attach_capture_session(shell, content.as_bytes(), Some(window), cx);
+    let pane = view
+        .pane_of(id)
+        .cloned()
+        .ok_or_else(|| "the session was recorded without a terminal".to_owned())?;
+    if !pane.update(cx, |pane, cx| pane.capture_hover_link(cx)) {
+        return Err("no OSC 8 link reached the grid".to_owned());
+    }
+    Ok(())
+}
+
+fn terminal_link_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    terminal_ready(view, cx)?;
+    let hovered = view
+        .pane()
+        .is_some_and(|pane| pane.read(cx).capture_link_hovered());
+    if !hovered {
+        return Err("the terminal shows no hovered link".to_owned());
+    }
+    Ok(())
+}
+
 /// The hosts page with the header's shell menu open under its control (R6).
 fn show_shell_menu(
     view: &mut ShelluneView,
@@ -4129,6 +4161,19 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: nothing,
         install: show_terminal_menu,
         ready: terminal_menu_ready,
+    },
+    Scenario {
+        id: "terminal-osc8-link",
+        title: "终端 · OSC 8 超链接悬停",
+        category: Category::Overlay,
+        fixture: "the local terminal fed with the transcript fixture and one line whose \
+                  `run #4821` is an OSC 8 link, hovered by the build",
+        evidence: "shows the hovered link underlined and its target in the corner hint; \
+                   nothing was opened, and Ctrl/Cmd-click behaviour is covered by tests",
+        start: || page(Destination::LocalShells),
+        prepare: nothing,
+        install: show_terminal_link,
+        ready: terminal_link_ready,
     },
     Scenario {
         id: "menu-shell",

@@ -3461,6 +3461,10 @@ pub struct UxStrings {
     pub terminal_open_link: &'static str,
     /// Terminal context menu action to copy an http(s) URL
     pub terminal_copy_link: &'static str,
+    /// Toast when an OSC 8 link with a disallowed scheme was not opened; {scheme}
+    pub terminal_link_refused_scheme: &'static str,
+    /// Toast when an OSC 8 link target was malformed and not opened
+    pub terminal_link_refused_malformed: &'static str,
     /// Terminal context menu action to clear visible screen and scrollback buffer
     pub terminal_clear_scrollback: &'static str,
     /// Menu action to open the snippets / shortcut commands dialog
@@ -3992,6 +3996,8 @@ impl UxStrings {
             self.terminal_jump_bottom_new,
             self.terminal_open_link,
             self.terminal_copy_link,
+            self.terminal_link_refused_scheme,
+            self.terminal_link_refused_malformed,
             self.terminal_clear_scrollback,
             self.terminal_snippets_menu,
             self.snippet_palette_aliases,
@@ -4520,6 +4526,8 @@ included",
     terminal_jump_bottom_new: "New output \u{00b7} Jump to bottom ({lines})",
     terminal_open_link: "Open link",
     terminal_copy_link: "Copy link",
+    terminal_link_refused_scheme: "Didn't open a {scheme}: link",
+    terminal_link_refused_malformed: "Didn't open a link with an unusable address",
     terminal_clear_scrollback: "Clear terminal & scrollback",
     terminal_snippets_menu: "Snippets\u{2026}",
     snippet_palette_aliases: "Snippets",
@@ -5043,6 +5051,8 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     terminal_jump_bottom_new: "有新输出 \u{00b7} 回到底部（{lines} 行）",
     terminal_open_link: "打开链接",
     terminal_copy_link: "复制链接",
+    terminal_link_refused_scheme: "未打开 {scheme}: 链接",
+    terminal_link_refused_malformed: "链接地址无法使用，未打开",
     terminal_clear_scrollback: "清空终端与回滚",
     terminal_snippets_menu: "代码片段\u{2026}",
     snippet_palette_aliases: "代码片段",

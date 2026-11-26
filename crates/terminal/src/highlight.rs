@@ -80,6 +80,52 @@ static PATTERNS: LazyLock<[(Kind, Regex); 4]> = LazyLock::new(|| {
 /// Other schemes (`ssh://`, `ftp://`, `file://`, custom handlers) are deliberately refused so
 /// terminal output can never trigger arbitrary local commands or protocol handlers.
 #[must_use]
+/// Why an OSC 8 target is not opened (R1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkRefusal {
+    /// The target names a scheme outside http, https, mailto and file.
+    Scheme(String),
+    /// The target has no scheme, is empty, or holds whitespace or control characters.
+    Malformed,
+}
+
+/// Decides whether an OSC 8 target may be opened (R1).
+///
+/// A program chooses these targets freely, and a link's text need not resemble it,
+/// so only schemes whose handlers merely show something are allowed: web pages,
+/// a mail draft, a local file. Everything else - `javascript:`, a custom protocol
+/// handler, a target without a scheme - is refused and named, never opened.
+///
+/// # Errors
+///
+/// Returns why the target is refused.
+pub fn osc8_target_allowed(uri: &str) -> Result<(), LinkRefusal> {
+    if uri.is_empty() || uri.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err(LinkRefusal::Malformed);
+    }
+    let Some((scheme, rest)) = uri.split_once(':') else {
+        return Err(LinkRefusal::Malformed);
+    };
+    let valid_scheme = scheme
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'));
+    if !valid_scheme {
+        return Err(LinkRefusal::Malformed);
+    }
+    match scheme.to_ascii_lowercase().as_str() {
+        "http" | "https" if is_openable_http_url(uri) => Ok(()),
+        "http" | "https" => Err(LinkRefusal::Malformed),
+        "mailto" if !rest.is_empty() => Ok(()),
+        "file" if rest.starts_with("//") => Ok(()),
+        "mailto" | "file" => Err(LinkRefusal::Malformed),
+        other => Err(LinkRefusal::Scheme(other.to_owned())),
+    }
+}
+
 pub fn is_openable_http_url(url: &str) -> bool {
     let rest = if url
         .get(..7)
@@ -194,6 +240,42 @@ mod tests {
         assert!(!is_openable_http_url("file:///etc/passwd"));
         assert!(!is_openable_http_url("javascript:alert(1)"));
         assert!(!is_openable_http_url("https://"));
+    }
+
+    #[test]
+    fn osc8_targets_open_only_for_web_mail_and_file_schemes() {
+        assert_eq!(osc8_target_allowed("https://example.com"), Ok(()));
+        assert_eq!(osc8_target_allowed("HTTP://example.com/a"), Ok(()));
+        assert_eq!(osc8_target_allowed("mailto:ops@example.com"), Ok(()));
+        assert_eq!(osc8_target_allowed("file:///var/log/syslog"), Ok(()));
+        assert_eq!(osc8_target_allowed("file://host/etc/hosts"), Ok(()));
+        assert_eq!(
+            osc8_target_allowed("javascript:alert(1)"),
+            Err(LinkRefusal::Scheme("javascript".into()))
+        );
+        assert_eq!(
+            osc8_target_allowed("vscode://file/x"),
+            Err(LinkRefusal::Scheme("vscode".into()))
+        );
+        assert_eq!(
+            osc8_target_allowed("/etc/passwd"),
+            Err(LinkRefusal::Malformed)
+        );
+        assert_eq!(osc8_target_allowed(""), Err(LinkRefusal::Malformed));
+        assert_eq!(osc8_target_allowed("https://"), Err(LinkRefusal::Malformed));
+        assert_eq!(osc8_target_allowed("mailto:"), Err(LinkRefusal::Malformed));
+        assert_eq!(
+            osc8_target_allowed("file:relative"),
+            Err(LinkRefusal::Malformed)
+        );
+        assert_eq!(
+            osc8_target_allowed("https://a.example/ b"),
+            Err(LinkRefusal::Malformed)
+        );
+        assert_eq!(
+            osc8_target_allowed("1http://x"),
+            Err(LinkRefusal::Malformed)
+        );
         assert!(!is_openable_http_url("https:///only-path"));
         assert!(!is_openable_http_url("https://example.com/bad\x07url"));
     }

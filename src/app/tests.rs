@@ -48440,6 +48440,120 @@ async fn terminal_search_refocus_editing_clear_and_scroll_bottom_pill_ux(cx: &mu
 }
 
 #[gpui::test]
+async fn osc8_links_show_their_target_on_hover_and_open_only_when_allowed(cx: &mut TestAppContext) {
+    let content = "\x1b]8;;https://example.com/docs\x1b\\docs here\x1b]8;;\x1b\\  \
+                   \x1b]8;;javascript:alert(1)\x1b\\evil\x1b]8;;\x1b\\";
+    let (pane, cx) = pane_with(content, cx);
+    let refused = std::rc::Rc::new(std::cell::RefCell::new(Vec::<Option<String>>::new()));
+    let seen = refused.clone();
+    let _subscription = cx.update(|_window, app| {
+        app.subscribe(
+            &pane,
+            move |_pane, request: &crate::app::terminal::PaneRequest, _app| {
+                if let crate::app::terminal::PaneRequest::LinkRefused(scheme) = request {
+                    seen.borrow_mut().push(scheme.clone());
+                }
+            },
+        )
+    });
+    let cell = cx.update(|_window, app| pane.read(app).cell_size());
+    let vp = bounds_of(cx, "terminal.viewport");
+    let at = |column: f32| {
+        point(
+            vp.origin.x + px(cell.width * (column + 0.5)),
+            vp.origin.y + px(cell.height * 0.5),
+        )
+    };
+    let secondary = if cfg!(target_os = "macos") {
+        Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        }
+    } else {
+        Modifiers {
+            control: true,
+            ..Modifiers::default()
+        }
+    };
+    let hovered = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| pane.read(app).hovered_link_for_test().map(str::to_owned))
+    };
+    let opened = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| pane.read(app).opened_urls_for_test().to_vec())
+    };
+
+    // A plain hover over an OSC 8 link shows where it goes, without opening it.
+    cx.simulate_mouse_move(at(2.0), None, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(hovered(cx), Some("https://example.com/docs".to_owned()));
+    assert!(
+        cx.debug_bounds("terminal.link_target").is_some(),
+        "the target is shown while the link is hovered"
+    );
+
+    // A plain click is still a click on text: nothing opens.
+    cx.simulate_click(at(2.0), Modifiers::default());
+    cx.run_until_parked();
+    assert!(opened(cx).is_empty());
+
+    // A plain drag across the link still selects.
+    let from = grid_point_at(cx, &pane, 0.5, 0.1);
+    assert_eq!(
+        drag_in_grid(cx, &pane, from, at(6.0), Modifiers::default()),
+        Some("docs he".to_owned()),
+        "dragging over a link selects its text"
+    );
+    assert!(opened(cx).is_empty());
+
+    // Ctrl/Cmd+click opens the stated target.
+    cx.simulate_mouse_move(at(2.0), None, secondary);
+    cx.simulate_click(at(2.0), secondary);
+    cx.run_until_parked();
+    assert_eq!(opened(cx), vec!["https://example.com/docs".to_owned()]);
+
+    // Moving off the link hides the target. (GPUI keeps a selector's last debug
+    // bounds across frames, so the hover state is what is checked here.)
+    cx.simulate_mouse_move(at(30.0), None, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(hovered(cx), None);
+
+    // A javascript: target is refused and named, never opened.
+    cx.simulate_mouse_move(at(12.0), None, secondary);
+    cx.simulate_click(at(12.0), secondary);
+    cx.run_until_parked();
+    assert_eq!(opened(cx).len(), 1, "javascript: must not open");
+    assert_eq!(
+        refused.borrow().as_slice(),
+        &[Some("javascript".to_owned())]
+    );
+    assert!(
+        cx.update(|_window, app| pane.read(app).sent().is_empty()),
+        "no link interaction reached the shell"
+    );
+}
+
+#[gpui::test]
+async fn a_program_that_took_the_mouse_still_gets_plain_clicks_on_an_osc8_link(
+    cx: &mut TestAppContext,
+) {
+    let content = "\x1b[?1000h\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\";
+    let (pane, cx) = pane_with(content, cx);
+    let cell = cx.update(|_window, app| pane.read(app).cell_size());
+    let vp = bounds_of(cx, "terminal.viewport");
+    let on_link = point(
+        vp.origin.x + px(cell.width * 1.5),
+        vp.origin.y + px(cell.height * 0.5),
+    );
+    cx.simulate_click(on_link, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| pane.read(app).sent().is_empty()),
+        "the click was reported to the program"
+    );
+    assert!(cx.update(|_window, app| pane.read(app).opened_urls_for_test().is_empty()));
+}
+
+#[gpui::test]
 async fn terminal_links_context_menu_and_shell_key_passthrough_invariants(cx: &mut TestAppContext) {
     let mut content = String::new();
     for i in 0..60 {

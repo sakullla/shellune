@@ -30,8 +30,9 @@ use std::ops::Range;
 
 use shellune_core::{EventTag, LocalShell, SessionFailure, TerminalMode};
 use shellune_ssh::{ChainEvent, ChainSession, RemoteEvent, RemoteSession, X11Status};
+use shellune_terminal::LinkKind;
 use shellune_terminal::core::{LineAnchor, SearchOptions};
-use shellune_terminal::highlight::is_openable_http_url;
+use shellune_terminal::highlight::{LinkRefusal, is_openable_http_url, osc8_target_allowed};
 use shellune_terminal::shell::ShellEnvironmentNote;
 use shellune_terminal::{
     BlockFilter, BlockStatus, CellSize, CommandBlock, CommandBlockId, CursorShape, DetectedLink,
@@ -582,6 +583,8 @@ pub enum PaneRequest {
     OpenSnippets,
     /// Split this terminal's pane along `axis`.
     Split(shellune_core::SplitAxis),
+    /// An OSC 8 link was not opened: its scheme (named), or a malformed target (R1).
+    LinkRefused(Option<String>),
 }
 
 impl gpui::EventEmitter<PaneRequest> for TerminalPane {}
@@ -721,6 +724,8 @@ pub struct TerminalPane {
     menu_link: Option<String>,
     /// Openable `http(s)://` URL currently hovered while the primary modifier is held.
     hovered_link: Option<DetectedLink>,
+    /// Whether the modifier that opens the hovered link is held, so a click opens it.
+    link_armed: bool,
     /// Last pointer position over the terminal viewport, for modifier-change updates.
     last_hover_position: Option<gpui::Point<Pixels>>,
     #[cfg(test)]
@@ -977,6 +982,7 @@ impl TerminalPane {
             menu: None,
             menu_link: None,
             hovered_link: None,
+            link_armed: false,
             last_hover_position: None,
             #[cfg(test)]
             opened_urls: Vec::new(),
@@ -1067,6 +1073,7 @@ impl TerminalPane {
             menu: None,
             menu_link: None,
             hovered_link: None,
+            link_armed: false,
             last_hover_position: None,
             #[cfg(test)]
             opened_urls: Vec::new(),
@@ -1156,6 +1163,7 @@ impl TerminalPane {
             menu: None,
             menu_link: None,
             hovered_link: None,
+            link_armed: false,
             last_hover_position: None,
             #[cfg(test)]
             opened_urls: Vec::new(),
@@ -1329,6 +1337,7 @@ impl TerminalPane {
             menu: None,
             menu_link: None,
             hovered_link: None,
+            link_armed: false,
             last_hover_position: None,
             #[cfg(test)]
             opened_urls: Vec::new(),
@@ -1539,6 +1548,7 @@ impl TerminalPane {
             menu: None,
             menu_link: None,
             hovered_link: None,
+            link_armed: false,
             last_hover_position: None,
             #[cfg(test)]
             opened_urls: Vec::new(),
@@ -1643,7 +1653,7 @@ impl TerminalPane {
     /// does, for a capture (R6). Nothing in it is run.
     #[cfg(feature = "ui-capture")]
     pub fn capture_open_menu(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
-        self.menu_link = self.hit_test_http_link(position).map(|link| link.url);
+        self.menu_link = self.hit_test_link(position).map(|link| link.url);
         self.menu = Some(position);
         cx.notify();
     }
@@ -1693,6 +1703,32 @@ impl TerminalPane {
         self.capture_selection = Some(CaptureSelection { from, to, kind });
         self.apply_capture_selection();
         cx.notify();
+    }
+
+    /// Hovers the lowest OSC 8 link on screen, as a pointer resting on it would, so a
+    /// capture shows the link's underline and its target (R1). Nothing is opened.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_hover_link(&mut self, cx: &mut Context<Self>) -> bool {
+        let snapshot = self.core.snapshot();
+        let found = snapshot
+            .rows
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(row, rendered)| {
+                rendered.links.first().map(|link| (row, link.columns.start))
+            });
+        self.hovered_link = found.and_then(|(row, column)| self.core.link_at(row, column));
+        self.link_armed = false;
+        cx.notify();
+        self.hovered_link.is_some()
+    }
+
+    /// Whether a capture's hovered link is still shown.
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_link_hovered(&self) -> bool {
+        self.hovered_link.is_some()
     }
 
     /// Lays the selection a capture asked for on the grid as it is now.
@@ -3647,22 +3683,30 @@ impl TerminalPane {
         Some((row, column))
     }
 
-    fn hit_test_http_link(&self, position: gpui::Point<Pixels>) -> Option<DetectedLink> {
-        if self.alternate_screen() {
-            return None;
-        }
+    /// The link under `position`: an OSC 8 hyperlink on either screen, else an
+    /// openable `http(s)://` address in primary-screen text (R1).
+    fn hit_test_link(&self, position: gpui::Point<Pixels>) -> Option<DetectedLink> {
         let (row, column) = self.strict_cell_at(position)?;
         self.core
-            .http_link_at(row, column)
-            .filter(|link| is_openable_http_url(&link.url))
+            .link_at(row, column)
+            .filter(|link| link.kind == LinkKind::Osc8 || is_openable_http_url(&link.url))
     }
 
     fn link_modifier_active(modifiers: &gpui::Modifiers) -> bool {
         modifiers.number_of_modifiers() == 1 && modifiers.secondary()
     }
 
-    fn open_http_link(&mut self, url: &str, cx: &mut Context<Self>) -> bool {
-        if !is_openable_http_url(url) {
+    /// Opens a link target, or refuses it and says so (R1).
+    ///
+    /// Recognized text is always an `http(s)://` address. An OSC 8 target is the
+    /// program's choice, so only web, mail and local-file targets are opened; any
+    /// other is named in a message and nothing is launched.
+    fn open_link(&mut self, url: &str, cx: &mut Context<Self>) -> bool {
+        if let Err(refusal) = osc8_target_allowed(url) {
+            cx.emit(PaneRequest::LinkRefused(match refusal {
+                LinkRefusal::Scheme(scheme) => Some(scheme),
+                LinkRefusal::Malformed => None,
+            }));
             return false;
         }
         #[cfg(test)]
@@ -3679,16 +3723,20 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) {
         self.last_hover_position = position;
-        let next = if !self.alternate_screen()
-            && self.drag.is_none()
-            && Self::link_modifier_active(modifiers)
-        {
-            position.and_then(|pos| self.hit_test_http_link(pos))
+        // A program's OSC 8 link is shown on plain hover, so its target can be read
+        // before anything is opened; recognized text only lights up with the
+        // modifier that opens it, as before (R1).
+        let next = if self.drag.is_none() {
+            position
+                .and_then(|pos| self.hit_test_link(pos))
+                .filter(|link| link.kind == LinkKind::Osc8 || Self::link_modifier_active(modifiers))
         } else {
             None
         };
-        if self.hovered_link != next {
+        let armed = next.is_some() && Self::link_modifier_active(modifiers);
+        if self.hovered_link != next || self.link_armed != armed {
             self.hovered_link = next;
+            self.link_armed = armed;
             cx.notify();
         }
     }
@@ -3709,11 +3757,10 @@ impl TerminalPane {
         self.menu = None;
         self.menu_link = None;
         if event.click_count == 1
-            && !self.alternate_screen()
             && Self::link_modifier_active(&event.modifiers)
-            && let Some(link) = self.hit_test_http_link(event.position)
+            && let Some(link) = self.hit_test_link(event.position)
         {
-            self.open_http_link(&link.url, cx);
+            self.open_link(&link.url, cx);
             return;
         }
         if self.report_mouse(
@@ -3812,7 +3859,7 @@ impl TerminalPane {
             self.mouse_held = Some(TerminalMouseButton::Right);
             return;
         }
-        self.menu_link = self.hit_test_http_link(event.position).map(|link| link.url);
+        self.menu_link = self.hit_test_link(event.position).map(|link| link.url);
         self.menu = Some(event.position);
         cx.notify();
     }
@@ -4186,7 +4233,7 @@ impl TerminalPane {
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         this.menu = None;
                         this.menu_link = None;
-                        this.open_http_link(&open_url, cx);
+                        this.open_link(&open_url, cx);
                     })),
                 )
                 .child(
@@ -5454,10 +5501,11 @@ impl TerminalPane {
                     }
                 }
             };
-            let hovered_link_cell = self
-                .hovered_link
-                .as_ref()
-                .is_some_and(|link| link.row == index && link.columns.contains(&column));
+            let hovered_link_cell = self.hovered_link.as_ref().is_some_and(|link| {
+                link.spans
+                    .iter()
+                    .any(|(row, columns)| *row == index && columns.contains(&column))
+            });
             let style = TextStyle {
                 ink,
                 bold: rendered.attributes.bold,
@@ -6397,6 +6445,36 @@ impl TerminalPane {
         )
     }
 
+    /// The target of the OSC 8 link under the pointer, at the bottom left of the grid,
+    /// so a person can read where a link goes before opening it (R1).
+    fn link_target_hint(&self, metrics: Metrics) -> Option<gpui::Stateful<gpui::Div>> {
+        let link = self.hovered_link.as_ref()?;
+        if link.kind != LinkKind::Osc8 {
+            return None;
+        }
+        Some(
+            div()
+                .id("terminal.link_target")
+                .debug_selector(|| "terminal.link_target".to_owned())
+                .absolute()
+                .left(metrics.scale(spacing::SNUG))
+                .bottom(metrics.scale(spacing::SNUG))
+                .max_w(gpui::relative(0.8))
+                .overflow_hidden()
+                .px(metrics.scale(spacing::SNUG))
+                .py(metrics.scale(spacing::HALF))
+                .rounded(px(theme::radius::LARGE))
+                .bg(theme::swatch(shell_palette::RAISED))
+                .border_1()
+                .border_color(theme::swatch(shell_palette::BORDER_STRONG))
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(shell_palette::TEXT_MUTED))
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(link.url.clone()),
+        )
+    }
+
     /// A floating pill that shows how many lines above the live prompt the viewport is
     /// and returns to the bottom in one click.
     fn scroll_bottom_pill(
@@ -6525,7 +6603,7 @@ impl TerminalPane {
             );
         }
 
-        let link_hovered = self.hovered_link.is_some();
+        let link_hovered = self.hovered_link.is_some() && self.link_armed;
         div()
             .on_children_prepainted(listener)
             .id("terminal.viewport.surface")
@@ -7267,7 +7345,8 @@ impl Render for TerminalPane {
                     .bg(color_of(palette::BACKGROUND))
                     .child(self.viewport(window, cx))
                     .children(self.scrollback_thumb(cx))
-                    .children(self.scroll_bottom_pill(metrics, show_blocks, cx)),
+                    .children(self.scroll_bottom_pill(metrics, show_blocks, cx))
+                    .children(self.link_target_hint(metrics)),
             )
             // A serial line states itself above the bar: its device, its settings and
             // the two send habits are what a person changes while the session runs, and

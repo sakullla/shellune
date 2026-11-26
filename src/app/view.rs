@@ -6133,6 +6133,17 @@ impl ShelluneView {
                 self.split_session_pane(id, axis, cx);
                 return;
             }
+            terminal::PaneRequest::LinkRefused(scheme) => {
+                let ux = copy::ux();
+                let title = match scheme {
+                    Some(scheme) => {
+                        copy::fill(ux.terminal_link_refused_scheme, &[("scheme", &scheme)])
+                    }
+                    None => ux.terminal_link_refused_malformed.to_owned(),
+                };
+                self.toast(Tone::Warning, title, None, cx);
+                return;
+            }
             terminal::PaneRequest::Platform(platform) => {
                 if let Some(SessionKind::Remote { host }) = self
                     .workspace

@@ -192,6 +192,34 @@ pub struct RenderedCell {
 pub struct RenderedRow {
     /// Cells from left to right.
     pub cells: Vec<RenderedCell>,
+    /// OSC 8 hyperlinks a program attached to cells of this row, left to right (R1).
+    ///
+    /// Kept per row as column spans rather than on every cell: most rows carry none,
+    /// and a span is what both hovering and opening need.
+    pub links: Vec<RowLink>,
+}
+
+/// A run of cells on one row that a program linked with OSC 8 (R1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowLink {
+    /// Grid column span `[start..end)` covered by the link on this row.
+    pub columns: Range<usize>,
+    /// The link's identity: its OSC 8 `id`, or one the parser gave it.
+    ///
+    /// Two spans with the same identity and target are the same link, even on
+    /// different rows, so a link wrapped over two lines is hovered as one.
+    pub id: Arc<str>,
+    /// The target exactly as the program stated it.
+    pub uri: Arc<str>,
+}
+
+/// Where a link under the pointer came from (R1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkKind {
+    /// Text that looks like an `http(s)://` address.
+    Text,
+    /// A link the program attached to the cells with OSC 8.
+    Osc8,
 }
 
 /// Where the cursor is drawn.
@@ -371,15 +399,23 @@ pub struct Snapshot {
     pub mode: TermMode,
 }
 
-/// An external `http://` or `https://` link recognized on one visible row.
+/// A link found at one visible position: recognized `http(s)://` text, or an
+/// OSC 8 hyperlink.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DetectedLink {
     /// Viewport row index from the top.
     pub row: usize,
-    /// Grid column span `[start..end)` covered by the link.
+    /// Grid column span `[start..end)` covered by the link on that row.
     pub columns: Range<usize>,
-    /// Matched URL text with trailing sentence punctuation stripped.
+    /// The target: matched URL text with trailing sentence punctuation stripped, or
+    /// the OSC 8 target as stated.
     pub url: String,
+    /// Text or OSC 8.
+    pub kind: LinkKind,
+    /// Every visible `(row, columns)` span of the same link, the found one included.
+    ///
+    /// An OSC 8 link can wrap over several rows; recognized text is one span.
+    pub spans: Vec<(usize, Range<usize>)>,
 }
 
 impl Snapshot {
@@ -402,6 +438,47 @@ impl Snapshot {
             .collect()
     }
 
+    /// The OSC 8 hyperlink covering `(row, column)`, with every visible span of it.
+    ///
+    /// The program declared it, so unlike recognized text it is offered on the
+    /// alternate screen too. Whether the target may be opened is not decided here.
+    #[must_use]
+    pub fn hyperlink_at(&self, row: usize, column: usize) -> Option<DetectedLink> {
+        let found = self
+            .rows
+            .get(row)?
+            .links
+            .iter()
+            .find(|link| link.columns.contains(&column))?;
+        let spans = self
+            .rows
+            .iter()
+            .enumerate()
+            .flat_map(|(index, rendered)| {
+                rendered
+                    .links
+                    .iter()
+                    .filter(|link| link.id == found.id && link.uri == found.uri)
+                    .map(move |link| (index, link.columns.clone()))
+            })
+            .collect();
+        Some(DetectedLink {
+            row,
+            columns: found.columns.clone(),
+            url: found.uri.to_string(),
+            kind: LinkKind::Osc8,
+            spans,
+        })
+    }
+
+    /// The link at `(row, column)`: an OSC 8 hyperlink first, then recognized
+    /// `http(s)://` text on the primary screen.
+    #[must_use]
+    pub fn link_at(&self, row: usize, column: usize) -> Option<DetectedLink> {
+        self.hyperlink_at(row, column)
+            .or_else(|| self.http_link_at(row, column))
+    }
+
     /// Returns the openable `http(s)://` link covering `(row, column)` when not on the
     /// alternate screen.
     #[must_use]
@@ -412,6 +489,29 @@ impl Snapshot {
         let rendered = self.rows.get(row)?;
         http_link_in_cells(row, column, &rendered.cells)
     }
+}
+
+/// Adds one linked cell to a row's spans, extending the last span when the cell
+/// continues it.
+fn push_link_span(
+    links: &mut Vec<RowLink>,
+    column: usize,
+    width: usize,
+    link: &alacritty_terminal::term::cell::Hyperlink,
+) {
+    if let Some(last) = links.last_mut()
+        && last.columns.end == column
+        && &*last.id == link.id()
+        && &*last.uri == link.uri()
+    {
+        last.columns.end = column + width;
+        return;
+    }
+    links.push(RowLink {
+        columns: column..column + width,
+        id: Arc::from(link.id()),
+        uri: Arc::from(link.uri()),
+    });
 }
 
 fn http_link_in_cells(row: usize, column: usize, cells: &[RenderedCell]) -> Option<DetectedLink> {
@@ -447,6 +547,8 @@ fn http_link_in_cells(row: usize, column: usize, cells: &[RenderedCell]) -> Opti
                 row,
                 columns: start_col..end_col,
                 url: candidate.to_owned(),
+                kind: LinkKind::Text,
+                spans: vec![(row, start_col..end_col)],
             });
         }
     }
@@ -727,6 +829,16 @@ impl TerminalCore {
         self.snapshot().http_link_at(row, column)
     }
 
+    /// The link at viewport `(row, column)`: an OSC 8 hyperlink on either screen,
+    /// else recognized `http(s)://` text on the primary screen (R1).
+    #[must_use]
+    pub fn link_at(&self, row: usize, column: usize) -> Option<DetectedLink> {
+        if row >= self.grid.rows || column >= self.grid.cols {
+            return None;
+        }
+        self.snapshot().link_at(row, column)
+    }
+
     /// Starts a mouse selection at a viewport row and column.
     ///
     /// `side` is the half of the cell the pointer is in. A selection's edges are
@@ -860,6 +972,7 @@ impl TerminalCore {
         let mut rows: Vec<_> = (0..self.grid.rows)
             .map(|_| RenderedRow {
                 cells: Vec::with_capacity(self.grid.cols),
+                links: Vec::new(),
             })
             .collect();
         // Which cells the program left in the default ink: only those may be
@@ -880,6 +993,15 @@ impl TerminalCore {
             // not drawn: drawing it would push the rest of the row one cell right.
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                 continue;
+            }
+
+            if let Some(link) = cell.hyperlink() {
+                let width = if cell.flags.contains(Flags::WIDE_CHAR) {
+                    2
+                } else {
+                    1
+                };
+                push_link_span(&mut row.links, point.column.0, width, &link);
             }
 
             if highlight && let Some(flags) = plain.get_mut(viewport.line) {
@@ -3391,5 +3513,148 @@ mod tests {
             Some((0, 0)),
             "cursor returns to origin"
         );
+    }
+
+    fn osc8(id: Option<&str>, uri: &str, text: &str) -> Vec<u8> {
+        let params = id.map_or(String::new(), |id| format!("id={id}"));
+        format!("\x1b]8;{params};{uri}\x1b\\{text}\x1b]8;;\x1b\\").into_bytes()
+    }
+
+    #[test]
+    fn an_osc8_link_covers_exactly_the_cells_it_was_attached_to() {
+        let mut terminal = core();
+        terminal.feed(b"see ");
+        terminal.feed(&osc8(None, "https://example.com", "text"));
+        terminal.feed(b" after");
+
+        let snapshot = terminal.snapshot();
+        assert_eq!(snapshot.row_text(0).as_deref(), Some("see text after"));
+        let links = &snapshot.rows[0].links;
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].columns, 4..8);
+        assert_eq!(&*links[0].uri, "https://example.com");
+
+        let link = terminal.link_at(0, 5).expect("the linked text has a link");
+        assert_eq!(link.kind, LinkKind::Osc8);
+        assert_eq!(link.url, "https://example.com");
+        assert_eq!(link.columns, 4..8);
+        assert_eq!(terminal.link_at(0, 3), None);
+        assert_eq!(terminal.link_at(0, 8), None);
+    }
+
+    #[test]
+    fn an_osc8_link_wins_over_text_that_looks_like_another_address() {
+        let mut terminal = core();
+        terminal.feed(&osc8(None, "https://real.example", "https://shown.example"));
+        let link = terminal.link_at(0, 2).expect("a link");
+        assert_eq!(link.kind, LinkKind::Osc8);
+        assert_eq!(link.url, "https://real.example");
+    }
+
+    #[test]
+    fn a_wrapped_osc8_link_is_one_link_on_every_row_it_covers() {
+        let mut terminal = TerminalCore::new(10, 4, 100);
+        terminal.feed(&osc8(
+            Some("w"),
+            "https://example.com/long",
+            "abcdefghijklmn",
+        ));
+
+        let link = terminal.link_at(1, 1).expect("the second row is linked");
+        assert_eq!(link.spans, vec![(0, 0..10), (1, 0..4)]);
+        assert_eq!(link.row, 1);
+        assert_eq!(link.columns, 0..4);
+    }
+
+    #[test]
+    fn two_osc8_links_side_by_side_stay_two_links() {
+        let mut terminal = core();
+        terminal.feed(&osc8(None, "https://a.example", "aa"));
+        terminal.feed(&osc8(None, "https://b.example", "bb"));
+        let links = terminal.snapshot().rows[0].links.clone();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].columns, 0..2);
+        assert_eq!(links[1].columns, 2..4);
+        assert_eq!(terminal.link_at(0, 3).expect("b").url, "https://b.example");
+    }
+
+    #[test]
+    fn a_wide_character_inside_an_osc8_link_counts_two_columns() {
+        let mut terminal = core();
+        terminal.feed(&osc8(None, "https://example.com", "中a"));
+        let links = terminal.snapshot().rows[0].links.clone();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].columns, 0..3);
+    }
+
+    #[test]
+    fn an_osc8_link_follows_its_text_into_history_and_back() {
+        let mut terminal = TerminalCore::new(20, 3, 100);
+        terminal.feed(&osc8(None, "https://example.com", "link"));
+        terminal.feed(b"\r\n1\r\n2\r\n3\r\n4");
+        // The linked row has scrolled into history: nothing on screen is linked.
+        assert!(
+            terminal
+                .snapshot()
+                .rows
+                .iter()
+                .all(|row| row.links.is_empty())
+        );
+
+        terminal.scroll(10);
+        let snapshot = terminal.snapshot();
+        assert_eq!(snapshot.row_text(0).as_deref(), Some("link"));
+        assert_eq!(snapshot.rows[0].links[0].columns, 0..4);
+        assert_eq!(
+            terminal.link_at(0, 1).map(|link| link.url),
+            Some("https://example.com".into())
+        );
+    }
+
+    #[test]
+    fn clearing_or_resizing_leaves_no_link_on_cells_without_one() {
+        let mut terminal = core();
+        terminal.feed(&osc8(None, "https://example.com", "link"));
+        terminal.clear_screen_and_scrollback();
+        terminal.feed(b"plain");
+        assert!(
+            terminal
+                .snapshot()
+                .rows
+                .iter()
+                .all(|row| row.links.is_empty())
+        );
+
+        let mut terminal = core();
+        terminal.feed(b"\x1b[2;1H");
+        terminal.feed(&osc8(None, "https://example.com", "link"));
+        terminal.resize(GridSize { cols: 20, rows: 5 });
+        let snapshot = terminal.snapshot();
+        let linked: Vec<_> = snapshot
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| !row.links.is_empty())
+            .map(|(index, row)| (index, row.links[0].columns.clone()))
+            .collect();
+        assert_eq!(linked.len(), 1);
+        let (row, columns) = &linked[0];
+        assert_eq!(
+            &snapshot.row_text(*row).expect("row")[columns.clone()],
+            "link"
+        );
+    }
+
+    #[test]
+    fn an_osc8_link_is_offered_on_the_alternate_screen_but_text_is_not() {
+        let mut terminal = core();
+        terminal.feed(b"\x1b[?1049h");
+        terminal.feed(&osc8(None, "https://example.com", "link"));
+        terminal.feed(b" https://text.example");
+        assert_eq!(
+            terminal.link_at(0, 1).map(|link| link.kind),
+            Some(LinkKind::Osc8)
+        );
+        assert_eq!(terminal.link_at(0, 8), None);
     }
 }
