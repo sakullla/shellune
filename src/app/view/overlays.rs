@@ -10,8 +10,8 @@ use gpui::{
     SharedString, Stateful, Window, div, px,
 };
 use shellune_core::{
-    HostConfig, LocalShell, MAX_TAB_NAME_CHARS, PaneTarget, SessionId, SessionKind, TabAccent,
-    TabId, tab_name_in_limits,
+    HostConfig, LocalShell, MAX_TAB_NAME_CHARS, PaneTarget, SessionId, SessionKind, SplitAxis,
+    TabAccent, TabId, tab_name_in_limits,
 };
 
 use super::shell::ModalContent;
@@ -193,6 +193,10 @@ impl ShelluneView {
         self.session_more = None;
         self.files_menu = None;
         self.settle_pending_tool_focus(window, cx);
+        self.palette_search_ready = self
+            .active
+            .and_then(|id| self.pane_for(id))
+            .is_some_and(|pane| pane.read(cx).can_search());
         // The field is made per opening so its placeholder is in the current language
         // and no earlier search is waiting in it.
         let placeholder = self.strings().palette_placeholder;
@@ -617,6 +621,8 @@ impl ShelluneView {
             current: false,
         });
 
+        self.push_workspace_entries(&mut entries);
+
         if let Some(id) = self.reconnect_candidate() {
             entries.push(Entry {
                 command: Command::Reconnect(id),
@@ -813,6 +819,106 @@ impl ShelluneView {
             current: false,
         });
         entries
+    }
+
+    /// The pane and window-layout actions, so every one of them can be found by name
+    /// and not only by a shortcut the user has to know first (R5).
+    ///
+    /// Each entry is listed only while it would do something: a split needs a pane on
+    /// screen, a zoom needs a second pane, a search needs a terminal whose screen is
+    /// its own history, and the sidebar cannot unfold in a window too narrow for it.
+    fn push_workspace_entries(&self, entries: &mut Vec<Entry>) {
+        let strings = self.strings();
+        let ux = copy::ux();
+        let on_screen = self.shows_terminal(self.workspace.destination());
+        let tab_title = self.active.map(|id| self.tab_title(id)).unwrap_or_default();
+
+        if on_screen && self.workspace.layout().active_pane().is_some() {
+            entries.push(Entry {
+                command: Command::SplitRight,
+                group: Group::Actions,
+                title: strings.pane_split_right.to_owned(),
+                detail: tab_title.clone(),
+                shortcut: self.keymap.label("pane.split-right"),
+                icon: Icon::SplitRight,
+                current: false,
+            });
+            entries.push(Entry {
+                command: Command::SplitDown,
+                group: Group::Actions,
+                title: strings.pane_split_down.to_owned(),
+                detail: tab_title.clone(),
+                shortcut: self.keymap.label("pane.split-down"),
+                icon: Icon::SplitDown,
+                current: false,
+            });
+        }
+        if on_screen
+            && let Some(tab) = self.workspace.layout().active_tab()
+            && !matches!(tab.root(), Node::Leaf(_))
+        {
+            entries.push(Entry {
+                command: Command::TogglePaneZoom,
+                group: Group::Actions,
+                title: if tab.zoomed().is_some() {
+                    strings.pane_unzoom
+                } else {
+                    strings.pane_zoom
+                }
+                .to_owned(),
+                detail: tab_title.clone(),
+                shortcut: self.keymap.label("pane.zoom"),
+                icon: Icon::Zoom,
+                current: false,
+            });
+        }
+        if on_screen
+            && let Some(id) = self.active
+            && self.palette_search_ready
+            && self.pane_for(id).is_some()
+        {
+            entries.push(Entry {
+                command: Command::SearchTerminal(id),
+                group: Group::Actions,
+                title: strings.terminal_search.to_owned(),
+                detail: tab_title.clone(),
+                shortcut: self.keymap.label("terminal.search"),
+                icon: Icon::Search,
+                current: false,
+            });
+        }
+        if self.focus_mode || self.can_focus_mode() {
+            entries.push(Entry {
+                command: Command::ToggleFocusMode,
+                group: Group::Actions,
+                title: if self.focus_mode {
+                    ux.focus_mode_exit
+                } else {
+                    ux.focus_mode_enter
+                }
+                .to_owned(),
+                detail: tab_title,
+                shortcut: self.keymap.label("view.focus"),
+                icon: Icon::Maximize,
+                current: false,
+            });
+        }
+        if !self.viewport_forces_icon_rail() {
+            entries.push(Entry {
+                command: Command::ToggleSidebar,
+                group: Group::Actions,
+                title: if self.rail_collapsed {
+                    ux.home_sidebar_expand
+                } else {
+                    ux.home_sidebar_collapse
+                }
+                .to_owned(),
+                detail: String::new(),
+                shortcut: self.keymap.label("sidebar.toggle"),
+                icon: Icon::Sidebar,
+                current: false,
+            });
+        }
     }
 
     /// The entries that match what is typed, best first.
@@ -1034,6 +1140,16 @@ impl ShelluneView {
             Command::ClearTabAccent(id) => {
                 if let Some(tab) = self.workspace.tab_of_session(id) {
                     self.set_tab_accent(tab, None, cx);
+                }
+            }
+            Command::SplitRight => self.split_active(SplitAxis::LeftRight, window, cx),
+            Command::SplitDown => self.split_active(SplitAxis::TopBottom, window, cx),
+            Command::TogglePaneZoom => self.toggle_active_zoom(window, cx),
+            Command::ToggleFocusMode => self.toggle_focus_mode(window, cx),
+            Command::ToggleSidebar => self.toggle_rail(cx),
+            Command::SearchTerminal(id) => {
+                if let Some(pane) = self.pane_for(id).cloned() {
+                    pane.update(cx, |pane, cx| pane.toggle_search(window, cx));
                 }
             }
             Command::ToggleLanguage => self.toggle_locale(cx),

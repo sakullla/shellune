@@ -15497,6 +15497,97 @@ async fn the_palette_opens_from_a_terminal_and_switches_sessions(cx: &mut TestAp
 }
 
 #[gpui::test]
+async fn the_palette_lists_pane_actions_only_while_they_can_run(cx: &mut TestAppContext) {
+    // Without a session on screen there is nothing to split, zoom, search or focus.
+    {
+        let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+        cx.simulate_resize(design_window());
+        cx.run_until_parked();
+        go(cx, crate::app::actions::OpenPalette);
+        let titles = cx.update(|_window, app| view.read(app).palette_titles());
+        for absent in [
+            ENGLISH.pane_split_right,
+            ENGLISH.pane_split_down,
+            ENGLISH.pane_zoom,
+            ENGLISH.terminal_search,
+            copy::ux_for(Locale::English).focus_mode_enter,
+        ] {
+            assert!(
+                !titles.iter().any(|title| title == absent),
+                "{absent:?} is not offered without a session, got {titles:?}"
+            );
+        }
+        assert!(
+            titles
+                .iter()
+                .any(|title| title == copy::ux_for(Locale::English).home_sidebar_collapse),
+            "the sidebar can be folded from the palette, got {titles:?}"
+        );
+    }
+
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let run = |cx: &mut VisualTestContext, query: &str, expected: &str| {
+        cx.simulate_keystrokes(palette_keystroke());
+        cx.run_until_parked();
+        cx.simulate_input(query);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_window, app| view.read(app).palette_selected_title())
+                .as_deref(),
+            Some(expected),
+            "{query:?} finds the action by its name first"
+        );
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+    };
+
+    cx.simulate_keystrokes(palette_keystroke());
+    cx.run_until_parked();
+    let titles = cx.update(|_window, app| view.read(app).palette_titles());
+    assert!(titles.iter().any(|title| title == ENGLISH.pane_split_right));
+    assert!(titles.iter().any(|title| title == ENGLISH.terminal_search));
+    assert!(
+        !titles.iter().any(|title| title == ENGLISH.pane_zoom),
+        "a tab of one pane has nothing to zoom, got {titles:?}"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    run(cx, "split right", ENGLISH.pane_split_right);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).leaf_ids_for_test().len()),
+        3,
+        "the palette split the pane on screen, beside the other tab's pane"
+    );
+
+    run(cx, "zoom", ENGLISH.pane_zoom);
+    cx.simulate_keystrokes(palette_keystroke());
+    cx.run_until_parked();
+    let titles = cx.update(|_window, app| view.read(app).palette_titles());
+    assert!(
+        titles.iter().any(|title| title == ENGLISH.pane_unzoom),
+        "a zoomed tab offers to show every pane again, got {titles:?}"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    run(
+        cx,
+        "focus mode",
+        copy::ux_for(Locale::English).focus_mode_enter,
+    );
+    assert!(cx.update(|_window, app| view.read(app).focus_mode()));
+    run(
+        cx,
+        "exit focus",
+        copy::ux_for(Locale::English).focus_mode_exit,
+    );
+    assert!(!cx.update(|_window, app| view.read(app).focus_mode()));
+}
+
+#[gpui::test]
 async fn home_and_end_jump_to_the_palette_edges(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());

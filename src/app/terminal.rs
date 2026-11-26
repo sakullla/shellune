@@ -2964,6 +2964,12 @@ impl TerminalPane {
         self.core.mode().contains(TermMode::ALT_SCREEN)
     }
 
+    /// Whether the search bar can open: a full-screen program owns its screen, so the
+    /// palette offers no search there rather than an entry that does nothing.
+    pub(crate) fn can_search(&self) -> bool {
+        !self.alternate_screen()
+    }
+
     /// Whether the alternate screen is up. Tests use this; the view reads the same flag.
     #[cfg(test)]
     #[must_use]
@@ -2994,7 +3000,7 @@ impl TerminalPane {
     /// on screen while the terminal holds the keyboard, the shortcut returns focus to
     /// the query without discarding it; pressing it while the query already holds focus
     /// closes the bar.
-    fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.alternate_screen() {
             return;
         }

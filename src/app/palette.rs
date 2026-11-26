@@ -71,6 +71,18 @@ pub enum Command {
     CycleTabAccent(SessionId),
     /// Clears the distinguishing colour of an open session's tab.
     ClearTabAccent(SessionId),
+    /// Splits the pane on screen to the right, the way the shortcut does.
+    SplitRight,
+    /// Splits the pane on screen downwards.
+    SplitDown,
+    /// Lets the active pane fill its tab, or shows every pane again.
+    TogglePaneZoom,
+    /// Hides the window chrome around the session on screen, or brings it back.
+    ToggleFocusMode,
+    /// Collapses the sidebar to its icons, or expands it.
+    ToggleSidebar,
+    /// Opens the search bar of the terminal on screen.
+    SearchTerminal(SessionId),
     /// Switches the interface language.
     ToggleLanguage,
     /// Steps the interface text size.

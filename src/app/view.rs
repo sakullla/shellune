@@ -936,6 +936,9 @@ pub struct ShelluneView {
     focus_lost_watch: Option<gpui::Subscription>,
     /// The highlighted palette entry.
     palette_selected: usize,
+    /// Whether the terminal on screen could open its search bar when the palette was
+    /// opened; read once there because the entries are listed without the app.
+    palette_search_ready: bool,
     /// Keeps the highlighted palette entry in view.
     palette_scroll: gpui::ScrollHandle,
     /// The settings page, which scrolls through every category.
@@ -3078,6 +3081,7 @@ impl ShelluneView {
             paste_key_spent: false,
             focus_lost_watch: None,
             palette_selected: 0,
+            palette_search_ready: false,
             palette_scroll: gpui::ScrollHandle::new(),
             settings_scroll: gpui::ScrollHandle::new(),
             home_scroll: gpui::ScrollHandle::new(),
