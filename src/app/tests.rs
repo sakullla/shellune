@@ -48532,6 +48532,67 @@ async fn osc8_links_show_their_target_on_hover_and_open_only_when_allowed(cx: &m
     );
 }
 
+/// A pointer resting on a link stays still while the grid moves under it: new
+/// output, the wheel and a resize each re-check what it is over, so the underline
+/// and target never stay on cells that now hold other text (R1).
+#[gpui::test]
+async fn a_hovered_osc8_link_follows_the_text_when_the_grid_moves_under_a_still_pointer(
+    cx: &mut TestAppContext,
+) {
+    let mut content = String::new();
+    for i in 0..200 {
+        content.push_str(&format!("older {i}\r\n"));
+    }
+    content.push_str("\x1b]8;;https://example.com/a\x1b\\link-a\x1b]8;;\x1b\\");
+    let (pane, cx) = pane_with(&content, cx);
+    let row = cx.update(|_window, app| {
+        pane.read(app)
+            .visible_text()
+            .iter()
+            .position(|line| line.contains("link-a"))
+            .expect("the link is on screen")
+    });
+    let resting = grid_point_at(cx, &pane, row as f32 + 0.5, 2.5);
+    let hovered = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| pane.read(app).hovered_link_for_test().map(str::to_owned))
+    };
+    cx.simulate_mouse_move(resting, None, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(hovered(cx), Some("https://example.com/a".to_owned()));
+
+    // Output scrolls the link up a row; the pointer now rests on plain text.
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.feed_for_test(b"\r\nplain text here", cx)
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    assert_eq!(
+        hovered(cx),
+        None,
+        "output moved the link away from the pointer"
+    );
+
+    // The wheel brings it back under the pointer: the hover follows the text again.
+    cx.simulate_mouse_move(resting, None, Modifiers::default());
+    cx.simulate_event(ScrollWheelEvent {
+        position: resting,
+        delta: ScrollDelta::Lines(point(0.0, 1.0)),
+        modifiers: Modifiers::default(),
+        touch_phase: Default::default(),
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    let visible = cx.update(|_window, app| pane.read(app).visible_text());
+    let under = visible.get(row).cloned().unwrap_or_default();
+    assert_eq!(
+        hovered(cx).is_some(),
+        under.contains("link-a"),
+        "the hover matches the text under the pointer after the wheel: {under:?}"
+    );
+}
+
 #[gpui::test]
 async fn a_program_that_took_the_mouse_still_gets_plain_clicks_on_an_osc8_link(
     cx: &mut TestAppContext,

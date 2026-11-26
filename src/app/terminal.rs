@@ -728,6 +728,9 @@ pub struct TerminalPane {
     link_armed: bool,
     /// Last pointer position over the terminal viewport, for modifier-change updates.
     last_hover_position: Option<gpui::Point<Pixels>>,
+    /// The modifiers held at the last pointer or modifier event, for re-checking the
+    /// hovered link when the grid moves under a still pointer (R1).
+    last_hover_modifiers: gpui::Modifiers,
     #[cfg(test)]
     opened_urls: Vec<String>,
     marked: Option<String>,
@@ -984,6 +987,7 @@ impl TerminalPane {
             hovered_link: None,
             link_armed: false,
             last_hover_position: None,
+            last_hover_modifiers: gpui::Modifiers::default(),
             #[cfg(test)]
             opened_urls: Vec::new(),
             marked: None,
@@ -1075,6 +1079,7 @@ impl TerminalPane {
             hovered_link: None,
             link_armed: false,
             last_hover_position: None,
+            last_hover_modifiers: gpui::Modifiers::default(),
             #[cfg(test)]
             opened_urls: Vec::new(),
             marked: None,
@@ -1165,6 +1170,7 @@ impl TerminalPane {
             hovered_link: None,
             link_armed: false,
             last_hover_position: None,
+            last_hover_modifiers: gpui::Modifiers::default(),
             #[cfg(test)]
             opened_urls: Vec::new(),
             marked: None,
@@ -1339,6 +1345,7 @@ impl TerminalPane {
             hovered_link: None,
             link_armed: false,
             last_hover_position: None,
+            last_hover_modifiers: gpui::Modifiers::default(),
             #[cfg(test)]
             opened_urls: Vec::new(),
             marked: None,
@@ -1550,6 +1557,7 @@ impl TerminalPane {
             hovered_link: None,
             link_armed: false,
             last_hover_position: None,
+            last_hover_modifiers: gpui::Modifiers::default(),
             #[cfg(test)]
             opened_urls: Vec::new(),
             marked: None,
@@ -3716,6 +3724,36 @@ impl TerminalPane {
         true
     }
 
+    /// Looks the hovered link up again at the last pointer position and modifiers;
+    /// returns whether what is hovered changed.
+    ///
+    /// The hover is in viewport cells, and the text under a still pointer moves when
+    /// the history scrolls, output arrives or the grid is resized. Each of those
+    /// redraws the pane, and the redraw asks again here, so an underline or a target
+    /// is never left on cells that now hold other text (R1).
+    fn refresh_hovered_link(&mut self) -> bool {
+        let modifiers = self.last_hover_modifiers;
+        // A program's OSC 8 link is shown on plain hover, so its target can be read
+        // before anything is opened; recognized text only lights up with the
+        // modifier that opens it, as before (R1).
+        let next = if self.drag.is_none() {
+            self.last_hover_position
+                .and_then(|pos| self.hit_test_link(pos))
+                .filter(|link| {
+                    link.kind == LinkKind::Osc8 || Self::link_modifier_active(&modifiers)
+                })
+        } else {
+            None
+        };
+        let armed = next.is_some() && Self::link_modifier_active(&modifiers);
+        if self.hovered_link == next && self.link_armed == armed {
+            return false;
+        }
+        self.hovered_link = next;
+        self.link_armed = armed;
+        true
+    }
+
     fn update_hovered_link(
         &mut self,
         position: Option<gpui::Point<Pixels>>,
@@ -3723,20 +3761,8 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) {
         self.last_hover_position = position;
-        // A program's OSC 8 link is shown on plain hover, so its target can be read
-        // before anything is opened; recognized text only lights up with the
-        // modifier that opens it, as before (R1).
-        let next = if self.drag.is_none() {
-            position
-                .and_then(|pos| self.hit_test_link(pos))
-                .filter(|link| link.kind == LinkKind::Osc8 || Self::link_modifier_active(modifiers))
-        } else {
-            None
-        };
-        let armed = next.is_some() && Self::link_modifier_active(modifiers);
-        if self.hovered_link != next || self.link_armed != armed {
-            self.hovered_link = next;
-            self.link_armed = armed;
+        self.last_hover_modifiers = *modifiers;
+        if self.refresh_hovered_link() {
             cx.notify();
         }
     }
@@ -4146,6 +4172,9 @@ impl TerminalPane {
         }
         let before = self.core.display_offset();
         self.core.scroll(lines);
+        // The pointer did not move, the text under it did: what it rests on may now
+        // be a link, or no longer be one (R1).
+        self.refresh_hovered_link();
         if self.core.display_offset() == 0 {
             self.unseen_output = false;
             if lines < 0 {
@@ -7290,6 +7319,9 @@ impl Render for TerminalPane {
         // The advance width comes from the font the window actually resolved, so
         // the grid matches what is drawn even when the platform substitutes a face.
         let _ = self.measure_cell(window);
+        if self.hovered_link.is_some() {
+            self.refresh_hovered_link();
+        }
         let focused = self.focus.is_focused(window);
         self.drive_cursor_blink(focused, cx);
 

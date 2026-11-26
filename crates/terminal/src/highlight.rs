@@ -75,11 +75,6 @@ static PATTERNS: LazyLock<[(Kind, Regex); 4]> = LazyLock::new(|| {
     ]
 });
 
-/// Whether `url` is an external web link safe to hand to the operating system (`http://` or `https://`).
-///
-/// Other schemes (`ssh://`, `ftp://`, `file://`, custom handlers) are deliberately refused so
-/// terminal output can never trigger arbitrary local commands or protocol handlers.
-#[must_use]
 /// Why an OSC 8 target is not opened (R1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LinkRefusal {
@@ -126,6 +121,11 @@ pub fn osc8_target_allowed(uri: &str) -> Result<(), LinkRefusal> {
     }
 }
 
+/// Whether `url` is an external web link safe to hand to the operating system (`http://` or `https://`).
+///
+/// Other schemes (`ssh://`, `ftp://`, `file://`, custom handlers) are deliberately refused so
+/// terminal output can never trigger arbitrary local commands or protocol handlers.
+#[must_use]
 pub fn is_openable_http_url(url: &str) -> bool {
     let rest = if url
         .get(..7)
@@ -240,6 +240,8 @@ mod tests {
         assert!(!is_openable_http_url("file:///etc/passwd"));
         assert!(!is_openable_http_url("javascript:alert(1)"));
         assert!(!is_openable_http_url("https://"));
+        assert!(!is_openable_http_url("https:///only-path"));
+        assert!(!is_openable_http_url("https://example.com/bad\x07url"));
     }
 
     #[test]
@@ -276,7 +278,5 @@ mod tests {
             osc8_target_allowed("1http://x"),
             Err(LinkRefusal::Malformed)
         );
-        assert!(!is_openable_http_url("https:///only-path"));
-        assert!(!is_openable_http_url("https://example.com/bad\x07url"));
     }
 }
