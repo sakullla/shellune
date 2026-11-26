@@ -3465,6 +3465,28 @@ pub struct UxStrings {
     pub terminal_link_refused_scheme: &'static str,
     /// Toast when an OSC 8 link target was malformed and not opened
     pub terminal_link_refused_malformed: &'static str,
+    /// Desktop notification title when a long command succeeded; {session}
+    pub notify_command_done: &'static str,
+    /// Desktop notification title when a long command failed; {session}, {code}
+    pub notify_command_failed: &'static str,
+    /// Desktop notification title when a long command ended without an exit code; {session}
+    pub notify_command_ended: &'static str,
+    /// Stands in for a finished command whose text is unknown
+    pub notify_command_unnamed: &'static str,
+    /// Desktop notification body for a long command; {command}, {seconds}
+    pub notify_command_body: &'static str,
+    /// Appended to a notification when earlier ones were held back; {count}
+    pub notify_held_back: &'static str,
+    /// Settings item: desktop notifications from background terminals
+    pub settings_desktop_notify: &'static str,
+    /// Hint under the desktop notification settings
+    pub settings_desktop_notify_hint: &'static str,
+    /// Switch label: programs' OSC 9 / OSC 777 notifications
+    pub settings_notify_program: &'static str,
+    /// Switch label: long command finished notifications
+    pub settings_notify_long: &'static str,
+    /// Segment label for the long-command threshold; {seconds}
+    pub settings_notify_threshold: &'static str,
     /// Terminal context menu action to clear visible screen and scrollback buffer
     pub terminal_clear_scrollback: &'static str,
     /// Menu action to open the snippets / shortcut commands dialog
@@ -3998,6 +4020,17 @@ impl UxStrings {
             self.terminal_copy_link,
             self.terminal_link_refused_scheme,
             self.terminal_link_refused_malformed,
+            self.notify_command_done,
+            self.notify_command_failed,
+            self.notify_command_ended,
+            self.notify_command_unnamed,
+            self.notify_command_body,
+            self.notify_held_back,
+            self.settings_desktop_notify,
+            self.settings_desktop_notify_hint,
+            self.settings_notify_program,
+            self.settings_notify_long,
+            self.settings_notify_threshold,
             self.terminal_clear_scrollback,
             self.terminal_snippets_menu,
             self.snippet_palette_aliases,
@@ -4528,6 +4561,17 @@ included",
     terminal_copy_link: "Copy link",
     terminal_link_refused_scheme: "Didn't open a {scheme}: link",
     terminal_link_refused_malformed: "Didn't open a link with an unusable address",
+    notify_command_done: "Command finished · {session}",
+    notify_command_failed: "Command failed (exit {code}) · {session}",
+    notify_command_ended: "Command ended · {session}",
+    notify_command_unnamed: "A command",
+    notify_command_body: "{command}\nRan for {seconds} s",
+    notify_held_back: "\n({count} more held back)",
+    settings_desktop_notify: "Desktop notifications",
+    settings_desktop_notify_hint: "Shown only while the terminal is not in front, at most 3 per terminal every 10 seconds. They include the program's text or the command line.",
+    settings_notify_program: "Program requests",
+    settings_notify_long: "Long commands",
+    settings_notify_threshold: "{seconds} s",
     terminal_clear_scrollback: "Clear terminal & scrollback",
     terminal_snippets_menu: "Snippets\u{2026}",
     snippet_palette_aliases: "Snippets",
@@ -5053,6 +5097,17 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     terminal_copy_link: "复制链接",
     terminal_link_refused_scheme: "未打开 {scheme}: 链接",
     terminal_link_refused_malformed: "链接地址无法使用，未打开",
+    notify_command_done: "命令已完成 · {session}",
+    notify_command_failed: "命令失败（退出码 {code}）· {session}",
+    notify_command_ended: "命令已结束 · {session}",
+    notify_command_unnamed: "一条命令",
+    notify_command_body: "{command}\n运行了 {seconds} 秒",
+    notify_held_back: "\n（另有 {count} 条未显示）",
+    settings_desktop_notify: "桌面通知",
+    settings_desktop_notify_hint: "仅在终端不在前台时显示，每个终端 10 秒内最多 3 条。通知会包含程序给出的文字或命令行。",
+    settings_notify_program: "程序请求的通知",
+    settings_notify_long: "长命令完成",
+    settings_notify_threshold: "{seconds} 秒",
     terminal_clear_scrollback: "清空终端与回滚",
     terminal_snippets_menu: "代码片段\u{2026}",
     snippet_palette_aliases: "代码片段",

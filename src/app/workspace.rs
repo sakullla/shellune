@@ -501,6 +501,122 @@ impl AttentionSettings {
     }
 }
 
+/// Default number of seconds a command must run before its end is a desktop
+/// notification (R2).
+pub const DEFAULT_LONG_COMMAND_SECS: u32 = 10;
+/// Shortest long-command threshold a user can choose, in seconds (R2).
+pub const MIN_LONG_COMMAND_SECS: u32 = 1;
+/// Longest long-command threshold a user can choose, in seconds (R2).
+pub const MAX_LONG_COMMAND_SECS: u32 = 3600;
+/// How many desktop notifications one session may raise within [`NOTIFY_WINDOW`].
+pub const NOTIFY_BURST: usize = 3;
+/// The sliding window [`NOTIFY_BURST`] is counted over.
+pub const NOTIFY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Which desktop notifications a terminal in the background may raise (R2).
+///
+/// Separate from [`AttentionSettings`]: a tab mark never carries text, a desktop
+/// notification does, and someone may want one without the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotifySettings {
+    /// A program's OSC 9 / OSC 777 request is shown.
+    pub program: bool,
+    /// A command that ran at least `long_command_secs` is shown when it ends.
+    pub long_command: bool,
+    /// The long-command threshold, always within
+    /// [`MIN_LONG_COMMAND_SECS`]..=[`MAX_LONG_COMMAND_SECS`].
+    pub long_command_secs: u32,
+}
+
+impl Default for NotifySettings {
+    fn default() -> Self {
+        Self {
+            program: true,
+            long_command: true,
+            long_command_secs: DEFAULT_LONG_COMMAND_SECS,
+        }
+    }
+}
+
+impl NotifySettings {
+    /// A threshold brought into the allowed range.
+    #[must_use]
+    pub fn clamp_secs(secs: u32) -> u32 {
+        secs.clamp(MIN_LONG_COMMAND_SECS, MAX_LONG_COMMAND_SECS)
+    }
+
+    /// Whether this kind of notification may be shown at all.
+    #[must_use]
+    pub fn allows(self, kind: NotifyKind) -> bool {
+        match kind {
+            NotifyKind::Program => self.program,
+            NotifyKind::LongCommand => self.long_command,
+        }
+    }
+
+    /// Whether a command that ran for `duration` counts as long.
+    #[must_use]
+    pub fn is_long(self, duration: std::time::Duration) -> bool {
+        duration >= std::time::Duration::from_secs(u64::from(self.long_command_secs))
+    }
+}
+
+/// The two kinds of desktop notification a terminal can raise (R2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotifyKind {
+    /// A program asked with OSC 9 or OSC 777.
+    Program,
+    /// A long command ended.
+    LongCommand,
+}
+
+/// What the rate limit decided about one notification (R2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotifyAdmission {
+    /// Show it; `held_back` earlier ones from the same session were dropped since
+    /// the last one shown, and the shown one says so.
+    Show { held_back: usize },
+    /// Too many from this session in the window: drop it and count it.
+    HeldBack,
+}
+
+/// Keeps one session from flooding the desktop (R2).
+///
+/// At most [`NOTIFY_BURST`] notifications per session in any [`NOTIFY_WINDOW`]; the
+/// rest are counted, and the next one shown mentions how many were held back.
+#[derive(Debug, Default)]
+pub struct NotifyGate {
+    shown: BTreeMap<SessionId, std::collections::VecDeque<std::time::Instant>>,
+    held_back: BTreeMap<SessionId, usize>,
+}
+
+impl NotifyGate {
+    /// Decides about one notification from `session` at `now`.
+    pub fn admit(&mut self, session: SessionId, now: std::time::Instant) -> NotifyAdmission {
+        let shown = self.shown.entry(session).or_default();
+        while shown
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= NOTIFY_WINDOW)
+        {
+            shown.pop_front();
+        }
+        if shown.len() >= NOTIFY_BURST {
+            *self.held_back.entry(session).or_default() += 1;
+            return NotifyAdmission::HeldBack;
+        }
+        shown.push_back(now);
+        NotifyAdmission::Show {
+            held_back: self.held_back.remove(&session).unwrap_or(0),
+        }
+    }
+
+    /// Forgets a session that closed.
+    pub fn forget(&mut self, session: SessionId) {
+        self.shown.remove(&session);
+        self.held_back.remove(&session);
+    }
+}
+
 /// The two background events a tab can be marked for (R7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttentionKind {
@@ -568,6 +684,10 @@ pub struct Workspace {
     layout: SessionLayout,
     /// Which background notices may mark a tab (R7).
     attention: AttentionSettings,
+    /// Which desktop notifications background terminals may raise (R2).
+    notify: NotifySettings,
+    /// The per-session rate limit on those notifications (R2).
+    notify_gate: NotifyGate,
     /// The background notices each tab is carrying until it is seen (R7).
     ///
     /// This is a reminder about something that happened while the window was open, not
@@ -614,6 +734,8 @@ impl Workspace {
             context: PanelSection::None,
             layout: SessionLayout::new(),
             attention: AttentionSettings::default(),
+            notify: NotifySettings::default(),
+            notify_gate: NotifyGate::default(),
             unread: BTreeMap::new(),
         }
     }
@@ -724,6 +846,50 @@ impl Workspace {
             self.unread.retain(|_, notices| !notices.is_empty());
         }
         true
+    }
+
+    /// Which desktop notifications background terminals may raise (R2).
+    #[must_use]
+    pub fn notify_settings(&self) -> NotifySettings {
+        self.notify
+    }
+
+    /// Switches one kind of desktop notification on or off; says whether it changed.
+    pub fn set_notify(&mut self, kind: NotifyKind, on: bool) -> bool {
+        let slot = match kind {
+            NotifyKind::Program => &mut self.notify.program,
+            NotifyKind::LongCommand => &mut self.notify.long_command,
+        };
+        if *slot == on {
+            return false;
+        }
+        *slot = on;
+        true
+    }
+
+    /// Sets the long-command threshold, clamped to the allowed range; says whether
+    /// it changed.
+    pub fn set_long_command_secs(&mut self, secs: u32) -> bool {
+        let secs = NotifySettings::clamp_secs(secs);
+        if self.notify.long_command_secs == secs {
+            return false;
+        }
+        self.notify.long_command_secs = secs;
+        true
+    }
+
+    /// Passes one notification from `session` through the rate limit (R2).
+    pub fn admit_notification(
+        &mut self,
+        session: SessionId,
+        now: std::time::Instant,
+    ) -> NotifyAdmission {
+        self.notify_gate.admit(session, now)
+    }
+
+    /// Drops the rate-limit history of a session that closed.
+    pub fn forget_notifications(&mut self, session: SessionId) {
+        self.notify_gate.forget(session);
     }
 
     /// Records that a background notice came from one session's tab.
@@ -1424,5 +1590,39 @@ mod tests {
             sanitize_diagnostic("connection reset by peer"),
             "connection reset by peer"
         );
+    }
+
+    #[test]
+    fn a_session_shows_three_notifications_per_window_and_counts_the_rest() {
+        use super::{NOTIFY_WINDOW, NotifyAdmission, NotifyGate};
+        let mut gate = NotifyGate::default();
+        let a = shellune_core::SessionId::new();
+        let b = shellune_core::SessionId::new();
+        let start = std::time::Instant::now();
+        for _ in 0..3 {
+            assert_eq!(gate.admit(a, start), NotifyAdmission::Show { held_back: 0 });
+        }
+        assert_eq!(gate.admit(a, start), NotifyAdmission::HeldBack);
+        assert_eq!(gate.admit(a, start), NotifyAdmission::HeldBack);
+        // Another session has its own budget.
+        assert_eq!(gate.admit(b, start), NotifyAdmission::Show { held_back: 0 });
+        // Once the window has passed, the next one is shown and says two were held.
+        let later = start + NOTIFY_WINDOW;
+        assert_eq!(gate.admit(a, later), NotifyAdmission::Show { held_back: 2 });
+        assert_eq!(gate.admit(a, later), NotifyAdmission::Show { held_back: 0 });
+        gate.forget(a);
+        assert_eq!(gate.admit(a, later), NotifyAdmission::Show { held_back: 0 });
+    }
+
+    #[test]
+    fn the_long_command_threshold_stays_in_range_and_decides_what_is_long() {
+        use super::{MAX_LONG_COMMAND_SECS, MIN_LONG_COMMAND_SECS, NotifySettings};
+        assert_eq!(NotifySettings::clamp_secs(0), MIN_LONG_COMMAND_SECS);
+        assert_eq!(NotifySettings::clamp_secs(99_999), MAX_LONG_COMMAND_SECS);
+        assert_eq!(NotifySettings::clamp_secs(45), 45);
+        let settings = NotifySettings::default();
+        assert_eq!(settings.long_command_secs, 10);
+        assert!(!settings.is_long(std::time::Duration::from_millis(9_999)));
+        assert!(settings.is_long(std::time::Duration::from_secs(10)));
     }
 }

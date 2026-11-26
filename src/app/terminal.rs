@@ -30,7 +30,6 @@ use std::ops::Range;
 
 use shellune_core::{EventTag, LocalShell, SessionFailure, TerminalMode};
 use shellune_ssh::{ChainEvent, ChainSession, RemoteEvent, RemoteSession, X11Status};
-use shellune_terminal::LinkKind;
 use shellune_terminal::core::{LineAnchor, SearchOptions};
 use shellune_terminal::highlight::{LinkRefusal, is_openable_http_url, osc8_target_allowed};
 use shellune_terminal::shell::ShellEnvironmentNote;
@@ -42,6 +41,7 @@ use shellune_terminal::{
     encode_mouse, encode_paste, encode_text, grid_for, mouse_reporting, palette,
     paste_needs_confirmation, sanitize_font_size, step_font_size,
 };
+use shellune_terminal::{FinishedCommand, LinkKind, ProgramNotice};
 
 use crate::app::actions::{TerminalCopy, TerminalPaste, TerminalSearch};
 use crate::app::components;
@@ -638,6 +638,19 @@ impl TerminalAttention {
     }
 }
 
+/// A desktop notification a terminal asked the window to consider (R2).
+///
+/// Kept apart from [`TerminalAttention`], which never carries text: these do, and
+/// only reach the desktop when the user has notifications on and the terminal is not
+/// in front.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaneNotice {
+    /// A program asked with OSC 9 or OSC 777.
+    Program(ProgramNotice),
+    /// A command that ran for a while ended.
+    Finished(FinishedCommand),
+}
+
 /// What offering a saved command to a pane did (R6).
 ///
 /// The window may only report what really happened: a body held behind the paste prompt
@@ -807,6 +820,8 @@ pub struct TerminalPane {
     /// They are taken by the window, which knows which tab is on screen; this pane only
     /// remembers that something happened, never what it was.
     attention: TerminalAttention,
+    /// Desktop notifications waiting for the window to decide about them (R2).
+    system_notices: Vec<PaneNotice>,
     /// What X11 forwarding of this session reported last (R11).
     ///
     /// Taken by the window like the background notices are: the pane only holds
@@ -1028,6 +1043,7 @@ impl TerminalPane {
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
+            system_notices: Vec::new(),
             x11: None,
             directory: None,
             environment_notes,
@@ -1120,6 +1136,7 @@ impl TerminalPane {
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
+            system_notices: Vec::new(),
             x11: None,
             directory: None,
             environment_notes: Vec::new(),
@@ -1211,6 +1228,7 @@ impl TerminalPane {
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
+            system_notices: Vec::new(),
             x11: None,
             directory: None,
             environment_notes: Vec::new(),
@@ -1383,6 +1401,7 @@ impl TerminalPane {
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
+            system_notices: Vec::new(),
             x11: None,
             directory: None,
             environment_notes: Vec::new(),
@@ -1598,6 +1617,7 @@ impl TerminalPane {
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
+            system_notices: Vec::new(),
             x11: None,
             directory: None,
             environment_notes: Vec::new(),
@@ -2177,6 +2197,15 @@ impl TerminalPane {
             // window, which marks the tab only when it is not the one on screen (R7).
             self.attention.absorb(notices);
         }
+        // A program's notification request and a long command's end are kept for the
+        // window, which alone knows whether this terminal is in front (R2). Bounded, so
+        // a window that is not collecting cannot make a pane grow without limit.
+        for notice in effects.notices {
+            self.push_system_notice(PaneNotice::Program(notice));
+        }
+        if let Some(finished) = effects.finished_command {
+            self.push_system_notice(PaneNotice::Finished(finished));
+        }
         if let Some(directory) = effects.directory {
             // The shell stated where it is. The report is kept until the window reads
             // it, so one that arrived between two frames is not lost; keeping only the
@@ -2192,6 +2221,21 @@ impl TerminalPane {
     /// does not touch the grid, the blocks or the session state.
     pub fn take_attention(&mut self) -> TerminalAttention {
         std::mem::take(&mut self.attention)
+    }
+
+    /// Keeps one notification for the window, dropping the oldest past a small bound.
+    fn push_system_notice(&mut self, notice: PaneNotice) {
+        const MOST: usize = 16;
+        if self.system_notices.len() >= MOST {
+            self.system_notices.remove(0);
+        }
+        self.system_notices.push(notice);
+    }
+
+    /// Takes the desktop notifications this terminal produced since the last call
+    /// (R2). The window decides about each one.
+    pub fn take_system_notices(&mut self) -> Vec<PaneNotice> {
+        std::mem::take(&mut self.system_notices)
     }
 
     /// Takes what X11 forwarding reported since the last call (R11).
@@ -6816,6 +6860,11 @@ pub fn quote_posix_path(path: &str) -> String {
 fn new_core(grid: GridSize, scrollback: usize) -> TerminalCore {
     let mut core = TerminalCore::new(grid.cols, grid.rows, scrollback);
     core.set_shown_colors(shown_color);
+    // Every command of at least the shortest threshold a user can choose is reported
+    // with its text; the window compares it with the threshold actually chosen (R2).
+    core.set_long_command_threshold(Some(Duration::from_secs(u64::from(
+        crate::app::workspace::MIN_LONG_COMMAND_SECS,
+    ))));
     core
 }
 

@@ -70,7 +70,31 @@ pub struct TerminalEffects {
     /// printed a path without an OSC 7 leaves this empty. Only the last report of the
     /// chunk is kept, because each one replaces the previous state of the same shell.
     pub directory: Option<String>,
+    /// Desktop notifications the program asked for with OSC 9 / OSC 777 (R2).
+    ///
+    /// Unlike the counts above these carry text, so they are kept apart from the
+    /// tab marks (which must never repeat what ran) and only reach the system
+    /// notification path, which the user can switch off.
+    pub notices: Vec<crate::blocks::ProgramNotice>,
+    /// A command that ran at least the long-command threshold ended in this chunk
+    /// (R2). Only set when a threshold was given with
+    /// [`TerminalCore::set_long_command_threshold`].
+    pub finished_command: Option<FinishedCommand>,
 }
+
+/// A command the shell reported as ended after running for a long time (R2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinishedCommand {
+    /// The command line, cut to [`MAX_FINISHED_COMMAND`] characters.
+    pub command: String,
+    /// How it ended, as the shell reported it.
+    pub status: crate::blocks::BlockStatus,
+    /// From output start to the end marker.
+    pub duration: std::time::Duration,
+}
+
+/// Longest command text a finished-command notice carries, in characters.
+pub const MAX_FINISHED_COMMAND: usize = 256;
 
 impl TerminalEffects {
     /// Whether nothing was requested.
@@ -81,6 +105,8 @@ impl TerminalEffects {
             && self.clipboard.is_none()
             && !self.bell
             && self.commands_finished == 0
+            && self.notices.is_empty()
+            && self.finished_command.is_none()
     }
 
     /// Whether a background event happened that a tab may mark, without any of its text.
@@ -615,6 +641,8 @@ pub struct TerminalCore {
     /// resolved in (a light terminal maps every default slot); a program asking
     /// for the background must hear the colour the user sees.
     shown: fn(Rgb) -> Rgb,
+    /// How long a command must run for its end to be reported with its text (R2).
+    long_command: Option<std::time::Duration>,
 }
 
 impl TerminalCore {
@@ -645,6 +673,7 @@ impl TerminalCore {
             scrollback,
             row_addresses: Vec::new(),
             shown: |color| color,
+            long_command: None,
         }
     }
 
@@ -701,7 +730,15 @@ impl TerminalCore {
                     // count is a background notice, never a command line (R7).
                     if self.apply_integration(event) {
                         effects.commands_finished += 1;
+                        if let Some(finished) = self.long_command_finished() {
+                            effects.finished_command = Some(finished);
+                        }
                     }
+                }
+                Segment::Notice(notice) => {
+                    // Taken out of the stream like a directory report: the grid has
+                    // received nothing for these bytes (R2).
+                    effects.notices.push(notice);
                 }
                 Segment::Directory(directory) => {
                     // The shell stated where it is. The report replaces the previous
@@ -733,6 +770,27 @@ impl TerminalCore {
         self.note_history();
         self.refresh_running_output();
         effects
+    }
+
+    /// Sets how long a command must run before its end is reported as a
+    /// [`FinishedCommand`] (R2); `None` reports none.
+    pub fn set_long_command_threshold(&mut self, threshold: Option<std::time::Duration>) {
+        self.long_command = threshold;
+    }
+
+    /// The block that just ended, when it ran at least the threshold.
+    fn long_command_finished(&self) -> Option<FinishedCommand> {
+        let threshold = self.long_command?;
+        let block = self.blocks.last_finished()?;
+        let duration = block.duration?;
+        if duration < threshold {
+            return None;
+        }
+        Some(FinishedCommand {
+            command: block.command.chars().take(MAX_FINISHED_COMMAND).collect(),
+            status: block.status,
+            duration,
+        })
     }
 
     /// Resizes the grid, keeping the history.
@@ -1887,6 +1945,10 @@ fn merge_effects(into: &mut TerminalEffects, next: TerminalEffects) {
     }
     into.bell |= next.bell;
     into.commands_finished += next.commands_finished;
+    into.notices.extend(next.notices);
+    if next.finished_command.is_some() {
+        into.finished_command = next.finished_command;
+    }
 }
 
 /// Colours the highlighted spans of one drawn row, in the cells left in default ink.
@@ -3656,5 +3718,88 @@ mod tests {
             Some(LinkKind::Osc8)
         );
         assert_eq!(terminal.link_at(0, 8), None);
+    }
+
+    /// Runs one integrated command that takes about 20 ms and returns the effects of
+    /// the chunk that ended it.
+    fn run_command(terminal: &mut TerminalCore, command: &str, end: &str) -> TerminalEffects {
+        terminal.feed(&osc("133;A"));
+        terminal.feed(b"$ ");
+        terminal.feed(&osc("133;B"));
+        terminal.feed(command.as_bytes());
+        terminal.feed(&osc("133;C"));
+        terminal.feed(b"\r\nout\r\n");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        terminal.feed(&osc(end))
+    }
+
+    #[test]
+    fn a_command_over_the_threshold_reports_its_text_status_and_duration() {
+        let mut terminal = core();
+        terminal.set_long_command_threshold(Some(std::time::Duration::from_millis(10)));
+        let effects = run_command(&mut terminal, "make build", "133;D;2");
+        assert_eq!(
+            effects.commands_finished, 1,
+            "the count means the same as before"
+        );
+        let finished = effects
+            .finished_command
+            .clone()
+            .expect("a command over the threshold is reported");
+        assert_eq!(finished.command, "make build");
+        assert_eq!(finished.status, BlockStatus::Exited(2));
+        assert!(finished.duration >= std::time::Duration::from_millis(10));
+        assert!(effects.has_background_notice());
+    }
+
+    #[test]
+    fn a_short_command_or_no_threshold_reports_only_the_count() {
+        let mut terminal = core();
+        terminal.set_long_command_threshold(Some(std::time::Duration::from_secs(10)));
+        let effects = run_command(&mut terminal, "ls", "133;D;0");
+        assert_eq!(effects.commands_finished, 1);
+        assert_eq!(effects.finished_command, None);
+
+        let mut terminal = core();
+        let effects = run_command(&mut terminal, "sleep 1", "133;D;0");
+        assert_eq!(effects.commands_finished, 1);
+        assert_eq!(effects.finished_command, None, "no threshold, no text");
+    }
+
+    #[test]
+    fn a_reported_command_line_is_cut_to_its_limit() {
+        let mut terminal = core();
+        terminal.set_long_command_threshold(Some(std::time::Duration::from_millis(1)));
+        let long = "e".repeat(MAX_FINISHED_COMMAND + 40);
+        terminal.feed(&osc("133;A"));
+        terminal.feed(&osc("133;B"));
+        terminal.feed(&osc(&format!("633;E;{long}")));
+        terminal.feed(&osc("133;C"));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let effects = terminal.feed(&osc("133;D;0"));
+        let finished = effects.finished_command.expect("reported");
+        assert_eq!(finished.command.chars().count(), MAX_FINISHED_COMMAND);
+    }
+
+    #[test]
+    fn a_program_notice_is_an_effect_and_leaves_the_grid_untouched() {
+        let mut terminal = core();
+        let effects = terminal.feed(b"before\x1b]9;done\x07after");
+        assert_eq!(
+            effects.notices,
+            vec![crate::blocks::ProgramNotice {
+                title: None,
+                body: "done".into()
+            }]
+        );
+        assert!(!effects.is_empty());
+        assert!(
+            !effects.has_background_notice(),
+            "a notice is not a tab mark; the window decides about it separately"
+        );
+        assert_eq!(
+            terminal.snapshot().row_text(0).as_deref(),
+            Some("beforeafter")
+        );
     }
 }

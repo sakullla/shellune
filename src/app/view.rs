@@ -81,8 +81,8 @@ use crate::app::transfers::{
     PathProblem, TransferProblem, TransferViews, default_download_directory, file_name,
 };
 use crate::app::workspace::{
-    AttentionKind, Failure, Recovery, SectionState, SectionStatus, SessionPhase, SessionStatus,
-    SessionStep, UnreadNotices, Workspace,
+    AttentionKind, Failure, NotifyAdmission, NotifyKind, Recovery, SectionState, SectionStatus,
+    SessionPhase, SessionStatus, SessionStep, UnreadNotices, Workspace,
 };
 use crate::app::{components, theme::radius};
 #[cfg(test)]
@@ -155,6 +155,18 @@ impl PaneKind {
             SessionKind::Serial { .. } => Self::Serial,
         }
     }
+}
+
+/// How long after a desktop notification coming back to the window goes to the
+/// terminal that raised it (R2).
+const NOTIFIED_FOCUS_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The last desktop notification's terminal, and what was focused when it was raised.
+#[derive(Clone, Copy, Debug)]
+struct NotifiedFocus {
+    session: SessionId,
+    at: std::time::Instant,
+    focused: Option<SessionId>,
 }
 
 /// Why a session's connection resources are being ended (R17).
@@ -1114,6 +1126,14 @@ pub struct ShelluneView {
     keys_control: usize,
     /// Whether the window already tells this view when the system palette changes.
     watching_appearance: bool,
+    /// Where desktop notifications go (R2): the platform's, or a recorder in tests.
+    notifier: std::sync::Arc<dyn crate::app::notify::Notifier>,
+    /// Whether the window has the keyboard, as the platform last said (R2). A
+    /// terminal in an inactive window is not in front, even when its tab is shown.
+    window_active: bool,
+    /// The session the last desktop notification came from, and what was focused
+    /// then: coming back to the window soon after goes to that terminal (R2).
+    notified_focus: Option<NotifiedFocus>,
     /// Whether the operating system asks for reduced motion, as last read. Combined with
     /// the user's preference on every draw; re-read when the window comes back to the
     /// front, which is when a setting changed elsewhere can have changed.
@@ -3155,6 +3175,9 @@ impl ShelluneView {
             keys_selected: 0,
             keys_control: 0,
             watching_appearance: false,
+            notifier: std::sync::Arc::new(crate::app::notify::DesktopNotifier),
+            window_active: true,
+            notified_focus: None,
             system_reduces_motion: false,
             layout_persist: false,
             layout_error: None,
@@ -3295,6 +3318,19 @@ impl ShelluneView {
         // A file written before the switch existed means on (R2).
         self.update
             .set_auto_check(saved.auto_check_updates.unwrap_or(true));
+        // Absent means on, and the default threshold; a stored number outside the
+        // allowed range is brought into it (R2).
+        self.workspace
+            .set_notify(NotifyKind::Program, saved.notify_program.unwrap_or(true));
+        self.workspace.set_notify(
+            NotifyKind::LongCommand,
+            saved.notify_long_command.unwrap_or(true),
+        );
+        self.workspace.set_long_command_secs(
+            saved
+                .long_command_secs
+                .unwrap_or(crate::app::workspace::DEFAULT_LONG_COMMAND_SECS),
+        );
         self.saved_preferences = Some(self.current_preferences());
     }
 
@@ -3364,6 +3400,10 @@ impl ShelluneView {
             }),
             // This computer's own choice; a backup or a sync does not carry it (R2).
             auto_check_updates: Some(self.update.auto_check()),
+            // Desktop notifications are this computer's too (R2).
+            notify_program: Some(self.workspace.notify_settings().program),
+            notify_long_command: Some(self.workspace.notify_settings().long_command),
+            long_command_secs: Some(self.workspace.notify_settings().long_command_secs),
         }
     }
 
@@ -6264,6 +6304,8 @@ impl ShelluneView {
         // The connection of this session ends with its terminal, so its file view goes
         // with it instead of keeping a path and a listing that nothing backs any more.
         self.end_files(id);
+        // Its notification history goes too; a new session starts with its own (R2).
+        self.workspace.forget_notifications(id);
         if self.active == Some(id) {
             // The next tab takes over, or the previous one when this was the last: a
             // shell never ends up with no terminal selected while one is still open.
@@ -12620,6 +12662,12 @@ impl ShelluneView {
         // screen, so it decides here whether the news marks a tab or was already seen.
         let notices = pane.update(cx, |pane, _cx| pane.take_attention());
         self.collect_attention(id, notices, cx);
+        // Desktop notifications carry text, so they are decided apart from the tab
+        // marks above, under their own switches (R2).
+        let requests = pane.update(cx, |pane, _cx| pane.take_system_notices());
+        for request in requests {
+            self.raise_notification(id, request, cx);
+        }
         // X11 forwarding reports through the same pane, and the bar it belongs to is
         // this window's to draw (R11).
         if let Some(status) = pane.update(cx, |pane, _cx| pane.take_x11_status()) {
@@ -12712,6 +12760,163 @@ impl ShelluneView {
         if marked {
             cx.notify();
         }
+    }
+
+    /// Decides about one desktop notification a terminal asked for, and raises it
+    /// (R2).
+    ///
+    /// Nothing is shown when its switch is off, when a finished command did not run
+    /// for the chosen threshold, or when the terminal is in front: the window has the
+    /// keyboard and the terminal's tab is on screen. A session that raises many in a
+    /// short time is held to [`crate::app::workspace::NOTIFY_BURST`]. When the platform
+    /// cannot show it, the tab is marked instead, under the tab marks' own switches.
+    fn raise_notification(
+        &mut self,
+        id: SessionId,
+        request: terminal::PaneNotice,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = self.workspace.notify_settings();
+        let (kind, fallback) = match &request {
+            terminal::PaneNotice::Program(_) => (NotifyKind::Program, AttentionKind::Bell),
+            terminal::PaneNotice::Finished(finished) => {
+                if !settings.is_long(finished.duration) {
+                    return;
+                }
+                (NotifyKind::LongCommand, AttentionKind::CommandFinished)
+            }
+        };
+        if !settings.allows(kind) {
+            return;
+        }
+        if self.window_active && self.is_viewing_session(id) {
+            return;
+        }
+        let held_back = match self
+            .workspace
+            .admit_notification(id, std::time::Instant::now())
+        {
+            NotifyAdmission::Show { held_back } => held_back,
+            NotifyAdmission::HeldBack => return,
+        };
+        let notice = self.word_notification(id, &request, held_back);
+        self.notified_focus = Some(NotifiedFocus {
+            session: id,
+            at: std::time::Instant::now(),
+            focused: self.workspace.layout().active_session(),
+        });
+        let notifier = self.notifier.clone();
+        let shown = cx
+            .background_executor()
+            .spawn(async move { notifier.show(&notice) });
+        cx.spawn(async move |this, cx| {
+            if shown.await.is_err() {
+                // No notification service, or no permission: the tab is marked as it
+                // would be for a bell or a command end, so the news is not lost.
+                let _ = this.update(cx, |view, cx| {
+                    if view.workspace.note_attention(id, fallback) {
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// The words of one desktop notification.
+    fn word_notification(
+        &self,
+        id: SessionId,
+        request: &terminal::PaneNotice,
+        held_back: usize,
+    ) -> crate::app::notify::SystemNotice {
+        let ux = copy::ux();
+        let session = self
+            .workspace
+            .session(id)
+            .map(|session| session.title().to_owned())
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| crate::app::product::NAME.to_owned());
+        let (title, mut body) = match request {
+            terminal::PaneNotice::Program(notice) => (
+                notice.title.clone().unwrap_or_else(|| session.clone()),
+                notice.body.clone(),
+            ),
+            terminal::PaneNotice::Finished(finished) => {
+                let seconds = finished.duration.as_secs().to_string();
+                let title = match finished.status {
+                    shellune_terminal::BlockStatus::Exited(0) => {
+                        copy::fill(ux.notify_command_done, &[("session", &session)])
+                    }
+                    shellune_terminal::BlockStatus::Exited(code) => copy::fill(
+                        ux.notify_command_failed,
+                        &[("session", &session), ("code", &code.to_string())],
+                    ),
+                    _ => copy::fill(ux.notify_command_ended, &[("session", &session)]),
+                };
+                let command = if finished.command.trim().is_empty() {
+                    ux.notify_command_unnamed.to_owned()
+                } else {
+                    finished.command.clone()
+                };
+                (
+                    title,
+                    copy::fill(
+                        ux.notify_command_body,
+                        &[("command", &command), ("seconds", &seconds)],
+                    ),
+                )
+            }
+        };
+        if held_back > 0 {
+            body.push_str(&copy::fill(
+                ux.notify_held_back,
+                &[("count", &held_back.to_string())],
+            ));
+        }
+        crate::app::notify::SystemNotice { title, body }
+    }
+
+    /// Goes to the terminal the last desktop notification came from, when the
+    /// window comes back soon after it and nothing else was chosen meanwhile (R2).
+    ///
+    /// Clicking a notification brings the application forward on every platform,
+    /// but not every platform says which one was clicked; coming back within
+    /// [`NOTIFIED_FOCUS_WINDOW`] is taken as following it. A user who picked another
+    /// terminal since is left where they are.
+    fn follow_notification(&mut self, cx: &mut Context<Self>) {
+        let Some(notified) = self.notified_focus.take() else {
+            return;
+        };
+        if notified.at.elapsed() > NOTIFIED_FOCUS_WINDOW {
+            return;
+        }
+        if self.workspace.layout().active_session() != notified.focused {
+            return;
+        }
+        if self.workspace.session(notified.session).is_none() {
+            return;
+        }
+        self.activate(notified.session, cx);
+        cx.notify();
+    }
+
+    /// Sets the desktop notification switches and threshold, for tests.
+    #[cfg(test)]
+    pub fn set_notify_for_test(&mut self, program: bool, long_command: bool, secs: u32) {
+        self.workspace.set_notify(NotifyKind::Program, program);
+        self.workspace
+            .set_notify(NotifyKind::LongCommand, long_command);
+        self.workspace.set_long_command_secs(secs);
+    }
+
+    /// Replaces where desktop notifications go, for tests.
+    #[cfg(test)]
+    pub fn set_notifier_for_test(
+        &mut self,
+        notifier: std::sync::Arc<dyn crate::app::notify::Notifier>,
+    ) {
+        self.notifier = notifier;
     }
 
     /// Whether one session's terminal is on screen.
@@ -22865,9 +23070,14 @@ impl Render for ShelluneView {
             .detach();
             // A reduce-motion switch flipped in the system settings is seen when the
             // user comes back to the window.
+            // From here on the platform says when the keyboard comes and goes; until
+            // now the window is taken as in front, as a newly opened one is (R2).
+            self.window_active = window.is_window_active();
             cx.observe_window_activation(window, |this, window, cx| {
-                if window.is_window_active() {
+                this.window_active = window.is_window_active();
+                if this.window_active {
                     this.refresh_system_motion(cx);
+                    this.follow_notification(cx);
                 }
             })
             .detach();

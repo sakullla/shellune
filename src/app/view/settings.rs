@@ -22,7 +22,7 @@ use crate::app::keymap;
 use crate::app::nav::Destination;
 use crate::app::terminal;
 use crate::app::theme::{self, Motion, Zoom, palette, radius, spacing};
-use crate::app::workspace::AttentionKind;
+use crate::app::workspace::{AttentionKind, NotifyKind};
 
 /// Width below which the navigation column and the page no longer fit side by side, in
 /// logical pixels before the text scale is applied (R8).
@@ -100,6 +100,7 @@ pub(crate) enum Item {
     Lock,
     BellNotice,
     FinishedNotice,
+    DesktopNotify,
     Shortcuts,
     HostsFile,
     Import,
@@ -126,7 +127,7 @@ const TERMINAL: [Item; 4] = [
 ];
 const CONNECTION: [Item; 1] = [Item::Policy];
 const SECURITY: [Item; 3] = [Item::KeysAndPassword, Item::HostTrust, Item::Lock];
-const NOTICES: [Item; 2] = [Item::BellNotice, Item::FinishedNotice];
+const NOTICES: [Item; 3] = [Item::BellNotice, Item::FinishedNotice, Item::DesktopNotify];
 const KEYS: [Item; 1] = [Item::Shortcuts];
 const DATA: [Item; 4] = [
     Item::HostsFile,
@@ -233,7 +234,7 @@ impl Item {
             }
             Self::Policy => Category::Connection,
             Self::KeysAndPassword | Self::HostTrust | Self::Lock => Category::Security,
-            Self::BellNotice | Self::FinishedNotice => Category::Notices,
+            Self::BellNotice | Self::FinishedNotice | Self::DesktopNotify => Category::Notices,
             Self::Shortcuts => Category::Keys,
             Self::HostsFile | Self::Import | Self::ExportBackup | Self::ImportBackup => {
                 Category::Data
@@ -276,6 +277,7 @@ impl Item {
             Self::Lock => "lock",
             Self::BellNotice => "bell-notice",
             Self::FinishedNotice => "finished-notice",
+            Self::DesktopNotify => "desktop-notify",
             Self::Shortcuts => "keys",
             Self::HostsFile => "hosts-file",
             Self::Import => "import",
@@ -306,6 +308,7 @@ impl Item {
             Self::Lock => copy::security_for(locale).lock_settings_item,
             Self::BellNotice => ux.settings_bell_notice,
             Self::FinishedNotice => ux.settings_finished_notice,
+            Self::DesktopNotify => ux.settings_desktop_notify,
             Self::Shortcuts => ux.settings_keys,
             Self::HostsFile => ux.settings_hosts_file,
             Self::Import => locale.strings().import_open,
@@ -336,6 +339,7 @@ impl Item {
             Self::Lock => copy::security_for(locale).lock_settings_hint,
             Self::BellNotice => ux.settings_bell_notice_hint,
             Self::FinishedNotice => ux.settings_finished_notice_hint,
+            Self::DesktopNotify => ux.settings_desktop_notify_hint,
             Self::Shortcuts => ux.settings_keys_hint,
             Self::HostsFile => "",
             Self::Import => ux.settings_import_hint,
@@ -1058,6 +1062,12 @@ impl ShelluneView {
                 ux.settings_finished_notice_hint,
                 self.settings_notice_control(AttentionKind::CommandFinished, cx),
             ),
+            Item::DesktopNotify => self.settings_row(
+                "desktop-notify",
+                label,
+                ux.settings_desktop_notify_hint,
+                self.settings_desktop_notify_control(cx),
+            ),
             Item::Import => self.settings_row(
                 "import",
                 label,
@@ -1337,6 +1347,75 @@ impl ShelluneView {
         div().child(self.switch_control(id, on, cx, move |view, on, cx| {
             view.set_attention_notice(kind, on, cx);
         }))
+    }
+
+    /// Desktop notifications from terminals that are not in front (R2): a switch for
+    /// programs' own requests, one for long commands, and how long is long.
+    ///
+    /// The threshold is offered as a few steps; a value written into the file by hand
+    /// that is none of them is shown as one more step, selected, so the page never
+    /// claims a value the window does not use.
+    fn settings_desktop_notify_control(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let settings = self.workspace.notify_settings();
+        let mut steps: Vec<u32> = vec![5, 10, 30, 60, 300];
+        if !steps.contains(&settings.long_command_secs) {
+            steps.push(settings.long_command_secs);
+            steps.sort_unstable();
+        }
+        let options = steps
+            .iter()
+            .map(|secs| {
+                (
+                    copy::fill(
+                        ux.settings_notify_threshold,
+                        &[("seconds", &secs.to_string())],
+                    ),
+                    *secs == settings.long_command_secs,
+                )
+            })
+            .collect();
+        let labelled = |label: &'static str, control: Stateful<Div>| {
+            div()
+                .flex()
+                .items_center()
+                .gap(metrics.scale(spacing::SNUG))
+                .child(div().text_size(metrics.caption_size()).child(label))
+                .child(control)
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::SNUG))
+            .child(labelled(
+                ux.settings_notify_program,
+                self.switch_control(
+                    "settings.notify.program",
+                    settings.program,
+                    cx,
+                    |view, on, cx| view.set_desktop_notify(NotifyKind::Program, on, cx),
+                ),
+            ))
+            .child(labelled(
+                ux.settings_notify_long,
+                self.switch_control(
+                    "settings.notify.long",
+                    settings.long_command,
+                    cx,
+                    |view, on, cx| view.set_desktop_notify(NotifyKind::LongCommand, on, cx),
+                ),
+            ))
+            .child(self.segments(
+                "settings.notify.threshold",
+                options,
+                cx,
+                move |view, index, cx| {
+                    if let Some(secs) = steps.get(index) {
+                        view.set_long_command_secs(*secs, cx);
+                    }
+                },
+            ))
     }
 
     /// The connection page: the keepalive and timeout numbers every host is dialled with

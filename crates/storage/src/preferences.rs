@@ -172,6 +172,21 @@ pub struct Preferences {
     /// an import keeps this computer's value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_check_updates: Option<bool>,
+    /// Whether a program's OSC 9 / OSC 777 request shows a desktop notification while
+    /// its terminal is not in front (R2). Absent means on.
+    ///
+    /// Like the update check, a choice about this computer's desktop: it is in neither
+    /// part of a backup or sync document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notify_program: Option<bool>,
+    /// Whether a long command ending while its terminal is not in front shows a
+    /// desktop notification (R2). Absent means on. Local to this computer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notify_long_command: Option<bool>,
+    /// How many seconds a command must run to count as long (R2). Absent means 10;
+    /// a value outside 1-3600 is clamped when read. Local to this computer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub long_command_secs: Option<u32>,
 }
 
 /// A preferences file at a known location.
@@ -283,6 +298,9 @@ mod tests {
             command_notice: Some(true),
             connection: Some(ConnectionDefaults::new(45, 4, 12).expect("valid defaults")),
             auto_check_updates: Some(false),
+            notify_program: Some(false),
+            notify_long_command: Some(true),
+            long_command_secs: Some(45),
         };
         store.save(&preferences).expect("saves");
         assert_eq!(store.load(), preferences);

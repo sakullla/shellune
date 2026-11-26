@@ -600,6 +600,15 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_the_large_text(
                     "settings.row.finished-notice",
                     &["settings.notice.finished"][..],
                 ),
+                (
+                    "desktop-notify",
+                    "settings.row.desktop-notify",
+                    &[
+                        "settings.notify.program",
+                        "settings.notify.long",
+                        "settings.notify.threshold",
+                    ][..],
+                ),
             ],
         ),
         (
@@ -680,7 +689,7 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_the_large_text(
             checked += 1;
         }
     }
-    assert_eq!(checked, 17, "not every settings item was measured"); // The font stepper keeps a pointer target a finger can hit at the largest text too.
+    assert_eq!(checked, 18, "not every settings item was measured"); // The font stepper keeps a pointer target a finger can hit at the largest text too.
     click(cx, "settings.category.terminal");
     click(cx, "settings.item.font-size");
     for selector in ["settings.font.less", "settings.font.more"] {
@@ -727,6 +736,7 @@ fn item_selector(item: &'static str) -> &'static str {
         "policy" => "settings.item.policy",
         "bell-notice" => "settings.item.bell-notice",
         "finished-notice" => "settings.item.finished-notice",
+        "desktop-notify" => "settings.item.desktop-notify",
         // The shortcut page is named like its category, so the category is its row.
         "keys" => "settings.category.keys",
         "hosts-file" => "settings.item.hosts-file",
@@ -753,6 +763,7 @@ fn card_selector(item: &'static str) -> &'static str {
         "policy" => "settings.card.policy",
         "bell-notice" => "settings.card.bell-notice",
         "finished-notice" => "settings.card.finished-notice",
+        "desktop-notify" => "settings.card.desktop-notify",
         "hosts-file" => "settings.card.hosts-file",
         "import" => "settings.card.import",
         "backup-export" => "settings.card.backup-export",
@@ -911,6 +922,7 @@ fn page_selector(item: &'static str) -> &'static str {
         "policy" => "settings.page.policy",
         "bell-notice" => "settings.page.bell-notice",
         "finished-notice" => "settings.page.finished-notice",
+        "desktop-notify" => "settings.page.desktop-notify",
         "keys" => "settings.page.keys",
         "hosts-file" => "settings.page.hosts-file",
         "import" => "settings.page.import",
@@ -1185,7 +1197,7 @@ async fn the_narrow_window_reaches_every_settings_category_and_item_at_115_perce
         ("settings.category.connection", &["policy"][..]),
         (
             "settings.category.notices",
-            &["bell-notice", "finished-notice"][..],
+            &["bell-notice", "finished-notice", "desktop-notify"][..],
         ),
         ("settings.category.keys", &["keys"][..]),
         ("settings.category.data", &["hosts-file", "import"][..]),
@@ -1205,7 +1217,7 @@ async fn the_narrow_window_reaches_every_settings_category_and_item_at_115_perce
             reached += 1;
         }
     }
-    assert_eq!(reached, 16, "not every settings item was reachable");
+    assert_eq!(reached, 17, "not every settings item was reachable");
 
     // The way out is on the page as it always was, so a person is never stranded here.
     assert_within_width(bounds_of(cx, "nav.hosts"), viewport, "the hosts entry");
@@ -21827,6 +21839,216 @@ fn unread_of(
 /// A command the shell reports from start to end, as its integration markers do.
 const REPORTED_COMMAND: &[u8] =
     b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07secret output\r\n\x1b]133;D;0\x07";
+
+// ---------------------------------------------------------------------------
+// Desktop notifications (R2)
+// ---------------------------------------------------------------------------
+
+/// Two shells, the newest on screen, with notifications recorded instead of shown.
+fn two_shells_recording(
+    cx: &mut TestAppContext,
+) -> Option<(
+    Entity<ShelluneView>,
+    &mut VisualTestContext,
+    Arc<crate::app::notify::RecordingNotifier>,
+)> {
+    let (view, cx) = two_shells(cx)?;
+    // The window has the keyboard, as it does when the user is working in it.
+    cx.update(|window, _app| window.activate_window());
+    cx.run_until_parked();
+    let notifier = crate::app::notify::RecordingNotifier::shared();
+    let handle: Arc<dyn crate::app::notify::Notifier> = notifier.clone();
+    cx.update(|_window, app| view.update(app, |view, _cx| view.set_notifier_for_test(handle)));
+    Some((view, cx, notifier))
+}
+
+#[gpui::test]
+async fn a_program_notice_reaches_the_desktop_only_when_its_terminal_is_not_in_front(
+    cx: &mut TestAppContext,
+) {
+    let Some((view, cx, notifier)) = two_shells_recording(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let (background, foreground) = (tabs[0], tabs[1]);
+
+    // The tab on screen, in the window that has the keyboard: nothing to tell.
+    feed_session(cx, &view, foreground, b"\x1b]9;in front\x07");
+    assert!(
+        notifier.shown().is_empty(),
+        "a terminal in front is not notified"
+    );
+
+    // A background tab's request is shown, with its own words.
+    feed_session(
+        cx,
+        &view,
+        background,
+        b"\x1b]777;notify;Build;all green\x07",
+    );
+    let shown = notifier.shown();
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].title, "Build");
+    assert_eq!(shown[0].body, "all green");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(foreground),
+        "a notification never switches the tab"
+    );
+
+    // The same tab on screen in a window without the keyboard is not in front either.
+    cx.deactivate_window();
+    cx.run_until_parked();
+    feed_session(cx, &view, foreground, b"\x1b]9;window away\x07");
+    assert_eq!(notifier.shown().len(), 2);
+    assert_eq!(notifier.shown()[1].body, "window away");
+}
+
+#[gpui::test]
+async fn a_flood_of_notices_is_held_to_three_and_a_switch_turns_them_off(cx: &mut TestAppContext) {
+    let Some((view, cx, notifier)) = two_shells_recording(cx) else {
+        return;
+    };
+    let background = cx.update(|_window, app| view.read(app).open_tabs())[0];
+    for index in 0..6 {
+        feed_session(
+            cx,
+            &view,
+            background,
+            format!("\x1b]9;n{index}\x07").as_bytes(),
+        );
+    }
+    let bodies: Vec<String> = notifier.shown().into_iter().map(|n| n.body).collect();
+    assert_eq!(
+        bodies,
+        vec!["n0", "n1", "n2"],
+        "one terminal shows at most three"
+    );
+
+    // Switched off, nothing more reaches the desktop, and the choice is saved.
+    cx.update(|_window, app| {
+        view.update(app, |view, _cx| view.set_notify_for_test(false, true, 10));
+    });
+    let other = cx.update(|_window, app| view.read(app).open_tabs())[0];
+    feed_session(cx, &view, other, b"\x1b]9;after switch\x07");
+    assert_eq!(notifier.shown().len(), 3);
+    let saved = cx.update(|_window, app| view.read(app).current_preferences_for_test());
+    assert_eq!(saved.notify_program, Some(false));
+    assert_eq!(saved.notify_long_command, Some(true));
+    assert_eq!(saved.long_command_secs, Some(10));
+}
+
+#[gpui::test]
+async fn a_notice_the_desktop_cannot_show_marks_the_tab_instead(cx: &mut TestAppContext) {
+    let Some((view, cx, notifier)) = two_shells_recording(cx) else {
+        return;
+    };
+    let background = cx.update(|_window, app| view.read(app).open_tabs())[0];
+    notifier.set_failing(true);
+    feed_session(cx, &view, background, b"\x1b]9;nobody listens\x07");
+    cx.run_until_parked();
+    assert!(notifier.shown().is_empty());
+    assert!(
+        unread_of(cx, &view, background).bell,
+        "the news is kept on the tab when the desktop could not show it"
+    );
+}
+
+#[gpui::test]
+async fn a_long_command_ending_in_the_background_is_named_with_its_exit_code(
+    cx: &mut TestAppContext,
+) {
+    let Some((view, cx, notifier)) = two_shells_recording(cx) else {
+        return;
+    };
+    let background = cx.update(|_window, app| view.read(app).open_tabs())[0];
+    cx.update(|_window, app| {
+        view.update(app, |view, _cx| view.set_notify_for_test(true, true, 1));
+    });
+
+    // A short command is not news.
+    feed_session(cx, &view, background, REPORTED_COMMAND);
+    assert!(
+        notifier.shown().is_empty(),
+        "a command under the threshold says nothing"
+    );
+
+    // One that ran past the threshold is, with its command line and exit code.
+    feed_session(
+        cx,
+        &view,
+        background,
+        b"\x1b]133;A\x07\x1b]133;B\x07\x1b]633;E;make release\x07\x1b]133;C\x07",
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1_050));
+    feed_session(cx, &view, background, b"\x1b]133;D;2\x07");
+    let shown = notifier.shown();
+    assert_eq!(shown.len(), 1);
+    assert!(
+        shown[0].title.contains("exit 2"),
+        "title: {:?}",
+        shown[0].title
+    );
+    assert!(
+        shown[0].body.contains("make release"),
+        "body: {:?}",
+        shown[0].body
+    );
+
+    // With long-command notices off, the same thing is quiet.
+    cx.update(|_window, app| {
+        view.update(app, |view, _cx| view.set_notify_for_test(true, false, 1));
+    });
+    feed_session(
+        cx,
+        &view,
+        background,
+        b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07",
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1_050));
+    feed_session(cx, &view, background, b"\x1b]133;D;0\x07");
+    assert_eq!(notifier.shown().len(), 1);
+}
+
+#[gpui::test]
+async fn coming_back_after_a_notification_goes_to_the_terminal_that_raised_it(
+    cx: &mut TestAppContext,
+) {
+    let Some((view, cx, notifier)) = two_shells_recording(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let (background, foreground) = (tabs[0], tabs[1]);
+    cx.deactivate_window();
+    cx.run_until_parked();
+    feed_session(cx, &view, background, b"\x1b]9;look here\x07");
+    assert_eq!(notifier.shown().len(), 1);
+
+    cx.update(|window, _app| window.activate_window());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(background),
+        "returning to the window follows the notification"
+    );
+
+    // A user who chose another terminal themselves in the meantime is left there.
+    new_default_shell(cx);
+    let third = cx.update(|_window, app| view.read(app).open_tabs())[2];
+    cx.update(|_window, app| view.update(app, |view, cx| view.activate(background, cx)));
+    cx.deactivate_window();
+    cx.run_until_parked();
+    feed_session(cx, &view, foreground, b"\x1b]9;other\x07");
+    assert_eq!(notifier.shown().len(), 2);
+    cx.update(|_window, app| view.update(app, |view, cx| view.activate(third, cx)));
+    cx.update(|window, _app| window.activate_window());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(third),
+        "the user's own choice is kept"
+    );
+}
 
 #[gpui::test]
 async fn a_bell_in_a_background_tab_marks_it_without_taking_the_screen(cx: &mut TestAppContext) {

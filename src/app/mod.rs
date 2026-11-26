@@ -37,6 +37,8 @@ pub mod keymap;
 pub mod layout;
 pub mod monogram;
 pub mod nav;
+/// Desktop notifications for terminals in the background (R2).
+pub mod notify;
 pub mod os_icons;
 pub mod palette;
 pub mod product;

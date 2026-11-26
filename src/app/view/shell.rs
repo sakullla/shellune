@@ -28,7 +28,7 @@ use crate::app::terminal;
 use crate::app::terminal::SnippetOffer;
 use crate::app::text_field::TextField;
 use crate::app::theme::{self, ThemeChoice, Tone, palette, radius, spacing};
-use crate::app::workspace::{AttentionKind, SectionState};
+use crate::app::workspace::{AttentionKind, NotifyKind, SectionState};
 
 /// The least width a saved command's name and preview keep before its actions wrap.
 const SNIPPET_DETAIL_MIN_WIDTH: f32 = 160.0;
@@ -1356,6 +1356,29 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) {
         if self.workspace.set_attention(kind, on) && self.persist_preferences() {
+            self.note_data_changed(cx);
+        }
+        cx.notify();
+    }
+
+    /// Switches one kind of desktop notification on or off (R2). Saved with the
+    /// other preferences, on this computer only.
+    pub(super) fn set_desktop_notify(
+        &mut self,
+        kind: NotifyKind,
+        on: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.set_notify(kind, on) && self.persist_preferences() {
+            self.note_data_changed(cx);
+        }
+        cx.notify();
+    }
+
+    /// Sets how long a command must run for its end to be a desktop notification
+    /// (R2), within the allowed range.
+    pub(super) fn set_long_command_secs(&mut self, secs: u32, cx: &mut Context<Self>) {
+        if self.workspace.set_long_command_secs(secs) && self.persist_preferences() {
             self.note_data_changed(cx);
         }
         cx.notify();

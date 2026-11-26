@@ -166,6 +166,73 @@ pub(crate) enum Segment {
     Event(IntegrationEvent),
     /// A working directory a shell stated with OSC 7. Never part of the grid text.
     Directory(WorkingDirectory),
+    /// A notification a program asked for with OSC 9 or OSC 777 (R2). Never drawn.
+    Notice(ProgramNotice),
+}
+
+/// Longest notification title kept, in characters (R2).
+pub const MAX_NOTICE_TITLE: usize = 256;
+/// Longest notification body kept, in characters (R2).
+pub const MAX_NOTICE_BODY: usize = 1024;
+
+/// A desktop notification a program asked for (R2).
+///
+/// `OSC 9 ; body` (iTerm2, ConEmu, Windows Terminal) has no title; `OSC 777 ;
+/// notify ; title ; body` (rxvt, foot, Ghostty) has one. Control characters are
+/// dropped and both parts are cut to a fixed length, so a program cannot use a
+/// notice to carry escape sequences or a flood of text into the desktop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramNotice {
+    /// The title the program gave, when it gave one.
+    pub title: Option<String>,
+    /// The text of the notice. Never empty.
+    pub body: String,
+}
+
+impl ProgramNotice {
+    /// Parses the body of an OSC 9 sequence (after `9;`).
+    ///
+    /// ConEmu uses `9;<number>;…` for progress, tab titles and other commands that
+    /// are not notifications; those, and a body that is only digits, are not a
+    /// notice and stay with the grid parser, which ignores them.
+    fn parse_osc9(rest: &[u8]) -> Option<Self> {
+        let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
+        if digits > 0 && (digits == rest.len() || rest[digits] == b';') {
+            return None;
+        }
+        let body = clean_notice_text(rest, MAX_NOTICE_BODY)?;
+        Some(Self { title: None, body })
+    }
+
+    /// Parses the body of an OSC 777 sequence (after `777;`); only `notify` is a
+    /// notice.
+    fn parse_osc777(rest: &[u8]) -> Option<Self> {
+        let rest = rest.strip_prefix(b"notify;")?;
+        let (title, body) = match rest.iter().position(|byte| *byte == b';') {
+            Some(at) => (&rest[..at], &rest[at + 1..]),
+            None => (rest, &[][..]),
+        };
+        let title = clean_notice_text(title, MAX_NOTICE_TITLE);
+        match clean_notice_text(body, MAX_NOTICE_BODY) {
+            Some(body) => Some(Self { title, body }),
+            // A notice with only a title still says something; it becomes the text.
+            None => title.map(|body| Self { title: None, body }),
+        }
+    }
+}
+
+/// Decodes notice text as UTF-8 (lossily), drops control characters, trims it and
+/// keeps at most `limit` characters; `None` when nothing is left.
+fn clean_notice_text(raw: &[u8], limit: usize) -> Option<String> {
+    let text: String = String::from_utf8_lossy(raw)
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .collect();
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.chars().take(limit).collect())
 }
 
 /// Longest working directory a shell may report.
@@ -310,6 +377,14 @@ impl IntegrationSplitter {
                     consumed += n;
                     out.push(Segment::Directory(directory));
                 }
+                Take::Notice(n, notice) => {
+                    if !plain.is_empty() {
+                        out.push(Segment::Bytes(std::mem::take(&mut plain)));
+                    }
+                    let n = n.min(self.held.len() - consumed);
+                    consumed += n;
+                    out.push(Segment::Notice(notice));
+                }
             }
         }
         self.held.drain(..consumed);
@@ -325,6 +400,7 @@ enum Take {
     Plain(usize),
     Event(usize, IntegrationEvent),
     Directory(usize, WorkingDirectory),
+    Notice(usize, ProgramNotice),
 }
 
 /// How long an unfinished OSC may be held before it is treated as ordinary text.
@@ -390,6 +466,21 @@ fn classify(body: &[u8], end: usize) -> Take {
         b"7" => {
             return match WorkingDirectory::parse(rest) {
                 Some(directory) => Take::Directory(end, directory),
+                None => Take::Plain(end),
+            };
+        }
+        // A program asking for a desktop notification (R2). It is never drawn; an
+        // OSC 9 that is a ConEmu command, or a 777 that is not `notify`, goes on to
+        // the grid parser, which ignores it as before.
+        b"9" => {
+            return match ProgramNotice::parse_osc9(rest) {
+                Some(notice) => Take::Notice(end, notice),
+                None => Take::Plain(end),
+            };
+        }
+        b"777" => {
+            return match ProgramNotice::parse_osc777(rest) {
+                Some(notice) => Take::Notice(end, notice),
                 None => Take::Plain(end),
             };
         }
@@ -740,6 +831,11 @@ impl BlockBook {
     }
 
     /// Finished blocks, then the running one when a command has actually started.
+    /// The block that ended most recently, if any is still kept.
+    pub(crate) fn last_finished(&self) -> Option<&CommandBlock> {
+        self.finished.last()
+    }
+
     pub(crate) fn blocks(&self) -> Vec<CommandBlock> {
         let mut blocks = self.finished.clone();
         if let Some(open) = &self.open
@@ -999,6 +1095,7 @@ mod tests {
             Segment::Bytes(bytes) => assert_eq!(bytes, b"hello \x1b]0;title\x07\x1b[31m"),
             Segment::Event(_) => panic!("a title OSC is not a command marker"),
             Segment::Directory(_) => panic!("a title OSC is not a working directory"),
+            Segment::Notice(_) => panic!("a title OSC is not a notification"),
         }
     }
 
@@ -1115,5 +1212,106 @@ mod tests {
             vec![BlockStatus::Exited(0), BlockStatus::Unknown],
             "the reported end kept its code, and the interrupted command stayed unknown"
         );
+    }
+
+    fn notices(segments: &[Segment]) -> Vec<ProgramNotice> {
+        segments
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Notice(notice) => Some(notice.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn plain(segments: &[Segment]) -> Vec<u8> {
+        segments
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Bytes(bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn osc9_and_osc777_notify_become_notices_and_never_reach_the_grid() {
+        let segments = events(b"a\x1b]9;hello\x1b\\b");
+        assert_eq!(
+            notices(&segments),
+            vec![ProgramNotice {
+                title: None,
+                body: "hello".into()
+            }]
+        );
+        assert_eq!(plain(&segments), b"ab");
+
+        let segments = events(&osc("777;notify;Build;done in 3m"));
+        assert_eq!(
+            notices(&segments),
+            vec![ProgramNotice {
+                title: Some("Build".into()),
+                body: "done in 3m".into()
+            }]
+        );
+        assert!(plain(&segments).is_empty());
+
+        // A title without a body is still something to say.
+        let segments = events(&osc("777;notify;Only title"));
+        assert_eq!(
+            notices(&segments),
+            vec![ProgramNotice {
+                title: None,
+                body: "Only title".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn conemu_commands_and_other_777_requests_stay_with_the_grid_parser() {
+        for payload in ["9;4;1;50", "9;9;C:\\work", "9;12", "777;preexec", "9;   "] {
+            let bytes = osc(payload);
+            let segments = events(&bytes);
+            assert!(notices(&segments).is_empty(), "{payload} is not a notice");
+            assert_eq!(plain(&segments), bytes, "{payload} goes on unchanged");
+        }
+    }
+
+    #[test]
+    fn a_notice_cut_between_reads_is_one_notice() {
+        let mut splitter = IntegrationSplitter::new();
+        let mut segments = splitter.push(b"out\x1b]777;noti");
+        assert!(notices(&segments).is_empty());
+        segments.extend(splitter.push(b"fy;T;B\x1b"));
+        segments.extend(splitter.push(b"\\more"));
+        assert_eq!(
+            notices(&segments),
+            vec![ProgramNotice {
+                title: Some("T".into()),
+                body: "B".into()
+            }]
+        );
+        assert_eq!(plain(&segments), b"outmore");
+    }
+
+    #[test]
+    fn notice_text_loses_control_characters_and_is_cut_to_length() {
+        let segments = events(&osc("9;be\u{1}ll\u{7f}  "));
+        assert_eq!(notices(&segments)[0].body, "bell");
+
+        let long_body = "x".repeat(MAX_NOTICE_BODY + 50);
+        let long_title = "t".repeat(MAX_NOTICE_TITLE + 50);
+        let segments = events(&osc(&format!("777;notify;{long_title};{long_body}")));
+        let notice = &notices(&segments)[0];
+        assert_eq!(notice.body.chars().count(), MAX_NOTICE_BODY);
+        assert_eq!(
+            notice.title.as_deref().map(|title| title.chars().count()),
+            Some(MAX_NOTICE_TITLE)
+        );
+
+        // Invalid UTF-8 is replaced, not dropped wholesale.
+        let segments = events(b"\x1b]9;caf\xe9!\x07");
+        assert_eq!(notices(&segments)[0].body, "caf\u{fffd}!");
     }
 }

@@ -42,6 +42,7 @@ gpui = "=0.2.2"
 shellune-core = { path = "crates/core" }
 shellune-ssh = { path = "crates/ssh" }
 shellune-storage = { path = "crates/storage" }
+notify-rust = { workspace = true }
 # WebDAV sync of the portable data file (settings, state, conflicts).
 shellune-sync = { path = "crates/sync" }
 shellune-terminal = { path = "crates/terminal" }
@@ -131,6 +132,10 @@ license = "GPL-3.0-only"
 
 [workspace.dependencies]
 alacritty_terminal = "0.26.0"
+# Desktop notifications for terminals in the background (R2). GPUI has no
+# notification API; this covers the freedesktop bus (through zbus, already in the
+# graph for the keyring), macOS and Windows.
+notify-rust = "4.19.0"
 # The SSH protocol itself. `ring` is the crypto backend: it needs no CMake, and
 # `rsa` keeps RSA keys usable for the servers that still only offer them.
 russh = { version = "0.64.1", default-features = false, features = ["ring", "rsa"] }

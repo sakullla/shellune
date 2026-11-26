@@ -32,10 +32,14 @@ pub use alacritty_terminal::index::Side;
 pub use alacritty_terminal::selection::SelectionType;
 pub use alacritty_terminal::term::TermMode;
 pub use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
-pub use blocks::{BlockFilter, BlockStatus, CommandBlock, CommandBlockId, WorkingDirectory};
+pub use blocks::{
+    BlockFilter, BlockStatus, CommandBlock, CommandBlockId, MAX_NOTICE_BODY, MAX_NOTICE_TITLE,
+    ProgramNotice, WorkingDirectory,
+};
 pub use core::{
-    CellAttributes, DEFAULT_SCROLLBACK, DetectedLink, HistoryMatch, LinkKind, RenderedCell,
-    RenderedCursor, RenderedRow, RowLink, Snapshot, TerminalCore, TerminalEffects,
+    CellAttributes, DEFAULT_SCROLLBACK, DetectedLink, FinishedCommand, HistoryMatch, LinkKind,
+    MAX_FINISHED_COMMAND, RenderedCell, RenderedCursor, RenderedRow, RowLink, Snapshot,
+    TerminalCore, TerminalEffects,
 };
 pub use highlight::{LinkRefusal, osc8_target_allowed};
 pub use input::{
