@@ -2276,11 +2276,74 @@ pub fn kind_label(kind: FileKind, strings: &Strings) -> &'static str {
     }
 }
 
+/// How long a pause ends a type-ahead word: the next letter starts a new one.
+pub const TYPE_AHEAD_PAUSE: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// The row a type-ahead word lands on, the way a file manager's listing answers letters.
+///
+/// `typed` is every letter of the word so far, the newest last. A word of one letter, or
+/// of one letter pressed again and again, steps to the next row after `current` that
+/// starts with that letter and wraps around, so "d d d" walks through every folder
+/// whose name starts with d. A longer word keeps the row it is on while that row still
+/// matches, and otherwise finds the first row after it that does. Case is ignored;
+/// `None` means no row starts with the word, and the selection stays where it was.
+#[must_use]
+pub fn type_ahead_target(names: &[String], current: Option<usize>, typed: &str) -> Option<usize> {
+    let word = typed.to_lowercase();
+    let mut letters = word.chars();
+    let first = letters.next()?;
+    let repeated = letters.all(|letter| letter == first);
+    let (needle, start) = if repeated {
+        (first.to_string(), current.map_or(0, |index| index + 1))
+    } else {
+        (word.clone(), current.unwrap_or(0))
+    };
+    let len = names.len();
+    (0..len)
+        .map(|offset| (start + offset) % len)
+        .find(|&index| names[index].to_lowercase().starts_with(&needle))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
+
+    fn listing(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_letter_steps_through_the_rows_that_start_with_it_and_wraps() {
+        let names = listing(&["bin", "Desktop", "docs", "downloads", "etc"]);
+        assert_eq!(type_ahead_target(&names, None, "d"), Some(1), "any case");
+        assert_eq!(type_ahead_target(&names, Some(1), "d"), Some(2));
+        assert_eq!(
+            type_ahead_target(&names, Some(2), "dd"),
+            Some(3),
+            "pressed again"
+        );
+        assert_eq!(type_ahead_target(&names, Some(3), "ddd"), Some(1), "wraps");
+        assert_eq!(type_ahead_target(&names, Some(3), "z"), None);
+        assert_eq!(type_ahead_target(&names, Some(0), ""), None);
+        assert_eq!(type_ahead_target(&[], None, "a"), None);
+    }
+
+    #[test]
+    fn a_word_keeps_the_row_it_still_names_and_moves_on_when_it_does_not() {
+        let names = listing(&["bin", "Desktop", "docs", "downloads", "etc"]);
+        // "d" landed on Desktop; "do" no longer names it, so the word moves on.
+        assert_eq!(type_ahead_target(&names, Some(1), "do"), Some(2));
+        assert_eq!(type_ahead_target(&names, Some(2), "dow"), Some(3));
+        assert_eq!(
+            type_ahead_target(&names, Some(1), "de"),
+            Some(1),
+            "still named"
+        );
+        assert_eq!(type_ahead_target(&names, Some(4), "bi"), Some(0), "wraps");
+        assert_eq!(type_ahead_target(&names, Some(0), "bx"), None);
+    }
     use shellune_core::DirEntry;
 
     fn stamped(name: &str, kind: FileKind, modified: Option<u64>) -> DirEntry {

@@ -5783,6 +5783,30 @@ impl ShelluneView {
         self.security.search.read(cx).focus_handle().clone()
     }
 
+    /// Starts a vault search with a letter typed on the list, and gives the search the
+    /// keyboard, as the hosts list does.
+    pub(crate) fn security_type_to_search(
+        &mut self,
+        letter: char,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.security.search.update(cx, |field, cx| {
+            let mut phrase = field.text().to_owned();
+            phrase.push(letter);
+            field.set_text(phrase, cx);
+        });
+        let handle = self.security_search_focus(cx);
+        window.focus(&handle);
+        cx.notify();
+    }
+
+    /// The phrase in the vault search, for a test.
+    #[cfg(test)]
+    pub(crate) fn security_search_text_for_test(&self, cx: &App) -> String {
+        self.security.search.read(cx).text().to_owned()
+    }
+
     /// Whether the vault list focus handle currently holds keyboard focus.
     pub(crate) fn security_list_focused(&self, window: &Window) -> bool {
         self.security.list_focus.is_focused(window)

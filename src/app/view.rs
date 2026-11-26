@@ -936,6 +936,8 @@ pub struct ShelluneView {
     focus_lost_watch: Option<gpui::Subscription>,
     /// The highlighted palette entry.
     palette_selected: usize,
+    /// The letters typed into a file listing in one quick run (R14).
+    files_type_ahead: Option<FilesTypeAhead>,
     /// Whether the terminal on screen could open its search bar when the palette was
     /// opened; read once there because the entries are listed without the app.
     palette_search_ready: bool,
@@ -3082,6 +3084,7 @@ impl ShelluneView {
             focus_lost_watch: None,
             palette_selected: 0,
             palette_search_ready: false,
+            files_type_ahead: None,
             palette_scroll: gpui::ScrollHandle::new(),
             settings_scroll: gpui::ScrollHandle::new(),
             home_scroll: gpui::ScrollHandle::new(),
@@ -4004,6 +4007,17 @@ impl ShelluneView {
                 };
             }
             let vault_list_focused = self.security_list_focused(window);
+            let modifiers = &event.keystroke.modifiers;
+            let plain = modifiers.number_of_modifiers() == 0
+                || (modifiers.shift && modifiers.number_of_modifiers() == 1);
+            if (page_focused || vault_list_focused)
+                && plain
+                && let Some(letter) = type_ahead_letter(&event.keystroke)
+                    .filter(|letter| !matches!(letter, '/' | '*'))
+            {
+                self.security_type_to_search(letter, window, cx);
+                return true;
+            }
             return match event.keystroke.key.as_str() {
                 "down" if page_focused => {
                     self.security_focus_list_handle(window);
@@ -4052,6 +4066,22 @@ impl ShelluneView {
         let alt_only = modifiers.alt && modifiers.number_of_modifiers() == 1;
         let shift_only = modifiers.shift && modifiers.number_of_modifiers() == 1;
         let bare = modifiers.number_of_modifiers() == 0;
+        // A letter typed while the list holds the keys starts a search with it, the way
+        // "/" moves there, so finding a host never needs the pointer first. "/" and "*"
+        // keep their own meaning; Space, Enter and the editing keys are not letters.
+        if page_focused
+            && (bare || shift_only)
+            && let Some(letter) =
+                type_ahead_letter(&event.keystroke).filter(|letter| !matches!(letter, '/' | '*'))
+        {
+            self.hosts_search.update(cx, |field, cx| {
+                let mut phrase = field.text().to_owned();
+                phrase.push(letter);
+                field.set_text(phrase, cx);
+            });
+            self.focus_hosts_search(window, cx);
+            return true;
+        }
         if alt_only {
             if event.keystroke.key.eq_ignore_ascii_case("f")
                 && let Some(id) = self.active_hosts_cursor()
@@ -17651,6 +17681,19 @@ impl ShelluneView {
             self.files_move_selection_marked(id, source, delta, cx);
             return true;
         }
+        // A printable letter, Shift included for capitals, jumps to the row it starts.
+        // No other key of the listing is a single character, so nothing is taken from
+        // the shortcuts above or from the program.
+        if on_the_listing
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+            && !modifiers.function
+            && let Some(letter) = type_ahead_letter(&event.keystroke)
+        {
+            self.files_type_ahead(id, source, letter, cx);
+            return true;
+        }
         if modifiers.modified() {
             return false;
         }
@@ -18339,7 +18382,22 @@ impl ShelluneView {
                 }
             }
         };
-        self.files.select(id, source, Some(names[next].clone()));
+        self.files_select_row(id, source, &names, next, cx);
+    }
+
+    /// Selects row `index` of the listing on screen and scrolls it into view.
+    fn files_select_row(
+        &mut self,
+        id: SessionId,
+        source: FileSource,
+        names: &[String],
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(name) = names.get(index) else {
+            return;
+        };
+        self.files.select(id, source, Some(name.clone()));
         let has_parent = self
             .files
             .browser_in(id, source)
@@ -18348,8 +18406,46 @@ impl ShelluneView {
         // The rows are the list's children after the parent row; the column header
         // stands above the list and is not one of them.
         self.files_list_scroll(source)
-            .scroll_to_item(usize::from(has_parent) + next, gpui::ScrollStrategy::Top);
+            .scroll_to_item(usize::from(has_parent) + index, gpui::ScrollStrategy::Top);
         cx.notify();
+    }
+
+    /// Jumps to the row whose name starts with the letters typed in a quick run, the
+    /// way a file manager's listing does (R14). A pause, another column or another
+    /// session starts a new word.
+    fn files_type_ahead(
+        &mut self,
+        id: SessionId,
+        source: FileSource,
+        letter: char,
+        cx: &mut Context<Self>,
+    ) {
+        let now = std::time::Instant::now();
+        let mut typed = match self.files_type_ahead.take() {
+            Some(ahead)
+                if ahead.session == id
+                    && ahead.source == source
+                    && now.duration_since(ahead.at) < crate::app::files::TYPE_AHEAD_PAUSE =>
+            {
+                ahead.typed
+            }
+            _ => String::new(),
+        };
+        typed.push(letter);
+        let names = self.files_entry_names(id, source);
+        let current = self
+            .files
+            .selected(id, source)
+            .and_then(|name| names.iter().position(|item| item == name));
+        if let Some(index) = crate::app::files::type_ahead_target(&names, current, &typed) {
+            self.files_select_row(id, source, &names, index, cx);
+        }
+        self.files_type_ahead = Some(FilesTypeAhead {
+            session: id,
+            source,
+            typed,
+            at: now,
+        });
     }
 
     /// Why one source could not be read, and the action that source can still take.
@@ -21205,6 +21301,18 @@ impl ShelluneView {
     #[cfg(test)]
     pub fn files_marked_for_test(&self, id: SessionId, source: FileSource) -> Vec<String> {
         self.files.marked(id, source)
+    }
+
+    /// Ends the type-ahead word as a pause would, for a test that cannot wait (R14).
+    #[cfg(test)]
+    pub fn files_type_ahead_pause_for_test(&mut self) {
+        self.files_type_ahead = None;
+    }
+
+    /// The row the keyboard is on in one file column, for a test (R14).
+    #[cfg(test)]
+    pub fn files_selected_for_test(&self, id: SessionId, source: FileSource) -> Option<String> {
+        self.files.selected(id, source).map(str::to_owned)
     }
 
     /// Whether the file view is docked beside the terminal, for a test (R14).
@@ -24063,6 +24171,26 @@ fn zoom_percent(zoom: theme::Zoom) -> u16 {
         theme::Zoom::Regular => 100,
         theme::Zoom::Comfortable => 115,
     }
+}
+
+/// The type-ahead word of one file listing and when its last letter came.
+struct FilesTypeAhead {
+    session: SessionId,
+    source: FileSource,
+    typed: String,
+    at: std::time::Instant,
+}
+
+/// The character a key types into a type-ahead word, if it types one: a single visible
+/// character, never a space, which marks the row instead.
+fn type_ahead_letter(keystroke: &gpui::Keystroke) -> Option<char> {
+    let text = keystroke
+        .key_char
+        .as_deref()
+        .unwrap_or(keystroke.key.as_str());
+    let mut chars = text.chars();
+    let letter = chars.next()?;
+    (chars.next().is_none() && !letter.is_whitespace() && !letter.is_control()).then_some(letter)
 }
 
 /// Moves a scroll handle by one page, one line, or to either end.

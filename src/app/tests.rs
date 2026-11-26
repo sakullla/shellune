@@ -34049,6 +34049,72 @@ async fn the_delete_key_covers_the_batch_the_menu_deletes(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+async fn typing_letters_in_a_file_listing_jumps_to_the_row_they_start(cx: &mut TestAppContext) {
+    // R14: a listing answers letters the way a file manager does, so a long folder is
+    // crossed by name instead of by holding an arrow key.
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let files = FileAnswers::accepting();
+    open_files_for(cx, &view, id, &files);
+    files.reply(
+        1,
+        "/home/deploy",
+        &[
+            ("bin", shellune_core::FileKind::Directory),
+            ("Desktop", shellune_core::FileKind::Directory),
+            ("docs", shellune_core::FileKind::Directory),
+            ("downloads", shellune_core::FileKind::Directory),
+            ("notes.txt", shellune_core::FileKind::File),
+        ],
+    );
+    pump_files(cx, &view);
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::Body)),
+        "the listing holds the keys"
+    );
+    let selected = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .files_selected_for_test(id, FileSource::Remote)
+        })
+    };
+
+    let pause = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| {
+            view.update(app, |view, _cx| view.files_type_ahead_pause_for_test());
+        });
+    };
+
+    press_key(cx, "n");
+    assert_eq!(selected(cx).as_deref(), Some("notes.txt"));
+    pause(cx);
+    // One letter pressed again walks through every row it starts, in any case.
+    press_key(cx, "d");
+    assert_eq!(selected(cx).as_deref(), Some("Desktop"));
+    press_key(cx, "d");
+    assert_eq!(selected(cx).as_deref(), Some("docs"));
+    pause(cx);
+    // A quick word narrows the jump: "dow" passes docs and lands on downloads.
+    press_key(cx, "d o w");
+    assert_eq!(
+        selected(cx).as_deref(),
+        Some("downloads"),
+        "the whole word is matched"
+    );
+    press_key(cx, "shift-b");
+    assert_eq!(
+        selected(cx).as_deref(),
+        Some("downloads"),
+        "a word nothing starts with leaves the row where it was"
+    );
+    assert!(
+        column_marked(cx, &view, id, FileSource::Remote).is_empty(),
+        "letters only move the row, they mark nothing"
+    );
+}
+
+#[gpui::test]
 async fn a_batch_counts_the_tasks_it_started_and_says_what_it_left_out(cx: &mut TestAppContext) {
     // R14: a batch reports what really happened. A folder among the marks is not a task -
     // a batch copies one path per task and never expands a folder into a tree behind the
@@ -35197,6 +35263,51 @@ async fn an_address_nobody_saved_is_offered_by_the_empty_list_and_enter_dials_it
         "nothing was saved"
     );
     assert_eq!(dir.store().load().expect("reads").hosts().len(), 1);
+}
+
+#[gpui::test]
+async fn a_letter_typed_on_the_host_list_starts_a_search_with_it(cx: &mut TestAppContext) {
+    let dir = TempDir::new("home-type-to-search");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("alpha", "10.0.0.1", 22, "deploy", None),
+            stored_host("zulu", "10.0.0.3", 22, "deploy", None),
+        ],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    let search_focused = |cx: &mut VisualTestContext| {
+        let handle = cx.update(|_window, app| view.read(app).hosts_search_focus_for_test(app));
+        cx.update(|window, _app| handle.is_focused(window))
+    };
+    let phrase = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| view.read(app).hosts_state().search().to_owned())
+    };
+
+    click(cx, "hosts.row.1");
+    assert!(!search_focused(cx));
+    cx.simulate_keystrokes("shift-z");
+    cx.run_until_parked();
+    assert!(
+        search_focused(cx),
+        "the letter took the keyboard to the search"
+    );
+    assert_eq!(phrase(cx), "Z", "and it was typed there, capital and all");
+    cx.simulate_input("ul");
+    cx.run_until_parked();
+    assert_eq!(
+        phrase(cx),
+        "Zul",
+        "the rest of the word follows in the field"
+    );
+
+    // Space still marks, and the keys of the page keep their meaning.
+    click(cx, "hosts.row.0");
+    cx.simulate_keystrokes("space");
+    cx.run_until_parked();
+    assert!(!search_focused(cx), "Space is not a letter");
+    assert_eq!(phrase(cx), "Zul");
 }
 
 #[gpui::test]
@@ -46866,6 +46977,27 @@ async fn vault_wide_master_detail_scrolls_independently_and_row_click_keeps_arro
         cx.update(|_window, app| view.read(app).security_detail_name_for_test()),
         Some("Deploy Key 23".to_owned()),
         "Up + Enter after clicking row 24 selects Deploy Key 23"
+    );
+
+    // 2A. A letter typed while the vault list holds the keys starts a vault search with
+    //     it, as on the hosts list; Escape in the search clears it again.
+    cx.simulate_keystrokes("shift-d");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_search_text_for_test(app)),
+        "D",
+        "the letter was typed into the vault search"
+    );
+    let vault_search = cx.update(|_window, app| view.read(app).security_search_focus(app));
+    assert!(
+        cx.update(|window, _app| vault_search.is_focused(window)),
+        "and the vault search holds the keyboard"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).security_search_text_for_test(app)),
+        ""
     );
 
     // 2B. Home Vault pure keyboard loop from `security.search`:
