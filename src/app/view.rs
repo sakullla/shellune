@@ -1134,6 +1134,9 @@ pub struct ShelluneView {
     /// The session the last desktop notification came from, and what was focused
     /// then: coming back to the window soon after goes to that terminal (R2).
     notified_focus: Option<NotifiedFocus>,
+    /// This view's window, once it has been drawn: a notification click brings it
+    /// forward (R2).
+    window_handle: Option<gpui::AnyWindowHandle>,
     /// Whether the operating system asks for reduced motion, as last read. Combined with
     /// the user's preference on every draw; re-read when the window comes back to the
     /// front, which is when a setting changed elsewhere can have changed.
@@ -3178,6 +3181,7 @@ impl ShelluneView {
             notifier: std::sync::Arc::new(crate::app::notify::DesktopNotifier),
             window_active: true,
             notified_focus: None,
+            window_handle: None,
             system_reduces_motion: false,
             layout_persist: false,
             layout_error: None,
@@ -12789,7 +12793,12 @@ impl ShelluneView {
         if !settings.allows(kind) {
             return;
         }
-        if self.window_active && self.is_viewing_session(id) {
+        // In front means the window has the keyboard and this is the terminal the
+        // keys go to. A visible pane beside it in a split tab is not in front (R2).
+        if self.window_active
+            && self.is_viewing_session(id)
+            && self.workspace.layout().active_session() == Some(id)
+        {
             return;
         }
         let held_back = match self
@@ -12806,9 +12815,16 @@ impl ShelluneView {
             focused: self.workspace.layout().active_session(),
         });
         let notifier = self.notifier.clone();
+        // A click is reported on the notifier's own thread; the channel brings it
+        // here without holding a thread while nobody clicks.
+        let (clicked_tx, clicked_rx) = futures_channel::oneshot::channel::<()>();
+        let on_click: crate::app::notify::OnClick = Box::new(move || {
+            let _ = clicked_tx.send(());
+        });
         let shown = cx
             .background_executor()
-            .spawn(async move { notifier.show(&notice) });
+            .spawn(async move { notifier.show(&notice, on_click) });
+        let window = self.window_handle;
         cx.spawn(async move |this, cx| {
             if shown.await.is_err() {
                 // No notification service, or no permission: the tab is marked as it
@@ -12818,9 +12834,32 @@ impl ShelluneView {
                         cx.notify();
                     }
                 });
+                return;
+            }
+            // Closed without a click, or on a platform that does not report one:
+            // the sender is dropped and nothing happens.
+            if clicked_rx.await.is_err() {
+                return;
+            }
+            let _ = this.update(cx, |view, cx| view.follow_click(id, cx));
+            if let Some(window) = window {
+                let _ = cx.update_window(window, |_, window, _cx| window.activate_window());
             }
         })
         .detach();
+    }
+
+    /// Goes to the terminal whose notification was clicked (R2), if it is still open.
+    ///
+    /// The terminal is chosen before the window is brought forward, so the window's
+    /// activation finds the user's choice made and leaves it.
+    fn follow_click(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.notified_focus = None;
+        if self.workspace.session(id).is_none() {
+            return;
+        }
+        self.activate(id, cx);
+        cx.notify();
     }
 
     /// The words of one desktop notification.
@@ -23068,11 +23107,13 @@ impl Render for ShelluneView {
                 cx.notify();
             })
             .detach();
+            // From here on the platform says when the keyboard comes and goes; until
+            // now the window is taken as in front, as a newly opened one is (R2). A
+            // notification click brings this window forward through its handle.
+            self.window_active = window.is_window_active();
+            self.window_handle = Some(window.window_handle());
             // A reduce-motion switch flipped in the system settings is seen when the
             // user comes back to the window.
-            // From here on the platform says when the keyboard comes and goes; until
-            // now the window is taken as in front, as a newly opened one is (R2).
-            self.window_active = window.is_window_active();
             cx.observe_window_activation(window, |this, window, cx| {
                 this.window_active = window.is_window_active();
                 if this.window_active {

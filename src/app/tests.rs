@@ -22051,6 +22051,109 @@ async fn coming_back_after_a_notification_goes_to_the_terminal_that_raised_it(
 }
 
 #[gpui::test]
+async fn clicking_a_notification_goes_to_the_terminal_that_raised_it(cx: &mut TestAppContext) {
+    let Some((view, cx, notifier)) = two_shells_recording(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let (background, foreground) = (tabs[0], tabs[1]);
+    feed_session(cx, &view, background, b"\x1b]9;tests done\x07");
+    assert_eq!(notifier.shown().len(), 1);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(foreground),
+        "showing it moved nothing"
+    );
+
+    assert!(notifier.click(0), "the notification can be clicked");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(background),
+        "the click went to the terminal that raised it"
+    );
+}
+
+#[gpui::test]
+async fn a_visible_pane_that_does_not_have_the_keys_is_not_in_front(cx: &mut TestAppContext) {
+    let Some((view, cx, unfocused, focused)) = split_tab(cx) else {
+        return;
+    };
+    cx.update(|window, _app| window.activate_window());
+    cx.run_until_parked();
+    let notifier = crate::app::notify::RecordingNotifier::shared();
+    let handle: Arc<dyn crate::app::notify::Notifier> = notifier.clone();
+    cx.update(|_window, app| view.update(app, |view, _cx| view.set_notifier_for_test(handle)));
+
+    feed_session(cx, &view, focused, b"\x1b]9;typed here\x07");
+    assert!(
+        notifier.shown().is_empty(),
+        "the pane with the keys is in front"
+    );
+    feed_session(cx, &view, unfocused, b"\x1b]9;beside it\x07");
+    let shown = notifier.shown();
+    assert_eq!(shown.len(), 1, "the pane beside it is not the active pane");
+    assert_eq!(shown[0].body, "beside it");
+    assert!(
+        unread_of(cx, &view, unfocused).is_empty(),
+        "the tab marks keep treating the split tab as seen"
+    );
+}
+
+#[gpui::test]
+async fn the_notification_settings_are_switched_on_their_page_and_read_back_in_range(
+    cx: &mut TestAppContext,
+) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    click(cx, "nav.settings");
+    click(cx, "settings.category.notices");
+    click(cx, "settings.item.desktop-notify");
+    click(cx, "settings.notify.program");
+    // The steps are 5, 10, 30, 60 and 300 seconds.
+    click(cx, "settings.notify.threshold.2");
+    let settings = cx.update(|_window, app| view.read(app).workspace().notify_settings());
+    assert!(!settings.program, "the program switch turned off");
+    assert!(settings.long_command, "the other switch is untouched");
+    assert_eq!(settings.long_command_secs, 30);
+    let written = cx.update(|_window, app| view.read(app).current_preferences_for_test());
+    assert_eq!(written.notify_program, Some(false));
+    assert_eq!(written.notify_long_command, Some(true));
+    assert_eq!(written.long_command_secs, Some(30));
+
+    // A file read back: absent means on and 10 seconds, and a number outside the
+    // range is brought into it rather than used as written.
+    for (stored, expected) in [
+        (None, 10),
+        (Some(0), 1),
+        (Some(99_999), 3600),
+        (Some(45), 45),
+    ] {
+        let saved = shellune_storage::Preferences {
+            long_command_secs: stored,
+            ..Default::default()
+        };
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| {
+                view.use_saved_preferences_for_test(&saved, cx)
+            });
+        });
+        let settings = cx.update(|_window, app| view.read(app).workspace().notify_settings());
+        assert_eq!(settings.long_command_secs, expected, "stored {stored:?}");
+        assert!(
+            settings.program && settings.long_command,
+            "absent switches are on"
+        );
+    }
+    // A stored value that is none of the steps is offered as one more, selected.
+    redraw(cx);
+    assert!(cx.debug_bounds("settings.notify.threshold.5").is_some());
+}
+
+#[gpui::test]
 async fn a_bell_in_a_background_tab_marks_it_without_taking_the_screen(cx: &mut TestAppContext) {
     let Some((view, cx)) = two_shells(cx) else {
         return;

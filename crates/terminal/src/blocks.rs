@@ -830,12 +830,12 @@ impl BlockBook {
         ended_a_command
     }
 
-    /// Finished blocks, then the running one when a command has actually started.
     /// The block that ended most recently, if any is still kept.
     pub(crate) fn last_finished(&self) -> Option<&CommandBlock> {
         self.finished.last()
     }
 
+    /// Finished blocks, then the running one when a command has actually started.
     pub(crate) fn blocks(&self) -> Vec<CommandBlock> {
         let mut blocks = self.finished.clone();
         if let Some(open) = &self.open

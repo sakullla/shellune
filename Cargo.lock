@@ -6519,6 +6519,7 @@ name = "shellune"
 version = "0.4.40"
 dependencies = [
  "embed-resource",
+ "futures-channel",
  "gpui",
  "image",
  "libc",
