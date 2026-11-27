@@ -18044,8 +18044,13 @@ async fn the_dialog_shows_the_fields_of_the_chosen_sign_in_and_closes_on_escape(
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     assert!(
+        cx.debug_bounds("hosts.discard.confirm").is_some(),
+        "Escape on dirty auth selection asks to confirm discard"
+    );
+    click(cx, "hosts.discard.ok");
+    assert!(
         !cx.update(|_window, app| view.read(app).hosts_state().is_editing()),
-        "Escape closes the dialog without saving"
+        "confirming discard closes the dialog without saving"
     );
     assert!(cx.update(|_window, app| view.read(app).book().hosts().is_empty()));
 }
@@ -51117,6 +51122,11 @@ async fn vault_and_connection_modals_preserve_outer_focus_return_across_typing_v
     );
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("hosts.discard.confirm").is_some(),
+        "Escape on dirty SSH dialog prompts discard confirmation"
+    );
+    click(cx, "hosts.discard.ok");
     redraw(cx);
     assert!(
         hosts_search_focused(cx),
