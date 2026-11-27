@@ -41,6 +41,9 @@ const PENDING_EMBLEM_SIZE: f32 = 40.0;
 /// The widest the explanation on a waiting pane grows before it wraps.
 const PENDING_WORDS_MAX_WIDTH: f32 = 420.0;
 
+/// The height of the top-center hover trigger zone that reveals the focus mode exit button.
+const FOCUS_EXIT_BAR_HEIGHT: f32 = 34.0;
+
 impl ShelluneView {
     /// Reads `workspace.json` into pending panes.
     ///
@@ -882,7 +885,7 @@ impl ShelluneView {
                         .justify_center()
                         .pt(metrics.scale(spacing::HAIRLINE))
                         .px(metrics.scale(spacing::BASE))
-                        .h(metrics.scale(34.0))
+                        .h(metrics.scale(FOCUS_EXIT_BAR_HEIGHT))
                         .child(
                             div()
                                 .occlude()
