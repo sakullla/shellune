@@ -158,7 +158,9 @@ impl TransferViews {
     /// Whether this session can move files at all.
     #[must_use]
     pub fn can_transfer(&self, session: SessionId) -> bool {
-        self.channels.contains_key(&session)
+        self.channels
+            .get(&session)
+            .is_some_and(|link| link.events_open())
     }
 
     /// Every task, oldest first, for the transfers page.
@@ -173,7 +175,6 @@ impl TransferViews {
     }
 
     /// One task, by identifier.
-    #[cfg(test)]
     #[must_use]
     pub fn get(&self, id: TransferId) -> Option<&Transfer> {
         self.queue.get(id)
@@ -421,8 +422,14 @@ impl TransferViews {
         } else {
             // A task whose command never left this process must not sit in the list as
             // if a server had been asked: it is reported as what it is.
-            self.queue
-                .fail_session(session, TransferFailure::ConnectionLost);
+            let _ = self.queue.apply(&TransferEvent {
+                transfer: id,
+                update: TransferUpdate::Failed {
+                    failure: TransferFailure::ConnectionLost,
+                    residue: None,
+                    resume: None,
+                },
+            });
             Err(TransferProblem::CommandRefused)
         }
     }
@@ -562,17 +569,7 @@ impl TransferViews {
     }
 
     fn launch(&mut self, transfer: Transfer) -> Option<TransferId> {
-        let session = transfer.session();
-        let id = self.queue.add(transfer.clone());
-        if !self.dispatch(
-            session,
-            TransferCommand::Start(TransferRequest::for_transfer(&transfer)),
-        ) {
-            self.queue
-                .fail_session(session, TransferFailure::ConnectionLost);
-            return None;
-        }
-        Some(id)
+        self.start(transfer.session(), transfer).ok()
     }
 
     /// Applies every event that arrived, returning whether anything changed.

@@ -22,6 +22,31 @@ pub enum Locale {
     Chinese,
 }
 
+/// A transfer rejection can include the server's own diagnostic in either language.
+pub fn transfer_failure_reason(failure: &shellune_core::TransferFailure, locale: Locale) -> String {
+    use shellune_core::{ResumeRefusal, TransferFailure};
+    let strings = locale.strings();
+    match failure {
+        TransferFailure::ResumeRefused { reason } => match reason {
+            ResumeRefusal::SourceChanged => strings.transfers_resume_source,
+            ResumeRefusal::Unverifiable => strings.transfers_resume_unverifiable,
+            ResumeRefusal::Unsupported => strings.transfers_resume_unsupported,
+            ResumeRefusal::PartialDamaged => strings.transfers_resume_damaged,
+        },
+        _ if locale == Locale::English => return failure.to_string(),
+        TransferFailure::SourceUnreadable => "无法读取源文件",
+        TransferFailure::NotFound => "目标路径不存在",
+        TransferFailure::PermissionDenied => "服务器拒绝了此操作",
+        TransferFailure::NoSpace => "服务器的存储空间不足",
+        TransferFailure::ConnectionLost => "传输时连接已中断",
+        TransferFailure::OverwriteNotConfirmed => "目标已存在，尚未确认覆盖",
+        TransferFailure::FinalizeFailed => "无法替换目标，请检查目标文件",
+        TransferFailure::DestinationUnwritable => "无法写入本地目标",
+        TransferFailure::Refused { reason } => return format!("服务器拒绝传输：{reason}"),
+    }
+    .to_owned()
+}
+
 impl Locale {
     /// Both languages, in display order.
     pub const ALL: [Self; 2] = [Self::English, Self::Chinese];
@@ -825,6 +850,10 @@ pub struct Strings {
     pub transfers_close_app_confirm: &'static str,
     /// Label before the host a transfer belongs to.
     pub transfers_host: &'static str,
+    pub transfer_details: &'static str,
+    pub transfer_source: &'static str,
+    pub transfer_destination: &'static str,
+    pub transfer_checkpoint: &'static str,
     /// Placeholder of the palette's search field.
     pub palette_placeholder: &'static str,
     /// Shown when nothing in the palette matches.
@@ -1637,6 +1666,10 @@ pub static ENGLISH: Strings = Strings {
     transfers_close_app_cancel: "Keep working",
     transfers_close_app_confirm: "Close and stop them",
     transfers_host: "Host",
+    transfer_details: "Transfer details",
+    transfer_source: "From",
+    transfer_destination: "To",
+    transfer_checkpoint: "Confirmed offset",
     palette_placeholder: "Search sessions, shells, hosts and actions",
     palette_empty: "Nothing matches",
     palette_group_sessions: "Open sessions",
@@ -2229,6 +2262,10 @@ pub static CHINESE: Strings = Strings {
     transfers_close_app_cancel: "继续工作",
     transfers_close_app_confirm: "关闭并停止",
     transfers_host: "主机",
+    transfer_details: "传输详情",
+    transfer_source: "来源",
+    transfer_destination: "目标",
+    transfer_checkpoint: "已确认的断点位置",
     palette_placeholder: "搜索会话、Shell、主机与操作",
     palette_empty: "没有匹配的结果",
     palette_group_sessions: "已打开的会话",

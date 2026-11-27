@@ -109,6 +109,7 @@ mod startup;
 mod sync;
 mod titlebar;
 mod toasts;
+mod transfer_details;
 mod update;
 
 // The steps a desktop pane reports, for the tests that check the tab, the session
@@ -473,6 +474,8 @@ const FILES_SHORT_VIEWPORT_HEIGHT: f32 = 560.0;
 const FILES_TRANSFER_CAP_SHARE: f32 = 0.42;
 /// Maximum share of viewport height the transfer strip may claim in a short single-column window.
 const FILES_SHORT_TRANSFER_CAP_SHARE: f32 = 0.34;
+/// An explicitly expanded route can use more room while the file columns remain accessible.
+const FILES_TRANSFER_DETAILS_CAP_SHARE: f32 = 0.58;
 
 /// How many placeholder rows a column draws while its listing is on the way.
 const FILES_LOADING_ROWS: usize = 3;
@@ -961,6 +964,7 @@ pub struct ShelluneView {
     /// Focus and scroll of the transfer strip, so a failure under the first screen is
     /// reached with Page Up/Down rather than only with the wheel (R4).
     files_transfer_focus: FocusHandle,
+    transfer_inspection: transfer_details::Inspection,
     transfers_scroll: gpui::ScrollHandle,
     /// Focus and scroll of an X11 failure notice that is taller than its box (R4, R11).
     x11_notice_focus: FocusHandle,
@@ -2381,10 +2385,15 @@ impl ShelluneView {
         } else {
             ("/home/deploy/项目 发布/2026-11 版本", FILES)
         };
+        let Some(session) = self.workspace.session(id) else {
+            return;
+        };
+        let name = session.title().to_owned();
+        let endpoint = self.target_of(session);
         self.files.attach(
             id,
-            "prod-web",
-            "deploy@10.0.0.12:22",
+            name,
+            endpoint,
             Self::capture_browse(remote_root, remote_entries),
         );
         self.files
@@ -3044,6 +3053,7 @@ impl ShelluneView {
         // the data; both are read once while the store is still borrowed.
         let data_root = store.root().to_path_buf();
 
+        let transfers_scroll = gpui::ScrollHandle::new();
         let mut view = Self {
             workspace,
             root_focus: cx.focus_handle(),
@@ -3244,7 +3254,8 @@ impl ShelluneView {
             files_follow_focus: cx.focus_handle(),
             files_close_focus: cx.focus_handle(),
             files_transfer_focus: cx.focus_handle(),
-            transfers_scroll: gpui::ScrollHandle::new(),
+            transfer_inspection: transfer_details::Inspection::new(cx, transfers_scroll.clone()),
+            transfers_scroll,
             x11_notice_focus: cx.focus_handle(),
             x11_notice_scroll: gpui::ScrollHandle::new(),
             files_field_focus: false,
@@ -7454,6 +7465,7 @@ impl ShelluneView {
     /// reported is queued on both, and a completed one is never shown as running.
     fn sync_transfer_section(&mut self) {
         let items = self.transfers.transfers().to_vec();
+        self.transfer_inspection.sync(&items, &self.workspace);
         self.workspace.replace_transfers(items);
     }
 
@@ -15485,6 +15497,7 @@ impl ShelluneView {
     /// Whether `handle` belongs to a persistent overlay/modal control rather than page content.
     pub(super) fn is_overlay_internal_focus(&self, handle: &FocusHandle, cx: &gpui::App) -> bool {
         handle == &self.snippet_focus
+            || handle == &self.transfer_inspection.center_focus
             || handle == &self.paste_focus
             || self
                 .paste_editor
@@ -15640,6 +15653,11 @@ impl ShelluneView {
         }
         if self.tool == Some(shell::Tool::Snippets) {
             return self.snippet_focus.clone();
+        }
+        if self.tool == Some(shell::Tool::Transfers)
+            && self.workspace.state(Destination::Transfers) == SectionState::Populated
+        {
+            return self.transfer_inspection.center_focus.clone();
         }
         if self.tool.is_some() {
             return self.root_focus.clone();
@@ -15818,8 +15836,13 @@ impl ShelluneView {
                 ) || self.batch.view().is_open()
                     || self.import.is_open())
             {
-                let root = self.root_focus.clone();
-                window.focus(&root);
+                if self.tool == Some(shell::Tool::Transfers)
+                    && self.workspace.state(Destination::Transfers) == SectionState::Populated
+                {
+                    window.focus(&self.transfer_inspection.center_focus);
+                } else {
+                    window.focus(&self.root_focus);
+                }
             }
         }
     }
@@ -16173,6 +16196,10 @@ impl ShelluneView {
             cx.notify();
             return true;
         }
+        if self.tool == Some(shell::Tool::Transfers) && self.close_transfer_detail(None, window, cx)
+        {
+            return true;
+        }
         if self.tool.is_some() {
             self.tool = None;
             self.remember_tool_focus_pending = false;
@@ -16217,6 +16244,11 @@ impl ShelluneView {
         // A focused non-empty filter inside the file view clears its own phrase first
         // before Escape closes the whole file view.
         if let Some(id) = self.active.filter(|id| self.files.is_open(*id)) {
+            if self.files_transfer_focus.is_focused(window)
+                && self.close_transfer_detail(Some(id), window, cx)
+            {
+                return true;
+            }
             for source in [FileSource::Remote, FileSource::Local] {
                 if let Some(field) = self.files_filter_fields.get(&(id, source)).cloned()
                     && field.read(cx).focus_handle().is_focused(window)
@@ -17323,7 +17355,9 @@ impl ShelluneView {
         // above its first line, and at 720×480 with 200% text that cut the title
         // and the count flat (R4).
         let transfers = self.transfers_strip_shown(id).then(|| {
-            let cap_share = if compact {
+            let cap_share = if self.inspected_transfer(Some(id)).is_some() {
+                FILES_TRANSFER_DETAILS_CAP_SHARE
+            } else if compact {
                 FILES_SHORT_TRANSFER_CAP_SHARE
             } else {
                 FILES_TRANSFER_CAP_SHARE
@@ -17379,6 +17413,10 @@ impl ShelluneView {
                         .debug_selector(|| "files.transfers.scroll".to_owned())
                         .child(self.transfers_panel(id, cx)),
                 )
+                .child(crate::app::scrollbar::bar(
+                    "files.transfers.scrollbar",
+                    scroll,
+                ))
         });
 
         div()
@@ -19383,7 +19421,9 @@ impl ShelluneView {
                 self.files_set_follow(id, next, cx);
                 self.files_focus_stop(source, stop, window, cx);
             }
-            FilesStop::Transfers => self.transfer_keyboard_recover(id, cx),
+            FilesStop::Transfers => {
+                self.transfer_list_key(Some(id), "enter", false, window, cx);
+            }
             FilesStop::Close => {
                 // The same switch the pointer presses: the terminal is where this session
                 // came from, and it takes the keyboard back (R4). A view that is already
@@ -19446,6 +19486,13 @@ impl ShelluneView {
     ) -> bool {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
+        if !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+            && self.transfer_list_key(Some(id), key, modifiers.shift, window, cx)
+        {
+            return true;
+        }
         if key == "tab" && !modifiers.control && !modifiers.alt && !modifiers.platform {
             let delta = if modifiers.shift { -1 } else { 1 };
             self.files_step_stop(id, delta, window, cx);
@@ -19459,45 +19506,7 @@ impl ShelluneView {
             cx.notify();
             return true;
         }
-        if matches!(key, "enter" | "space") {
-            self.transfer_keyboard_recover(id, cx);
-            return true;
-        }
         false
-    }
-
-    /// The recovery a keyboard user gets from the transfer strip.
-    ///
-    /// A failed or cancelled task is retried (or restarted, when that is what its row
-    /// offers). Otherwise an active task is cancelled. The buttons on the row call the
-    /// same two paths.
-    fn transfer_keyboard_recover(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        let tasks: Vec<Transfer> = self.transfers.for_session(id).cloned().collect();
-        if let Some(task) = tasks.iter().find(|task| {
-            matches!(
-                task.state(),
-                shellune_core::TransferState::Failed { .. }
-                    | shellune_core::TransferState::Cancelled { .. }
-            )
-        }) {
-            let resumable = task.resume_hint().is_some();
-            let refused = matches!(
-                task.state().failure(),
-                Some(shellune_core::TransferFailure::ResumeRefused { .. })
-            );
-            if resumable || refused {
-                self.transfer_restart(task.id(), cx);
-            } else {
-                self.transfer_retry(task.id(), cx);
-            }
-            return;
-        }
-        if let Some(task) = tasks
-            .iter()
-            .find(|task| task.is_active() && !task.state().is_awaiting_overwrite())
-        {
-            self.transfer_cancel(task.id(), cx);
-        }
     }
 
     /// Page Up/Down, Home and End, and the arrow keys, while the X11 notice has the
@@ -20578,7 +20587,7 @@ impl ShelluneView {
                 move |view, cx| view.cancel_all_transfers(id, cx),
             ));
         }
-        if failed > 0 {
+        if failed > 0 && self.transfers.can_transfer(id) {
             actions = actions.child(self.text_button(
                 SharedString::from("transfers.retry_failed"),
                 ux.transfers_retry_failed,
@@ -20944,17 +20953,7 @@ impl ShelluneView {
 
     /// Why a transfer failed, in the interface language when the reason is a resume refusal.
     fn transfer_failure_text(&self, failure: &shellune_core::TransferFailure) -> String {
-        let strings = self.strings();
-        match failure {
-            shellune_core::TransferFailure::ResumeRefused { reason } => match reason {
-                shellune_core::ResumeRefusal::SourceChanged => strings.transfers_resume_source,
-                shellune_core::ResumeRefusal::Unverifiable => strings.transfers_resume_unverifiable,
-                shellune_core::ResumeRefusal::Unsupported => strings.transfers_resume_unsupported,
-                shellune_core::ResumeRefusal::PartialDamaged => strings.transfers_resume_damaged,
-            }
-            .to_owned(),
-            other => other.to_string(),
-        }
+        copy::transfer_failure_reason(failure, self.workspace.locale())
     }
 
     fn transfer_host_label(&self, task: &Transfer) -> String {
@@ -20962,11 +20961,16 @@ impl ShelluneView {
             .session(task.session())
             .map(|session| session.title().to_owned())
             .filter(|title| !title.is_empty())
-            .unwrap_or_else(|| "—".to_owned())
+            .or_else(|| {
+                self.transfer_inspection
+                    .host_names
+                    .get(&task.session())
+                    .cloned()
+            })
+            .unwrap_or_else(|| task.session().to_string())
     }
 
-    /// Cancel, resume and start-over for one task. The same actions serve the file
-    /// view and the transfer center, so a task can be reached after the files close.
+    /// Operations available while a task is still active.
     fn transfer_actions(
         &self,
         mut actions: Div,
@@ -20978,22 +20982,9 @@ impl ShelluneView {
     ) -> Div {
         let strings = self.strings();
         let id = task.id();
-        // The checkpoint the task may really continue, which is what a resume button
-        // promises. A protocol without resume answers nothing here even when a record
-        // from elsewhere still names an offset, so SCP never offers such an entry.
-        let resumable = task.resume_hint().is_some();
-        let refused = matches!(
-            task.state().failure(),
-            Some(shellune_core::TransferFailure::ResumeRefused { .. })
-        );
         if task.is_active() && !task.state().is_awaiting_overwrite() {
-            actions = actions.child(self.text_button(
-                SharedString::from(format!("{prefix}.cancel.{index}")),
-                strings.transfers_cancel,
-                Variant::Ghost,
-                cx,
-                move |view, cx| view.transfer_cancel(id, cx),
-            ));
+            let scope = (!include_overwrite).then_some(task.session());
+            actions = actions.child(self.transfer_cancel_button(scope, prefix, index, task, cx));
         }
         if include_overwrite && task.state().is_awaiting_overwrite() {
             let ux = copy::ux();
@@ -21051,50 +21042,6 @@ impl ShelluneView {
                     ))
                 });
         }
-        if resumable {
-            actions = actions.child(self.text_button(
-                SharedString::from(format!("{prefix}.resume.{index}")),
-                strings.transfers_resume,
-                Variant::Secondary,
-                cx,
-                move |view, cx| view.transfer_retry(id, cx),
-            ));
-        }
-        if matches!(
-            task.state(),
-            shellune_core::TransferState::Failed { .. }
-                | shellune_core::TransferState::Cancelled { .. }
-        ) {
-            // A checkpoint uses Resume above. Transfer again is the explicit restart
-            // from the first byte. A failure with nothing to resume keeps the Retry id
-            // the file view already had.
-            let (name, label, restart) = if resumable || refused {
-                (
-                    format!("{prefix}.restart.{index}"),
-                    strings.transfers_restart,
-                    true,
-                )
-            } else {
-                (
-                    format!("{prefix}.retry.{index}"),
-                    strings.transfers_retry,
-                    false,
-                )
-            };
-            actions = actions.child(self.text_button(
-                SharedString::from(name),
-                label,
-                Variant::Secondary,
-                cx,
-                move |view, cx| {
-                    if restart {
-                        view.transfer_restart(id, cx);
-                    } else {
-                        view.transfer_retry(id, cx);
-                    }
-                },
-            ));
-        }
         actions
     }
 
@@ -21105,6 +21052,9 @@ impl ShelluneView {
         task: &Transfer,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        if transfer_details::inspectable(task) {
+            return self.failed_transfer_row(Some(task.session()), index, task, cx);
+        }
         let metrics = self.metrics();
         let strings = self.strings();
         let tone = Tone::for_transfer_state(task.state());
@@ -23981,7 +23931,26 @@ impl ShelluneView {
                     .child(self.transfer_row(index, transfer, cx)),
             );
         }
-        list
+        div().child(
+            list.id("transfer-center-list")
+                .track_focus(&self.transfer_inspection.center_focus)
+                .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                    let modifiers = event.keystroke.modifiers;
+                    if !modifiers.control
+                        && !modifiers.alt
+                        && !modifiers.platform
+                        && view.transfer_list_key(
+                            None,
+                            event.keystroke.key.as_str(),
+                            modifiers.shift,
+                            window,
+                            cx,
+                        )
+                    {
+                        cx.stop_propagation();
+                    }
+                })),
+        )
     }
 
     /// One session in a list: what it is on the left, its state and `actions` on the
@@ -24055,6 +24024,9 @@ impl ShelluneView {
     }
 
     fn transfer_row(&self, index: usize, transfer: &Transfer, cx: &mut Context<Self>) -> Div {
+        if transfer_details::inspectable(transfer) {
+            return div().child(self.failed_transfer_row(None, index, transfer, cx));
+        }
         let metrics = self.metrics();
         let strings = self.strings();
         let locale = self.workspace.locale();

@@ -204,6 +204,10 @@ impl Scenario {
     /// The narrow home and side-by-side file views need a particular layout.
     pub fn variant(&self, mut variant: Variant) -> Variant {
         (variant.width, variant.height) = match self.id {
+            "home-no-match-narrow" | "transfers-failed-details" | "settings-item-search" => {
+                variant.zoom = Zoom::Comfortable;
+                (720.0, 480.0)
+            }
             "home-narrow" => (860.0, 640.0),
             "files-split" => (1680.0, 940.0),
             _ => crate::app::DEFAULT_WINDOW_SIZE,
@@ -3273,6 +3277,17 @@ pub const SCENARIOS: &[Scenario] = &[
         ready: no_match_ready,
     },
     Scenario {
+        id: "home-no-match-narrow",
+        title: "主机 · 窄窗清除搜索条件",
+        category: Category::Home,
+        fixture: "a populated host book with no matches, at 115% text size",
+        evidence: "shows the active search and the actions available when no host matches",
+        start: || page(Destination::Hosts),
+        prepare: seed_home,
+        install: show_no_match,
+        ready: no_match_ready,
+    },
+    Scenario {
         id: "hosts-read-failed",
         title: "主机 · 主机文件读不出来",
         category: Category::Home,
@@ -3716,6 +3731,25 @@ pub const SCENARIOS: &[Scenario] = &[
         ready: failed_transfer_ready,
     },
     Scenario {
+        id: "transfers-failed-details",
+        title: "传输 · 失败任务详情",
+        category: Category::Overlay,
+        fixture: "one disconnected transfer with a saved checkpoint and full paths",
+        evidence: "shows the expanded failed task in the session strip at 115% text size",
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: |view, window, cx| {
+            show_failed_transfer(view, window, cx)?;
+            let id = view.active_session().ok_or("missing transfer session")?;
+            if view.capture_failed_transfer_details(id, window, cx) {
+                Ok(())
+            } else {
+                Err("failed transfer details did not open".into())
+            }
+        },
+        ready: failed_transfer_ready,
+    },
+    Scenario {
         id: "forwards-empty",
         title: "转发 · 尚未保存规则",
         category: Category::Overlay,
@@ -3778,6 +3812,26 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: nothing,
         install: no_state,
         ready: settings_ready,
+    },
+    Scenario {
+        id: "settings-item-search",
+        title: "设置 · 跨分类查找字号",
+        category: Category::Settings,
+        fixture: "a font query in the current interface language at 115% text size",
+        evidence: "shows both interface and terminal font settings in the live results",
+        start: || page(Destination::Settings),
+        prepare: nothing,
+        install: |view, window, cx| {
+            view.capture_settings_item_search(window, cx);
+            Ok(())
+        },
+        ready: |view, cx| {
+            if view.capture_settings_font_results_ready(cx) {
+                Ok(())
+            } else {
+                Err("the search has not returned both font settings".into())
+            }
+        },
     },
     Scenario {
         id: "settings-connection",

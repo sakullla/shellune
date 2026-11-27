@@ -2206,7 +2206,7 @@ impl ShelluneView {
                             |this, cx| this.clear_finished_transfers(None, cx),
                         ))
                 });
-                Some(self.modal(
+                Some(self.modal_with(
                     window,
                     "transfers.dialog",
                     680.0,
@@ -2215,6 +2215,10 @@ impl ShelluneView {
                         subtitle,
                         body,
                         footer,
+                    },
+                    ModalBehaviour {
+                        scroll: Some(self.transfer_inspection.center_scroll.clone()),
+                        ..ModalBehaviour::default()
                     },
                 ))
             }

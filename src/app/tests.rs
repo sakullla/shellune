@@ -11237,8 +11237,17 @@ fn live_remote_second(
     view: &Entity<ShelluneView>,
     known: SessionId,
 ) -> SessionId {
+    live_remote_other(cx, view, known, "hosts.connect.0")
+}
+
+fn live_remote_other(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    known: SessionId,
+    selector: &'static str,
+) -> SessionId {
     click(cx, "nav.hosts");
-    click(cx, "hosts.connect.0");
+    click(cx, selector);
     cx.update(|_window, app| {
         view.update(app, |view, cx| {
             view.script_remote_attempt(
@@ -14882,6 +14891,159 @@ async fn resume_carries_the_checkpoint_and_transfer_again_drops_it(cx: &mut Test
     );
     assert_ne!(starts.last().map(|request| request.transfer), Some(task));
     assert_ne!(starts.last().map(|request| request.transfer), Some(resumed));
+}
+
+#[gpui::test]
+async fn workspace_ux_transfer_keyboard_recovers_only_the_inspected_task(cx: &mut TestAppContext) {
+    let dir = TempDir::new("transfer-targets");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("east", "10.0.0.1", 22, "build", None),
+            stored_host("west", "10.0.0.2", 22, "build", None),
+        ],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    let first = live_remote(cx, &view);
+    let (_, first_link) = open_transfers(cx, &view, first);
+    let start = |cx: &mut VisualTestContext, path: &str| {
+        click(cx, "files.upload");
+        cx.update(|_, app| {
+            view.update(app, |view, cx| {
+                view.files_question_set_text_for_test(path);
+                view.submit_files_change_for_test(cx);
+            })
+        });
+        cx.run_until_parked();
+    };
+    start(cx, "C:/first/report.txt");
+    let failed = first_link.starts()[0].transfer;
+    first_link.push(shellune_core::TransferEvent {
+        transfer: failed,
+        update: shellune_core::TransferUpdate::Failed {
+            failure: shellune_core::TransferFailure::NotFound,
+            residue: None,
+            resume: None,
+        },
+    });
+    pump_files(cx, &view);
+    let second = live_remote_other(cx, &view, first, "hosts.connect.1");
+    let (_, second_link) = open_transfers(cx, &view, second);
+    start(cx, "C:/第二个目录/路径很长的发布目录/report.txt");
+    let selected = second_link.starts()[0].transfer;
+    let hint = shellune_core::ResumeHint {
+        partial: "/远程目录/report.part".into(),
+        record: "/恢复记录".into(),
+        offset: 2049,
+        generation: 1,
+    };
+    second_link.push(shellune_core::TransferEvent {
+        transfer: selected,
+        update: shellune_core::TransferUpdate::Failed {
+            failure: shellune_core::TransferFailure::NoSpace,
+            residue: Some(hint.partial.clone()),
+            resume: Some(hint.clone()),
+        },
+    });
+    pump_files(cx, &view);
+    // The session strip opens a single stable task; Enter alone never starts it.
+    let titles = cx.update(|_, app| {
+        [first, second].map(|id| {
+            view.read(app)
+                .workspace()
+                .session(id)
+                .unwrap()
+                .title()
+                .to_owned()
+        })
+    });
+    assert_ne!(titles[0], titles[1]);
+    cx.update(|window, app| view.read(app).focus_transfer_strip_for_test(window));
+    press_key(cx, "enter");
+    assert!(cx.debug_bounds("transfers.paths.0").is_some());
+    assert_eq!(second_link.starts().len(), 1);
+    press_key(cx, "escape");
+    assert_eq!(
+        cx.update(|_, app| view.read(app).inspected_transfer(Some(second))),
+        None
+    );
+    assert!(cx.update(|_, app| view.read(app).files_visible(second)));
+
+    click(cx, "files.close");
+    go(cx, crate::app::actions::GoToTransfers);
+    cx.simulate_resize(narrow_window());
+    press_key(cx, "down");
+    press_key(cx, "down");
+    press_key(cx, "enter");
+    assert_eq!(
+        cx.update(|_, app| view.read(app).inspected_transfer(None)),
+        Some(selected)
+    );
+    assert!(cx.debug_bounds("transfers.center.paths.1").is_some());
+    press_key(cx, "tab");
+    press_key(cx, "enter");
+    assert_eq!(first_link.starts().len(), 1);
+    let requests = second_link.starts();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].resume.as_ref(), Some(&hint));
+    assert_eq!(requests[1].source, requests[0].source);
+    assert!(
+        cx.update(|window, app| view.read(app).transfer_list_focused_for_test(None, window)),
+        "the global list keeps focus after dispatch"
+    );
+    press_key(cx, "escape");
+    assert_eq!(
+        cx.update(|_, app| view.read(app).inspected_transfer(None)),
+        None
+    );
+    press_key(cx, "enter");
+    assert!(
+        cx.debug_bounds("transfers.center.paths.1").is_some(),
+        "closing retained the selected task"
+    );
+    press_key(cx, "up");
+    press_key(cx, "enter");
+    press_key(cx, "tab");
+    // The action was available when drawn, but the channel now refuses the command.
+    first_link.0.lock().unwrap().accepting = false;
+    press_key(cx, "enter");
+    assert_eq!(first_link.starts().len(), 2);
+    assert!(first_link.starts().last().unwrap().resume.is_none());
+    let tasks = cx.update(|_, app| view.read(app).transfer_tasks());
+    assert!(matches!(
+        tasks.last().unwrap().state(),
+        shellune_core::TransferState::Failed { .. }
+    ));
+    assert!(
+        tasks
+            .iter()
+            .any(|t| t.id() == requests[1].transfer && t.is_active())
+    );
+    cx.update(|_, app| view.update(app, |v, cx| v.close_session(first, cx)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("transfers.center.offline.0").is_some());
+    assert!(cx.update(|_, app| {
+        view.read(app)
+            .transfer_center_text_for_test(failed)
+            .unwrap()
+            .contains(&titles[0])
+    }));
+    let before = first_link.commands().len();
+    press_key(cx, "enter");
+    assert_eq!(first_link.commands().len(), before);
+
+    // A disappearing selection never transfers its pending action to its neighbour.
+    cx.update(|_, app| view.update(app, |v, cx| v.clear_finished_transfers(Some(first), cx)));
+    cx.run_until_parked();
+    press_key(cx, "enter");
+    assert_eq!(second_link.starts().len(), 2);
+    assert!(second_link.cancels().is_empty());
+    assert!(cx.debug_bounds("transfers.center.paths.0").is_some());
+    press_key(cx, "down");
+    press_key(cx, "enter");
+    assert!(second_link.cancels().is_empty());
+    press_key(cx, "enter");
+    assert_eq!(second_link.cancels(), vec![requests[1].transfer]);
 }
 
 #[gpui::test]
