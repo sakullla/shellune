@@ -24,6 +24,9 @@ use crate::app::terminal;
 use crate::app::theme::{self, Motion, Zoom, palette, radius, spacing};
 use crate::app::workspace::{AttentionKind, NotifyKind};
 
+mod search;
+use search::SettingsSearch;
+
 /// Width below which the navigation column and the page no longer fit side by side, in
 /// logical pixels before the text scale is applied (R8).
 const TWO_COLUMN_WIDTH: f32 = 780.0;
@@ -359,6 +362,9 @@ impl Item {
 /// user was on rather than its first one again (R16). The scope filter belongs to the
 /// page rather than to the keymap: it narrows what is listed and changes no binding.
 pub(super) struct SettingsNav {
+    search: Option<SettingsSearch>,
+    control_focus: Option<(&'static str, gpui::FocusHandle)>,
+    consume_search_enter_release: bool,
     category: Category,
     item: [usize; 9],
     scope: Option<keymap::Context>,
@@ -374,6 +380,9 @@ impl SettingsNav {
     /// The page a fresh window opens on: the appearance category, its first item.
     pub(super) fn new() -> Self {
         Self {
+            search: None,
+            control_focus: None,
+            consume_search_enter_release: false,
             category: Category::Appearance,
             item: [0; 9],
             scope: None,
@@ -502,6 +511,7 @@ impl ShelluneView {
             self.settings_scroll.clone(),
         ));
         let page = div()
+            .relative()
             .flex()
             .flex_col()
             .flex_1()
@@ -512,12 +522,22 @@ impl ShelluneView {
             .mx_auto()
             .px(metrics.scale(spacing::LOOSE))
             .debug_selector(|| "settings".to_owned())
-            .child(body);
+            .child(body)
+            .children(self.settings_search_results(cx));
 
         div()
             .id("content.scroll")
             .debug_selector(|| "content".to_owned())
             .track_focus(self.destination_focus(Destination::Settings))
+            .capture_key_down(cx.listener(Self::settings_search_key))
+            .capture_key_up(cx.listener(|this, event: &gpui::KeyUpEvent, window, cx| {
+                if event.keystroke.key == "enter"
+                    && std::mem::take(&mut this.settings_nav.consume_search_enter_release)
+                {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 this.settings_page_key(event, window, cx);
             }))
@@ -807,7 +827,8 @@ impl ShelluneView {
             .w(metrics.scale(NAV_WIDTH))
             .min_w_0()
             .gap(metrics.scale(spacing::HALF))
-            .debug_selector(|| "settings.nav".to_owned());
+            .debug_selector(|| "settings.nav".to_owned())
+            .child(self.settings_search_button(cx));
         // The mark follows what is on screen, so scrolling the page moves it.
         let in_view = self.settings_category_in_view();
         for category in Category::ALL {
@@ -922,7 +943,8 @@ impl ShelluneView {
             .w_full()
             .min_w_0()
             .gap(metrics.scale(spacing::HAIRLINE))
-            .debug_selector(|| "settings.picker.category".to_owned());
+            .debug_selector(|| "settings.picker.category".to_owned())
+            .child(self.settings_search_button(cx));
         for candidate in Category::ALL {
             let selector = format!("settings.category.{}", candidate.id());
             let reserved = components::segment_reserved_width(candidate.label(locale), metrics);
@@ -1024,6 +1046,31 @@ impl ShelluneView {
                         .text_color(theme::swatch(palette::TEXT_SECONDARY))
                         .debug_selector(|| "settings.paths".to_owned()),
                     self.store.path().display().to_string(),
+                )
+                .id("settings.paths.focus")
+                .when_some(
+                    self.settings_target_focus("settings.paths"),
+                    |control, focus| {
+                        control
+                            .track_focus(&focus)
+                            .focus(super::files_focus_ring)
+                            .on_key_down(cx.listener(
+                                |view, event: &gpui::KeyDownEvent, window, cx| {
+                                    if matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                        && !event.keystroke.modifiers.modified()
+                                    {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            view.store.path().display().to_string(),
+                                        ));
+                                        window.dispatch_action(
+                                            Box::new(crate::app::actions::ShowCopied),
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
+                                    }
+                                },
+                            ))
+                    },
                 )
                 .child(SharedString::from(super::home_relative(
                     &self.store.path().display().to_string(),
@@ -1134,6 +1181,10 @@ impl ShelluneView {
                     self.metrics(),
                 )
                 .id("settings.import")
+                .when_some(
+                    self.settings_target_focus("settings.import"),
+                    |button, focus| button.track_focus(&focus).focus(super::files_focus_ring),
+                )
                 .debug_selector(|| "settings.import".to_owned())
                 .on_click(cx.listener(|this, _event, window, cx| {
                     this.select(Destination::Hosts, window, cx);
@@ -1153,6 +1204,10 @@ impl ShelluneView {
                     self.metrics(),
                 )
                 .id("settings.backup.export")
+                .when_some(
+                    self.settings_target_focus("settings.backup.export"),
+                    |button, focus| button.track_focus(&focus).focus(super::files_focus_ring),
+                )
                 .debug_selector(|| "settings.backup.export".to_owned())
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.open_backup_export(cx);
@@ -1169,6 +1224,10 @@ impl ShelluneView {
                     self.metrics(),
                 )
                 .id("settings.backup.import")
+                .when_some(
+                    self.settings_target_focus("settings.backup.import"),
+                    |button, focus| button.track_focus(&focus).focus(super::files_focus_ring),
+                )
                 .debug_selector(|| "settings.backup.import".to_owned())
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.choose_backup_import(cx);
@@ -1360,6 +1419,31 @@ impl ShelluneView {
             .child(
                 components::icon_button("A+", metrics)
                     .id("settings.font.more")
+                    .when_some(
+                        self.settings_target_focus("settings.font.more"),
+                        |button, focus| {
+                            button
+                                .track_focus(&focus)
+                                .focus(super::files_focus_ring)
+                                .on_key_down(cx.listener(
+                                    |view, event: &gpui::KeyDownEvent, _, cx| {
+                                        if event.keystroke.modifiers.modified() {
+                                            return;
+                                        }
+                                        let step = match event.keystroke.key.as_str() {
+                                            "left" | "down" => -1.0,
+                                            "right" | "up" => 1.0,
+                                            _ => return,
+                                        };
+                                        view.set_terminal_font_size(
+                                            view.workspace.local_font_size() + step,
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
+                                    },
+                                ))
+                        },
+                    )
                     .debug_selector(|| "settings.font.more".to_owned())
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.set_terminal_font_size(this.workspace.local_font_size() + 1.0, cx);
@@ -1642,6 +1726,11 @@ impl ShelluneView {
                 .text_size(metrics.label_size())
                 .text_color(theme::swatch(palette::TEXT_SECONDARY))
                 .debug_selector(|| "status.version".to_owned())
+                .id("settings.version.focus")
+                .when_some(
+                    self.settings_target_focus("status.version"),
+                    |value, focus| value.track_focus(&focus).focus(super::files_focus_ring),
+                )
                 .child(SharedString::from(version)),
         )
     }

@@ -1297,6 +1297,11 @@ impl ShelluneView {
                         metrics,
                     )
                     .id("security.locked.unlock")
+                    .when_some(
+                        self.settings_target_focus("security.locked.unlock")
+                            .filter(|_| !in_home),
+                        |button, focus| button.track_focus(&focus).focus(super::files_focus_ring),
+                    )
                     .debug_selector(|| "security.locked.unlock".to_owned())
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.security_begin(Vec::new(), cx);
@@ -5891,6 +5896,10 @@ impl ShelluneView {
     /// Focus handle of the vault search input.
     pub(crate) fn security_search_focus(&self, cx: &App) -> gpui::FocusHandle {
         self.security.search.read(cx).focus_handle().clone()
+    }
+
+    pub(super) fn settings_trust_field_focus(&self, cx: &App) -> gpui::FocusHandle {
+        self.security.trust_search.read(cx).focus_handle().clone()
     }
 
     /// Starts a vault search with a letter typed on the list, and gives the search the

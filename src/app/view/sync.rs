@@ -1816,6 +1816,10 @@ impl ShelluneView {
         )
     }
 
+    pub(super) fn settings_sync_url_focus(&self, cx: &gpui::App) -> gpui::FocusHandle {
+        self.sync.url.read(cx).focus_handle().clone()
+    }
+
     /// The sync page: the server, the switches, the actions and the status (R7, R8).
     pub(super) fn sync_settings_page(&self, cx: &mut Context<Self>) -> Div {
         let strings = self.sync_strings();

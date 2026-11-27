@@ -1281,6 +1281,7 @@ impl ShelluneView {
         let mut control = components::segmented(metrics)
             .min_w(floor.min(components::settings_row_content_cap(metrics)))
             .debug_selector(move || id.to_owned());
+        let count = options.len();
         for (index, (label, selected)) in options.into_iter().enumerate() {
             let pick = pick.clone();
             let reserved = components::segment_reserved_width(&label, metrics);
@@ -1294,6 +1295,29 @@ impl ShelluneView {
                     .min_h(metrics.compact_control_height())
                     .id(SharedString::from(format!("{id}.{index}")))
                     .debug_selector(move || format!("{id}.{index}"))
+                    .when_some(
+                        self.settings_target_focus(id).filter(|_| selected),
+                        |button, focus| {
+                            let pick = pick.clone();
+                            button
+                                .track_focus(&focus)
+                                .focus(files_focus_ring)
+                                .on_key_down(cx.listener(
+                                    move |view, event: &KeyDownEvent, _, cx| {
+                                        if event.keystroke.modifiers.modified() {
+                                            return;
+                                        }
+                                        let next = match event.keystroke.key.as_str() {
+                                            "left" => index.saturating_sub(1),
+                                            "right" => (index + 1).min(count - 1),
+                                            _ => return,
+                                        };
+                                        pick(view, next, cx);
+                                        cx.stop_propagation();
+                                    },
+                                ))
+                        },
+                    )
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         pick(this, index, cx);
                     })),
@@ -1324,6 +1348,9 @@ impl ShelluneView {
         )
         .id(id)
         .debug_selector(move || id.to_owned())
+        .when_some(self.settings_target_focus(id), |button, focus| {
+            button.track_focus(&focus).focus(files_focus_ring)
+        })
         .on_click(cx.listener(move |this, _event, _window, cx| {
             set(this, !on, cx);
         }))
