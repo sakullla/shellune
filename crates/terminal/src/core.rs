@@ -225,6 +225,53 @@ pub struct RenderedRow {
     pub links: Vec<RowLink>,
 }
 
+/// Total decoded image memory one terminal keeps, in bytes (R4). Past it the
+/// oldest images are dropped first.
+pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// An image on screen, for the view to draw (R4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisibleImage {
+    /// Stable for the image's life, so a renderer can keep what it made of it.
+    pub id: u64,
+    /// Viewport row of the image's top edge. Negative when the top has scrolled
+    /// above the viewport and only the lower part shows.
+    pub row: i32,
+    /// Grid column of its left edge.
+    pub column: usize,
+    /// The pixels.
+    pub image: Arc<crate::sixel::SixelImage>,
+}
+
+/// An image a program placed on the grid (R4).
+#[derive(Debug)]
+struct PlacedImage {
+    id: u64,
+    /// Stable line of the image's top row; see [`TerminalCore::stable_line`].
+    stable: i64,
+    column: usize,
+    /// Rows it covered when it was placed.
+    rows: usize,
+    image: Arc<crate::sixel::SixelImage>,
+    /// Placed on the alternate screen, which it is shown on and dies with.
+    alternate: bool,
+    /// The text of each covered row when it was placed: a row that changes means
+    /// text was written over the image, which then goes, as in other terminals.
+    covered: Vec<u64>,
+}
+
+impl PlacedImage {
+    fn bytes(&self) -> usize {
+        self.image.rgba.len()
+    }
+}
+
+fn text_hash(text: &str) -> u64 {
+    let mut hash = DefaultHasher::new();
+    hash.write(text.trim_end().as_bytes());
+    hash.finish()
+}
+
 /// A run of cells on one row that a program linked with OSC 8 (R1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowLink {
@@ -423,6 +470,8 @@ pub struct Snapshot {
     pub history: usize,
     /// Terminal modes currently active.
     pub mode: TermMode,
+    /// Images that reach into the viewport, oldest first (R4).
+    pub images: Vec<VisibleImage>,
 }
 
 /// A link found at one visible position: recognized `http(s)://` text, or an
@@ -643,6 +692,11 @@ pub struct TerminalCore {
     shown: fn(Rgb) -> Rgb,
     /// How long a command must run for its end to be reported with its text (R2).
     long_command: Option<std::time::Duration>,
+    /// Images programs placed, oldest first (R4).
+    images: Vec<PlacedImage>,
+    next_image: u64,
+    /// The size of one cell in the pixels images are measured in (R4).
+    cell_pixels: (f32, f32),
 }
 
 impl TerminalCore {
@@ -674,6 +728,9 @@ impl TerminalCore {
             row_addresses: Vec::new(),
             shown: |color| color,
             long_command: None,
+            images: Vec::new(),
+            next_image: 1,
+            cell_pixels: (8.0, 16.0),
         }
     }
 
@@ -713,6 +770,29 @@ impl TerminalCore {
         if bytes.is_empty() {
             return TerminalEffects::default();
         }
+        if self.images.is_empty() {
+            return self.feed_segments(bytes);
+        }
+        // Clearing the screen or resetting the terminal takes the images with it
+        // (R4). Erasing blank rows leaves no trace in the text, so the sequences
+        // are looked for here rather than read back from the grid.
+        let reset = contains(bytes, b"\x1bc");
+        let scrollback = reset || contains(bytes, b"\x1b[3J");
+        let screen = scrollback || contains(bytes, b"\x1b[2J");
+        if screen {
+            self.clear_images(scrollback);
+        }
+        let was_alternate = self.on_alternate_screen();
+        let effects = self.feed_segments(bytes);
+        if was_alternate != self.on_alternate_screen() {
+            // Entering or leaving the alternate screen starts it fresh.
+            self.images.retain(|image| !image.alternate);
+        }
+        self.drop_stale_images();
+        effects
+    }
+
+    fn feed_segments(&mut self, bytes: &[u8]) -> TerminalEffects {
         if self.splitter.can_pass_through(bytes) {
             let plain_ascii = bytes.len() >= 256 && bytes.is_ascii() && !bytes.contains(&0x1b);
             return self.feed_grid(bytes, plain_ascii);
@@ -740,6 +820,12 @@ impl TerminalCore {
                     // received nothing for these bytes (R2).
                     effects.notices.push(notice);
                 }
+                Segment::Sixel { params, data } => {
+                    self.note_history();
+                    merge_effects(&mut effects, self.place_sixel(&params, &data));
+                }
+                // Too large to keep: nothing is drawn and the grid is untouched (R4).
+                Segment::SixelDropped => {}
                 Segment::Directory(directory) => {
                     // The shell stated where it is. The report replaces the previous
                     // one and is never drawn: the grid has already received nothing
@@ -767,9 +853,116 @@ impl TerminalCore {
         if let Some(title) = &effects.title {
             self.title = Some(title.clone());
         }
+        // The grid parser answers primary device attributes as a VT102; this
+        // terminal also draws Sixel images, which programs only send to a terminal
+        // that says so (R4).
+        if !effects.writes.is_empty() {
+            replace_all(&mut effects.writes, PARSER_DA1, SIXEL_DA1);
+        }
         self.note_history();
         self.refresh_running_output();
         effects
+    }
+
+    /// Tells the terminal how large one cell is, in the pixels images are measured
+    /// in, so an image covers the right number of rows and columns (R4).
+    pub fn set_cell_pixels(&mut self, width: f32, height: f32) {
+        if width.is_finite() && height.is_finite() && width >= 1.0 && height >= 1.0 {
+            self.cell_pixels = (width, height);
+        }
+    }
+
+    /// Decodes and places one Sixel image at the cursor, then moves the cursor to
+    /// the row under it, as xterm does with Sixel scrolling on (R4).
+    fn place_sixel(&mut self, params: &[u8], data: &[u8]) -> TerminalEffects {
+        let background = palette::BACKGROUND;
+        let Ok(image) =
+            crate::sixel::decode(params, data, [background.r, background.g, background.b])
+        else {
+            // Malformed or too large: dropped, and the grid is as it was.
+            return TerminalEffects::default();
+        };
+        let (_, cell_height) = self.cell_pixels;
+        let rows = ((image.height as f32) / cell_height).ceil().max(1.0) as usize;
+        let cursor = self.term.grid().cursor.point;
+        let column = cursor.column.0;
+        let alternate = self.on_alternate_screen();
+        // Make room first: the line feeds scroll the screen when the image is
+        // taller than the rows below the cursor, and the image's top row goes with
+        // them, so its anchor is taken from where the cursor ends up.
+        let effects = self.feed_grid(&vec![b'\n'; rows], false);
+        let bottom = self.term.grid().cursor.point.line.0;
+        let top = bottom - i32::try_from(rows).unwrap_or(i32::MAX);
+        let stable = self.stable_line(top);
+        let covered = (0..rows)
+            .map(|offset| {
+                let line = top + i32::try_from(offset).unwrap_or(0);
+                self.line_from_stable(self.stable_line(line))
+                    .map_or(0, |line| text_hash(&self.line_text(Line(line))))
+            })
+            .collect();
+        let id = self.next_image;
+        self.next_image += 1;
+        self.images.push(PlacedImage {
+            id,
+            stable,
+            column,
+            rows,
+            image: Arc::new(image),
+            alternate,
+            covered,
+        });
+        let mut total: usize = self.images.iter().map(PlacedImage::bytes).sum();
+        while total > MAX_IMAGE_BYTES && !self.images.is_empty() {
+            total -= self.images.remove(0).bytes();
+        }
+        effects
+    }
+
+    /// Drops the images on the current screen (and, with `scrollback`, in its
+    /// history too).
+    fn clear_images(&mut self, scrollback: bool) {
+        let alternate = self.on_alternate_screen();
+        let history = self.term.grid().history_size() as i64;
+        let first_on_screen = history + self.lines_dropped;
+        self.images.retain(|image| {
+            if image.alternate != alternate {
+                return true;
+            }
+            !scrollback && image.stable + image.rows as i64 <= first_on_screen
+        });
+    }
+
+    /// Drops images whose rows left the scrollback or had text written over them.
+    fn drop_stale_images(&mut self) {
+        let alternate = self.on_alternate_screen();
+        let images = std::mem::take(&mut self.images);
+        self.images = images
+            .into_iter()
+            .filter(|image| {
+                // Its bottom row rotated out of the kept history: so did the rest.
+                let last = image.stable + image.rows as i64 - 1;
+                if self.line_from_stable(last).is_none() {
+                    return false;
+                }
+                if image.alternate != alternate {
+                    return true;
+                }
+                image.covered.iter().enumerate().all(|(offset, hash)| {
+                    match self.line_from_stable(image.stable + offset as i64) {
+                        Some(line) => text_hash(&self.line_text(Line(line))) == *hash,
+                        // Rotated out of history at the top: still the same image.
+                        None => true,
+                    }
+                })
+            })
+            .collect();
+    }
+
+    /// How many images this terminal keeps, on either screen.
+    #[must_use]
+    pub fn image_count(&self) -> usize {
+        self.images.len()
     }
 
     /// Sets how long a command must run before its end is reported as a
@@ -799,9 +992,18 @@ impl TerminalCore {
         if grid == self.grid {
             return;
         }
+        let rewrapped = grid.cols != self.grid.cols;
         self.term.resize(grid);
         self.grid = grid;
         self.note_history();
+        // A new width re-wraps lines, so an image's rows no longer stand where its
+        // anchor says: it goes rather than being drawn over other text (R4). A new
+        // height keeps them; any row that changed still takes its image with it.
+        if rewrapped {
+            self.images.clear();
+        } else if !self.images.is_empty() {
+            self.drop_stale_images();
+        }
     }
 
     /// The working directory the shell last reported with OSC 7 (R15).
@@ -864,6 +1066,8 @@ impl TerminalCore {
     ///
     /// Full-screen alternate programs own their screen and are left untouched.
     pub fn clear_screen_and_scrollback(&mut self) {
+        // The primary screen's images go with its text (R4).
+        self.images.retain(|image| image.alternate);
         if self.on_alternate_screen() {
             return;
         }
@@ -1128,6 +1332,7 @@ impl TerminalCore {
             }
         }
 
+        let images = self.visible_images(display_offset);
         Snapshot {
             rows,
             cursor: self.viewport_cursor(display_offset, content.cursor),
@@ -1135,7 +1340,37 @@ impl TerminalCore {
             display_offset,
             history: self.term.grid().history_size(),
             mode: content.mode,
+            images,
         }
+    }
+
+    /// The images of the screen on show that reach into the viewport (R4).
+    fn visible_images(&self, display_offset: usize) -> Vec<VisibleImage> {
+        if self.images.is_empty() {
+            return Vec::new();
+        }
+        let alternate = self.on_alternate_screen();
+        let viewport_rows = self.grid.rows as i64;
+        let history = self.term.grid().history_size() as i64;
+        self.images
+            .iter()
+            .filter(|image| image.alternate == alternate)
+            .filter_map(|image| {
+                // Stable line -> grid line -> viewport row.
+                let line = image.stable - self.lines_dropped - history;
+                let row = line + display_offset as i64;
+                let bottom = row + image.rows as i64;
+                if bottom <= 0 || row >= viewport_rows {
+                    return None;
+                }
+                Some(VisibleImage {
+                    id: image.id,
+                    row: i32::try_from(row).ok()?,
+                    column: image.column,
+                    image: image.image.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Cursor geometry for input methods that only need its screen position.
@@ -1933,6 +2168,36 @@ fn osc_len(bytes: &[u8]) -> usize {
         index += 1;
     }
     bytes.len()
+}
+
+/// What the grid parser answers to primary device attributes.
+const PARSER_DA1: &[u8] = b"\x1b[?6c";
+/// What this terminal answers instead: VT220 class, with Sixel (4) and ANSI
+/// colour (22) (R4).
+pub const SIXEL_DA1: &[u8] = b"\x1b[?62;4;22c";
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn replace_all(bytes: &mut Vec<u8>, from: &[u8], to: &[u8]) {
+    if !contains(bytes, from) {
+        return;
+    }
+    let mut out = Vec::with_capacity(bytes.len() + to.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at..].starts_with(from) {
+            out.extend_from_slice(to);
+            at += from.len();
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    *bytes = out;
 }
 
 fn merge_effects(into: &mut TerminalEffects, next: TerminalEffects) {
@@ -3801,5 +4066,182 @@ mod tests {
             terminal.snapshot().row_text(0).as_deref(),
             Some("beforeafter")
         );
+    }
+
+    /// A Sixel image `width` x `height` pixels of one colour, as an encoder writes it.
+    fn sixel(width: usize, height: usize) -> Vec<u8> {
+        let mut out = format!("\x1bP0;1q\"1;1;{width};{height}#1;2;100;0;0#1").into_bytes();
+        let bands = height.div_ceil(6);
+        for band in 0..bands {
+            out.extend_from_slice(format!("!{width}~").as_bytes());
+            if band + 1 < bands {
+                out.push(b'-');
+            }
+        }
+        out.extend_from_slice(b"\x1b\\");
+        out
+    }
+
+    fn core_with_cells() -> TerminalCore {
+        let mut terminal = TerminalCore::new(40, 10, 100);
+        terminal.set_cell_pixels(8.0, 16.0);
+        terminal
+    }
+
+    #[test]
+    fn an_image_sits_at_the_cursor_and_text_continues_below_it() {
+        let mut terminal = core_with_cells();
+        terminal.feed(b"top\r\n  ");
+        // 32 px tall at 16 px a row: two rows.
+        terminal.feed(&sixel(24, 32));
+        terminal.feed(b"after");
+        let snapshot = terminal.snapshot();
+        assert_eq!(snapshot.images.len(), 1);
+        let image = &snapshot.images[0];
+        assert_eq!((image.row, image.column), (1, 2));
+        assert_eq!((image.image.width, image.image.height), (24, 32));
+        assert_eq!(snapshot.row_text(3).as_deref(), Some("  after"));
+        assert!(
+            snapshot.text().iter().all(|row| !row.contains('~')),
+            "the image data never reaches the grid"
+        );
+    }
+
+    #[test]
+    fn an_image_cut_between_reads_is_one_image() {
+        let mut terminal = core_with_cells();
+        let bytes = sixel(16, 12);
+        for chunk in bytes.chunks(3) {
+            terminal.feed(chunk);
+        }
+        assert_eq!(terminal.snapshot().images.len(), 1);
+        assert_eq!(terminal.snapshot().row_text(0).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn an_image_scrolls_with_its_rows_and_goes_when_they_leave_the_history() {
+        let mut terminal = TerminalCore::new(20, 4, 5);
+        terminal.set_cell_pixels(8.0, 16.0);
+        terminal.feed(&sixel(8, 16));
+        assert_eq!(terminal.snapshot().images[0].row, 0);
+        terminal.feed(b"a\r\nb\r\nc\r\n");
+        let images = terminal.snapshot().images;
+        assert!(
+            images.is_empty() || images[0].row < 0,
+            "it moved up: {images:?}"
+        );
+        terminal.scroll(10);
+        let images = terminal.snapshot().images;
+        assert_eq!(images.len(), 1, "scrolled back, it is on screen again");
+        assert!(images[0].row >= 0);
+        terminal.scroll_to_bottom();
+        for _ in 0..20 {
+            terminal.feed(b"more\r\n");
+        }
+        assert_eq!(
+            terminal.image_count(),
+            0,
+            "out of the history, it is released"
+        );
+    }
+
+    #[test]
+    fn clearing_resetting_or_switching_screens_takes_images_away() {
+        let mut terminal = core_with_cells();
+        terminal.feed(&sixel(8, 8));
+        terminal.feed(b"\x1b[2J");
+        assert_eq!(terminal.image_count(), 0, "ED 2");
+
+        terminal.feed(&sixel(8, 8));
+        terminal.feed(b"\x1bc");
+        assert_eq!(terminal.image_count(), 0, "RIS");
+
+        terminal.feed(&sixel(8, 8));
+        terminal.clear_screen_and_scrollback();
+        assert_eq!(terminal.image_count(), 0, "the clear command");
+
+        // An image on the alternate screen is shown there and goes when it is left.
+        terminal.feed(&sixel(8, 8));
+        terminal.feed(b"\x1b[?1049h");
+        assert!(
+            terminal.snapshot().images.is_empty(),
+            "the primary image is not on the alternate screen"
+        );
+        terminal.feed(&sixel(8, 8));
+        assert_eq!(terminal.snapshot().images.len(), 1);
+        terminal.feed(b"\x1b[?1049l");
+        assert_eq!(
+            terminal.snapshot().images.len(),
+            1,
+            "the primary image is back"
+        );
+        assert_eq!(terminal.image_count(), 1, "the alternate one is gone");
+    }
+
+    #[test]
+    fn text_written_over_an_image_removes_it() {
+        let mut terminal = core_with_cells();
+        terminal.feed(&sixel(16, 32));
+        assert_eq!(terminal.image_count(), 1);
+        terminal.feed(b"\x1b[1;1Hover");
+        assert_eq!(terminal.image_count(), 0);
+    }
+
+    #[test]
+    fn a_new_width_removes_images_and_a_new_height_keeps_them() {
+        let mut terminal = core_with_cells();
+        terminal.feed(&sixel(8, 8));
+        terminal.resize(GridSize::new(40, 12));
+        assert_eq!(terminal.image_count(), 1);
+        terminal.resize(GridSize::new(30, 12));
+        assert_eq!(terminal.image_count(), 0);
+    }
+
+    #[test]
+    fn broken_or_oversized_images_are_dropped_and_the_screen_stays_right() {
+        let mut terminal = core_with_cells();
+        terminal.feed(b"before ");
+        terminal.feed(b"\x1bP0;1q\x01\x02garbage\x1b\\");
+        terminal.feed(b"\x1bP0;1q\"1;1;9000;9000#1~\x1b\\");
+        terminal.feed(b"after");
+        assert_eq!(terminal.image_count(), 0);
+        assert_eq!(
+            terminal.snapshot().row_text(0).as_deref(),
+            Some("before after")
+        );
+    }
+
+    #[test]
+    fn images_past_the_memory_limit_push_out_the_oldest() {
+        let mut terminal = TerminalCore::new(40, 10, 10_000);
+        terminal.set_cell_pixels(8.0, 16.0);
+        // 2048 x 1024 RGBA is 8 MiB: nine of them exceed 64 MiB.
+        for _ in 0..9 {
+            terminal.feed(&sixel(2048, 1024));
+        }
+        let kept: usize = terminal.images.iter().map(PlacedImage::bytes).sum();
+        assert!(kept <= MAX_IMAGE_BYTES, "{kept}");
+        assert_eq!(terminal.image_count(), 8);
+        assert_eq!(terminal.images[0].id, 2, "the first image went first");
+    }
+
+    #[test]
+    fn device_attributes_say_this_terminal_draws_sixel() {
+        let mut terminal = core();
+        let effects = terminal.feed(b"\x1b[c");
+        assert_eq!(effects.writes, SIXEL_DA1);
+        let effects = terminal.feed(b"\x1b[0c");
+        assert_eq!(effects.writes, SIXEL_DA1);
+    }
+
+    #[test]
+    fn other_device_control_strings_still_reach_the_grid_parser() {
+        let mut terminal = core();
+        // DECRQSS for the cursor style: answered by the parser as before.
+        let effects = terminal.feed(b"\x1bP$q q\x1b\\");
+        assert!(terminal.snapshot().text().iter().all(String::is_empty));
+        let _ = effects;
+        terminal.feed(b"x");
+        assert_eq!(terminal.snapshot().row_text(0).as_deref(), Some("x"));
     }
 }

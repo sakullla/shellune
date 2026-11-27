@@ -29,6 +29,7 @@ pub mod palette;
 pub mod pty;
 pub mod session_log;
 pub mod shell;
+pub mod sixel;
 
 pub use alacritty_terminal::index::Side;
 pub use alacritty_terminal::selection::SelectionType;
@@ -36,12 +37,12 @@ pub use alacritty_terminal::term::TermMode;
 pub use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 pub use blocks::{
     BlockFilter, BlockStatus, CommandBlock, CommandBlockId, MAX_NOTICE_BODY, MAX_NOTICE_TITLE,
-    ProgramNotice, WorkingDirectory,
+    MAX_SIXEL_BYTES, ProgramNotice, WorkingDirectory,
 };
 pub use core::{
     CellAttributes, DEFAULT_SCROLLBACK, DetectedLink, FinishedCommand, HistoryMatch, LinkKind,
-    MAX_FINISHED_COMMAND, RenderedCell, RenderedCursor, RenderedRow, RowLink, Snapshot,
-    TerminalCore, TerminalEffects,
+    MAX_FINISHED_COMMAND, MAX_IMAGE_BYTES, RenderedCell, RenderedCursor, RenderedRow, RowLink,
+    SIXEL_DA1, Snapshot, TerminalCore, TerminalEffects, VisibleImage,
 };
 pub use highlight::{LinkRefusal, osc8_target_allowed};
 pub use input::{

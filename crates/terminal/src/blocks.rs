@@ -168,6 +168,83 @@ pub(crate) enum Segment {
     Directory(WorkingDirectory),
     /// A notification a program asked for with OSC 9 or OSC 777 (R2). Never drawn.
     Notice(ProgramNotice),
+    /// A complete Sixel image (R4): the parameters before `q` and the data after it.
+    /// Never given to the grid parser.
+    Sixel {
+        /// The `P1;P2;P3` bytes.
+        params: Vec<u8>,
+        /// Everything between `q` and the string terminator.
+        data: Vec<u8>,
+    },
+    /// A Sixel image that was longer than [`MAX_SIXEL_BYTES`] and was dropped (R4).
+    SixelDropped,
+}
+
+/// Longest Sixel data, in bytes, a terminal collects for one image (R4). Past it
+/// the rest of the image is skipped up to its terminator and nothing is drawn.
+pub const MAX_SIXEL_BYTES: usize = 32 * 1024 * 1024;
+
+/// A Sixel image being collected across reads.
+#[derive(Debug, Default)]
+struct SixelCollect {
+    params: Vec<u8>,
+    data: Vec<u8>,
+    /// The last byte seen was ESC: it ends the image if `\\` follows.
+    pending_escape: bool,
+    /// Over the limit: bytes are skipped until the terminator.
+    discarding: bool,
+}
+
+impl SixelCollect {
+    /// Takes bytes until the image ends; returns how many of `input` belonged to it
+    /// (terminator included) once it has, or `None` when all of `input` did.
+    fn feed(&mut self, input: &[u8]) -> Option<usize> {
+        let mut at = 0;
+        while at < input.len() {
+            if self.pending_escape {
+                self.pending_escape = false;
+                if input[at] == b'\\' {
+                    return Some(at + 1);
+                }
+                self.keep(&[0x1b]);
+            }
+            match input[at..].iter().position(|byte| *byte == 0x1b) {
+                Some(offset) => {
+                    self.keep(&input[at..at + offset]);
+                    self.pending_escape = true;
+                    at += offset + 1;
+                }
+                None => {
+                    self.keep(&input[at..]);
+                    at = input.len();
+                }
+            }
+        }
+        None
+    }
+
+    fn keep(&mut self, bytes: &[u8]) {
+        if self.discarding || bytes.is_empty() {
+            return;
+        }
+        if self.data.len() + bytes.len() > MAX_SIXEL_BYTES {
+            self.discarding = true;
+            self.data = Vec::new();
+            return;
+        }
+        self.data.extend_from_slice(bytes);
+    }
+
+    fn finish(self) -> Segment {
+        if self.discarding {
+            Segment::SixelDropped
+        } else {
+            Segment::Sixel {
+                params: self.params,
+                data: self.data,
+            }
+        }
+    }
 }
 
 /// Longest notification title kept, in characters (R2).
@@ -332,26 +409,59 @@ fn hex_digit(byte: u8) -> Option<u8> {
 #[derive(Debug, Default)]
 pub(crate) struct IntegrationSplitter {
     held: Vec<u8>,
+    /// A Sixel image whose terminator has not arrived yet (R4).
+    sixel: Option<SixelCollect>,
 }
 
 impl IntegrationSplitter {
     pub(crate) fn new() -> Self {
-        Self { held: Vec::new() }
+        Self {
+            held: Vec::new(),
+            sixel: None,
+        }
     }
 
-    /// Only OSC needs splitting. Keep a trailing escape until we know its introducer.
+    /// Only OSC and DCS need splitting. Keep a trailing escape until we know its
+    /// introducer.
     pub(crate) fn can_pass_through(&self, input: &[u8]) -> bool {
         self.held.is_empty()
+            && self.sixel.is_none()
             && !input.ends_with(b"\x1b")
-            && (!input.contains(&b']') || !input.windows(2).any(|pair| pair == b"\x1b]"))
+            && !input
+                .windows(2)
+                .any(|pair| pair == b"\x1b]" || pair == b"\x1bP")
     }
 
     /// Appends `input` and returns every complete segment it now contains.
     pub(crate) fn push(&mut self, input: &[u8]) -> Vec<Segment> {
-        self.held.extend_from_slice(input);
         let mut out = Vec::new();
+        let mut rest: Vec<u8> = input.to_vec();
+        loop {
+            if let Some(collect) = self.sixel.as_mut() {
+                match collect.feed(&rest) {
+                    Some(used) => {
+                        if let Some(done) = self.sixel.take() {
+                            out.push(done.finish());
+                        }
+                        rest.drain(..used);
+                    }
+                    None => return out,
+                }
+            }
+            match self.push_plain(&rest, &mut out) {
+                Some(after) => rest = after,
+                None => return out,
+            }
+        }
+    }
+
+    /// The splitting of everything but Sixel data. Returns the bytes that follow a
+    /// Sixel introducer, which then belong to the image, when one started.
+    fn push_plain(&mut self, input: &[u8], out: &mut Vec<Segment>) -> Option<Vec<u8>> {
+        self.held.extend_from_slice(input);
         let mut plain = Vec::new();
         let mut consumed = 0;
+        let mut started = None;
         loop {
             match take_one(&self.held[consumed..]) {
                 Take::NeedMore => break,
@@ -385,13 +495,24 @@ impl IntegrationSplitter {
                     consumed += n;
                     out.push(Segment::Notice(notice));
                 }
+                Take::SixelStart(n, params) => {
+                    let n = n.min(self.held.len() - consumed);
+                    consumed += n;
+                    self.sixel = Some(SixelCollect {
+                        params,
+                        ..SixelCollect::default()
+                    });
+                    started = Some(self.held[consumed..].to_vec());
+                    consumed = self.held.len();
+                    break;
+                }
             }
         }
         self.held.drain(..consumed);
         if !plain.is_empty() {
             out.push(Segment::Bytes(plain));
         }
-        out
+        started
     }
 }
 
@@ -401,7 +522,12 @@ enum Take {
     Event(usize, IntegrationEvent),
     Directory(usize, WorkingDirectory),
     Notice(usize, ProgramNotice),
+    /// `ESC P <params> q`: a Sixel image starts after this many bytes (R4).
+    SixelStart(usize, Vec<u8>),
 }
+
+/// Longest `P1;P2;P3` run accepted before a Sixel `q`.
+const MAX_DCS_PARAMS: usize = 64;
 
 /// How long an unfinished OSC may be held before it is treated as ordinary text.
 ///
@@ -421,6 +547,23 @@ fn take_one(data: &[u8]) -> Take {
     }
     if data.len() == 1 {
         return Take::NeedMore;
+    }
+    if data[1] == b'P' {
+        // DCS. Only Sixel (`ESC P <digits and ;> q`) is taken out; any other
+        // device control string goes on to the grid parser, which handles or
+        // ignores it as before (R4).
+        let params = data[2..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit() || **byte == b';')
+            .count();
+        if params > MAX_DCS_PARAMS {
+            return Take::Plain(1);
+        }
+        return match data.get(2 + params) {
+            None => Take::NeedMore,
+            Some(b'q') => Take::SixelStart(3 + params, data[2..2 + params].to_vec()),
+            Some(_) => Take::Plain(1),
+        };
     }
     if data[1] != b']' {
         return Take::Plain(1);
@@ -1096,6 +1239,7 @@ mod tests {
             Segment::Event(_) => panic!("a title OSC is not a command marker"),
             Segment::Directory(_) => panic!("a title OSC is not a working directory"),
             Segment::Notice(_) => panic!("a title OSC is not a notification"),
+            Segment::Sixel { .. } | Segment::SixelDropped => panic!("a title OSC is not an image"),
         }
     }
 
@@ -1313,5 +1457,53 @@ mod tests {
         // Invalid UTF-8 is replaced, not dropped wholesale.
         let segments = events(b"\x1b]9;caf\xe9!\x07");
         assert_eq!(notices(&segments)[0].body, "caf\u{fffd}!");
+    }
+
+    #[test]
+    fn a_sixel_image_is_taken_out_whole_and_the_text_around_it_stays() {
+        let mut splitter = IntegrationSplitter::new();
+        let mut segments = splitter.push(b"before\x1bP0;1");
+        segments.extend(splitter.push(b"q#1~"));
+        segments.extend(splitter.push(b"~\x1b"));
+        segments.extend(splitter.push(b"\\after"));
+        let images: Vec<_> = segments
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Sixel { params, data } => Some((params.clone(), data.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images, vec![(b"0;1".to_vec(), b"#1~~".to_vec())]);
+        assert_eq!(plain(&segments), b"beforeafter");
+    }
+
+    #[test]
+    fn an_image_past_the_byte_limit_is_skipped_to_its_end() {
+        let mut splitter = IntegrationSplitter::new();
+        let mut segments = splitter.push(b"\x1bPq");
+        let chunk = vec![b'~'; 1024 * 1024];
+        for _ in 0..=(MAX_SIXEL_BYTES / chunk.len()) {
+            segments.extend(splitter.push(&chunk));
+        }
+        segments.extend(splitter.push(b"\x1b\\next"));
+        assert!(segments.iter().any(|s| matches!(s, Segment::SixelDropped)));
+        assert!(!segments.iter().any(|s| matches!(s, Segment::Sixel { .. })));
+        assert_eq!(plain(&segments), b"next");
+        assert!(
+            splitter.sixel.is_none(),
+            "nothing is held after the terminator"
+        );
+    }
+
+    #[test]
+    fn other_device_control_strings_pass_through_unchanged() {
+        for bytes in [
+            &b"\x1bP$q q\x1b\\"[..],
+            b"\x1bP+q544e\x1b\\",
+            b"\x1bP1;2|x\x1b\\",
+        ] {
+            let segments = events(bytes);
+            assert_eq!(plain(&segments), bytes, "{bytes:?}");
+        }
     }
 }

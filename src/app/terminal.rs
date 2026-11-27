@@ -720,6 +720,13 @@ pub struct TerminalPane {
     origin: PaneOrigin,
     /// The file this terminal's output is being written to, while it is (R3).
     log: Option<SessionLog>,
+    /// Images converted for drawing, by the terminal's image id, so an image is
+    /// converted once and not on every frame (R4).
+    image_cache:
+        std::cell::RefCell<std::collections::HashMap<u64, std::sync::Arc<gpui::RenderImage>>>,
+    /// How many images the last frame drew, for tests.
+    #[cfg(test)]
+    painted_images: std::cell::Cell<usize>,
     state: PaneState,
     /// Bytes written to the shell, kept so what the user typed can be inspected.
     ///
@@ -1060,6 +1067,9 @@ impl TerminalPane {
             attention: TerminalAttention::default(),
             system_notices: Vec::new(),
             log: None,
+            image_cache: std::cell::RefCell::default(),
+            #[cfg(test)]
+            painted_images: std::cell::Cell::new(0),
             x11: None,
             directory: None,
             environment_notes,
@@ -1154,6 +1164,9 @@ impl TerminalPane {
             attention: TerminalAttention::default(),
             system_notices: Vec::new(),
             log: None,
+            image_cache: std::cell::RefCell::default(),
+            #[cfg(test)]
+            painted_images: std::cell::Cell::new(0),
             x11: None,
             directory: None,
             environment_notes: Vec::new(),
@@ -1247,6 +1260,9 @@ impl TerminalPane {
             attention: TerminalAttention::default(),
             system_notices: Vec::new(),
             log: None,
+            image_cache: std::cell::RefCell::default(),
+            #[cfg(test)]
+            painted_images: std::cell::Cell::new(0),
             x11: None,
             directory: None,
             environment_notes: Vec::new(),
@@ -1421,6 +1437,9 @@ impl TerminalPane {
             attention: TerminalAttention::default(),
             system_notices: Vec::new(),
             log: None,
+            image_cache: std::cell::RefCell::default(),
+            #[cfg(test)]
+            painted_images: std::cell::Cell::new(0),
             x11: None,
             directory: None,
             environment_notes: Vec::new(),
@@ -1641,6 +1660,9 @@ impl TerminalPane {
             attention: TerminalAttention::default(),
             system_notices: Vec::new(),
             log: None,
+            image_cache: std::cell::RefCell::default(),
+            #[cfg(test)]
+            painted_images: std::cell::Cell::new(0),
             x11: None,
             directory: None,
             environment_notes: Vec::new(),
@@ -1774,6 +1796,13 @@ impl TerminalPane {
         self.link_armed = false;
         cx.notify();
         self.hovered_link.is_some()
+    }
+
+    /// How many images the terminal keeps, for a capture's readiness check (R4).
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_image_count(&self) -> usize {
+        self.core.image_count()
     }
 
     /// Whether a capture's hovered link is still shown.
@@ -3683,6 +3712,8 @@ impl TerminalPane {
             height: self.font_size * shellune_terminal::LINE_HEIGHT_RATIO,
         };
         self.cell = cell;
+        // Images are measured in these units, so their rows match the text (R4).
+        self.core.set_cell_pixels(cell.width, cell.height);
         cell
     }
 
@@ -6668,6 +6699,84 @@ impl TerminalPane {
         )
     }
 
+    /// The images on screen, drawn over the text rows they cover (R4).
+    ///
+    /// Each image is converted to the GPU's format once and kept by id; an image
+    /// that left the screen is let go here, texture included, so scrolling a long
+    /// history of images does not keep them all.
+    fn image_layer(&self, snapshot: &Snapshot, window: &mut Window) -> Option<gpui::Canvas<()>> {
+        let mut cache = self.image_cache.borrow_mut();
+        let visible: std::collections::HashSet<u64> =
+            snapshot.images.iter().map(|image| image.id).collect();
+        let gone: Vec<u64> = cache
+            .keys()
+            .filter(|id| !visible.contains(id))
+            .copied()
+            .collect();
+        for id in gone {
+            if let Some(image) = cache.remove(&id) {
+                let _ = window.drop_image(image);
+            }
+        }
+        #[cfg(test)]
+        self.painted_images.set(snapshot.images.len());
+        if snapshot.images.is_empty() {
+            return None;
+        }
+        let cell = self.cell.sanitized();
+        let placed: Vec<(Bounds<Pixels>, std::sync::Arc<gpui::RenderImage>)> = snapshot
+            .images
+            .iter()
+            .map(|visible| {
+                let image = cache
+                    .entry(visible.id)
+                    .or_insert_with(|| std::sync::Arc::new(render_image(&visible.image)))
+                    .clone();
+                let bounds = Bounds::new(
+                    point(
+                        px(visible.column as f32 * cell.width),
+                        px(visible.row as f32 * cell.height),
+                    ),
+                    gpui::size(
+                        px(visible.image.width as f32),
+                        px(visible.image.height as f32),
+                    ),
+                );
+                (bounds, image)
+            })
+            .collect();
+        Some(canvas(
+            |_, _, _| (),
+            move |bounds, _, window, _| {
+                for (at, image) in placed {
+                    let target = Bounds::new(bounds.origin + at.origin, at.size);
+                    let _ = window.paint_image(target, gpui::Corners::default(), image, 0, false);
+                }
+            },
+        ))
+    }
+
+    /// Scrolls the history by `lines` (positive is back), for tests.
+    #[cfg(test)]
+    pub fn scroll_for_test(&mut self, lines: i32, cx: &mut Context<Self>) {
+        self.core.scroll(lines);
+        cx.notify();
+    }
+
+    /// How many images the last frame drew, for tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn painted_images_for_test(&self) -> usize {
+        self.painted_images.get()
+    }
+
+    /// How many converted images the pane keeps, for tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn cached_images_for_test(&self) -> usize {
+        self.image_cache.borrow().len()
+    }
+
     /// A small badge in the terminal's bar while its output is being logged, with the
     /// file in its tooltip (R3). It sits with the bar's tools, never over the grid.
     fn log_badge(&self, metrics: Metrics) -> Option<gpui::Stateful<gpui::Div>> {
@@ -6835,6 +6944,9 @@ impl TerminalPane {
             .debug_selector(|| "terminal.viewport".to_owned());
         for index in 0..snapshot.rows.len() {
             rows = rows.child(self.row(index, &snapshot, focused));
+        }
+        if let Some(images) = self.image_layer(&snapshot, window) {
+            rows = rows.child(images);
         }
         if let Some(overlay) = self.composition_overlay(&snapshot) {
             rows = rows.child(overlay);
@@ -7037,6 +7149,21 @@ pub fn quote_posix_path(path: &str) -> String {
     } else {
         format!("'{}'", path.replace('\'', "'\\''"))
     }
+}
+
+/// A decoded image in the GPU's pixel order (BGRA), for drawing (R4).
+fn render_image(image: &shellune_terminal::sixel::SixelImage) -> gpui::RenderImage {
+    let mut bgra = image.rgba.clone();
+    for pixel in bgra.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    gpui::RenderImage::from_bgra(
+        gpui::size(
+            gpui::DevicePixels(i32::try_from(image.width).unwrap_or(i32::MAX)),
+            gpui::DevicePixels(i32::try_from(image.height).unwrap_or(i32::MAX)),
+        ),
+        std::sync::Arc::from(bgra),
+    )
 }
 
 /// The name a new log is offered under (R3): `<label>-YYYYMMDD-HHMMSSZ.log`.

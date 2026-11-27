@@ -49187,6 +49187,122 @@ async fn terminal_search_refocus_editing_clear_and_scroll_bottom_pill_ux(cx: &mu
     );
 }
 
+/// A Sixel image `width` x `height` pixels of one colour, as an encoder writes it.
+fn sixel_image(width: usize, height: usize) -> Vec<u8> {
+    let mut out = format!("\x1bP0;1q\"1;1;{width};{height}#1;2;0;60;100#1").into_bytes();
+    let bands = height.div_ceil(6);
+    for band in 0..bands {
+        out.extend_from_slice(format!("!{width}~").as_bytes());
+        if band + 1 < bands {
+            out.push(b'-');
+        }
+    }
+    out.extend_from_slice(b"\x1b\\");
+    out
+}
+
+#[gpui::test]
+async fn a_sixel_image_is_drawn_once_converted_and_let_go_when_it_goes(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("before\r\n", cx);
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.feed_for_test(&sixel_image(64, 48), cx);
+            pane.feed_for_test(b"after", cx);
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).painted_images_for_test()),
+        1
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).cached_images_for_test()),
+        1
+    );
+    assert!(
+        cx.update(|_window, app| pane.read(app).visible_text())
+            .iter()
+            .any(|line| line.contains("after")),
+        "text goes on under the image"
+    );
+    // Drawn again, it is not converted again.
+    redraw(cx);
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).cached_images_for_test()),
+        1
+    );
+
+    // A cleared screen takes it away, and its texture with it.
+    cx.update(|_window, app| pane.update(app, |pane, cx| pane.feed_for_test(b"\x1b[2J", cx)));
+    cx.run_until_parked();
+    redraw(cx);
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).painted_images_for_test()),
+        0
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).cached_images_for_test()),
+        0
+    );
+}
+
+#[gpui::test]
+async fn a_broken_sixel_image_draws_nothing_and_the_terminal_carries_on(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("", cx);
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.feed_for_test(b"one \x1bPq\x01\x02\x1b\\two", cx);
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).painted_images_for_test()),
+        0
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).visible_text())[0],
+        "one two"
+    );
+}
+
+/// The measurement R4 asks for: twenty 512 x 512 images scrolled through the
+/// viewport, timed per frame. Printed, and held to a bound a debug build meets.
+#[gpui::test]
+async fn twenty_large_images_scroll_within_a_frame_budget(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("", cx);
+    let image = sixel_image(512, 512);
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            for index in 0..20 {
+                pane.feed_for_test(format!("image {index}\r\n").as_bytes(), cx);
+                pane.feed_for_test(&image, cx);
+            }
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    let mut frames = Vec::new();
+    for _ in 0..30 {
+        cx.update(|_window, app| pane.update(app, |pane, cx| pane.scroll_for_test(5, cx)));
+        let started = std::time::Instant::now();
+        redraw(cx);
+        frames.push(started.elapsed());
+    }
+    frames.sort();
+    let median = frames[frames.len() / 2];
+    let worst = frames[frames.len() - 1];
+    eprintln!(
+        "R4 image scroll: median {median:?}, worst {worst:?}, cached {} images",
+        cx.update(|_window, app| pane.read(app).cached_images_for_test())
+    );
+    assert!(
+        median < std::time::Duration::from_millis(250),
+        "median frame {median:?}"
+    );
+}
+
 #[gpui::test]
 async fn osc8_links_show_their_target_on_hover_and_open_only_when_allowed(cx: &mut TestAppContext) {
     let content = "\x1b]8;;https://example.com/docs\x1b\\docs here\x1b]8;;\x1b\\  \

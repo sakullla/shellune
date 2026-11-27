@@ -2983,6 +2983,50 @@ fn show_terminal_link(
     Ok(())
 }
 
+/// A Sixel image a program drew, with its text going on below it (R4).
+fn show_terminal_image(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let shell = LocalShell::new(SHOT_SHELL, SHOT_SHELL);
+    // A 160 x 96 gradient in eight bands of colour, the way an encoder writes it.
+    let mut content = format!("{TRANSCRIPT}\r\n$ img2sixel chart.png\r\n").into_bytes();
+    content.extend_from_slice(b"\x1bP0;1q\"1;1;160;96");
+    for band in 0..16u32 {
+        let register = band % 8;
+        content.extend_from_slice(
+            format!(
+                "#{register};2;{};{};{}#{register}!160~",
+                20 + register * 10,
+                40 + register * 7,
+                90
+            )
+            .as_bytes(),
+        );
+        if band < 15 {
+            content.push(b'-');
+        }
+    }
+    content.extend_from_slice(b"\x1b\\$ ");
+    let id = view.attach_capture_session(shell, &content, Some(window), cx);
+    if view.pane_of(id).is_none() {
+        return Err("the session was recorded without a terminal".to_owned());
+    }
+    Ok(())
+}
+
+fn terminal_image_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    terminal_ready(view, cx)?;
+    let images = view
+        .pane()
+        .map_or(0, |pane| pane.read(cx).capture_image_count());
+    if images == 0 {
+        return Err("the terminal holds no image".to_owned());
+    }
+    Ok(())
+}
+
 fn terminal_link_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
     terminal_ready(view, cx)?;
     let hovered = view
@@ -4161,6 +4205,19 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: nothing,
         install: show_terminal_menu,
         ready: terminal_menu_ready,
+    },
+    Scenario {
+        id: "terminal-sixel-image",
+        title: "终端 · Sixel 内联图像",
+        category: Category::Overlay,
+        fixture: "the local terminal fed with the transcript fixture and a 160 x 96 Sixel \
+                  image in eight colour bands, followed by a prompt",
+        evidence: "shows the image placed at the cursor with the prompt below it; the \
+                   image is drawn by the terminal itself, not by a real program",
+        start: || page(Destination::LocalShells),
+        prepare: nothing,
+        install: show_terminal_image,
+        ready: terminal_image_ready,
     },
     Scenario {
         id: "terminal-osc8-link",
