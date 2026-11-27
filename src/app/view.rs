@@ -6277,7 +6277,7 @@ impl ShelluneView {
         request: terminal::PaneRequest,
         cx: &mut Context<Self>,
     ) {
-        let locals: Vec<String> = match request {
+        let (locals, unsupported) = match request {
             terminal::PaneRequest::OpenSnippets => {
                 if self.workspace.layout_mut().focus_session(id) {
                     self.active = Some(id);
@@ -6328,11 +6328,20 @@ impl ShelluneView {
                 }
                 return;
             }
-            terminal::PaneRequest::UploadFiles(paths) => paths
-                .iter()
-                .filter(|path| path.is_file())
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect(),
+            terminal::PaneRequest::UploadFiles(paths) => {
+                let mut items = Vec::new();
+                let mut unsupported = 0usize;
+                for path in paths {
+                    if path.is_dir() {
+                        items.push((path.to_string_lossy().into_owned(), true));
+                    } else if path.is_file() {
+                        items.push((path.to_string_lossy().into_owned(), false));
+                    } else {
+                        unsupported += 1;
+                    }
+                }
+                (items, unsupported)
+            }
             terminal::PaneRequest::PasteImage(image) => {
                 let extension = image
                     .format
@@ -6349,11 +6358,11 @@ impl ShelluneView {
                     self.toast(Tone::Danger, title, Some(error.to_string()), cx);
                     return;
                 }
-                vec![path.to_string_lossy().into_owned()]
+                (vec![(path.to_string_lossy().into_owned(), false)], 0)
             }
         };
         if locals.is_empty() {
-            self.toast(Tone::Warning, copy::ux().drop_folders_unsupported, None, cx);
+            self.toast(Tone::Warning, copy::ux().drop_unsupported_items, None, cx);
             return;
         }
         let directory = self
@@ -6363,13 +6372,18 @@ impl ShelluneView {
             .map(str::to_owned);
         let mut typed = Vec::new();
         let protocol = self.session_protocol(id);
-        for local in &locals {
+        for (local, is_dir) in &locals {
+            let (item_protocol, recursive) = if *is_dir {
+                (TransferProtocol::Scp, true)
+            } else {
+                (protocol, false)
+            };
             match self.transfers.upload_over(
                 id,
                 local,
                 Some(directory.as_deref().unwrap_or(".")),
-                protocol,
-                false,
+                item_protocol,
+                recursive,
             ) {
                 Ok(_) => {
                     let name = std::path::Path::new(local)
@@ -6399,9 +6413,13 @@ impl ShelluneView {
             text.push(' ');
             pane.update(cx, |pane, cx| pane.type_text(&text, cx));
             self.watch_files(cx);
+            self.sync_transfer_section();
             let title = copy::fill(copy::ux().drop_uploading, &[("count", &count)]);
             let folder = directory.unwrap_or_else(|| "~".to_owned());
             self.toast(Tone::Accent, title, Some(folder), cx);
+        }
+        if unsupported > 0 {
+            self.toast(Tone::Warning, copy::ux().drop_unsupported_items, None, cx);
         }
         cx.notify();
     }
@@ -22680,6 +22698,18 @@ impl ShelluneView {
     #[cfg(test)]
     pub(crate) fn files_menu_open_for_test(&self) -> bool {
         self.files_menu.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_pane_upload_for_test(
+        &mut self,
+        id: SessionId,
+        paths: Vec<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.pane_of(id).cloned() {
+            self.answer_pane(id, &pane, terminal::PaneRequest::UploadFiles(paths), cx);
+        }
     }
 
     /// Whether the file view of a session is open.

@@ -53422,3 +53422,61 @@ async fn t4_transfer_strip_overwrite_all_cancel_all_and_retry_failed(cx: &mut Te
         "Retry failed starts a new attempt for both failed transfers"
     );
 }
+
+#[gpui::test]
+async fn t4_terminal_pane_mixed_drop_uploads_folders_recursively_and_warns_unsupported(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("t4-pane-mixed-drop");
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_answers, transfers) = open_transfers(cx, &view, id);
+
+    let drop_file = dir.path().join("readme.txt");
+    let drop_dir = dir.path().join("configs");
+    let missing = dir.path().join("does-not-exist");
+    std::fs::write(&drop_file, b"hello").expect("write drop file");
+    std::fs::create_dir_all(&drop_dir).expect("create drop dir");
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.handle_pane_upload_for_test(
+                id,
+                vec![drop_file.clone(), drop_dir.clone(), missing.clone()],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    let starts = transfers.starts();
+    assert_eq!(
+        starts.len(),
+        2,
+        "mixed terminal pane drop queues both the file and the folder: {starts:?}"
+    );
+    assert!(
+        starts.iter().any(|req| {
+            req.direction == shellune_core::TransferDirection::Upload
+                && !req.recursive
+                && req.source.ends_with("readme.txt")
+        }),
+        "dropped file is uploaded normally: {starts:?}"
+    );
+    assert!(
+        starts.iter().any(|req| {
+            req.direction == shellune_core::TransferDirection::Upload
+                && req.protocol == shellune_core::TransferProtocol::Scp
+                && req.recursive
+                && req.source.ends_with("configs")
+        }),
+        "dropped folder is uploaded recursively over SCP instead of silently skipped: {starts:?}"
+    );
+    let toasts = cx.update(|_window, app| view.read(app).toast_titles());
+    assert!(
+        toasts
+            .iter()
+            .any(|title| title == crate::app::copy::ux().drop_unsupported_items),
+        "unsupported dropped entries produce an explicit warning toast: {toasts:?}"
+    );
+}
