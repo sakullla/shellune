@@ -49220,6 +49220,20 @@ async fn a_sixel_image_is_drawn_once_converted_and_let_go_when_it_goes(cx: &mut 
         cx.update(|_window, app| pane.read(app).cached_images_for_test()),
         1
     );
+    // The layer covers the grid exactly, so an image's cell is where it is drawn:
+    // the second row, first column, under "before".
+    let grid = bounds_of(cx, "terminal.viewport");
+    let layer = bounds_of(cx, "terminal.images");
+    assert_eq!(
+        layer.origin, grid.origin,
+        "the image layer starts at the grid's corner"
+    );
+    assert_eq!(layer.size, grid.size);
+    let cell = cx.update(|_window, app| pane.read(app).cell_size());
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).image_origins_for_test()),
+        vec![point(px(0.0), px(cell.height))]
+    );
     assert!(
         cx.update(|_window, app| pane.read(app).visible_text())
             .iter()

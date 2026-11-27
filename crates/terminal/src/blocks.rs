@@ -195,24 +195,59 @@ struct SixelCollect {
     discarding: bool,
 }
 
+/// How a Sixel image's data ended.
+#[derive(Debug, PartialEq, Eq)]
+enum SixelEnd {
+    /// `ESC \\`: the image is complete; this many bytes of the input were its.
+    Terminated(usize),
+    /// Another escape sequence began, as a VT parser ends any device control string
+    /// at an ESC: the image ends with the data so far, and the bytes from this
+    /// offset on - the ESC included, `escape_before` when it came at the end of the
+    /// previous read - are ordinary output again.
+    Interrupted { at: usize, escape_before: bool },
+    /// CAN or SUB: the image is cancelled; this many bytes were its.
+    Cancelled(usize),
+}
+
 impl SixelCollect {
-    /// Takes bytes until the image ends; returns how many of `input` belonged to it
-    /// (terminator included) once it has, or `None` when all of `input` did.
-    fn feed(&mut self, input: &[u8]) -> Option<usize> {
+    /// Takes bytes until the image ends; returns how it ended, or `None` when all
+    /// of `input` belonged to it.
+    fn feed(&mut self, input: &[u8]) -> Option<SixelEnd> {
         let mut at = 0;
-        while at < input.len() {
-            if self.pending_escape {
-                self.pending_escape = false;
-                if input[at] == b'\\' {
-                    return Some(at + 1);
-                }
-                self.keep(&[0x1b]);
+        if self.pending_escape && !input.is_empty() {
+            self.pending_escape = false;
+            if input[0] == b'\\' {
+                return Some(SixelEnd::Terminated(1));
             }
-            match input[at..].iter().position(|byte| *byte == 0x1b) {
+            return Some(SixelEnd::Interrupted {
+                at: 0,
+                escape_before: true,
+            });
+        }
+        while at < input.len() {
+            match input[at..]
+                .iter()
+                .position(|byte| matches!(*byte, 0x1b | 0x18 | 0x1a))
+            {
                 Some(offset) => {
                     self.keep(&input[at..at + offset]);
-                    self.pending_escape = true;
-                    at += offset + 1;
+                    let stop = at + offset;
+                    if input[stop] != 0x1b {
+                        return Some(SixelEnd::Cancelled(stop + 1));
+                    }
+                    match input.get(stop + 1) {
+                        Some(b'\\') => return Some(SixelEnd::Terminated(stop + 2)),
+                        Some(_) => {
+                            return Some(SixelEnd::Interrupted {
+                                at: stop,
+                                escape_before: false,
+                            });
+                        }
+                        None => {
+                            self.pending_escape = true;
+                            return None;
+                        }
+                    }
                 }
                 None => {
                     self.keep(&input[at..]);
@@ -438,14 +473,30 @@ impl IntegrationSplitter {
         let mut rest: Vec<u8> = input.to_vec();
         loop {
             if let Some(collect) = self.sixel.as_mut() {
-                match collect.feed(&rest) {
-                    Some(used) => {
-                        if let Some(done) = self.sixel.take() {
-                            out.push(done.finish());
-                        }
+                let Some(end) = collect.feed(&rest) else {
+                    return out;
+                };
+                let Some(done) = self.sixel.take() else {
+                    return out;
+                };
+                match end {
+                    SixelEnd::Terminated(used) => {
+                        out.push(done.finish());
                         rest.drain(..used);
                     }
-                    None => return out,
+                    // Whatever was drawn before the interruption is the image; the
+                    // rest is output the terminal must show (R4).
+                    SixelEnd::Interrupted { at, escape_before } => {
+                        out.push(done.finish());
+                        rest.drain(..at);
+                        if escape_before {
+                            rest.insert(0, 0x1b);
+                        }
+                    }
+                    SixelEnd::Cancelled(used) => {
+                        out.push(Segment::SixelDropped);
+                        rest.drain(..used);
+                    }
                 }
             }
             match self.push_plain(&rest, &mut out) {
@@ -1504,6 +1555,44 @@ mod tests {
         ] {
             let segments = events(bytes);
             assert_eq!(plain(&segments), bytes, "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn an_image_without_its_terminator_ends_at_the_next_escape_and_output_goes_on() {
+        let mut splitter = IntegrationSplitter::new();
+        let mut segments = splitter.push(b"\x1bPq#1~~");
+        segments.extend(splitter.push(b"\r\n\x1b[31mprompt$ \x1b[0mls\r\n"));
+        assert!(
+            segments
+                .iter()
+                .any(|s| matches!(s, Segment::Sixel { data, .. } if data == b"#1~~\r\n")),
+            "{segments:?}"
+        );
+        assert_eq!(plain(&segments), b"\x1b[31mprompt$ \x1b[0mls\r\n");
+        assert!(splitter.sixel.is_none());
+    }
+
+    #[test]
+    fn an_escape_at_the_end_of_a_read_that_is_not_the_terminator_is_output_again() {
+        let mut splitter = IntegrationSplitter::new();
+        let mut segments = splitter.push(b"\x1bPq#1~\x1b");
+        segments.extend(splitter.push(b"[1mbold"));
+        assert!(segments.iter().any(|s| matches!(s, Segment::Sixel { .. })));
+        assert_eq!(plain(&segments), b"\x1b[1mbold");
+    }
+
+    #[test]
+    fn can_or_sub_cancels_an_image_and_what_follows_is_output() {
+        for cancel in [0x18u8, 0x1a] {
+            let mut splitter = IntegrationSplitter::new();
+            let mut bytes = b"\x1bPq#1~~".to_vec();
+            bytes.push(cancel);
+            bytes.extend_from_slice(b"text");
+            let segments = splitter.push(&bytes);
+            assert!(segments.iter().any(|s| matches!(s, Segment::SixelDropped)));
+            assert!(!segments.iter().any(|s| matches!(s, Segment::Sixel { .. })));
+            assert_eq!(plain(&segments), b"text");
         }
     }
 }

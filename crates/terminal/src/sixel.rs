@@ -102,7 +102,7 @@ fn hls(hue: u32, lightness: u32, saturation: u32) -> [u8; 3] {
         return [v, v, v];
     }
     // DEC puts blue at 0 degrees; the usual formula puts red there.
-    let h = f64::from((hue + 240) % 360) / 360.0;
+    let h = f64::from((hue % 360 + 240) % 360) / 360.0;
     let q = if l < 0.5 {
         l * (1.0 + s)
     } else {
@@ -173,39 +173,11 @@ pub fn decode(params: &[u8], data: &[u8], background: [u8; 3]) -> Result<SixelIm
     let mut palette = [[0u8; 3]; REGISTERS];
     palette[..16].copy_from_slice(&DEFAULT_PALETTE);
     let mut colour = palette[0];
-    // Pixels are kept as palette-resolved RGB with a "set" flag, grown as needed.
-    let mut width = 0usize;
-    let mut height = 0usize;
+    let mut canvas = Canvas::default();
     let mut stated: Option<(usize, usize)> = None;
-    let mut pixels: Vec<Option<[u8; 3]>> = Vec::new();
     let mut x = 0usize;
     let mut band = 0usize;
     let mut at = 0usize;
-
-    let mut grow = |pixels: &mut Vec<Option<[u8; 3]>>,
-                    width: &mut usize,
-                    height: &mut usize,
-                    need_w: usize,
-                    need_h: usize|
-     -> Result<(), SixelError> {
-        if need_w > MAX_SIDE || need_h > MAX_SIDE {
-            return Err(SixelError::TooLarge);
-        }
-        if need_w <= *width && need_h <= *height {
-            return Ok(());
-        }
-        let new_w = need_w.max(*width);
-        let new_h = need_h.max(*height);
-        let mut next = vec![None; new_w * new_h];
-        for row in 0..*height {
-            let from = row * *width;
-            next[row * new_w..row * new_w + *width].copy_from_slice(&pixels[from..from + *width]);
-        }
-        *pixels = next;
-        *width = new_w;
-        *height = new_h;
-        Ok(())
-    };
 
     while at < data.len() {
         let byte = data[at];
@@ -222,6 +194,8 @@ pub fn decode(params: &[u8], data: &[u8], background: [u8; 3]) -> Result<SixelIm
                         return Err(SixelError::TooLarge);
                     }
                     stated = Some((w, h));
+                    // The size is known: one allocation instead of growing.
+                    canvas.reserve(w, h)?;
                 }
             }
             b'#' => {
@@ -250,32 +224,12 @@ pub fn decode(params: &[u8], data: &[u8], background: [u8; 3]) -> Result<SixelIm
                 if x.saturating_add(count) > MAX_SIDE {
                     return Err(SixelError::TooLarge);
                 }
-                draw(
-                    &mut grow,
-                    &mut pixels,
-                    &mut width,
-                    &mut height,
-                    sixel - b'?',
-                    x,
-                    count,
-                    band,
-                    colour,
-                )?;
+                canvas.draw(sixel - b'?', x, count, band, colour)?;
                 x += count;
             }
             b'?'..=b'~' => {
                 at += 1;
-                draw(
-                    &mut grow,
-                    &mut pixels,
-                    &mut width,
-                    &mut height,
-                    byte - b'?',
-                    x,
-                    1,
-                    band,
-                    colour,
-                )?;
+                canvas.draw(byte - b'?', x, 1, band, colour)?;
                 x += 1;
             }
             b'$' => {
@@ -299,27 +253,18 @@ pub fn decode(params: &[u8], data: &[u8], background: [u8; 3]) -> Result<SixelIm
     // A stated size is the image's size, as other decoders read it: encoders draw
     // whole six-pixel bands and state the real height, and some state a margin
     // they leave untouched. Pixels drawn past it are cut off.
-    if let Some((w, h)) = stated {
-        grow(&mut pixels, &mut width, &mut height, w, h)?;
-        if w < width || h < height {
-            let mut cropped = Vec::with_capacity(w * h);
-            for row in 0..h {
-                cropped.extend_from_slice(&pixels[row * width..row * width + w]);
-            }
-            pixels = cropped;
-            width = w;
-            height = h;
-        }
-    }
-    if width == 0 || height == 0 || pixels.iter().all(Option::is_none) {
+    let (width, height) = stated.unwrap_or((canvas.width, canvas.height));
+    if width == 0 || height == 0 || !canvas.any_drawn(width, height) {
         return Err(SixelError::Empty);
     }
     let mut rgba = Vec::with_capacity(width * height * 4);
-    for pixel in &pixels {
-        match pixel {
-            Some([r, g, b]) => rgba.extend_from_slice(&[*r, *g, *b, 255]),
-            None if transparent => rgba.extend_from_slice(&[0, 0, 0, 0]),
-            None => rgba.extend_from_slice(&[background[0], background[1], background[2], 255]),
+    for row in 0..height {
+        for column in 0..width {
+            match canvas.get(column, row) {
+                Some([r, g, b]) => rgba.extend_from_slice(&[r, g, b, 255]),
+                None if transparent => rgba.extend_from_slice(&[0, 0, 0, 0]),
+                None => rgba.extend_from_slice(&[background[0], background[1], background[2], 255]),
+            }
         }
     }
     Ok(SixelImage {
@@ -329,42 +274,100 @@ pub fn decode(params: &[u8], data: &[u8], background: [u8; 3]) -> Result<SixelIm
     })
 }
 
-/// Paints `count` copies of one sixel (six vertical pixels, bit 0 on top).
-#[allow(clippy::too_many_arguments)]
-fn draw(
-    grow: &mut impl FnMut(
-        &mut Vec<Option<[u8; 3]>>,
-        &mut usize,
-        &mut usize,
-        usize,
-        usize,
-    ) -> Result<(), SixelError>,
-    pixels: &mut Vec<Option<[u8; 3]>>,
-    width: &mut usize,
-    height: &mut usize,
-    bits: u8,
-    x: usize,
-    count: usize,
-    band: usize,
-    colour: [u8; 3],
-) -> Result<(), SixelError> {
-    if bits == 0 {
-        // Still advances the image's width, as the column exists.
-        return grow(pixels, width, height, x + count, *height);
-    }
-    let top = band * 6;
-    grow(pixels, width, height, x + count, top + 6)?;
-    for bit in 0..6 {
-        if bits & (1 << bit) == 0 {
-            continue;
+/// The pixels drawn so far.
+///
+/// Its storage grows by doubling, up to [`MAX_SIDE`] a side, so drawing an image
+/// band by band or column by column costs time in proportion to its size, never
+/// to its size squared. `width` and `height` are how far drawing reached, which
+/// the storage usually exceeds.
+#[derive(Default)]
+struct Canvas {
+    pixels: Vec<Option<[u8; 3]>>,
+    stride: usize,
+    rows: usize,
+    width: usize,
+    height: usize,
+}
+
+impl Canvas {
+    /// Makes room for at least `need_w` x `need_h` pixels.
+    fn reserve(&mut self, need_w: usize, need_h: usize) -> Result<(), SixelError> {
+        if need_w > MAX_SIDE || need_h > MAX_SIDE {
+            return Err(SixelError::TooLarge);
         }
-        let row = top + bit;
-        let start = row * *width + x;
-        for pixel in &mut pixels[start..start + count] {
-            *pixel = Some(colour);
+        if need_w <= self.stride && need_h <= self.rows {
+            return Ok(());
         }
+        let grow = |have: usize, need: usize| {
+            if need <= have {
+                have
+            } else {
+                need.max(have.saturating_mul(2)).min(MAX_SIDE)
+            }
+        };
+        let stride = grow(self.stride, need_w);
+        let rows = grow(self.rows, need_h);
+        let mut next = vec![None; stride * rows];
+        for row in 0..self.rows {
+            let from = row * self.stride;
+            next[row * stride..row * stride + self.stride]
+                .copy_from_slice(&self.pixels[from..from + self.stride]);
+        }
+        self.pixels = next;
+        self.stride = stride;
+        self.rows = rows;
+        Ok(())
     }
-    Ok(())
+
+    /// Paints `count` copies of one sixel (six vertical pixels, bit 0 on top).
+    fn draw(
+        &mut self,
+        bits: u8,
+        x: usize,
+        count: usize,
+        band: usize,
+        colour: [u8; 3],
+    ) -> Result<(), SixelError> {
+        let top = band * 6;
+        let right = x + count;
+        if bits == 0 {
+            // Still widens the image, as the columns exist.
+            self.reserve(right, self.rows)?;
+            self.width = self.width.max(right);
+            return Ok(());
+        }
+        self.reserve(right, top + 6)?;
+        for bit in 0..6 {
+            if bits & (1 << bit) == 0 {
+                continue;
+            }
+            let row = top + bit;
+            let start = row * self.stride + x;
+            for pixel in &mut self.pixels[start..start + count] {
+                *pixel = Some(colour);
+            }
+        }
+        self.width = self.width.max(right);
+        self.height = self.height.max(top + 6);
+        Ok(())
+    }
+
+    fn get(&self, column: usize, row: usize) -> Option<[u8; 3]> {
+        if column >= self.stride || row >= self.rows {
+            return None;
+        }
+        self.pixels[row * self.stride + column]
+    }
+
+    /// Whether any pixel inside `width` x `height` was drawn.
+    fn any_drawn(&self, width: usize, height: usize) -> bool {
+        (0..height.min(self.rows)).any(|row| {
+            let from = row * self.stride;
+            self.pixels[from..from + width.min(self.stride)]
+                .iter()
+                .any(Option::is_some)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -464,6 +467,30 @@ mod tests {
         // A repeat cut off at the end draws what came before it.
         let image = decode(b"0;1", b"#1~!5", WHITE).expect("decodes the first column");
         assert_eq!(image.width, 1);
+    }
+
+    #[test]
+    fn a_saturated_hls_hue_is_a_colour_and_not_a_crash() {
+        let image = decode(b"0;1", b"#1;1;4294967295;50;50#1~", WHITE).expect("decodes");
+        assert_eq!(pixel(&image, 0, 0)[3], 255);
+    }
+
+    #[test]
+    fn the_largest_image_drawn_band_by_band_decodes_in_linear_time() {
+        // One full-width band, then 681 more one column wide: before, every band
+        // copied the whole image again.
+        let mut data = b"#1!4095~".to_vec();
+        for _ in 0..681 {
+            data.extend_from_slice(b"-~");
+        }
+        let started = std::time::Instant::now();
+        let image = decode(b"0;1", &data, WHITE).expect("decodes");
+        assert_eq!((image.width, image.height), (4095, 4092));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

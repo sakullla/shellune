@@ -1508,6 +1508,11 @@ impl TerminalPane {
     pub fn close(&mut self, cx: &mut Context<Self>) -> Option<SerialClose> {
         // The log is written to the end of what arrived before the source goes (R3).
         drop(self.log.take());
+        // Image textures live in the window's atlas, not in the pane: they are let
+        // go with it, or a window that opens and closes terminals keeps them (R4).
+        for (_, image) in self.image_cache.get_mut().drain() {
+            cx.drop_image(image, None);
+        }
         let mut closed = None;
         match self.source.as_mut() {
             Some(PaneSource::Serial(link)) => {
@@ -6704,7 +6709,7 @@ impl TerminalPane {
     /// Each image is converted to the GPU's format once and kept by id; an image
     /// that left the screen is let go here, texture included, so scrolling a long
     /// history of images does not keep them all.
-    fn image_layer(&self, snapshot: &Snapshot, window: &mut Window) -> Option<gpui::Canvas<()>> {
+    fn image_layer(&self, snapshot: &Snapshot, window: &mut Window) -> Option<gpui::Div> {
         let mut cache = self.image_cache.borrow_mut();
         let visible: std::collections::HashSet<u64> =
             snapshot.images.iter().map(|image| image.id).collect();
@@ -6745,15 +6750,53 @@ impl TerminalPane {
                 (bounds, image)
             })
             .collect();
-        Some(canvas(
-            |_, _, _| (),
-            move |bounds, _, window, _| {
-                for (at, image) in placed {
-                    let target = Bounds::new(bounds.origin + at.origin, at.size);
-                    let _ = window.paint_image(target, gpui::Corners::default(), image, 0, false);
-                }
-            },
-        ))
+        // Laid over the rows, from the grid's own top left corner: in the rows'
+        // flow it would start below the last row and every image would land a whole
+        // grid lower than its cells.
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .debug_selector(|| "terminal.images".to_owned())
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            for (at, image) in placed {
+                                let target = Bounds::new(bounds.origin + at.origin, at.size);
+                                let _ = window.paint_image(
+                                    target,
+                                    gpui::Corners::default(),
+                                    image,
+                                    0,
+                                    false,
+                                );
+                            }
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                ),
+        )
+    }
+
+    /// Where the last frame drew each image, relative to the grid's top left
+    /// corner, for tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn image_origins_for_test(&self) -> Vec<gpui::Point<Pixels>> {
+        let cell = self.cell.sanitized();
+        self.core
+            .snapshot()
+            .images
+            .iter()
+            .map(|image| {
+                point(
+                    px(image.column as f32 * cell.width),
+                    px(image.row as f32 * cell.height),
+                )
+            })
+            .collect()
     }
 
     /// Scrolls the history by `lines` (positive is back), for tests.

@@ -229,6 +229,46 @@ pub struct RenderedRow {
 /// oldest images are dropped first.
 pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Most images one terminal keeps, however small (R4). Each costs work on every
+/// read, so a flood of tiny images is bounded too; past it the oldest go first.
+pub const MAX_IMAGES: usize = 256;
+
+/// What a clearing sequence takes away (R4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageClear {
+    /// ED 2: the screen.
+    Screen,
+    /// ED 3: the history.
+    History,
+    /// RIS: everything, on both screens.
+    Reset,
+}
+
+/// The clearing sequences in `bytes`, each with the screen it was sent to,
+/// following the alternate-screen switches in between.
+fn screen_clears(bytes: &[u8], mut alternate: bool) -> Vec<(bool, ImageClear)> {
+    const ENTER: [&[u8]; 3] = [b"\x1b[?1049h", b"\x1b[?1047h", b"\x1b[?47h"];
+    const LEAVE: [&[u8]; 3] = [b"\x1b[?1049l", b"\x1b[?1047l", b"\x1b[?47l"];
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(offset) = bytes[at..].iter().position(|byte| *byte == 0x1b) {
+        let rest = &bytes[at + offset..];
+        if ENTER.iter().any(|seq| rest.starts_with(seq)) {
+            alternate = true;
+        } else if LEAVE.iter().any(|seq| rest.starts_with(seq)) {
+            alternate = false;
+        } else if rest.starts_with(b"\x1b[2J") {
+            found.push((alternate, ImageClear::Screen));
+        } else if rest.starts_with(b"\x1b[3J") {
+            found.push((alternate, ImageClear::History));
+        } else if rest.starts_with(b"\x1bc") {
+            found.push((alternate, ImageClear::Reset));
+        }
+        at += offset + 1;
+    }
+    found
+}
+
 /// An image on screen, for the view to draw (R4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VisibleImage {
@@ -697,6 +737,8 @@ pub struct TerminalCore {
     next_image: u64,
     /// The size of one cell in the pixels images are measured in (R4).
     cell_pixels: (f32, f32),
+    /// Which screen the grid showed after the last output, to see it switch (R4).
+    last_alternate: bool,
 }
 
 impl TerminalCore {
@@ -731,6 +773,7 @@ impl TerminalCore {
             images: Vec::new(),
             next_image: 1,
             cell_pixels: (8.0, 16.0),
+            last_alternate: false,
         }
     }
 
@@ -770,39 +813,52 @@ impl TerminalCore {
         if bytes.is_empty() {
             return TerminalEffects::default();
         }
-        if self.images.is_empty() {
-            return self.feed_segments(bytes);
-        }
-        // Clearing the screen or resetting the terminal takes the images with it
-        // (R4). Erasing blank rows leaves no trace in the text, so the sequences
-        // are looked for here rather than read back from the grid.
-        let reset = contains(bytes, b"\x1bc");
-        let scrollback = reset || contains(bytes, b"\x1b[3J");
-        let screen = scrollback || contains(bytes, b"\x1b[2J");
-        if screen {
-            self.clear_images(scrollback);
-        }
-        let was_alternate = self.on_alternate_screen();
         let effects = self.feed_segments(bytes);
-        if was_alternate != self.on_alternate_screen() {
-            // Entering or leaving the alternate screen starts it fresh.
+        if !self.images.is_empty() {
+            self.drop_stale_images();
+        }
+        effects
+    }
+
+    /// Output for the grid, with what it does to images (R4).
+    ///
+    /// Clearing the screen or resetting the terminal takes the images with it.
+    /// Erasing blank rows leaves no trace in the text, so the sequences are found
+    /// in the bytes, each with the screen it was sent to: a program that switches
+    /// to the alternate screen and clears it in one write clears that screen, not
+    /// the one it left.
+    fn feed_output(&mut self, bytes: &[u8], plain_ascii: bool) -> TerminalEffects {
+        if !self.images.is_empty() && !plain_ascii {
+            for (alternate, clear) in screen_clears(bytes, self.on_alternate_screen()) {
+                self.clear_images(alternate, clear);
+            }
+        }
+        let effects = self.feed_grid(bytes, plain_ascii);
+        self.note_screen();
+        effects
+    }
+
+    /// Entering or leaving the alternate screen starts it fresh, so its images go;
+    /// the primary screen's stay for when it is shown again.
+    fn note_screen(&mut self) {
+        let alternate = self.on_alternate_screen();
+        if alternate != self.last_alternate {
+            self.last_alternate = alternate;
             self.images.retain(|image| !image.alternate);
         }
-        self.drop_stale_images();
-        effects
     }
 
     fn feed_segments(&mut self, bytes: &[u8]) -> TerminalEffects {
         if self.splitter.can_pass_through(bytes) {
             let plain_ascii = bytes.len() >= 256 && bytes.is_ascii() && !bytes.contains(&0x1b);
-            return self.feed_grid(bytes, plain_ascii);
+            return self.feed_output(bytes, plain_ascii);
         }
         let segments = self.splitter.push(bytes);
         let mut effects = TerminalEffects::default();
         for segment in segments {
             match segment {
                 Segment::Bytes(chunk) => {
-                    merge_effects(&mut effects, self.feed_grid(&chunk, false));
+                    merge_effects(&mut effects, self.feed_output(&chunk, false));
                 }
                 Segment::Event(event) => {
                     self.note_history();
@@ -913,7 +969,8 @@ impl TerminalCore {
             covered,
         });
         let mut total: usize = self.images.iter().map(PlacedImage::bytes).sum();
-        while total > MAX_IMAGE_BYTES && !self.images.is_empty() {
+        while (total > MAX_IMAGE_BYTES || self.images.len() > MAX_IMAGES) && !self.images.is_empty()
+        {
             total -= self.images.remove(0).bytes();
         }
         effects
@@ -921,15 +978,32 @@ impl TerminalCore {
 
     /// Drops the images on the current screen (and, with `scrollback`, in its
     /// history too).
-    fn clear_images(&mut self, scrollback: bool) {
-        let alternate = self.on_alternate_screen();
+    fn clear_images(&mut self, alternate: bool, clear: ImageClear) {
+        if clear == ImageClear::Reset {
+            self.images.clear();
+            return;
+        }
+        if alternate != self.on_alternate_screen() {
+            // A clear sent to the screen that is not the one the grid shows yet
+            // (it was switched to earlier in the same write): that screen's images
+            // go, all of them, as its history cannot be told apart from here.
+            self.images.retain(|image| image.alternate != alternate);
+            return;
+        }
         let history = self.term.grid().history_size() as i64;
         let first_on_screen = history + self.lines_dropped;
         self.images.retain(|image| {
             if image.alternate != alternate {
                 return true;
             }
-            !scrollback && image.stable + image.rows as i64 <= first_on_screen
+            let in_history = image.stable + image.rows as i64 <= first_on_screen;
+            match clear {
+                // ED 2 erases the screen; images wholly in history stay.
+                ImageClear::Screen => in_history,
+                // ED 3 erases the history; images on screen stay.
+                ImageClear::History => !in_history,
+                ImageClear::Reset => false,
+            }
         });
     }
 
@@ -940,13 +1014,15 @@ impl TerminalCore {
         self.images = images
             .into_iter()
             .filter(|image| {
+                // The other screen's images are judged when it is shown: its rows
+                // are not the grid's rows now.
+                if image.alternate != alternate {
+                    return true;
+                }
                 // Its bottom row rotated out of the kept history: so did the rest.
                 let last = image.stable + image.rows as i64 - 1;
                 if self.line_from_stable(last).is_none() {
                     return false;
-                }
-                if image.alternate != alternate {
-                    return true;
                 }
                 image.covered.iter().enumerate().all(|(offset, hash)| {
                     match self.line_from_stable(image.stable + offset as i64) {
@@ -4243,5 +4319,53 @@ mod tests {
         let _ = effects;
         terminal.feed(b"x");
         assert_eq!(terminal.snapshot().row_text(0).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn a_full_screen_program_leaves_the_primary_screen_images_in_place() {
+        let mut terminal = core_with_cells();
+        for index in 0..50 {
+            terminal.feed(format!("line {index}\r\n").as_bytes());
+        }
+        terminal.feed(&sixel(16, 32));
+        let before = terminal.snapshot().images;
+        assert_eq!(before.len(), 1);
+        // What vim and less send in one write: switch, home, clear.
+        terminal.feed(b"\x1b[?1049h\x1b[H\x1b[2Jeditor");
+        assert!(
+            terminal.snapshot().images.is_empty(),
+            "not on the alternate screen"
+        );
+        terminal.feed(b"\x1b[2J\x1b[Hmore editor");
+        terminal.feed(b"\x1b[?1049l");
+        assert_eq!(terminal.snapshot().images, before, "back where it was");
+    }
+
+    #[test]
+    fn an_image_drawn_right_after_entering_the_alternate_screen_stays_there() {
+        let mut terminal = core_with_cells();
+        let mut bytes = b"\x1b[?1049h".to_vec();
+        bytes.extend_from_slice(&sixel(8, 8));
+        terminal.feed(&bytes);
+        assert_eq!(terminal.snapshot().images.len(), 1);
+    }
+
+    #[test]
+    fn erasing_the_history_keeps_the_image_on_screen() {
+        let mut terminal = core_with_cells();
+        terminal.feed(&sixel(8, 8));
+        terminal.feed(b"\x1b[3J");
+        assert_eq!(terminal.image_count(), 1);
+    }
+
+    #[test]
+    fn a_flood_of_tiny_images_is_held_to_the_image_limit() {
+        let mut terminal = TerminalCore::new(40, 10, 10_000);
+        terminal.set_cell_pixels(8.0, 16.0);
+        let tiny = sixel(1, 6);
+        for _ in 0..(MAX_IMAGES + 50) {
+            terminal.feed(&tiny);
+        }
+        assert!(terminal.image_count() <= MAX_IMAGES);
     }
 }
