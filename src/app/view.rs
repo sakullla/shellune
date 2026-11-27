@@ -6328,6 +6328,10 @@ impl ShelluneView {
         match &open.content {
             PaneContent::Terminal(pane) => {
                 let pane = pane.clone();
+                // A log is closed first and its last write is checked, so a failure
+                // that only showed at the end is still reported (R3).
+                let log = pane.update(cx, |pane, cx| pane.stop_log(cx));
+                self.report_log_end(log, cx);
                 closed = pane.update(cx, |pane, cx| pane.close(cx));
             }
             PaneContent::Desktop(pane) => {
@@ -6589,6 +6593,7 @@ impl ShelluneView {
     /// session. Running it twice is harmless.
     fn end_session_surface(&mut self, id: SessionId, cx: &mut Context<Self>) {
         let mut closed = None;
+        let mut log_ends = Vec::new();
         for open in self.panes.iter().filter(|open| open.tag.session == id) {
             match &open.content {
                 PaneContent::Desktop(pane) => pane.update(cx, |pane, cx| pane.stop(cx)),
@@ -6597,9 +6602,14 @@ impl ShelluneView {
                 // thread and the queue of bytes waiting for the device outlive the
                 // session, and the port stays held by a line nothing is talking over.
                 PaneContent::Terminal(pane) => {
+                    let log = pane.update(cx, |pane, cx| pane.stop_log(cx));
+                    log_ends.push(log);
                     closed = pane.update(cx, |pane, cx| pane.release_serial(cx));
                 }
             }
+        }
+        for log in log_ends {
+            self.report_log_end(log, cx);
         }
         self.raise_serial_close(closed, cx);
     }
@@ -12920,6 +12930,14 @@ impl ShelluneView {
             };
             let _ = this.update(cx, |view, cx| {
                 view.last_log_dir = path.parent().map(std::path::Path::to_owned);
+                // The terminal may have closed, or been replaced by a reconnect, while
+                // the dialog was open: a log is only started on the one still shown.
+                if view
+                    .pane_for(id)
+                    .is_none_or(|current| current.entity_id() != pane.entity_id())
+                {
+                    return;
+                }
                 let started = pane.update(cx, |pane, cx| pane.start_log(&path, format, cx));
                 let ux = copy::ux();
                 match started {
@@ -12942,26 +12960,35 @@ impl ShelluneView {
         let Some(pane) = self.pane_for(id).cloned() else {
             return;
         };
-        let Some(report) = pane.update(cx, |pane, cx| pane.stop_log(cx)) else {
+        let report = pane.update(cx, |pane, cx| pane.stop_log(cx));
+        self.report_log_end(report, cx);
+    }
+
+    /// Says how a log ended (R3): saved, saved with bytes the disk could not take,
+    /// or stopped by a failure, which is never called "saved".
+    fn report_log_end(
+        &mut self,
+        report: Option<shellune_terminal::LogReport>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(report) = report else {
             return;
         };
         let ux = copy::ux();
-        let title = copy::fill(
-            ux.terminal_log_stopped,
-            &[("name", &file_label(&report.path))],
-        );
+        let name = file_label(&report.path);
+        if let Some(reason) = report.error {
+            let title = copy::fill(ux.terminal_log_failed, &[("name", &name)]);
+            self.toast(Tone::Danger, title, Some(reason), cx);
+            return;
+        }
+        let title = copy::fill(ux.terminal_log_stopped, &[("name", &name)]);
         let detail = (report.dropped > 0).then(|| {
             copy::fill(
                 ux.terminal_log_dropped,
                 &[("bytes", &report.dropped.to_string())],
             )
         });
-        let tone = if report.error.is_some() {
-            Tone::Danger
-        } else {
-            Tone::Positive
-        };
-        self.toast(tone, title, report.error.or(detail), cx);
+        self.toast(Tone::Positive, title, detail, cx);
     }
 
     /// Goes to the terminal whose notification was clicked (R2), if it is still open.

@@ -92,9 +92,10 @@ impl SessionLog {
         let (sender, receiver) = sync_channel(QUEUE);
         let shared = Arc::new(Shared::default());
         let thread_shared = shared.clone();
+        let target = Target::of(path, &file)?;
         let writer = std::thread::Builder::new()
             .name("session-log".to_owned())
-            .spawn(move || write_loop(file, format, &receiver, &thread_shared))?;
+            .spawn(move || write_loop(file, format, &target, &receiver, &thread_shared))?;
         Ok(Self {
             path: path.to_owned(),
             format,
@@ -195,15 +196,93 @@ impl std::fmt::Debug for SessionLog {
     }
 }
 
-fn write_loop(file: File, format: LogFormat, receiver: &Receiver<Message>, shared: &Shared) {
+/// How often the writer checks that its file is still where, and what, it was.
+pub const TARGET_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The file a log writes to, as it was when the log started (R3).
+///
+/// Writing to an open file goes on succeeding after its folder is made read-only,
+/// after it is deleted, or after another file takes its name: the operating system
+/// checks access when a file is opened, not on each write. A log that went on like
+/// that would be writing into nothing, so the writer checks the path itself every
+/// [`TARGET_CHECK_INTERVAL`] while output arrives, and once more before it closes.
+struct Target {
+    path: PathBuf,
+    #[cfg(unix)]
+    identity: (u64, u64),
+}
+
+impl Target {
+    fn of(path: &Path, file: &File) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file.metadata()?;
+            (metadata.dev(), metadata.ino())
+        };
+        #[cfg(not(unix))]
+        let _ = file;
+        Ok(Self {
+            path: path.to_owned(),
+            #[cfg(unix)]
+            identity,
+        })
+    }
+
+    /// Why the file can no longer be written as the user chose it, if it cannot.
+    fn problem(&self) -> Option<String> {
+        let Ok(metadata) = std::fs::metadata(&self.path) else {
+            return Some(format!("{} no longer exists", self.path.display()));
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if (metadata.dev(), metadata.ino()) != self.identity {
+                return Some(format!(
+                    "{} was replaced by another file",
+                    self.path.display()
+                ));
+            }
+        }
+        // A character device such as /dev/null has no meaningful write bits to check.
+        if !metadata.is_file() {
+            return None;
+        }
+        if metadata.permissions().readonly() {
+            return Some(format!("{} was made read-only", self.path.display()));
+        }
+        let folder = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        match std::fs::metadata(folder) {
+            Ok(folder_metadata) if folder_metadata.permissions().readonly() => Some(format!(
+                "the folder {} no longer accepts writes",
+                folder.display()
+            )),
+            Ok(_) => None,
+            Err(_) => Some(format!("the folder {} no longer exists", folder.display())),
+        }
+    }
+}
+
+fn write_loop(
+    file: File,
+    format: LogFormat,
+    target: &Target,
+    receiver: &Receiver<Message>,
+    shared: &Shared,
+) {
     let mut out = BufWriter::new(file);
     let mut plain = PlainText::default();
-    let fail = |error: std::io::Error| {
+    let fail = |reason: String| {
         if let Ok(mut slot) = shared.error.lock() {
-            *slot = Some(error.to_string());
+            *slot = Some(reason);
         }
         shared.failed.store(true, Ordering::Release);
     };
+    let mut checked = std::time::Instant::now();
     while let Ok(message) = receiver.recv() {
         let bytes = match message {
             Message::Bytes(bytes) => bytes,
@@ -220,13 +299,25 @@ fn write_loop(file: File, format: LogFormat, receiver: &Receiver<Message>, share
             }
         };
         if let Err(error) = written {
-            fail(error);
+            fail(error.to_string());
+            continue;
+        }
+        if checked.elapsed() >= TARGET_CHECK_INTERVAL {
+            checked = std::time::Instant::now();
+            if let Some(reason) = target.problem() {
+                fail(reason);
+            }
         }
     }
-    if !shared.failed.load(Ordering::Acquire)
-        && let Err(error) = out.flush().and_then(|()| out.get_ref().sync_all())
-    {
-        fail(error);
+    if shared.failed.load(Ordering::Acquire) {
+        return;
+    }
+    if let Some(reason) = target.problem() {
+        fail(reason);
+        return;
+    }
+    if let Err(error) = out.flush().and_then(|()| out.get_ref().sync_all()) {
+        fail(error.to_string());
     }
 }
 
@@ -342,6 +433,75 @@ mod tests {
             log.write(b"before close");
         }
         assert_eq!(std::fs::read(&path).expect("reads"), b"before close");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Writes until the log reports a problem, or gives up after a few seconds.
+    fn write_until_failed(log: &mut SessionLog) -> Option<String> {
+        for _ in 0..100 {
+            log.write(b"more output\r\n");
+            if let Some(found) = log.poll_error() {
+                return Some(found);
+            }
+            std::thread::sleep(TARGET_CHECK_INTERVAL / 5);
+        }
+        None
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_made_read_only_while_logging_stops_the_log() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("readonly");
+        let folder = dir.join("logs");
+        std::fs::create_dir_all(&folder).expect("a folder");
+        let mut log = SessionLog::start(&folder.join("out.log"), LogFormat::Plain).expect("starts");
+        log.write(b"before\r\n");
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555))
+            .expect("the folder is made read-only");
+        let reason = write_until_failed(&mut log);
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755))
+            .expect("the folder is writable again");
+        let reason = reason.expect("the log noticed");
+        assert!(reason.contains("no longer accepts writes"), "{reason}");
+        assert!(log.stop().error.is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_log_whose_folder_was_deleted_stops_instead_of_writing_into_nothing() {
+        let dir = scratch("deleted");
+        let folder = dir.join("logs");
+        std::fs::create_dir_all(&folder).expect("a folder");
+        let mut log = SessionLog::start(&folder.join("out.log"), LogFormat::Raw).expect("starts");
+        log.write(b"before");
+        if std::fs::remove_dir_all(&folder).is_err() {
+            // A platform that refuses to delete an open file's folder keeps it.
+            drop(log.stop());
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        }
+        let reason = write_until_failed(&mut log).expect("the log noticed");
+        assert!(reason.contains("no longer exists"), "{reason}");
+        let report = log.stop();
+        assert!(
+            report.error.is_some(),
+            "stopping does not claim it was saved"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_log_whose_file_was_removed_reports_it_when_stopped() {
+        let dir = scratch("removed-at-stop");
+        let path = dir.join("out.log");
+        let log = SessionLog::start(&path, LogFormat::Raw).expect("starts");
+        log.write(b"short");
+        std::fs::remove_file(&path).expect("removed");
+        assert!(
+            log.stop().error.is_some(),
+            "the last check before closing sees it"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

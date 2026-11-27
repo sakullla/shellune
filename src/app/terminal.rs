@@ -2294,10 +2294,13 @@ impl TerminalPane {
     }
 
     /// Stops the running log, writing what it was given (R3).
+    ///
+    /// A terminal without a log is left untouched: the window asks every terminal of
+    /// an ending session, and a redraw requested here would make it ask again.
     pub fn stop_log(&mut self, cx: &mut Context<Self>) -> Option<LogReport> {
-        let report = self.log.take().map(SessionLog::stop);
+        let report = self.log.take().map(SessionLog::stop)?;
         cx.notify();
-        report
+        Some(report)
     }
 
     /// The file this terminal is logging to and how, while it is (R3).
@@ -5213,6 +5216,7 @@ impl TerminalPane {
             .flex_none()
             .items_center()
             .gap(metrics.scale(spacing::HALF))
+            .children(self.log_badge(metrics))
             .debug_selector(|| "terminal.bar.tools".to_owned())
             .when(!has_slot, |row| {
                 row.child(self.search_button(metrics, strings, cx)).child(
@@ -6664,8 +6668,8 @@ impl TerminalPane {
         )
     }
 
-    /// A small badge at the top left of the grid while this terminal's output is
-    /// being logged, with the file in its tooltip (R3).
+    /// A small badge in the terminal's bar while its output is being logged, with the
+    /// file in its tooltip (R3). It sits with the bar's tools, never over the grid.
     fn log_badge(&self, metrics: Metrics) -> Option<gpui::Stateful<gpui::Div>> {
         let (path, _format) = self.logging()?;
         let ux = crate::app::copy::ux_for(self.locale);
@@ -6674,10 +6678,8 @@ impl TerminalPane {
             div()
                 .id("terminal.log.indicator")
                 .debug_selector(|| "terminal.log.indicator".to_owned())
-                .absolute()
-                .left(metrics.scale(spacing::SNUG))
-                .top(metrics.scale(spacing::SNUG))
                 .flex()
+                .flex_none()
                 .items_center()
                 .gap(metrics.scale(spacing::HALF))
                 .px(metrics.scale(spacing::SNUG))
@@ -7640,8 +7642,7 @@ impl Render for TerminalPane {
                     .child(self.viewport(window, cx))
                     .children(self.scrollback_thumb(cx))
                     .children(self.scroll_bottom_pill(metrics, show_blocks, cx))
-                    .children(self.link_target_hint(metrics))
-                    .children(self.log_badge(metrics)),
+                    .children(self.link_target_hint(metrics)),
             )
             // A serial line states itself above the bar: its device, its settings and
             // the two send habits are what a person changes while the session runs, and

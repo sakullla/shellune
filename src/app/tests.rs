@@ -22248,9 +22248,11 @@ async fn a_local_terminal_logs_through_its_menu_and_shows_that_it_does(cx: &mut 
         Some((target.clone(), shellune_terminal::LogFormat::Raw))
     );
     redraw(cx);
+    let badge = bounds_of(cx, "terminal.log.indicator");
+    let bar = bounds_of(cx, "terminal.bar");
     assert!(
-        cx.debug_bounds("terminal.log.indicator").is_some(),
-        "a logging terminal says so"
+        bar.contains(&badge.origin) && bar.contains(&badge.bottom_right()),
+        "the badge sits in the bar, never over the grid: {badge:?} in {bar:?}"
     );
 
     feed_session(cx, &view, id, b"\x1b[1mraw\x1b[0m bytes\r\n");
@@ -22508,6 +22510,47 @@ async fn a_log_that_fails_to_write_stops_and_the_terminal_carries_on(cx: &mut Te
             .any(|line| line.contains("still here")),
         "the terminal carries on"
     );
+    let before = cx.update(|_window, app| pane.read(app).sent().len());
+    cx.update(|_window, app| pane.update(app, |pane, cx| pane.type_text("ls", cx)));
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| pane.read(app).sent().len()) > before,
+        "the terminal still takes input"
+    );
+}
+
+#[gpui::test]
+async fn closing_a_logging_terminal_keeps_everything_it_showed(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let id = cx
+        .update(|_window, app| view.read(app).active_session())
+        .expect("a shell");
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("its terminal");
+    let dir = log_dir("close");
+    let path = dir.join("closed.log");
+    let started = cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.start_log(&path, shellune_terminal::LogFormat::Plain, cx)
+        })
+    });
+    assert_eq!(started, Ok(()));
+    feed_session(cx, &view, id, b"line one\r\nline two\r\n");
+    cx.update(|_window, app| view.update(app, |view, cx| view.close_session(id, cx)));
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).pane_of(id).is_none()));
+    let text = std::fs::read_to_string(&path).expect("the log was written");
+    assert!(text.contains("line one\nline two\n"), "{text:?}");
+    assert!(
+        cx.update(|_window, app| view.read(app).toast_titles())
+            .iter()
+            .any(|title| title.contains("closed.log")),
+        "closing says where the log is"
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
