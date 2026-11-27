@@ -7,14 +7,14 @@
 //! menu adds a way to reach them, not a second behaviour.
 
 use gpui::prelude::*;
-use gpui::{Context, Div, Pixels, Point, Window, div};
+use gpui::{Context, Div, FocusHandle, KeyDownEvent, Pixels, Point, Window, div};
 
 use super::{ShelluneView, overlay_layer};
 use crate::app::components;
 use crate::app::copy;
 use crate::app::files::FileSource;
 use crate::app::icons::Icon;
-use crate::app::theme::{Tone, spacing};
+use crate::app::theme::{self, Tone, palette, spacing};
 use shellune_core::{FileKind, SessionId};
 
 /// What the menu was opened on.
@@ -25,6 +25,10 @@ pub(super) struct FilesMenu {
     /// The item, or `None` for the empty part of the list.
     pub(super) entry: Option<MenuEntry>,
     pub(super) position: Point<Pixels>,
+    /// Index among actionable (non-divider) menu lines currently highlighted by keyboard.
+    pub(super) selected: usize,
+    /// Focus handle so arrow keys, Enter and Escape drive the open menu.
+    pub(super) focus: FocusHandle,
 }
 
 #[derive(Clone, Debug)]
@@ -72,11 +76,15 @@ impl ShelluneView {
             source,
             entry,
             position,
+            selected: 0,
+            focus: cx.focus_handle(),
         });
+        self.files_menu_focus_pending = true;
         cx.notify();
     }
 
     pub(super) fn close_files_menu(&mut self, cx: &mut Context<Self>) {
+        self.files_menu_focus_pending = false;
         if self.files_menu.take().is_some() {
             cx.notify();
         }
@@ -117,17 +125,9 @@ impl ShelluneView {
         }
     }
 
-    /// The menu, when one is open.
-    pub(super) fn files_menu_overlay(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Option<Div> {
-        let menu = self.files_menu.clone()?;
-        let metrics = self.metrics();
+    fn files_menu_lines(&self, menu: &FilesMenu) -> Vec<Line> {
         let strings = self.strings();
         let ux = copy::ux();
-        let viewport = window.viewport_size();
         let id = menu.session;
         let source = menu.source;
 
@@ -145,6 +145,49 @@ impl ShelluneView {
                         "files.menu.open",
                         Box::new(move |view, cx| view.files_enter(id, source, &open, cx)),
                     )));
+                    let across = name.clone();
+                    match source {
+                        FileSource::Remote => {
+                            let download = name.clone();
+                            lines.push(Some((
+                                strings.files_to_local,
+                                Icon::ChevronLeft,
+                                false,
+                                "files.menu.to_local",
+                                Box::new(move |view, cx| {
+                                    let _ = view.files_transfer_folder_named(
+                                        id,
+                                        FileSource::Remote,
+                                        &across,
+                                        cx,
+                                    );
+                                }),
+                            )));
+                            lines.push(Some((
+                                strings.transfers_download,
+                                Icon::Download,
+                                false,
+                                "files.menu.download",
+                                Box::new(move |view, cx| {
+                                    view.files_ask_download_folder(id, &download, cx)
+                                }),
+                            )));
+                        }
+                        FileSource::Local => lines.push(Some((
+                            strings.files_to_remote,
+                            Icon::Upload,
+                            false,
+                            "files.menu.to_remote",
+                            Box::new(move |view, cx| {
+                                let _ = view.files_transfer_folder_named(
+                                    id,
+                                    FileSource::Local,
+                                    &across,
+                                    cx,
+                                );
+                            }),
+                        ))),
+                    }
                 } else {
                     let across = name.clone();
                     match source {
@@ -262,19 +305,145 @@ impl ShelluneView {
                 )));
             }
         }
+        lines
+    }
+
+    pub(super) fn files_menu_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(menu) = self.files_menu.clone() else {
+            return false;
+        };
+        let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+        let lines = self.files_menu_lines(&menu);
+        let actions: Vec<Action> = lines
+            .into_iter()
+            .filter_map(|line| line.map(|(_, _, _, _, action)| action))
+            .collect();
+        let count = actions.len();
+        if count == 0 {
+            return false;
+        }
+        let step = |current: usize, delta: isize| -> usize {
+            ((current as isize + delta).rem_euclid(count as isize)) as usize
+        };
+        match key {
+            "down" if !modifiers.modified() => {
+                if let Some(active) = &mut self.files_menu {
+                    active.selected = step(active.selected.min(count - 1), 1);
+                }
+                cx.notify();
+                true
+            }
+            "up" if !modifiers.modified() => {
+                if let Some(active) = &mut self.files_menu {
+                    active.selected = step(active.selected.min(count - 1), -1);
+                }
+                cx.notify();
+                true
+            }
+            "tab" if !modifiers.control && !modifiers.alt && !modifiers.platform => {
+                let delta = if modifiers.shift { -1 } else { 1 };
+                if let Some(active) = &mut self.files_menu {
+                    active.selected = step(active.selected.min(count - 1), delta);
+                }
+                cx.notify();
+                true
+            }
+            "home" if !modifiers.modified() => {
+                if let Some(active) = &mut self.files_menu {
+                    active.selected = 0;
+                }
+                cx.notify();
+                true
+            }
+            "end" if !modifiers.modified() => {
+                if let Some(active) = &mut self.files_menu {
+                    active.selected = count - 1;
+                }
+                cx.notify();
+                true
+            }
+            "enter" | "space" if !modifiers.modified() => {
+                let index = menu.selected.min(count - 1);
+                let source = menu.source;
+                self.files_menu = None;
+                self.files_menu_focus_pending = false;
+                actions[index](self, cx);
+                if self.files_dialog.is_none() {
+                    let focus = self.files_panel_focus(source).clone();
+                    window.focus(&focus);
+                }
+                cx.notify();
+                true
+            }
+            "escape" => {
+                let source = menu.source;
+                self.close_files_menu(cx);
+                let focus = self.files_panel_focus(source).clone();
+                window.focus(&focus);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The menu, when one is open.
+    pub(super) fn files_menu_overlay(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let menu = self.files_menu.clone()?;
+        let metrics = self.metrics();
+        let viewport = window.viewport_size();
+        let lines = self.files_menu_lines(&menu);
+        let action_count = lines.iter().filter(|line| line.is_some()).count();
+        let selected = if action_count == 0 {
+            0
+        } else {
+            menu.selected.min(action_count - 1)
+        };
 
         // The shared menu card and entries: the file view's menu is the same object as
         // the tab's and the terminal's (R6).
-        let mut list = components::menu_card("files.menu", metrics);
+        let mut list = components::menu_card("files.menu", metrics)
+            .track_focus(&menu.focus)
+            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                if view.files_menu_key(event, window, cx) {
+                    cx.stop_propagation();
+                }
+            }));
+        let mut action_index = 0usize;
         for line in lines {
             let Some((label, icon, danger, selector, action)) = line else {
                 list = list.child(components::menu_divider(metrics));
                 continue;
             };
+            let current = action_index;
+            action_index += 1;
+            let is_selected = current == selected;
             list = list.child(
                 components::menu_entry(label, selector, Some(icon), true, danger, metrics)
+                    .when(is_selected, |el| {
+                        el.bg(theme::swatch(palette::SURFACE_HOVER))
+                    })
+                    .on_hover(cx.listener(move |view, hovered: &bool, _window, cx| {
+                        if *hovered
+                            && let Some(active) = &mut view.files_menu
+                            && active.selected != current
+                        {
+                            active.selected = current;
+                            cx.notify();
+                        }
+                    }))
                     .on_click(cx.listener(move |view, _event, _window, cx| {
                         view.files_menu = None;
+                        view.files_menu_focus_pending = false;
                         action(view, cx);
                         cx.notify();
                     })),

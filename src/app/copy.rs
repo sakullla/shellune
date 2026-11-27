@@ -3427,6 +3427,24 @@ pub struct UxStrings {
     pub files_go_to_action: &'static str,
     /// Action to clear completed and cancelled transfers
     pub transfers_clear_finished: &'static str,
+    /// Action to cancel all active transfers in the strip
+    pub transfers_cancel_all: &'static str,
+    /// Action to retry all failed transfers in the strip
+    pub transfers_retry_failed: &'static str,
+    /// Batch overwrite choice: keep existing for all conflicts
+    pub transfers_overwrite_keep_all: &'static str,
+    /// Batch overwrite choice: replace for all conflicts
+    pub transfers_overwrite_replace_all: &'static str,
+    /// File browser toolbar toggle to show dotfiles
+    pub files_show_hidden: &'static str,
+    /// File browser toolbar toggle to hide dotfiles
+    pub files_hide_hidden: &'static str,
+    /// Drag label when dragging multiple marked file entries
+    pub files_drag_items: &'static str,
+    /// Tooltip on the divider between terminal and docked files rail
+    pub files_dock_divider_hint: &'static str,
+    /// Warning toast when some dropped paths could not be uploaded
+    pub drop_unsupported_items: &'static str,
     /// Error shown when the tunnel's host was deleted
     pub fwd_missing_host: &'static str,
     /// Button in batch run / history output header to copy stdout/stderr
@@ -4041,6 +4059,15 @@ impl UxStrings {
             self.files_go_to_title,
             self.files_go_to_action,
             self.transfers_clear_finished,
+            self.transfers_cancel_all,
+            self.transfers_retry_failed,
+            self.transfers_overwrite_keep_all,
+            self.transfers_overwrite_replace_all,
+            self.files_show_hidden,
+            self.files_hide_hidden,
+            self.files_drag_items,
+            self.files_dock_divider_hint,
+            self.drop_unsupported_items,
             self.fwd_missing_host,
             self.batch_output_copy,
             self.batch_output_copied,
@@ -4599,6 +4626,15 @@ included",
     files_go_to_title: "Go to folder",
     files_go_to_action: "Open folder",
     transfers_clear_finished: "Clear finished",
+    transfers_cancel_all: "Cancel all",
+    transfers_retry_failed: "Retry failed",
+    transfers_overwrite_keep_all: "Keep all",
+    transfers_overwrite_replace_all: "Replace all",
+    files_show_hidden: "Show hidden files",
+    files_hide_hidden: "Hide hidden files",
+    files_drag_items: "{count} items",
+    files_dock_divider_hint: "Drag to resize · Double-click to reset",
+    drop_unsupported_items: "Some dropped items could not be uploaded.",
     fwd_missing_host: "rule {rule}: host {host} is not saved, so this rule was not started",
     batch_output_copy: "Copy output",
     batch_output_copied: "Output copied",
@@ -5152,6 +5188,15 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     files_go_to_title: "前往文件夹",
     files_go_to_action: "打开文件夹",
     transfers_clear_finished: "清理已完成",
+    transfers_cancel_all: "全部取消",
+    transfers_retry_failed: "重试全部失败",
+    transfers_overwrite_keep_all: "全部保留",
+    transfers_overwrite_replace_all: "全部替换",
+    files_show_hidden: "显示隐藏文件",
+    files_hide_hidden: "隐藏点文件",
+    files_drag_items: "{count} 项",
+    files_dock_divider_hint: "拖拽调整宽度 · 双击重置",
+    drop_unsupported_items: "部分拖入条目无法上传。",
     fwd_missing_host: "规则 {rule}：主机 {host} 未保存，因此该规则未启动",
     batch_output_copy: "复制输出",
     batch_output_copied: "输出已复制",

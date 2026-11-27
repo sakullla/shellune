@@ -11390,8 +11390,28 @@ async fn the_file_view_names_its_host_and_shows_the_directory_the_server_listed(
         "directories first, and a Chinese name with spaces is kept as it is"
     );
 
-    // Opening a directory asks the server for exactly that path.
+    // Single-clicking a directory selects it without opening it; double-clicking opens it.
     click(cx, "files.entry.0");
+    assert_eq!(
+        answers.requests().len(),
+        1,
+        "single-click selects a folder without sending a List request"
+    );
+    let target = bounds_of(cx, "files.entry.0").center();
+    cx.simulate_event(gpui::MouseDownEvent {
+        position: target,
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui::MouseUpEvent {
+        position: target,
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+    });
+    cx.run_until_parked();
     let sent = answers.requests();
     assert_eq!(
         sent.last(),
@@ -53079,5 +53099,326 @@ async fn t3_non_primary_dialog_controls_mark_draft_dirty(cx: &mut TestAppContext
     assert!(
         !cx.update(|_window, app| view.read(app).hosts_state().is_editing_connection()),
         "confirming Discard closes dirty RDP connection dialog"
+    );
+}
+
+#[gpui::test]
+async fn t4_file_browser_ctrl_f_and_dotfiles_toggle(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let answers = FileAnswers::accepting();
+    let channel = answers.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_files_for_test(id, "web", "deploy@10.0.0.5:22", Box::new(channel), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "session.files");
+    answers.reply(
+        1,
+        "/home/deploy",
+        &[
+            (".env", shellune_core::FileKind::File),
+            ("docs", shellune_core::FileKind::Directory),
+            ("notes.txt", shellune_core::FileKind::File),
+        ],
+    );
+    pump_files(cx, &view);
+
+    // Dotfiles are shown initially; clicking the toolbar toggle hides them.
+    let initial_rows = cx.update(|_window, app| {
+        view.read(app)
+            .files_row_names_for_test(id, crate::app::files::FileSource::Remote)
+    });
+    assert_eq!(initial_rows, vec!["docs", ".env", "notes.txt"]);
+    click(cx, "files.hidden");
+    let hidden_rows = cx.update(|_window, app| {
+        view.read(app)
+            .files_row_names_for_test(id, crate::app::files::FileSource::Remote)
+    });
+    assert_eq!(
+        hidden_rows,
+        vec!["docs", "notes.txt"],
+        "hiding dotfiles leaves only docs and notes.txt"
+    );
+    click(cx, "files.hidden");
+    let restored_rows = cx.update(|_window, app| {
+        view.read(app)
+            .files_row_names_for_test(id, crate::app::files::FileSource::Remote)
+    });
+    assert_eq!(
+        restored_rows,
+        vec!["docs", ".env", "notes.txt"],
+        "toggling dotfiles back on restores .env"
+    );
+
+    // Pressing Ctrl+F on the listing moves keyboard focus to that column's filter field.
+    click(cx, "files.row.0");
+    cx.simulate_keystrokes("ctrl-f");
+    cx.run_until_parked();
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((
+            crate::app::files::FileSource::Remote,
+            crate::app::files::FilesStop::Filter
+        )),
+        "Ctrl+F focuses the remote column filter field"
+    );
+}
+
+#[gpui::test]
+async fn t4_batch_drag_mixed_external_drop_and_folder_context_menu_keyboard_nav(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("t4-batch-drop");
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_answers, transfers) = open_transfers(cx, &view, id);
+
+    // 1. Right-click on a folder offers recursive transfer and supports keyboard navigation (Down + Enter).
+    right_click(cx, "files.row.0");
+    assert!(cx.debug_bounds("files.menu").is_some());
+    assert!(
+        cx.debug_bounds("files.menu.to_local").is_some(),
+        "remote folder context menu offers recursive transfer to local"
+    );
+    assert!(
+        cx.debug_bounds("files.menu.download").is_some(),
+        "remote folder context menu offers recursive download dialog"
+    );
+    // First item is Open, second item is Send to local (recursive SCP).
+    press_key(cx, "down");
+    press_key(cx, "enter");
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_menu_open_for_test()),
+        "Enter executes the highlighted menu item and closes the menu"
+    );
+    let cmds = transfers.commands();
+    assert!(
+        cmds.iter().any(|cmd| matches!(
+            cmd,
+            shellune_ssh::TransferCommand::Start(req)
+                if req.direction == shellune_core::TransferDirection::Download
+                    && req.protocol == shellune_core::TransferProtocol::Scp
+                    && req.recursive
+                    && req.source == "/home/deploy/docs"
+        )),
+        "keyboard-selected folder menu action starts recursive SCP download: {cmds:?}"
+    );
+
+    // 2. Batch drag of multiple entries starts one transfer per entry.
+    let before_batch = transfers.starts().len();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_drop_many_for_test(
+                id,
+                crate::app::files::FileSource::Local,
+                crate::app::files::FileSource::Remote,
+                "/home/deploy",
+                vec!["docs".to_owned(), "notes.txt".to_owned()],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        transfers.starts().len(),
+        before_batch + 2,
+        "batch drag starts transfers for both dropped entries (including folder via recursive SCP)"
+    );
+
+    // 3. External mixed drop of a file and a folder uploads the file and recursively uploads the folder over SCP.
+    let drop_file = dir.path().join("hello.txt");
+    let drop_dir = dir.path().join("bundle");
+    std::fs::write(&drop_file, b"hi").expect("write drop file");
+    std::fs::create_dir_all(&drop_dir).expect("create drop dir");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_upload_paths_for_test(id, &[drop_file.clone(), drop_dir.clone()], cx);
+        });
+    });
+    cx.run_until_parked();
+    let cmds = transfers.commands();
+    assert!(
+        cmds.iter().any(|cmd| matches!(
+            cmd,
+            shellune_ssh::TransferCommand::Start(req)
+                if req.direction == shellune_core::TransferDirection::Upload
+                    && req.protocol == shellune_core::TransferProtocol::Scp
+                    && req.recursive
+        )),
+        "dropped folder is queued as a recursive SCP upload rather than silently dropped: {cmds:?}"
+    );
+}
+
+#[gpui::test]
+async fn t4_docked_files_divider_resizes_and_clamps_rail_width(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let _answers = open_files(cx, &view, id);
+
+    // Widen the window enough for docked mode.
+    cx.simulate_resize(size(px(1800.0), px(900.0)));
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).files_docked_for_test()));
+    assert!(cx.debug_bounds("files.dock.divider").is_some());
+
+    let before = cx.update(|_window, app| view.read(app).files_area_width_for_test());
+    let divider = bounds_of(cx, "files.dock.divider").center();
+
+    // Drag divider left by 120px to widen the docked file rail.
+    cx.simulate_event(gpui::MouseDownEvent {
+        position: divider,
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.run_until_parked();
+    cx.simulate_event(gpui::MouseMoveEvent {
+        position: gpui::point(divider.x - px(120.0), divider.y),
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    cx.run_until_parked();
+    cx.simulate_event(gpui::MouseUpEvent {
+        position: gpui::point(divider.x - px(120.0), divider.y),
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    });
+    cx.run_until_parked();
+    let widened = cx.update(|_window, app| view.read(app).files_area_width_for_test());
+    assert!(
+        widened > before + 80.0,
+        "dragging divider left widens the docked file rail: before={before}, widened={widened}"
+    );
+
+    // Drag far right to verify clamping at minimum rail width.
+    let divider = bounds_of(cx, "files.dock.divider").center();
+    cx.simulate_event(gpui::MouseDownEvent {
+        position: divider,
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.run_until_parked();
+    cx.simulate_event(gpui::MouseMoveEvent {
+        position: gpui::point(px(2200.0), divider.y),
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    cx.run_until_parked();
+    cx.simulate_event(gpui::MouseUpEvent {
+        position: gpui::point(px(2200.0), divider.y),
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    });
+    cx.run_until_parked();
+    let clamped = cx.update(|_window, app| view.read(app).files_area_width_for_test());
+    assert!(
+        clamped >= crate::app::view::FILES_PANEL_WIDTH - 1.0,
+        "docked rail width clamps at minimum width: {clamped}"
+    );
+}
+
+#[gpui::test]
+async fn t4_transfer_strip_overwrite_all_cancel_all_and_retry_failed(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_answers, transfers) = open_transfers(cx, &view, id);
+
+    // Queue two downloads so batch overwrite buttons appear.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_drop_many_for_test(
+                id,
+                crate::app::files::FileSource::Local,
+                crate::app::files::FileSource::Remote,
+                "/home/deploy",
+                vec!["notes.txt".to_owned(), "notes.txt".to_owned()],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    let ids: Vec<_> = transfers
+        .starts()
+        .into_iter()
+        .map(|req| req.transfer)
+        .collect();
+    assert_eq!(ids.len(), 2);
+
+    // First hits TargetExists -> click "Replace all", then second hits TargetExists and is auto-decided.
+    transfers.push(shellune_core::TransferEvent::target_exists(
+        ids[0],
+        Some(10),
+    ));
+    pump_files(cx, &view);
+    assert!(cx.debug_bounds("transfers.overwrite.keep_all.0").is_some());
+    assert!(
+        cx.debug_bounds("transfers.overwrite.replace_all.0")
+            .is_some()
+    );
+    click(cx, "transfers.overwrite.replace_all.0");
+    transfers.push(shellune_core::TransferEvent::target_exists(
+        ids[1],
+        Some(20),
+    ));
+    pump_files(cx, &view);
+    let decisions = transfers.decisions();
+    assert!(decisions.contains(&(ids[0], shellune_core::OverwriteChoice::Replace)));
+    assert!(decisions.contains(&(ids[1], shellune_core::OverwriteChoice::Replace)));
+
+    // "Cancel all" in the strip header cancels both active tasks.
+    assert!(cx.debug_bounds("transfers.cancel_all").is_some());
+    click(cx, "transfers.cancel_all");
+    let cancels = transfers.cancels();
+    assert!(cancels.contains(&ids[0]));
+    assert!(cancels.contains(&ids[1]));
+
+    // Start two more, fail both, then click "Retry failed".
+    let before_starts = transfers.starts().len();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_drop_many_for_test(
+                id,
+                crate::app::files::FileSource::Local,
+                crate::app::files::FileSource::Remote,
+                "/home/deploy",
+                vec!["notes.txt".to_owned(), "notes.txt".to_owned()],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    let active_ids: Vec<_> = transfers
+        .starts()
+        .into_iter()
+        .skip(before_starts)
+        .map(|req| req.transfer)
+        .collect();
+    assert_eq!(active_ids.len(), 2);
+    for tid in active_ids {
+        transfers.push(shellune_core::TransferEvent {
+            transfer: tid,
+            update: shellune_core::TransferUpdate::Failed {
+                failure: shellune_core::TransferFailure::ConnectionLost,
+                residue: None,
+                resume: None,
+            },
+        });
+    }
+    pump_files(cx, &view);
+    let before_retry = transfers.starts().len();
+    assert!(cx.debug_bounds("transfers.retry_failed").is_some());
+    click(cx, "transfers.retry_failed");
+    assert_eq!(
+        transfers.starts().len(),
+        before_retry + 2,
+        "Retry failed starts a new attempt for both failed transfers"
     );
 }

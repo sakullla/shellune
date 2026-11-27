@@ -250,6 +250,10 @@ struct SessionFiles {
     local_filter: String,
     /// The text the remote column keeps only names containing (R14).
     remote_filter: String,
+    /// Whether the local column includes dotfiles (names starting with `.`).
+    local_show_hidden: bool,
+    /// Whether the remote column includes dotfiles (names starting with `.`).
+    remote_show_hidden: bool,
     /// The local entries the user marked, in the order they were marked (R14).
     ///
     /// The mark is separate from the row the keyboard is on: one row is where typing
@@ -316,6 +320,8 @@ impl FileViews {
                 remote_sort: FileSort::name(),
                 local_filter: String::new(),
                 remote_filter: String::new(),
+                local_show_hidden: true,
+                remote_show_hidden: true,
                 local_marked: Vec::new(),
                 remote_marked: Vec::new(),
                 local_pending: VecDeque::new(),
@@ -501,6 +507,31 @@ impl FileViews {
         true
     }
 
+    /// Whether one column includes dotfiles (entries whose name starts with `.`).
+    #[must_use]
+    pub fn show_hidden(&self, session: SessionId, source: FileSource) -> bool {
+        let Some(files) = self.sessions.get(&session) else {
+            return true;
+        };
+        match source {
+            FileSource::Local => files.local_show_hidden,
+            FileSource::Remote => files.remote_show_hidden,
+        }
+    }
+
+    /// Toggles whether one column shows dotfiles. Returns the new visibility state.
+    pub fn toggle_show_hidden(&mut self, session: SessionId, source: FileSource) -> bool {
+        let Some(files) = self.sessions.get_mut(&session) else {
+            return true;
+        };
+        let slot = match source {
+            FileSource::Local => &mut files.local_show_hidden,
+            FileSource::Remote => &mut files.remote_show_hidden,
+        };
+        *slot = !*slot;
+        *slot
+    }
+
     /// The rows one column shows: its listing, filtered by the column's own text and
     /// ordered by the column's own sort (R14).
     ///
@@ -519,10 +550,12 @@ impl FileViews {
             .unwrap_or("")
             .trim()
             .to_lowercase();
+        let show_hidden = self.show_hidden(session, source);
         let sort = self.sort_of(session, source).unwrap_or_else(FileSort::name);
         let mut rows: Vec<DirEntry> = listing
             .entries()
             .iter()
+            .filter(|entry| show_hidden || !entry.name().starts_with('.'))
             .filter(|entry| needle.is_empty() || entry.name().to_lowercase().contains(&needle))
             .cloned()
             .collect();
@@ -3437,5 +3470,46 @@ mod tests {
             Some(BrowseRequest::List { path, .. }) => assert_eq!(path, "/var/log"),
             other => panic!("the switch goes to the last report, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn toggling_hidden_files_hides_and_restores_dotfiles_per_column() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        let mut views = FileViews::new();
+        views.attach(
+            session,
+            "web",
+            "deploy@10.0.0.7:22",
+            Box::new(channel.clone()),
+        );
+        assert!(views.open(session));
+        channel.reply(
+            1,
+            "/home/deploy",
+            &[
+                (".env", FileKind::File),
+                (".ssh", FileKind::Directory),
+                ("notes.txt", FileKind::File),
+            ],
+        );
+        assert!(views.pump());
+
+        assert!(views.show_hidden(session, FileSource::Remote));
+        assert_eq!(views.rows(session, FileSource::Remote).len(), 3);
+        assert_eq!(views.counts(session, FileSource::Remote), Some((3, 3)));
+
+        assert!(!views.toggle_show_hidden(session, FileSource::Remote));
+        assert!(views.show_hidden(session, FileSource::Local));
+        let names: Vec<String> = views
+            .rows(session, FileSource::Remote)
+            .into_iter()
+            .map(|entry| entry.name().to_owned())
+            .collect();
+        assert_eq!(names, vec!["notes.txt"]);
+        assert_eq!(views.counts(session, FileSource::Remote), Some((1, 3)));
+
+        assert!(views.toggle_show_hidden(session, FileSource::Remote));
+        assert_eq!(views.rows(session, FileSource::Remote).len(), 3);
     }
 }

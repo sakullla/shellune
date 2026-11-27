@@ -136,6 +136,8 @@ pub struct TransferViews {
     pending_settlement: HashMap<SessionId, Vec<TransferId>>,
     /// The speed each running task was last seen moving at.
     paces: HashMap<TransferId, Pace>,
+    /// Batch overwrite decision remembered for a session while active transfers remain.
+    overwrite_all: HashMap<SessionId, OverwriteChoice>,
     /// Whether the capture fixture fixed the pace and no frame may resample it.
     frozen: bool,
     queue: TransferQueue,
@@ -446,6 +448,28 @@ impl TransferViews {
         )
     }
 
+    /// Applies one overwrite decision to every currently awaiting task of `session` and
+    /// remembers it for subsequent overwrite prompts while that session still has active
+    /// transfers.
+    pub fn decide_all(&mut self, session: SessionId, choice: OverwriteChoice) -> usize {
+        let waiting: Vec<TransferId> = self
+            .queue
+            .for_session(session)
+            .filter(|task| task.state().is_awaiting_overwrite())
+            .map(Transfer::id)
+            .collect();
+        if self.queue.active_count(session) > 0 {
+            self.overwrite_all.insert(session, choice);
+        }
+        let mut decided = 0;
+        for id in waiting {
+            if self.decide(id, choice) {
+                decided += 1;
+            }
+        }
+        decided
+    }
+
     /// Stops one task, leaving its target untouched.
     ///
     /// The state is cancelled here so the list cannot keep showing a running transfer
@@ -461,6 +485,63 @@ impl TransferViews {
         }
         self.dispatch(session, TransferCommand::Cancel { transfer: id });
         true
+    }
+
+    /// Stops every active task of one session and forgets any remembered overwrite policy.
+    pub fn cancel_all_for_session(&mut self, session: SessionId) -> usize {
+        self.overwrite_all.remove(&session);
+        let active: Vec<TransferId> = self
+            .queue
+            .for_session(session)
+            .filter(|task| task.is_active())
+            .map(Transfer::id)
+            .collect();
+        let mut cancelled = 0;
+        for id in active {
+            if self.cancel(id) {
+                cancelled += 1;
+            }
+        }
+        cancelled
+    }
+
+    /// How many tasks of one session ended in a failed state.
+    #[must_use]
+    pub fn failed_count_for_session(&self, session: SessionId) -> usize {
+        self.queue
+            .for_session(session)
+            .filter(|task| matches!(task.state(), shellune_core::TransferState::Failed { .. }))
+            .count()
+    }
+
+    /// Starts a new attempt for every failed task of one session.
+    ///
+    /// Tasks whose previous failure was a resume refusal are restarted from byte zero so
+    /// a batch retry does not immediately hit the same refusal again.
+    pub fn retry_failed_for_session(&mut self, session: SessionId) -> usize {
+        let failed: Vec<(TransferId, bool)> = self
+            .queue
+            .for_session(session)
+            .filter_map(|task| match task.state() {
+                shellune_core::TransferState::Failed { failure, .. } => Some((
+                    task.id(),
+                    matches!(failure, TransferFailure::ResumeRefused { .. }),
+                )),
+                _ => None,
+            })
+            .collect();
+        let mut launched = 0;
+        for (id, restart) in failed {
+            let started = if restart {
+                self.restart(id)
+            } else {
+                self.retry(id)
+            };
+            if started.is_some() {
+                launched += 1;
+            }
+        }
+        launched
     }
 
     /// Starts a new task for the same two paths.
@@ -516,8 +597,26 @@ impl TransferViews {
             }
         }
         for event in live {
+            let awaiting = matches!(event.update, TransferUpdate::TargetExists { .. });
             if self.queue.apply(&event).is_some() {
                 changed = true;
+                if awaiting
+                    && let Some((session, choice)) =
+                        self.queue.get(event.transfer).and_then(|task| {
+                            self.overwrite_all
+                                .get(&task.session())
+                                .copied()
+                                .map(|choice| (task.session(), choice))
+                        })
+                {
+                    self.dispatch(
+                        session,
+                        TransferCommand::Decide {
+                            transfer: event.transfer,
+                            choice,
+                        },
+                    );
+                }
             }
         }
         for (session, events) in settled {
@@ -544,6 +643,8 @@ impl TransferViews {
             self.pending_settlement.remove(&session);
             self.settling.remove(&session);
         }
+        self.overwrite_all
+            .retain(|session, _| self.queue.active_count(*session) > 0);
         self.sample(Instant::now());
         changed
     }
@@ -744,6 +845,7 @@ impl TransferViews {
     /// flushed prefix; that report replaces the checkpoint, and it is not dropped with
     /// the link.
     pub fn session_lost(&mut self, session: SessionId, failure: TransferFailure) -> bool {
+        self.overwrite_all.remove(&session);
         let failed = self.queue.fail_session(session, failure);
         // The worker can still be settling the prefix it flushed after the last
         // checkpoint. The link stays until that report arrives.
@@ -761,6 +863,7 @@ impl TransferViews {
     ///
     /// Returns how many tasks were stopped.
     pub fn detach(&mut self, session: SessionId) -> usize {
+        self.overwrite_all.remove(&session);
         let cancelled = self.queue.cancel_session(session);
         for id in &cancelled {
             self.dispatch(session, TransferCommand::Cancel { transfer: *id });
@@ -1510,5 +1613,125 @@ mod tests {
             None,
             "a tree whose size the worker does not know has no remainder to estimate"
         );
+    }
+
+    #[test]
+    fn decide_all_answers_waiting_and_subsequent_overwrite_prompts_until_batch_finishes() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        let mut views = views(session, channel.clone());
+        let first = views
+            .upload(session, "/tmp/a.txt", Some("/srv"))
+            .expect("first upload starts");
+        let second = views
+            .upload(session, "/tmp/b.txt", Some("/srv"))
+            .expect("second upload starts");
+
+        channel.push(TransferEvent::target_exists(first, Some(10)));
+        views.pump();
+
+        assert_eq!(views.decide_all(session, OverwriteChoice::Replace), 1);
+        assert!(channel.commands().contains(&TransferCommand::Decide {
+            transfer: first,
+            choice: OverwriteChoice::Replace,
+        }));
+
+        // A second task in the same active batch hits TargetExists later and is auto-decided.
+        channel.push(TransferEvent::target_exists(second, Some(20)));
+        views.pump();
+        assert!(channel.commands().contains(&TransferCommand::Decide {
+            transfer: second,
+            choice: OverwriteChoice::Replace,
+        }));
+
+        // Once the batch finishes, a new upload is no longer auto-decided.
+        channel.push(TransferEvent {
+            transfer: first,
+            update: TransferUpdate::OverwriteConfirmed,
+        });
+        channel.push(TransferEvent {
+            transfer: first,
+            update: TransferUpdate::Completed { bytes: 10 },
+        });
+        channel.push(TransferEvent {
+            transfer: second,
+            update: TransferUpdate::OverwriteConfirmed,
+        });
+        channel.push(TransferEvent {
+            transfer: second,
+            update: TransferUpdate::Completed { bytes: 20 },
+        });
+        views.pump();
+
+        let third = views
+            .upload(session, "/tmp/c.txt", Some("/srv"))
+            .expect("third upload starts");
+        channel.push(TransferEvent::target_exists(third, Some(30)));
+        views.pump();
+        assert!(
+            !channel.commands().contains(&TransferCommand::Decide {
+                transfer: third,
+                choice: OverwriteChoice::Replace,
+            }),
+            "remembered overwrite policy clears once no active transfers remain"
+        );
+    }
+
+    #[test]
+    fn cancel_all_and_retry_failed_act_only_on_one_session() {
+        let session_a = SessionId::new();
+        let session_b = SessionId::new();
+        let channel_a = FakeChannel::accepting();
+        let channel_b = FakeChannel::accepting();
+        let mut views = TransferViews::new();
+        views.attach(session_a, Box::new(channel_a.clone()));
+        views.attach(session_b, Box::new(channel_b.clone()));
+
+        let a1 = views
+            .upload(session_a, "/tmp/a1.txt", Some("/srv"))
+            .expect("a1");
+        let a2 = views
+            .upload(session_a, "/tmp/a2.txt", Some("/srv"))
+            .expect("a2");
+        let b1 = views
+            .upload(session_b, "/tmp/b1.txt", Some("/srv"))
+            .expect("b1");
+
+        assert_eq!(views.cancel_all_for_session(session_a), 2);
+        assert_eq!(views.active_count(session_a), 0);
+        assert_eq!(views.active_count(session_b), 1);
+        assert!(channel_b.commands().iter().all(|cmd| !matches!(
+            cmd,
+            TransferCommand::Cancel { transfer } if *transfer == b1
+        )));
+
+        // Fail two new tasks in session_a and retry all failed.
+        let f1 = views
+            .upload(session_a, "/tmp/f1.txt", Some("/srv"))
+            .expect("f1");
+        let f2 = views
+            .upload(session_a, "/tmp/f2.txt", Some("/srv"))
+            .expect("f2");
+        channel_a.push(TransferEvent {
+            transfer: f1,
+            update: TransferUpdate::Failed {
+                failure: TransferFailure::ConnectionLost,
+                residue: None,
+                resume: None,
+            },
+        });
+        channel_a.push(TransferEvent {
+            transfer: f2,
+            update: TransferUpdate::Failed {
+                failure: TransferFailure::ConnectionLost,
+                residue: None,
+                resume: None,
+            },
+        });
+        views.pump();
+        assert_eq!(views.failed_count_for_session(session_a), 2);
+        assert_eq!(views.retry_failed_for_session(session_a), 2);
+        assert_eq!(views.active_count(session_a), 2);
+        let _ = (a1, a2);
     }
 }

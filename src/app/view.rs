@@ -279,16 +279,23 @@ struct SnippetNote {
     toast: u64,
 }
 
-/// A file dragged from one column onto the other.
+/// One or more files dragged from one column onto the other.
 ///
-/// The directory is the one the file was listed in, so the drop asks to transfer
-/// that file and not whatever now occupies the same row.
+/// The directory is the one the entries were listed in, so the drop asks to transfer
+/// those entries and not whatever now occupies the same rows.
 #[derive(Clone)]
 struct FileDrag {
     session: SessionId,
     source: FileSource,
-    name: String,
+    names: Vec<String>,
     directory: String,
+}
+
+/// Active drag of the divider between the terminal and the docked file rail.
+#[derive(Clone, Copy)]
+struct FilesDockDrag {
+    origin_x: f32,
+    origin_width: f32,
 }
 
 /// The small label GPUI shows while a file is dragged.
@@ -589,6 +596,14 @@ pub struct ShelluneView {
     launcher_query: String,
     /// The file view's right-click menu, while open.
     files_menu: Option<files_menu::FilesMenu>,
+    /// Whether the open file menu needs keyboard focus on the next frame.
+    files_menu_focus_pending: bool,
+    /// User-dragged width of the docked file rail (in logical pixels), or `None` for 50%.
+    files_dock_width: Option<f32>,
+    /// Active drag state for the divider between terminal and docked file rail.
+    files_dock_drag: Option<FilesDockDrag>,
+    /// Whether the pointer is hovering the docked file rail divider.
+    files_dock_divider_hovered: bool,
     /// Short messages in the corner, oldest first.
     toasts: Vec<toasts::Toast>,
     next_toast: u64,
@@ -2996,6 +3011,10 @@ impl ShelluneView {
             launcher_field: None,
             launcher_query: String::new(),
             files_menu: None,
+            files_menu_focus_pending: false,
+            files_dock_width: None,
+            files_dock_drag: None,
+            files_dock_divider_hovered: false,
             toasts: Vec::new(),
             next_toast: 0,
             snippet_note: None,
@@ -6849,6 +6868,46 @@ impl ShelluneView {
         self.files_ask_download_into(id, name, None, cx);
     }
 
+    /// Opens the download dialog pre-configured for recursive SCP download of a folder.
+    fn files_ask_download_folder(&mut self, id: SessionId, name: &str, cx: &mut Context<Self>) {
+        let directory = self
+            .files
+            .browser(id)
+            .and_then(|browser| browser.current_directory())
+            .map(str::to_owned);
+        let remote = match directory.as_deref() {
+            Some(directory) => join_path(directory, name),
+            None => name.to_owned(),
+        };
+        let placeholder = self.strings().transfers_download_placeholder;
+        let suggested = self
+            .files
+            .local_os_directory(id)
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_else(default_download_directory);
+        let field = cx.new(|cx| {
+            let mut field = TextField::with_text(placeholder, &suggested, cx);
+            field.set_browse(Browse::Directory, cx);
+            field
+        });
+        let remote_placeholder = self.strings().transfers_remote_path;
+        let remote_field = cx.new(|cx| TextField::with_text(remote_placeholder, &remote, cx));
+        self.open_files_dialog_with(
+            FilesDialog::Download {
+                session: id,
+                source: FileSource::Remote,
+                remote,
+                text: suggested,
+                protocol: TransferProtocol::Scp,
+                recursive: true,
+                problem: None,
+            },
+            field,
+            Some(remote_field),
+            cx,
+        );
+    }
+
     /// The same question, with the folder the copy would land in already chosen.
     ///
     /// The keyboard's download shortcut passes the folder the local column is showing:
@@ -7089,6 +7148,34 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) {
         self.transfers.decide(id, choice);
+        self.sync_transfer_section();
+        cx.notify();
+    }
+
+    /// Answers all current and subsequent overwrite prompts for a session's active batch.
+    fn transfer_decide_all(
+        &mut self,
+        session: SessionId,
+        choice: shellune_core::OverwriteChoice,
+        cx: &mut Context<Self>,
+    ) {
+        self.transfers.decide_all(session, choice);
+        self.sync_transfer_section();
+        cx.notify();
+    }
+
+    /// Cancels every active transfer belonging to `session`.
+    fn cancel_all_transfers(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        self.transfers.cancel_all_for_session(session);
+        self.sync_transfer_section();
+        cx.notify();
+    }
+
+    /// Retries every failed transfer belonging to `session`.
+    fn retry_failed_transfers(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if self.transfers.retry_failed_for_session(session) > 0 {
+            self.watch_files(cx);
+        }
         self.sync_transfer_section();
         cx.notify();
     }
@@ -17040,7 +17127,7 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let files = self.files_view(id, window, cx);
-        div()
+        let mut split = div()
             .flex()
             .flex_row()
             .flex_1()
@@ -17056,7 +17143,7 @@ impl ShelluneView {
                     .min_h_0()
                     .child(terminal),
             )
-            .child(components::column_divider())
+            .child(self.files_dock_divider(cx))
             .child(
                 div()
                     .flex()
@@ -17065,7 +17152,122 @@ impl ShelluneView {
                     .w(self.files_area_width())
                     .min_h_0()
                     .child(files),
+            );
+        if self.files_dock_drag.is_some() {
+            split = split.child(self.files_dock_drag_canvas(cx));
+        }
+        split
+    }
+
+    /// Draggable divider between the terminal and the docked file rail.
+    fn files_dock_divider(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let active = self.files_dock_drag.is_some() || self.files_dock_divider_hovered;
+        let line_color = if active {
+            theme::swatch(palette::ACCENT)
+        } else {
+            theme::swatch(palette::BORDER)
+        };
+        let line_width = if active {
+            px(2.0)
+        } else {
+            px(components::HAIRLINE_WIDTH)
+        };
+        div()
+            .id("files.dock.divider")
+            .debug_selector(|| "files.dock.divider".to_owned())
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .w(px(6.0))
+            .h_full()
+            .cursor_col_resize()
+            .tooltip(components::tooltip(copy::ux().files_dock_divider_hint))
+            .on_hover(cx.listener(|view, hovered: &bool, _window, cx| {
+                if view.files_dock_divider_hovered != *hovered {
+                    view.files_dock_divider_hovered = *hovered;
+                    cx.notify();
+                }
+            }))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|view, event: &gpui::MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                    if event.click_count >= 2 {
+                        view.files_dock_drag = None;
+                        view.files_dock_width = None;
+                        cx.notify();
+                    } else {
+                        view.files_dock_drag = Some(FilesDockDrag {
+                            origin_x: f32::from(event.position.x),
+                            origin_width: f32::from(view.files_area_width()),
+                        });
+                        cx.notify();
+                    }
+                }),
             )
+            .child(div().w(line_width).h_full().bg(line_color))
+    }
+
+    /// Tracks pointer motion while the user drags the docked file rail divider.
+    fn files_dock_drag_canvas(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> gpui::Canvas<gpui::Bounds<gpui::Pixels>> {
+        let view = cx.entity().downgrade();
+        gpui::canvas(
+            |bounds, _window, _app| bounds,
+            move |_bounds, _prepaint, window, _app| {
+                let view_move = view.clone();
+                window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _window, app| {
+                    if phase != gpui::DispatchPhase::Bubble {
+                        return;
+                    }
+                    let _ = view_move.update(app, |this, cx| {
+                        this.files_drag_dock(event.position.x, cx);
+                    });
+                });
+                let view_up = view.clone();
+                window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, _window, app| {
+                    if phase != gpui::DispatchPhase::Bubble
+                        || event.button != gpui::MouseButton::Left
+                    {
+                        return;
+                    }
+                    let _ = view_up.update(app, |this, cx| {
+                        if this.files_dock_drag.take().is_some() {
+                            cx.notify();
+                        }
+                    });
+                });
+            },
+        )
+    }
+
+    fn files_dock_bounds(&self) -> (f32, f32) {
+        let total = f32::from(self.viewport_width);
+        let min_files = f32::from(self.metrics().scale(FILES_PANEL_WIDTH));
+        let min_terminal = f32::from(self.metrics().scale(360.0));
+        let divider = 6.0;
+        let max_files = (total - min_terminal - divider).max(min_files);
+        (min_files, max_files)
+    }
+
+    fn files_drag_dock(&mut self, pointer_x: gpui::Pixels, cx: &mut Context<Self>) {
+        let Some(drag) = self.files_dock_drag else {
+            return;
+        };
+        let (min_files, max_files) = self.files_dock_bounds();
+        // Dragging the divider left widens the right-side file rail; dragging right narrows it.
+        let delta = drag.origin_x - f32::from(pointer_x);
+        let next = (drag.origin_width + delta).clamp(min_files, max_files);
+        if self
+            .files_dock_width
+            .is_none_or(|current| (current - next).abs() > 0.5)
+        {
+            self.files_dock_width = Some(next);
+            cx.notify();
+        }
     }
 
     /// "Upload" or "Download" in the interface language.
@@ -17077,8 +17279,9 @@ impl ShelluneView {
         }
     }
 
-    /// Uploads files dropped from the system onto the server side, into the
-    /// folder it shows.
+    /// Uploads files and folders dropped from the system onto the server side, into the
+    /// folder it shows. Folders are transferred recursively over SCP so mixed drops do
+    /// not silently discard directories.
     fn files_upload_paths(
         &mut self,
         id: SessionId,
@@ -17090,23 +17293,42 @@ impl ShelluneView {
             .browser(id)
             .and_then(|browser| browser.current_directory())
             .map(str::to_owned);
-        let files: Vec<String> = paths
-            .iter()
-            .filter(|path| path.is_file())
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect();
-        if files.is_empty() {
-            self.toast(Tone::Warning, copy::ux().drop_folders_unsupported, None, cx);
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        let mut unsupported = 0usize;
+        for path in paths {
+            if path.is_dir() {
+                dirs.push(path.to_string_lossy().into_owned());
+            } else if path.is_file() {
+                files.push(path.to_string_lossy().into_owned());
+            } else {
+                unsupported += 1;
+            }
+        }
+        if files.is_empty() && dirs.is_empty() {
+            self.toast(Tone::Warning, copy::ux().drop_unsupported_items, None, cx);
             return;
         }
         let mut started = 0;
+        let protocol = self.session_protocol(id);
         for local in &files {
+            match self
+                .transfers
+                .upload_over(id, local, directory.as_deref(), protocol, false)
+            {
+                Ok(_) => started += 1,
+                Err(problem) => {
+                    self.transfer_problem = Some((id, problem));
+                }
+            }
+        }
+        for local in &dirs {
             match self.transfers.upload_over(
                 id,
                 local,
                 directory.as_deref(),
-                self.session_protocol(id),
-                false,
+                TransferProtocol::Scp,
+                true,
             ) {
                 Ok(_) => started += 1,
                 Err(problem) => {
@@ -17116,11 +17338,15 @@ impl ShelluneView {
         }
         if started > 0 {
             self.watch_files(cx);
+            self.sync_transfer_section();
             let title = copy::fill(
                 copy::ux().drop_uploading_files,
                 &[("count", &started.to_string())],
             );
             self.toast(Tone::Accent, title, directory, cx);
+        }
+        if unsupported > 0 {
+            self.toast(Tone::Warning, copy::ux().drop_unsupported_items, None, cx);
         }
         cx.notify();
     }
@@ -17225,8 +17451,11 @@ impl ShelluneView {
     /// window.
     fn files_area_width(&self) -> gpui::Pixels {
         if self.files_docked() {
-            // Half the window, less the hairline between the terminal and the files.
-            self.viewport_width * 0.5 - px(components::HAIRLINE_WIDTH)
+            let (min_files, max_files) = self.files_dock_bounds();
+            let width = self
+                .files_dock_width
+                .unwrap_or_else(|| f32::from(self.viewport_width) * 0.5 - 6.0);
+            px(width.clamp(min_files, max_files))
         } else {
             self.viewport_width
         }
@@ -18097,10 +18326,11 @@ impl ShelluneView {
         open
     }
 
-    /// Moves a file between the two columns of one session.
+    /// Moves one or more files or folders between the two columns of one session.
     ///
     /// The button on a row and a drop onto the other column both arrive here, so a
-    /// drag cannot start a transfer the button would not.
+    /// drag cannot start a transfer the button would not. Folders are transferred
+    /// recursively over SCP.
     fn files_accept_drop(
         &mut self,
         id: SessionId,
@@ -18108,14 +18338,139 @@ impl ShelluneView {
         drag: &FileDrag,
         cx: &mut Context<Self>,
     ) -> Result<(), TransferProblem> {
-        if drag.session != id || drag.source == onto {
+        if drag.session != id || drag.source == onto || drag.names.is_empty() {
             // A drop that belongs to another session, or that would copy a column onto
             // itself, is not a request this column takes: no task exists afterwards.
             return Err(TransferProblem::CommandRefused);
         }
-        match onto {
-            FileSource::Remote => self.transfer_to_remote(id, &drag.directory, &drag.name, cx),
-            FileSource::Local => self.transfer_to_local(id, &drag.directory, &drag.name, cx),
+        if drag.names.len() == 1 {
+            let name = &drag.names[0];
+            let is_dir = self
+                .files
+                .browser_in(id, drag.source)
+                .and_then(|browser| browser.entry(name))
+                .is_some_and(|entry| entry.is_directory());
+            return match onto {
+                FileSource::Remote if is_dir => {
+                    self.transfer_folder_to_remote(id, &drag.directory, name, cx)
+                }
+                FileSource::Local if is_dir => {
+                    self.transfer_folder_to_local(id, &drag.directory, name, cx)
+                }
+                FileSource::Remote => self.transfer_to_remote(id, &drag.directory, name, cx),
+                FileSource::Local => self.transfer_to_local(id, &drag.directory, name, cx),
+            };
+        }
+        self.transfer_problem = None;
+        self.transfer_skipped_folders = None;
+        let mut started = 0usize;
+        let mut refused = None;
+        for name in &drag.names {
+            let is_dir = self
+                .files
+                .browser_in(id, drag.source)
+                .and_then(|browser| browser.entry(name))
+                .is_some_and(|entry| entry.is_directory());
+            let result = match onto {
+                FileSource::Remote if is_dir => {
+                    self.transfer_folder_to_remote(id, &drag.directory, name, cx)
+                }
+                FileSource::Local if is_dir => {
+                    self.transfer_folder_to_local(id, &drag.directory, name, cx)
+                }
+                FileSource::Remote => self.transfer_to_remote(id, &drag.directory, name, cx),
+                FileSource::Local => self.transfer_to_local(id, &drag.directory, name, cx),
+            };
+            match result {
+                Ok(()) => started += 1,
+                Err(problem) => refused = refused.or(Some(problem)),
+            }
+        }
+        self.transfer_problem = refused.map(|problem| (id, problem));
+        self.files.clear_marked(id, drag.source);
+        if started > 0 {
+            let template = match onto {
+                FileSource::Remote => self.strings().files_uploaded_selected,
+                FileSource::Local => self.strings().files_downloaded_selected,
+            };
+            let title = copy::fill(template, &[("count", &started.to_string())]);
+            self.toast(Tone::Accent, title, None, cx);
+            Ok(())
+        } else {
+            Err(refused.unwrap_or(TransferProblem::CommandRefused))
+        }
+    }
+
+    /// Recursively uploads a local folder into the on-screen remote directory over SCP.
+    fn transfer_folder_to_remote(
+        &mut self,
+        id: SessionId,
+        directory: &str,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), TransferProblem> {
+        let Some(folder) = local_protocol_to_os(directory) else {
+            self.transfer_problem = Some((id, TransferProblem::DirectoryUnknown));
+            cx.notify();
+            return Err(TransferProblem::DirectoryUnknown);
+        };
+        let path = folder.join(name);
+        let remote_dir = self.on_screen_remote_directory(id);
+        let started = self.transfers.upload_over(
+            id,
+            &path.to_string_lossy(),
+            remote_dir.as_deref(),
+            TransferProtocol::Scp,
+            true,
+        );
+        self.finish_transfer_question(id, started, cx)
+    }
+
+    /// Recursively downloads a remote folder into the on-screen local directory over SCP.
+    fn transfer_folder_to_local(
+        &mut self,
+        id: SessionId,
+        directory: &str,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), TransferProblem> {
+        let remote = join_path(directory, name);
+        let Some(folder) = self.files.local_os_directory(id) else {
+            self.transfer_problem = Some((id, TransferProblem::DirectoryUnknown));
+            cx.notify();
+            return Err(TransferProblem::DirectoryUnknown);
+        };
+        let started = self.transfers.download_over(
+            id,
+            &remote,
+            &folder.to_string_lossy(),
+            TransferProtocol::Scp,
+            true,
+        );
+        self.finish_transfer_question(id, started, cx)
+    }
+
+    /// Recursively transfers the named folder of `source` to the other column over SCP.
+    fn files_transfer_folder_named(
+        &mut self,
+        id: SessionId,
+        source: FileSource,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), TransferProblem> {
+        let Some(directory) = self
+            .files
+            .browser_in(id, source)
+            .and_then(|browser| browser.current_directory())
+            .map(str::to_owned)
+        else {
+            self.transfer_problem = Some((id, TransferProblem::DirectoryUnknown));
+            cx.notify();
+            return Err(TransferProblem::DirectoryUnknown);
+        };
+        match source {
+            FileSource::Local => self.transfer_folder_to_remote(id, &directory, name, cx),
+            FileSource::Remote => self.transfer_folder_to_local(id, &directory, name, cx),
         }
     }
 
@@ -18149,7 +18504,7 @@ impl ShelluneView {
             &FileDrag {
                 session: id,
                 source,
-                name: name.to_owned(),
+                names: vec![name.to_owned()],
                 directory,
             },
             cx,
@@ -18179,6 +18534,15 @@ impl ShelluneView {
         if key == "tab" && !modifiers.control && !modifiers.alt && !modifiers.platform {
             let delta = if modifiers.shift { -1 } else { 1 };
             self.files_step_stop(id, delta, window, cx);
+            return true;
+        }
+        if key == "f"
+            && (modifiers.control || modifiers.platform)
+            && !modifiers.alt
+            && !modifiers.shift
+            && self.files_filter_shown(id, source)
+        {
+            self.files_focus_stop(source, FilesStop::Filter, window, cx);
             return true;
         }
         // The batch keys belong to the listing itself: Shift with the arrows extends the
@@ -19291,7 +19655,23 @@ impl ShelluneView {
         if remote {
             tools = tools.child(self.files_follow_button(id, cx));
         }
+        let show_hidden = self.files.show_hidden(id, source);
         tools = tools
+            .child(self.row_icon_button(
+                files_element_id(source, "hidden"),
+                if show_hidden { Icon::Eye } else { Icon::EyeOff },
+                if show_hidden {
+                    ux.files_hide_hidden
+                } else {
+                    ux.files_show_hidden
+                },
+                false,
+                cx,
+                move |view, cx| {
+                    view.files.toggle_show_hidden(id, source);
+                    cx.notify();
+                },
+            ))
             .child(self.row_icon_button(
                 files_element_id(source, "goto"),
                 Icon::FolderOpen,
@@ -19887,6 +20267,7 @@ impl ShelluneView {
             .for_session(id)
             .filter(|task| task.is_active())
             .count();
+        let failed = self.transfers.failed_count_for_session(id);
         let total = self.transfers.for_session(id).count();
         let clearable = self.transfers.has_finished_for_session(id)
             || self
@@ -19897,6 +20278,39 @@ impl ShelluneView {
                 .transfer_skipped_folders
                 .as_ref()
                 .is_some_and(|(s, _)| *s == id);
+        let mut actions = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::HAIRLINE));
+        if active > 0 {
+            actions = actions.child(self.text_button(
+                SharedString::from("transfers.cancel_all"),
+                ux.transfers_cancel_all,
+                Variant::Ghost,
+                cx,
+                move |view, cx| view.cancel_all_transfers(id, cx),
+            ));
+        }
+        if failed > 0 {
+            actions = actions.child(self.text_button(
+                SharedString::from("transfers.retry_failed"),
+                ux.transfers_retry_failed,
+                Variant::Ghost,
+                cx,
+                move |view, cx| view.retry_failed_transfers(id, cx),
+            ));
+        }
+        if clearable {
+            actions = actions.child(self.text_button(
+                SharedString::from("transfers.clear_finished"),
+                ux.transfers_clear_finished,
+                Variant::Ghost,
+                cx,
+                move |view, cx| view.clear_finished_transfers(Some(id), cx),
+            ));
+        }
         // The strip's own toolbar line: what it is and how many tasks still run.
         div()
             .flex()
@@ -19938,14 +20352,8 @@ impl ShelluneView {
                         .debug_selector(|| "transfers.count".to_owned()),
                     ),
             )
-            .when(clearable, |row| {
-                row.child(self.text_button(
-                    SharedString::from("transfers.clear_finished"),
-                    ux.transfers_clear_finished,
-                    Variant::Ghost,
-                    cx,
-                    move |view, cx| view.clear_finished_transfers(Some(id), cx),
-                ))
+            .when(active > 0 || failed > 0 || clearable, |row| {
+                row.child(actions)
             })
     }
 
@@ -20063,7 +20471,10 @@ impl ShelluneView {
     ) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
+        let ux = copy::ux();
         let id = task.id();
+        let session = task.session();
+        let batch = self.transfers.active_count(session) > 1;
         // The same inline form a file question is, in its danger edge: the answer
         // decides whether a file that already exists is replaced (ADR-7).
         components::inline_form(Tone::Danger, metrics)
@@ -20103,6 +20514,21 @@ impl ShelluneView {
                             );
                         },
                     ))
+                    .when(batch, |row| {
+                        row.child(self.text_button(
+                            SharedString::from(format!("transfers.overwrite.keep_all.{index}")),
+                            ux.transfers_overwrite_keep_all,
+                            Variant::Secondary,
+                            cx,
+                            move |view, cx| {
+                                view.transfer_decide_all(
+                                    session,
+                                    shellune_core::OverwriteChoice::KeepExisting,
+                                    cx,
+                                );
+                            },
+                        ))
+                    })
                     .child(self.text_button(
                         SharedString::from(format!("transfers.overwrite.replace.{index}")),
                         strings.transfers_overwrite_replace,
@@ -20111,7 +20537,22 @@ impl ShelluneView {
                         move |view, cx| {
                             view.transfer_decide(id, shellune_core::OverwriteChoice::Replace, cx);
                         },
-                    )),
+                    ))
+                    .when(batch, |row| {
+                        row.child(self.text_button(
+                            SharedString::from(format!("transfers.overwrite.replace_all.{index}")),
+                            ux.transfers_overwrite_replace_all,
+                            Variant::Danger,
+                            cx,
+                            move |view, cx| {
+                                view.transfer_decide_all(
+                                    session,
+                                    shellune_core::OverwriteChoice::Replace,
+                                    cx,
+                                );
+                            },
+                        ))
+                    }),
             )
     }
 
@@ -20270,6 +20711,9 @@ impl ShelluneView {
             ));
         }
         if include_overwrite && task.state().is_awaiting_overwrite() {
+            let ux = copy::ux();
+            let session = task.session();
+            let batch = self.transfers.active_count(session) > 1;
             // Keeping the file is the cancelling answer and stands left of the one that
             // replaces it (ADR-7).
             actions = actions
@@ -20282,6 +20726,21 @@ impl ShelluneView {
                         view.transfer_decide(id, shellune_core::OverwriteChoice::KeepExisting, cx);
                     },
                 ))
+                .when(batch, |row| {
+                    row.child(self.text_button(
+                        SharedString::from(format!("{prefix}.overwrite.keep_all.{index}")),
+                        ux.transfers_overwrite_keep_all,
+                        Variant::Secondary,
+                        cx,
+                        move |view, cx| {
+                            view.transfer_decide_all(
+                                session,
+                                shellune_core::OverwriteChoice::KeepExisting,
+                                cx,
+                            );
+                        },
+                    ))
+                })
                 .child(self.text_button(
                     SharedString::from(format!("{prefix}.overwrite.replace.{index}")),
                     strings.transfers_overwrite_replace,
@@ -20290,7 +20749,22 @@ impl ShelluneView {
                     move |view, cx| {
                         view.transfer_decide(id, shellune_core::OverwriteChoice::Replace, cx);
                     },
-                ));
+                ))
+                .when(batch, |row| {
+                    row.child(self.text_button(
+                        SharedString::from(format!("{prefix}.overwrite.replace_all.{index}")),
+                        ux.transfers_overwrite_replace_all,
+                        Variant::Danger,
+                        cx,
+                        move |view, cx| {
+                            view.transfer_decide_all(
+                                session,
+                                shellune_core::OverwriteChoice::Replace,
+                                cx,
+                            );
+                        },
+                    ))
+                });
         }
         if resumable {
             actions = actions.child(self.text_button(
@@ -21229,9 +21703,9 @@ impl ShelluneView {
             row = row.child(div().flex().flex_1().min_w_0().child(field.clone()));
         }
         if let Some((shown, total)) = self.files.counts(id, source) {
-            // "24 of 24" says a filter is narrowing nothing; until one is typed, the
-            // count is just how many entries the folder holds.
-            let count = if filter.trim().is_empty() {
+            // "24 of 24" says a filter is narrowing nothing; until a filter or hidden
+            // dotfiles toggle hides rows, the count is just how many entries the folder holds.
+            let count = if filter.trim().is_empty() && shown == total {
                 copy::fill(strings.files_item_count, &[("total", &total.to_string())])
             } else {
                 copy::fill(
@@ -21527,48 +22001,36 @@ impl ShelluneView {
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .child(SharedString::from(size_text)),
             );
-        if openable {
-            let open_name = name.to_owned();
-            entry_row = entry_row.cursor_pointer().on_click(cx.listener(
-                move |view, event: &gpui::ClickEvent, _window, cx| {
-                    let modifiers = event.modifiers();
-                    if modifiers.shift {
-                        cx.stop_propagation();
-                        let anchor = view
-                            .files
-                            .selected(id, source)
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| open_name.clone());
-                        view.files.mark_range(id, source, &anchor, &open_name);
-                        view.files.select(id, source, Some(open_name.clone()));
-                        cx.notify();
-                    } else if modifiers.control || modifiers.platform {
-                        cx.stop_propagation();
-                        view.files.toggle_mark(id, source, &open_name);
-                        view.files.select(id, source, Some(open_name.clone()));
-                        cx.notify();
-                    } else {
-                        view.files_enter(id, source, &open_name, cx);
-                    }
-                },
-            ));
-        } else if let Some(directory) = self
+        if let Some(directory) = self
             .files
             .browser_in(id, source)
             .and_then(|browser| browser.current_directory())
             .map(str::to_owned)
         {
-            let drag_name = name.to_owned();
+            let drag_names = if self.files_row_in_batch(id, source, name) {
+                self.files.marked(id, source)
+            } else {
+                vec![name.to_owned()]
+            };
+            let drag_label_template = ux.files_drag_items;
             entry_row = entry_row.on_drag(
                 FileDrag {
                     session: id,
                     source,
-                    name: drag_name.clone(),
+                    names: drag_names,
                     directory,
                 },
                 move |drag, _offset, _window, cx| {
+                    let label = if drag.names.len() == 1 {
+                        drag.names[0].clone()
+                    } else {
+                        copy::fill(
+                            drag_label_template,
+                            &[("count", &drag.names.len().to_string())],
+                        )
+                    };
                     cx.new(|_| FileDragLabel {
-                        name: SharedString::from(drag.name.clone()),
+                        name: SharedString::from(label),
                     })
                 },
             );
@@ -21714,12 +22176,14 @@ impl ShelluneView {
             )
             .text_size(metrics.label_size())
             .on_click(
-                cx.listener(move |view, event: &gpui::ClickEvent, _window, cx| {
-                    // A plain click is one row and clears the batch; Ctrl adds one row to it
-                    // and Shift marks the range between the keyboard's row and this one, so
-                    // both ways of building a batch are pointer gestures (R14).
+                cx.listener(move |view, event: &gpui::ClickEvent, window, cx| {
+                    // A plain click selects one row and clears the batch; a double-click on
+                    // a folder enters it. Ctrl adds one row to the batch and Shift marks the
+                    // range between the keyboard's row and this one (R14, R6).
                     let modifiers = event.modifiers();
                     let name = select_name.clone();
+                    let focus = view.files_panel_focus(source).clone();
+                    window.focus(&focus);
                     if modifiers.shift {
                         let anchor = view
                             .files
@@ -21731,6 +22195,10 @@ impl ShelluneView {
                     } else if modifiers.control || modifiers.platform {
                         view.files.toggle_mark(id, source, &name);
                         view.files.select(id, source, Some(name));
+                    } else if openable && event.click_count() >= 2 {
+                        view.files.clear_marked(id, source);
+                        view.files_enter(id, source, &name, cx);
+                        return;
                     } else {
                         view.files.select(id, source, Some(name));
                         view.files.clear_marked(id, source);
@@ -22151,11 +22619,67 @@ impl ShelluneView {
             &FileDrag {
                 session: id,
                 source: from,
-                name: name.to_owned(),
+                names: vec![name.to_owned()],
                 directory: directory.to_owned(),
             },
             cx,
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn files_drop_many_for_test(
+        &mut self,
+        id: SessionId,
+        onto: FileSource,
+        from: FileSource,
+        directory: &str,
+        names: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.files_accept_drop(
+            id,
+            onto,
+            &FileDrag {
+                session: id,
+                source: from,
+                names,
+                directory: directory.to_owned(),
+            },
+            cx,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn files_upload_paths_for_test(
+        &mut self,
+        id: SessionId,
+        paths: &[std::path::PathBuf],
+        cx: &mut Context<Self>,
+    ) {
+        self.files_upload_paths(id, paths, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn files_area_width_for_test(&self) -> f32 {
+        f32::from(self.files_area_width())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn files_row_names_for_test(
+        &self,
+        id: SessionId,
+        source: FileSource,
+    ) -> Vec<String> {
+        self.files
+            .rows(id, source)
+            .into_iter()
+            .map(|entry| entry.name().to_owned())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn files_menu_open_for_test(&self) -> bool {
+        self.files_menu.is_some()
     }
 
     /// Whether the file view of a session is open.
@@ -23614,6 +24138,14 @@ impl Render for ShelluneView {
                 window.focus(&handle);
             }
         }
+        if self.files_menu_focus_pending {
+            self.files_menu_focus_pending = false;
+            if let Some(menu) = &self.files_menu
+                && !menu.focus.is_focused(window)
+            {
+                window.focus(&menu.focus);
+            }
+        }
         let metrics = self.metrics();
         let notice = self.notice_strip(cx);
         // A pane that asked for the whole window keeps it only while it is the one
@@ -23659,6 +24191,10 @@ impl Render for ShelluneView {
                 // key is spent on it. Enter in the field or the terminal behind the
                 // dimming would otherwise act on something the user cannot see, and
                 // typed text would go to a program behind a question (R5).
+                if this.files_menu.is_some() && this.files_menu_key(event, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.question_open() && !this.paste_prompt_open(cx) {
                     if event.keystroke.key == "escape"
                         && event.keystroke.modifiers.number_of_modifiers() == 0
