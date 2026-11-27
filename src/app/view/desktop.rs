@@ -2564,8 +2564,9 @@ impl DesktopPane {
             .gap(metrics.scale(spacing::HAIRLINE))
             .child(bar);
         if self.special_keys_open {
+            const SPECIAL_KEYS_MENU_WIDTH: f32 = 172.0;
             let mut menu = components::menu_card("desktop.special_keys.menu", metrics)
-                .w(metrics.scale(172.0))
+                .w(metrics.scale(SPECIAL_KEYS_MENU_WIDTH))
                 .id(SharedString::from("desktop.special_keys.menu"))
                 .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                     this.set_bar_hovered(*hovered, cx);
@@ -2619,6 +2620,9 @@ impl DesktopPane {
 
     /// Low-interference top-center micro-handle shown while the floating toolbar is collapsed.
     fn controls_handle(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
+        const CONTROLS_HANDLE_WIDTH: f32 = 48.0;
+        const CONTROLS_HANDLE_HEIGHT: f32 = 14.0;
+        const CONTROLS_HANDLE_ICON_SIZE: f32 = 10.0;
         let strings = self.locale.strings();
         let mut pill = div()
             .id(SharedString::from("desktop.controls.handle"))
@@ -2626,8 +2630,8 @@ impl DesktopPane {
             .flex()
             .items_center()
             .justify_center()
-            .w(metrics.scale(48.0))
-            .h(metrics.scale(14.0))
+            .w(metrics.scale(CONTROLS_HANDLE_WIDTH))
+            .h(metrics.scale(CONTROLS_HANDLE_HEIGHT))
             .rounded_b(px(crate::app::theme::radius::SMALL))
             .bg(theme::faded(theme::swatch(palette::CHROME), 0.78))
             .border_b_1()
@@ -2655,7 +2659,7 @@ impl DesktopPane {
             }))
             .child(icons::icon(
                 Icon::ChevronDown,
-                metrics.scale(10.0),
+                metrics.scale(CONTROLS_HANDLE_ICON_SIZE),
                 theme::swatch(palette::TEXT_MUTED),
             ));
         pill.style().mouse_cursor = Some(CursorStyle::PointingHand);

@@ -5045,6 +5045,8 @@ impl TerminalPane {
             })
             .when_some(serial.note().map(str::to_owned), |row, note| {
                 let tone = serial.note_tone();
+                const SERIAL_NOTE_MAX_WIDTH: f32 = 420.0;
+                const SERIAL_NOTE_DISMISS_SIZE: f32 = 18.0;
                 // Severity-graded dismissible pill: Warning for overflow/incomplete,
                 // Danger for port errors or held drivers.
                 row.child(
@@ -5062,7 +5064,7 @@ impl TerminalPane {
                         .border_color(theme::faded(tone.text(), 0.35))
                         .text_color(tone.text())
                         .min_w_0()
-                        .max_w(metrics.scale(420.0))
+                        .max_w(metrics.scale(SERIAL_NOTE_MAX_WIDTH))
                         .tooltip(components::tooltip(SharedString::from(note.clone())))
                         .child(
                             div()
@@ -5073,8 +5075,8 @@ impl TerminalPane {
                         )
                         .child(
                             components::icon_only_button(Icon::Close, metrics)
-                                .h(metrics.scale(18.0))
-                                .w(metrics.scale(18.0))
+                                .h(metrics.scale(SERIAL_NOTE_DISMISS_SIZE))
+                                .w(metrics.scale(SERIAL_NOTE_DISMISS_SIZE))
                                 .id("serial.note.dismiss")
                                 .debug_selector(|| "serial.note.dismiss".to_owned())
                                 .tooltip(components::tooltip(SharedString::from(

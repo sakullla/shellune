@@ -17444,6 +17444,8 @@ impl ShelluneView {
 
     /// Draggable divider between the terminal and the docked file rail.
     fn files_dock_divider(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        const FILES_DOCK_DIVIDER_ACTIVE_WIDTH: f32 = 2.0;
+        const FILES_DOCK_DIVIDER_HIT_WIDTH: f32 = 6.0;
         let active = self.files_dock_drag.is_some() || self.files_dock_divider_hovered;
         let line_color = if active {
             theme::swatch(palette::ACCENT)
@@ -17451,7 +17453,7 @@ impl ShelluneView {
             theme::swatch(palette::BORDER)
         };
         let line_width = if active {
-            px(2.0)
+            px(FILES_DOCK_DIVIDER_ACTIVE_WIDTH)
         } else {
             px(components::HAIRLINE_WIDTH)
         };
@@ -17462,7 +17464,7 @@ impl ShelluneView {
             .flex_none()
             .items_center()
             .justify_center()
-            .w(px(6.0))
+            .w(px(FILES_DOCK_DIVIDER_HIT_WIDTH))
             .h_full()
             .cursor_col_resize()
             .tooltip(components::tooltip(copy::ux().files_dock_divider_hint))
