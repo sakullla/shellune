@@ -14,12 +14,13 @@
 //!   library is in that state, because an unreadable library is somebody's data, not an
 //!   empty one.
 
-use gpui::Entity;
+use gpui::{Entity, ScrollHandle};
 
 use shellune_core::{Snippet, SnippetBook, SnippetId, SnippetProblem};
 use shellune_storage::SnippetStore;
 
 use crate::app::copy::{self, Locale};
+use crate::app::text_area::TextArea;
 use crate::app::text_field::TextField;
 
 /// A shortcut command's body as it is offered to a terminal.
@@ -249,8 +250,8 @@ pub struct SnippetEditor {
     pub id: Option<SnippetId>,
     /// The name field.
     pub name: Entity<TextField>,
-    /// The body field. It keeps line breaks, drawn as `\n`.
-    pub body: Entity<TextField>,
+    /// The multi-line body editor.
+    pub body: Entity<TextArea>,
     /// Why the last save was refused, in the interface language.
     pub problem: Option<String>,
 }
@@ -272,6 +273,7 @@ pub struct SnippetsPanel {
     selected: usize,
     search: Option<Entity<TextField>>,
     query: String,
+    scroll: ScrollHandle,
 }
 
 impl SnippetsPanel {
@@ -284,7 +286,19 @@ impl SnippetsPanel {
             selected: 0,
             search: None,
             query: String::new(),
+            scroll: ScrollHandle::new(),
         }
+    }
+
+    /// Scroll handle for the snippet list so keyboard navigation stays in view.
+    #[must_use]
+    pub fn scroll(&self) -> &ScrollHandle {
+        &self.scroll
+    }
+
+    /// Scrolls the list so the currently selected row is visible.
+    pub fn scroll_to_selected(&self) {
+        self.scroll.scroll_to_item(self.selected);
     }
 
     /// The search field that narrows the snippet list, while initialized.
@@ -400,11 +414,7 @@ pub fn body_preview(body: &str, max_chars: usize) -> String {
     let mut used = 0;
     for character in flat.chars() {
         let piece = if character == '\n' { "\\n" } else { "" };
-        let added = if character == '\n' {
-            2
-        } else {
-            character.len_utf8()
-        };
+        let added = if character == '\n' { 2 } else { 1 };
         if used + added > max_chars {
             preview.push('…');
             return preview;
@@ -570,5 +580,13 @@ mod tests {
     fn a_draft_is_checked_with_the_rule_the_library_uses() {
         assert_eq!(draft_problem(" ", "ls"), Some(SnippetProblem::EmptyName));
         assert_eq!(draft_problem("ls", "ls"), None);
+    }
+
+    #[test]
+    fn body_preview_counts_cjk_characters_not_utf8_bytes() {
+        let chinese = "一二三四五六七八九十";
+        assert_eq!(body_preview(chinese, 10), chinese);
+        assert_eq!(body_preview(chinese, 5), "一二三四五…");
+        assert_eq!(body_preview("部署\n重启服务", 6), "部署\\n重启…");
     }
 }

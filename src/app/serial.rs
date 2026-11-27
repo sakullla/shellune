@@ -21,11 +21,14 @@
 //! presents a device it did not open: [`SerialTarget`] is a description, and a pane is
 //! live only while a [`SerialLink`] holds an open port.
 
-use shellune_core::{ConnectionRecord, SerialFlow, SerialParity, SerialStopBits};
+use shellune_core::{ConnectionRecord, SerialFlow, SerialNewline, SerialParity, SerialStopBits};
 use shellune_serial::{
     CloseOutcome, DataBits, FlowControl, Parity, PortInfo, SerialCause, SerialConfig, SerialError,
     SerialEvent, SerialSession, StopBits, list_ports,
 };
+
+use crate::app::copy::{self, Locale};
+use crate::app::theme::Tone;
 
 /// A saved serial connection, as a device is opened from it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +36,7 @@ pub struct SerialTarget {
     device: String,
     config: SerialConfig,
     local_echo: bool,
+    newline: NewlineFormat,
 }
 
 impl SerialTarget {
@@ -50,7 +54,19 @@ impl SerialTarget {
             device: saved.device().to_owned(),
             config: config_of(saved),
             local_echo: saved.local_echo(),
+            newline: NewlineFormat::from(saved.newline()),
         })
+    }
+
+    /// Returns a copy targeting a different device path while keeping line settings.
+    #[must_use]
+    pub fn with_device(&self, device: impl Into<String>) -> Self {
+        Self {
+            device: device.into(),
+            config: self.config,
+            local_echo: self.local_echo,
+            newline: self.newline,
+        }
     }
 
     /// The device exactly as the platform spells it, which is what is opened.
@@ -69,6 +85,12 @@ impl SerialTarget {
     #[must_use]
     pub fn local_echo(&self) -> bool {
         self.local_echo
+    }
+
+    /// The saved newline mode for this serial connection.
+    #[must_use]
+    pub fn newline(&self) -> NewlineFormat {
+        self.newline
     }
 }
 
@@ -138,8 +160,14 @@ impl NewlineFormat {
     /// The short label the control shows.
     #[must_use]
     pub fn label(self) -> &'static str {
+        self.localized_label(Locale::English)
+    }
+
+    /// The localized short label for the status bar button and tooltip.
+    #[must_use]
+    pub fn localized_label(self, locale: Locale) -> &'static str {
         match self {
-            Self::AsTyped => "as typed",
+            Self::AsTyped => locale.strings().serial_newline_as_typed,
             Self::CarriageReturn => "CR",
             Self::LineFeed => "LF",
             Self::CarriageReturnLineFeed => "CRLF",
@@ -210,6 +238,28 @@ impl NewlineFormat {
         shown
     }
 }
+
+impl From<SerialNewline> for NewlineFormat {
+    fn from(value: SerialNewline) -> Self {
+        match value {
+            SerialNewline::AsTyped => Self::AsTyped,
+            SerialNewline::Cr => Self::CarriageReturn,
+            SerialNewline::Lf => Self::LineFeed,
+            SerialNewline::Crlf => Self::CarriageReturnLineFeed,
+        }
+    }
+}
+
+impl From<NewlineFormat> for SerialNewline {
+    fn from(value: NewlineFormat) -> Self {
+        match value {
+            NewlineFormat::AsTyped => Self::AsTyped,
+            NewlineFormat::CarriageReturn => Self::Cr,
+            NewlineFormat::LineFeed => Self::Lf,
+            NewlineFormat::CarriageReturnLineFeed => Self::Crlf,
+        }
+    }
+}
 /// One open device, as a terminal pane drives it (R17, R21).
 ///
 /// The reader and writer threads belong to the session inside; the pane sees only
@@ -232,16 +282,15 @@ pub struct SerialLink {
 }
 
 impl SerialLink {
-    /// Opens the device a target names and starts its session.
+    /// Opens the device and formats any error in `locale`.
     ///
     /// # Errors
     ///
-    /// The reason the backend allowed, already phrased for a person: which port,
-    /// which cause the platform could separate, and what to do about it.
-    pub fn open(target: &SerialTarget) -> Result<Self, String> {
+    /// Returns a localized description if the device could not be opened.
+    pub fn open_for(target: &SerialTarget, locale: Locale) -> Result<Self, String> {
         SerialSession::open(target.device(), target.config())
             .map(Self::holding)
-            .map_err(|error| describe(&error))
+            .map_err(|error| describe_for(&error, locale))
     }
 
     /// Wraps an already open session.
@@ -259,17 +308,25 @@ impl SerialLink {
         }
     }
 
-    /// Queues bytes for the device.
-    ///
-    /// Returns `Ok(true)` when queued, `Ok(false)` when refused. A full queue is **not** an error of the
-    /// session: the bytes were refused, the session is still open, and the pane says so
-    /// while keeping the terminal live. Any other cause really did end the session and
-    /// is reported as one.
+    /// Sends a serial BREAK signal on the open line.
     ///
     /// # Errors
     ///
-    /// The reason the session is no longer open, when it is not.
-    pub fn write(&mut self, bytes: &[u8]) -> Result<bool, String> {
+    /// Returns a localized error description if the port is closed or the driver refuses.
+    pub fn send_break(&self, locale: Locale) -> Result<(), String> {
+        self.session
+            .send_break()
+            .map_err(|error| describe_for(&error, locale))
+    }
+
+    /// Queues bytes for the device, formatting any error in `locale`.
+    ///
+    /// Returns `Ok(true)` when queued, `Ok(false)` when refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns a localized error if the session is no longer open.
+    pub fn write_for(&mut self, bytes: &[u8], locale: Locale) -> Result<bool, String> {
         match self.session.send(bytes) {
             Ok(_) => {
                 self.send_problem = None;
@@ -279,33 +336,39 @@ impl SerialLink {
             // can be typed again. Ending the session here would kill a device that is
             // merely slower than the typist.
             Err(error) if error.is(SerialCause::QueueFull) => {
-                self.send_problem = Some(describe(&error));
+                self.send_problem = Some(describe_for(&error, locale));
                 Ok(false)
             }
-            Err(error) => Err(describe(&error)),
+            Err(error) => Err(describe_for(&error, locale)),
         }
     }
 
-    /// Everything the session reported since the last call, in order.
-    ///
-    /// The events are passed up unchanged except for the two the pane states itself:
-    /// a driver receive loss and an unfinished frame are kept here for the bar,
-    /// because they describe this line rather than a change of state.
-    pub fn poll(&mut self) -> Vec<SerialEvent> {
+    /// Polls the session and formats runtime warnings in `locale`.
+    pub fn poll_for(&mut self, locale: Locale) -> Vec<SerialEvent> {
+        let strings = locale.strings();
         let events = self.session.poll();
         for event in &events {
             match event {
                 SerialEvent::SendIncomplete {
                     sent, requested, ..
                 } => {
-                    self.incomplete = Some(format!(
-                        "the device accepted {sent} of {requested} bytes; the rest was not sent again"
+                    self.incomplete = Some(copy::fill(
+                        strings.serial_send_incomplete,
+                        &[
+                            ("sent", &sent.to_string()),
+                            ("requested", &requested.to_string()),
+                        ],
                     ));
                 }
                 SerialEvent::ReceiveOverflow { notice } => {
                     self.loss = Some(match notice.lost {
-                        Some(lost) => format!("the device lost {lost} bytes: {}", notice.text),
-                        None => format!("the device lost bytes: {}", notice.text),
+                        Some(lost) => copy::fill(
+                            strings.serial_receive_overflow_count,
+                            &[("lost", &lost.to_string()), ("text", &notice.text)],
+                        ),
+                        None => {
+                            copy::fill(strings.serial_receive_overflow, &[("text", &notice.text)])
+                        }
                     });
                 }
                 SerialEvent::Received(_)
@@ -339,6 +402,12 @@ impl SerialLink {
     /// keeps the port in Closing and says so instead of reporting a release that did
     /// not happen, and the pane states that as the reason it is not finished.
     pub fn close(&mut self) -> CloseReport {
+        self.close_for(Locale::English)
+    }
+
+    /// Stops the session and releases the port, formatting any close note in `locale`.
+    pub fn close_for(&mut self, locale: Locale) -> CloseReport {
+        let strings = locale.strings();
         match self.session.close() {
             CloseOutcome::Closed {
                 discarded_frames,
@@ -346,8 +415,12 @@ impl SerialLink {
             } => CloseReport {
                 released: true,
                 note: (discarded_frames > 0).then(|| {
-                    format!(
-                        "{discarded_frames} queued frames ({discarded_bytes} bytes) were never sent"
+                    copy::fill(
+                        strings.serial_close_discarded,
+                        &[
+                            ("frames", &discarded_frames.to_string()),
+                            ("bytes", &discarded_bytes.to_string()),
+                        ],
                     )
                 }),
             },
@@ -357,9 +430,9 @@ impl SerialLink {
             },
             CloseOutcome::StillClosing { waited } => CloseReport {
                 released: false,
-                note: Some(format!(
-                    "the driver did not stop within {} ms, so the port is still held",
-                    waited.as_millis()
+                note: Some(copy::fill(
+                    strings.serial_close_still_held,
+                    &[("ms", &waited.as_millis().to_string())],
                 )),
             },
         }
@@ -383,6 +456,12 @@ pub struct CloseReport {
 /// never returns a diagnostic without one.
 #[must_use]
 pub fn describe(error: &SerialError) -> String {
+    describe_for(error, Locale::English)
+}
+
+/// Describes a serial error in `locale`.
+#[must_use]
+pub fn describe_for(error: &SerialError, locale: Locale) -> String {
     let mut text = String::new();
     if let Some(port) = error.port() {
         text.push_str(port);
@@ -396,7 +475,7 @@ pub fn describe(error: &SerialError) -> String {
         .map(|cause| cause.label())
         .collect();
     if !also.is_empty() {
-        text.push_str(" (or: ");
+        text.push_str(&format!(" ({}: ", locale.strings().serial_or));
         text.push_str(&also.join(", "));
         text.push(')');
     }
@@ -523,24 +602,32 @@ pub struct SerialPane {
     echo: bool,
     ports: PortScan,
     note: Option<String>,
+    note_tone: Tone,
 }
 
 impl SerialPane {
-    /// The state of a pane for a saved device.
-    ///
-    /// The local echo starts from the record, because that is the choice the user made
-    /// when they saved the connection; the newline format starts as typed, which is
-    /// what the bytes on the wire really were before a choice is made.
+    /// The state of a pane for a saved device with an initial newline format.
     #[must_use]
-    pub fn new(device: &str, settings: impl Into<String>, local_echo: bool) -> Self {
+    pub fn with_format(
+        device: &str,
+        settings: impl Into<String>,
+        local_echo: bool,
+        format: NewlineFormat,
+    ) -> Self {
         Self {
             device: device.to_owned(),
             settings: settings.into(),
-            format: NewlineFormat::AsTyped,
+            format,
             echo: local_echo,
             ports: PortScan::NotAsked,
             note: None,
+            note_tone: Tone::Warning,
         }
+    }
+
+    /// Updates the device path shown in the status bar after switching ports.
+    pub fn set_device(&mut self, device: impl Into<String>) {
+        self.device = device.into();
     }
 
     /// The device the pane is about.
@@ -607,9 +694,21 @@ impl SerialPane {
         self.note.as_deref()
     }
 
-    /// Replaces the line the pane says, or clears it.
-    pub fn set_note(&mut self, note: Option<String>) {
+    /// Severity tone of the current status note.
+    #[must_use]
+    pub fn note_tone(&self) -> Tone {
+        self.note_tone
+    }
+
+    /// Replaces the status note along with its severity tone.
+    pub fn set_note_with_tone(&mut self, note: Option<String>, tone: Tone) {
         self.note = note;
+        self.note_tone = tone;
+    }
+
+    /// Dismisses the current status note.
+    pub fn clear_note(&mut self) {
+        self.note = None;
     }
 
     /// Keeps the newest of two things worth saying about the line.
@@ -617,6 +716,12 @@ impl SerialPane {
     /// Only one line is drawn, so the newest fact replaces the older one: a refused
     /// send that was followed by a lost byte should not hide the loss behind it.
     pub fn say(&mut self, note: impl Into<String>) {
+        self.say_with_tone(note, Tone::Warning);
+    }
+
+    /// Keeps the newest status note with an explicit severity tone.
+    pub fn say_with_tone(&mut self, note: impl Into<String>, tone: Tone) {
         self.note = Some(note.into());
+        self.note_tone = tone;
     }
 }

@@ -12,10 +12,10 @@ use std::{rc::Rc, sync::Arc};
 
 use gpui::prelude::*;
 use gpui::{
-    Bounds, Context, CursorStyle, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Window, div,
-    img, px,
+    Bounds, ClipboardItem, Context, CursorStyle, FocusHandle, ImageFormat, KeyDownEvent,
+    KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString,
+    Subscription, Window, div, img, px,
 };
 use shellune_core::SessionFailure;
 use shellune_desktop::PointerShape;
@@ -26,8 +26,8 @@ use crate::app::desktop::{
     ALT_LEFT, Availability, Buttons, CONTROL_LEFT, ClipboardEntry, ClipboardKind,
     DESKTOP_POLL_INTERVAL, DESKTOP_TILE, DesktopLink, DesktopSurface, DesktopTarget, DesktopZoom,
     DriveProblem, InputQueue, KeyCodes, LinkEvent, LinkFailure, LinkState, NativeLink, Notice,
-    SHIFT_LEFT, availability, clamp_pan, content_rect_in, encryption_note, in_controls_reveal_zone,
-    key_codes, to_remote_in,
+    SHIFT_LEFT, SpecialKeyCombo, availability, clamp_pan, content_rect_in, encryption_note,
+    in_controls_reveal_zone, key_codes, to_remote_in,
 };
 use crate::app::desktop_clipboard;
 use crate::app::icons::{self, Icon};
@@ -97,11 +97,35 @@ enum InitialClipboard {
 struct SignIn {
     cancel_focus: FocusHandle,
     connect_focus: FocusHandle,
+    save_focus: FocusHandle,
     user: Option<gpui::Entity<TextField>>,
     password: gpui::Entity<TextField>,
+    save: bool,
     focus_pending: bool,
     rejection: Option<String>,
 }
+
+/// Actions a [`DesktopPane`] asks the enclosing window to perform.
+pub enum DesktopPaneRequest {
+    /// Reconnect this desktop session.
+    Reconnect,
+    /// Show a toast notification in the window.
+    Toast {
+        /// Toast tone.
+        tone: Tone,
+        /// Toast headline.
+        title: String,
+    },
+    /// Persist the credentials entered in the inline sign-in form.
+    SaveCredentials {
+        /// Optional updated username.
+        user: Option<String>,
+        /// Password to store in the vault.
+        password: shellune_core::SecretString,
+    },
+}
+
+impl gpui::EventEmitter<DesktopPaneRequest> for DesktopPane {}
 
 /// Where a desktop pane is in its own terms (R17).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -359,6 +383,8 @@ pub struct DesktopPane {
     /// session keep it, and it is never written down - a new attempt starts with the
     /// bar shown, because the fold was a decision about this screen.
     controls_collapsed: bool,
+    /// Whether the special keys dropdown menu is currently open in the floating toolbar.
+    special_keys_open: bool,
     /// Monotonic debounce token for the toolbar auto-hide timer (R2).
     controls_idle_token: u64,
     /// How many frames drew the bar over the picture, for the test that a folded bar
@@ -475,6 +501,7 @@ impl DesktopPane {
             bar_hovered: false,
             controls_visible: cfg!(feature = "ui-capture"),
             controls_collapsed: false,
+            special_keys_open: false,
             controls_idle_token: 0,
             #[cfg(test)]
             controls_frames: 0,
@@ -619,10 +646,14 @@ impl DesktopPane {
     /// band or pressing Alt+Shift+T.
     pub fn set_controls_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
         if collapsed {
-            let changed = !self.controls_collapsed || self.controls_visible || self.bar_hovered;
+            let changed = !self.controls_collapsed
+                || self.controls_visible
+                || self.bar_hovered
+                || self.special_keys_open;
             self.controls_collapsed = true;
             self.controls_visible = false;
             self.bar_hovered = false;
+            self.special_keys_open = false;
             self.controls_idle_token = self.controls_idle_token.wrapping_add(1);
             if changed {
                 cx.notify();
@@ -671,7 +702,11 @@ impl DesktopPane {
     }
 
     fn auto_hide_controls_if_idle(&mut self, token: u64, cx: &mut Context<Self>) {
-        if self.controls_idle_token != token || self.bar_hovered || !self.controls_visible {
+        if self.controls_idle_token != token
+            || self.bar_hovered
+            || self.special_keys_open
+            || !self.controls_visible
+        {
             return;
         }
         self.controls_visible = false;
@@ -1095,9 +1130,72 @@ impl DesktopPane {
         self.presented_cursor
     }
 
+    /// Cancels an in-flight connection attempt.
+    pub fn cancel_connect(&mut self, cx: &mut Context<Self>) {
+        if self.phase != DesktopPhase::Connecting {
+            return;
+        }
+        self.fail(LinkFailure::Cancelled, "", cx);
+    }
+
+    /// Sends a special key combination (e.g. Ctrl+Alt+Del) to the remote desktop.
+    pub fn send_special_key(&mut self, combo: SpecialKeyCombo, cx: &mut Context<Self>) {
+        self.special_keys_open = false;
+        if !self.can_send_input() {
+            cx.notify();
+            return;
+        }
+        self.input.push_combo(combo.keys());
+        self.flush_input();
+        cx.notify();
+    }
+
+    /// Captures the current remote framebuffer as a PNG image on the system clipboard.
+    pub fn capture_screenshot(&mut self, cx: &mut Context<Self>) {
+        self.special_keys_open = false;
+        let strings = self.locale.strings();
+        let (width, height) = self.surface.size();
+        if width == 0 || height == 0 {
+            cx.emit(DesktopPaneRequest::Toast {
+                tone: Tone::Danger,
+                title: strings.desktop_screenshot_failed.to_owned(),
+            });
+            return;
+        }
+        let mut pixels = self.surface.pixels();
+        for chunk in pixels.as_chunks_mut::<4>().0 {
+            chunk.swap(0, 2);
+        }
+        let encoded = image::RgbaImage::from_raw(width, height, pixels).and_then(|rgba| {
+            let mut png = Vec::new();
+            image::DynamicImage::ImageRgba8(rgba)
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .ok()
+                .map(|()| png)
+        });
+        match encoded {
+            Some(png) => {
+                let image = gpui::Image::from_bytes(ImageFormat::Png, png);
+                cx.write_to_clipboard(ClipboardItem::new_image(&image));
+                cx.emit(DesktopPaneRequest::Toast {
+                    tone: Tone::Positive,
+                    title: strings.desktop_screenshot_copied.to_owned(),
+                });
+            }
+            None => {
+                cx.emit(DesktopPaneRequest::Toast {
+                    tone: Tone::Danger,
+                    title: strings.desktop_screenshot_failed.to_owned(),
+                });
+            }
+        }
+        cx.notify();
+    }
+
     /// Whether the controls over the picture are currently mounted in the element tree (R2).
     fn controls_shown(&self) -> bool {
-        !self.controls_collapsed && (self.controls_visible || self.bar_hovered)
+        !self.controls_collapsed
+            && (self.controls_visible || self.bar_hovered || self.special_keys_open)
     }
 
     /// Whether the bar is drawn, for the tests.
@@ -1506,8 +1604,10 @@ impl DesktopPane {
                     self.sign_in = Some(SignIn {
                         cancel_focus: cx.focus_handle(),
                         connect_focus: cx.focus_handle(),
+                        save_focus: cx.focus_handle(),
                         user,
                         password,
+                        save: false,
                         focus_pending: true,
                         rejection: rejected,
                     });
@@ -2033,7 +2133,7 @@ impl DesktopPane {
     /// server that is waiting for a certificate decision and one that is deciding
     /// on a password do not look the same, and a failure names the step it
     /// stopped on instead of leaving the user to guess where it went wrong.
-    fn status_card(&self, metrics: Metrics) -> gpui::Div {
+    fn status_card(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
         let strings = self.locale.strings();
         let (tone, headline, detail) = match &self.phase {
             DesktopPhase::NotStarted => (
@@ -2141,6 +2241,59 @@ impl DesktopPane {
                             .child(SharedString::from(problem.clone())),
                     ),
             );
+        }
+        // Connecting shows a Cancel button; an ended session shows a Reconnect button.
+        match &self.phase {
+            DesktopPhase::Connecting => {
+                card = card.child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .pt(metrics.scale(spacing::TIGHT))
+                        .child(
+                            components::compact_button(
+                                strings.desktop_cancel_connect,
+                                Variant::Secondary,
+                                metrics,
+                            )
+                            .id(SharedString::from("desktop.status.cancel"))
+                            .debug_selector(|| "desktop.status.cancel".to_owned())
+                            .on_click(cx.listener(
+                                |this, _event, _window, cx| {
+                                    cx.stop_propagation();
+                                    this.cancel_connect(cx);
+                                },
+                            )),
+                        ),
+                );
+            }
+            DesktopPhase::Ended(_) => {
+                card = card.child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .pt(metrics.scale(spacing::TIGHT))
+                        .child(
+                            components::icon_label_button(
+                                Icon::Refresh,
+                                strings.desktop_reconnect,
+                                Variant::Primary,
+                                metrics,
+                            )
+                            .h(metrics.compact_control_height())
+                            .px(metrics.scale(spacing::SNUG))
+                            .id(SharedString::from("desktop.status.reconnect"))
+                            .debug_selector(|| "desktop.status.reconnect".to_owned())
+                            .on_click(cx.listener(
+                                |_this, _event, _window, cx| {
+                                    cx.stop_propagation();
+                                    cx.emit(DesktopPaneRequest::Reconnect);
+                                },
+                            )),
+                        ),
+                );
+            }
+            DesktopPhase::NotStarted | DesktopPhase::Live => {}
         }
         // Centred and capped by the shared rule, so it is measured at the width it is
         // painted at (ADR-2).
@@ -2320,6 +2473,51 @@ impl DesktopPane {
             .child(components::divider_vertical(metrics).mx(metrics.scale(spacing::HAIRLINE)))
             .child(
                 components::icon_label_button(
+                    Icon::Key,
+                    strings.desktop_special_keys,
+                    if self.special_keys_open {
+                        Variant::Secondary
+                    } else {
+                        Variant::Ghost
+                    },
+                    metrics,
+                )
+                .h(metrics.compact_control_height())
+                .px(metrics.scale(spacing::TIGHT))
+                .text_size(metrics.label_size())
+                .id(SharedString::from("desktop.special_keys"))
+                .debug_selector(|| "desktop.special_keys".to_owned())
+                .tooltip(components::tooltip(strings.desktop_special_keys_hint))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.special_keys_open = !this.special_keys_open;
+                    if this.special_keys_open {
+                        this.controls_idle_token = this.controls_idle_token.wrapping_add(1);
+                    }
+                    cx.notify();
+                })),
+            )
+            .child(
+                components::icon_only_button(Icon::Copy, metrics)
+                    .id(SharedString::from("desktop.screenshot"))
+                    .debug_selector(|| "desktop.screenshot".to_owned())
+                    .tooltip(components::tooltip(strings.desktop_screenshot))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.capture_screenshot(cx);
+                    })),
+            )
+            .child(
+                components::icon_only_button(Icon::Refresh, metrics)
+                    .id(SharedString::from("desktop.reconnect"))
+                    .debug_selector(|| "desktop.reconnect".to_owned())
+                    .tooltip(components::tooltip(strings.desktop_reconnect))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.special_keys_open = false;
+                        cx.emit(DesktopPaneRequest::Reconnect);
+                    })),
+            )
+            .child(components::divider_vertical(metrics).mx(metrics.scale(spacing::HAIRLINE)))
+            .child(
+                components::icon_label_button(
                     if self.fullscreen {
                         Icon::Restore
                     } else {
@@ -2359,6 +2557,55 @@ impl DesktopPane {
         // buttons keep their own pointing hand, which is set on them and painted
         // after the bar.
         bar.style().mouse_cursor = Some(CursorStyle::Arrow);
+        let mut stack = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .child(bar);
+        if self.special_keys_open {
+            let mut menu = components::menu_card("desktop.special_keys.menu", metrics)
+                .w(metrics.scale(172.0))
+                .id(SharedString::from("desktop.special_keys.menu"))
+                .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                    this.set_bar_hovered(*hovered, cx);
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+                );
+            for (selector, label, combo) in [
+                (
+                    "desktop.special_keys.ctrl_alt_del",
+                    strings.desktop_key_ctrl_alt_del,
+                    SpecialKeyCombo::CtrlAltDel,
+                ),
+                (
+                    "desktop.special_keys.win",
+                    strings.desktop_key_win,
+                    SpecialKeyCombo::Win,
+                ),
+                (
+                    "desktop.special_keys.print_screen",
+                    strings.desktop_key_print_screen,
+                    SpecialKeyCombo::PrintScreen,
+                ),
+            ] {
+                menu = menu.child(
+                    components::compact_button(label, Variant::Ghost, metrics)
+                        .w_full()
+                        .justify_start()
+                        .id(SharedString::from(selector))
+                        .debug_selector(move || selector.to_owned())
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            cx.stop_propagation();
+                            this.send_special_key(combo, cx);
+                        })),
+                );
+            }
+            menu.style().mouse_cursor = Some(CursorStyle::Arrow);
+            stack = stack.child(menu);
+        }
         div()
             .absolute()
             .top_0()
@@ -2367,13 +2614,66 @@ impl DesktopPane {
             .flex()
             .justify_center()
             .pt(metrics.scale(spacing::TIGHT))
-            .child(bar)
+            .child(stack)
+    }
+
+    /// Low-interference top-center micro-handle shown while the floating toolbar is collapsed.
+    fn controls_handle(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
+        let strings = self.locale.strings();
+        let mut pill = div()
+            .id(SharedString::from("desktop.controls.handle"))
+            .debug_selector(|| "desktop.controls.handle".to_owned())
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(metrics.scale(48.0))
+            .h(metrics.scale(14.0))
+            .rounded_b(px(crate::app::theme::radius::SMALL))
+            .bg(theme::faded(theme::swatch(palette::CHROME), 0.78))
+            .border_b_1()
+            .border_l_1()
+            .border_r_1()
+            .border_color(theme::faded(theme::swatch(palette::BORDER), 0.7))
+            .cursor_pointer()
+            .occlude()
+            .tooltip(components::tooltip(format!(
+                "{} (Alt+Shift+T)",
+                strings.desktop_show_controls
+            )))
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                if *hovered {
+                    this.reveal_controls(cx);
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+            )
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                cx.stop_propagation();
+                this.reveal_controls(cx);
+            }))
+            .child(icons::icon(
+                Icon::ChevronDown,
+                metrics.scale(10.0),
+                theme::swatch(palette::TEXT_MUTED),
+            ));
+        pill.style().mouse_cursor = Some(CursorStyle::PointingHand);
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(pill)
     }
 
     fn submit_credentials(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(fields) = &self.sign_in else {
             return;
         };
+        let mut updated_user = None;
         if let Some(user) = &fields.user {
             let name = user.read(cx).text().trim();
             if name.is_empty() {
@@ -2381,17 +2681,21 @@ impl DesktopPane {
                 return;
             }
             self.target.set_user(name.to_owned());
+            updated_user = Some(name.to_owned());
         }
         let password = shellune_core::SecretString::new(fields.password.read(cx).text());
-        if password.is_empty() {
-            window.focus(fields.password.read(cx).focus_handle());
-            return;
-        }
+        let save = fields.save;
         fields
             .password
             .update(cx, |field, cx| field.set_text("", cx));
         self.sign_in = None;
         window.focus(&self.focus);
+        if save && !password.is_empty() {
+            cx.emit(DesktopPaneRequest::SaveCredentials {
+                user: updated_user,
+                password: password.clone(),
+            });
+        }
         self.start(Some(password.expose()), cx);
     }
 
@@ -2405,6 +2709,8 @@ impl DesktopPane {
         let fields = self.sign_in.as_mut().expect("sign-in form is active");
         let password = fields.password.clone();
         let user = fields.user.clone();
+        let save = fields.save;
+        let save_focus = fields.save_focus.clone();
         if std::mem::take(&mut fields.focus_pending) {
             let field = user
                 .as_ref()
@@ -2412,10 +2718,10 @@ impl DesktopPane {
                 .unwrap_or(&password);
             window.focus(field.read(cx).focus_handle());
         }
-        let ready = !password.read(cx).text().is_empty()
-            && user
-                .as_ref()
-                .is_none_or(|u| !u.read(cx).text().trim().is_empty());
+        // Empty passwords are allowed for servers configured without one.
+        let ready = user
+            .as_ref()
+            .is_none_or(|u| !u.read(cx).text().trim().is_empty());
         let row = |label, field: gpui::Entity<TextField>, selector: &'static str| {
             div()
                 .flex()
@@ -2438,6 +2744,7 @@ impl DesktopPane {
             .chain(std::iter::once(&password))
             .map(|field| field.read(cx).focus_handle().clone())
             .collect();
+        stops.push(save_focus.clone());
         stops.push(cancel_focus.clone());
         if ready {
             stops.push(connect_focus.clone());
@@ -2478,6 +2785,27 @@ impl DesktopPane {
             password.clone(),
             "desktop.signin.password",
         ))
+        .child(
+            components::checkbox(
+                "desktop.signin.save",
+                strings.desktop_save_credentials,
+                save,
+                metrics,
+            )
+            .debug_selector(|| "desktop.signin.save".to_owned())
+            .track_focus(&save_focus)
+            .focus(|style| {
+                style
+                    .border_1()
+                    .border_color(theme::swatch(palette::FOCUS_RING))
+            })
+            .on_click(cx.listener(|pane, _, _, cx| {
+                if let Some(fields) = pane.sign_in.as_mut() {
+                    fields.save = !fields.save;
+                    cx.notify();
+                }
+            })),
+        )
         .child(
             div()
                 .flex()
@@ -2534,6 +2862,12 @@ impl DesktopPane {
                     "enter" | "space" if cancel_focus.is_focused(window) => {
                         pane.sign_in = None;
                         pane.fail(LinkFailure::Cancelled, "", cx);
+                    }
+                    "space" if save_focus.is_focused(window) => {
+                        if let Some(fields) = pane.sign_in.as_mut() {
+                            fields.save = !fields.save;
+                            cx.notify();
+                        }
                     }
                     "enter" => pane.submit_credentials(window, cx),
                     "space" if connect_focus.is_focused(window) => {
@@ -2610,12 +2944,34 @@ impl DesktopPane {
                 ),
             );
         }
+        let changed = self
+            .previous_pin
+            .as_ref()
+            .is_some_and(|pin| pin != &question.fingerprint);
         if let Some(pin) = &self.previous_pin
             && pin != &question.fingerprint
         {
-            details = details
-                .child(label(strings.desktop_certificate_changed))
-                .child(pin.clone());
+            details = details.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .debug_selector(|| "desktop.certificate.changed".to_owned())
+                    .child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(Tone::Danger.text())
+                            .child(strings.desktop_certificate_changed),
+                    )
+                    .child(
+                        div()
+                            .font_family(crate::app::terminal::monospace_family())
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .child(pin.clone()),
+                    ),
+            );
         }
         if !question.fingerprint.is_empty() {
             details = details.child(
@@ -2639,11 +2995,18 @@ impl DesktopPane {
             );
         }
         if let Some(error) = &self.pin_error {
-            details = details.child(error.clone());
+            details = details.child(
+                div()
+                    .debug_selector(|| "desktop.certificate.error".to_owned())
+                    .text_size(metrics.caption_size())
+                    .text_color(Tone::Danger.text())
+                    .child(SharedString::from(error.clone())),
+            );
         }
+        let card_tone = if changed { Tone::Danger } else { Tone::Warning };
         components::status_card(
-            Tone::Warning,
-            icons::icon(Icon::Lock, metrics.icon_size(), Tone::Warning.text()).into_any_element(),
+            card_tone,
+            icons::icon(Icon::Lock, metrics.icon_size(), card_tone.text()).into_any_element(),
             div().child(strings.desktop_certificate_title),
             Some(div().child(SharedString::from(if question.host.is_empty() {
                 self.target.target()
@@ -3106,29 +3469,38 @@ impl Render for DesktopPane {
             body = body.child(div().flex_1());
         }
         // The floating controls belong to the pane, not the remote session (R2, R18).
-        // When hidden or manually collapsed they are omitted from the element tree
-        // completely so zero hitboxes remain over the remote picture, and they are
-        // placed beneath status/certificate cards so blocking prompts always stay on top.
-        if has_picture && self.controls_shown() && self.certificate.is_none() {
-            #[cfg(test)]
-            {
-                self.controls_frames += 1;
+        // When collapsed, a minimal top-center restore handle stays reachable so users
+        // can expand the bar by pointer without memorizing shortcuts.
+        if has_picture && self.is_live() && self.certificate.is_none() {
+            if self.controls_shown() {
+                #[cfg(test)]
+                {
+                    self.controls_frames += 1;
+                }
+                body = body.child(self.controls(metrics, cx));
+            } else if self.controls_collapsed {
+                body = body.child(self.controls_handle(metrics, cx));
             }
-            body = body.child(self.controls(metrics, cx));
         }
         if has_picture && let Some(notice) = self.notice_strip(metrics, cx) {
             body = body.child(notice);
         }
-        if show_status && (!has_picture || self.reconnecting()) {
+        let ended_over_picture = has_picture && matches!(self.phase, DesktopPhase::Ended(_));
+        if show_status && (!has_picture || self.reconnecting() || ended_over_picture) {
             body = body.child(
                 div()
                     .absolute()
                     .inset_0()
+                    .when(ended_over_picture, |overlay| {
+                        overlay
+                            .bg(theme::scrim())
+                            .debug_selector(|| "desktop.ended.overlay".to_owned())
+                    })
                     .flex()
                     .items_center()
                     .justify_center()
                     .child(theme::enter(
-                        self.status_card(metrics),
+                        self.status_card(metrics, cx),
                         "desktop.status.enter",
                         theme::Enter::Rise,
                     )),

@@ -476,6 +476,28 @@ pub struct Strings {
     pub desktop_drive_other: &'static str,
     /// Button that puts the desktop notices away.
     pub desktop_notice_dismiss: &'static str,
+    /// Button that opens the special keys menu in a desktop toolbar.
+    pub desktop_special_keys: &'static str,
+    /// Tooltip for the special keys menu button.
+    pub desktop_special_keys_hint: &'static str,
+    /// Special key entry: Ctrl+Alt+Del.
+    pub desktop_key_ctrl_alt_del: &'static str,
+    /// Special key entry: Win / Super.
+    pub desktop_key_win: &'static str,
+    /// Special key entry: PrintScreen.
+    pub desktop_key_print_screen: &'static str,
+    /// Toolbar button that copies a screenshot of the remote desktop.
+    pub desktop_screenshot: &'static str,
+    /// Toast title when a remote desktop screenshot is copied to clipboard.
+    pub desktop_screenshot_copied: &'static str,
+    /// Toast title when capturing a remote desktop screenshot fails.
+    pub desktop_screenshot_failed: &'static str,
+    /// Button that reconnects a desktop session.
+    pub desktop_reconnect: &'static str,
+    /// Button that cancels a connecting desktop session.
+    pub desktop_cancel_connect: &'static str,
+    /// Checkbox in the inline desktop sign-in card to save the password.
+    pub desktop_save_credentials: &'static str,
     /// Label of the switch that echoes typed characters locally in a serial pane.
     pub serial_echo: &'static str,
     /// The local echo is on.
@@ -484,6 +506,32 @@ pub struct Strings {
     pub serial_echo_off: &'static str,
     /// Label of the control that chooses what the Return key sends.
     pub serial_newline: &'static str,
+    /// Label for the "as typed" serial newline format.
+    pub serial_newline_as_typed: &'static str,
+    /// Button that disconnects a serial port without closing its tab.
+    pub serial_disconnect: &'static str,
+    /// Button that reconnects a disconnected serial port in-place.
+    pub serial_reconnect: &'static str,
+    /// Button that sends a serial BREAK signal on the line.
+    pub serial_send_break: &'static str,
+    /// Notice shown after sending a serial BREAK signal.
+    pub serial_break_sent: &'static str,
+    /// Button that dismisses the serial status bar notice.
+    pub serial_note_dismiss: &'static str,
+    /// Notice when a serial write was only partially accepted (`{sent}`, `{requested}`).
+    pub serial_send_incomplete: &'static str,
+    /// Notice when the serial driver reported a known count of lost bytes (`{lost}`, `{text}`).
+    pub serial_receive_overflow_count: &'static str,
+    /// Notice when the serial driver reported lost bytes (`{text}`).
+    pub serial_receive_overflow: &'static str,
+    /// Note when closing a serial port discarded queued frames (`{frames}`, `{bytes}`).
+    pub serial_close_discarded: &'static str,
+    /// Note when closing a serial port timed out while driver held the port (`{ms}`).
+    pub serial_close_still_held: &'static str,
+    /// Conjunction between secondary serial error causes.
+    pub serial_or: &'static str,
+    /// Tooltip on a detected serial port chip when offline (`{port}`).
+    pub serial_switch_port_hint: &'static str,
     /// Control that asks the system for the serial ports again.
     pub serial_ports_refresh: &'static str,
     /// Headline of a serial port list that could not be read.
@@ -1418,10 +1466,34 @@ pub static ENGLISH: Strings = Strings {
     desktop_drive_not_added: "the drive could not be set up",
     desktop_drive_other: "the reason is unknown",
     desktop_notice_dismiss: "Dismiss",
+    desktop_special_keys: "Keys",
+    desktop_special_keys_hint: "Send special key combination",
+    desktop_key_ctrl_alt_del: "Ctrl+Alt+Del",
+    desktop_key_win: "Win / Super",
+    desktop_key_print_screen: "PrintScreen",
+    desktop_screenshot: "Screenshot",
+    desktop_screenshot_copied: "Screenshot copied to clipboard",
+    desktop_screenshot_failed: "Could not capture screenshot",
+    desktop_reconnect: "Reconnect",
+    desktop_cancel_connect: "Cancel",
+    desktop_save_credentials: "Save password in vault",
     serial_echo: "Echo",
     serial_echo_on: "on",
     serial_echo_off: "off",
     serial_newline: "Newline",
+    serial_newline_as_typed: "As typed",
+    serial_disconnect: "Disconnect",
+    serial_reconnect: "Reconnect",
+    serial_send_break: "Send Break",
+    serial_break_sent: "Break signal sent",
+    serial_note_dismiss: "Dismiss",
+    serial_send_incomplete: "Device accepted {sent} of {requested} bytes; remainder was not re-sent",
+    serial_receive_overflow_count: "Device lost {lost} bytes: {text}",
+    serial_receive_overflow: "Device lost bytes: {text}",
+    serial_close_discarded: "{frames} queued frames ({bytes} bytes) were never sent",
+    serial_close_still_held: "Driver did not stop within {ms} ms; the port is still held",
+    serial_or: "or",
+    serial_switch_port_hint: "Click to switch to {port} and reconnect",
     serial_ports_refresh: "Refresh ports",
     serial_ports_failed: "The port list could not be read",
     serial_ports_empty: "This machine reports no serial ports",
@@ -1986,10 +2058,34 @@ pub static CHINESE: Strings = Strings {
     desktop_drive_not_added: "无法建立磁盘",
     desktop_drive_other: "原因未知",
     desktop_notice_dismiss: "知道了",
+    desktop_special_keys: "特殊键",
+    desktop_special_keys_hint: "发送特殊组合键",
+    desktop_key_ctrl_alt_del: "Ctrl+Alt+Del",
+    desktop_key_win: "Win / Super",
+    desktop_key_print_screen: "PrintScreen",
+    desktop_screenshot: "截图",
+    desktop_screenshot_copied: "截图已复制到剪贴板",
+    desktop_screenshot_failed: "无法截取屏幕",
+    desktop_reconnect: "重新连接",
+    desktop_cancel_connect: "取消",
+    desktop_save_credentials: "保存密码到密码库",
     serial_echo: "本地回显",
     serial_echo_on: "开",
     serial_echo_off: "关",
     serial_newline: "换行",
+    serial_newline_as_typed: "原样",
+    serial_disconnect: "断开端口",
+    serial_reconnect: "重连端口",
+    serial_send_break: "发送 Break",
+    serial_break_sent: "已发送 Break 信号",
+    serial_note_dismiss: "关闭",
+    serial_send_incomplete: "设备仅接收 {sent}/{requested} 字节，剩余数据未重发",
+    serial_receive_overflow_count: "设备丢失 {lost} 字节：{text}",
+    serial_receive_overflow: "设备丢失字节：{text}",
+    serial_close_discarded: "{frames} 个待发帧（{bytes} 字节）未发送",
+    serial_close_still_held: "驱动在 {ms} ms 内未停止，端口仍被占用",
+    serial_or: "或",
+    serial_switch_port_hint: "点击切换到 {port} 并重连",
     serial_ports_refresh: "刷新串口",
     serial_ports_failed: "无法读取串口列表",
     serial_ports_empty: "本机没有可用的串口",
@@ -2838,6 +2934,10 @@ pub struct UxStrings {
     pub snippet_fill_hint: &'static str,
     /// Said beside the run action: it is written and submitted once
     pub snippet_run_hint: &'static str,
+    /// Row button: copy the command to the clipboard
+    pub snippet_copy: &'static str,
+    /// Tooltip for the copy button of one snippet row
+    pub snippet_copy_hint: &'static str,
     /// Row button: change the command
     pub snippet_edit: &'static str,
     /// Row button: remove the command
@@ -3820,6 +3920,8 @@ impl UxStrings {
             self.snippet_run,
             self.snippet_fill_hint,
             self.snippet_run_hint,
+            self.snippet_copy,
+            self.snippet_copy_hint,
             self.snippet_edit,
             self.snippet_delete,
             self.snippet_delete_title,
@@ -4408,12 +4510,14 @@ included",
     snippet_field_body: "Command",
     snippet_name_placeholder: "Deploy the service",
     snippet_body_placeholder: "make deploy && obsctl status",
-    snippet_editor_keys: "Enter saves. Shift+Enter starts a new line, shown as \\n in the field.",
+    snippet_editor_keys: "Enter adds a new line in the command. {save_key} saves.",
     snippet_save: "Save command",
     snippet_insert: "Fill in",
     snippet_run: "Run",
     snippet_fill_hint: "Writes the command into the terminal and runs nothing",
     snippet_run_hint: "Writes the command and submits it once, after a confirmation",
+    snippet_copy: "Copy",
+    snippet_copy_hint: "Copy the command to the clipboard",
     snippet_edit: "Edit",
     snippet_delete: "Delete",
     snippet_delete_title: "Delete this shortcut command?",
@@ -4756,7 +4860,7 @@ included",
     batch_snippet_empty: "No saved snippets yet.",
     snippet_search_placeholder: "Filter shortcut commands\u{2026}",
     snippet_search_empty: "No matching shortcut commands.",
-    snippet_keys_hint: "↑↓ select · Enter fill in · {run_key} run · Esc close",
+    snippet_keys_hint: "↑↓ select · Enter fill in · {run_key} run · {new_key} new · F2 edit · Esc close",
     quick_address_placeholder: "example.com or 192.0.2.10",
     settings_reset_default: "Reset",
     sync_unsaved_changes: "Unsaved changes — click Save before syncing",
@@ -4997,12 +5101,14 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     snippet_field_body: "命令正文",
     snippet_name_placeholder: "部署服务",
     snippet_body_placeholder: "例如 make deploy && obsctl status",
-    snippet_editor_keys: "回车保存；Shift+回车换行，换行在字段里显示为 \\n。",
+    snippet_editor_keys: "命令正文内按回车换行，按 {save_key} 保存。",
     snippet_save: "保存命令",
     snippet_insert: "填入",
     snippet_run: "执行",
     snippet_fill_hint: "只把命令写进终端，不执行",
     snippet_run_hint: "写入命令后提交一次，提交前需要确认",
+    snippet_copy: "复制",
+    snippet_copy_hint: "复制命令到剪贴板",
     snippet_edit: "编辑",
     snippet_delete: "删除",
     snippet_delete_title: "删除这条快捷命令？",
@@ -5345,7 +5451,7 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     batch_snippet_empty: "暂无已保存的代码片段。",
     snippet_search_placeholder: "搜索快捷命令\u{2026}",
     snippet_search_empty: "没有匹配的快捷命令。",
-    snippet_keys_hint: "↑↓ 选择 · Enter 填入 · {run_key} 执行 · Esc 关闭",
+    snippet_keys_hint: "↑↓ 选择 · Enter 填入 · {run_key} 执行 · {new_key} 新建 · F2 编辑 · Esc 关闭",
     quick_address_placeholder: "example.com 或 192.0.2.10",
     settings_reset_default: "重置",
     sync_unsaved_changes: "有未保存的修改——请先点击保存再同步",

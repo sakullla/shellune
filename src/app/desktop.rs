@@ -480,8 +480,9 @@ impl DesktopSurface {
         self.width == 0 || self.height == 0 || self.tiles.is_empty()
     }
 
-    /// Pack a snapshot for pixel-level assertions. Painting uses the tiles directly.
-    #[cfg(test)]
+    /// Pack a snapshot of the framebuffer (BGRA) for screenshots and pixel assertions.
+    /// Painting uses the tiles directly.
+    #[must_use]
     pub fn pixels(&self) -> Vec<u8> {
         let mut snapshot = vec![0; self.width as usize * self.height as usize * 4];
         for (i, tile) in self.tiles.iter().enumerate() {
@@ -936,6 +937,17 @@ impl InputQueue {
         self.queued.push_back(DesktopInput::Clipboard(entries));
     }
 
+    /// Queues a special key combination (e.g. Ctrl+Alt+Del): presses each key in
+    /// order, then releases them in reverse order.
+    pub fn push_combo(&mut self, keys: &[KeyCodes]) {
+        for &codes in keys {
+            self.push_key(codes, true);
+        }
+        for &codes in keys.iter().rev() {
+            self.push_key(codes, false);
+        }
+    }
+
     /// Appends the releases for everything the queue still believes is held.
     ///
     /// Returns how many events that added. Keys are released in the reverse order
@@ -1025,6 +1037,56 @@ pub const ALT_LEFT: KeyCodes = KeyCodes {
     extended: false,
     shift: false,
 };
+
+/// The Delete key.
+pub const DELETE_KEY: KeyCodes = KeyCodes {
+    scancode: 0x53,
+    keysym: 0xffff,
+    extended: true,
+    shift: false,
+};
+
+/// The left Windows / Super key.
+pub const SUPER_LEFT: KeyCodes = KeyCodes {
+    scancode: 0x5b,
+    keysym: 0xffeb,
+    extended: true,
+    shift: false,
+};
+
+/// The PrintScreen key.
+pub const PRINT_SCREEN: KeyCodes = KeyCodes {
+    scancode: 0x37,
+    keysym: 0xff61,
+    extended: true,
+    shift: false,
+};
+
+/// Special key combinations offered by the remote desktop toolbar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpecialKeyCombo {
+    /// Ctrl+Alt+Del.
+    CtrlAltDel,
+    /// Win / Super key.
+    Win,
+    /// PrintScreen key.
+    PrintScreen,
+}
+
+impl SpecialKeyCombo {
+    /// The key codes pressed in order (and released in reverse order) for this combo.
+    #[must_use]
+    pub fn keys(self) -> &'static [KeyCodes] {
+        const CTRL_ALT_DEL: [KeyCodes; 3] = [CONTROL_LEFT, ALT_LEFT, DELETE_KEY];
+        const WIN: [KeyCodes; 1] = [SUPER_LEFT];
+        const PRINT: [KeyCodes; 1] = [PRINT_SCREEN];
+        match self {
+            Self::CtrlAltDel => &CTRL_ALT_DEL,
+            Self::Win => &WIN,
+            Self::PrintScreen => &PRINT,
+        }
+    }
+}
 
 /// The key codes for a key the window reported, or None for a key this build does
 /// not translate.
@@ -2538,5 +2600,58 @@ mod tests {
             viewport(0.0, 0.0),
             point(px(0.0), px(0.0))
         ));
+    }
+
+    #[test]
+    fn push_combo_presses_in_order_and_releases_in_reverse() {
+        let mut queue = InputQueue::new();
+        queue.push_combo(SpecialKeyCombo::CtrlAltDel.keys());
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<(KeyCodes, bool)>>>);
+        impl DesktopLink for Recorder {
+            fn connect(&mut self) -> Result<(), LinkError> {
+                Ok(())
+            }
+            fn drain(&mut self) -> Vec<LinkEvent> {
+                Vec::new()
+            }
+            fn key(&self, codes: KeyCodes, down: bool) -> Result<(), LinkError> {
+                self.0.lock().expect("lock").push((codes, down));
+                Ok(())
+            }
+            fn pointer(&self, _x: u16, _y: u16, _buttons: Buttons) -> Result<(), LinkError> {
+                Ok(())
+            }
+            fn resize(
+                &self,
+                _width: u32,
+                _height: u32,
+                _scale_percent: u32,
+            ) -> Result<(), LinkError> {
+                Ok(())
+            }
+            fn clipboard(&self, _entries: &[ClipboardEntry]) -> Result<(), LinkError> {
+                Ok(())
+            }
+            fn answer_certificate(&self, _request_id: u32, _accept: bool) -> Result<(), LinkError> {
+                Ok(())
+            }
+            fn shutdown(&mut self) {}
+        }
+        let recorder = Recorder(sent.clone());
+        let count = queue.flush(&recorder).expect("combo flushes");
+        assert_eq!(count, 6);
+        assert_eq!(
+            *sent.lock().expect("lock"),
+            vec![
+                (CONTROL_LEFT, true),
+                (ALT_LEFT, true),
+                (DELETE_KEY, true),
+                (DELETE_KEY, false),
+                (ALT_LEFT, false),
+                (CONTROL_LEFT, false),
+            ]
+        );
+        assert!(queue.held_keys().is_empty());
     }
 }

@@ -42750,17 +42750,17 @@ async fn desktop_controls_dock_top_center_keep_expand_handle_visible_and_block_p
         "clicking desktop.zoom.in must not pass through to the remote surface"
     );
 
-    // Collapse the bar and move the pointer off the picture: no residual handle exists,
-    // and moving into the top-center reveal zone restores the bar without sending any
-    // pointer press to the remote surface (R2).
+    // Collapse the bar and move the pointer off the picture: a minimal top-center
+    // restore handle stays visible, and moving into the top-center reveal zone
+    // restores the bar without sending any pointer press to the remote surface.
     click(cx, "desktop.controls.collapse");
     cx.simulate_mouse_move(point(px(2.0), px(2.0)), None, Modifiers::default());
     cx.run_until_parked();
     redraw(cx);
     cx.run_until_parked();
     assert!(
-        cx.debug_bounds("desktop.controls.handle").is_none(),
-        "no residual handle is drawn after collapsing desktop.controls"
+        cx.debug_bounds("desktop.controls.handle").is_some(),
+        "a minimal top-center restore handle is drawn after collapsing desktop.controls"
     );
     let before_expand = log.lock().expect("log lock").inputs.len();
     cx.simulate_mouse_move(
@@ -53848,5 +53848,315 @@ async fn t5_relabel_fields_and_snippet_picker_escape(cx: &mut TestAppContext) {
     assert!(
         cx.update(|_window, app| view.read(app).batch_panel().view().is_editor()),
         "batch editor stays open after Escape closes the snippet picker"
+    );
+}
+
+#[gpui::test]
+async fn t6_snippets_multiline_textarea_copy_shortcuts_and_cjk_preview(cx: &mut TestAppContext) {
+    let dir = TempDir::new("t6-snippets");
+    let (view, cx) = snippet_view(cx, &dir);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.open_snippets(true, cx));
+    });
+    cx.run_until_parked();
+
+    // Multi-line TextArea: plain Enter inserts a newline rather than submitting, and
+    // Cmd/Ctrl+Enter saves the snippet.
+    type_into(cx, "snippet.editor.name", "中文部署");
+    click(cx, "snippet.editor.body");
+    cx.simulate_input("echo 第一行");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("echo 第二行");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).snippet_panel().is_editing()),
+        "plain Enter inside snippet body TextArea adds a newline instead of closing editor"
+    );
+    let save_key = format!(
+        "{}-enter",
+        crate::app::nav::Platform::current().keystroke_modifier()
+    );
+    cx.simulate_keystrokes(&save_key);
+    cx.run_until_parked();
+
+    let saved = cx.update(|_window, app| {
+        view.read(app)
+            .snippets()
+            .snippets()
+            .first()
+            .map(|s| (s.name().to_owned(), s.body().to_owned()))
+    });
+    assert_eq!(
+        saved,
+        Some(("中文部署".to_owned(), "echo 第一行\necho 第二行".to_owned())),
+        "Cmd/Ctrl+Enter saves the multi-line Chinese snippet"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).snippet_panel().is_editing()),
+        "editor closes after Cmd/Ctrl+Enter save"
+    );
+
+    // Copy button works even when no terminal is open.
+    click(cx, "snippet.copy.0");
+    cx.run_until_parked();
+    let copied = cx.read_from_clipboard().and_then(|item| item.text());
+    assert_eq!(
+        copied.as_deref(),
+        Some("echo 第一行\necho 第二行"),
+        "snippet copy button writes the full command to the clipboard without an active terminal"
+    );
+
+    // F2 opens editor on selected snippet; Escape closes editor.
+    cx.simulate_keystrokes("f2");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).snippet_panel().is_editing()),
+        "F2 opens the editor on the selected snippet"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).snippet_panel().is_editing()),
+        "Escape closes the snippet editor"
+    );
+}
+
+#[gpui::test]
+async fn t6_desktop_special_keys_screenshot_handle_cancel_and_ended_overlay(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let (link, log) = ScriptedLink::new(live_desktop_events());
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("t6-desk"), link);
+
+    // Collapse toolbar -> top-center restore handle is drawn and clicking it expands the bar.
+    hover(cx, "desktop.body");
+    cx.run_until_parked();
+    click(cx, "desktop.controls.collapse");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("desktop.controls.handle").is_some(),
+        "collapsed desktop toolbar renders a top-center restore handle"
+    );
+    click(cx, "desktop.controls.handle");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| {
+            view.read(app)
+                .desktop_of(id)
+                .expect("desktop mounted")
+                .read(app)
+                .controls_collapsed_for_test()
+        }),
+        "clicking desktop.controls.handle expands the toolbar"
+    );
+
+    // Special keys menu sends Ctrl+Alt+Del press/release sequence.
+    let before = log.lock().expect("lock").inputs.len();
+    click(cx, "desktop.special_keys");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("desktop.special_keys.menu").is_some(),
+        "clicking desktop.special_keys opens the special keys menu"
+    );
+    click(cx, "desktop.special_keys.ctrl_alt_del");
+    cx.run_until_parked();
+    let sent_keys: Vec<_> = log.lock().expect("lock").inputs[before..]
+        .iter()
+        .filter_map(|input| match input {
+            DesktopInput::Key { codes, down } => Some((*codes, *down)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sent_keys,
+        vec![
+            (crate::app::desktop::CONTROL_LEFT, true),
+            (crate::app::desktop::ALT_LEFT, true),
+            (crate::app::desktop::DELETE_KEY, true),
+            (crate::app::desktop::DELETE_KEY, false),
+            (crate::app::desktop::ALT_LEFT, false),
+            (crate::app::desktop::CONTROL_LEFT, false),
+        ],
+        "Ctrl+Alt+Del menu item sends the full press and reverse-release sequence"
+    );
+
+    // Screenshot copies PNG to clipboard and shows a toast.
+    click(cx, "desktop.screenshot");
+    cx.run_until_parked();
+    let has_png = cx.read_from_clipboard().is_some_and(|item| {
+        item.entries().iter().any(|entry| {
+            matches!(
+                entry,
+                gpui::ClipboardEntry::Image(img) if img.format == gpui::ImageFormat::Png && !img.bytes.is_empty()
+            )
+        })
+    });
+    assert!(
+        has_png,
+        "desktop screenshot writes a PNG image to the clipboard"
+    );
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .toast_titles()
+                .into_iter()
+                .any(|title| title == copy::ENGLISH.desktop_screenshot_copied)
+        }),
+        "desktop screenshot shows a confirmation toast"
+    );
+
+    // Ending an active desktop session dims the frozen frame and shows a reconnect button.
+    cx.update(|_window, app| {
+        let pane = view.read(app).desktop_of(id).expect("desktop").clone();
+        pane.update(app, |pane, cx| {
+            pane.stop(cx);
+        });
+    });
+    let mut ended_events = live_desktop_events();
+    ended_events.push(LinkEvent::State {
+        state: LinkState::Failed(LinkFailure::Io),
+        failure: LinkFailure::Io,
+        detail: 0,
+        reason: "connection reset".to_owned(),
+    });
+    let (ended_link, _) = ScriptedLink::new(ended_events);
+    let ended_id = mount_scripted_desktop(&view, cx, &desktop_record("t6-ended"), ended_link);
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("desktop.ended.overlay").is_some(),
+        "ended desktop session with a frame shows a dimmed overlay"
+    );
+    assert!(
+        cx.debug_bounds("desktop.status.reconnect").is_some(),
+        "ended desktop session overlay includes a reconnect button"
+    );
+    let _ = ended_id;
+}
+
+#[gpui::test]
+async fn t6_serial_disconnect_reconnect_send_break_and_newline_persistence(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("t6-serial");
+    let record = serial_record("console", "COM3");
+    let record_id = record.id();
+    let mut book = HostBook::new();
+    book.insert_connection(record.clone())
+        .expect("serial record saved");
+    let store = dir.store();
+    store.save(&book).expect("book saves");
+    let (view, cx) = cx
+        .add_window_view(move |_window, cx| ShelluneView::with_store(cx, Workspace::new(), store));
+    cx.run_until_parked();
+
+    let (link, device) = scripted_serial_port(
+        "COM3",
+        shellune_serial::testing::FakeSpec::new(),
+        std::time::Duration::from_secs(2),
+    );
+    let id = cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            view.attach_scripted_serial_for_test(
+                &record,
+                link,
+                "COM3",
+                "115200 8N1, none flow control",
+                false,
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+
+    // Cycling newline persists SerialNewline on the saved record.
+    click(cx, "serial.newline");
+    cx.run_until_parked();
+    let persisted = cx.update(|_window, app| {
+        view.read(app)
+            .book()
+            .connection(record_id)
+            .and_then(|rec| match rec {
+                shellune_core::ConnectionRecord::Serial(cfg) => Some(cfg.newline()),
+                _ => None,
+            })
+    });
+    assert_eq!(
+        persisted,
+        Some(shellune_core::SerialNewline::Cr),
+        "cycling serial newline format persists it onto the saved SerialConfig"
+    );
+
+    // Send Break invokes PortIo::send_break and shows a dismissible status note.
+    click(cx, "serial.break");
+    cx.run_until_parked();
+    assert_eq!(
+        device.breaks(),
+        1,
+        "clicking serial.break sends a BREAK signal on the port"
+    );
+    assert!(
+        cx.debug_bounds("serial.note.dismiss").is_some(),
+        "serial status note has a dismiss button"
+    );
+    click(cx, "serial.note.dismiss");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .pane_of(id)
+                .and_then(|pane| pane.read(app).serial_note().map(str::to_owned))
+                .is_none()
+        }),
+        "clicking serial.note.dismiss clears the status note"
+    );
+
+    // Disconnect releases the port without closing the tab, and Reconnect reopens in-place.
+    click(cx, "serial.disconnect");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).pane_of(id).is_some()),
+        "disconnecting serial port keeps the tab open"
+    );
+    assert!(
+        !cx.update(|_window, app| {
+            view.read(app)
+                .pane_of(id)
+                .expect("pane")
+                .read(app)
+                .state()
+                .accepts_input()
+        }),
+        "disconnected serial pane no longer accepts input"
+    );
+    assert!(
+        cx.debug_bounds("serial.reconnect").is_some(),
+        "disconnected serial strip shows a reconnect button"
+    );
+
+    let (reopened_link, _reopened_device) = scripted_serial_port(
+        "COM3",
+        shellune_serial::testing::FakeSpec::new(),
+        std::time::Duration::from_secs(2),
+    );
+    cx.update(|_window, app| {
+        view.update(app, |view, _cx| {
+            view.queue_scripted_serial_for_test("COM3", reopened_link);
+        });
+    });
+    click(cx, "serial.reconnect");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .pane_of(id)
+                .expect("pane")
+                .read(app)
+                .state()
+                .accepts_input()
+        }),
+        "clicking serial.reconnect reopens the serial port in-place"
     );
 }

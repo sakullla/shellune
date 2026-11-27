@@ -5852,6 +5852,24 @@ impl ShelluneView {
             }
         })
         .detach();
+        let session_id = tag.session;
+        cx.subscribe(&pane, move |view, _pane, request, cx| match request {
+            desktop::DesktopPaneRequest::Reconnect => {
+                view.reconnect_session(session_id, cx);
+            }
+            desktop::DesktopPaneRequest::Toast { tone, title } => {
+                view.toast(*tone, title.clone(), None, cx);
+            }
+            desktop::DesktopPaneRequest::SaveCredentials { user, password } => {
+                view.save_desktop_inline_credentials(
+                    session_id,
+                    user.as_deref(),
+                    password.clone(),
+                    cx,
+                );
+            }
+        })
+        .detach();
         let pane_focus = pane.read(cx).focus_handle().clone();
         self.panes.push(OpenPane {
             tag,
@@ -5874,6 +5892,44 @@ impl ShelluneView {
         self.showing_connection_form = false;
         self.focus_pane(tag.session, cx);
         cx.notify();
+    }
+
+    /// Persists credentials entered in the inline RDP/VNC sign-in card into the vault.
+    fn save_desktop_inline_credentials(
+        &mut self,
+        session: SessionId,
+        user: Option<&str>,
+        password: shellune_core::SecretString,
+        cx: &mut Context<Self>,
+    ) {
+        let host_id = self
+            .workspace
+            .session(session)
+            .and_then(|session| match session.kind() {
+                SessionKind::Rdp { host } | SessionKind::Vnc { host } => Some(*host),
+                _ => None,
+            });
+        let Some(host_id) = host_id else {
+            return;
+        };
+        let Some(record) = self.book.connection(host_id) else {
+            return;
+        };
+        let mut draft = crate::app::hosts::ProtocolDraft::edit(&record);
+        if let Some(user) = user {
+            draft.set_text(crate::app::hosts::ConnectionFormField::User, user);
+        }
+        draft.set_credential(None);
+        draft.set_remember(true);
+        let Ok(edit) = draft.build() else {
+            return;
+        };
+        let save = HostFormSave {
+            edit: HostFormEdit::Connection(edit),
+            editing: Some(host_id),
+            connect: false,
+        };
+        self.begin_host_form_save(save, password, cx);
     }
 
     /// Repeats what a desktop surface reports into the session record (R17).
@@ -6189,12 +6245,13 @@ impl ShelluneView {
         #[cfg(test)]
         let scripted = self.take_scripted_serial(target.device());
         let device = target.clone();
+        let locale = self.workspace.locale();
         let open = cx.background_executor().spawn(async move {
             #[cfg(test)]
             if let Some(link) = scripted {
                 return Ok(link);
             }
-            crate::app::serial::SerialLink::open(&device)
+            crate::app::serial::SerialLink::open_for(&device, locale)
         });
         cx.spawn(async move |this, cx| {
             let opened = open.await;
@@ -6346,6 +6403,107 @@ impl ShelluneView {
         cx.notify();
     }
 
+    /// Persists the selected serial newline format onto the saved serial connection record.
+    fn persist_serial_newline(
+        &mut self,
+        session: SessionId,
+        format: crate::app::serial::NewlineFormat,
+        cx: &mut Context<Self>,
+    ) {
+        let host_id = self
+            .workspace
+            .session(session)
+            .and_then(|s| match s.kind() {
+                SessionKind::Serial { host } => Some(*host),
+                _ => None,
+            });
+        let Some(host_id) = host_id else {
+            return;
+        };
+        let Some(shellune_core::ConnectionRecord::Serial(mut config)) =
+            self.book.connection(host_id)
+        else {
+            return;
+        };
+        let newline: shellune_core::SerialNewline = format.into();
+        if config.newline() == newline {
+            return;
+        }
+        config.set_newline(newline);
+        let mut next = self.book.clone();
+        if next
+            .update_connection(shellune_core::ConnectionRecord::Serial(config), host_id)
+            .is_err()
+        {
+            return;
+        }
+        if self.store.save(&next).is_ok() {
+            self.book = next;
+            self.note_data_changed(cx);
+        }
+    }
+
+    /// Reconnects a serial pane in-place (keeping its tab and scrollback), optionally
+    /// switching to another detected port path.
+    fn reconnect_serial_in_place(
+        &mut self,
+        session: SessionId,
+        override_device: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let host_id = self
+            .workspace
+            .session(session)
+            .and_then(|s| match s.kind() {
+                SessionKind::Serial { host } => Some(*host),
+                _ => None,
+            });
+        let Some(host_id) = host_id else {
+            return;
+        };
+        let Some(record) = self.book.connection(host_id) else {
+            let reason = self.strings().session_reconnect_missing_host.to_owned();
+            self.toast(Tone::Warning, reason, None, cx);
+            return;
+        };
+        let Some(mut target) = crate::app::serial::SerialTarget::of_record(&record) else {
+            return;
+        };
+        if let Some(device) = override_device {
+            target = target.with_device(device);
+        }
+        let Some(pane) = self.pane_for(session).cloned() else {
+            self.open_serial_port(session, target, cx);
+            return;
+        };
+        #[cfg(test)]
+        let scripted = self.take_scripted_serial(target.device());
+        let device = target.clone();
+        let locale = self.workspace.locale();
+        let open = cx.background_executor().spawn(async move {
+            #[cfg(test)]
+            if let Some(link) = scripted {
+                return Ok(link);
+            }
+            crate::app::serial::SerialLink::open_for(&device, locale)
+        });
+        cx.spawn(async move |this, cx| {
+            let opened = open.await;
+            let _ = this.update(cx, |view, cx| {
+                pane.update(cx, |pane, cx| {
+                    pane.reconnect_serial_with(target.device(), opened, cx);
+                });
+                if let Some(failure) = pane.read(cx).state().failure() {
+                    view.workspace.session_failed(session, failure);
+                } else {
+                    view.workspace.session_connected(session);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Uploads what a remote terminal was given, then types where it went.
     ///
     /// The files go to the folder the file view shows, or, before it was opened,
@@ -6398,6 +6556,14 @@ impl ShelluneView {
                     LinkRefusal::Malformed => ux.terminal_link_refused_malformed.to_owned(),
                 };
                 self.toast(Tone::Warning, title, None, cx);
+                return;
+            }
+            terminal::PaneRequest::SerialFormatChanged(format) => {
+                self.persist_serial_newline(id, format, cx);
+                return;
+            }
+            terminal::PaneRequest::SerialReconnect(device) => {
+                self.reconnect_serial_in_place(id, device, cx);
                 return;
             }
             terminal::PaneRequest::Platform(platform) => {

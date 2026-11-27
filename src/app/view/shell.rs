@@ -23,15 +23,23 @@ use crate::app::copy;
 use crate::app::files::FileSource;
 use crate::app::icons::{self, Icon};
 use crate::app::nav::{Destination, Platform};
-use crate::app::snippets::{SnippetEditor, body_preview};
+use crate::app::scrollbar;
+use crate::app::snippets::{SnippetEditor, SnippetSaveError, body_preview};
 use crate::app::terminal;
 use crate::app::terminal::SnippetOffer;
+use crate::app::text_area::TextArea;
 use crate::app::text_field::TextField;
 use crate::app::theme::{self, ThemeChoice, Tone, palette, radius, spacing};
 use crate::app::workspace::{AttentionKind, NotifyKind, SectionState};
 
 /// The least width a saved command's name and preview keep before its actions wrap.
 const SNIPPET_DETAIL_MIN_WIDTH: f32 = 160.0;
+
+/// Maximum height of the multi-line command editor before it scrolls, before zoom.
+const SNIPPET_BODY_MAX_HEIGHT: f32 = 160.0;
+
+/// Maximum height of the snippet list inside the manager dialog, before zoom.
+const SNIPPET_LIST_MAX_HEIGHT: f32 = 340.0;
 
 /// The ring of the bar's colour around a notice badge, so the dot stands off the
 /// control it marks; unscaled, like a border.
@@ -2338,38 +2346,60 @@ impl ShelluneView {
     /// belongs.
     fn open_snippet_editor(&mut self, id: Option<SnippetId>, cx: &mut Context<Self>) {
         let ux = copy::ux();
+        let metrics = self.metrics();
         let (name_text, body_text) = match id.and_then(|id| self.snippets.get(id).cloned()) {
             Some(snippet) => (snippet.name().to_owned(), snippet.body().to_owned()),
             None => (String::new(), String::new()),
         };
         let name = cx.new(|cx| TextField::with_text(ux.snippet_name_placeholder, &name_text, cx));
         let body = cx.new(|cx| {
-            let mut field = TextField::with_text(ux.snippet_body_placeholder, &body_text, cx);
-            // A command may be a short block, so the body keeps its line breaks; Enter
-            // still saves, which is what keeps the dialog on one keyboard path.
-            field.set_keeps_line_breaks(true, cx);
-            field
+            let mut area = TextArea::new(&body_text, metrics.scale(SNIPPET_BODY_MAX_HEIGHT), cx);
+            area.set_placeholder(ux.snippet_body_placeholder, cx);
+            area
         });
-        // Enter in either field saves what is typed. The field keeps its text so a refused
-        // draft stays on screen beside the reason it was refused.
+        // Enter in the name field saves; inside the multi-line body, Enter inserts a new
+        // line and Cmd/Ctrl+Enter saves via `snippet_panel_key`.
         let view = cx.entity().downgrade();
-        for field in [name.clone(), body.clone()] {
-            field.update(cx, |field, _cx| {
-                let view = view.clone();
-                field.on_submit(move |_text, _window, app| {
-                    view.update(app, |view, cx| {
-                        view.save_snippet_editor(cx);
-                        false
-                    })
-                    .unwrap_or(false)
-                });
+        name.update(cx, |field, _cx| {
+            let view = view.clone();
+            field.on_submit(move |_text, _window, app| {
+                view.update(app, |view, cx| {
+                    view.save_snippet_editor(cx);
+                    false
+                })
+                .unwrap_or(false)
             });
-            // The dialog redraws as the draft changes, so the length warning appears while
-            // the text can still be shortened rather than only after a refused save.
-            cx.observe(&field, |_view, _field, cx| cx.notify()).detach();
-        }
-        TextField::wire_tab_ring(&[name.clone(), body.clone()], cx);
-        let handle = name.read(cx).focus_handle().clone();
+        });
+        let name_focus = name.read(cx).focus_handle().clone();
+        let body_focus = body.read(cx).focus_handle().clone();
+        name.update(cx, |field, _cx| {
+            let body_focus = body_focus.clone();
+            field.on_tab(move |_back, window, _app| {
+                window.focus(&body_focus);
+                true
+            });
+        });
+        body.update(cx, |area, _cx| {
+            let name_focus = name_focus.clone();
+            area.on_tab(move |_back, window, _app| {
+                window.focus(&name_focus);
+                true
+            });
+        });
+        // The dialog redraws as the draft changes, so the length warning appears while
+        // the text can still be shortened rather than only after a refused save.
+        cx.observe(&name, |_view, field, cx| {
+            field.update(cx, |field, cx| field.set_invalid(false, cx));
+            cx.notify();
+        })
+        .detach();
+        cx.observe(&body, |_view, area, cx| {
+            if area.read(cx).invalid() {
+                area.update(cx, |area, cx| area.set_invalid(false, cx));
+            }
+            cx.notify();
+        })
+        .detach();
         self.snippet_panel.begin_edit(SnippetEditor {
             id,
             name,
@@ -2378,7 +2408,7 @@ impl ShelluneView {
         });
         // The keyboard goes to the first field on the next draw, which is the only place
         // with a window to give it to.
-        self.snippet_focus_pending = Some(handle);
+        self.snippet_focus_pending = Some(name_focus);
         cx.notify();
     }
 
@@ -2424,6 +2454,19 @@ impl ShelluneView {
             }
             Err(error) => {
                 let reason = error.text(locale);
+                if let SnippetSaveError::Problem(problem) = &error {
+                    match problem {
+                        shellune_core::SnippetProblem::EmptyName
+                        | shellune_core::SnippetProblem::NameTooLong { .. } => {
+                            name_field.update(cx, |field, cx| field.set_invalid(true, cx));
+                        }
+                        shellune_core::SnippetProblem::EmptyBody
+                        | shellune_core::SnippetProblem::BodyTooLong { .. } => {
+                            body_field.update(cx, |area, cx| area.set_invalid(true, cx));
+                        }
+                        shellune_core::SnippetProblem::Unknown { .. } => {}
+                    }
+                }
                 if let Some(editor) = self.snippet_panel.editor_mut() {
                     editor.problem = Some(reason);
                 }
@@ -2455,6 +2498,21 @@ impl ShelluneView {
             }
         }
         cx.notify();
+    }
+
+    /// Copies one saved command's body to the system clipboard, even when no terminal is open.
+    pub(crate) fn copy_snippet(&mut self, id: SnippetId, cx: &mut Context<Self>) {
+        let Some(body) = self.snippets.get(id).map(|s| s.body().to_owned()) else {
+            let ux = copy::ux();
+            self.toast(
+                Tone::Danger,
+                ux.snippet_problem_unknown.to_owned(),
+                None,
+                cx,
+            );
+            return;
+        };
+        self.copy_text(body, cx);
     }
 
     /// Offers one saved command to the terminal on screen (R6).
@@ -2600,38 +2658,81 @@ impl ShelluneView {
     fn snippet_panel_key(
         &mut self,
         event: &gpui::KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
-        // While the editor is open the keys belong to its fields.
+        let secondary = event.keystroke.modifiers.number_of_modifiers() == 1
+            && event.keystroke.modifiers.secondary();
+        let plain = !event.keystroke.modifiers.modified();
+        // While the editor is open, Cmd/Ctrl+Enter saves; other keys belong to its fields.
         if self.snippet_panel.is_editing() {
+            if secondary && key == "enter" && self.snippets.can_write() {
+                cx.stop_propagation();
+                self.save_snippet_editor(cx);
+            }
             return;
         }
         let filtered = self
             .snippet_panel
             .filtered_indices(self.snippets.snippets());
         let len = filtered.len();
-        let secondary = event.keystroke.modifiers.number_of_modifiers() == 1
-            && event.keystroke.modifiers.secondary();
+        let selected_id = filtered
+            .get(self.snippet_panel.selected())
+            .and_then(|&real_index| self.snippets.snippets().get(real_index))
+            .map(shellune_core::Snippet::id);
+        let search_focused = self
+            .snippet_panel
+            .search_field()
+            .is_some_and(|field| field.read(cx).focus_handle().is_focused(window));
         match key {
             "down" => {
                 cx.stop_propagation();
                 self.snippet_panel.step(1, len);
+                self.snippet_panel.scroll_to_selected();
                 cx.notify();
             }
             "up" => {
                 cx.stop_propagation();
                 self.snippet_panel.step(-1, len);
+                self.snippet_panel.scroll_to_selected();
                 cx.notify();
             }
             "enter" if self.snippet_panel.pending_delete().is_none() => {
                 cx.stop_propagation();
-                if let Some(&real_index) = filtered.get(self.snippet_panel.selected())
-                    && let Some(snippet) = self.snippets.snippets().get(real_index)
-                {
-                    let id = snippet.id();
+                if let Some(id) = selected_id {
                     self.use_snippet(id, secondary, cx);
+                }
+            }
+            "n" if secondary && self.snippets.can_write() => {
+                cx.stop_propagation();
+                self.snippet_panel.keep();
+                self.open_snippet_editor(None, cx);
+            }
+            "f2" if plain && self.snippets.can_write() => {
+                if let Some(id) = selected_id {
+                    cx.stop_propagation();
+                    self.open_snippet_editor(Some(id), cx);
+                }
+            }
+            "e" if secondary && self.snippets.can_write() => {
+                if let Some(id) = selected_id {
+                    cx.stop_propagation();
+                    self.open_snippet_editor(Some(id), cx);
+                }
+            }
+            "delete" if (plain && !search_focused) || secondary => {
+                if let Some(id) = selected_id {
+                    cx.stop_propagation();
+                    self.snippet_panel.ask_delete(id);
+                    cx.notify();
+                }
+            }
+            "backspace" if secondary => {
+                if let Some(id) = selected_id {
+                    cx.stop_propagation();
+                    self.snippet_panel.ask_delete(id);
+                    cx.notify();
                 }
             }
             _ => {}
@@ -2738,6 +2839,10 @@ impl ShelluneView {
                 );
             }
             let mut list = div()
+                .id("snippets.list.scroll")
+                .track_scroll(self.snippet_panel.scroll())
+                .max_h(metrics.scale(SNIPPET_LIST_MAX_HEIGHT))
+                .overflow_y_scroll()
                 .flex()
                 .flex_col()
                 .gap(metrics.scale(spacing::HAIRLINE))
@@ -2752,18 +2857,45 @@ impl ShelluneView {
                         .child(ux.snippet_search_empty),
                 );
             } else {
+                let pending_delete = self.snippet_panel.pending_delete();
                 for (pos, &index) in filtered.iter().enumerate() {
-                    list = list.child(self.snippet_row(pos, index, filtered.len(), cx));
+                    let row_id = self
+                        .snippets
+                        .snippets()
+                        .get(index)
+                        .map(shellune_core::Snippet::id);
+                    let mut item = div()
+                        .flex()
+                        .flex_col()
+                        .gap(metrics.scale(spacing::HAIRLINE))
+                        .child(self.snippet_row(pos, index, filtered.len(), cx));
+                    if row_id.is_some()
+                        && row_id == pending_delete
+                        && let Some(question) = self.snippet_delete_question(cx)
+                    {
+                        item = item.child(question);
+                    }
+                    list = list.child(item);
                 }
             }
-            body = body.child(list);
+            body = body.child(div().relative().w_full().child(list).child(scrollbar::bar(
+                "snippets.list.scrollbar",
+                self.snippet_panel.scroll().clone(),
+            )));
             if count > 0 {
                 let platform = crate::app::nav::Platform::current();
                 let run_key = crate::app::keymap::keystroke_label(
                     &format!("{}-enter", platform.keystroke_modifier()),
                     platform,
                 );
-                let keys_hint = copy::fill(ux.snippet_keys_hint, &[("run_key", &run_key)]);
+                let new_key = crate::app::keymap::keystroke_label(
+                    &format!("{}-n", platform.keystroke_modifier()),
+                    platform,
+                );
+                let keys_hint = copy::fill(
+                    ux.snippet_keys_hint,
+                    &[("run_key", &run_key), ("new_key", &new_key)],
+                );
                 body = body.child(
                     div()
                         .text_size(metrics.caption_size())
@@ -2771,9 +2903,6 @@ impl ShelluneView {
                         .debug_selector(|| "snippets.keys.hint".to_owned())
                         .child(SharedString::from(keys_hint)),
                 );
-            }
-            if let Some(question) = self.snippet_delete_question(cx) {
-                body = body.child(question);
             }
         }
 
@@ -2810,14 +2939,14 @@ impl ShelluneView {
         let close_footer = close.clone();
         let footer = components::modal_footer(metrics)
             .justify_between()
-            .child(new_button)
             .child(self.text_button(
                 SharedString::from("snippets.dialog.footer.close"),
                 ux.tool_close,
                 Variant::Ghost,
                 cx,
                 move |this, cx| close_footer(this, cx),
-            ));
+            ))
+            .child(new_button);
 
         self.modal(
             window,
@@ -2848,7 +2977,6 @@ impl ShelluneView {
         let id = snippet.id();
         let lines = snippet.line_count();
         let selected = self.snippet_panel.selected() == pos;
-        let hover = theme::swatch(palette::SURFACE_HOVER);
         // The name and the body are one line each, ellipsized when the row is narrow: a
         // column that is allowed to wrap instead is squeezed to a few pixels by the four
         // actions beside it, and at 200% text in the minimum window that turned each
@@ -2893,29 +3021,24 @@ impl ShelluneView {
                 }),
             );
         }
-        div()
+        let state = if selected {
+            components::ControlState::Selected
+        } else {
+            components::ControlState::Resting
+        };
+        components::list_row_frame(state, metrics)
             .id(SharedString::from(format!("snippet.row.{index}")))
             .debug_selector({
                 let selector = format!("snippet.row.{index}");
                 move || selector.clone()
             })
-            .flex()
-            .items_center()
             .flex_wrap()
-            .gap(metrics.scale(spacing::TIGHT))
-            .px(metrics.scale(spacing::TIGHT))
-            .py(metrics.scale(spacing::HAIRLINE + 2.0))
-            .rounded(px(radius::SMALL))
-            .when(selected, |row| {
-                row.bg(theme::swatch(palette::SURFACE_SELECTED))
-            })
-            .hover(move |style| style.bg(hover))
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.snippet_panel.select(pos, visible_len);
                 cx.notify();
             }))
             .child(detail)
-            // What can be done with the command stays together: at 200% text the four
+            // What can be done with the command stays together: at 200% text the
             // labels are wider than the row, so they take a line of their own below the
             // name and body instead of splitting the name into a column of characters.
             .child(
@@ -2943,6 +3066,16 @@ impl ShelluneView {
                         true,
                         cx,
                     ))
+                    .child(
+                        self.text_button(
+                            SharedString::from(format!("snippet.copy.{index}")),
+                            ux.snippet_copy,
+                            Variant::Ghost,
+                            cx,
+                            move |this, cx| this.copy_snippet(id, cx),
+                        )
+                        .tooltip(components::tooltip(ux.snippet_copy_hint)),
+                    )
                     .child(self.text_button(
                         SharedString::from(format!("snippet.edit.{index}")),
                         ux.snippet_edit,
@@ -3026,14 +3159,24 @@ impl ShelluneView {
             .child(components::form_field(
                 ux.snippet_field_body,
                 div()
-                    .h(metrics.control_height())
+                    .w_full()
                     .debug_selector(|| "snippet.editor.body".to_owned())
                     .child(editor.body.clone()),
                 1.0,
                 components::FORM_FIELD_MIN_WIDTH,
                 metrics,
             ))
-            .child(components::form_hint(ux.snippet_editor_keys, metrics))
+            .child(components::form_hint(
+                {
+                    let platform = Platform::current();
+                    let save_key = crate::app::keymap::keystroke_label(
+                        &format!("{}-enter", platform.keystroke_modifier()),
+                        platform,
+                    );
+                    copy::fill(ux.snippet_editor_keys, &[("save_key", &save_key)])
+                },
+                metrics,
+            ))
             // A draft that is already too long says so while it is being written: an empty
             // name or body is not reported before anything is typed, because a new command
             // starts empty on purpose.

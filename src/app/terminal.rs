@@ -51,7 +51,7 @@ use crate::app::copy::Locale;
 use crate::app::glyphs;
 use crate::app::icons::Icon;
 use crate::app::serial::{
-    CloseReport, NewlineFormat, PortScan, SerialLink, SerialPane, SerialTarget, describe,
+    CloseReport, NewlineFormat, PortScan, SerialLink, SerialPane, SerialTarget, describe_for,
 };
 use crate::app::theme::{self, Metrics, Tone, palette as shell_palette, radius, spacing};
 
@@ -409,12 +409,12 @@ impl SourceEvent {
 }
 
 impl PaneSource {
-    fn write(&mut self, bytes: &[u8]) -> Result<bool, String> {
+    fn write(&mut self, bytes: &[u8], locale: Locale) -> Result<bool, String> {
         match self {
             Self::Local(session) => session.try_write(bytes).map_err(|error| error.to_string()),
             Self::Remote(session) => session.try_write(bytes),
             Self::Chain(session) => session.try_write(bytes),
-            Self::Serial(link) => link.write(bytes),
+            Self::Serial(link) => link.write_for(bytes, locale),
         }
     }
 
@@ -430,7 +430,7 @@ impl PaneSource {
         }
     }
 
-    fn drain(&mut self) -> Vec<SourceEvent> {
+    fn drain(&mut self, locale: Locale) -> Vec<SourceEvent> {
         match self {
             Self::Local(session) => session
                 .drain()
@@ -447,14 +447,14 @@ impl PaneSource {
                 .filter_map(SourceEvent::from_remote)
                 .collect(),
             Self::Serial(link) => link
-                .poll()
+                .poll_for(locale)
                 .into_iter()
                 .filter_map(|event| match event {
                     shellune_serial::SerialEvent::Received(bytes) => Some(SourceEvent::Data(bytes)),
                     // A device that went away is a session that was live and is not any
                     // more; the sentence the platform gave is kept.
                     shellune_serial::SerialEvent::Disconnected { error } => {
-                        Some(SourceEvent::Lost(describe(&error)))
+                        Some(SourceEvent::Lost(describe_for(&error, locale)))
                     }
                     // A release states no new state of the *terminal*: a close started
                     // here has already moved the pane, and a device that failed reported
@@ -598,6 +598,10 @@ pub enum PaneRequest {
     },
     /// An OSC 8 link was not opened, and why (R1).
     LinkRefused(LinkRefusal),
+    /// The user changed the serial newline mode; persist it on the saved record.
+    SerialFormatChanged(NewlineFormat),
+    /// Reconnect this serial pane in-place, optionally switching to another detected port.
+    SerialReconnect(Option<String>),
 }
 
 impl gpui::EventEmitter<PaneRequest> for TerminalPane {}
@@ -1292,6 +1296,7 @@ impl TerminalPane {
             target.device(),
             target.config().summary(),
             target.local_echo(),
+            target.newline(),
             tag,
             grid,
             font_size,
@@ -1309,7 +1314,7 @@ impl TerminalPane {
                 // kept until the refresh control is used.
                 if let Some(serial) = pane.serial.as_mut() {
                     serial.refresh_ports();
-                    serial.set_note(Some(reason.clone()));
+                    serial.set_note_with_tone(Some(reason.clone()), Tone::Danger);
                 }
                 pane.state = PaneState::Failed(SessionFailure::ConnectionFailed { reason });
             }
@@ -1341,6 +1346,7 @@ impl TerminalPane {
             device,
             settings.to_owned(),
             local_echo,
+            NewlineFormat::AsTyped,
             tag,
             grid,
             font_size,
@@ -1359,6 +1365,7 @@ impl TerminalPane {
         device: &str,
         settings: String,
         local_echo: bool,
+        newline: NewlineFormat,
         tag: EventTag,
         grid: GridSize,
         font_size: f32,
@@ -1443,7 +1450,9 @@ impl TerminalPane {
             x11: None,
             directory: None,
             environment_notes: Vec::new(),
-            serial: Some(SerialPane::new(device, settings, local_echo)),
+            serial: Some(SerialPane::with_format(
+                device, settings, local_echo, newline,
+            )),
             scroll_fraction: 0.0,
             scroll_gesture_active: false,
             scroll_gesture_pinned: false,
@@ -1477,6 +1486,7 @@ impl TerminalPane {
             device,
             settings.to_owned(),
             local_echo,
+            NewlineFormat::AsTyped,
             tag,
             grid,
             font_size,
@@ -1486,7 +1496,7 @@ impl TerminalPane {
         pane.state = state;
         if let Some(serial) = pane.serial.as_mut() {
             serial.show_ports(ports);
-            serial.set_note(note);
+            serial.set_note_with_tone(note, Tone::Warning);
         }
         if !content.is_empty() {
             let was_alternate = pane.alternate_screen();
@@ -1547,12 +1557,91 @@ impl TerminalPane {
             return None;
         };
         drop(self.log.take());
-        let report = link.close();
+        let report = link.close_for(self.locale);
         self.source = None;
         self.poll_task = None;
         let closed = self.keep_close_note(&report);
         cx.notify();
         closed
+    }
+
+    /// Releases the serial port without closing this tab, leaving the pane ready to reconnect.
+    pub fn disconnect_serial(&mut self, cx: &mut Context<Self>) {
+        if self.serial.is_none() || !self.state.accepts_input() {
+            return;
+        }
+        let _ = self.release_serial(cx);
+        if let Some(serial) = self.serial.as_mut() {
+            serial.refresh_ports();
+        }
+        self.state = PaneState::Exited {
+            report: ExitReport::Clean,
+        };
+        cx.notify();
+    }
+
+    /// Reconnects this serial pane in-place with a newly opened link (or records the open failure).
+    pub fn reconnect_serial_with(
+        &mut self,
+        device: &str,
+        opened: Result<SerialLink, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.serial.is_none() {
+            return;
+        }
+        let _ = self.release_serial(cx);
+        self.origin = PaneOrigin::Serial {
+            device: device.to_owned(),
+        };
+        if let Some(serial) = self.serial.as_mut() {
+            serial.set_device(device);
+        }
+        match opened {
+            Ok(link) => {
+                self.source = Some(PaneSource::Serial(link));
+                self.state = PaneState::Live;
+                if let Some(serial) = self.serial.as_mut() {
+                    serial.clear_note();
+                }
+                self.start_polling(cx);
+            }
+            Err(reason) => {
+                if let Some(serial) = self.serial.as_mut() {
+                    serial.refresh_ports();
+                    serial.set_note_with_tone(Some(reason.clone()), Tone::Danger);
+                }
+                self.state = PaneState::Failed(SessionFailure::ConnectionFailed { reason });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Sends a serial BREAK signal on the active port.
+    pub fn send_serial_break(&mut self, cx: &mut Context<Self>) {
+        let result = match self.source.as_ref() {
+            Some(PaneSource::Serial(link)) => link.send_break(self.locale),
+            _ => return,
+        };
+        if let Some(serial) = self.serial.as_mut() {
+            match result {
+                Ok(()) => {
+                    serial.say_with_tone(self.locale.strings().serial_break_sent, Tone::Positive)
+                }
+                Err(reason) => serial.say_with_tone(reason, Tone::Danger),
+            }
+        }
+        cx.notify();
+    }
+
+    /// Dismisses the current serial status bar note.
+    pub fn dismiss_serial_note(&mut self, cx: &mut Context<Self>) {
+        if let Some(serial) = self.serial.as_mut()
+            && serial.note().is_some()
+        {
+            serial.clear_note();
+            cx.notify();
+        }
     }
 
     /// Keeps what a close reported, and hands it to the window as well.
@@ -1571,7 +1660,12 @@ impl TerminalPane {
             format!("{held}: {note}")
         };
         if let Some(serial) = self.serial.as_mut() {
-            serial.set_note(Some(sentence.clone()));
+            let tone = if report.released {
+                Tone::Warning
+            } else {
+                Tone::Danger
+            };
+            serial.set_note_with_tone(Some(sentence.clone()), tone);
         }
         Some(SerialClose {
             device: self.serial.as_ref().map_or_else(
@@ -1917,6 +2011,7 @@ impl TerminalPane {
             && serial.format() != format
         {
             serial.set_format(format);
+            cx.emit(PaneRequest::SerialFormatChanged(format));
             cx.notify();
         }
     }
@@ -2064,6 +2159,7 @@ impl TerminalPane {
     /// Returns whether polling should continue: a pane whose process ended stops
     /// polling instead of waking up for ever.
     fn drain_events(&mut self, cx: &mut Context<Self>) -> bool {
+        let locale = self.locale;
         let Some(source) = self.source.as_mut() else {
             return false;
         };
@@ -2072,7 +2168,7 @@ impl TerminalPane {
         // the wakeup that brought this drain may stand for more than one batch.
         let drains_all = ssh || matches!(source, PaneSource::Local(_));
         let deadline = std::time::Instant::now() + SSH_DRAIN_BUDGET;
-        let mut events = source.drain();
+        let mut events = source.drain(locale);
         // What the line itself reported - a refused send, a frame the driver cut short,
         // bytes it dropped - is taken even when no state event came with it: it is news
         // about the device, and the pane is where a person reads it.
@@ -2134,7 +2230,7 @@ impl TerminalPane {
             let Some(source) = self.source.as_mut() else {
                 break;
             };
-            events = source.drain();
+            events = source.drain(locale);
         }
         // A continuous log stream must not rescan all scrollback every 12 ms.
         // User edits/navigation still refresh immediately. Flush the pending scan
@@ -2452,10 +2548,11 @@ impl TerminalPane {
         // it for the life of the session.
         #[cfg(test)]
         self.sent.extend_from_slice(bytes);
+        let locale = self.locale;
         let Some(source) = self.source.as_mut() else {
             return true;
         };
-        match source.write(bytes) {
+        match source.write(bytes, locale) {
             Ok(accepted) => {
                 if !matches!(source, PaneSource::Serial(_)) && self.input_busy == accepted {
                     self.input_busy = !accepted;
@@ -4841,7 +4938,11 @@ impl TerminalPane {
             )
             .child(
                 components::compact_button(
-                    format!("{} {}", strings.serial_newline, serial.format().label()),
+                    format!(
+                        "{} {}",
+                        strings.serial_newline,
+                        serial.format().localized_label(self.locale)
+                    ),
                     components::Variant::Ghost,
                     metrics,
                 )
@@ -4850,9 +4951,10 @@ impl TerminalPane {
                 .id("serial.newline")
                 .debug_selector(|| "serial.newline".to_owned())
                 .tooltip(components::tooltip(SharedString::from(format!(
-                    "{}: {} (LF / CRLF / CR)",
+                    "{}: {} ({} / CR / LF / CRLF)",
                     strings.serial_newline,
-                    serial.format().label()
+                    serial.format().localized_label(self.locale),
+                    strings.serial_newline_as_typed,
                 ))))
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     let Some(current) = this.serial.as_ref().map(SerialPane::format) else {
@@ -4869,8 +4971,61 @@ impl TerminalPane {
                     this.set_serial_format(next, cx);
                 })),
             )
+            .when(live, |row| {
+                row.child(
+                    components::compact_button(
+                        strings.serial_send_break,
+                        components::Variant::Ghost,
+                        metrics,
+                    )
+                    .h(metrics.hit_target())
+                    .px(metrics.scale(spacing::TIGHT))
+                    .id("serial.break")
+                    .debug_selector(|| "serial.break".to_owned())
+                    .tooltip(components::tooltip(SharedString::from(
+                        strings.serial_send_break,
+                    )))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.send_serial_break(cx);
+                    })),
+                )
+                .child(
+                    components::compact_button(
+                        strings.serial_disconnect,
+                        components::Variant::Ghost,
+                        metrics,
+                    )
+                    .h(metrics.hit_target())
+                    .px(metrics.scale(spacing::TIGHT))
+                    .id("serial.disconnect")
+                    .debug_selector(|| "serial.disconnect".to_owned())
+                    .tooltip(components::tooltip(SharedString::from(
+                        strings.serial_disconnect,
+                    )))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.disconnect_serial(cx);
+                    })),
+                )
+            })
             .when(!live, |row| {
                 row.child(
+                    components::compact_button(
+                        strings.serial_reconnect,
+                        components::Variant::Primary,
+                        metrics,
+                    )
+                    .h(metrics.hit_target())
+                    .px(metrics.scale(spacing::TIGHT))
+                    .id("serial.reconnect")
+                    .debug_selector(|| "serial.reconnect".to_owned())
+                    .tooltip(components::tooltip(SharedString::from(
+                        strings.serial_reconnect,
+                    )))
+                    .on_click(cx.listener(|_this, _event, _window, cx| {
+                        cx.emit(PaneRequest::SerialReconnect(None));
+                    })),
+                )
+                .child(
                     components::compact_button(
                         strings.serial_ports_refresh,
                         components::Variant::Secondary,
@@ -4889,24 +5044,76 @@ impl TerminalPane {
                 )
             })
             .when_some(serial.note().map(str::to_owned), |row, note| {
-                // The whole sentence is in the tooltip: this row is one line, and a
-                // reason the user cannot finish reading is not a reason.
+                let tone = serial.note_tone();
+                // Severity-graded dismissible pill: Warning for overflow/incomplete,
+                // Danger for port errors or held drivers.
                 row.child(
                     div()
-                        .id("serial.note.text")
-                        .truncate()
+                        .id("serial.note.pill")
                         .debug_selector(|| "serial.note".to_owned())
+                        .flex()
+                        .items_center()
+                        .gap(metrics.scale(spacing::HAIRLINE))
+                        .px(metrics.scale(spacing::TIGHT))
+                        .py(px(spacing::HAIRLINE))
+                        .rounded(px(radius::SMALL))
+                        .bg(theme::swatch(tone.tint()))
+                        .border_1()
+                        .border_color(theme::faded(tone.text(), 0.35))
+                        .text_color(tone.text())
+                        .min_w_0()
+                        .max_w(metrics.scale(420.0))
                         .tooltip(components::tooltip(SharedString::from(note.clone())))
-                        .child(SharedString::from(note)),
+                        .child(
+                            div()
+                                .id("serial.note.text")
+                                .min_w_0()
+                                .truncate()
+                                .child(SharedString::from(note)),
+                        )
+                        .child(
+                            components::icon_only_button(Icon::Close, metrics)
+                                .h(metrics.scale(18.0))
+                                .w(metrics.scale(18.0))
+                                .id("serial.note.dismiss")
+                                .debug_selector(|| "serial.note.dismiss".to_owned())
+                                .tooltip(components::tooltip(SharedString::from(
+                                    strings.serial_note_dismiss,
+                                )))
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.dismiss_serial_note(cx);
+                                })),
+                        ),
                 )
             })
             .when(!live, |row| {
-                row.child(
+                let mut row = row.child(
                     div()
                         .truncate()
                         .debug_selector(|| "serial.ports".to_owned())
                         .child(SharedString::from(ports_line(serial, self.locale))),
-                )
+                );
+                for (index, port) in serial.ports().ports().iter().enumerate() {
+                    let path = port.path().to_owned();
+                    let label = port.name().to_owned();
+                    let hint = crate::app::copy::fill(
+                        strings.serial_switch_port_hint,
+                        &[("port", &label)],
+                    );
+                    let selector = format!("serial.port.{index}");
+                    row = row.child(
+                        components::compact_button(label, components::Variant::Ghost, metrics)
+                            .h(metrics.hit_target())
+                            .px(metrics.scale(spacing::TIGHT))
+                            .id(SharedString::from(selector.clone()))
+                            .debug_selector(move || selector.clone())
+                            .tooltip(components::tooltip(SharedString::from(hint)))
+                            .on_click(cx.listener(move |_this, _event, _window, cx| {
+                                cx.emit(PaneRequest::SerialReconnect(Some(path.clone())));
+                            })),
+                    );
+                }
+                row
             });
         Some(
             div()
