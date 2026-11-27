@@ -210,22 +210,32 @@ struct Target {
     path: PathBuf,
     #[cfg(unix)]
     identity: (u64, u64),
+    /// Whether the file was already read-only when the log started; only a change
+    /// to read-only is a problem, never a state the log was started in.
+    file_read_only: bool,
+    /// The same for the folder. Windows does not honour its read-only attribute on
+    /// folders and sets it on customised ones such as Downloads, so there the
+    /// folder's attribute is not watched at all.
+    folder_read_only: bool,
 }
 
 impl Target {
     fn of(path: &Path, file: &File) -> std::io::Result<Self> {
+        let metadata = file.metadata()?;
         #[cfg(unix)]
         let identity = {
             use std::os::unix::fs::MetadataExt;
-            let metadata = file.metadata()?;
             (metadata.dev(), metadata.ino())
         };
-        #[cfg(not(unix))]
-        let _ = file;
+        let folder_read_only = std::fs::metadata(folder_of(path))
+            .map(|folder| folder.permissions().readonly())
+            .unwrap_or(false);
         Ok(Self {
             path: path.to_owned(),
             #[cfg(unix)]
             identity,
+            file_read_only: metadata.permissions().readonly(),
+            folder_read_only,
         })
     }
 
@@ -248,23 +258,36 @@ impl Target {
         if !metadata.is_file() {
             return None;
         }
-        if metadata.permissions().readonly() {
+        if metadata.permissions().readonly() && !self.file_read_only {
             return Some(format!("{} was made read-only", self.path.display()));
         }
-        let folder = self
-            .path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
+        let folder = folder_of(&self.path);
         match std::fs::metadata(folder) {
-            Ok(folder_metadata) if folder_metadata.permissions().readonly() => Some(format!(
-                "the folder {} no longer accepts writes",
-                folder.display()
-            )),
+            Ok(folder_metadata)
+                if WATCH_FOLDER_ATTRIBUTE
+                    && folder_metadata.permissions().readonly()
+                    && !self.folder_read_only =>
+            {
+                Some(format!(
+                    "the folder {} no longer accepts writes",
+                    folder.display()
+                ))
+            }
             Ok(_) => None,
             Err(_) => Some(format!("the folder {} no longer exists", folder.display())),
         }
     }
+}
+
+/// Whether a folder's read-only attribute means it refuses new files: on Unix the
+/// write bits do; on Windows the attribute on a folder is not enforced.
+const WATCH_FOLDER_ATTRIBUTE: bool = cfg!(unix);
+
+/// The folder a log file is in; the current directory for a bare file name.
+fn folder_of(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 fn write_loop(
@@ -465,6 +488,38 @@ mod tests {
         let reason = reason.expect("the log noticed");
         assert!(reason.contains("no longer accepts writes"), "{reason}");
         assert!(log.stop().error.is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_was_already_read_only_when_the_log_started_is_not_a_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("already-readonly");
+        let folder = dir.join("logs");
+        std::fs::create_dir_all(&folder).expect("a folder");
+        let path = folder.join("out.log");
+        std::fs::write(&path, b"").expect("the file exists first");
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555))
+            .expect("the folder is read-only");
+        // Root (as in CI containers) can still open the file; others cannot start.
+        let Ok(log) = SessionLog::start(&path, LogFormat::Raw) else {
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755))
+                .expect("restored");
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        };
+        for _ in 0..5 {
+            log.write(b"output\r\n");
+            std::thread::sleep(TARGET_CHECK_INTERVAL / 2);
+        }
+        let report = log.stop();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755))
+            .expect("restored");
+        assert_eq!(
+            report.error, None,
+            "a state the log started in is not a change"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
