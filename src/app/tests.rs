@@ -14895,6 +14895,12 @@ async fn resume_carries_the_checkpoint_and_transfer_again_drops_it(cx: &mut Test
 
 #[gpui::test]
 async fn workspace_ux_transfer_keyboard_recovers_only_the_inspected_task(cx: &mut TestAppContext) {
+    let repeat = |cx: &mut VisualTestContext, key: &str| {
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke::parse(key).expect("a transfer key"),
+            is_held: true,
+        });
+    };
     let dir = TempDir::new("transfer-targets");
     seed(
         &dir.store(),
@@ -14931,6 +14937,14 @@ async fn workspace_ux_transfer_keyboard_recovers_only_the_inspected_task(cx: &mu
     let (_, second_link) = open_transfers(cx, &view, second);
     start(cx, "C:/第二个目录/路径很长的发布目录/report.txt");
     let selected = second_link.starts()[0].transfer;
+    cx.update(|window, app| view.read(app).focus_transfer_strip_for_test(window));
+    press_key(cx, "space");
+    repeat(cx, "space");
+    assert!(
+        second_link.cancels().is_empty(),
+        "one held press cannot confirm cancellation"
+    );
+    press_key(cx, "escape");
     let hint = shellune_core::ResumeHint {
         partial: "/远程目录/report.part".into(),
         record: "/恢复记录".into(),
@@ -14960,6 +14974,11 @@ async fn workspace_ux_transfer_keyboard_recovers_only_the_inspected_task(cx: &mu
     assert_ne!(titles[0], titles[1]);
     cx.update(|window, app| view.read(app).focus_transfer_strip_for_test(window));
     press_key(cx, "enter");
+    repeat(cx, "enter");
+    assert_eq!(
+        cx.update(|_, app| view.read(app).inspected_transfer(Some(second))),
+        Some(selected)
+    );
     assert!(cx.debug_bounds("transfers.paths.0").is_some());
     assert_eq!(second_link.starts().len(), 1);
     press_key(cx, "escape");
@@ -14973,7 +14992,7 @@ async fn workspace_ux_transfer_keyboard_recovers_only_the_inspected_task(cx: &mu
     go(cx, crate::app::actions::GoToTransfers);
     cx.simulate_resize(narrow_window());
     press_key(cx, "down");
-    press_key(cx, "down");
+    repeat(cx, "down");
     press_key(cx, "enter");
     assert_eq!(
         cx.update(|_, app| view.read(app).inspected_transfer(None)),
@@ -14982,6 +15001,8 @@ async fn workspace_ux_transfer_keyboard_recovers_only_the_inspected_task(cx: &mu
     assert!(cx.debug_bounds("transfers.center.paths.1").is_some());
     press_key(cx, "tab");
     press_key(cx, "enter");
+    repeat(cx, "enter");
+    repeat(cx, "enter");
     assert_eq!(first_link.starts().len(), 1);
     let requests = second_link.starts();
     assert_eq!(requests.len(), 2);
@@ -15006,7 +15027,8 @@ async fn workspace_ux_transfer_keyboard_recovers_only_the_inspected_task(cx: &mu
     press_key(cx, "tab");
     // The action was available when drawn, but the channel now refuses the command.
     first_link.0.lock().unwrap().accepting = false;
-    press_key(cx, "enter");
+    press_key(cx, "space");
+    repeat(cx, "space");
     assert_eq!(first_link.starts().len(), 2);
     assert!(first_link.starts().last().unwrap().resume.is_none());
     let tasks = cx.update(|_, app| view.read(app).transfer_tasks());
@@ -15041,6 +15063,7 @@ async fn workspace_ux_transfer_keyboard_recovers_only_the_inspected_task(cx: &mu
     assert!(cx.debug_bounds("transfers.center.paths.0").is_some());
     press_key(cx, "down");
     press_key(cx, "enter");
+    repeat(cx, "enter");
     assert!(second_link.cancels().is_empty());
     press_key(cx, "enter");
     assert_eq!(second_link.cancels(), vec![requests[1].transfer]);

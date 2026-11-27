@@ -213,13 +213,21 @@ impl ShelluneView {
     pub(super) fn transfer_list_key(
         &mut self,
         scope: Scope,
-        key: &str,
-        shift: bool,
+        event: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if shift && key != "tab" {
+        let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+        if modifiers.control
+            || modifiers.alt
+            || modifiers.platform
+            || (modifiers.shift && key != "tab")
+        {
             return false;
+        }
+        if event.is_held && matches!(key, "enter" | "space") {
+            return true;
         }
         if key == "escape" {
             return self.close_transfer_detail(scope, window, cx);
@@ -281,7 +289,7 @@ impl ShelluneView {
                 if !inspectable(task) || !self.transfers.can_transfer(task.session()) {
                     return false;
                 }
-                cursor.action = match (cursor.action, shift, can_resume(task)) {
+                cursor.action = match (cursor.action, modifiers.shift, can_resume(task)) {
                     (None, false, true) | (Some(RecoveryAction::Restart), true, true) => {
                         Some(RecoveryAction::Resume)
                     }

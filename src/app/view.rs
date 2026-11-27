@@ -18987,7 +18987,7 @@ impl ShelluneView {
                 return true;
             }
             if matches!(key, "enter" | "space") {
-                self.files_activate_stop(id, source, stop, window, cx);
+                self.files_activate_stop(id, source, stop, event, window, cx);
                 return true;
             }
         }
@@ -19378,6 +19378,7 @@ impl ShelluneView {
         id: SessionId,
         source: FileSource,
         stop: FilesStop,
+        event: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -19422,7 +19423,7 @@ impl ShelluneView {
                 self.files_focus_stop(source, stop, window, cx);
             }
             FilesStop::Transfers => {
-                self.transfer_list_key(Some(id), "enter", false, window, cx);
+                self.transfer_list_key(Some(id), event, window, cx);
             }
             FilesStop::Close => {
                 // The same switch the pointer presses: the terminal is where this session
@@ -19486,11 +19487,7 @@ impl ShelluneView {
     ) -> bool {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
-        if !modifiers.control
-            && !modifiers.alt
-            && !modifiers.platform
-            && self.transfer_list_key(Some(id), key, modifiers.shift, window, cx)
-        {
+        if self.transfer_list_key(Some(id), event, window, cx) {
             return true;
         }
         if key == "tab" && !modifiers.control && !modifiers.alt && !modifiers.platform {
@@ -23935,18 +23932,7 @@ impl ShelluneView {
             list.id("transfer-center-list")
                 .track_focus(&self.transfer_inspection.center_focus)
                 .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
-                    let modifiers = event.keystroke.modifiers;
-                    if !modifiers.control
-                        && !modifiers.alt
-                        && !modifiers.platform
-                        && view.transfer_list_key(
-                            None,
-                            event.keystroke.key.as_str(),
-                            modifiers.shift,
-                            window,
-                            cx,
-                        )
-                    {
+                    if view.transfer_list_key(None, event, window, cx) {
                         cx.stop_propagation();
                     }
                 })),
