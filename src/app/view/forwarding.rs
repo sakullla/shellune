@@ -36,6 +36,9 @@ const FORWARD_HOST_ROWS: f32 = 6.0;
 /// text scale; its address takes the rest.
 const FORWARD_HOST_NAME_MAX: f32 = 200.0;
 
+/// The least width of the forwards search field before toolbar controls wrap.
+const FORWARD_SEARCH_MIN_WIDTH: f32 = 180.0;
+
 /// The through-host picker of the tunnel form, while it is open (ADR-7).
 ///
 /// A search field over the saved hosts with one candidate marked for the keyboard: a
@@ -1026,7 +1029,7 @@ impl ShelluneView {
             .child(
                 div()
                     .flex_1()
-                    .min_w(metrics.scale(180.0))
+                    .min_w(metrics.scale(FORWARD_SEARCH_MIN_WIDTH))
                     .debug_selector(|| "forwards.search".to_owned())
                     .child(self.forward_search.clone()),
             );

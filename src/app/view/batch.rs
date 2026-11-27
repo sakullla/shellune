@@ -60,6 +60,10 @@ const STEP_NUMBER_WIDTH: f32 = 20.0;
 const CONCURRENCY_WIDTH: f32 = 72.0;
 /// The least width of the task name field.
 const NAME_MIN_WIDTH: f32 = 160.0;
+/// The least width of the history search field before it wraps.
+const HISTORY_SEARCH_MIN_WIDTH: f32 = 180.0;
+/// The tallest the inline snippet picker grows before its list scrolls.
+const SNIPPET_PICKER_MAX_HEIGHT: f32 = 160.0;
 /// The least width of the running hosts column before the output moves under it.
 const RUN_HOSTS_MIN_WIDTH: f32 = 320.0;
 /// The tallest the running hosts column grows before it scrolls.
@@ -1228,7 +1232,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .flex_1()
-                            .min_w(metrics.scale(180.0))
+                            .min_w(metrics.scale(HISTORY_SEARCH_MIN_WIDTH))
                             .debug_selector(|| "batch.history.search".to_owned())
                             .child(self.batch_history_search.clone()),
                     ),
@@ -2211,7 +2215,7 @@ impl ShelluneView {
             .id("batch.snippet.options")
             .flex()
             .flex_col()
-            .max_h(metrics.scale(160.0))
+            .max_h(metrics.scale(SNIPPET_PICKER_MAX_HEIGHT))
             .overflow_y_scroll()
             .gap(metrics.scale(spacing::HAIRLINE));
         if matching.is_empty() {
