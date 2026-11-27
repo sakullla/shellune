@@ -53860,11 +53860,40 @@ async fn t6_snippets_multiline_textarea_copy_shortcuts_and_cjk_preview(cx: &mut 
     });
     cx.run_until_parked();
 
-    // Multi-line TextArea: plain Enter inserts a newline rather than submitting, and
-    // Cmd/Ctrl+Enter saves the snippet.
+    // Multi-line TextArea: submitting with an empty body marks the body invalid and
+    // keeps the invalid state after GPUI observers settle; typing clears it.
     type_into(cx, "snippet.editor.name", "中文部署");
+    click(cx, "snippet.editor.save");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .snippet_panel()
+                .editor()
+                .expect("editor stays open")
+                .body
+                .read(app)
+                .invalid()
+        }),
+        "empty snippet body stays invalid after GPUI observers settle"
+    );
+
+    // Plain Enter inserts a newline rather than submitting, and Cmd/Ctrl+Enter saves.
     click(cx, "snippet.editor.body");
     cx.simulate_input("echo 第一行");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| {
+            view.read(app)
+                .snippet_panel()
+                .editor()
+                .expect("editor open")
+                .body
+                .read(app)
+                .invalid()
+        }),
+        "typing into snippet body clears the invalid state"
+    );
     cx.simulate_keystrokes("enter");
     cx.simulate_input("echo 第二行");
     cx.run_until_parked();

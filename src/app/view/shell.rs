@@ -2388,18 +2388,8 @@ impl ShelluneView {
         });
         // The dialog redraws as the draft changes, so the length warning appears while
         // the text can still be shortened rather than only after a refused save.
-        cx.observe(&name, |_view, field, cx| {
-            field.update(cx, |field, cx| field.set_invalid(false, cx));
-            cx.notify();
-        })
-        .detach();
-        cx.observe(&body, |_view, area, cx| {
-            if area.read(cx).invalid() {
-                area.update(cx, |area, cx| area.set_invalid(false, cx));
-            }
-            cx.notify();
-        })
-        .detach();
+        cx.observe(&name, |_view, _field, cx| cx.notify()).detach();
+        cx.observe(&body, |_view, _area, cx| cx.notify()).detach();
         self.snippet_panel.begin_edit(SnippetEditor {
             id,
             name,
@@ -2721,14 +2711,14 @@ impl ShelluneView {
                     self.open_snippet_editor(Some(id), cx);
                 }
             }
-            "delete" if (plain && !search_focused) || secondary => {
+            "delete" if ((plain && !search_focused) || secondary) && self.snippets.can_write() => {
                 if let Some(id) = selected_id {
                     cx.stop_propagation();
                     self.snippet_panel.ask_delete(id);
                     cx.notify();
                 }
             }
-            "backspace" if secondary => {
+            "backspace" if secondary && self.snippets.can_write() => {
                 if let Some(id) = selected_id {
                     cx.stop_propagation();
                     self.snippet_panel.ask_delete(id);
