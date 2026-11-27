@@ -446,6 +446,8 @@ pub const FILES_PANEL_WIDTH: f32 = 340.0;
 /// Both columns of the file view have to fit in half of it, plus the terminal's own
 /// minimum: below this the files take the terminal's place instead of squeezing both.
 pub const DOCK_MIN_WIDTH: f32 = (FILES_PANEL_WIDTH * 2.0 + 120.0) * 2.0 + 40.0;
+/// Minimum terminal width kept beside a docked file rail, before text scale.
+const FILES_MIN_TERMINAL_WIDTH: f32 = 360.0;
 
 /// Vertical offset below the header when opening a row's context menu via keyboard.
 const KEYBOARD_HOST_MENU_TOP: f32 = 140.0;
@@ -17528,7 +17530,7 @@ impl ShelluneView {
     fn files_dock_bounds(&self) -> (f32, f32) {
         let total = f32::from(self.viewport_width);
         let min_files = f32::from(self.metrics().scale(FILES_PANEL_WIDTH));
-        let min_terminal = f32::from(self.metrics().scale(360.0));
+        let min_terminal = f32::from(self.metrics().scale(FILES_MIN_TERMINAL_WIDTH));
         let divider = 6.0;
         let max_files = (total - min_terminal - divider).max(min_files);
         (min_files, max_files)
