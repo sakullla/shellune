@@ -122,13 +122,18 @@ impl ShelluneView {
         id
     }
 
+    /// Whether the pointer is over the toast stack or any toast card.
+    fn is_toasts_hovered(&self) -> bool {
+        self.toasts_hovered || !self.toast_cards_hovered.is_empty()
+    }
+
     /// Takes a toast away after `after`, or later while the pointer is over the
     /// stack.
     fn expire_toast(&mut self, id: u64, after: Duration, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(after).await;
             let _ = this.update(cx, |view, cx| {
-                if view.toasts_hovered {
+                if view.is_toasts_hovered() {
                     view.expire_toast(id, Duration::from_secs(2), cx);
                 } else {
                     view.dismiss_toast(id, cx);
@@ -141,12 +146,28 @@ impl ShelluneView {
     pub(super) fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
         let before = self.toasts.len();
         self.toasts.retain(|toast| toast.id != id);
+        self.toast_cards_hovered.remove(&id);
         if self.toasts.is_empty() {
             self.toasts_hovered = false;
+            self.toast_cards_hovered.clear();
         }
         if self.toasts.len() != before {
             cx.notify();
         }
+    }
+
+    /// Dismisses the most recent toast, for Escape; returns whether one was dismissed.
+    pub(super) fn dismiss_latest_toast(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(last) = self.toasts.pop() else {
+            return false;
+        };
+        self.toast_cards_hovered.remove(&last.id);
+        if self.toasts.is_empty() {
+            self.toasts_hovered = false;
+            self.toast_cards_hovered.clear();
+        }
+        cx.notify();
+        true
     }
 
     /// The messages, newest at the bottom, in the corner above the page.
@@ -199,8 +220,12 @@ impl ShelluneView {
             .when_some(full_detail, |card, detail| {
                 card.tooltip(components::tooltip(detail))
             })
-            .on_hover(cx.listener(|view, hovered: &bool, _window, cx| {
-                view.toasts_hovered = *hovered;
+            .on_hover(cx.listener(move |view, hovered: &bool, _window, cx| {
+                if *hovered {
+                    view.toast_cards_hovered.insert(id);
+                } else {
+                    view.toast_cards_hovered.remove(&id);
+                }
                 cx.notify();
             }))
             .child(
@@ -240,7 +265,7 @@ impl ShelluneView {
     /// Whether the pointer is recorded as hovering over the toast stack, for a test.
     #[cfg(test)]
     pub fn toasts_hovered(&self) -> bool {
-        self.toasts_hovered
+        self.is_toasts_hovered()
     }
 }
 

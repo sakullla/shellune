@@ -596,6 +596,8 @@ pub struct ShelluneView {
     snippet_note: Option<SnippetNote>,
     /// The pointer is over the toasts, which holds them while they are read.
     toasts_hovered: bool,
+    /// Toast card ids currently under the pointer (cards occlude the stack container).
+    toast_cards_hovered: std::collections::HashSet<u64>,
     /// Where the header's "▾" was last drawn, so its menu can hang from it.
     shell_menu_anchor: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
     /// Whether the open shell menu is the home page's "Local terminal" menu rather than
@@ -700,6 +702,18 @@ pub struct ShelluneView {
     /// Whether the group dropdown was put away (Escape, or a pick) since the group
     /// field's text last changed; typing or pressing Down opens it again.
     group_picker_closed: bool,
+    /// One-shot flag requesting `group_dropdown` to scroll the dialog body so it is not clipped.
+    group_picker_reveal: std::rc::Rc<std::cell::Cell<bool>>,
+    /// Search filter and scroll handle for the host dialog's managed key picker.
+    host_key_search: Entity<TextField>,
+    host_key_scroll: gpui::ScrollHandle,
+    /// Search filter and scroll handle for the host/connection dialog's shared credential picker.
+    host_cred_search: Entity<TextField>,
+    host_cred_scroll: gpui::ScrollHandle,
+    /// Whether the open host/connection dialog has unsaved user edits.
+    host_draft_dirty: bool,
+    /// Whether the open host/connection dialog is showing its discard-unsaved-changes confirmation.
+    host_confirm_discard: bool,
     /// Keyboard stops for the Home sidebar's fixed places: All, Favorites, Recent, Vault, Local.
     sidebar_place_focus: [FocusHandle; 5],
     /// Keyboard stop for the folded Home sidebar's Groups button.
@@ -996,6 +1010,11 @@ pub struct ShelluneView {
     tab_revealed: std::cell::Cell<Option<(shellune_core::TabId, gpui::Pixels)>>,
     /// A category the navigation scrolled to and the page has not drawn there yet.
     settings_pending_reveal: std::cell::Cell<bool>,
+    /// The specific settings item to scroll to when `settings_pending_reveal` is active.
+    settings_pending_reveal_item: std::cell::Cell<Option<self::settings::Item>>,
+    /// Measured content-space Y offsets of each settings item inside `settings.scroll`.
+    settings_item_offsets:
+        std::rc::Rc<std::cell::RefCell<HashMap<self::settings::Item, gpui::Pixels>>>,
     /// The tab whose menu is open, and where the pointer opened it.
     tab_menu: Option<(TabMenuTarget, gpui::Point<gpui::Pixels>)>,
     /// The tab whose name is being edited, while that dialog is open.
@@ -1084,6 +1103,9 @@ pub struct ShelluneView {
     /// The stages of the start: which ended, what they read, what the start waits for.
     startup_run: startup::StartupRun,
     startup_scroll: gpui::ScrollHandle,
+    /// Cached overflow state of `startup.body`, updated after layout so the scroll hint
+    /// appears only when content actually overflows.
+    startup_scroll_overflows: std::rc::Rc<std::cell::Cell<bool>>,
     /// Whether the start is still fading out over the page that replaced it.
     splash_fading: bool,
     /// Whether the page is still fading in (and, with full motion, rising) under it.
@@ -1229,6 +1251,8 @@ pub struct ShelluneView {
     /// The controls of the status banner the keyboard walks, in order: its next step,
     /// its details, the copy of its diagnostic and its close (ADR-6).
     banner_focus: [FocusHandle; 4],
+    /// The scroll handle of the unfolded diagnostic detail box in the status banner.
+    banner_detail_scroll: gpui::ScrollHandle,
     /// The last screen of a remote session that is reconnecting, and why it ended,
     /// kept so the screen stays under its banner while the new attempt runs and comes
     /// back if that attempt is cancelled (ADR-6).
@@ -2976,6 +3000,7 @@ impl ShelluneView {
             next_toast: 0,
             snippet_note: None,
             toasts_hovered: false,
+            toast_cards_hovered: std::collections::HashSet::new(),
             shell_menu_anchor: std::rc::Rc::default(),
             shell_menu_home: false,
             home_local_anchor: std::rc::Rc::default(),
@@ -3009,6 +3034,21 @@ impl ShelluneView {
             group_picker_highlight: 0,
             group_picker_scroll: gpui::ScrollHandle::new(),
             group_picker_closed: false,
+            group_picker_reveal: std::rc::Rc::new(std::cell::Cell::new(true)),
+            host_key_search: {
+                let field = cx.new(|cx| TextField::new(copy::ux().picker_search_keys, cx));
+                cx.observe(&field, |_view, _field, cx| cx.notify()).detach();
+                field
+            },
+            host_key_scroll: gpui::ScrollHandle::new(),
+            host_cred_search: {
+                let field = cx.new(|cx| TextField::new(copy::ux().picker_search_credentials, cx));
+                cx.observe(&field, |_view, _field, cx| cx.notify()).detach();
+                field
+            },
+            host_cred_scroll: gpui::ScrollHandle::new(),
+            host_draft_dirty: false,
+            host_confirm_discard: false,
             sidebar_place_focus: [
                 cx.focus_handle().tab_stop(true),
                 cx.focus_handle().tab_stop(true),
@@ -3043,6 +3083,7 @@ impl ShelluneView {
                 cx.focus_handle(),
                 cx.focus_handle(),
             ],
+            banner_detail_scroll: gpui::ScrollHandle::new(),
             reconnect_screens: HashMap::new(),
             showing_connection_form: false,
             reconnect: None,
@@ -3153,6 +3194,8 @@ impl ShelluneView {
             tab_scroll: gpui::ScrollHandle::new(),
             tab_revealed: std::cell::Cell::new(None),
             settings_pending_reveal: std::cell::Cell::new(false),
+            settings_pending_reveal_item: std::cell::Cell::new(None),
+            settings_item_offsets: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
             tab_menu: None,
             tab_rename: None,
             accent_hover: None,
@@ -3238,6 +3281,7 @@ impl ShelluneView {
             startup: startup::Startup::Ready,
             startup_run: startup::StartupRun::default(),
             startup_scroll: gpui::ScrollHandle::new(),
+            startup_scroll_overflows: std::rc::Rc::new(std::cell::Cell::new(false)),
             splash_fading: false,
             page_entering: false,
             system_motion_pending: false,
@@ -5550,6 +5594,14 @@ impl ShelluneView {
             (&self.quick_password, strings.auth_password),
             (&self.quick_key, strings.auth_key),
             (&self.quick_passphrase, strings.auth_key_passphrase),
+            (
+                &self.host_key_search,
+                copy::ux_for(self.workspace.locale()).picker_search_keys,
+            ),
+            (
+                &self.host_cred_search,
+                copy::ux_for(self.workspace.locale()).picker_search_credentials,
+            ),
         ];
         for (field, label) in labels {
             field.update(cx, |field, cx| field.set_placeholder(label, cx));
@@ -8179,6 +8231,8 @@ impl ShelluneView {
                 );
             }
             if changed {
+                view.host_draft_dirty = true;
+                view.host_confirm_discard = false;
                 view.set_host_field_invalid(Ok(field), false, cx);
                 if split {
                     view.set_host_field_invalid(Ok(HostField::User), false, cx);
@@ -8226,7 +8280,10 @@ impl ShelluneView {
         for field in ConnectionField::ALL {
             let text = self.connection_draft.text(field).to_owned();
             let entity = self.connection_fields.get(field).clone();
-            entity.update(cx, |text_field, cx| text_field.set_text(text, cx));
+            entity.update(cx, |text_field, cx| {
+                text_field.set_text(text, cx);
+                text_field.set_invalid(false, cx);
+            });
         }
     }
 
@@ -8250,8 +8307,21 @@ impl ShelluneView {
         if !self.connection_draft.set_text(field, text) {
             return;
         }
-        if let Ok(defaults) = self.connection_draft.resolve() {
-            self.connection_choice = Some(defaults);
+        match self.connection_draft.resolve() {
+            Ok(defaults) => {
+                self.connection_choice = Some(defaults);
+                for f in ConnectionField::ALL {
+                    let entity = self.connection_fields.get(f).clone();
+                    entity.update(cx, |tf, cx| tf.set_invalid(false, cx));
+                }
+            }
+            Err(_) => {
+                let refused = self.connection_draft.error().map(|(f, _)| f);
+                for f in ConnectionField::ALL {
+                    let entity = self.connection_fields.get(f).clone();
+                    entity.update(cx, |tf, cx| tf.set_invalid(refused == Some(f), cx));
+                }
+            }
         }
         cx.notify();
     }
@@ -8412,6 +8482,13 @@ impl ShelluneView {
 
     fn open_host_fields(&mut self, cx: &mut Context<Self>) {
         self.jump_picker = None;
+        self.host_draft_dirty = false;
+        self.host_confirm_discard = false;
+        self.group_picker_reveal.set(true);
+        self.host_key_search
+            .update(cx, |f, cx| f.set_text(String::new(), cx));
+        self.host_cred_search
+            .update(cx, |f, cx| f.set_text(String::new(), cx));
         self.last_invalid_host_field = None;
         self.invalid_host_fields.clear();
         self.last_invalid_protocol_field = None;
@@ -8589,12 +8666,24 @@ impl ShelluneView {
         );
     }
 
+    /// Asks for confirmation when the host form has unsaved edits; otherwise closes immediately.
+    pub(super) fn request_close_host_editor(&mut self, cx: &mut Context<Self>) {
+        if self.host_draft_dirty && !self.host_confirm_discard {
+            self.host_confirm_discard = true;
+            cx.notify();
+            return;
+        }
+        self.close_host_editor(cx);
+    }
+
     /// Closes the form without touching the saved records.
-    fn close_host_editor(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_host_editor(&mut self, cx: &mut Context<Self>) {
         self.hosts.close_editor();
         self.jump_picker = None;
         self.host_fields = None;
         self.host_connection_fields = None;
+        self.host_draft_dirty = false;
+        self.host_confirm_discard = false;
         self.last_invalid_host_field = None;
         self.invalid_host_fields.clear();
         self.modal_focus_captured = false;
@@ -8654,6 +8743,11 @@ impl ShelluneView {
 
     /// Builds the fields of the open protocol form and keeps the draft in step.
     fn open_protocol_fields(&mut self, cx: &mut Context<Self>) {
+        self.host_draft_dirty = false;
+        self.host_confirm_discard = false;
+        self.group_picker_reveal.set(true);
+        self.host_cred_search
+            .update(cx, |f, cx| f.set_text(String::new(), cx));
         self.last_invalid_host_field = None;
         self.invalid_host_fields.clear();
         self.last_invalid_protocol_field = None;
@@ -8842,6 +8936,8 @@ impl ShelluneView {
                 );
             }
             if changed {
+                view.host_draft_dirty = true;
+                view.host_confirm_discard = false;
                 view.set_protocol_field_invalid(field, false, cx);
                 if split {
                     view.set_protocol_field_invalid(ConnectionFormField::User, false, cx);
@@ -9068,10 +9164,22 @@ impl ShelluneView {
         self.protocol_fields.is_some() && self.invalid_protocol_fields.contains(&field)
     }
 
+    /// Asks for confirmation when the connection form has unsaved edits; otherwise closes immediately.
+    pub(super) fn request_close_connection_editor(&mut self, cx: &mut Context<Self>) {
+        if self.host_draft_dirty && !self.host_confirm_discard {
+            self.host_confirm_discard = true;
+            cx.notify();
+            return;
+        }
+        self.close_connection_editor(cx);
+    }
+
     /// Closes the protocol form without touching the saved records.
-    fn close_connection_editor(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_connection_editor(&mut self, cx: &mut Context<Self>) {
         self.hosts.close_connection_editor();
         self.protocol_fields = None;
+        self.host_draft_dirty = false;
+        self.host_confirm_discard = false;
         self.last_invalid_protocol_field = None;
         self.invalid_protocol_fields.clear();
         self.modal_focus_captured = false;
@@ -15584,12 +15692,17 @@ impl ShelluneView {
             cx.notify();
             return true;
         }
+        if self.host_confirm_discard {
+            self.host_confirm_discard = false;
+            cx.notify();
+            return true;
+        }
         if self.host_fields.is_some() {
-            self.close_host_editor(cx);
+            self.request_close_host_editor(cx);
             return true;
         }
         if self.protocol_fields.is_some() {
-            self.close_connection_editor(cx);
+            self.request_close_connection_editor(cx);
             return true;
         }
         if self.hosts.group_editor().is_some() {
@@ -15764,6 +15877,9 @@ impl ShelluneView {
         // The banner over an ended or reconnecting terminal is the last thing Escape
         // closes; it stays closed until its session states something else (ADR-6).
         if self.dismiss_active_banner(window, cx) {
+            return true;
+        }
+        if self.dismiss_latest_toast(cx) {
             return true;
         }
         false

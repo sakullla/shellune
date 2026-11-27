@@ -608,6 +608,35 @@ impl SyncCenter {
         };
         let password = secret_field(password_saved, cx);
         let passphrase = secret_field(passphrase_saved, cx);
+        TextField::wire_tab_ring(
+            &[
+                url.clone(),
+                username.clone(),
+                password.clone(),
+                remote_dir.clone(),
+                passphrase.clone(),
+            ],
+            cx,
+        );
+        let view = cx.entity().downgrade();
+        for field in [
+            url.clone(),
+            username.clone(),
+            password.clone(),
+            remote_dir.clone(),
+            passphrase.clone(),
+        ] {
+            let view = view.clone();
+            field.update(cx, |field, _cx| {
+                field.on_submit(move |_text, _window, app| {
+                    view.update(app, |view, cx| {
+                        view.save_sync_settings(cx);
+                        false
+                    })
+                    .unwrap_or(false)
+                });
+            });
+        }
         Self {
             service,
             draft_auto: shown.auto,
@@ -1472,16 +1501,25 @@ impl ShelluneView {
                 .ok()
                 .flatten()
                 .is_some_and(|saved| !saved.expose().trim().is_empty());
+        self.sync.url.update(cx, |f, cx| f.set_invalid(false, cx));
+        self.sync
+            .passphrase
+            .update(cx, |f, cx| f.set_invalid(false, cx));
         if !webdav_password && !self.sync.passphrase_saved && passphrase.trim().is_empty() {
+            self.sync
+                .passphrase
+                .update(cx, |f, cx| f.set_invalid(true, cx));
             self.sync.form_problem = Some(strings.passphrase_required.to_owned());
             cx.notify();
             return;
         }
         let service = self.sync.service.clone();
+        let mut url_invalid = false;
         let saved = (|| {
-            service
-                .save_config(&draft)
-                .map_err(|error| sync_error_text(&SyncError::Config(error), strings))?;
+            service.save_config(&draft).map_err(|error| {
+                url_invalid = true;
+                sync_error_text(&SyncError::Config(error), strings)
+            })?;
             if !password.is_empty() {
                 service
                     .set_password(Some(&SecretString::new(password.clone())))
@@ -1494,6 +1532,9 @@ impl ShelluneView {
             }
             Ok::<(), String>(())
         })();
+        if url_invalid {
+            self.sync.url.update(cx, |f, cx| f.set_invalid(true, cx));
+        }
         match saved {
             Ok(()) => {
                 self.sync.form_problem = None;
@@ -1565,10 +1606,12 @@ impl ShelluneView {
         let strings = self.sync_strings();
         let draft = self.sync_draft(cx);
         if !draft.is_configured() {
+            self.sync.url.update(cx, |f, cx| f.set_invalid(true, cx));
             self.sync.test = TestStatus::Failed(strings.url_required.to_owned());
             cx.notify();
             return;
         }
+        self.sync.url.update(cx, |f, cx| f.set_invalid(false, cx));
         let typed = self.sync.password.read(cx).text().to_owned();
         let service = self.sync.service.clone();
         self.sync.test = TestStatus::Running;
@@ -1846,6 +1889,71 @@ impl ShelluneView {
             ));
         }
         let testing = self.sync.test == TestStatus::Running;
+        let configured = self.sync.configured();
+        let running_upload = matches!(self.sync.running, Some(SyncJob::Upload));
+        let running_pull = matches!(self.sync.running, Some(SyncJob::Pull));
+        let sync_busy = self.sync.running.is_some();
+        let test_button = components::compact_button_with_state(
+            if testing {
+                strings.testing
+            } else {
+                strings.test
+            },
+            Variant::Secondary,
+            if testing {
+                components::ControlState::Loading
+            } else {
+                components::ControlState::Resting
+            },
+            metrics,
+        )
+        .id("settings.sync.test")
+        .debug_selector(|| "settings.sync.test".to_owned())
+        .when(!testing, |button| {
+            button.on_click(cx.listener(|this, _event, _window, cx| {
+                this.test_sync_connection(cx);
+            }))
+        });
+        let upload_state = if running_upload {
+            components::ControlState::Loading
+        } else if !configured || sync_busy {
+            components::ControlState::Disabled
+        } else {
+            components::ControlState::Resting
+        };
+        let upload_button = components::compact_button_with_state(
+            strings.upload,
+            Variant::Secondary,
+            upload_state,
+            metrics,
+        )
+        .id("settings.sync.upload")
+        .debug_selector(|| "settings.sync.upload".to_owned())
+        .when(configured && !sync_busy, |button| {
+            button.on_click(cx.listener(|this, _event, _window, cx| {
+                this.request_sync(SyncJob::Upload, cx);
+            }))
+        });
+        let pull_state = if running_pull {
+            components::ControlState::Loading
+        } else if !configured || sync_busy {
+            components::ControlState::Disabled
+        } else {
+            components::ControlState::Resting
+        };
+        let pull_button = components::compact_button_with_state(
+            strings.pull,
+            Variant::Secondary,
+            pull_state,
+            metrics,
+        )
+        .id("settings.sync.pull")
+        .debug_selector(|| "settings.sync.pull".to_owned())
+        .when(configured && !sync_busy, |button| {
+            button.on_click(cx.listener(|this, _event, _window, cx| {
+                this.request_sync(SyncJob::Pull, cx);
+            }))
+        });
         let mut actions = div()
             .flex()
             .flex_wrap()
@@ -1863,31 +1971,9 @@ impl ShelluneView {
                 cx,
                 |this, cx| this.save_sync_settings(cx),
             ))
-            .child(self.text_button(
-                SharedString::from("settings.sync.test"),
-                if testing {
-                    strings.testing
-                } else {
-                    strings.test
-                },
-                Variant::Secondary,
-                cx,
-                |this, cx| this.test_sync_connection(cx),
-            ))
-            .child(self.text_button(
-                SharedString::from("settings.sync.upload"),
-                strings.upload,
-                Variant::Secondary,
-                cx,
-                |this, cx| this.request_sync(SyncJob::Upload, cx),
-            ))
-            .child(self.text_button(
-                SharedString::from("settings.sync.pull"),
-                strings.pull,
-                Variant::Secondary,
-                cx,
-                |this, cx| this.request_sync(SyncJob::Pull, cx),
-            ));
+            .child(test_button)
+            .child(upload_button)
+            .child(pull_button);
         if self.sync.has_conflict() {
             actions = actions.child(self.text_button(
                 SharedString::from("settings.sync.conflict"),
@@ -2541,18 +2627,25 @@ impl ShelluneView {
                         .child(SharedString::from(remote_line)),
                 );
             let keep = |which: u8, picked: bool, selector: String, label: &'static str| {
-                components::compact_button(label, Variant::Secondary, metrics)
-                    .id(SharedString::from(selector.clone()))
-                    .debug_selector(move || selector.clone())
-                    .when(picked, |button| button.opacity(0.5))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        let side = if which == 0 {
-                            VaultChoiceSide::Local
-                        } else {
-                            VaultChoiceSide::Remote
-                        };
-                        this.choose_vault_side(index, side, cx);
-                    }))
+                components::compact_button(
+                    label,
+                    if picked {
+                        Variant::Primary
+                    } else {
+                        Variant::Secondary
+                    },
+                    metrics,
+                )
+                .id(SharedString::from(selector.clone()))
+                .debug_selector(move || selector.clone())
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    let side = if which == 0 {
+                        VaultChoiceSide::Local
+                    } else {
+                        VaultChoiceSide::Remote
+                    };
+                    this.choose_vault_side(index, side, cx);
+                }))
             };
             row = row.child(
                 div()
@@ -2658,18 +2751,18 @@ impl ShelluneView {
                     }
                 }),
             );
-        let apply = components::compact_button(
+        let apply = components::compact_button_with_state(
             strings.vault_apply,
+            Variant::Primary,
             if all_answered {
-                Variant::Primary
+                components::ControlState::Resting
             } else {
-                Variant::Secondary
+                components::ControlState::Disabled
             },
             metrics,
         )
         .id("sync.vault.conflict.apply")
         .debug_selector(|| "sync.vault.conflict.apply".to_owned())
-        .when(!all_answered, |button| button.opacity(0.5))
         .when(all_answered, |button| {
             button.on_click(cx.listener(|this, _event, _window, cx| {
                 this.resolve_sync_vault(cx);

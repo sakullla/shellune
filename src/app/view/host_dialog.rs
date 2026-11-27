@@ -412,6 +412,9 @@ impl ShelluneView {
         adder
     }
 
+    /// Maximum height of the scrollable managed-key and shared-credential pickers, before zoom.
+    const PICKER_LIST_MAX_HEIGHT: f32 = 180.0;
+
     /// The open jump picker: its search field over the candidates it narrows.
     fn jump_picker_card(&self, cx: &mut Context<Self>) -> Option<Div> {
         let picker = self.jump_picker.as_ref()?;
@@ -831,45 +834,99 @@ impl ShelluneView {
                             .debug_selector(|| "hosts.auth.managed.none".to_owned())
                             .child(security.method_none),
                     );
-                }
-                for (index, meta) in keys.iter().enumerate() {
-                    let id = meta.id();
-                    let selected = chosen == Some(id);
-                    let label = format!("{} · {}", meta.name(), meta.fingerprint());
-                    let selector = format!("hosts.auth.managed.key.{index}");
-                    let reserved = components::compact_label_reserved_width(&label, metrics);
+                } else {
+                    let ux = copy::ux();
+                    let query = self.host_key_search.read(cx).text().trim().to_lowercase();
                     picker = picker.child(
-                        components::compact_button(
-                            SharedString::from(label.clone()),
-                            if selected {
-                                components::Variant::Primary
-                            } else {
-                                components::Variant::Secondary
-                            },
-                            metrics,
-                        )
-                        .min_w(reserved)
-                        .max_w_full()
-                        .flex_shrink()
-                        .whitespace_normal()
-                        .h(gpui::auto())
-                        .min_h(metrics.compact_control_height())
-                        .id(SharedString::from(selector.clone()))
-                        .debug_selector({
-                            let selector = selector.clone();
-                            move || selector.clone()
-                        })
-                        .on_click(cx.listener(
-                            move |this, _event, _window, cx| {
-                                if let Some(draft) = this.hosts.draft_mut()
-                                    && draft.set_managed_key(Some(id))
-                                {
-                                    this.clear_resolved_host_validation(cx);
-                                }
-                                cx.notify();
-                            },
-                        )),
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .debug_selector(|| "hosts.auth.managed.search".to_owned())
+                            .child(self.host_key_search.clone()),
                     );
+                    let filtered: Vec<_> = keys
+                        .iter()
+                        .filter(|meta| {
+                            query.is_empty()
+                                || meta.name().to_lowercase().contains(&query)
+                                || meta.fingerprint().to_lowercase().contains(&query)
+                        })
+                        .collect();
+                    if filtered.is_empty() {
+                        picker = picker.child(components::empty_state_with_cta(
+                            Icon::Search,
+                            ux.picker_no_match,
+                            None,
+                            "hosts.auth.managed.clear_filter",
+                            ux.clear_filter,
+                            Variant::Secondary,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.host_key_search
+                                    .update(cx, |f, cx| f.set_text(String::new(), cx));
+                                cx.notify();
+                            }),
+                            metrics,
+                        ));
+                    } else {
+                        let mut list = div()
+                            .id("hosts.auth.managed.list")
+                            .debug_selector(|| "hosts.auth.managed.list".to_owned())
+                            .flex()
+                            .flex_col()
+                            .gap(metrics.scale(spacing::HAIRLINE))
+                            .w_full()
+                            .max_h(metrics.scale(Self::PICKER_LIST_MAX_HEIGHT))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.host_key_scroll);
+                        for (index, meta) in filtered.iter().enumerate() {
+                            let id = meta.id();
+                            let selected = chosen == Some(id);
+                            let label = format!("{} · {}", meta.name(), meta.fingerprint());
+                            let selector = format!("hosts.auth.managed.key.{index}");
+                            let reserved =
+                                components::compact_label_reserved_width(&label, metrics);
+                            list = list.child(
+                                components::compact_button(
+                                    SharedString::from(label.clone()),
+                                    if selected {
+                                        components::Variant::Primary
+                                    } else {
+                                        components::Variant::Secondary
+                                    },
+                                    metrics,
+                                )
+                                .min_w(reserved)
+                                .max_w_full()
+                                .flex_shrink()
+                                .whitespace_normal()
+                                .h(gpui::auto())
+                                .min_h(metrics.compact_control_height())
+                                .id(SharedString::from(selector.clone()))
+                                .debug_selector({
+                                    let selector = selector.clone();
+                                    move || selector.clone()
+                                })
+                                .on_click(cx.listener(
+                                    move |this, _event, _window, cx| {
+                                        if let Some(draft) = this.hosts.draft_mut()
+                                            && draft.set_managed_key(Some(id))
+                                        {
+                                            this.host_draft_dirty = true;
+                                            this.host_confirm_discard = false;
+                                            this.clear_resolved_host_validation(cx);
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            );
+                        }
+                        picker = picker.child(div().relative().w_full().child(list).child(
+                            crate::app::scrollbar::bar(
+                                "hosts.auth.managed.scrollbar",
+                                self.host_key_scroll.clone(),
+                            ),
+                        ));
+                    }
                 }
                 let inline_actions = div()
                     .flex()
@@ -992,58 +1049,115 @@ impl ShelluneView {
                     .unwrap_or_default();
                 shared.sort_by(|a, b| a.name().cmp(b.name()));
                 if !shared.is_empty() {
-                    picker = picker.child(
-                        div()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(security.host_credential_pick),
-                    );
-                }
-                for (index, meta) in shared.iter().enumerate() {
-                    let id = meta.id();
-                    let selected = chosen == Some(id);
-                    let label = match meta.user() {
-                        Some(user) => format!("{} · {}", meta.name(), user),
-                        None => meta.name().to_owned(),
-                    };
-                    let selector = format!("hosts.auth.credential.{index}");
-                    let reserved = components::compact_label_reserved_width(&label, metrics);
-                    picker = picker.child(
-                        components::compact_button(
-                            SharedString::from(label.clone()),
-                            if selected {
-                                components::Variant::Primary
-                            } else {
-                                components::Variant::Secondary
-                            },
-                            metrics,
+                    let ux = copy::ux();
+                    let query = self.host_cred_search.read(cx).text().trim().to_lowercase();
+                    picker = picker
+                        .child(
+                            div()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .child(security.host_credential_pick),
                         )
-                        .min_w(reserved)
-                        .max_w_full()
-                        .flex_shrink()
-                        .whitespace_normal()
-                        .h(gpui::auto())
-                        .min_h(metrics.compact_control_height())
-                        .id(SharedString::from(selector.clone()))
-                        .debug_selector({
-                            let selector = selector.clone();
-                            move || selector.clone()
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .debug_selector(|| "hosts.auth.credential.search".to_owned())
+                                .child(self.host_cred_search.clone()),
+                        );
+                    let filtered: Vec<_> = shared
+                        .iter()
+                        .filter(|meta| {
+                            query.is_empty()
+                                || meta.name().to_lowercase().contains(&query)
+                                || meta
+                                    .user()
+                                    .is_some_and(|u| u.to_lowercase().contains(&query))
                         })
-                        .on_click(cx.listener(
-                            move |this, _event, _window, cx| {
-                                if let Some(draft) = this.hosts.draft_mut() {
-                                    // Choosing a record again goes back to a typed
-                                    // password, which is the other way this method
-                                    // signs in.
-                                    let next = (draft.credential_id() != Some(id)).then_some(id);
-                                    if draft.set_credential(next) {
-                                        this.clear_resolved_host_validation(cx);
-                                    }
-                                }
+                        .collect();
+                    if filtered.is_empty() {
+                        picker = picker.child(components::empty_state_with_cta(
+                            Icon::Search,
+                            ux.picker_no_match,
+                            None,
+                            "hosts.auth.credential.clear_filter",
+                            ux.clear_filter,
+                            Variant::Secondary,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.host_cred_search
+                                    .update(cx, |f, cx| f.set_text(String::new(), cx));
                                 cx.notify();
-                            },
-                        )),
-                    );
+                            }),
+                            metrics,
+                        ));
+                    } else {
+                        let mut list = div()
+                            .id("hosts.auth.credential.list")
+                            .debug_selector(|| "hosts.auth.credential.list".to_owned())
+                            .flex()
+                            .flex_col()
+                            .gap(metrics.scale(spacing::HAIRLINE))
+                            .w_full()
+                            .max_h(metrics.scale(Self::PICKER_LIST_MAX_HEIGHT))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.host_cred_scroll);
+                        for (index, meta) in filtered.iter().enumerate() {
+                            let id = meta.id();
+                            let selected = chosen == Some(id);
+                            let label = match meta.user() {
+                                Some(user) => format!("{} · {}", meta.name(), user),
+                                None => meta.name().to_owned(),
+                            };
+                            let selector = format!("hosts.auth.credential.{index}");
+                            let reserved =
+                                components::compact_label_reserved_width(&label, metrics);
+                            list = list.child(
+                                components::compact_button(
+                                    SharedString::from(label.clone()),
+                                    if selected {
+                                        components::Variant::Primary
+                                    } else {
+                                        components::Variant::Secondary
+                                    },
+                                    metrics,
+                                )
+                                .min_w(reserved)
+                                .max_w_full()
+                                .flex_shrink()
+                                .whitespace_normal()
+                                .h(gpui::auto())
+                                .min_h(metrics.compact_control_height())
+                                .id(SharedString::from(selector.clone()))
+                                .debug_selector({
+                                    let selector = selector.clone();
+                                    move || selector.clone()
+                                })
+                                .on_click(cx.listener(
+                                    move |this, _event, _window, cx| {
+                                        if let Some(draft) = this.hosts.draft_mut() {
+                                            // Choosing a record again goes back to a typed
+                                            // password, which is the other way this method
+                                            // signs in.
+                                            let next =
+                                                (draft.credential_id() != Some(id)).then_some(id);
+                                            if draft.set_credential(next) {
+                                                this.host_draft_dirty = true;
+                                                this.host_confirm_discard = false;
+                                                this.clear_resolved_host_validation(cx);
+                                            }
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            );
+                        }
+                        picker = picker.child(div().relative().w_full().child(list).child(
+                            crate::app::scrollbar::bar(
+                                "hosts.auth.credential.scrollbar",
+                                self.host_cred_scroll.clone(),
+                            ),
+                        ));
+                    }
                 }
                 picker = picker.child(
                     div().flex().items_center().child(
@@ -1518,6 +1632,7 @@ impl ShelluneView {
     /// Opens the group dropdown again after it was put away.
     pub(super) fn reopen_group_picker(&mut self) {
         self.group_picker_closed = false;
+        self.group_picker_reveal.set(true);
         self.group_picker_highlight = 0;
         self.group_picker_scroll.scroll_to_item(0);
     }
@@ -1720,13 +1835,39 @@ impl ShelluneView {
             );
         }
 
+        let reveal = self.group_picker_reveal.clone();
+        let body = self.host_body_scroll.clone();
+        let shell = cx.entity_id();
+        let margin = metrics.scale(spacing::HAIRLINE);
+        let reveal_canvas = canvas(
+            move |bounds, window, cx| {
+                if !reveal.replace(false) {
+                    return;
+                }
+                let view = body.bounds();
+                let limit = view.bottom().min(window.viewport_size().height);
+                let below = bounds.bottom() + margin - limit;
+                let shift = below.min((bounds.top() - margin - view.top()).max(px(0.0)));
+                if shift > px(0.0) {
+                    let mut offset = body.offset();
+                    offset.y -= shift;
+                    body.set_offset(offset);
+                    cx.defer(move |cx| cx.notify(shell));
+                }
+            },
+            |_bounds, (), _window, _cx| {},
+        )
+        .absolute()
+        .inset_0();
         let panel = components::popover_surface()
+            .relative()
             .occlude()
             .flex()
             .flex_col()
             .w_full()
             .overflow_hidden()
             .debug_selector(move || format!("{prefix}.group.suggestions"))
+            .child(reveal_canvas)
             .child(
                 div()
                     .relative()
@@ -2012,7 +2153,7 @@ impl ShelluneView {
             Some(ux.host_dialog_intro.to_owned()),
             "hosts.editor.close",
             cx,
-            |this, cx| this.close_host_editor(cx),
+            |this, cx| this.request_close_host_editor(cx),
         );
 
         // The refusal takes a line of its own above the actions; the actions stay on
@@ -2023,7 +2164,60 @@ impl ShelluneView {
             } else {
                 "Ctrl+Enter"
             };
+        let discard_banner = self.host_confirm_discard.then(|| {
+            components::banner(Tone::Warning, metrics)
+                .w_full()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap(metrics.scale(spacing::TIGHT))
+                .debug_selector(|| "hosts.discard.confirm".to_owned())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .child(ux.host_discard_prompt),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(metrics.scale(spacing::TIGHT))
+                        .child(
+                            components::compact_button(
+                                ux.host_discard_keep,
+                                Variant::Ghost,
+                                metrics,
+                            )
+                            .id("hosts.discard.keep")
+                            .debug_selector(|| "hosts.discard.keep".to_owned())
+                            .on_click(cx.listener(
+                                |view, _event, _window, cx| {
+                                    view.host_confirm_discard = false;
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .child(
+                            components::compact_button(
+                                ux.host_discard_confirm,
+                                Variant::Danger,
+                                metrics,
+                            )
+                            .id("hosts.discard.ok")
+                            .debug_selector(|| "hosts.discard.ok".to_owned())
+                            .on_click(cx.listener(
+                                |view, _event, _window, cx| {
+                                    view.close_host_editor(cx);
+                                },
+                            )),
+                        ),
+                )
+        });
         let footer = components::modal_footer(metrics)
+            .children(discard_banner)
             .children(refusal.map(|refusal| refusal.w_full()))
             .child(
                 self.text_button(
@@ -2031,7 +2225,7 @@ impl ShelluneView {
                     strings.host_cancel,
                     Variant::Ghost,
                     cx,
-                    |view, cx| view.close_host_editor(cx),
+                    |view, cx| view.request_close_host_editor(cx),
                 )
                 .h(metrics.control_height()),
             )
@@ -2389,60 +2583,118 @@ impl ShelluneView {
                             .unwrap_or_default();
                         shared.sort_by(|a, b| a.name().cmp(b.name()));
                         if !shared.is_empty() {
-                            picker = picker.child(
-                                div()
-                                    .text_size(metrics.caption_size())
-                                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                                    .child(security.host_credential_pick),
-                            );
-                        }
-                        for (index, meta) in shared.iter().enumerate() {
-                            let id = meta.id();
-                            let selected = chosen == Some(id);
-                            let label = match meta.user() {
-                                Some(user) => format!("{} · {}", meta.name(), user),
-                                None => meta.name().to_owned(),
-                            };
-                            let selector = format!("connection.auth.credential.{index}");
-                            let reserved =
-                                components::compact_label_reserved_width(&label, metrics);
-                            picker = picker.child(
-                                components::compact_button(
-                                    SharedString::from(label),
-                                    if selected {
-                                        components::Variant::Primary
-                                    } else {
-                                        components::Variant::Secondary
-                                    },
-                                    metrics,
+                            let ux = copy::ux();
+                            let query = self.host_cred_search.read(cx).text().trim().to_lowercase();
+                            picker = picker
+                                .child(
+                                    div()
+                                        .text_size(metrics.caption_size())
+                                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                                        .child(security.host_credential_pick),
                                 )
-                                .min_w(reserved)
-                                .max_w_full()
-                                .flex_shrink()
-                                .whitespace_normal()
-                                .h(gpui::auto())
-                                .min_h(metrics.compact_control_height())
-                                .id(SharedString::from(selector.clone()))
-                                .debug_selector({
-                                    let selector = selector.clone();
-                                    move || selector.clone()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .debug_selector(|| {
+                                            "connection.auth.credential.search".to_owned()
+                                        })
+                                        .child(self.host_cred_search.clone()),
+                                );
+                            let filtered: Vec<_> = shared
+                                .iter()
+                                .filter(|meta| {
+                                    query.is_empty()
+                                        || meta.name().to_lowercase().contains(&query)
+                                        || meta
+                                            .user()
+                                            .is_some_and(|u| u.to_lowercase().contains(&query))
                                 })
-                                .on_click(cx.listener(
-                                    move |this, _event, _window, cx| {
-                                        if let Some(draft) = this.hosts.protocol_draft_mut() {
-                                            // Choosing a record again goes back to a
-                                            // typed password, which is the other way a
-                                            // desktop connection signs in.
-                                            let next =
-                                                (draft.credential_id() != Some(id)).then_some(id);
-                                            if draft.set_credential(next) {
-                                                this.clear_resolved_protocol_validation(cx);
-                                            }
-                                        }
+                                .collect();
+                            if filtered.is_empty() {
+                                picker = picker.child(components::empty_state_with_cta(
+                                    Icon::Search,
+                                    ux.picker_no_match,
+                                    None,
+                                    "connection.auth.credential.clear_filter",
+                                    ux.clear_filter,
+                                    Variant::Secondary,
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.host_cred_search
+                                            .update(cx, |f, cx| f.set_text(String::new(), cx));
                                         cx.notify();
-                                    },
-                                )),
-                            );
+                                    }),
+                                    metrics,
+                                ));
+                            } else {
+                                let mut list = div()
+                                    .id("connection.auth.credential.list")
+                                    .debug_selector(|| "connection.auth.credential.list".to_owned())
+                                    .flex()
+                                    .flex_col()
+                                    .gap(metrics.scale(spacing::HAIRLINE))
+                                    .w_full()
+                                    .max_h(metrics.scale(Self::PICKER_LIST_MAX_HEIGHT))
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.host_cred_scroll);
+                                for (index, meta) in filtered.iter().enumerate() {
+                                    let id = meta.id();
+                                    let selected = chosen == Some(id);
+                                    let label = match meta.user() {
+                                        Some(user) => format!("{} · {}", meta.name(), user),
+                                        None => meta.name().to_owned(),
+                                    };
+                                    let selector = format!("connection.auth.credential.{index}");
+                                    let reserved =
+                                        components::compact_label_reserved_width(&label, metrics);
+                                    list = list.child(
+                                        components::compact_button(
+                                            SharedString::from(label),
+                                            if selected {
+                                                components::Variant::Primary
+                                            } else {
+                                                components::Variant::Secondary
+                                            },
+                                            metrics,
+                                        )
+                                        .min_w(reserved)
+                                        .max_w_full()
+                                        .flex_shrink()
+                                        .whitespace_normal()
+                                        .h(gpui::auto())
+                                        .min_h(metrics.compact_control_height())
+                                        .id(SharedString::from(selector.clone()))
+                                        .debug_selector({
+                                            let selector = selector.clone();
+                                            move || selector.clone()
+                                        })
+                                        .on_click(
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                if let Some(draft) = this.hosts.protocol_draft_mut()
+                                                {
+                                                    // Choosing a record again goes back to a
+                                                    // typed password, which is the other way a
+                                                    // desktop connection signs in.
+                                                    let next = (draft.credential_id() != Some(id))
+                                                        .then_some(id);
+                                                    if draft.set_credential(next) {
+                                                        this.host_draft_dirty = true;
+                                                        this.host_confirm_discard = false;
+                                                        this.clear_resolved_protocol_validation(cx);
+                                                    }
+                                                }
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    );
+                                }
+                                picker = picker.child(div().relative().w_full().child(list).child(
+                                    crate::app::scrollbar::bar(
+                                        "connection.auth.credential.scrollbar",
+                                        self.host_cred_scroll.clone(),
+                                    ),
+                                ));
+                            }
                         }
                     }
                     if chosen.is_some() {
@@ -2798,7 +3050,7 @@ impl ShelluneView {
             Some(draft.protocol().label().to_owned()),
             "connection.editor.close",
             cx,
-            |this, cx| this.close_connection_editor(cx),
+            |this, cx| this.request_close_connection_editor(cx),
         );
 
         let save_connect_shortcut =
@@ -2807,7 +3059,61 @@ impl ShelluneView {
             } else {
                 "Ctrl+Enter"
             };
+        let ux = copy::ux();
+        let discard_banner = self.host_confirm_discard.then(|| {
+            components::banner(Tone::Warning, metrics)
+                .w_full()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap(metrics.scale(spacing::TIGHT))
+                .debug_selector(|| "connection.discard.confirm".to_owned())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .child(ux.host_discard_prompt),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(metrics.scale(spacing::TIGHT))
+                        .child(
+                            components::compact_button(
+                                ux.host_discard_keep,
+                                Variant::Ghost,
+                                metrics,
+                            )
+                            .id("connection.discard.keep")
+                            .debug_selector(|| "connection.discard.keep".to_owned())
+                            .on_click(cx.listener(
+                                |view, _event, _window, cx| {
+                                    view.host_confirm_discard = false;
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .child(
+                            components::compact_button(
+                                ux.host_discard_confirm,
+                                Variant::Danger,
+                                metrics,
+                            )
+                            .id("connection.discard.ok")
+                            .debug_selector(|| "connection.discard.ok".to_owned())
+                            .on_click(cx.listener(
+                                |view, _event, _window, cx| {
+                                    view.close_connection_editor(cx);
+                                },
+                            )),
+                        ),
+                )
+        });
         let footer = components::modal_footer(metrics)
+            .children(discard_banner)
             .children(refusal.map(|refusal| refusal.w_full()))
             .child(
                 self.text_button(
@@ -2815,7 +3121,7 @@ impl ShelluneView {
                     strings.host_cancel,
                     Variant::Ghost,
                     cx,
-                    |view, cx| view.close_connection_editor(cx),
+                    |view, cx| view.request_close_connection_editor(cx),
                 )
                 .h(metrics.control_height()),
             )

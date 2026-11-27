@@ -96,6 +96,9 @@ const BAR_WIDTH: f32 = 200.0;
 /// The widest the words of a failed stage run, in logical pixels before zoom.
 const FAILURE_WIDTH: f32 = components::STATUS_CARD_WIDTH;
 
+/// Minimum scrollable remainder treated as real overflow, in logical pixels.
+const OVERFLOW_EPSILON: f32 = 0.5;
+
 /// Where the window is in its start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Startup {
@@ -1070,7 +1073,15 @@ impl ShelluneView {
                 }))
             })
             .child(self.startup_caption(window, cx))
-            .child(splash_body(brand, buttons, Some(&self.startup_scroll)))
+            .child(splash_body(
+                brand,
+                buttons,
+                Some((
+                    &self.startup_scroll,
+                    self.startup_scroll_overflows.clone(),
+                    cx.entity_id(),
+                )),
+            ))
             .into_any_element()
     }
 
@@ -1236,6 +1247,10 @@ impl ShelluneView {
         metrics: Metrics,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let overflows = self.startup_scroll_overflows.get()
+            || self.startup_scroll.max_offset().height > gpui::px(OVERFLOW_EPSILON);
+        let focus_continue = !self.pointer_input && !self.startup_run.focus_open_folder;
+        let focus_folder = !self.pointer_input && self.startup_run.focus_open_folder;
         div()
             .flex()
             .flex_col()
@@ -1249,15 +1264,17 @@ impl ShelluneView {
             .pb(metrics.scale(spacing::SNUG))
             .gap(metrics.scale(spacing::TIGHT))
             .debug_selector(|| "startup.failure.actions".to_owned())
-            .child(
-                div()
-                    .max_w_full()
-                    .text_center()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .debug_selector(|| "startup.failure.scroll_hint".to_owned())
-                    .child(SharedString::from(strings.scroll_hint)),
-            )
+            .when(overflows, |panel| {
+                panel.child(
+                    div()
+                        .max_w_full()
+                        .text_center()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .debug_selector(|| "startup.failure.scroll_hint".to_owned())
+                        .child(SharedString::from(strings.scroll_hint)),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -1269,13 +1286,12 @@ impl ShelluneView {
                         components::button(strings.continue_start, Variant::Primary, metrics)
                             .id("startup.continue")
                             .debug_selector(|| "startup.continue".to_owned())
-                            .when(
-                                !self.pointer_input && !self.startup_run.focus_open_folder,
-                                |b| {
-                                    b.border_2()
-                                        .border_color(theme::swatch(palette::FOCUS_RING))
-                                },
-                            )
+                            .border_2()
+                            .border_color(if focus_continue {
+                                theme::swatch(palette::FOCUS_RING)
+                            } else {
+                                gpui::transparent_black().into()
+                            })
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.continue_startup(cx);
                             })),
@@ -1289,13 +1305,12 @@ impl ShelluneView {
                         )
                         .id("startup.open_folder")
                         .debug_selector(|| "startup.open_folder".to_owned())
-                        .when(
-                            !self.pointer_input && self.startup_run.focus_open_folder,
-                            |b| {
-                                b.border_2()
-                                    .border_color(theme::swatch(palette::FOCUS_RING))
-                            },
-                        )
+                        .border_2()
+                        .border_color(if focus_folder {
+                            theme::swatch(palette::FOCUS_RING)
+                        } else {
+                            theme::swatch(palette::BORDER_STRONG)
+                        })
                         .on_click(cx.listener(
                             |this, _event, _window, cx| {
                                 this.open_data_folder(cx);
@@ -1482,11 +1497,17 @@ impl<A: Future + Unpin, L: Future + Unpin> Future for Bounded<'_, A, L> {
 fn splash_body(
     brand: Option<AnyElement>,
     buttons: Option<AnyElement>,
-    scroll: Option<&ScrollHandle>,
+    scroll: Option<(
+        &ScrollHandle,
+        std::rc::Rc<std::cell::Cell<bool>>,
+        gpui::EntityId,
+    )>,
 ) -> impl IntoElement {
+    let scroll_handle = scroll.as_ref().map(|(handle, _, _)| (*handle).clone());
     // The floor centres the start and, under it, a stop's buttons; when the two are
     // taller than the floor the words above the buttons scroll and the buttons stay.
     div()
+        .relative()
         .flex()
         .flex_col()
         .flex_1()
@@ -1501,7 +1522,7 @@ fn splash_body(
                 .flex_shrink()
                 .min_h_0()
                 .overflow_y_scroll()
-                .when_some(scroll, |el, handle| el.track_scroll(handle))
+                .when_some(scroll_handle.as_ref(), |el, handle| el.track_scroll(handle))
                 .child(
                     div()
                         .flex()
@@ -1512,6 +1533,25 @@ fn splash_body(
                         .children(brand),
                 ),
         )
+        .when_some(scroll, |el, (handle, overflows, shell)| {
+            let watch_handle = handle.clone();
+            let watch = gpui::canvas(
+                move |_bounds, _window, cx| {
+                    let now = watch_handle.max_offset().height > gpui::px(OVERFLOW_EPSILON);
+                    if overflows.replace(now) != now {
+                        cx.defer(move |cx| cx.notify(shell));
+                    }
+                },
+                |_bounds, (), _window, _cx| {},
+            )
+            .h(gpui::px(0.0))
+            .w(gpui::px(0.0))
+            .flex_none();
+            el.child(watch).child(crate::app::scrollbar::bar(
+                "startup.body.scrollbar",
+                handle.clone(),
+            ))
+        })
         .children(buttons)
 }
 

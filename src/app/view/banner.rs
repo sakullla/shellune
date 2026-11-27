@@ -620,7 +620,7 @@ impl ShelluneView {
             }
             Some(SessionStep::Close) => {
                 let button = if narrow {
-                    components::icon_only_button(Icon::Close, metrics).size(metrics.hit_target())
+                    components::danger_icon_button(Icon::Stop, metrics).size(metrics.hit_target())
                 } else {
                     components::compact_button(strings.session_close, Variant::Secondary, metrics)
                 }
@@ -715,6 +715,7 @@ impl ShelluneView {
                 .w_full()
                 .max_h(metrics.scale(DIAGNOSTIC_MAX_HEIGHT))
                 .overflow_y_scroll()
+                .track_scroll(&self.banner_detail_scroll)
                 .gap(metrics.scale(spacing::HALF))
                 .px(metrics.scale(spacing::SNUG))
                 .py(metrics.scale(spacing::NARROW))
@@ -748,6 +749,7 @@ impl ShelluneView {
             // The box keeps to a share of the pane as well as to its own most: in a
             // short pane the details give way before the last screen does.
             let room = div()
+                .relative()
                 .flex()
                 .flex_col()
                 .flex_shrink()
@@ -755,7 +757,11 @@ impl ShelluneView {
                 .w_full()
                 .max_h(gpui::relative(DIAGNOSTIC_MAX_SHARE))
                 .debug_selector(|| "terminal.failure.room".to_owned())
-                .child(detail);
+                .child(detail)
+                .child(crate::app::scrollbar::bar(
+                    SharedString::from(format!("terminal.failure.detail.scrollbar.{id:?}")),
+                    self.banner_detail_scroll.clone(),
+                ));
             unfolded = Some(theme::enter(
                 room,
                 SharedString::from(format!("session.banner.detail.{id:?}")),

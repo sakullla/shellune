@@ -83,7 +83,7 @@ pub(super) enum Category {
 }
 
 /// One settings item: the page the navigation opens.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Item {
     Theme,
     Language,
@@ -420,8 +420,7 @@ impl ShelluneView {
         // their final height a frame later (wrapped hints, measured segments) still shows
         // the chosen category's heading instead of a line under it.
         if self.settings_pending_reveal.get() {
-            self.settings_scroll
-                .scroll_to_top_of_item(self.settings_nav.category.index());
+            self.apply_settings_reveal();
         }
 
         // Every category on one page that scrolls: settings are read the way a person
@@ -578,7 +577,57 @@ impl ShelluneView {
     /// Scrolls the page so a category's heading is at the top.
     pub(super) fn settings_reveal(&self, category: Category) {
         self.settings_pending_reveal.set(true);
+        self.settings_pending_reveal_item.set(None);
         self.settings_scroll.scroll_to_top_of_item(category.index());
+    }
+
+    /// Scrolls the page so a specific item within `category` is brought into view.
+    pub(super) fn settings_reveal_item(&self, category: Category, item: Item) {
+        self.settings_pending_reveal.set(true);
+        if category.items().first().copied() == Some(item) {
+            self.settings_pending_reveal_item.set(None);
+            self.settings_scroll.scroll_to_top_of_item(category.index());
+        } else {
+            self.settings_pending_reveal_item.set(Some(item));
+            self.apply_settings_reveal();
+        }
+    }
+
+    /// Applies the pending category or item reveal to `settings_scroll`.
+    fn apply_settings_reveal(&self) {
+        if let Some(item) = self.settings_pending_reveal_item.get() {
+            let content_y = self.settings_item_offsets.borrow().get(&item).copied();
+            if let Some(y) = content_y {
+                let pad = self.metrics().scale(spacing::LOOSE);
+                let target = (y - pad).max(px(0.0));
+                self.settings_scroll
+                    .set_offset(gpui::point(px(0.0), -target));
+                return;
+            }
+        }
+        self.settings_scroll
+            .scroll_to_top_of_item(self.settings_nav.category.index());
+    }
+
+    /// Zero-height anchor element that records an item's content-space Y position inside
+    /// `settings.scroll` so clicking a sub-item in the sidebar scrolls directly to it.
+    fn settings_item_anchor(&self, item: Item) -> gpui::AnyElement {
+        let scroll = self.settings_scroll.clone();
+        let offsets = self.settings_item_offsets.clone();
+        gpui::canvas(
+            move |bounds, _window, _cx| {
+                let scroll_bounds = scroll.bounds();
+                if scroll_bounds.size.height > px(0.0) {
+                    let content_y = bounds.origin.y - scroll_bounds.origin.y - scroll.offset().y;
+                    offsets.borrow_mut().insert(item, content_y);
+                }
+            },
+            |_bounds, (), _window, _cx| {},
+        )
+        .h(px(0.0))
+        .w(px(0.0))
+        .flex_none()
+        .into_any_element()
     }
 
     /// One category of the page: its title, then each of its settings under its own
@@ -658,6 +707,7 @@ impl ShelluneView {
                             row.border_b_1()
                                 .border_color(theme::swatch(palette::BORDER))
                         })
+                        .child(self.settings_item_anchor(item))
                         // The chosen setting carries the accent edge, so the place the
                         // navigation points at is found on the page as well.
                         .child(
@@ -698,6 +748,7 @@ impl ShelluneView {
                     .min_w_0()
                     .gap(metrics.scale(spacing::TIGHT))
                     .debug_selector(move || selector.clone())
+                    .child(self.settings_item_anchor(item))
                     .when(named, |block| {
                         block.child(
                             div()
@@ -1384,6 +1435,34 @@ impl ShelluneView {
                 .child(div().text_size(metrics.caption_size()).child(label))
                 .child(control)
         };
+        let threshold_control = if settings.long_command {
+            self.segments(
+                "settings.notify.threshold",
+                options,
+                cx,
+                move |view, index, cx| {
+                    if let Some(secs) = steps.get(index) {
+                        view.set_long_command_secs(*secs, cx);
+                    }
+                },
+            )
+        } else {
+            let mut bar = components::segmented(metrics)
+                .debug_selector(|| "settings.notify.threshold".to_owned())
+                .opacity(0.5);
+            for (index, (label, selected)) in options.into_iter().enumerate() {
+                bar = bar.child(
+                    components::segment(label, selected, metrics)
+                        .id(SharedString::from(format!(
+                            "settings.notify.threshold.{index}"
+                        )))
+                        .debug_selector(move || format!("settings.notify.threshold.{index}"))
+                        .cursor_default()
+                        .text_color(theme::swatch(palette::DISABLED_TEXT)),
+                );
+            }
+            bar
+        };
         div()
             .flex()
             .flex_col()
@@ -1406,16 +1485,7 @@ impl ShelluneView {
                     |view, on, cx| view.set_desktop_notify(NotifyKind::LongCommand, on, cx),
                 ),
             ))
-            .child(self.segments(
-                "settings.notify.threshold",
-                options,
-                cx,
-                move |view, index, cx| {
-                    if let Some(secs) = steps.get(index) {
-                        view.set_long_command_secs(*secs, cx);
-                    }
-                },
-            ))
+            .child(threshold_control)
     }
 
     /// The connection page: the keepalive and timeout numbers every host is dialled with
@@ -2107,7 +2177,7 @@ impl ShelluneView {
         self.settings_nav.category = category;
         self.settings_nav.set_item(category, index);
         self.settings_nav.nav_focus = false;
-        self.settings_reveal(category);
+        self.settings_reveal_item(category, self.settings_nav.current());
         self.keys_selected = 0;
         self.keys_control = 0;
         cx.notify();
@@ -2144,6 +2214,7 @@ impl ShelluneView {
         let at = self.settings_nav.item_of(category);
         self.settings_nav
             .set_item(category, crate::app::palette::step(at, delta, count));
+        self.settings_reveal_item(category, self.settings_nav.current());
         cx.notify();
     }
 

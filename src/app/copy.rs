@@ -3527,6 +3527,20 @@ pub struct UxStrings {
     pub snippet_palette_aliases: &'static str,
     /// Session menu action to open global port forwarding rules
     pub session_global_forwards: &'static str,
+    /// Prompt shown when closing a host/connection dialog with unsaved edits
+    pub host_discard_prompt: &'static str,
+    /// Action to remain in the host/connection dialog after attempting to close
+    pub host_discard_keep: &'static str,
+    /// Action to discard unsaved edits and close the host/connection dialog
+    pub host_discard_confirm: &'static str,
+    /// Search placeholder in the host dialog's managed key picker
+    pub picker_search_keys: &'static str,
+    /// Search placeholder in the host/connection dialog's shared credential picker
+    pub picker_search_credentials: &'static str,
+    /// Empty search result message inside a key/credential picker
+    pub picker_no_match: &'static str,
+    /// Generic "Clear filter" button label for empty search states
+    pub clear_filter: &'static str,
 }
 
 impl UxStrings {
@@ -4077,6 +4091,13 @@ impl UxStrings {
             self.terminal_snippets_menu,
             self.snippet_palette_aliases,
             self.session_global_forwards,
+            self.host_discard_prompt,
+            self.host_discard_keep,
+            self.host_discard_confirm,
+            self.picker_search_keys,
+            self.picker_search_credentials,
+            self.picker_no_match,
+            self.clear_filter,
         ]
     }
 }
@@ -4628,6 +4649,13 @@ included",
     terminal_snippets_menu: "Snippets\u{2026}",
     snippet_palette_aliases: "Snippets",
     session_global_forwards: "All port forwards\u{2026}",
+    host_discard_prompt: "Discard unsaved changes?",
+    host_discard_keep: "Keep editing",
+    host_discard_confirm: "Discard",
+    picker_search_keys: "Search keys\u{2026}",
+    picker_search_credentials: "Search shared passwords\u{2026}",
+    picker_no_match: "No matching items",
+    clear_filter: "Clear filter",
 };
 
 /// Simplified Chinese.
@@ -5174,6 +5202,13 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     terminal_snippets_menu: "代码片段\u{2026}",
     snippet_palette_aliases: "代码片段",
     session_global_forwards: "全部端口转发\u{2026}",
+    host_discard_prompt: "放弃未保存的修改？",
+    host_discard_keep: "继续编辑",
+    host_discard_confirm: "放弃",
+    picker_search_keys: "搜索密钥\u{2026}",
+    picker_search_credentials: "搜索共享密码\u{2026}",
+    picker_no_match: "无匹配项",
+    clear_filter: "清除筛选",
 };
 
 /// The redesigned-shell strings of the current language.
@@ -6707,12 +6742,67 @@ pub fn relative_time(then_unix: u64, now_unix: u64, locale: Locale) -> String {
     }
 }
 
-/// Fills `{name}` placeholders.
+/// Fills `{name}` placeholders and adjusts English singular/plural agreement when a
+/// `"count"` placeholder is supplied.
 #[must_use]
 pub fn fill(template: &str, pairs: &[(&str, &str)]) -> String {
     let mut text = template.to_owned();
+    let mut count_value: Option<&str> = None;
     for (name, value) in pairs {
+        if *name == "count" {
+            count_value = Some(*value);
+        }
         text = text.replace(&format!("{{{name}}}"), value);
+    }
+    if let Some(count) = count_value {
+        text = adjust_english_plural(text, count == "1");
+    }
+    text
+}
+
+/// Fills `{count}` in `template` with English singular/plural agreement.
+#[must_use]
+#[allow(dead_code)]
+pub fn fill_count(template: &str, count: usize) -> String {
+    fill(template, &[("count", &count.to_string())])
+}
+
+/// Normalises English singular/plural forms after `{count}` has been substituted.
+/// Chinese strings contain none of these English patterns and pass through untouched.
+fn adjust_english_plural(mut text: String, singular: bool) -> String {
+    if singular {
+        text = text.replace("1 folder(s) were", "1 folder was");
+        text = text.replace("(s)", "");
+        for (plural_phrase, singular_phrase) in [
+            ("1 saved passwords are", "1 saved password is"),
+            ("1 passwords were", "1 password was"),
+            ("1 passwords no longer", "1 password no longer"),
+            ("1 servers have", "1 server has"),
+            ("1 servers had", "1 server had"),
+            ("1 connections sign", "1 connection signs"),
+            ("1 connections", "1 connection"),
+            ("1 terminal sessions", "1 terminal session"),
+            ("1 file transfers", "1 file transfer"),
+            ("1 remote desktops", "1 remote desktop"),
+            ("1 serial sessions", "1 serial session"),
+            ("1 selected hosts", "1 selected host"),
+            ("1 hosts", "1 host"),
+            ("1 earlier lines are", "1 earlier line is"),
+            ("1 older runs are", "1 older run is"),
+            ("1 lines", "1 line"),
+            ("1 steps", "1 step"),
+            ("1 jumps", "1 jump"),
+            ("1 times", "1 time"),
+            ("1 changes", "1 change"),
+            ("1 paths", "1 path"),
+            ("1 entries", "1 entry"),
+        ] {
+            if text.contains(plural_phrase) {
+                text = text.replace(plural_phrase, singular_phrase);
+            }
+        }
+    } else {
+        text = text.replace("(s)", "s");
     }
     text
 }
@@ -6855,6 +6945,31 @@ mod ux_tests {
     #[test]
     fn fill_replaces_every_placeholder() {
         assert_eq!(fill("{a} to {b}", &[("a", "x"), ("b", "y")]), "x to y");
+    }
+
+    #[test]
+    fn fill_count_adjusts_english_singular_and_plural_without_touching_chinese() {
+        assert_eq!(fill_count(ENGLISH_UX.hosts_moved, 1), "1 host moved");
+        assert_eq!(fill_count(ENGLISH_UX.hosts_moved, 3), "3 hosts moved");
+        assert_eq!(
+            fill_count(ENGLISH_BACKUP.export_done_secrets, 1),
+            "1 saved password is in the file, encrypted"
+        );
+        assert_eq!(
+            fill_count(ENGLISH_BACKUP.export_done_secrets, 2),
+            "2 saved passwords are in the file, encrypted"
+        );
+        assert_eq!(
+            fill_count(ENGLISH_UPDATE.confirm_terminals, 1),
+            "1 terminal session"
+        );
+        assert_eq!(
+            fill_count(ENGLISH_UPDATE.confirm_terminals, 4),
+            "4 terminal sessions"
+        );
+        assert_eq!(fill_count(ENGLISH_SECURITY.hosts_count, 1), "1 connection");
+        assert_eq!(fill_count(ENGLISH_SECURITY.hosts_count, 0), "0 connections");
+        assert_eq!(fill_count(CHINESE_UX.hosts_moved, 1), "已移动 1 台主机");
     }
 
     #[test]

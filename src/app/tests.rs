@@ -35211,6 +35211,12 @@ fn assert_tab_follows_drawn_order(
     };
     click(cx, drawn[0]);
     for (step, selector) in drawn.iter().enumerate().skip(1) {
+        // A non-empty revealable password field (`hosts.field.secret`) inserts its
+        // reveal toggle as a Tab stop before advancing to the next text field (R4).
+        if drawn[step - 1] == "hosts.field.secret" {
+            cx.simulate_keystrokes("tab");
+            cx.run_until_parked();
+        }
         mark(cx, "tab", selector, &step.to_string());
     }
     // The ring closes: Tab from the last field returns to the first, Shift+Tab goes back.
@@ -42175,6 +42181,7 @@ async fn switching_protocols_keeps_the_open_dialog_in_place(cx: &mut TestAppCont
     // The entrance is still played when the form opens: what was wrong was replaying it
     // on a switch, not the dialog arriving.
     click(cx, "connection.cancel");
+    click(cx, "connection.discard.ok");
     settle(cx);
     click(cx, "hosts.new");
     let arriving = open_form_bounds(cx);
@@ -48766,6 +48773,7 @@ async fn dialog_validation_targets_required_fields_clears_all_borders_and_aborte
             && v.hosts_state().message().is_none()
     }));
     click(cx, "connection.cancel");
+    click(cx, "connection.discard.ok");
 
     // 4. SSH keepalive override error clears when switching back to Inherit, and SSH group picker clears invalid Group.
     click(cx, "hosts.new");
@@ -52883,5 +52891,148 @@ async fn t2_all_tabs_search_dismiss_pending_close_batch_queue_and_reopen_deleted
     assert!(
         !cx.update(|_window, app| view.read(app).tab_list_open_for_test()),
         "clicking outside backdrop dismisses all-tabs overlay"
+    );
+}
+
+#[gpui::test]
+async fn t3_backup_export_vault_shows_refusal_and_hides_no_secrets_copy(cx: &mut TestAppContext) {
+    let dir = TempDir::new("t3-backup-vault-refusal");
+    seed(&dir.store(), Vec::new());
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    click(cx, "nav.settings");
+    click(cx, "settings.category.data");
+    click(cx, "settings.backup.export");
+    click(cx, "backup.export.vault");
+    let refusal_text = cx.update(|_window, app| view.read(app).export_refusal_for_test(app));
+    assert!(
+        refusal_text.is_some(),
+        "vault export without saved sync passphrase reports refusal"
+    );
+    assert!(
+        cx.debug_bounds("backup.export.refusal").is_some(),
+        "vault export without saved sync passphrase displays refusal banner"
+    );
+    // Re-open in a fresh window and toggle vault on the first frame to confirm
+    // `backup.export.plain` is never rendered while `include_vault` is checked.
+    let dir2 = TempDir::new("t3-backup-vault-no-plain");
+    seed(&dir2.store(), Vec::new());
+    let (view2, cx2) = hosts_view_with_trust(cx, &dir2);
+    cx2.update(|_window, app| {
+        view2.update(app, |view, cx| {
+            view.open_backup_export_with_vault_for_test(cx);
+        });
+    });
+    cx2.run_until_parked();
+    assert!(
+        cx2.debug_bounds("backup.export.refusal").is_some(),
+        "vault export shows refusal banner"
+    );
+    assert!(
+        cx2.debug_bounds("backup.export.plain").is_none(),
+        "vault export never renders contradictory no-secrets caption"
+    );
+}
+
+#[gpui::test]
+async fn t3_host_dialog_dirty_draft_prompts_before_discard_and_clean_closes_immediately(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("t3-host-dirty-confirm");
+    seed(&dir.store(), Vec::new());
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    // Clean dialog closes immediately on Escape.
+    click(cx, "hosts.new");
+    assert!(cx.debug_bounds("hosts.editor").is_some());
+    press_key(cx, "escape");
+    assert!(
+        cx.debug_bounds("hosts.editor").is_none(),
+        "clean host dialog closes immediately on Escape without confirmation"
+    );
+
+    // Dirty dialog asks for confirmation on Escape and keeps editing on second Escape.
+    click(cx, "hosts.new");
+    type_into(cx, "hosts.field.address", "10.0.0.42");
+    press_key(cx, "escape");
+    assert!(
+        cx.debug_bounds("hosts.editor").is_some(),
+        "dirty host dialog stays open on first Escape"
+    );
+    assert!(
+        cx.debug_bounds("hosts.discard.confirm").is_some(),
+        "dirty host dialog shows discard confirmation banner"
+    );
+    press_key(cx, "escape");
+    assert!(
+        cx.debug_bounds("hosts.editor").is_some()
+            && cx.debug_bounds("hosts.discard.confirm").is_none(),
+        "second Escape cancels discard prompt and keeps editing"
+    );
+
+    // Clicking Cancel on dirty dialog prompts, then clicking Discard closes it.
+    click(cx, "hosts.cancel");
+    assert!(cx.debug_bounds("hosts.discard.confirm").is_some());
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().is_editing()),
+        "dirty host dialog stays open until Discard is confirmed"
+    );
+    click(cx, "hosts.discard.ok");
+    assert!(
+        !cx.update(|_window, app| view.read(app).hosts_state().is_editing()),
+        "clicking Discard closes dirty host dialog"
+    );
+    let _ = view;
+}
+
+#[gpui::test]
+async fn t3_toast_escape_dismisses_and_settings_notify_disables_threshold(cx: &mut TestAppContext) {
+    let dir = TempDir::new("t3-toast-settings");
+    seed(&dir.store(), Vec::new());
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    // Copy text produces a toast; Escape dismisses it.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.copy_text("hello-clipboard".to_owned(), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).toast_titles().len()),
+        1
+    );
+    press_key(cx, "escape");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).toast_titles().len()),
+        0,
+        "Escape dismisses the active toast"
+    );
+
+    // Open Settings -> Notifications -> Desktop notifications; turning off long commands disables threshold clicks.
+    click(cx, "nav.settings");
+    click(cx, "settings.category.notices");
+    let initial_secs = cx.update(|_window, app| {
+        view.read(app)
+            .workspace()
+            .notify_settings()
+            .long_command_secs
+    });
+    // Click the long-command switch to disable it (starts enabled by default).
+    click(cx, "settings.notify.long");
+    assert!(
+        !cx.update(|_window, app| view.read(app).workspace().notify_settings().long_command),
+        "long command switch toggled off"
+    );
+    // Attempting to click a different threshold segment while disabled must not change the value.
+    click(cx, "settings.notify.threshold.0");
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .notify_settings()
+                .long_command_secs
+        }),
+        initial_secs,
+        "threshold segments are non-interactive while long-command notification is off"
     );
 }

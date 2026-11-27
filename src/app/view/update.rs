@@ -59,9 +59,6 @@ pub(super) const TOPBAR_FULL_CHIP_WIDTH: f32 = 900.0;
 /// How often an update that waits for held saves looks again.
 const HELD_WRITES_POLL: Duration = Duration::from_millis(200);
 
-/// The height of the download bar under the update card's head, before zoom.
-const DOWNLOAD_BAR_HEIGHT: f32 = 4.0;
-
 /// The update state of one window.
 pub(super) struct UpdateCenter {
     /// The update calls; `None` when this window never updates (a capture, a test that
@@ -770,29 +767,23 @@ impl ShelluneView {
         rows.push(notes_block);
     }
 
-    /// The bar of a download.
+    /// The bar of a download: determinate when the total size is known, indeterminate
+    /// (animated under full motion, still under reduced motion) when it is not.
     fn update_progress_bar(&self, downloaded: u64, total: Option<u64>) -> Div {
         let metrics = self.metrics();
-        let fraction = progress_fraction(downloaded, total).unwrap_or(0.0);
-        div().w_full().px(metrics.scale(spacing::BASE)).child(
-            div()
-                .flex()
-                .flex_row()
-                .w_full()
-                .min_w_0()
-                .h(metrics.scale(DOWNLOAD_BAR_HEIGHT))
-                .rounded_full()
-                .overflow_hidden()
-                .bg(theme::swatch(palette::LOADING_TRACK))
-                .debug_selector(|| "settings.update.progress".to_owned())
-                .child(
-                    div()
-                        .flex_none()
-                        .h_full()
-                        .w(gpui::relative(fraction))
-                        .bg(theme::swatch(palette::LOADING_FILL)),
-                ),
-        )
+        let progress = match progress_fraction(downloaded, total) {
+            Some(fraction) => components::Progress::Determinate(fraction),
+            None => components::Progress::Indeterminate,
+        };
+        div()
+            .w_full()
+            .px(metrics.scale(spacing::BASE))
+            .debug_selector(|| "settings.update.progress".to_owned())
+            .child(components::progress_bar(
+                "settings.update.progress.bar",
+                progress,
+                metrics,
+            ))
     }
 
     /// The update page: the automatic switch, the check, and the card of where the
@@ -820,24 +811,31 @@ impl ShelluneView {
         // start is said by the status line alone.
         let checking = matches!(stage, UpdateStage::Checking { manual: true });
         let mut check_row = self.update_actions("settings.update.check.row");
-        check_row = check_row.child(
-            self.text_button(
-                SharedString::from("settings.update.check"),
-                if checking {
-                    strings.checking
-                } else {
-                    strings.check
-                },
-                Variant::Secondary,
-                cx,
-                move |this, cx| {
-                    if can_check {
-                        this.check_for_updates(true, cx);
-                    }
-                },
-            )
-            .when(!can_check, |button| button.opacity(0.6)),
-        );
+        let check_state = if checking {
+            components::ControlState::Loading
+        } else if can_check {
+            components::ControlState::Resting
+        } else {
+            components::ControlState::Disabled
+        };
+        let check_button = components::compact_button_with_state(
+            if checking {
+                strings.checking
+            } else {
+                strings.check
+            },
+            Variant::Secondary,
+            check_state,
+            self.metrics(),
+        )
+        .id("settings.update.check")
+        .debug_selector(|| "settings.update.check".to_owned())
+        .when(can_check, |button| {
+            button.on_click(cx.listener(|this, _event, _window, cx| {
+                this.check_for_updates(true, cx);
+            }))
+        });
+        check_row = check_row.child(check_button);
         rows.push(check_row);
         let version = self.version();
         match stage {

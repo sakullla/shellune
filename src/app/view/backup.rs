@@ -529,8 +529,15 @@ impl ShelluneView {
         let confirm = self.passphrase_field(strings.passphrase_confirm, cx);
         let vault_passphrase = self.passphrase_field(strings.export_vault_passphrase, cx);
         let vault_confirm = self.passphrase_field(strings.export_vault_confirm, cx);
+        TextField::wire_tab_ring(&[passphrase.clone(), confirm.clone()], cx);
+        TextField::wire_tab_ring(&[vault_passphrase.clone(), vault_confirm.clone()], cx);
         let view = cx.entity().downgrade();
-        for field in [confirm.clone(), vault_confirm.clone()] {
+        for field in [
+            passphrase.clone(),
+            confirm.clone(),
+            vault_passphrase.clone(),
+            vault_confirm.clone(),
+        ] {
             let view = view.clone();
             field.update(cx, |field, _cx| {
                 field.on_submit(move |_text, _window, app| {
@@ -629,13 +636,35 @@ impl ShelluneView {
     /// Opens the system's save dialog on the default file name, and exports to the file
     /// it returns. A refused or cancelled choice writes nothing.
     pub(super) fn choose_backup_export_path(&mut self, cx: &mut Context<Self>) {
-        let refused = match self.backup.as_ref() {
+        let refusal_fields = match self.backup.as_ref() {
             Some(BackupDialog::Export(dialog)) => {
-                dialog.choosing || dialog.running || self.export_refusal(dialog, cx).is_some()
+                if dialog.choosing || dialog.running {
+                    return;
+                }
+                if self.export_refusal(dialog, cx).is_some() {
+                    if dialog.include_vault && self.saved_sync_passphrase().is_none() {
+                        let empty = dialog.vault_passphrase.read(cx).text().trim().is_empty();
+                        Some((
+                            dialog.vault_passphrase.clone(),
+                            dialog.vault_confirm.clone(),
+                            empty,
+                        ))
+                    } else if dialog.include_secrets {
+                        let empty = dialog.passphrase.read(cx).text().trim().is_empty();
+                        Some((dialog.passphrase.clone(), dialog.confirm.clone(), empty))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             }
-            _ => true,
+            _ => return,
         };
-        if refused {
+        if let Some((first, second, empty)) = refusal_fields {
+            first.update(cx, |f, cx| f.set_invalid(empty, cx));
+            second.update(cx, |f, cx| f.set_invalid(!empty, cx));
+            cx.notify();
             return;
         }
         // A backup that carries the whole vault is every secret leaving the
@@ -1027,6 +1056,8 @@ impl ShelluneView {
         let typed = field.read(cx).text().to_owned();
         if typed.trim().is_empty() {
             *problem = Some(strings.import_passphrase_required.to_owned());
+            let field = field.clone();
+            field.update(cx, |f, cx| f.set_invalid(true, cx));
             cx.notify();
             return;
         }
@@ -1103,7 +1134,10 @@ impl ShelluneView {
                 *running = false;
                 *problem = Some(strings.wrong_passphrase.to_owned());
                 let field = field.clone();
-                field.update(cx, |field, cx| field.set_text(String::new(), cx));
+                field.update(cx, |field, cx| {
+                    field.set_text(String::new(), cx);
+                    field.set_invalid(true, cx);
+                });
                 self.field_focus_pending = Some(field.read(cx).focus_handle().clone());
             }
         }
@@ -1133,6 +1167,8 @@ impl ShelluneView {
         let typed = field.read(cx).text().to_owned();
         if typed.trim().is_empty() {
             *problem = Some(strings.import_passphrase_required.to_owned());
+            let field = field.clone();
+            field.update(cx, |f, cx| f.set_invalid(true, cx));
             cx.notify();
             return;
         }
@@ -1193,7 +1229,10 @@ impl ShelluneView {
                 *running = false;
                 *problem = Some(backup_error_text(&error, strings));
                 let field = field.clone();
-                field.update(cx, |field, cx| field.set_text(String::new(), cx));
+                field.update(cx, |field, cx| {
+                    field.set_text(String::new(), cx);
+                    field.set_invalid(true, cx);
+                });
                 self.field_focus_pending = Some(field.read(cx).focus_handle().clone());
             }
         }
@@ -1637,13 +1676,18 @@ impl ShelluneView {
         cx: &mut Context<Self>,
         click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> Stateful<Div> {
-        let button = components::compact_button(label, variant, self.metrics())
+        let state = if enabled {
+            components::ControlState::Resting
+        } else {
+            components::ControlState::Disabled
+        };
+        let button = components::compact_button_with_state(label, variant, state, self.metrics())
             .id(id)
             .debug_selector(move || id.to_owned());
         if enabled {
             button.on_click(cx.listener(move |this, _event, _window, cx| click(this, cx)))
         } else {
-            button.opacity(0.5)
+            button
         }
     }
 
@@ -1736,13 +1780,14 @@ impl ShelluneView {
                     "backup.export.confirm",
                     &dialog.confirm,
                 ));
-            if let Some(refusal) = refusal {
-                body =
-                    body.child(self.backup_banner(Tone::Warning, refusal, "backup.export.refusal"));
-            }
-        } else {
+        } else if !dialog.include_vault {
             body =
                 body.child(self.backup_caption(strings.export_no_secrets, "backup.export.plain"));
+        }
+        if (dialog.include_secrets || dialog.include_vault)
+            && let Some(refusal) = refusal
+        {
+            body = body.child(self.backup_banner(Tone::Warning, refusal, "backup.export.refusal"));
         }
         if let Some(failure) = &dialog.failure {
             body = body.child(self.backup_banner(
@@ -1799,11 +1844,12 @@ impl ShelluneView {
         let metrics = self.metrics();
         let path = super::home_relative(&report.path.display().to_string());
         let secrets = match report.secrets {
-            Some(count) => copy::fill(
+            Some(count) => Some(copy::fill(
                 strings.export_done_secrets,
                 &[("count", &count.to_string())],
-            ),
-            None => strings.export_done_no_secrets.to_owned(),
+            )),
+            None if !report.vault => Some(strings.export_done_no_secrets.to_owned()),
+            None => None,
         };
         let mut card = components::banner(Tone::Positive, metrics)
             .debug_selector(|| "backup.export.report".to_owned())
@@ -1832,7 +1878,9 @@ impl ShelluneView {
                         &[("path", &path)],
                     ))),
             )
-            .child(SharedString::from(secrets));
+            .when_some(secrets, |card, secrets| {
+                card.child(SharedString::from(secrets))
+            });
         for (names, intro, selector) in [
             (
                 &report.unreadable,
@@ -2550,6 +2598,13 @@ impl ShelluneView {
             dialog.passphrase.read(cx).text().to_owned(),
             dialog.confirm.read(cx).text().to_owned(),
         ))
+    }
+
+    /// Opens the backup export dialog with `include_vault` already enabled, for tests.
+    #[cfg(test)]
+    pub fn open_backup_export_with_vault_for_test(&mut self, cx: &mut Context<Self>) {
+        self.open_backup_export(cx);
+        self.toggle_backup_vault(cx);
     }
 
     /// Why the export dialog refuses to start, for the tests.
