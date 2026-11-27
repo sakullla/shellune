@@ -26703,11 +26703,144 @@ async fn the_filter_menu_narrows_by_status_and_orders_the_list(cx: &mut TestAppC
         cx.debug_bounds("hosts.filter.sort").is_some(),
         "an order other than the saved one is named above the list"
     );
-    click(cx, "hosts.filter.clear");
+    click(cx, "hosts.filter.sort");
     assert_eq!(
         cx.update(|_window, app| view.read(app).hosts_state().sort()),
         crate::app::hosts::HostSort::Saved
     );
+}
+
+#[gpui::test]
+async fn workspace_ux_host_filters_keep_group_sort_and_visible_keyboard_target(
+    cx: &mut TestAppContext,
+) {
+    use crate::app::hosts::{HostProtocolFilter, HostSort, HostStatusFilter};
+
+    let dir = TempDir::new("host-filter-recovery");
+    let alpha = stored_host("alpha", "192.0.2.10", 22, "ops", Some("Ops"));
+    let alpha_id = alpha.id();
+    let group = HomeSection::Group(GroupPath::parse("Ops").unwrap());
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("zulu", "192.0.2.11", 22, "ops", Some("Ops")),
+            stored_host("aardvark", "192.0.2.12", 22, "ops", Some("Lab")),
+            alpha,
+        ],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.update(|window, app| {
+        app.bind_keys(key_bindings(Platform::current()));
+        view.update(app, |v, cx| {
+            v.show_home_section(group.clone(), cx);
+            window.focus(&v.hosts_search_focus_for_test(cx));
+        })
+    });
+    cx.simulate_keystrokes("tab tab enter tab tab right enter tab");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("hosts.filter.sort").is_some());
+    assert!(
+        cx.debug_bounds("hosts.filter.clear").is_none(),
+        "sorting alone cannot hide records"
+    );
+    cx.simulate_keystrokes("tab tab enter right tab left enter tab");
+    cx.run_until_parked();
+    let state = |cx: &mut VisualTestContext| {
+        cx.update(|_, app| {
+            let hosts = view.read(app).hosts_state();
+            (
+                hosts.section(),
+                hosts.sort(),
+                hosts.filter().protocol(),
+                hosts.filter().status(),
+                hosts.search().to_owned(),
+            )
+        })
+    };
+    let selected = (
+        group.clone(),
+        HostSort::Name,
+        HostProtocolFilter::Ssh,
+        HostStatusFilter::NeverConnected,
+        String::new(),
+    );
+    assert_eq!(state(cx), selected);
+    type_into(cx, "hosts.search", "missing!");
+    assert!(cx.debug_bounds("hosts.nomatch").is_some());
+    cx.simulate_keystrokes("escape");
+    assert_eq!(state(cx), selected);
+
+    // Each chip removes exactly one condition. Narrow to zero again using text,
+    // then use the empty state's clear action to restore the current group.
+    click(cx, "hosts.filter.protocol");
+    assert_eq!(state(cx).2, HostProtocolFilter::All);
+    assert_eq!(state(cx).3, HostStatusFilter::NeverConnected);
+    type_into(cx, "hosts.search", "missing!");
+    click(cx, "hosts.nomatch.clear");
+    let restored = (
+        group.clone(),
+        HostSort::Name,
+        HostProtocolFilter::All,
+        HostStatusFilter::Any,
+        String::new(),
+    );
+    assert_eq!(state(cx), restored);
+    assert!(cx.update(|w, app| {
+        view.read(app)
+            .hosts_search_focus_for_test(app)
+            .is_focused(w)
+    }));
+
+    // From the list go back to the funnel and clear an active protocol by keyboard.
+    cx.simulate_keystrokes("tab tab enter right shift-tab enter");
+    cx.run_until_parked();
+    assert_eq!(state(cx), restored);
+    assert!(cx.update(|w, app| {
+        view.read(app)
+            .hosts_search_focus_for_test(app)
+            .is_focused(w)
+    }));
+
+    // The summary's action drops the live search as well as a status condition.
+    type_into(cx, "hosts.search", "alpha");
+    click(cx, "hosts.filter");
+    click(cx, "hosts.status.never");
+    click(cx, "hosts.filter");
+    click(cx, "hosts.filter.clear");
+    assert_eq!(state(cx), restored);
+    cx.simulate_keystrokes("down enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, app| view
+            .read(app)
+            .remote_state()
+            .map(|remote| remote.host().id())),
+        Some(alpha_id)
+    );
+}
+
+#[gpui::test]
+async fn workspace_ux_empty_group_stays_in_place_after_clear(cx: &mut TestAppContext) {
+    let dir = TempDir::new("empty-group-filters");
+    let empty = GroupPath::parse("Empty").unwrap();
+    let mut groups = GroupBook::new();
+    groups.insert(&empty).unwrap();
+    shellune_storage::GroupStore::at(dir.path())
+        .save(&groups)
+        .unwrap();
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.update(|_, app| {
+        view.update(app, |v, cx| {
+            v.show_home_section(HomeSection::Group(empty.clone()), cx)
+        })
+    });
+    type_into(cx, "hosts.search", "missing!");
+    click(cx, "hosts.nomatch.clear");
+    assert_eq!(
+        cx.update(|_, app| view.read(app).hosts_state().section()),
+        HomeSection::Group(empty)
+    );
+    assert!(cx.debug_bounds("hosts.group.new_host").is_some());
 }
 
 #[gpui::test]

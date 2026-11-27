@@ -59,7 +59,7 @@ use crate::app::files::{
 use crate::app::forwarding::{ForwardCenter, ForwardConfirm};
 use crate::app::hosts::{
     ConnectionChoice, ConnectionDraft, ConnectionField, ConnectionFormField, GroupAction,
-    HostDraft, HostField, HostProtocolFilter, HostSort, HostStatusFilter, HostsPanel, ImportPanel,
+    HostDraft, HostField, HostProtocolFilter, HostStatusFilter, HostsPanel, ImportPanel,
     ProtocolDraft, group_path_from_text, import_message, unimported_hosts,
 };
 use crate::app::icons::{self, Icon};
@@ -626,6 +626,8 @@ pub struct ShelluneView {
     shell_menu_home: bool,
     /// Where the home page's "Local terminal" entry was last drawn.
     home_local_anchor: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
+    home_filter_focus: FocusHandle,
+    home_filter_row: home::FilterRow,
     /// Where the home toolbar's filter button was last drawn, for its menu.
     home_filter_anchor: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
     /// Where the home toolbar's "⋯" button was last drawn, for its menu.
@@ -3081,6 +3083,8 @@ impl ShelluneView {
             shell_menu_anchor: std::rc::Rc::default(),
             shell_menu_home: false,
             home_local_anchor: std::rc::Rc::default(),
+            home_filter_focus: cx.focus_handle(),
+            home_filter_row: home::FilterRow::Protocol,
             home_filter_anchor: std::rc::Rc::default(),
             home_more_anchor: std::rc::Rc::default(),
             home_menu: None,
@@ -3995,20 +3999,16 @@ impl ShelluneView {
         cx.notify();
     }
 
-    /// Drops the phrase and every filter that could empty the list (R3).
-    ///
-    /// It changes nothing about the records themselves: the search field is emptied,
-    /// which the panel mirrors as it does for typing, and the group and status filters
-    /// go back to their defaults. The list is restored; nothing is deleted.
-    pub(super) fn clear_host_narrowing(&mut self, cx: &mut Context<Self>) {
+    /// Restores all records in the current view, keeping its order.
+    pub(super) fn clear_host_narrowing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.hosts_search
-            .update(cx, |field, cx| field.set_text(String::new(), cx));
-        self.hosts.set_search(String::new());
+            .update(cx, |field, cx| field.set_text("", cx));
+        self.hosts.set_search("");
         self.hosts.set_status_filter(HostStatusFilter::Any);
         self.hosts.set_protocol_filter(HostProtocolFilter::All);
-        self.hosts.set_sort(HostSort::Saved);
         self.hosts_cursor = None;
-        cx.notify();
+        self.close_home_menu(cx);
+        self.focus_hosts_search(window, cx);
     }
 
     /// Every connectable record currently visible in the host list, paired with its
@@ -4165,6 +4165,15 @@ impl ShelluneView {
         }
         if event.keystroke.key == "tab" && modifiers.number_of_modifiers() == 0 && search_focused {
             return self.focus_hosts_list_from_search(window, cx);
+        }
+        if event.keystroke.key == "tab"
+            && modifiers.number_of_modifiers() == 0
+            && page_focused
+            && self.hosts.section() != crate::app::hosts::HomeSection::Vault
+        {
+            window.focus(&self.home_filter_focus);
+            cx.notify();
+            return true;
         }
         if modifiers.number_of_modifiers() != 0 && !secondary && !alt_only && !shift_only {
             return false;

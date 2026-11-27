@@ -155,6 +155,23 @@ pub(crate) enum HomeMenu {
     Group(GroupPath, Point<Pixels>),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FilterRow {
+    Protocol,
+    Status,
+    Sort,
+    Clear,
+}
+
+fn adjacent_choice<T: Copy + PartialEq>(choices: &[T], current: T, backward: bool) -> T {
+    let index = choices
+        .iter()
+        .position(|choice| *choice == current)
+        .unwrap_or(0);
+    let step = if backward { choices.len() - 1 } else { 1 };
+    choices[(index + step) % choices.len()]
+}
+
 /// One row of the list, as the window draws it.
 enum SnapshotRow {
     /// The unsaved `user@host[:port]` the search reads as an address.
@@ -447,6 +464,104 @@ impl ShelluneView {
         self.host_menu = None;
         self.home_menu = if same { None } else { Some(menu) };
         cx.notify();
+    }
+
+    #[cfg(feature = "ui-capture")]
+    pub(crate) fn capture_narrowed_host_group(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let group = GroupPath::parse("Prod").map_err(|err| format!("{err:?}"))?;
+        self.show_home_section(HomeSection::Group(group), cx);
+        self.hosts.set_sort(HostSort::Name);
+        self.hosts.set_protocol_filter(HostProtocolFilter::Ssh);
+        self.hosts.set_status_filter(HostStatusFilter::Recent);
+        self.search_hosts("no-such-host", cx);
+        Ok(())
+    }
+
+    fn host_filters_active(&self) -> bool {
+        !self.hosts.search().trim().is_empty()
+            || self.hosts.filter().protocol() != HostProtocolFilter::All
+            || self.hosts.filter().status() != HostStatusFilter::Any
+    }
+
+    /// The funnel keeps the keyboard while its menu is open. Tab moves between
+    /// questions, and the arrows change the focused segmented control.
+    fn home_filter_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let stroke = &event.keystroke;
+        let key = stroke.key.as_str();
+        let mods = stroke.modifiers;
+        if mods.control || mods.platform || mods.alt || (mods.shift && key != "tab") {
+            return;
+        }
+        if event.is_held && matches!(key, "enter" | "space") {
+            cx.stop_propagation();
+            return;
+        }
+        if self.home_menu != Some(HomeMenu::Filter) {
+            match key {
+                "enter" | "space" | "down" => {
+                    self.home_filter_row = FilterRow::Protocol;
+                    self.toggle_home_menu(HomeMenu::Filter, cx);
+                }
+                "tab" if mods.shift => {
+                    self.focus_hosts_list_from_search(window, cx);
+                }
+                "tab" | "escape" => self.focus_hosts_search(window, cx),
+                _ => return,
+            }
+        } else {
+            match key {
+                "tab" | "up" | "down" => {
+                    let mut rows = vec![FilterRow::Protocol, FilterRow::Status];
+                    if self.hosts.section() != HomeSection::Recent {
+                        rows.push(FilterRow::Sort);
+                    }
+                    if self.host_filters_active() {
+                        rows.push(FilterRow::Clear);
+                    }
+                    self.home_filter_row =
+                        adjacent_choice(&rows, self.home_filter_row, mods.shift || key == "up");
+                }
+                "left" | "right" => {
+                    let back = key == "left";
+                    match self.home_filter_row {
+                        FilterRow::Protocol => self.hosts.set_protocol_filter(adjacent_choice(
+                            &HostProtocolFilter::ALL,
+                            self.hosts.filter().protocol(),
+                            back,
+                        )),
+                        FilterRow::Status => self.hosts.set_status_filter(adjacent_choice(
+                            &HostStatusFilter::ALL,
+                            self.hosts.filter().status(),
+                            back,
+                        )),
+                        FilterRow::Sort => self.hosts.set_sort(adjacent_choice(
+                            &HostSort::ALL,
+                            self.hosts.sort(),
+                            back,
+                        )),
+                        FilterRow::Clear => return,
+                    }
+                    self.hosts_cursor = None;
+                }
+                "space" | "enter" if self.home_filter_row == FilterRow::Clear => {
+                    self.clear_host_narrowing(window, cx)
+                }
+                "space" | "enter" | "escape" => {
+                    self.close_home_menu(cx);
+                }
+                _ => return,
+            }
+        }
+        cx.notify();
+        cx.stop_propagation();
     }
 
     /// Closes the connection form a test opened from the list, as its own close does.
@@ -1488,6 +1603,7 @@ impl ShelluneView {
         let sort_applies = self.hosts.section() != HomeSection::Recent;
         let sort = self.hosts.sort();
         let sort_active = sort_applies && sort != HostSort::Saved;
+        let filtered = self.host_filters_active();
         if status != HostStatusFilter::Any || protocol != HostProtocolFilter::All || sort_active {
             let mut chips = div()
                 .flex()
@@ -1502,11 +1618,11 @@ impl ShelluneView {
                         .id("hosts.filter.protocol")
                         .debug_selector(|| "hosts.filter.protocol".to_owned())
                         .cursor_pointer()
-                        .tooltip(components::tooltip(ux.hosts_filter_clear))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
+                        .tooltip(components::tooltip(HostProtocolFilter::All.label(ux)))
+                        .on_click(cx.listener(|this, _event, window, cx| {
                             this.hosts.set_protocol_filter(HostProtocolFilter::All);
                             this.hosts_cursor = None;
-                            cx.notify();
+                            this.focus_hosts_search(window, cx);
                         })),
                 );
             }
@@ -1516,11 +1632,11 @@ impl ShelluneView {
                         .id("hosts.filter.status")
                         .debug_selector(|| "hosts.filter.status".to_owned())
                         .cursor_pointer()
-                        .tooltip(components::tooltip(ux.hosts_filter_clear))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
+                        .tooltip(components::tooltip(HostStatusFilter::Any.label(ux)))
+                        .on_click(cx.listener(|this, _event, window, cx| {
                             this.hosts.set_status_filter(HostStatusFilter::Any);
                             this.hosts_cursor = None;
-                            cx.notify();
+                            this.focus_hosts_search(window, cx);
                         })),
                 );
             }
@@ -1534,27 +1650,24 @@ impl ShelluneView {
                     .id("hosts.filter.sort")
                     .debug_selector(|| "hosts.filter.sort".to_owned())
                     .cursor_pointer()
-                    .tooltip(components::tooltip(ux.hosts_filter_clear))
-                    .on_click(cx.listener(|this, _event, _window, cx| {
+                    .tooltip(components::tooltip(HostSort::Saved.label(ux)))
+                    .on_click(cx.listener(|this, _event, window, cx| {
                         this.hosts.set_sort(HostSort::Saved);
-                        cx.notify();
+                        this.focus_hosts_search(window, cx);
                     })),
                 );
             }
-            body = body.child(
-                chips.child(
-                    components::compact_button(ux.hosts_filter_clear, Variant::Ghost, metrics)
-                        .id("hosts.filter.clear")
-                        .debug_selector(|| "hosts.filter.clear".to_owned())
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.hosts.set_status_filter(HostStatusFilter::Any);
-                            this.hosts.set_protocol_filter(HostProtocolFilter::All);
-                            this.hosts.set_sort(HostSort::Saved);
-                            this.hosts_cursor = None;
-                            cx.notify();
-                        })),
-                ),
-            );
+            body =
+                body.child(chips.when(filtered, |chips| {
+                    chips.child(
+                        components::compact_button(ux.hosts_filter_clear, Variant::Ghost, metrics)
+                            .id("hosts.filter.clear")
+                            .debug_selector(|| "hosts.filter.clear".to_owned())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.clear_host_narrowing(window, cx)
+                            })),
+                    )
+                }));
         }
         if !self.hosts.selected().is_empty() {
             body = body.child(self.hosts_selection_strip(list, cx));
@@ -1614,7 +1727,8 @@ impl ShelluneView {
     fn home_welcome_shown(&self) -> bool {
         self.book.hosts().is_empty()
             && self.book.connections().is_empty()
-            && self.hosts.search().trim().is_empty()
+            && self.hosts.section() == HomeSection::All
+            && !self.host_filters_active()
     }
 
     fn home_heading(&self, list: &HostList) -> Div {
@@ -1716,11 +1830,20 @@ impl ShelluneView {
             .child(
                 components::toggle_icon_button(Icon::Filter, narrowing || filter_open, metrics)
                     .id("hosts.filter")
+                    .track_focus(&self.home_filter_focus)
+                    .focus(|style| {
+                        style
+                            .border_1()
+                            .border_color(theme::swatch(palette::FOCUS_RING))
+                    })
+                    .on_key_down(cx.listener(Self::home_filter_key))
                     .debug_selector(|| "hosts.filter".to_owned())
                     .when(!filter_open, |button| {
                         button.tooltip(components::tooltip(ux.home_filter))
                     })
-                    .on_click(cx.listener(|this, _event, _window, cx| {
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.home_filter_row = FilterRow::Protocol;
+                        window.focus(&this.home_filter_focus);
                         this.toggle_home_menu(HomeMenu::Filter, cx);
                     })),
             )
@@ -1813,6 +1936,8 @@ impl ShelluneView {
                 // the panel is four lines high instead of a column of thirteen that
                 // covered the list, and it stays open while the answers are combined -
                 // the list behind it narrows with every press.
+                let ringed =
+                    |row| self.home_filter_focus.is_focused(window) && self.home_filter_row == row;
                 let row = |label: &'static str, control: Div| {
                     div()
                         .flex()
@@ -1833,8 +1958,13 @@ impl ShelluneView {
                     protocols = protocols.child(
                         components::segment(protocol.label(ux), chosen, metrics)
                             .id(protocol.debug_selector())
+                            .when(chosen && ringed(FilterRow::Protocol), |button| {
+                                button.border_color(theme::swatch(palette::FOCUS_RING))
+                            })
                             .debug_selector(move || protocol.debug_selector().to_owned())
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                            .on_click(cx.listener(move |this, _event, window, cx| {
+                                this.home_filter_row = FilterRow::Protocol;
+                                window.focus(&this.home_filter_focus);
                                 this.hosts.set_protocol_filter(protocol);
                                 this.hosts_cursor = None;
                                 cx.notify();
@@ -1847,8 +1977,13 @@ impl ShelluneView {
                     statuses = statuses.child(
                         components::segment(status.label(ux), chosen, metrics)
                             .id(status.debug_selector())
+                            .when(chosen && ringed(FilterRow::Status), |button| {
+                                button.border_color(theme::swatch(palette::FOCUS_RING))
+                            })
                             .debug_selector(move || status.debug_selector().to_owned())
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                            .on_click(cx.listener(move |this, _event, window, cx| {
+                                this.home_filter_row = FilterRow::Status;
+                                window.focus(&this.home_filter_focus);
                                 this.hosts.set_status_filter(status);
                                 this.hosts_cursor = None;
                                 cx.notify();
@@ -1870,14 +2005,34 @@ impl ShelluneView {
                         sorts = sorts.child(
                             components::segment(sort.label(ux), chosen, metrics)
                                 .id(sort.debug_selector())
+                                .when(chosen && ringed(FilterRow::Sort), |button| {
+                                    button.border_color(theme::swatch(palette::FOCUS_RING))
+                                })
                                 .debug_selector(move || sort.debug_selector().to_owned())
-                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                .on_click(cx.listener(move |this, _event, window, cx| {
+                                    this.home_filter_row = FilterRow::Sort;
+                                    window.focus(&this.home_filter_focus);
                                     this.hosts.set_sort(sort);
                                     cx.notify();
                                 })),
                         );
                     }
                     card = card.child(row(ux.home_sort_label, sorts));
+                }
+                if self.host_filters_active() {
+                    card = card.child(
+                        components::compact_button(ux.hosts_filter_clear, Variant::Ghost, metrics)
+                            .id("hosts.filter.menu.clear")
+                            .debug_selector(|| "hosts.filter.menu.clear".to_owned())
+                            .when(ringed(FilterRow::Clear), |button| {
+                                button
+                                    .border_1()
+                                    .border_color(theme::swatch(palette::FOCUS_RING))
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.clear_host_narrowing(window, cx)
+                            })),
+                    );
                 }
                 // Hung from the button's right edge, so a toolbar on the window's right
                 // keeps the panel inside the window.
@@ -2628,15 +2783,10 @@ impl ShelluneView {
                 ))
                 .into_any_element()
         };
-        let searching = !self.hosts.search().trim().is_empty();
-        let book_empty = self.book.hosts().is_empty() && self.book.connections().is_empty();
-        if book_empty && !searching {
+        if self.home_welcome_shown() {
             return self.home_welcome(cx);
         }
-        if searching
-            || self.hosts.filter().status() != HostStatusFilter::Any
-            || self.hosts.filter().protocol() != HostProtocolFilter::All
-        {
+        if self.host_filters_active() {
             let clear = components::button_sized(
                 ux.hosts_filter_clear,
                 Variant::Secondary,
@@ -2645,8 +2795,8 @@ impl ShelluneView {
             )
             .id("hosts.nomatch.clear")
             .debug_selector(|| "hosts.nomatch.clear".to_owned())
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.clear_host_narrowing(cx);
+            .on_click(cx.listener(|this, _event, window, cx| {
+                this.clear_host_narrowing(window, cx);
             }));
             let action = match self.home_direct_target() {
                 Some(target) => div()
