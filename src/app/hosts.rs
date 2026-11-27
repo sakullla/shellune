@@ -3060,7 +3060,10 @@ pub fn parse_quick_target(text: &str) -> Option<QuickTarget> {
     if text.is_empty() || text.chars().any(char::is_whitespace) {
         return None;
     }
-    let text = if text.len() >= 6 && text[..6].eq_ignore_ascii_case("ssh://") {
+    let text = if text
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ssh://"))
+    {
         &text[6..]
     } else {
         text
@@ -6120,6 +6123,10 @@ mod tests {
             "user@[::1]extra",
             "user@[not-ipv6]:22",
             "user@[::1",
+            "a中文",
+            "1本地终端",
+            "ssh测试",
+            "新建本地终端",
         ] {
             assert_eq!(parse_quick_target(text), None, "{text:?} is not an address");
         }

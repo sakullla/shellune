@@ -2821,10 +2821,10 @@ impl ShelluneView {
                 let pos = self.tab_list_selected.min(count - 1);
                 let (index, _, session) = filtered[pos];
                 if let Some(id) = session {
-                    if self.close_needs_confirmation(id) {
+                    self.request_close_tab_anchor(id, cx);
+                    if self.closing.is_some() {
                         self.close_tab_list(window, cx);
                     }
-                    self.request_close_tab_anchor(id, cx);
                 } else {
                     self.close_pending_tab(index, cx);
                 }
