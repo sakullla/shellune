@@ -854,77 +854,95 @@ impl ShelluneView {
         column
     }
 
-    /// Low-interference top-center hover zone to exit focus mode on every platform and
+    /// Low-interference top-edge hover zone to exit focus mode on every platform and
     /// session kind, including live RDP/VNC surfaces where the bottom-right pill is
     /// omitted to avoid covering remote window chrome.
+    ///
+    /// On active desktop sessions the zone anchors to the top-right (never spanning
+    /// `left_0..right_0`) so the top-center remains unobstructed for `desktop.controls`
+    /// and `desktop.controls.handle`.
     fn focus_mode_top_exit(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         if !self.focus_mode || self.desktop_fullscreen.is_some() {
             return None;
         }
+        let session_id = if self.workspace.layout().active_tab().is_some() {
+            self.workspace.layout().active_session()
+        } else {
+            self.active
+        };
+        let is_desktop = session_id.and_then(|id| self.desktop_for(id)).is_some();
         let metrics = self.metrics();
         let ux = crate::app::copy::ux();
         let tooltip = match self.keymap.label("view.focus") {
             Some(shortcut) => format!("{} ({shortcut})", ux.focus_mode_exit),
             None => ux.focus_mode_exit.to_owned(),
         };
-        Some(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .flex()
-                .justify_center()
-                .child(
-                    div()
-                        .id("focus.mode.top.zone")
-                        .debug_selector(|| "focus.mode.top.zone".to_owned())
-                        .group("focus-top-exit")
-                        .flex()
-                        .items_start()
-                        .justify_center()
-                        .pt(metrics.scale(spacing::HAIRLINE))
-                        .px(metrics.scale(spacing::BASE))
-                        .h(metrics.scale(FOCUS_EXIT_BAR_HEIGHT))
-                        .child(
-                            div()
-                                .occlude()
-                                .opacity(0.0)
-                                .group_hover("focus-top-exit", |style| style.opacity(1.0))
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                                .on_mouse_down(MouseButton::Middle, |_, _, cx| {
-                                    cx.stop_propagation()
-                                })
-                                .flex()
-                                .items_center()
-                                .rounded(px(radius::MEDIUM))
-                                .bg(theme::faded(theme::swatch(palette::CHROME), 0.92))
-                                .border_1()
-                                .border_color(theme::swatch(palette::BORDER_STRONG))
-                                .child(
-                                    crate::app::components::icon_label_button(
-                                        Icon::Restore,
-                                        ux.focus_mode_exit,
-                                        Variant::Ghost,
-                                        metrics,
-                                    )
-                                    .h(metrics.compact_control_height())
-                                    .id("focus.mode.top.exit")
-                                    .debug_selector(|| "focus.mode.top.exit".to_owned())
-                                    .tooltip(crate::app::components::tooltip(SharedString::from(
-                                        tooltip,
-                                    )))
-                                    .on_click(cx.listener(
-                                        |this, _event, window, cx| {
-                                            cx.stop_propagation();
-                                            this.toggle_focus_mode(window, cx);
-                                        },
-                                    )),
-                                ),
-                        ),
-                ),
-        )
+        let zone = div()
+            .id("focus.mode.top.zone")
+            .debug_selector(|| "focus.mode.top.zone".to_owned())
+            .group("focus-top-exit")
+            .flex()
+            .items_start()
+            .justify_center()
+            .pt(metrics.scale(spacing::HAIRLINE))
+            .px(metrics.scale(spacing::BASE))
+            .h(metrics.scale(FOCUS_EXIT_BAR_HEIGHT))
+            .child(
+                div()
+                    .occlude()
+                    .opacity(0.0)
+                    .group_hover("focus-top-exit", |style| style.opacity(1.0))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+                    .flex()
+                    .items_center()
+                    .rounded(px(radius::MEDIUM))
+                    .bg(theme::faded(theme::swatch(palette::CHROME), 0.92))
+                    .border_1()
+                    .border_color(theme::swatch(palette::BORDER_STRONG))
+                    .child(
+                        crate::app::components::icon_label_button(
+                            Icon::Restore,
+                            ux.focus_mode_exit,
+                            Variant::Ghost,
+                            metrics,
+                        )
+                        .h(metrics.compact_control_height())
+                        .id("focus.mode.top.exit")
+                        .debug_selector(|| "focus.mode.top.exit".to_owned())
+                        .tooltip(crate::app::components::tooltip(SharedString::from(tooltip)))
+                        .on_click(cx.listener(
+                            |this, _event, window, cx| {
+                                cx.stop_propagation();
+                                this.toggle_focus_mode(window, cx);
+                            },
+                        )),
+                    ),
+            );
+        if is_desktop {
+            Some(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .pr(metrics.scale(spacing::TIGHT))
+                    .flex()
+                    .justify_end()
+                    .child(zone),
+            )
+        } else {
+            Some(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .child(zone),
+            )
+        }
     }
 
     /// Lightweight, discoverable corner affordance to leave focus mode without blocking

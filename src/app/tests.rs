@@ -54199,3 +54199,75 @@ async fn t6_serial_disconnect_reconnect_send_break_and_newline_persistence(
         "clicking serial.reconnect reopens the serial port in-place"
     );
 }
+
+#[gpui::test]
+async fn t2_focus_mode_desktop_top_exit_does_not_overlap_desktop_controls(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let (link, _log) = ScriptedLink::new(live_desktop_events());
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("t2-focus-desk"), link);
+
+    // Collapse the desktop toolbar so its top-center restore handle is drawn.
+    hover(cx, "desktop.body");
+    cx.run_until_parked();
+    click(cx, "desktop.controls.collapse");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .desktop_of(id)
+                .expect("desktop mounted")
+                .read(app)
+                .controls_collapsed_for_test()
+        }),
+        "desktop toolbar is collapsed before entering focus mode"
+    );
+
+    // Enter focus mode on the live desktop session.
+    cx.dispatch_action(crate::app::keymap::ToggleFocusMode);
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).focus_mode()));
+
+    let handle = bounds_of(cx, "desktop.controls.handle");
+    let top_zone = bounds_of(cx, "focus.mode.top.zone");
+    let top_exit = bounds_of(cx, "focus.mode.top.exit");
+    assert!(
+        !handle.intersects(&top_zone) && !handle.intersects(&top_exit),
+        "focus mode top-right exit zone must not overlap desktop.controls.handle: handle={handle:?} zone={top_zone:?} exit={top_exit:?}"
+    );
+
+    // Clicking desktop.controls.handle expands the toolbar without leaving focus mode.
+    click(cx, "desktop.controls.handle");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| {
+            view.read(app)
+                .desktop_of(id)
+                .expect("desktop mounted")
+                .read(app)
+                .controls_collapsed_for_test()
+        }),
+        "clicking desktop.controls.handle expands desktop.controls in focus mode"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).focus_mode()),
+        "expanding desktop.controls must not exit focus mode"
+    );
+
+    let controls = bounds_of(cx, "desktop.controls");
+    let top_zone = bounds_of(cx, "focus.mode.top.zone");
+    let top_exit = bounds_of(cx, "focus.mode.top.exit");
+    assert!(
+        !controls.intersects(&top_zone) && !controls.intersects(&top_exit),
+        "focus mode top-right exit zone must not overlap expanded desktop.controls: controls={controls:?} zone={top_zone:?} exit={top_exit:?}"
+    );
+
+    // Clicking focus.mode.top.exit exits focus mode.
+    click(cx, "focus.mode.top.exit");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).focus_mode()),
+        "clicking focus.mode.top.exit leaves focus mode on a live desktop session"
+    );
+}
