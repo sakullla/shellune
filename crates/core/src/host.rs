@@ -1036,6 +1036,39 @@ impl SerialFlow {
     }
 }
 
+/// How line breaks typed or pasted by the user are sent to a serial device.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SerialNewline {
+    /// Send exactly what was typed without rewriting line breaks.
+    #[default]
+    AsTyped,
+    /// Rewrite every line break to CR (`\r`).
+    Cr,
+    /// Rewrite every line break to LF (`\n`).
+    Lf,
+    /// Rewrite every line break to CRLF (`\r\n`).
+    Crlf,
+}
+
+impl SerialNewline {
+    /// Every choice, in the order a chooser shows them.
+    pub const ALL: [Self; 4] = [Self::AsTyped, Self::Cr, Self::Lf, Self::Crlf];
+
+    /// Short label used in the form and status bar.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AsTyped => "as typed",
+            Self::Cr => "CR",
+            Self::Lf => "LF",
+            Self::Crlf => "CRLF",
+        }
+    }
+}
+
 /// Why a non-SSH connection configuration was rejected.
 ///
 /// Kept apart from `HostValidationError` so that the SSH rules a caller already
@@ -1823,6 +1856,12 @@ pub struct SerialConfig {
     /// per-connection decision and not a global one.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     local_echo: bool,
+    /// Preferred line-ending rewrite for bytes sent to the serial device.
+    ///
+    /// Absent means [`SerialNewline::AsTyped`], keeping records written by earlier
+    /// builds byte-identical on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    newline: Option<SerialNewline>,
 }
 
 /// The stored shape of a serial connection.
@@ -1852,6 +1891,8 @@ struct SerialConfigWire {
     flow: SerialFlow,
     #[serde(default)]
     local_echo: bool,
+    #[serde(default)]
+    newline: Option<SerialNewline>,
 }
 
 fn default_baud() -> u32 {
@@ -1879,6 +1920,7 @@ impl TryFrom<SerialConfigWire> for SerialConfig {
             stop_bits: wire.stop_bits,
             flow: wire.flow,
             local_echo: wire.local_echo,
+            newline: wire.newline.filter(|mode| *mode != SerialNewline::AsTyped),
         })
     }
 }
@@ -1906,6 +1948,7 @@ impl SerialConfig {
             stop_bits: SerialStopBits::One,
             flow: SerialFlow::None,
             local_echo: false,
+            newline: None,
         })
     }
 
@@ -1961,6 +2004,12 @@ impl SerialConfig {
     #[must_use]
     pub fn local_echo(&self) -> bool {
         self.local_echo
+    }
+
+    /// How line breaks typed by the user are sent to the device.
+    #[must_use]
+    pub fn newline(&self) -> SerialNewline {
+        self.newline.unwrap_or_default()
     }
 
     /// The single grouping label an earlier build would have written.
@@ -2063,6 +2112,14 @@ impl SerialConfig {
     /// Chooses whether typed characters are echoed locally.
     pub fn set_local_echo(&mut self, echo: bool) {
         self.local_echo = echo;
+    }
+
+    /// Chooses how line breaks typed by the user are rewritten on send.
+    ///
+    /// The default (`AsTyped`) is stored as `None` so untouched records stay
+    /// byte-identical to files written by earlier builds.
+    pub fn set_newline(&mut self, newline: SerialNewline) {
+        self.newline = (newline != SerialNewline::AsTyped).then_some(newline);
     }
 
     /// Sets or clears the grouping label.
@@ -3698,6 +3755,32 @@ mod connection_tests {
             Err(ConnectionValidationError::DataBitsOutOfRange { value: 9 })
         );
         assert!(!ConnectionRecord::Serial(config).remembers_secret());
+    }
+
+    #[test]
+    fn serial_newline_round_trips_and_defaults_for_legacy_records() {
+        let id = HostId::new();
+        let legacy_json = format!(r#"{{"id":"{id}","name":"console","device":"COM3"}}"#);
+        let legacy: SerialConfig = serde_json::from_str(&legacy_json).expect("reads legacy serial");
+        assert_eq!(legacy.newline(), SerialNewline::AsTyped);
+        let legacy_out = serde_json::to_string(&legacy).expect("serializes legacy serial");
+        assert!(
+            !legacy_out.contains("newline"),
+            "default newline must be omitted: {legacy_out}"
+        );
+
+        let mut config = SerialConfig::new("console", "COM3").expect("valid serial");
+        assert_eq!(config.newline(), SerialNewline::AsTyped);
+        config.set_newline(SerialNewline::Crlf);
+        let json = serde_json::to_string(&config).expect("serializes crlf");
+        assert!(json.contains(r#""newline":"crlf""#), "{json}");
+        let back: SerialConfig = serde_json::from_str(&json).expect("reads crlf");
+        assert_eq!(back, config);
+        assert_eq!(back.newline(), SerialNewline::Crlf);
+
+        config.set_newline(SerialNewline::AsTyped);
+        let reset_json = serde_json::to_string(&config).expect("serializes reset");
+        assert!(!reset_json.contains("newline"), "{reset_json}");
     }
 
     #[test]

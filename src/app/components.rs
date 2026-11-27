@@ -2418,6 +2418,39 @@ pub fn empty_state(
         }))
 }
 
+/// An [`empty_state`] with a standard clickable CTA button (for example, "Clear filter"
+/// on an empty search result or a primary creation action on an empty list).
+#[allow(clippy::too_many_arguments, dead_code)]
+pub fn empty_state_with_cta(
+    icon: Icon,
+    title: impl Into<SharedString>,
+    body: Option<SharedString>,
+    cta_id: &'static str,
+    cta_label: impl Into<SharedString>,
+    cta_variant: Variant,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    metrics: Metrics,
+) -> Div {
+    let cta = button(cta_label, cta_variant, metrics)
+        .id(cta_id)
+        .debug_selector(move || cta_id.to_owned())
+        .on_click(on_click)
+        .into_any_element();
+    empty_state(icon, title, body, Some(cta), metrics)
+}
+
+/// Standard modal width for narrow confirmations and short prompts, in logical pixels.
+#[allow(dead_code)]
+pub const MODAL_WIDTH_SM: f32 = 480.0;
+
+/// Standard modal width for form dialogs (host, security, sync, backup), in logical pixels.
+#[allow(dead_code)]
+pub const MODAL_WIDTH_MD: f32 = 560.0;
+
+/// Standard modal width for wide tool workspaces (batch, forwards, snippets), in logical pixels.
+#[allow(dead_code)]
+pub const MODAL_WIDTH_LG: f32 = 880.0;
+
 /// The pieces of one centred dialog.
 ///
 /// The subtitle is its own piece and is drawn at the top of the scrolling body.
@@ -4525,5 +4558,56 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.debug_bounds("progress.indeterminate").is_some());
         assert!(cx.debug_bounds("progress.still").is_none());
+    }
+
+    #[test]
+    fn modal_width_constants_are_strictly_ordered() {
+        const {
+            assert!(MODAL_WIDTH_SM < MODAL_WIDTH_MD);
+            assert!(MODAL_WIDTH_MD < MODAL_WIDTH_LG);
+        }
+    }
+
+    #[gpui::test]
+    fn empty_state_with_cta_renders_action_button_and_invokes_callback(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct CtaView {
+            clicked: std::rc::Rc<std::cell::Cell<bool>>,
+        }
+        impl gpui::Render for CtaView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let flag = std::rc::Rc::clone(&self.clicked);
+                div().w(px(500.0)).child(empty_state_with_cta(
+                    Icon::Search,
+                    "No matches",
+                    Some(SharedString::from("Try clearing the search filter.")),
+                    "empty.cta.clear",
+                    "Clear filter",
+                    Variant::Secondary,
+                    move |_event, _window, _cx| {
+                        flag.set(true);
+                    },
+                    Metrics::default(),
+                ))
+            }
+        }
+        let clicked = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = std::rc::Rc::clone(&clicked);
+        let (_view, cx) = cx.add_window_view(move |_window, _cx| CtaView { clicked: flag });
+        cx.simulate_resize(gpui::size(px(800.0), px(600.0)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("empty.state").is_some());
+        assert!(cx.debug_bounds("empty.state.action").is_some());
+        let cta = cx
+            .debug_bounds("empty.cta.clear")
+            .expect("CTA button is drawn");
+        cx.simulate_click(cta.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(clicked.get(), "clicking the CTA invokes its callback");
     }
 }

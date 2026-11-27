@@ -448,6 +448,8 @@ pub struct TextField {
     marked: Option<String>,
     placeholder: SharedString,
     focus: FocusHandle,
+    /// Focus handle for the trailing password reveal toggle so Tab can reach it.
+    reveal_focus: FocusHandle,
     submit: Option<SubmitHandler>,
     tab: Option<TabHandler>,
     /// Whether the line is drawn as bullets.
@@ -521,6 +523,7 @@ impl TextField {
             marked: None,
             placeholder: placeholder.into(),
             focus: cx.focus_handle(),
+            reveal_focus: cx.focus_handle().tab_stop(true),
             submit: None,
             tab: None,
             masked: false,
@@ -793,7 +796,7 @@ impl TextField {
 
     /// Copies the selection; a hidden password is never put on the clipboard.
     fn copy(&mut self, cx: &mut Context<Self>) {
-        if self.masked {
+        if self.hidden() {
             return;
         }
         if let Some(text) = self.model.selected_text() {
@@ -802,11 +805,12 @@ impl TextField {
     }
 
     fn cut(&mut self, cx: &mut Context<Self>) {
-        if self.masked {
+        if self.hidden() {
             return;
         }
         if let Some(text) = self.model.take_selection() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.veil_when_empty();
             cx.notify();
         }
     }
@@ -851,12 +855,16 @@ impl TextField {
                 }
             }
             "tab" if !modifiers.control && !modifiers.alt && !modifiers.platform => {
-                let consumed = match &self.tab {
-                    Some(tab) => tab(shift, window, cx),
-                    None => false,
-                };
-                if !consumed {
-                    return;
+                if !shift && self.masked && self.revealable && !self.model.text().is_empty() {
+                    window.focus(&self.reveal_focus);
+                } else {
+                    let consumed = match &self.tab {
+                        Some(tab) => tab(shift, window, cx),
+                        None => false,
+                    };
+                    if !consumed {
+                        return;
+                    }
                 }
             }
             // Escape first drops a selection; in a search/filter box it clears non-empty
@@ -1032,7 +1040,7 @@ impl TextField {
         let strings = Locale::current().strings();
         let viewport = window.viewport_size();
         let has_selection = !self.model.selection().is_empty();
-        let can_copy = has_selection && !self.masked;
+        let can_copy = has_selection && !self.hidden();
         let can_paste = cx
             .read_from_clipboard()
             .and_then(|item| item.text())
@@ -1293,18 +1301,23 @@ impl Render for TextField {
             })
             .when(reveal, |field| {
                 let hover = theme::swatch(palette::SURFACE_HOVER);
+                let hover_text = theme::swatch(palette::TEXT_PRIMARY);
+                let reveal_focused = self.reveal_focus.is_focused(window);
                 field.child(
                     div()
                         .id("field.reveal")
                         .debug_selector(|| "field.reveal".to_owned())
+                        .group("field-reveal")
                         .flex()
                         .flex_none()
                         .items_center()
                         .justify_center()
                         .size(metrics.hit_target())
                         .rounded(px(radius::SMALL))
+                        .when(reveal_focused, |btn| btn.border_1().border_color(accent))
                         .cursor_pointer()
                         .hover(move |style| style.bg(hover))
+                        .track_focus(&self.reveal_focus)
                         .tooltip(crate::app::components::tooltip(if revealed {
                             strings.field_conceal
                         } else {
@@ -1314,20 +1327,50 @@ impl Render for TextField {
                         // synthesized from the release: a press whose release never
                         // reaches the button (a tiny drag, or an ancestor taking it)
                         // still has to show the password. Stopping the press here also
-                        // keeps the field under it from moving its caret.
+                        // keeps the field under it from moving its caret, and restores
+                        // keyboard focus to the field so typing can continue right away.
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
+                            cx.listener(|this, _event: &MouseDownEvent, window, cx| {
                                 cx.stop_propagation();
                                 this.revealed = !this.revealed;
+                                window.focus(&this.focus);
                                 cx.notify();
                             }),
                         )
-                        .child(icons::icon(
-                            if revealed { Icon::EyeOff } else { Icon::Eye },
-                            metrics.small_icon_size(),
-                            theme::swatch(palette::TEXT_MUTED),
-                        )),
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                            let modifiers = &event.keystroke.modifiers;
+                            if modifiers.control || modifiers.alt || modifiers.platform {
+                                return;
+                            }
+                            match event.keystroke.key.as_str() {
+                                "enter" | "space" => {
+                                    this.revealed = !this.revealed;
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                                "tab" if modifiers.shift => {
+                                    window.focus(&this.focus);
+                                    cx.stop_propagation();
+                                }
+                                "tab" => {
+                                    if let Some(tab) = &this.tab
+                                        && tab(false, window, cx)
+                                    {
+                                        cx.stop_propagation();
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }))
+                        .child(
+                            icons::icon(
+                                if revealed { Icon::EyeOff } else { Icon::Eye },
+                                metrics.small_icon_size(),
+                                theme::swatch(palette::TEXT_MUTED),
+                            )
+                            .group_hover("field-reveal", move |style| style.text_color(hover_text)),
+                        ),
                 )
             })
             .when_some(self.browse, |field, kind| {
@@ -1973,5 +2016,115 @@ mod tests {
         assert_eq!(offset_from_utf16("a你b", 2), "a你".len());
         assert_eq!(offset_from_utf16("a😀b", 3), "a😀".len());
         assert_eq!(offset_from_utf16("ab", 9), 2);
+    }
+
+    #[gpui::test]
+    fn masked_field_allows_copy_and_cut_only_when_revealed(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            let field = cx.new(|cx| {
+                let mut f = TextField::with_text("Password", "secret123", cx);
+                f.set_masked(true, cx);
+                f.set_revealable(true, cx);
+                f
+            });
+            Holder {
+                width: 300.0,
+                zoom: theme::Zoom::default(),
+                field,
+            }
+        });
+        cx.run_until_parked();
+
+        // While hidden, copy and cut are refused.
+        cx.update(|_window, app| {
+            let field = view.read(app).field.clone();
+            field.update(app, |f, cx| {
+                f.model.select_all();
+                f.copy(cx);
+                f.cut(cx);
+            });
+            assert_eq!(app.read_from_clipboard(), None);
+            assert_eq!(field.read(app).text(), "secret123");
+        });
+
+        // Click field.reveal to show plaintext; focus returns to the input field.
+        let bounds = cx
+            .debug_bounds("field.reveal")
+            .expect("reveal button is drawn");
+        cx.simulate_mouse_down(bounds.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            let field = view.read(app).field.clone();
+            assert!(field.read(app).is_revealed());
+            assert!(
+                field.read(app).focus_handle().is_focused(window),
+                "clicking field.reveal restores focus to the text field"
+            );
+            field.update(app, |f, cx| {
+                f.model.select_all();
+                f.copy(cx);
+            });
+            assert_eq!(
+                app.read_from_clipboard().and_then(|item| item.text()),
+                Some("secret123".to_owned())
+            );
+            field.update(app, |f, cx| {
+                f.cut(cx);
+            });
+            assert_eq!(field.read(app).text(), "");
+            assert!(
+                !field.read(app).is_revealed(),
+                "empty field re-veils after cut"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn reveal_button_is_reachable_by_tab_and_toggled_by_keyboard(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            let field = cx.new(|cx| {
+                let mut f = TextField::with_text("Password", "pass", cx);
+                f.set_masked(true, cx);
+                f.set_revealable(true, cx);
+                f
+            });
+            Holder {
+                width: 300.0,
+                zoom: theme::Zoom::default(),
+                field,
+            }
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            let focus = view.read(app).field.read(app).focus_handle().clone();
+            window.focus(&focus);
+        });
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            let field = view.read(app).field.read(app);
+            assert!(
+                field.reveal_focus.is_focused(window),
+                "Tab from non-empty revealable field focuses field.reveal"
+            );
+        });
+
+        cx.simulate_keystrokes("space");
+        cx.run_until_parked();
+        cx.update(|_window, app| {
+            assert!(view.read(app).field.read(app).is_revealed());
+        });
+
+        cx.simulate_keystrokes("shift-tab");
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            let field = view.read(app).field.read(app);
+            assert!(
+                field.focus_handle().is_focused(window),
+                "Shift+Tab from field.reveal returns to the input"
+            );
+        });
     }
 }

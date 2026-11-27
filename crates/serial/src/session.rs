@@ -321,6 +321,25 @@ impl SerialSession {
         self.shared.enqueue(bytes, Some(timeout))
     }
 
+    /// Sends an RS-232 break signal on the open serial line.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::SerialCause::Closed`] or [`crate::SerialCause::Disconnected`]
+    /// when the session is no longer open, or the port's own failure if the driver
+    /// rejected the break.
+    pub fn send_break(&self) -> Result<(), SerialError> {
+        self.check_open()?;
+        let Some(port) = &self.port else {
+            return Err(SerialError::closed().at(self.name.clone()));
+        };
+        match port.send_break() {
+            Ok(()) => Ok(()),
+            Err(PortFault::Interrupted) => Err(SerialError::closed().at(self.name.clone())),
+            Err(PortFault::Failed(error)) => Err(error),
+        }
+    }
+
     /// Returns everything that happened since the last poll, in order.
     ///
     /// Polling also lets the reader continue when its received bytes were waiting for
@@ -931,5 +950,34 @@ mod tests {
             "a notice is reported once, not on every poll"
         );
         let _ = session.close();
+    }
+
+    #[test]
+    fn send_break_forwards_to_port_and_refuses_closed_or_failing_port() {
+        use crate::{SerialCause, SerialError};
+        use std::sync::Arc;
+
+        let port = fake("COM9", FakeSpec::new());
+        let mut session = session_over(Arc::clone(&port), config());
+        assert_eq!(port.breaks(), 0);
+        session.send_break().expect("open session sends break");
+        assert_eq!(port.breaks(), 1);
+        let _ = session.close();
+        let closed = session
+            .send_break()
+            .expect_err("closed session refuses break");
+        assert_eq!(closed.cause(), SerialCause::Closed);
+
+        let failing_port = fake(
+            "COM10",
+            FakeSpec::new()
+                .failing_breaks(SerialError::new(SerialCause::Io).with_detail("break failed")),
+        );
+        let mut failing_session = session_over(failing_port, config());
+        let error = failing_session
+            .send_break()
+            .expect_err("port break failure propagates");
+        assert_eq!(error.cause(), SerialCause::Io);
+        let _ = failing_session.close();
     }
 }

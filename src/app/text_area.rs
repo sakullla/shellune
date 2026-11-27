@@ -17,14 +17,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::prelude::*;
 use gpui::{
-    App, AvailableSpace, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, GlobalElementId, KeyDownEvent, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollHandle,
-    SharedString, Size, Style, TextAlign, TextRun, UTF16Selection, Window, WrappedLine, div, fill,
-    point, px, relative, size,
+    App, AvailableSpace, Bounds, BoxShadow, ClipboardItem, Context, Element, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, GlobalElementId, Hsla,
+    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, Render, ScrollHandle, SharedString, Size, Style, TextAlign, TextRun, UTF16Selection,
+    Window, WrappedLine, div, fill, point, px, relative, size,
 };
 
+use crate::app::components;
+use crate::app::copy::Locale;
 use crate::app::nav::Platform;
+use crate::app::scrollbar;
 use crate::app::text_field::LineModel;
 use crate::app::theme::{self, palette, radius, spacing};
 
@@ -35,13 +38,29 @@ const CARET_WIDTH: f32 = 1.5;
 /// an empty line still shows that line is in it.
 const BREAK_MARK_WIDTH: f32 = 4.0;
 
+/// Soft focus ring drawn outside the border while the area has the keyboard.
+const FOCUS_HALO: f32 = 3.0;
+
+/// Minimum width of the right-click context menu in logical pixels.
+const AREA_MENU_MIN_WIDTH: f32 = 168.0;
+
+type TabHandler = Box<dyn Fn(bool, &mut Window, &mut App) -> bool>;
+
 /// A multi-line text input.
 pub struct TextArea {
     id: SharedString,
     model: LineModel,
     /// What an input method is composing, shown at the caret until it commits.
     marked: Option<String>,
+    /// Hint text shown while the area is empty and not composing.
+    placeholder: SharedString,
     focus: FocusHandle,
+    /// Callback invoked on Shift+Tab so keyboard users can leave the multi-line editor.
+    tab: Option<TabHandler>,
+    /// Whether the last submission rejected this area's value.
+    invalid: bool,
+    /// Where the right-click context menu is open, in window coordinates.
+    menu: Option<Point<Pixels>>,
     /// Whether the left button is down after a press in the area: dragging selects.
     selecting: bool,
     /// The column Up and Down aim for, kept across a run of vertical moves so a short
@@ -133,7 +152,11 @@ impl TextArea {
             )),
             model,
             marked: None,
+            placeholder: SharedString::default(),
             focus: cx.focus_handle(),
+            tab: None,
+            invalid: false,
+            menu: None,
             selecting: false,
             goal_x: None,
             reveal: true,
@@ -141,6 +164,42 @@ impl TextArea {
             max_height,
             layout: Rc::new(RefCell::new(None)),
         }
+    }
+
+    /// Sets the hint text shown while the area is empty.
+    #[allow(dead_code)]
+    pub fn set_placeholder(
+        &mut self,
+        placeholder: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let placeholder = placeholder.into();
+        if self.placeholder != placeholder {
+            self.placeholder = placeholder;
+            cx.notify();
+        }
+    }
+
+    /// Marks the area as invalid so its border and focus halo use the danger swatch.
+    #[allow(dead_code)]
+    pub fn set_invalid(&mut self, invalid: bool, cx: &mut Context<Self>) {
+        if self.invalid != invalid {
+            self.invalid = invalid;
+            cx.notify();
+        }
+    }
+
+    /// Whether the area is currently marked invalid.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn invalid(&self) -> bool {
+        self.invalid
+    }
+
+    /// Installs a Shift+Tab handler so keyboard focus can leave the multi-line editor.
+    #[allow(dead_code)]
+    pub fn on_tab(&mut self, tab: impl Fn(bool, &mut Window, &mut App) -> bool + 'static) {
+        self.tab = Some(Box::new(tab));
     }
 
     /// The text as it is now.
@@ -172,6 +231,7 @@ impl TextArea {
 
     fn edit(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut LineModel)) {
         change(&mut self.model);
+        self.invalid = false;
         self.goal_x = None;
         self.reveal = true;
         cx.notify();
@@ -246,7 +306,7 @@ impl TextArea {
         cx.notify();
     }
 
-    fn handle_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let modifiers = &event.keystroke.modifiers;
         let mac = Platform::current() == Platform::MacOs;
         let command = if mac {
@@ -263,12 +323,22 @@ impl TextArea {
         match event.keystroke.key.as_str() {
             // A modified Enter and Escape belong to the dialog around the area.
             "enter" if command || modifiers.control || modifiers.platform => return,
+            "escape" if self.menu.is_some() => self.close_menu(cx),
             "escape" if self.model.selection().is_empty() => return,
             "escape" => {
                 let caret = self.model.caret();
                 self.edit(cx, |model| model.move_to(caret));
             }
             "enter" => self.edit(cx, |model| model.insert("\n")),
+            "tab" if shift && !modifiers.control && !modifiers.alt && !modifiers.platform => {
+                let consumed = match &self.tab {
+                    Some(tab) => tab(true, window, cx),
+                    None => false,
+                };
+                if !consumed {
+                    return;
+                }
+            }
             "tab" if !command && !modifiers.alt => self.edit(cx, |model| model.insert("\t")),
             "backspace" => self.edit(cx, |model| model.backspace(by_word)),
             "delete" => self.edit(cx, |model| model.delete(by_word)),
@@ -356,6 +426,7 @@ impl TextArea {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.menu = None;
         window.focus(&self.focus);
         let offset = self.offset_for_point(event.position);
         match event.click_count {
@@ -379,6 +450,132 @@ impl TextArea {
             }
         }
     }
+
+    fn open_menu(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
+        let offset = self.offset_for_point(event.position);
+        if !self.model.selection().contains(&offset) {
+            self.model.move_to(offset);
+        }
+        self.menu = Some(event.position);
+        cx.notify();
+    }
+
+    fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The right-click context menu: cut, copy, paste and select all.
+    fn menu(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let position = self.menu?;
+        let metrics = theme::metrics();
+        let strings = Locale::current().strings();
+        let viewport = window.viewport_size();
+        let has_selection = !self.model.selection().is_empty();
+        let can_paste = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .is_some_and(|text| !text.is_empty());
+        let can_select_all = !self.model.text().is_empty();
+        let platform = Platform::current();
+        let key = |letter: &str| match platform {
+            Platform::MacOs => format!("\u{2318}{letter}"),
+            Platform::Windows | Platform::Linux => format!("Ctrl+{letter}"),
+        };
+
+        let item = |label: &'static str, shortcut: String, enabled: bool, id: &'static str| {
+            components::menu_entry(label, id, None, enabled, false, metrics).child(
+                components::menu_shortcut(SharedString::from(shortcut), metrics),
+            )
+        };
+        let menu = components::menu_card("area.menu", metrics)
+            .min_w(metrics.scale(AREA_MENU_MIN_WIDTH))
+            .child(
+                item(strings.field_cut, key("X"), has_selection, "area.menu.cut").when(
+                    has_selection,
+                    |item| {
+                        item.on_click(cx.listener(|this, _event, _window, cx| {
+                            this.cut(cx);
+                            this.close_menu(cx);
+                        }))
+                    },
+                ),
+            )
+            .child(
+                item(
+                    strings.field_copy,
+                    key("C"),
+                    has_selection,
+                    "area.menu.copy",
+                )
+                .when(has_selection, |item| {
+                    item.on_click(cx.listener(|this, _event, _window, cx| {
+                        this.copy(cx);
+                        this.close_menu(cx);
+                    }))
+                }),
+            )
+            .child(
+                item(strings.field_paste, key("V"), can_paste, "area.menu.paste").when(
+                    can_paste,
+                    |item| {
+                        item.on_click(cx.listener(|this, _event, _window, cx| {
+                            this.paste(cx);
+                            this.close_menu(cx);
+                        }))
+                    },
+                ),
+            )
+            .child(components::menu_divider(metrics))
+            .child(
+                item(
+                    strings.field_select_all,
+                    key("A"),
+                    can_select_all,
+                    "area.menu.select_all",
+                )
+                .when(can_select_all, |item| {
+                    item.on_click(cx.listener(|this, _event, _window, cx| {
+                        this.model.select_all();
+                        this.close_menu(cx);
+                    }))
+                }),
+            );
+
+        Some(
+            gpui::deferred(
+                gpui::anchored().position(Point::default()).child(
+                    div()
+                        .relative()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .child(
+                            div()
+                                .id("area.menu.backdrop")
+                                .absolute()
+                                .inset_0()
+                                .occlude()
+                                .on_any_mouse_down(cx.listener(|this, _event, _window, cx| {
+                                    this.close_menu(cx);
+                                })),
+                        )
+                        .child(
+                            gpui::anchored()
+                                .position(position)
+                                .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
+                                .child(
+                                    div()
+                                        .occlude()
+                                        .child(components::menu_enter(menu, "area.menu.enter")),
+                                ),
+                        ),
+                ),
+            )
+            .with_priority(3),
+        )
+    }
 }
 
 /// Moves the caret to `offset`, extending the selection when `extend`.
@@ -395,7 +592,10 @@ impl Render for TextArea {
         let metrics = theme::metrics();
         let focused = self.focus.is_focused(window);
         let accent = theme::swatch(palette::ACCENT);
-        div()
+        let danger = theme::swatch(palette::DANGER);
+        let invalid = self.invalid;
+        let scrollbar_id = SharedString::from(format!("{}.scrollbar", self.id));
+        let box_view = div()
             .id(self.id.clone())
             .w_full()
             .min_w_0()
@@ -403,13 +603,27 @@ impl Render for TextArea {
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
             .rounded(px(radius::MEDIUM))
-            .border_1()
-            .border_color(if focused {
-                accent
-            } else {
-                theme::swatch(palette::BORDER_STRONG)
+            .map(|area| {
+                if invalid {
+                    area.border_2().border_color(danger)
+                } else {
+                    area.border_1().border_color(if focused {
+                        accent
+                    } else {
+                        theme::swatch(palette::BORDER_STRONG)
+                    })
+                }
             })
-            .when(!focused, |area| {
+            .when(focused, |area| {
+                let halo = if invalid { danger } else { accent };
+                area.shadow(vec![BoxShadow {
+                    color: theme::faded(halo, 0.22).into(),
+                    offset: point(px(0.0), px(0.0)),
+                    blur_radius: px(0.0),
+                    spread_radius: px(FOCUS_HALO),
+                }])
+            })
+            .when(!focused && !invalid, |area| {
                 let hover = theme::swatch(palette::TEXT_MUTED);
                 area.hover(move |style| style.border_color(hover))
             })
@@ -423,6 +637,13 @@ impl Render for TextArea {
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     this.on_mouse_down(event, window, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_menu(event, window, cx);
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
@@ -443,7 +664,15 @@ impl Render for TextArea {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key(event, window, cx);
             }))
-            .child(AreaElement { area: cx.entity() })
+            .child(AreaElement { area: cx.entity() });
+
+        div()
+            .relative()
+            .w_full()
+            .min_w_0()
+            .child(box_view)
+            .child(scrollbar::bar(scrollbar_id, self.scroll.clone()))
+            .children(self.menu(window, cx))
     }
 }
 
@@ -464,10 +693,16 @@ impl IntoElement for AreaElement {
 }
 
 /// Shapes every logical line of `text` at `width`.
-fn shape(text: &str, width: Option<Pixels>, window: &Window) -> (Vec<DrawnLine>, Pixels) {
+fn shape(
+    text: &str,
+    width: Option<Pixels>,
+    color: Option<Hsla>,
+    window: &Window,
+) -> (Vec<DrawnLine>, Pixels) {
     let style = window.text_style();
     let font_size = style.font_size.to_pixels(window.rem_size());
     let line_height = window.line_height();
+    let ink = color.unwrap_or(style.color);
     let mut lines = Vec::new();
     let mut top = px(0.0);
     let mut start = 0;
@@ -475,7 +710,7 @@ fn shape(text: &str, width: Option<Pixels>, window: &Window) -> (Vec<DrawnLine>,
         let run = TextRun {
             len: piece.len(),
             font: style.font(),
-            color: style.color,
+            color: ink,
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -519,7 +754,15 @@ impl Element for AreaElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let text = self.area.read(cx).display_text();
+        let (text, is_placeholder) = {
+            let area = self.area.read(cx);
+            let display = area.display_text();
+            if display.is_empty() && !area.placeholder.is_empty() {
+                (area.placeholder.to_string(), true)
+            } else {
+                (display, false)
+            }
+        };
         let mut style = Style::default();
         style.size.width = relative(1.).into();
         let layout = window.request_measured_layout(
@@ -529,7 +772,8 @@ impl Element for AreaElement {
                     AvailableSpace::Definite(width) => Some(width),
                     _ => None,
                 });
-                let (_, height) = shape(&text, width, window);
+                let color = is_placeholder.then(|| theme::swatch(palette::TEXT_MUTED).into());
+                let (_, height) = shape(&text, width, color, window);
                 size(width.unwrap_or(px(0.0)), height)
             },
         );
@@ -546,7 +790,16 @@ impl Element for AreaElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let area = self.area.read(cx);
-        let (lines, _) = shape(&area.display_text(), Some(bounds.size.width), window);
+        let display = area.display_text();
+        let (text, color) = if display.is_empty() && !area.placeholder.is_empty() {
+            (
+                area.placeholder.as_str(),
+                Some(theme::swatch(palette::TEXT_MUTED).into()),
+            )
+        } else {
+            (display.as_str(), None)
+        };
+        let (lines, _) = shape(text, Some(bounds.size.width), color, window);
         let layout = AreaLayout {
             lines,
             line_height: window.line_height(),
@@ -815,5 +1068,78 @@ mod tests {
             area.model.move_to(area.model.text().len());
             assert_eq!(area.line_bounds(), 13..18);
         });
+    }
+
+    struct AreaHolder {
+        area: Entity<TextArea>,
+    }
+
+    impl Render for AreaHolder {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().flex().w(px(360.0)).child(self.area.clone())
+        }
+    }
+
+    #[gpui::test]
+    fn area_supports_invalid_placeholder_shift_tab_and_context_menu(cx: &mut gpui::TestAppContext) {
+        let escaped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let escaped_flag = std::rc::Rc::clone(&escaped);
+        let (view, cx) = cx.add_window_view(move |_window, cx| {
+            let area = cx.new(|cx| {
+                let mut a = TextArea::new("", px(120.0), cx);
+                a.set_placeholder("Paste private key...", cx);
+                a.set_invalid(true, cx);
+                a.on_tab(move |shift, _window, _cx| {
+                    if shift {
+                        escaped_flag.set(true);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                a
+            });
+            AreaHolder { area }
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            let area = view.read(app).area.read(app);
+            assert!(area.invalid());
+            assert_eq!(area.placeholder.as_ref(), "Paste private key...");
+            window.focus(area.focus_handle());
+        });
+
+        // Shift+Tab invokes the escape callback instead of inserting a tab.
+        cx.simulate_keystrokes("shift-tab");
+        cx.run_until_parked();
+        assert!(escaped.get(), "Shift+Tab triggers on_tab callback");
+
+        // Plain Tab inserts a tab character and clears invalid state.
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        cx.update(|_window, app| {
+            let area = view.read(app).area.read(app);
+            assert_eq!(area.text(), "\t");
+            assert!(!area.invalid(), "editing clears invalid state");
+        });
+
+        // Right-click opens context menu; Escape closes it.
+        cx.simulate_mouse_down(
+            point(px(40.0), px(20.0)),
+            MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("area.menu").is_some(),
+            "right-click opens TextArea context menu"
+        );
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("area.menu").is_none(),
+            "Escape closes TextArea context menu"
+        );
     }
 }

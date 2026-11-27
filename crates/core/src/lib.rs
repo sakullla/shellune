@@ -62,8 +62,9 @@ pub use host::{
     ConnectionRecord, ConnectionValidationError, DEFAULT_RDP_PORT, DEFAULT_SERIAL_BAUD,
     DEFAULT_SSH_PORT, DEFAULT_VNC_PORT, HostConfig, HostValidationError, JumpFault,
     MAX_SERIAL_BAUD, MAX_SERIAL_DATA_BITS, MIN_SERIAL_BAUD, MIN_SERIAL_DATA_BITS, Port,
-    ProtocolKind, RdpCertificatePolicy, RdpConfig, SerialConfig, SerialFlow, SerialParity,
-    SerialStopBits, VncConfig, VncSecurity, X11Forwarding, connection_jump_fault, jump_faults,
+    ProtocolKind, RdpCertificatePolicy, RdpConfig, SerialConfig, SerialFlow, SerialNewline,
+    SerialParity, SerialStopBits, VncConfig, VncSecurity, X11Forwarding, connection_jump_fault,
+    jump_faults,
 };
 pub use ids::{CredentialId, ForwardId, HostId, KeyId, PaneId, SessionId, TabId, TransferId};
 pub use session::{

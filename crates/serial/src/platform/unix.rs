@@ -169,6 +169,19 @@ impl PortIo for UnixPort {
         }
     }
 
+    fn send_break(&self) -> Result<(), PortFault> {
+        // SAFETY: self.fd is an open terminal descriptor owned by this value; duration 0
+        // requests the standard POSIX break pulse.
+        if unsafe { libc::tcsendbreak(self.fd, 0) } == 0 {
+            return Ok(());
+        }
+        let errno = errno();
+        if errno == libc::EINTR {
+            return Err(PortFault::Interrupted);
+        }
+        Err(PortFault::Failed(self.failure(Stage::Io, errno)))
+    }
+
     /// No notice: termios and `poll` keep no receive-overrun counter.
     ///
     /// A Unix serial device reports a framing or parity error as the byte that did
@@ -575,5 +588,42 @@ fn drain(fd: RawFd) {
         if read <= 0 {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_port_sends_break_on_real_pty() {
+        let mut master: RawFd = -1;
+        let mut slave: RawFd = -1;
+        // SAFETY: openpty writes two valid descriptors into master/slave; null args
+        // omit name/termios/winsize.
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0, "openpty must succeed");
+        let (wake_read, wake_write) = make_pipe("pty-test").expect("wake pipe");
+        let port = UnixPort {
+            fd: slave,
+            wake_read,
+            wake_write,
+            name: "pty-test".to_owned(),
+        };
+        let result = port.send_break();
+        drop(port);
+        // SAFETY: master is owned by this test and closed once.
+        unsafe {
+            libc::close(master);
+        }
+        result.expect("tcsendbreak on PTY slave succeeds");
     }
 }

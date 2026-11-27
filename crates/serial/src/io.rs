@@ -114,6 +114,20 @@ pub trait PortIo: Send + Sync + 'static {
     /// Stops any in-flight read or write without releasing the handle.
     fn interrupt(&self);
 
+    /// Sends an RS-232 break signal on the open line.
+    ///
+    /// # Errors
+    ///
+    /// [`PortFault::Interrupted`] when cancelled, or [`PortFault::Failed`] when the
+    /// port could not emit the break signal.
+    fn send_break(&self) -> Result<(), PortFault> {
+        Err(PortFault::Failed(
+            SerialError::new(crate::error::SerialCause::UnsupportedConfig)
+                .at(self.name())
+                .with_detail("this port backend does not support sending a break signal"),
+        ))
+    }
+
     /// Notes that the session has finished with this port and will not call it again.
     fn release(&self) {}
 

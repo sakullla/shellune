@@ -25,9 +25,9 @@ use std::ptr;
 use std::sync::Arc;
 
 use windows_sys::Win32::Devices::Communication::{
-    CE_OVERRUN, CE_RXOVER, COMMTIMEOUTS, COMSTAT, ClearCommError, DCB, EVENPARITY, GetCommState,
-    MARKPARITY, NOPARITY, ODDPARITY, ONESTOPBIT, PURGE_RXCLEAR, PURGE_TXCLEAR, PurgeComm,
-    SPACEPARITY, SetCommState, SetCommTimeouts, SetupComm, TWOSTOPBITS,
+    CE_OVERRUN, CE_RXOVER, COMMTIMEOUTS, COMSTAT, ClearCommBreak, ClearCommError, DCB, EVENPARITY,
+    GetCommState, MARKPARITY, NOPARITY, ODDPARITY, ONESTOPBIT, PURGE_RXCLEAR, PURGE_TXCLEAR,
+    PurgeComm, SPACEPARITY, SetCommBreak, SetCommState, SetCommTimeouts, SetupComm, TWOSTOPBITS,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_DEV_NOT_EXIST, ERROR_DEVICE_NOT_CONNECTED,
@@ -214,6 +214,19 @@ impl PortIo for WindowsPort {
             CancelIoEx(self.handle.0, ptr::null());
             SetEvent(self.cancel_event.0);
         }
+    }
+
+    fn send_break(&self) -> Result<(), PortFault> {
+        // SAFETY: the handle is owned by this value and remains open for the call.
+        if unsafe { SetCommBreak(self.handle.0) } == 0 {
+            return Err(self.fault(last_error()));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        // SAFETY: the handle is owned by this value; ClearCommBreak ends the break state.
+        if unsafe { ClearCommBreak(self.handle.0) } == 0 {
+            return Err(self.fault(last_error()));
+        }
+        Ok(())
     }
 
     /// The receive loss the driver reported, for the session to state.

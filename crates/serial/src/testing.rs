@@ -39,6 +39,8 @@ pub struct FakeSpec {
     pub scripted: Vec<Vec<u8>>,
     /// A receive loss the fake reports once, as a driver that overran does.
     pub notice: Option<crate::io::PortNotice>,
+    /// A break failure the fake reports when [`PortIo::send_break`] is called.
+    pub break_failure: Option<crate::SerialError>,
 }
 
 impl FakeSpec {
@@ -96,6 +98,13 @@ impl FakeSpec {
         self.notice = Some(notice);
         self
     }
+
+    /// Makes [`PortIo::send_break`] fail with this error.
+    #[must_use]
+    pub fn failing_breaks(mut self, error: crate::SerialError) -> Self {
+        self.break_failure = Some(error);
+        self
+    }
 }
 
 /// One end of an in-memory serial pair.
@@ -107,6 +116,7 @@ pub struct FakePort {
     peer: Mutex<Weak<FakePort>>,
     written: Mutex<Vec<u8>>,
     interrupts: AtomicUsize,
+    breaks: AtomicUsize,
     writes: AtomicUsize,
     notice: Mutex<Option<crate::io::PortNotice>>,
     released: AtomicBool,
@@ -125,6 +135,7 @@ impl FakePort {
             peer: Mutex::new(Weak::new()),
             written: Mutex::new(Vec::new()),
             interrupts: AtomicUsize::new(0),
+            breaks: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             notice: Mutex::new(spec.notice.clone()),
             released: AtomicBool::new(false),
@@ -152,6 +163,12 @@ impl FakePort {
     #[must_use]
     pub fn interrupts(&self) -> usize {
         self.interrupts.load(Ordering::SeqCst)
+    }
+
+    /// How many break signals the session sent on this port.
+    #[must_use]
+    pub fn breaks(&self) -> usize {
+        self.breaks.load(Ordering::SeqCst)
     }
 
     /// Whether the session has released this port.
@@ -253,6 +270,17 @@ impl PortIo for FakePort {
         self.interrupts.fetch_add(1, Ordering::SeqCst);
         self.hold_wake.notify_all();
         self.inbox_wake.notify_all();
+    }
+
+    fn send_break(&self) -> Result<(), PortFault> {
+        if let Some(error) = &self.spec.break_failure {
+            return Err(PortFault::Failed(error.clone()));
+        }
+        if self.interrupts.load(Ordering::SeqCst) > 0 {
+            return Err(PortFault::Interrupted);
+        }
+        self.breaks.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     fn release(&self) {

@@ -230,6 +230,8 @@ pub struct ForwardRule {
     listen: Endpoint,
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<Endpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
 }
 
 /// Stored shape of a rule, checked by [`ForwardRule`]'s constructor rules.
@@ -242,12 +244,21 @@ struct ForwardRuleWire {
     listen: Endpoint,
     #[serde(default)]
     target: Option<Endpoint>,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+fn normalize_label(label: Option<String>) -> Option<String> {
+    label
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
 }
 
 impl TryFrom<ForwardRuleWire> for ForwardRule {
     type Error = ForwardBuildError;
 
     fn try_from(wire: ForwardRuleWire) -> Result<Self, Self::Error> {
+        let label = normalize_label(wire.label);
         match wire.kind {
             ForwardKind::Dynamic => {
                 if wire.target.is_some() {
@@ -259,6 +270,7 @@ impl TryFrom<ForwardRuleWire> for ForwardRule {
                     ForwardKind::Dynamic,
                     wire.listen,
                     None,
+                    label,
                 ))
             }
             ForwardKind::Local | ForwardKind::Remote => {
@@ -274,6 +286,7 @@ impl TryFrom<ForwardRuleWire> for ForwardRule {
                     wire.kind,
                     wire.listen,
                     Some(target),
+                    label,
                 ))
             }
         }
@@ -287,6 +300,7 @@ impl ForwardRule {
         kind: ForwardKind,
         listen: Endpoint,
         target: Option<Endpoint>,
+        label: Option<String>,
     ) -> Self {
         Self {
             id,
@@ -294,6 +308,7 @@ impl ForwardRule {
             kind,
             listen,
             target,
+            label: normalize_label(label),
         }
     }
 
@@ -307,6 +322,7 @@ impl ForwardRule {
             ForwardKind::Local,
             listen,
             Some(target),
+            None,
         )
     }
 
@@ -319,13 +335,21 @@ impl ForwardRule {
             ForwardKind::Remote,
             listen,
             Some(target),
+            None,
         )
     }
 
     /// A dynamic SOCKS forward. There is no fixed target.
     #[must_use]
     pub fn dynamic(host: HostId, listen: Endpoint) -> Self {
-        Self::from_parts(ForwardId::new(), host, ForwardKind::Dynamic, listen, None)
+        Self::from_parts(
+            ForwardId::new(),
+            host,
+            ForwardKind::Dynamic,
+            listen,
+            None,
+            None,
+        )
     }
 
     /// An edit of a saved rule. The id stays so the file still names the same rule.
@@ -346,7 +370,7 @@ impl ForwardRule {
                 if target.is_some() {
                     return Err(ForwardBuildError::UnexpectedTarget { id });
                 }
-                Ok(Self::from_parts(id, host, kind, listen, None))
+                Ok(Self::from_parts(id, host, kind, listen, None, None))
             }
             ForwardKind::Local | ForwardKind::Remote => {
                 let Some(target) = target else {
@@ -355,7 +379,7 @@ impl ForwardRule {
                         kind: kind.label(),
                     });
                 };
-                Ok(Self::from_parts(id, host, kind, listen, Some(target)))
+                Ok(Self::from_parts(id, host, kind, listen, Some(target), None))
             }
         }
     }
@@ -390,6 +414,24 @@ impl ForwardRule {
         self.target.as_ref()
     }
 
+    /// Optional user-defined label for this rule.
+    #[must_use]
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    /// Returns this rule with an optional label (blank labels are cleared).
+    #[must_use]
+    pub fn with_label(mut self, label: Option<impl Into<String>>) -> Self {
+        self.set_label(label);
+        self
+    }
+
+    /// Sets or clears the optional label (blank labels are cleared).
+    pub fn set_label(&mut self, label: Option<impl Into<String>>) {
+        self.label = normalize_label(label.map(Into::into));
+    }
+
     /// The same tunnel under a new id.
     ///
     /// Copying a rule does not copy a listener: the new rule is configuration until
@@ -402,6 +444,7 @@ impl ForwardRule {
             self.kind,
             self.listen.clone(),
             self.target.clone(),
+            self.label.clone(),
         )
     }
 
@@ -687,5 +730,41 @@ mod tests {
             }
         }
         assert!(book.rule(keep.id()).is_some());
+    }
+
+    #[test]
+    fn label_round_trips_and_omits_when_absent_for_legacy_compatibility() {
+        let id = ForwardId::new();
+        let host = HostId::new();
+        let legacy_json = format!(
+            r#"{{"id":"{id}","host":"{host}","kind":"dynamic","listen":{{"host":"127.0.0.1","port":1080}}}}"#
+        );
+        let legacy: ForwardRule = serde_json::from_str(&legacy_json).expect("reads legacy json");
+        assert_eq!(legacy.label(), None);
+        let reserialized = serde_json::to_string(&legacy).expect("serializes");
+        assert!(
+            !reserialized.contains("label"),
+            "absent label must be omitted: {reserialized}"
+        );
+
+        let labeled = ForwardRule::local(
+            host,
+            listen(5432),
+            Endpoint::new("db.internal", 5432).expect("target"),
+        )
+        .with_label(Some("  Prod DB  "));
+        assert_eq!(labeled.label(), Some("Prod DB"));
+        let json = serde_json::to_string(&labeled).expect("serializes labeled");
+        assert!(json.contains(r#""label":"Prod DB""#), "{json}");
+        let back: ForwardRule = serde_json::from_str(&json).expect("reads labeled");
+        assert_eq!(back, labeled);
+        assert_eq!(back.label(), Some("Prod DB"));
+        assert_eq!(labeled.copied().label(), Some("Prod DB"));
+
+        let mut cleared = labeled;
+        cleared.set_label(Some("   "));
+        assert_eq!(cleared.label(), None);
+        let cleared_json = serde_json::to_string(&cleared).expect("serializes cleared");
+        assert!(!cleared_json.contains("label"), "{cleared_json}");
     }
 }

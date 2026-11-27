@@ -27,18 +27,24 @@ use gpui::{
 
 use crate::app::theme::{self, palette};
 
-/// The hit strip along the container's right edge.
+/// The hit strip along the container's right edge at 100% scale.
 pub const TRACK_WIDTH: f32 = 12.0;
-/// The thumb at rest.
+/// The thumb at rest at 100% scale.
 const THUMB_WIDTH: f32 = 4.0;
-/// The thumb while pointed at or dragged.
+/// The thumb while pointed at or dragged at 100% scale.
 const THUMB_ACTIVE_WIDTH: f32 = 8.0;
-/// The gap between the thumb and the container's right edge and its ends.
+/// The gap between the thumb and the container's right edge and its ends at 100% scale.
 const THUMB_INSET: f32 = 2.0;
-/// The shortest thumb, so a very long list still has something to grab.
+/// The shortest thumb at 100% scale, so a very long list still has something to grab.
 const THUMB_MIN_LENGTH: f32 = 28.0;
 /// A remainder smaller than this is rounding, not content.
 const SCROLL_EPSILON: f32 = 0.5;
+
+/// The scaled hit-strip width for `metrics`.
+#[must_use]
+pub fn track_width(metrics: theme::Metrics) -> Pixels {
+    metrics.scale(TRACK_WIDTH)
+}
 
 /// What the bar remembers between frames.
 #[derive(Default)]
@@ -53,6 +59,7 @@ struct BarState {
 #[derive(Clone, Copy)]
 struct Geometry {
     track: Bounds<Pixels>,
+    inset: Pixels,
     thumb_top: Pixels,
     thumb_length: Pixels,
     travel: Pixels,
@@ -60,23 +67,29 @@ struct Geometry {
 }
 
 impl Geometry {
-    fn measure(handle: &ScrollHandle, track: Bounds<Pixels>) -> Option<Self> {
+    fn measure(
+        handle: &ScrollHandle,
+        track: Bounds<Pixels>,
+        metrics: theme::Metrics,
+    ) -> Option<Self> {
         let max = handle.max_offset().height;
         let viewport = handle.bounds().size.height;
         if max <= px(SCROLL_EPSILON) || viewport <= Pixels::ZERO {
             return None;
         }
-        let inset = px(THUMB_INSET);
+        let inset = metrics.scale(THUMB_INSET);
+        let min_length = metrics.scale(THUMB_MIN_LENGTH);
         let usable = track.size.height - inset * 2.0;
-        if usable <= px(THUMB_MIN_LENGTH) {
+        if usable <= min_length {
             return None;
         }
         let ratio = viewport / (viewport + max);
-        let thumb_length = (usable * ratio).max(px(THUMB_MIN_LENGTH)).min(usable);
+        let thumb_length = (usable * ratio).max(min_length).min(usable);
         let travel = usable - thumb_length;
         let progress = (-handle.offset().y / max).clamp(0.0, 1.0);
         Some(Self {
             track,
+            inset,
             thumb_top: track.origin.y + inset + travel * progress,
             thumb_length,
             travel,
@@ -93,8 +106,7 @@ impl Geometry {
         if self.travel <= Pixels::ZERO {
             return Pixels::ZERO;
         }
-        let progress =
-            ((top - self.track.origin.y - px(THUMB_INSET)) / self.travel).clamp(0.0, 1.0);
+        let progress = ((top - self.track.origin.y - self.inset) / self.travel).clamp(0.0, 1.0);
         -(self.max * progress)
     }
 }
@@ -112,18 +124,20 @@ pub fn bar(id: impl Into<ElementId>, handle: ScrollHandle) -> impl IntoElement {
     canvas(
         move |_bounds, window: &mut Window, cx: &mut App| {
             let state = window.use_keyed_state(id, cx, |_, _| BarState::default());
+            let metrics = theme::metrics();
+            let track_w = track_width(metrics);
             let viewport = handle.bounds();
             let track = Bounds::new(
-                point(viewport.right() - px(TRACK_WIDTH), viewport.top()),
-                size(px(TRACK_WIDTH), viewport.size.height),
+                point(viewport.right() - track_w, viewport.top()),
+                size(track_w, viewport.size.height),
             );
-            let geometry = Geometry::measure(&handle, track);
+            let geometry = Geometry::measure(&handle, track, metrics);
             let hitbox = geometry
                 .map(|_| window.insert_hitbox(track, HitboxBehavior::BlockMouseExceptScroll));
-            (state, geometry, hitbox)
+            (state, geometry, hitbox, metrics)
         },
         move |_bounds,
-              (state, geometry, hitbox): (_, Option<Geometry>, Option<Hitbox>),
+              (state, geometry, hitbox, metrics): (_, Option<Geometry>, Option<Hitbox>, _),
               window,
               cx| {
             let (Some(geometry), Some(hitbox)) = (geometry, hitbox) else {
@@ -137,7 +151,7 @@ pub fn bar(id: impl Into<ElementId>, handle: ScrollHandle) -> impl IntoElement {
             window.set_cursor_style(CursorStyle::Arrow, &hitbox);
 
             let active = dragging || hovered;
-            let width = px(if active {
+            let width = metrics.scale(if active {
                 THUMB_ACTIVE_WIDTH
             } else {
                 THUMB_WIDTH
@@ -149,7 +163,7 @@ pub fn bar(id: impl Into<ElementId>, handle: ScrollHandle) -> impl IntoElement {
             };
             let thumb = Bounds::new(
                 point(
-                    geometry.track.right() - px(THUMB_INSET) - width,
+                    geometry.track.right() - geometry.inset - width,
                     geometry.thumb_top,
                 ),
                 size(width, geometry.thumb_length),
@@ -255,6 +269,7 @@ mod tests {
     fn the_thumb_offset_round_trips_from_top_to_bottom() {
         let geometry = Geometry {
             track: track(404.0),
+            inset: px(THUMB_INSET),
             thumb_top: px(102.0),
             thumb_length: px(100.0),
             travel: px(300.0),
@@ -278,6 +293,17 @@ mod tests {
     #[test]
     fn nothing_to_scroll_draws_no_bar() {
         let handle = ScrollHandle::new();
-        assert!(Geometry::measure(&handle, track(400.0)).is_none());
+        assert!(Geometry::measure(&handle, track(400.0), theme::Metrics::default()).is_none());
+    }
+
+    #[test]
+    fn track_width_scales_with_metrics() {
+        let regular = theme::Metrics::new(theme::Zoom::Regular);
+        let comfortable = theme::Metrics::new(theme::Zoom::Comfortable);
+        assert_eq!(track_width(regular), px(TRACK_WIDTH));
+        assert!(
+            track_width(comfortable) > track_width(regular),
+            "scrollbar hit strip widens at larger zoom levels"
+        );
     }
 }
