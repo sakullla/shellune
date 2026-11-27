@@ -3033,44 +3033,71 @@ pub struct QuickTarget {
 }
 
 impl QuickTarget {
-    /// The target as the bar shows it back: `user@host` or `user@host:port`.
+    /// The target as the bar shows it back: `user@host`, `user@host:port`, or `user@[ipv6]:port`.
     #[must_use]
     pub fn label(&self) -> String {
         match self.port {
+            Some(port) if self.host.contains(':') => {
+                format!("{}@[{}]:{port}", self.user, self.host)
+            }
             Some(port) => format!("{}@{}:{port}", self.user, self.host),
             None => format!("{}@{}", self.user, self.host),
         }
     }
 }
 
-/// Reads `user@host[:port]` out of what was typed into the quick-connect bar.
+/// Reads `user@host[:port]`, `ssh://user@host[:port]`, or `user@[ipv6][:port]` out of
+/// what was typed into the quick-connect bar or command palette.
 ///
 /// The user and the host are both required, as the quick-connection form's own split
 /// requires them: a bare word is a search, not an address. A port has to be a number
 /// from 1 to 65535; anything else after a colon makes the text no address at all, so a
-/// typo is never dialled as some other port. An IPv6 literal keeps its colons and no
-/// port is read from it.
+/// typo is never dialled as some other port. Bracketed IPv6 literals support an optional
+/// `:port` suffix; unbracketed IPv6 literals keep their colons with no port.
 #[must_use]
 pub fn parse_quick_target(text: &str) -> Option<QuickTarget> {
     let text = text.trim();
     if text.is_empty() || text.chars().any(char::is_whitespace) {
         return None;
     }
+    let text = if text.len() >= 6 && text[..6].eq_ignore_ascii_case("ssh://") {
+        &text[6..]
+    } else {
+        text
+    };
     let (user, rest) = text.split_once('@')?;
     if user.is_empty() || rest.is_empty() || rest.contains('@') {
         return None;
     }
-    let (host, port) = match rest.rsplit_once(':') {
-        Some((host, port)) if !host.contains(':') && !host.starts_with('[') => {
-            if host.is_empty() || port.is_empty() || !port.chars().all(|ch| ch.is_ascii_digit()) {
-                return None;
-            }
-            let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
-            (host, Some(port))
+    let parse_port = |port: &str| -> Option<u16> {
+        if port.is_empty() || !port.chars().all(|ch| ch.is_ascii_digit()) {
+            return None;
         }
-        _ => (rest, None),
+        port.parse::<u16>().ok().filter(|port| *port != 0)
     };
-    if host.contains('/') {
+    let (host, port) = if let Some(after_open) = rest.strip_prefix('[') {
+        let (host, after_close) = after_open.split_once(']')?;
+        if host.is_empty() || !host.contains(':') {
+            return None;
+        }
+        if after_close.is_empty() {
+            (host, None)
+        } else {
+            let port_str = after_close.strip_prefix(':')?;
+            (host, Some(parse_port(port_str)?))
+        }
+    } else {
+        match rest.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => {
+                if host.is_empty() {
+                    return None;
+                }
+                (host, Some(parse_port(port)?))
+            }
+            _ => (rest, None),
+        }
+    };
+    if host.contains('/') || host.contains('[') || host.contains(']') {
         return None;
     }
     Some(QuickTarget {
@@ -6027,6 +6054,48 @@ mod tests {
             parse_quick_target("ops@db:2222").map(|target| target.label()),
             Some("ops@db:2222".to_owned())
         );
+        assert_eq!(
+            parse_quick_target("ssh://alice@example.com"),
+            Some(QuickTarget {
+                user: "alice".to_owned(),
+                host: "example.com".to_owned(),
+                port: None,
+            })
+        );
+        assert_eq!(
+            parse_quick_target("SSH://alice@example.com:2200"),
+            Some(QuickTarget {
+                user: "alice".to_owned(),
+                host: "example.com".to_owned(),
+                port: Some(2200),
+            })
+        );
+        let ipv6 = parse_quick_target("alice@[::1]:2222").expect("bracketed IPv6 with port");
+        assert_eq!(
+            ipv6,
+            QuickTarget {
+                user: "alice".to_owned(),
+                host: "::1".to_owned(),
+                port: Some(2222),
+            }
+        );
+        assert_eq!(ipv6.label(), "alice@[::1]:2222");
+        assert_eq!(
+            parse_quick_target("ssh://alice@[fe80::1]:2222"),
+            Some(QuickTarget {
+                user: "alice".to_owned(),
+                host: "fe80::1".to_owned(),
+                port: Some(2222),
+            })
+        );
+        assert_eq!(
+            parse_quick_target("alice@[::1]"),
+            Some(QuickTarget {
+                user: "alice".to_owned(),
+                host: "::1".to_owned(),
+                port: None,
+            })
+        );
     }
 
     #[test]
@@ -6044,6 +6113,13 @@ mod tests {
             "a@b@c",
             "user@ho st",
             "user@host/path",
+            "ssh://",
+            "ssh://host",
+            "user@[::1]:0",
+            "user@[::1]:ssh",
+            "user@[::1]extra",
+            "user@[not-ipv6]:22",
+            "user@[::1",
         ] {
             assert_eq!(parse_quick_target(text), None, "{text:?} is not an address");
         }

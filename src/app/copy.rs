@@ -1076,6 +1076,12 @@ pub struct Strings {
     pub tabs_scroll_end: &'static str,
     /// Explains the tab list: strip order, and choosing one shows it.
     pub tab_list_hint: &'static str,
+    /// Placeholder of the search box inside the all-tabs overlay.
+    pub tab_list_search_placeholder: &'static str,
+    /// Empty state shown when no open tab matches the all-tabs search filter.
+    pub tab_list_empty_search: &'static str,
+    /// Toast shown when reopening a recently closed session whose saved host was deleted.
+    pub session_reopen_missing_host: &'static str,
     /// Mark on a tab whose shell rang the bell in the background.
     pub tab_mark_bell: &'static str,
     /// Mark on a tab where a shell-reported command ended in the background.
@@ -1708,6 +1714,9 @@ pub static ENGLISH: Strings = Strings {
     tabs_scroll_start: "Scroll tabs left",
     tabs_scroll_end: "Scroll tabs right",
     tab_list_hint: "Every open tab, in strip order. Choosing one shows it.",
+    tab_list_search_placeholder: "Filter tabs by name, address or state…",
+    tab_list_empty_search: "No tabs match that filter.",
+    session_reopen_missing_host: "Cannot reopen: the saved host was deleted.",
     tab_mark_bell: "Bell",
     tab_mark_finished: "Ended",
     tab_mark_bell_hint: "A background shell rang the bell. Open this tab to clear the mark; the bell byte still reached its program.",
@@ -2273,6 +2282,9 @@ pub static CHINESE: Strings = Strings {
     tabs_scroll_start: "向左滚动标签",
     tabs_scroll_end: "向右滚动标签",
     tab_list_hint: "按顶栏顺序列出全部标签，选择即切换。",
+    tab_list_search_placeholder: "按名称、地址或状态筛选标签…",
+    tab_list_empty_search: "没有匹配的标签。",
+    session_reopen_missing_host: "无法重新打开：原主机记录已被删除。",
     tab_mark_bell: "响铃",
     tab_mark_finished: "结束",
     tab_mark_bell_hint: "后台 Shell 响铃了。打开这个标签即清除标记；响铃字节照常送到了它的程序。",

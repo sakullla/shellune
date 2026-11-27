@@ -324,10 +324,22 @@ impl ShelluneView {
             .unwrap_or_else(|| self.viewport_width < self.metrics().scale(SIDEBAR_FOLD_BELOW))
     }
 
-    /// Folds the sidebar to its icons, or opens its words again.
+    /// Folds the sidebar to its icons, or opens its words again, and persists the choice.
     pub(super) fn toggle_home_sidebar(&mut self, cx: &mut Context<Self>) {
         self.home_sidebar_fold = Some(!self.home_sidebar_folded());
+        self.persist_preferences();
         cx.notify();
+    }
+
+    /// Formats a secondary-modifier shortcut (`Cmd+<key>` on macOS, `Ctrl+<key>` elsewhere)
+    /// using the active keymap's platform formatter.
+    fn secondary_key_label(&self, key: &str) -> String {
+        let platform = self.keymap.platform();
+        let stroke = match platform {
+            crate::app::Platform::MacOs => format!("cmd-{key}"),
+            crate::app::Platform::Windows | crate::app::Platform::Linux => format!("ctrl-{key}"),
+        };
+        crate::app::keymap::keystroke_label(&stroke, platform)
     }
 
     /// Shows one place of the sidebar: every record, the favourites, the recent hosts or
@@ -722,13 +734,21 @@ impl ShelluneView {
             // The groups are one folder on the rail: pressing it opens the words, where
             // the tree is, rather than squeezing a tree into the width of an icon.
             let chosen = matches!(section, HomeSection::Group(_));
+            let groups_focus = self.sidebar_groups_focus.clone();
+            let groups_focus_click = groups_focus.clone();
             bar = bar.child(
                 components::sidebar_icon_item(Icon::Folder, chosen, metrics)
                     .id("home.sidebar.groups")
                     .debug_selector(|| "home.sidebar.groups".to_owned())
+                    .track_focus(&groups_focus)
+                    .border_1()
+                    .border_color(theme::clear())
+                    .focus(move |style| style.border_color(ring))
                     .tooltip(components::tooltip(ux.hosts_groups_title))
-                    .on_click(cx.listener(|this, _event, _window, cx| {
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        window.focus(&groups_focus_click);
                         this.home_sidebar_fold = Some(false);
+                        this.persist_preferences();
                         cx.notify();
                     })),
             );
@@ -1141,6 +1161,11 @@ impl ShelluneView {
             self.focus_group_row(&target, window, cx);
             return true;
         }
+        if self.home_sidebar_folded() && matches!(self.hosts.section(), HomeSection::Group(_)) {
+            window.focus(&self.sidebar_groups_focus.clone());
+            cx.notify();
+            return true;
+        }
         let place_slot = match self.hosts.section() {
             HomeSection::All | HomeSection::Group(_) => 0,
             HomeSection::Favorites => 1,
@@ -1165,6 +1190,7 @@ impl ShelluneView {
         #[derive(Clone, PartialEq, Eq)]
         enum SidebarStop {
             Place(usize, HomeSection),
+            Groups,
             Group(GroupPath),
             Local,
         }
@@ -1208,9 +1234,14 @@ impl ShelluneView {
             .sidebar_place_focus
             .iter()
             .position(|handle| handle.is_focused(window));
+        let groups_btn_focused = self.sidebar_groups_focus.is_focused(window);
         let focused_group = self.focused_group(window);
         let group_list_focused = self.group_list_focus.is_focused(window);
-        if focused_place.is_none() && focused_group.is_none() && group_list_focused {
+        if focused_place.is_none()
+            && !groups_btn_focused
+            && focused_group.is_none()
+            && group_list_focused
+        {
             if !self.home_shown() || self.hosts_keys_blocked() {
                 return false;
             }
@@ -1264,13 +1295,14 @@ impl ShelluneView {
                 _ => return false,
             }
         }
-        let current = match (focused_place, focused_group) {
-            (Some(0), _) => SidebarStop::Place(0, HomeSection::All),
-            (Some(1), _) => SidebarStop::Place(1, HomeSection::Favorites),
-            (Some(2), _) => SidebarStop::Place(2, HomeSection::Recent),
-            (Some(3), _) => SidebarStop::Place(3, HomeSection::Vault),
-            (Some(4), _) => SidebarStop::Local,
-            (_, Some(path)) => SidebarStop::Group(path),
+        let current = match (focused_place, groups_btn_focused, focused_group) {
+            (Some(0), _, _) => SidebarStop::Place(0, HomeSection::All),
+            (Some(1), _, _) => SidebarStop::Place(1, HomeSection::Favorites),
+            (Some(2), _, _) => SidebarStop::Place(2, HomeSection::Recent),
+            (Some(3), _, _) => SidebarStop::Place(3, HomeSection::Vault),
+            (Some(4), _, _) => SidebarStop::Local,
+            (_, true, _) => SidebarStop::Groups,
+            (_, _, Some(path)) => SidebarStop::Group(path),
             _ => return false,
         };
         if !self.home_shown() || self.hosts_keys_blocked() {
@@ -1292,13 +1324,12 @@ impl ShelluneView {
             SidebarStop::Place(2, HomeSection::Recent),
             SidebarStop::Place(3, HomeSection::Vault),
         ];
-        let drawn = if self.home_sidebar_folded() {
-            Vec::new()
+        if self.home_sidebar_folded() {
+            stops.push(SidebarStop::Groups);
         } else {
-            self.drawn_group_paths()
-        };
-        for path in &drawn {
-            stops.push(SidebarStop::Group(path.clone()));
+            for path in &self.drawn_group_paths() {
+                stops.push(SidebarStop::Group(path.clone()));
+            }
         }
         stops.push(SidebarStop::Local);
 
@@ -1343,6 +1374,18 @@ impl ShelluneView {
                 self.show_home_section(section.clone(), cx);
                 true
             }
+            (SidebarStop::Groups, "enter" | "space") => {
+                self.home_sidebar_fold = Some(false);
+                self.persist_preferences();
+                let drawn = self.drawn_group_paths();
+                if let Some(first) = drawn.first().cloned() {
+                    self.focus_group_row(&first, window, cx);
+                } else {
+                    window.focus(&self.sidebar_place_focus[0].clone());
+                    cx.notify();
+                }
+                true
+            }
             (SidebarStop::Local, "enter" | "space") => {
                 self.home_menu = None;
                 self.toggle_home_local_menu(cx);
@@ -1358,6 +1401,10 @@ impl ShelluneView {
                     match &stops[next] {
                         SidebarStop::Place(slot, _) => {
                             window.focus(&self.sidebar_place_focus[*slot].clone());
+                            cx.notify();
+                        }
+                        SidebarStop::Groups => {
+                            window.focus(&self.sidebar_groups_focus.clone());
                             cx.notify();
                         }
                         SidebarStop::Group(path) => {
@@ -1621,14 +1668,21 @@ impl ShelluneView {
         // in a file manager: the sidebar itself then starts with its places, and the
         // control is in one spot whether the sidebar is words or a rail.
         let folded = self.home_sidebar_folded();
-        let toggle = components::icon_only_button(Icon::Sidebar, metrics)
-            .id("home.sidebar.toggle")
-            .debug_selector(|| "home.sidebar.toggle".to_owned())
-            .tooltip(components::tooltip(if folded {
+        let toggle_tip = {
+            let base = if folded {
                 ux.home_sidebar_expand
             } else {
                 ux.home_sidebar_collapse
-            }))
+            };
+            match self.keymap.label("sidebar.toggle") {
+                Some(shortcut) => SharedString::from(format!("{base} ({shortcut})")),
+                None => SharedString::from(base),
+            }
+        };
+        let toggle = components::icon_only_button(Icon::Sidebar, metrics)
+            .id("home.sidebar.toggle")
+            .debug_selector(|| "home.sidebar.toggle".to_owned())
+            .tooltip(components::tooltip(toggle_tip))
             .on_click(cx.listener(|this, _event, _window, cx| {
                 this.toggle_home_sidebar(cx);
             }));
@@ -1717,12 +1771,7 @@ impl ShelluneView {
                     .child(filter)
                     .child(more)
                     .child({
-                        let shortcut =
-                            if crate::app::Platform::current() == crate::app::Platform::MacOs {
-                                "⌘N"
-                            } else {
-                                "Ctrl+N"
-                            };
+                        let shortcut = self.secondary_key_label("n");
                         let new_tip = format!("{} ({shortcut})", strings.primary_hosts);
                         components::icon_label_button(
                             Icon::Plus,
@@ -2726,11 +2775,7 @@ impl ShelluneView {
         let strings = self.strings();
         let ux = copy::ux();
         let backup = copy::backup_for(self.workspace.locale());
-        let shortcut = if crate::app::Platform::current() == crate::app::Platform::MacOs {
-            "⌘N"
-        } else {
-            "Ctrl+N"
-        };
+        let shortcut = self.secondary_key_label("n");
 
         let emblem = div()
             .flex()
@@ -4108,12 +4153,11 @@ fn row_tools_slot(tools: Div, cursor: bool, keycap: Option<Stateful<Div>>) -> Di
         }))
 }
 
-/// The quiet facts of a row with its actions laid over them.
+/// The quiet facts of a row beside its actions in a non-overlapping flex layout.
 ///
-/// At rest a row shows what it is - its group, when it was last reached, its state -
-/// and no column of buttons. Under the pointer, and at once on the keyboard's row or
-/// the row Enter would open, the tools and Connect cover those facts in the same place,
-/// on the row's own fill, so nothing moves and no room is kept empty for them.
+/// Metadata (group tag, last connected time, online status dot) remains visible even
+/// when the row is selected by keyboard or highlighted as a search match, with the
+/// action controls placed to its right instead of covering it with an opaque overlay.
 fn row_facts_and_actions(
     meta: Div,
     tools: Div,
@@ -4121,42 +4165,26 @@ fn row_facts_and_actions(
     shown: bool,
     metrics: Metrics,
 ) -> Div {
-    let veil = if shown {
-        palette::SURFACE_SELECTED
-    } else {
-        palette::SURFACE_HOVER
-    };
-    // The fills of a row are veils over the panel, so the cover is the panel's colour
-    // under the same veil: opaque, and the same shade as the row around it.
     let actions = div()
-        .absolute()
-        .top_0()
-        .bottom_0()
-        .right_0()
         .flex()
-        .bg(theme::swatch(palette::RAISED))
+        .flex_none()
+        .items_center()
+        .justify_end()
+        .gap(metrics.scale(spacing::TIGHT))
         .when(!shown, |cover| {
             cover
                 .opacity(0.0)
                 .group_hover(components::ROW_GROUP, |style| style.opacity(1.0))
         })
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_end()
-                .gap(metrics.scale(spacing::TIGHT))
-                .pl(metrics.scale(spacing::TIGHT))
-                .bg(theme::swatch(veil))
-                .child(tools)
-                .child(connect),
-        );
+        .child(tools)
+        .child(connect);
     div()
-        .relative()
         .flex()
-        .flex_none()
+        .flex_shrink()
+        .min_w_0()
         .items_center()
-        .child(meta)
+        .gap(metrics.scale(spacing::TIGHT))
+        .child(meta.min_w_0().flex_shrink())
         .child(actions)
 }
 

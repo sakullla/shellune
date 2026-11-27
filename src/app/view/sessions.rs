@@ -29,7 +29,7 @@ const SPLIT_MENU_WIDTH: f32 = 220.0;
 impl ShelluneView {
     /// Whether the session record is closed: its tab is gone and only the record is
     /// left.
-    fn is_closed(&self, id: SessionId) -> bool {
+    pub(super) fn is_closed(&self, id: SessionId) -> bool {
         self.workspace
             .session(id)
             .is_some_and(|session| matches!(session.state(), SessionState::Closed))
@@ -96,8 +96,26 @@ impl ShelluneView {
     /// Starts a closed session again: the same shell, or the same host's form.
     ///
     /// The new session takes the old record's place, so reopening does not leave a
-    /// closed copy behind it.
+    /// closed copy behind it. If the saved host or connection was deleted, an explicit
+    /// error toast is shown and the closed record is kept so the user knows why.
     pub fn reopen_session(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(kind) = self.workspace.session(id).map(Session::kind).cloned() {
+            let missing = match kind {
+                SessionKind::Remote { host } => {
+                    self.book.host(host).is_none()
+                        && !self.unsaved.iter().any(|(sid, _)| *sid == id)
+                }
+                SessionKind::Rdp { host }
+                | SessionKind::Vnc { host }
+                | SessionKind::Serial { host } => self.book.connection(host).is_none(),
+                SessionKind::Local { .. } => false,
+            };
+            if missing {
+                let message = self.strings().session_reopen_missing_host.to_owned();
+                self.toast(theme::Tone::Danger, message, None, cx);
+                return;
+            }
+        }
         self.duplicate_session(id, window, cx);
         if self.is_closed(id) {
             self.workspace.session_removed(id);

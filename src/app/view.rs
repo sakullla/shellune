@@ -702,6 +702,8 @@ pub struct ShelluneView {
     group_picker_closed: bool,
     /// Keyboard stops for the Home sidebar's fixed places: All, Favorites, Recent, Vault, Local.
     sidebar_place_focus: [FocusHandle; 5],
+    /// Keyboard stop for the folded Home sidebar's Groups button.
+    sidebar_groups_focus: FocusHandle,
     /// The host or connection row whose right-click menu is open, and where the pointer opened it.
     host_menu: Option<(HostId, gpui::Point<gpui::Pixels>)>,
     /// The connection form on screen. Other attempts keep theirs on [`Attempt::panel`].
@@ -824,6 +826,8 @@ pub struct ShelluneView {
     /// closing it cancels those transfers, and that is a consequence the user has to see
     /// before it happens.
     closing: Option<SessionId>,
+    /// Subsequent busy sessions queued for sequential close confirmation during batch close.
+    closing_queue: std::collections::VecDeque<SessionId>,
     /// The application close is waiting because transfers are still running.
     closing_app: bool,
     /// The user confirmed that those transfers may stop, so the window may close.
@@ -945,6 +949,13 @@ pub struct ShelluneView {
     palette: Option<Entity<TextField>>,
     /// What the palette's field held when the list was last ranked.
     palette_query: String,
+    /// Cached base palette entries built when opening the palette to avoid per-frame rebuilds.
+    palette_cache: Vec<crate::app::palette::Entry>,
+    /// True after keyboard navigation until the pointer physically moves, preventing stationary
+    /// hover from stealing the keyboard selection.
+    palette_pointer_locked: bool,
+    /// Last observed pointer position inside the palette list.
+    palette_last_mouse: Option<gpui::Point<gpui::Pixels>>,
     /// Whether the last input was the pointer. A focus ring answers "where are the
     /// keys?", which only matters to someone using them; a click already shows
     /// where it landed.
@@ -996,6 +1007,10 @@ pub struct ShelluneView {
     accent_hover: Option<(AccentRow, TabAccent)>,
     /// Whether the list of every open tab is open.
     tab_list_open: bool,
+    /// Search input inside the all-tabs overlay, present while the overlay is open.
+    tab_list_search: Option<Entity<TextField>>,
+    /// Current filter text inside the all-tabs overlay.
+    tab_list_query: String,
     /// The row the keyboard is on in that list.
     tab_list_selected: usize,
     /// The keyboard target of that list, so it answers Up, Down, Enter and Escape
@@ -1041,8 +1056,8 @@ pub struct ShelluneView {
     split_hover_button: Option<(u64, &'static str)>,
     /// The split divider currently focused by keyboard, if any.
     split_focused_divider: Option<u64>,
-    /// Focus handle for split divider keyboard focus.
-    divider_focus: FocusHandle,
+    /// Per-split focus handles so nested split dividers at every level can take keyboard focus.
+    divider_focuses: RefCell<HashMap<u64, FocusHandle>>,
     /// Measured pixel span of each split node along its axis, for 1:1 divider dragging.
     split_spans: RefCell<HashMap<u64, f32>>,
     /// Whether the sessions page shows the selected terminal rather than the list.
@@ -1084,8 +1099,6 @@ pub struct ShelluneView {
     /// instead of a page (ADR-2).
     #[cfg(feature = "ui-capture")]
     catalog_held: bool,
-    /// Whether the sidebar is collapsed to its icons.
-    rail_collapsed: bool,
     /// What the user chose for the palette.
     theme_choice: theme::ThemeChoice,
     /// The terminal's palette: the window's, or always dark or light.
@@ -3003,6 +3016,7 @@ impl ShelluneView {
                 cx.focus_handle().tab_stop(true),
                 cx.focus_handle().tab_stop(true),
             ],
+            sidebar_groups_focus: cx.focus_handle().tab_stop(true),
             host_menu: None,
             remote: None,
             chain: None,
@@ -3078,6 +3092,7 @@ impl ShelluneView {
             transfer_problem: None,
             transfer_skipped_folders: None,
             closing: None,
+            closing_queue: std::collections::VecDeque::new(),
             closing_app: false,
             app_close_confirmed: false,
             terminate_pending: false,
@@ -3120,6 +3135,9 @@ impl ShelluneView {
             files_layout_override: None,
             palette: None,
             palette_query: String::new(),
+            palette_cache: Vec::new(),
+            palette_pointer_locked: false,
+            palette_last_mouse: None,
             pointer_input: false,
             tool: None,
             pane_focus_pending: None,
@@ -3139,6 +3157,8 @@ impl ShelluneView {
             tab_rename: None,
             accent_hover: None,
             tab_list_open: false,
+            tab_list_search: None,
+            tab_list_query: String::new(),
             tab_list_selected: 0,
             tab_list_focus: cx.focus_handle(),
             tab_list_scroll: gpui::ScrollHandle::new(),
@@ -3163,7 +3183,6 @@ impl ShelluneView {
             retired_overlay_focus: Vec::new(),
             batch_was_open: false,
             remote_opened_from_workspace: false,
-            rail_collapsed: false,
             host_connection_fields: None,
             protocol_fields: None,
             desktop_secrets: std::collections::HashMap::new(),
@@ -3211,7 +3230,7 @@ impl ShelluneView {
             split_hover_band: None,
             split_hover_button: None,
             split_focused_divider: None,
-            divider_focus: cx.focus_handle(),
+            divider_focuses: RefCell::new(HashMap::new()),
             split_spans: RefCell::new(HashMap::new()),
             session_terminal: false,
             desktop_fullscreen: None,
@@ -3314,7 +3333,7 @@ impl ShelluneView {
             self.terminal_scheme = scheme;
         }
         if let Some(collapsed) = saved.sidebar_collapsed {
-            self.rail_collapsed = collapsed;
+            self.home_sidebar_fold = Some(collapsed);
         }
         if let Some(size) = saved
             .terminal_font_size
@@ -3387,7 +3406,7 @@ impl ShelluneView {
                 }
                 .to_owned(),
             ),
-            sidebar_collapsed: Some(self.rail_collapsed),
+            sidebar_collapsed: self.home_sidebar_fold,
             terminal_font_size: Some(self.workspace.local_font_size()),
             terminal_scheme: Some(
                 match self.terminal_scheme {
@@ -6560,6 +6579,7 @@ impl ShelluneView {
         if self.closing == Some(id) {
             self.closing = None;
         }
+        self.closing_queue.retain(|queued| *queued != id);
         if self.snippet_note.is_some_and(|note| note.session == id) {
             self.snippet_note = None;
         }
@@ -7049,13 +7069,16 @@ impl ShelluneView {
         self.close_session(id, cx);
     }
 
-    /// Keeps the session open and its transfers running.
+    /// Keeps the session open and its transfers running, and cancels any remaining
+    /// queued confirmations from a batch close.
     fn cancel_close_session(&mut self, cx: &mut Context<Self>) {
         self.closing = None;
+        self.closing_queue.clear();
         cx.notify();
     }
 
-    /// Closes the session the warning is about (R10).
+    /// Closes the session the warning is about (R10), then advances to the next
+    /// queued busy session if this came from a batch close.
     ///
     /// Only the transfers of this session are cancelled: the tasks of every other
     /// session keep running, because closing one tab says nothing about another.
@@ -7064,6 +7087,24 @@ impl ShelluneView {
             return;
         };
         self.close_session(id, cx);
+        self.advance_closing_queue(cx);
+    }
+
+    /// Presents the next queued session that still needs close confirmation, closing
+    /// any queued session whose active work finished in the meantime.
+    fn advance_closing_queue(&mut self, cx: &mut Context<Self>) {
+        while let Some(next) = self.closing_queue.pop_front() {
+            if self.workspace.session(next).is_none() || self.is_closed(next) {
+                continue;
+            }
+            if self.close_needs_confirmation(next) {
+                self.closing = Some(next);
+                cx.notify();
+                return;
+            }
+            self.close_session(next, cx);
+        }
+        cx.notify();
     }
 
     /// The question shown before a session with active transfers is closed (R9).
@@ -14915,18 +14956,12 @@ impl ShelluneView {
         }
     }
 
-    /// True when the labelled rail plus the page's main action would not fit.
-    ///
-    /// Window caption buttons stay a fixed 46px each; they are not part of the text scale.
+    /// Legacy rail-width check retained for `Metrics::rail_width` compatibility until
+    /// `theme.rs` is pruned in a dedicated cleanup.
+    #[allow(dead_code)]
     fn viewport_forces_icon_rail(&self) -> bool {
         let metrics = self.metrics();
-        let caption = if Platform::current() == Platform::Windows {
-            46.0 * 3.0
-        } else {
-            0.0
-        };
-        self.viewport_width
-            < metrics.rail_width() + metrics.scale(RAIL_PAGE_MIN_WIDTH) + px(caption)
+        self.viewport_width < metrics.rail_width()
     }
 
     /// The theme the user chose.
@@ -14973,6 +15008,10 @@ impl ShelluneView {
                 .as_ref()
                 .is_some_and(|editor| editor.area.read(cx).focus_handle() == handle)
             || handle == &self.tab_list_focus
+            || self
+                .tab_list_search
+                .as_ref()
+                .is_some_and(|field| field.read(cx).focus_handle() == handle)
             || handle == &self.forward_host_focus
             || self
                 .snippet_panel
@@ -15123,6 +15162,9 @@ impl ShelluneView {
             return self.root_focus.clone();
         }
         if self.tab_list_open {
+            if let Some(field) = &self.tab_list_search {
+                return field.read(cx).focus_handle().clone();
+            }
             return self.tab_list_focus.clone();
         }
         self.root_focus.clone()
@@ -15379,23 +15421,17 @@ impl ShelluneView {
         }
     }
 
-    /// Collapses the sidebar to its icons, or expands it again.
-    ///
-    /// A window that is already forcing the icon rail does not store that as the
-    /// user's choice, so widening it brings the labels back.
+    /// Collapses the sidebar to its icons, or expands it again, using the single
+    /// sidebar fold state shared with the home/vault toolbar and preferences.
     pub fn toggle_rail(&mut self, cx: &mut Context<Self>) {
-        if self.viewport_forces_icon_rail() {
-            return;
-        }
-        self.rail_collapsed = !self.rail_collapsed;
-        cx.notify();
+        self.toggle_home_sidebar(cx);
     }
 
     /// Whether the sidebar is collapsed.
     #[allow(dead_code)]
     #[must_use]
     pub fn rail_collapsed(&self) -> bool {
-        self.rail_collapsed
+        self.home_sidebar_folded()
     }
 
     /// Whether a question about something that cannot be undone is on screen: deleting
@@ -23466,7 +23502,7 @@ impl Render for ShelluneView {
         } else if self.focus_mode {
             // The system's window buttons stay on screen in focus mode, so a blank
             // caption strip keeps them off the first line of the session.
-            self.focus_mode_caption()
+            self.focus_mode_caption(cx)
         } else {
             Some(self.session_header(window, cx))
         };
@@ -23602,6 +23638,7 @@ impl Render for ShelluneView {
             }))
             .on_action(cx.listener(|this, _: &CycleTextSize, _window, cx| {
                 this.workspace.cycle_text_size();
+                this.persist_preferences();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleLanguage, _window, cx| {
@@ -24131,10 +24168,6 @@ const QUICK_PORT_WIDTH: f32 = 120.0;
 
 /// The gap between the lines of one import message, before zoom.
 const IMPORT_LINE_GAP: f32 = 1.0;
-
-/// The narrowest a page beside the full rail may become before the rail folds to
-/// icons, in logical pixels before zoom.
-const RAIL_PAGE_MIN_WIDTH: f32 = 280.0;
 
 /// The width of the local shell picker, before zoom.
 const SHELL_PICKER_WIDTH: f32 = 320.0;

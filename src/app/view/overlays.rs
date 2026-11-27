@@ -217,6 +217,7 @@ impl ShelluneView {
             if view.palette_query != query {
                 view.palette_query = query;
                 view.palette_selected = 0;
+                view.palette_pointer_locked = true;
                 view.palette_scroll.scroll_to_item(0);
                 cx.notify();
             }
@@ -252,7 +253,10 @@ impl ShelluneView {
         window.focus(field.read(cx).focus_handle());
         self.palette = Some(field);
         self.palette_query.clear();
+        self.palette_cache = self.palette_entries();
         self.palette_selected = 0;
+        self.palette_pointer_locked = false;
+        self.palette_last_mouse = None;
         cx.notify();
     }
 
@@ -262,6 +266,9 @@ impl ShelluneView {
             return;
         }
         self.palette_query.clear();
+        self.palette_cache.clear();
+        self.palette_pointer_locked = false;
+        self.palette_last_mouse = None;
         let modal_open = self.has_blocking_modal(cx);
         if let Some(handle) = self
             .palette_focus_return
@@ -425,9 +432,9 @@ impl ShelluneView {
             });
         }
 
-        let mut seen = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for (record, _, _) in self.book.recent_records() {
-            seen.push(record.id());
+            seen.insert(record.id());
             let (detail, icon) = match &record {
                 shellune_core::ConnectionRecord::Ssh(host) => {
                     (host_palette_detail(host, locale), Icon::Plug)
@@ -683,31 +690,32 @@ impl ShelluneView {
                 icon: Icon::Layers,
                 current: false,
             });
-            // Stepping through the colours cannot get back to none of them, and a name
-            // can only be cleared from a control; both are here so the keyboard alone
-            // can undo them as well as apply them (R2, R4).
-            entries.push(Entry {
-                command: Command::RestoreTabTitle(id),
-                group: Group::Actions,
-                title: strings.palette_restore_tab_title.to_owned(),
-                detail: self.tab_title(id),
-                shortcut: None,
-                icon: Icon::Pencil,
-                current: false,
-            });
-            entries.push(Entry {
-                command: Command::ClearTabAccent(id),
-                group: Group::Actions,
-                title: strings.palette_clear_tab_accent.to_owned(),
-                detail: accent
-                    .map_or(strings.tab_accent_none, |accent| {
-                        copy::tab_accent_label(accent, locale)
-                    })
-                    .to_owned(),
-                shortcut: None,
-                icon: Icon::Layers,
-                current: false,
-            });
+            // Only offer undo actions when the tab actually has a custom title or accent.
+            let has_custom_title = tab
+                .and_then(|tab| self.workspace.layout().tab(tab))
+                .is_some_and(|tab| tab.custom_title().is_some());
+            if has_custom_title {
+                entries.push(Entry {
+                    command: Command::RestoreTabTitle(id),
+                    group: Group::Actions,
+                    title: strings.palette_restore_tab_title.to_owned(),
+                    detail: self.tab_title(id),
+                    shortcut: None,
+                    icon: Icon::Pencil,
+                    current: false,
+                });
+            }
+            if let Some(accent) = accent {
+                entries.push(Entry {
+                    command: Command::ClearTabAccent(id),
+                    group: Group::Actions,
+                    title: strings.palette_clear_tab_accent.to_owned(),
+                    detail: copy::tab_accent_label(accent, locale).to_owned(),
+                    shortcut: None,
+                    icon: Icon::Layers,
+                    current: false,
+                });
+            }
         }
         entries.push(Entry {
             command: Command::QuickConnect,
@@ -942,27 +950,50 @@ impl ShelluneView {
                 current: false,
             });
         }
-        if !self.viewport_forces_icon_rail() {
-            entries.push(Entry {
-                command: Command::ToggleSidebar,
-                group: Group::Actions,
-                title: if self.rail_collapsed {
-                    ux.home_sidebar_expand
-                } else {
-                    ux.home_sidebar_collapse
-                }
-                .to_owned(),
-                detail: String::new(),
-                shortcut: self.keymap.label("sidebar.toggle"),
-                icon: Icon::Sidebar,
-                current: false,
-            });
-        }
+        entries.push(Entry {
+            command: Command::ToggleSidebar,
+            group: Group::Actions,
+            title: if self.home_sidebar_folded() {
+                ux.home_sidebar_expand
+            } else {
+                ux.home_sidebar_collapse
+            }
+            .to_owned(),
+            detail: String::new(),
+            shortcut: self.keymap.label("sidebar.toggle"),
+            icon: Icon::Sidebar,
+            current: false,
+        });
     }
 
     /// The entries that match what is typed, best first.
+    ///
+    /// Uses the snapshot cached when the palette opened to avoid rebuilding the entire
+    /// host/session catalog on every keystroke or frame, and prepends an inline quick
+    /// connect entry whenever the query parses as a valid SSH target.
     fn palette_results(&self) -> Vec<Entry> {
-        palette::rank(&self.palette_entries(), &self.palette_query)
+        let mut results = if !self.palette_cache.is_empty() {
+            palette::rank(&self.palette_cache, &self.palette_query)
+        } else {
+            palette::rank(&self.palette_entries(), &self.palette_query)
+        };
+        if let Some(target) = crate::app::hosts::parse_quick_target(&self.palette_query) {
+            let ux = copy::ux();
+            let label = target.label();
+            results.insert(
+                0,
+                Entry {
+                    command: Command::QuickConnectDirect,
+                    group: Group::Actions,
+                    title: copy::fill(ux.home_quick_temporary, &[("target", &label)]),
+                    detail: label,
+                    shortcut: None,
+                    icon: Icon::Plug,
+                    current: false,
+                },
+            );
+        }
+        results
     }
 
     /// The palette's current search, for tests.
@@ -1005,6 +1036,7 @@ impl ShelluneView {
     fn palette_step(&mut self, delta: isize, cx: &mut Context<Self>) {
         let results = self.palette_results();
         self.palette_selected = palette::step(self.palette_selected, delta, results.len());
+        self.palette_pointer_locked = true;
         self.palette_reveal(&results, cx);
     }
 
@@ -1016,6 +1048,7 @@ impl ShelluneView {
         } else {
             0
         };
+        self.palette_pointer_locked = true;
         self.palette_reveal(&results, cx);
     }
 
@@ -1055,6 +1088,9 @@ impl ShelluneView {
         {
             self.retire_focus_handle(&handle);
         }
+        let quick_target = (command == Command::QuickConnectDirect)
+            .then(|| crate::app::hosts::parse_quick_target(&self.palette_query))
+            .flatten();
         // Closing first lets the action decide where the keyboard goes next: a new
         // shell takes it, a page takes it, a form takes it.
         self.close_palette(window, cx);
@@ -1144,6 +1180,13 @@ impl ShelluneView {
                 self.close_editors_for_replacement(cx);
                 self.open_quick_connect(window, cx);
             }
+            Command::QuickConnectDirect => {
+                if let Some(target) = quick_target {
+                    self.close_tools_for_modal(cx);
+                    self.close_editors_for_replacement(cx);
+                    self.connect_quick_target(&target, window, cx);
+                }
+            }
             Command::InsertSnippet(id) => self.use_snippet(id, false, cx),
             Command::RunSnippet(id) => self.use_snippet(id, true, cx),
             Command::ManageSnippets => self.open_snippets(false, cx),
@@ -1198,6 +1241,7 @@ impl ShelluneView {
             Command::CycleMotion => self.cycle_motion(cx),
             Command::CycleTextSize => {
                 self.workspace.cycle_text_size();
+                self.persist_preferences();
                 cx.notify();
             }
         }
@@ -1247,6 +1291,14 @@ impl ShelluneView {
             .flex_shrink()
             .overflow_y_scroll()
             .track_scroll(&self.palette_scroll)
+            .on_mouse_move(
+                cx.listener(|this, event: &gpui::MouseMoveEvent, _window, _cx| {
+                    if this.palette_last_mouse != Some(event.position) {
+                        this.palette_last_mouse = Some(event.position);
+                        this.palette_pointer_locked = false;
+                    }
+                }),
+            )
             .px(metrics.scale(spacing::HAIRLINE + 2.0))
             .pb(metrics.scale(spacing::HAIRLINE + 2.0));
         for row in rows(&results, searching) {
@@ -1414,7 +1466,7 @@ impl ShelluneView {
                 row.bg(theme::swatch(colors::SURFACE_SELECTED))
             })
             .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
-                if *hovered && this.palette_selected != index {
+                if *hovered && !this.palette_pointer_locked && this.palette_selected != index {
                     this.palette_selected = index;
                     cx.notify();
                 }
@@ -1869,16 +1921,16 @@ impl ShelluneView {
 
     /// Closes every tab in `ids`.
     ///
-    /// A session with transfers or forwards still running is not closed behind the
-    /// user's back: the others close at once, and the first such session asks, as
-    /// its own close button would.
+    /// Sessions with active transfers or forwards are never silently dropped: non-busy
+    /// sessions close immediately, the first busy session prompts for confirmation, and
+    /// subsequent busy sessions are queued in order so every one is confirmed or kept.
     pub fn close_sessions(&mut self, ids: Vec<SessionId>, cx: &mut Context<Self>) {
-        let mut asked = false;
         for id in ids {
             if self.close_needs_confirmation(id) {
-                if !asked {
+                if self.closing.is_none() {
                     self.closing = Some(id);
-                    asked = true;
+                } else if self.closing != Some(id) && !self.closing_queue.contains(&id) {
+                    self.closing_queue.push_back(id);
                 }
                 continue;
             }
@@ -2600,6 +2652,22 @@ impl ShelluneView {
         self.session_more = None;
         self.files_menu = None;
         self.remember_focus(window, cx);
+        let strings = self.strings();
+        let search_field = cx.new(|cx| {
+            let mut field = TextField::new(strings.tab_list_search_placeholder, cx);
+            field.set_bare(true, cx);
+            field
+        });
+        cx.observe(&search_field, |view, field, cx| {
+            let query = field.read(cx).text().to_owned();
+            if view.tab_list_query != query {
+                view.tab_list_query = query;
+                view.tab_list_selected = 0;
+                view.tab_list_reveal.set(true);
+                cx.notify();
+            }
+        })
+        .detach();
         // The list opens with the keyboard on the tab that is on screen, so Up and Down
         // start from where the user already is and Enter never guesses (R17).
         self.tab_list_selected = self
@@ -2611,19 +2679,117 @@ impl ShelluneView {
                     .find(|index| self.workspace.layout().tabs()[*index].id() == active)
             })
             .unwrap_or(0);
+        self.tab_list_query.clear();
+        window.focus(search_field.read(cx).focus_handle());
+        self.tab_list_search = Some(search_field);
         self.tab_list_open = true;
         self.tab_list_reveal.set(true);
-        window.focus(&self.tab_list_focus);
         cx.notify();
+    }
+
+    /// Indices (into `layout().tabs()`) and identifiers matching the current all-tabs filter.
+    fn filtered_tab_list_indices(&self) -> Vec<(usize, TabId, Option<SessionId>)> {
+        let strings = self.strings();
+        let locale = self.workspace.locale();
+        let words: Vec<String> = self
+            .tab_list_query
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        let tabs = self.workspace.layout().tabs();
+        let anchors = self.workspace.tab_anchors();
+        let mut out = Vec::with_capacity(tabs.len());
+        for (index, tab) in tabs.iter().enumerate() {
+            let tab_id = tab.id();
+            let session = anchors
+                .iter()
+                .copied()
+                .find(|id| self.workspace.tab_of_session(*id) == Some(tab_id));
+            if !words.is_empty() {
+                let name = match session {
+                    Some(id) => self.tab_title(id),
+                    None => tab.display_title().to_owned(),
+                };
+                let (kind_label, target, state_label) =
+                    match session.and_then(|id| self.workspace.session(id)) {
+                        Some(sess) => {
+                            let kind = PaneKind::of(sess.kind());
+                            let (kind_label, _, _) = kind_badge_parts(kind, strings);
+                            let target = match sess.kind() {
+                                SessionKind::Local { .. } => {
+                                    program_label(&session_target(&self.book, sess))
+                                }
+                                _ => session_target(&self.book, sess),
+                            };
+                            (
+                                kind_label,
+                                target,
+                                copy::session_state_label(sess.state(), locale),
+                            )
+                        }
+                        None => {
+                            let kind = first_target(tab.root())
+                                .map(|target| match target {
+                                    PaneTarget::Local { .. } => PaneKind::Local,
+                                    PaneTarget::Remote { .. } => PaneKind::Remote,
+                                    PaneTarget::Rdp { .. } | PaneTarget::Vnc { .. } => {
+                                        PaneKind::Desktop
+                                    }
+                                    PaneTarget::Serial { .. } => PaneKind::Serial,
+                                })
+                                .unwrap_or(PaneKind::Local);
+                            let (kind_label, _, _) = kind_badge_parts(kind, strings);
+                            let target = first_target(tab.root())
+                                .map(|target| match target {
+                                    PaneTarget::Local { shell } => shell
+                                        .as_deref()
+                                        .map(program_label)
+                                        .unwrap_or_else(|| strings.session_kind_local.to_owned()),
+                                    PaneTarget::Remote { host } => self
+                                        .book
+                                        .host(*host)
+                                        .map(|host| host.target())
+                                        .unwrap_or_else(|| host.to_string()),
+                                    PaneTarget::Rdp { host }
+                                    | PaneTarget::Vnc { host }
+                                    | PaneTarget::Serial { host } => self
+                                        .book
+                                        .connection(*host)
+                                        .map(|record| record.target())
+                                        .unwrap_or_else(|| host.to_string()),
+                                })
+                                .unwrap_or_default();
+                            (kind_label, target, strings.pane_pending.to_owned())
+                        }
+                    };
+                let accent_text = tab
+                    .accent()
+                    .map(|accent| copy::tab_accent_label(accent, locale))
+                    .unwrap_or_default();
+                let haystack = format!(
+                    "{} {} {} {} {}",
+                    name, target, kind_label, state_label, accent_text
+                )
+                .to_lowercase();
+                if !words.iter().all(|word| haystack.contains(word.as_str())) {
+                    continue;
+                }
+            }
+            out.push((index, tab_id, session));
+        }
+        out
     }
 
     /// The keys the all-tabs list reads while it has the keyboard.
     ///
-    /// The list is a dialog of its own: it answers the arrow keys, Enter and Escape
-    /// rather than letting them reach the terminal behind it. The shortcut shown beside
-    /// a row is the binding in force for that position, not a copy of the defaults.
+    /// The list is a dialog of its own: it answers the arrow keys, Enter, F2 (rename),
+    /// Delete (close) and Escape rather than letting them reach the terminal behind it.
     fn tab_list_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.workspace.layout().tabs().len();
+        if event.keystroke.modifiers.number_of_modifiers() != 0 {
+            return;
+        }
+        let filtered = self.filtered_tab_list_indices();
+        let count = filtered.len();
         match event.keystroke.key.as_str() {
             "down" => {
                 self.tab_list_selected = palette::step(self.tab_list_selected, 1, count);
@@ -2638,9 +2804,38 @@ impl ShelluneView {
                 cx.stop_propagation();
             }
             "enter" if count > 0 => {
-                let index = self.tab_list_selected.min(count - 1);
+                let pos = self.tab_list_selected.min(count - 1);
+                let (index, _, _) = filtered[pos];
                 self.close_tab_list(window, cx);
                 self.select_tab(index, window, cx);
+                cx.stop_propagation();
+            }
+            "f2" if count > 0 => {
+                let pos = self.tab_list_selected.min(count - 1);
+                let (_, tab_id, _) = filtered[pos];
+                self.close_tab_list(window, cx);
+                self.open_tab_rename(tab_id, window, cx);
+                cx.stop_propagation();
+            }
+            "delete" if count > 0 => {
+                let pos = self.tab_list_selected.min(count - 1);
+                let (index, _, session) = filtered[pos];
+                if let Some(id) = session {
+                    if self.close_needs_confirmation(id) {
+                        self.close_tab_list(window, cx);
+                    }
+                    self.request_close_tab_anchor(id, cx);
+                } else {
+                    self.close_pending_tab(index, cx);
+                }
+                let remaining = self.filtered_tab_list_indices().len();
+                if remaining == 0 && self.workspace.layout().tabs().is_empty() {
+                    self.close_tab_list(window, cx);
+                } else {
+                    self.tab_list_selected =
+                        self.tab_list_selected.min(remaining.saturating_sub(1));
+                }
+                cx.notify();
                 cx.stop_propagation();
             }
             "escape" => {
@@ -2654,9 +2849,17 @@ impl ShelluneView {
     /// Closes the all-tabs list and gives the keyboard back to what was on screen.
     pub(super) fn close_tab_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if std::mem::take(&mut self.tab_list_open) {
+            self.tab_list_search = None;
+            self.tab_list_query.clear();
             self.restore_overlay_focus(window, cx);
             cx.notify();
         }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn tab_list_open_for_test(&self) -> bool {
+        self.tab_list_open
     }
 
     /// The list of every open tab, drawn over the page.
@@ -2672,9 +2875,9 @@ impl ShelluneView {
         let metrics = self.metrics();
         let strings = self.strings();
         let locale = self.workspace.locale();
-        let count = self.workspace.layout().tabs().len();
+        let filtered = self.filtered_tab_list_indices();
         let active = self.workspace.layout().active_tab_id();
-        let selected = self.tab_list_selected.min(count.saturating_sub(1));
+        let selected = self.tab_list_selected.min(filtered.len().saturating_sub(1));
         let (header, subtitle) = self.modal_header(
             Some(Icon::Layers),
             strings.tab_list_title.to_owned(),
@@ -2683,25 +2886,48 @@ impl ShelluneView {
             cx,
             |this, cx| {
                 this.tab_list_open = false;
+                this.tab_list_search = None;
+                this.tab_list_query.clear();
                 this.restore_focus_pending = true;
                 cx.notify();
             },
         );
+        let search_bar = self.tab_list_search.as_ref().map(|field| {
+            let focused = field.read(cx).focus_handle().is_focused(window);
+            div()
+                .debug_selector(|| "tabs.list.search".to_owned())
+                .child(components::search_field(
+                    field.clone().into_any_element(),
+                    None,
+                    None,
+                    if focused {
+                        components::ControlState::Focused
+                    } else {
+                        components::ControlState::Resting
+                    },
+                    metrics,
+                ))
+        });
         let mut rows = div()
             .flex()
             .flex_col()
             .gap(metrics.scale(spacing::HALF))
             .debug_selector(|| "tabs.list".to_owned());
-        for index in 0..count {
+        if filtered.is_empty() {
+            rows = rows.child(
+                div()
+                    .py(metrics.scale(spacing::WIDE))
+                    .text_center()
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(colors::TEXT_MUTED))
+                    .debug_selector(|| "tabs.list.empty".to_owned())
+                    .child(strings.tab_list_empty_search),
+            );
+        }
+        for (filtered_pos, &(index, tab_id, session)) in filtered.iter().enumerate() {
             let Some(tab) = self.workspace.layout().tabs().get(index) else {
                 continue;
             };
-            let tab_id = tab.id();
-            let session = self
-                .workspace
-                .tab_anchors()
-                .into_iter()
-                .find(|id| self.workspace.tab_of_session(*id) == Some(tab_id));
             let name = match session {
                 Some(id) => self.tab_title(id),
                 None => tab.display_title().to_owned(),
@@ -2779,7 +3005,7 @@ impl ShelluneView {
             let current = active == Some(tab_id);
             // The row the keyboard is on, drawn the same way the palette draws its own
             // highlight, so the two overlays answer the same keys the same way (R7).
-            let on_keyboard = index == selected;
+            let on_keyboard = filtered_pos == selected;
             let jump = crate::app::keymap::tab_jump_action(index + 1)
                 .and_then(|spec| self.keymap.label(spec.id));
             // What this tab is carrying from the background, spelled out: the strip has
@@ -2851,8 +3077,8 @@ impl ShelluneView {
                 // The pointer and the arrow keys move the same highlight, so the row a
                 // click would choose is the row Enter would open.
                 .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
-                    if *hovered && this.tab_list_selected != index {
-                        this.tab_list_selected = index;
+                    if *hovered && this.tab_list_selected != filtered_pos {
+                        this.tab_list_selected = filtered_pos;
                         cx.notify();
                     }
                 }))
@@ -2939,10 +3165,8 @@ impl ShelluneView {
                         })),
                 )
                 // The board exists because a crowded strip cannot be clicked; closing
-                // has to be one press here too (R8). It goes through the entry the
-                // strip's own cross uses, so a running transfer is still asked about
-                // before it stops and only this tab is named.
-                .children(session.map(|id| {
+                // has to be one press here too (R8) for both live and pending tabs.
+                .child(
                     components::icon_only_button(Icon::Close, metrics)
                         .id(SharedString::from(format!("tabs.list.close.{index}")))
                         .debug_selector(move || format!("tabs.list.close.{index}"))
@@ -2950,13 +3174,17 @@ impl ShelluneView {
                         .on_click(cx.listener(move |this, _event, window, cx| {
                             cx.stop_propagation();
                             this.close_tab_list(window, cx);
-                            this.request_close_tab_anchor(id, cx);
-                        }))
-                }));
+                            if let Some(id) = session {
+                                this.request_close_tab_anchor(id, cx);
+                            } else {
+                                this.close_pending_tab(index, cx);
+                            }
+                        })),
+                );
             rows = rows.child(row);
         }
-        // The list takes the keyboard while it is open, so its arrows and Enter work
-        // without a pointer and no key reaches the terminal behind it (R17).
+        // The list takes the keyboard while it is open, so its arrows, Enter, F2, Delete
+        // and Escape work without a pointer and no key reaches the terminal behind it.
         let body = div()
             .flex()
             .flex_col()
@@ -2967,6 +3195,7 @@ impl ShelluneView {
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.tab_list_key(event, window, cx);
             }))
+            .children(search_bar)
             .child(rows)
             .into_any_element();
         let hint = |keys: &'static str, label: &'static str| {
@@ -2979,10 +3208,12 @@ impl ShelluneView {
         };
         let footer = div()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(metrics.scale(spacing::SNUG))
-            .h(metrics.compact_control_height())
+            .min_h(metrics.compact_control_height())
             .px(metrics.scale(spacing::SNUG))
+            .py(metrics.scale(spacing::HAIRLINE))
             .border_t_1()
             .border_color(theme::swatch(colors::BORDER))
             .bg(theme::swatch(colors::CHROME))
@@ -2990,7 +3221,14 @@ impl ShelluneView {
             .text_color(theme::swatch(colors::TEXT_MUTED))
             .child(hint("\u{2191}\u{2193}", strings.palette_key_move))
             .child(hint("\u{21b5}", strings.palette_key_run))
+            .child(hint("F2", strings.tab_menu_rename))
+            .child(hint("Del", strings.tab_menu_close))
             .child(hint("Esc", strings.palette_key_close));
+        let dismiss: components::ModalDismiss = Box::new(cx.listener(
+            |this, _event: &gpui::MouseDownEvent, window, cx| {
+                this.close_tab_list(window, cx);
+            },
+        ));
         Some(self.modal_with(
             window,
             "tabs.list.dialog",
@@ -3003,7 +3241,7 @@ impl ShelluneView {
             },
             super::shell::ModalBehaviour {
                 scroll: Some(self.tab_list_scroll.clone()),
-                dismiss: None,
+                dismiss: Some(dismiss),
                 ..Default::default()
             },
         ))

@@ -52496,3 +52496,392 @@ async fn key_files_move_into_the_vault_and_their_connections_follow(cx: &mut Tes
         "the skipped file is named: {notice}"
     );
 }
+
+#[gpui::test]
+async fn t2_sidebar_fold_unifies_toolbar_palette_shortcut_and_persists_with_text_size(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("t2-sidebar-prefs");
+    let mut book = HostBook::new();
+    let mut host = HostConfig::new("prod-web", "10.0.0.10", 22, "deploy").expect("valid");
+    host.set_group_path(Some(GroupPath::parse("Prod").expect("valid")));
+    book.insert(host).expect("insert");
+    dir.store().save(&book).expect("save");
+
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.simulate_resize(size(px(1280.0), px(820.0)));
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.use_saved_preferences_for_test(&shellune_storage::Preferences::default(), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(!cx.update(|_window, app| view.read(app).home_sidebar_folded()));
+
+    // 1. Toolbar toggle folds the sidebar and persists `sidebar_collapsed = Some(true)`.
+    click(cx, "home.sidebar.toggle");
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).home_sidebar_folded()));
+    let saved = shellune_storage::PreferencesStore::at(dir.path()).load();
+    assert_eq!(saved.sidebar_collapsed, Some(true));
+
+    // 2. Folded Groups button is keyboard-reachable from Vault via Arrow Down and expands on Enter.
+    click(cx, "hosts.view.vault");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).home_sidebar_folded()),
+        "Enter on folded Groups expands the sidebar"
+    );
+    let saved = shellune_storage::PreferencesStore::at(dir.path()).load();
+    assert_eq!(saved.sidebar_collapsed, Some(false));
+
+    // 3. Shortcut (`ToggleSidebar`) and palette share the exact same state.
+    cx.dispatch_action(crate::app::actions::ToggleSidebar);
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).home_sidebar_folded()));
+    let saved = shellune_storage::PreferencesStore::at(dir.path()).load();
+    assert_eq!(saved.sidebar_collapsed, Some(true));
+
+    // 4. `CycleTextSize` persists `text_size`.
+    let before_size = saved.text_size;
+    cx.dispatch_action(CycleTextSize);
+    cx.run_until_parked();
+    let after = shellune_storage::PreferencesStore::at(dir.path()).load();
+    assert_ne!(after.text_size, before_size, "CycleTextSize persists zoom");
+}
+
+#[gpui::test]
+async fn t2_host_row_selected_and_search_match_do_not_occlude_meta(cx: &mut TestAppContext) {
+    let dir = TempDir::new("t2-host-row-meta");
+    let mut book = HostBook::new();
+    let mut host = HostConfig::new("prod-api", "10.0.0.21", 22, "deploy").expect("valid");
+    host.set_group_path(Some(GroupPath::parse("Prod").expect("valid")));
+    let host_id = host.id();
+    book.insert(host).expect("insert");
+    let mut other = HostConfig::new("staging-db", "10.0.0.22", 22, "ops").expect("valid");
+    other.set_group_path(Some(GroupPath::parse("Staging").expect("valid")));
+    book.insert(other).expect("insert");
+    book.record_connection(host_id, 1_700_000_000)
+        .expect("record connection");
+    dir.store().save(&book).expect("save");
+
+    let (_view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.simulate_resize(size(px(1280.0), px(820.0)));
+    cx.run_until_parked();
+
+    // Select the first row via keyboard cursor.
+    click(cx, "hosts.row.0");
+    cx.run_until_parked();
+    let tag = bounds_of(cx, "hosts.tag.0");
+    let last = bounds_of(cx, "hosts.last.0");
+    let connect = bounds_of(cx, "hosts.connect.0");
+    assert!(
+        tag.right() <= connect.left(),
+        "selected row group tag must not be covered by connect button: {tag:?} vs {connect:?}"
+    );
+    assert!(
+        last.right() <= connect.left(),
+        "selected row last-connected time must not be covered by connect button: {last:?} vs {connect:?}"
+    );
+
+    // Search so row 0 is the Enter match (`host.enter == true`).
+    click(cx, "hosts.search");
+    cx.simulate_input("prod-api");
+    cx.run_until_parked();
+    let tag = bounds_of(cx, "hosts.tag.0");
+    let last = bounds_of(cx, "hosts.last.0");
+    let connect = bounds_of(cx, "hosts.connect.0");
+    assert!(
+        tag.right() <= connect.left(),
+        "search match group tag must not be covered: {tag:?} vs {connect:?}"
+    );
+    assert!(
+        last.right() <= connect.left(),
+        "search match last time must not be covered: {last:?} vs {connect:?}"
+    );
+}
+
+#[gpui::test]
+async fn t2_focus_mode_provides_top_hover_exit_control(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    cx.simulate_resize(size(px(1280.0), px(820.0)));
+    cx.run_until_parked();
+
+    cx.dispatch_action(crate::app::keymap::ToggleFocusMode);
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).focus_mode()));
+    assert!(
+        cx.debug_bounds("focus.mode.top.exit").is_some(),
+        "top hover exit control is rendered in focus mode"
+    );
+
+    click(cx, "focus.mode.top.exit");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).focus_mode()),
+        "clicking top hover exit control leaves focus mode"
+    );
+}
+
+#[gpui::test]
+async fn t2_palette_inline_quick_connect_pointer_lock_and_conditional_tab_actions(
+    cx: &mut TestAppContext,
+) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    cx.simulate_resize(size(px(1280.0), px(820.0)));
+    cx.run_until_parked();
+
+    // Default tab has neither custom title nor accent, so restore/clear actions are hidden.
+    cx.dispatch_action(crate::app::actions::OpenPalette);
+    cx.run_until_parked();
+    let titles = cx.update(|_window, app| view.read(app).palette_titles());
+    let strings = Locale::English.strings();
+    assert!(
+        !titles
+            .iter()
+            .any(|t| t == strings.palette_restore_tab_title),
+        "RestoreTabTitle must be omitted when no custom title is set"
+    );
+    assert!(
+        !titles.iter().any(|t| t == strings.palette_clear_tab_accent),
+        "ClearTabAccent must be omitted when no accent is set"
+    );
+
+    // Keyboard navigation advances selection.
+    let first_title = cx.update(|_window, app| view.read(app).palette_selected_title());
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    let second_title = cx.update(|_window, app| view.read(app).palette_selected_title());
+    assert_ne!(first_title, second_title);
+
+    // Typing an ssh:// IPv6 quick target shows an inline quick-connect entry at index 0.
+    cx.simulate_input("ssh://alice@[::1]:2222");
+    cx.run_until_parked();
+    let results = cx.update(|_window, app| view.read(app).palette_titles());
+    assert!(
+        results
+            .first()
+            .is_some_and(|title| title.contains("alice@[::1]:2222")),
+        "inline quick-connect entry should appear first: {results:?}"
+    );
+}
+
+#[gpui::test]
+async fn t2_split_pane_header_identity_nested_divider_focus_and_right_click_focus(
+    cx: &mut TestAppContext,
+) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    cx.simulate_resize(size(px(1280.0), px(820.0)));
+    cx.run_until_parked();
+
+    // Create 3 nested panes (2 dividers: vertical then horizontal).
+    cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.split_active_for_test(SplitAxis::LeftRight, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.split_active_for_test(SplitAxis::TopBottom, window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let splits = cx.update(|_window, app| view.read(app).active_split_ids_for_test());
+    assert_eq!(splits.len(), 2, "nested 3-pane layout has 2 split dividers");
+
+    // Pane headers report the shell/host identity rather than generic "Pane N".
+    let panes: Vec<shellune_core::PaneId> = cx.update(|_window, app| {
+        view.read(app)
+            .workspace()
+            .layout()
+            .leaves()
+            .into_iter()
+            .map(|leaf| leaf.id())
+            .collect()
+    });
+    for pane in &panes {
+        let identity = cx
+            .update(|_window, app| view.read(app).pane_header_identity_for_test(*pane))
+            .expect("pane identity");
+        assert!(
+            !identity.is_empty() && !identity.starts_with("Pane "),
+            "pane header should show shell/host identity, got {identity:?}"
+        );
+    }
+
+    // Focus the secondary nested divider and resize it via keyboard arrow key.
+    let nested_split = splits[1];
+    let before_ratios = cx.update(|_window, app| view.read(app).layout_ratios_for_test());
+    cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.focus_split_divider_for_test(nested_split, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    let after_ratios = cx.update(|_window, app| view.read(app).layout_ratios_for_test());
+    assert_ne!(
+        before_ratios, after_ratios,
+        "secondary nested divider responds to keyboard resize"
+    );
+
+    // Right-clicking an idle pane transfers active pane and window focus to it.
+    let before_active = cx.update(|_window, app| view.read(app).workspace().layout().active_pane());
+    let idle_center = bounds_of(cx, "pane.idle").center();
+    cx.simulate_mouse_down(idle_center, gpui::MouseButton::Right, Modifiers::none());
+    cx.simulate_mouse_up(idle_center, gpui::MouseButton::Right, Modifiers::none());
+    cx.run_until_parked();
+    let after_active = cx.update(|_window, app| view.read(app).workspace().layout().active_pane());
+    assert_ne!(
+        before_active, after_active,
+        "right-clicking an idle pane activates it"
+    );
+}
+
+#[gpui::test]
+async fn t2_all_tabs_search_dismiss_pending_close_batch_queue_and_reopen_deleted_host(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("t2-tabs-batch-reopen");
+    let mut book = HostBook::new();
+    let host = HostConfig::new("ephemeral-host", "10.0.0.99", 22, "deploy").expect("valid");
+    let host_id = host.id();
+    book.insert(host).expect("insert");
+    dir.store().save(&book).expect("save");
+
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.simulate_resize(size(px(1280.0), px(820.0)));
+    cx.run_until_parked();
+
+    let first = live_remote(cx, &view);
+    let (_files1, _t1) = open_transfers(cx, &view, first);
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/first.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let second = live_remote_second(cx, &view, first);
+    let (_files2, _t2) = open_transfers(cx, &view, second);
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/second.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // Batch close both busy sessions: first prompts, confirming advances to second!
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.close_sessions(vec![first, second], cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).closing_for_test()),
+        Some(first),
+        "first busy session prompts first"
+    );
+    click(cx, "session.close.confirm");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).closing_for_test()),
+        Some(second),
+        "confirming first busy session advances confirmation queue to second"
+    );
+    click(cx, "session.close.confirm");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).closing_for_test()),
+        None
+    );
+
+    // Delete the saved host and attempt to reopen the closed session -> Danger toast & record kept.
+    let closed_remote = cx.update(|_window, app| {
+        view.read(app)
+            .workspace()
+            .closed_sessions()
+            .into_iter()
+            .find(|id| {
+                view.read(app)
+                    .workspace()
+                    .session(*id)
+                    .is_some_and(|s| matches!(s.kind(), shellune_core::SessionKind::Remote { host } if *host == host_id))
+            })
+    });
+    if let Some(closed_id) = closed_remote {
+        click(cx, "nav.hosts");
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| {
+                view.request_delete_host_for_test(host_id, cx);
+            });
+        });
+        cx.run_until_parked();
+        click(cx, "hosts.confirm.delete");
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.reopen_session(closed_id, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let toasts = cx.update(|_window, app| view.read(app).toast_entries());
+        assert!(
+            toasts
+                .iter()
+                .any(|(tone, _)| *tone == crate::app::theme::Tone::Danger),
+            "reopening deleted host shows Danger toast: {toasts:?}"
+        );
+        assert!(
+            cx.update(|_window, app| view.read(app).workspace().session(closed_id).is_some()),
+            "closed session record is preserved instead of silently deleted"
+        );
+    }
+
+    // All-tabs overlay: open with 2 shells, search filters rows, click outside dismisses.
+    cx.dispatch_action(crate::app::actions::NewLocalShell);
+    cx.dispatch_action(crate::app::actions::NewLocalShell);
+    cx.run_until_parked();
+    cx.update(|window, app| {
+        view.update(app, |view, cx| view.toggle_tab_list(window, cx));
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("tabs.list.search").is_some());
+    cx.simulate_input("definitely-no-tab-matches-this");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("tabs.list.empty").is_some(),
+        "search filter narrows all-tabs list to empty state"
+    );
+    // Click outside the modal backdrop to dismiss.
+    let dialog = bounds_of(cx, "tabs.list.dialog");
+    let outside = point(
+        dialog.origin.x / 2.0,
+        dialog.origin.y + dialog.size.height / 2.0,
+    );
+    cx.simulate_click(outside, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).tab_list_open_for_test()),
+        "clicking outside backdrop dismisses all-tabs overlay"
+    );
+}

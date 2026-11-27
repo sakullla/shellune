@@ -47,6 +47,8 @@ pub enum Command {
     UnlockVault,
     /// Connects with an address that is not saved as a host first.
     QuickConnect,
+    /// Connects directly to the quick-connect target typed into the palette query.
+    QuickConnectDirect,
     /// Types a saved command into the terminal on screen, without running it (R6).
     InsertSnippet(SnippetId),
     /// Types a saved command into the terminal on screen and submits it (R6).
@@ -235,18 +237,21 @@ fn score(entry: &Entry, words: &[String]) -> Option<u32> {
     let detail = entry.detail.to_lowercase();
     let mut total = 0;
     for word in words {
+        let word_len = word.chars().count();
         total += if title.starts_with(word.as_str()) {
-            8
+            10
         } else if title
             .split(|c: char| !c.is_alphanumeric())
             .any(|part| part.starts_with(word.as_str()))
         {
-            6
+            8
         } else if title.contains(word.as_str()) {
-            4
+            6
         } else if detail.contains(word.as_str()) {
+            4
+        } else if word_len >= 3 && is_subsequence(word, &title) {
             2
-        } else if word.chars().count() >= 3 && is_subsequence(word, &title) {
+        } else if word_len >= 3 && is_subsequence(word, &detail) {
             1
         } else {
             return None;
@@ -258,11 +263,10 @@ fn score(entry: &Entry, words: &[String]) -> Option<u32> {
 /// Where the words of `query` were found in `text`, as merged byte ranges, so the
 /// palette can draw why an entry matched.
 ///
-/// Each word is looked for case-insensitively, first at the start of a part of the
-/// text ("web" in "prod-web-01"), then anywhere in it; a word that only matched as a
-/// scattered subsequence marks nothing, since marking single letters across a title
-/// reads as noise rather than as an answer. The ranges always fall on character
-/// boundaries, whatever script the text is in.
+/// Each word is looked for case-insensitively: first at the start of a part of the
+/// text ("web" in "prod-web-01"), then anywhere in it, and finally (for words of at
+/// least three characters) as an in-order subsequence ("bsn" in "bastion"). The ranges
+/// always fall on character boundaries, whatever script the text is in.
 #[must_use]
 pub fn highlights(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
@@ -285,6 +289,26 @@ pub fn highlights(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
             at_part.or_else(|| (0..chars.len()).find(|&start| found_at(start, &word)))
         {
             ranges.push(chars[start].0..byte_end(start + word.len()));
+        } else if word.len() >= 3 {
+            let mut matched = Vec::with_capacity(word.len());
+            let mut cursor = 0;
+            let mut all_found = true;
+            for &wanted in &word {
+                if let Some(offset) = chars[cursor..]
+                    .iter()
+                    .position(|(_, letter)| same(wanted, *letter))
+                {
+                    let idx = cursor + offset;
+                    matched.push(chars[idx].0..byte_end(idx + 1));
+                    cursor = idx + 1;
+                } else {
+                    all_found = false;
+                    break;
+                }
+            }
+            if all_found {
+                ranges.extend(matched);
+            }
         }
     }
     ranges.sort_by_key(|range| range.start);
@@ -346,14 +370,35 @@ mod tests {
             vec![0..6, 7..9]
         );
         assert_eq!(highlights("staging", "sta ging"), vec![0..7]);
-        // A word that is not there, or only a subsequence, marks nothing.
-        assert!(highlights("bastion", "bsn").is_empty());
+        // A word of at least three letters matched as a subsequence marks its characters;
+        // a word not present at all marks nothing.
+        assert_eq!(highlights("bastion", "bsn"), vec![0..1, 2..3, 6..7]);
+        assert!(highlights("bastion", "xyz").is_empty());
         assert!(highlights("bastion", "").is_empty());
         // Ranges fall on character boundaries in any script.
         let text = "新建本地终端";
         let ranges = highlights(text, "本地");
         assert_eq!(ranges.len(), 1);
         assert_eq!(&text[ranges[0].clone()], "本地");
+    }
+
+    #[test]
+    fn detail_subsequence_matches_and_ranks_below_title_subsequence() {
+        let entries = [
+            entry("gateway", "deploy@production-api.internal", Group::Hosts),
+            entry("production-web", "root@10.0.0.1", Group::Hosts),
+        ];
+        let ranked = rank(&entries, "pdw");
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].title, "production-web");
+
+        let detail_ranked = rank(&entries, "dpi");
+        assert_eq!(detail_ranked.len(), 1);
+        assert_eq!(detail_ranked[0].title, "gateway");
+        assert!(
+            !highlights(&detail_ranked[0].detail, "dpi").is_empty(),
+            "detail subsequence match highlights its characters"
+        );
     }
 
     #[test]

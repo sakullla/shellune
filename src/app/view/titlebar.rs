@@ -109,18 +109,52 @@ impl ShelluneView {
         }
     }
 
-    /// The blank caption focus mode leaves at the top of the window on macOS.
+    /// The caption focus mode leaves at the top of the window on macOS.
     ///
     /// The tab strip is hidden there, but the system still draws its window buttons
-    /// over the session. The strip is as tall as the top row, so the buttons keep the
-    /// place they were given, and it drags the window like the row it stands for.
-    pub(super) fn focus_mode_caption(&self) -> Option<Div> {
+    /// over the session. Hovering the caption reveals a low-interference centred exit
+    /// control so focus mode can always be left without memorising the shortcut.
+    pub(super) fn focus_mode_caption(&self, cx: &mut Context<Self>) -> Option<Div> {
         (Platform::current() == Platform::MacOs).then(|| {
-            div().flex_none().child(
+            let metrics = self.metrics();
+            let ux = crate::app::copy::ux();
+            let tooltip = match self.keymap.label("view.focus") {
+                Some(shortcut) => format!("{} ({shortcut})", ux.focus_mode_exit),
+                None => ux.focus_mode_exit.to_owned(),
+            };
+            div().flex_none().group("focus-caption").child(
                 self.drag_area("focus.caption")
                     .w_full()
-                    .h(self.metrics().header_height())
-                    .bg(theme::swatch(palette::CANVAS)),
+                    .h(metrics.header_height())
+                    .bg(theme::swatch(palette::CANVAS))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .opacity(0.0)
+                            .group_hover("focus-caption", |style| style.opacity(1.0))
+                            .child(
+                                crate::app::components::icon_label_button(
+                                    Icon::Restore,
+                                    ux.focus_mode_exit,
+                                    crate::app::components::Variant::Ghost,
+                                    metrics,
+                                )
+                                .h(metrics.compact_control_height())
+                                .id("focus.mode.caption.exit")
+                                .debug_selector(|| "focus.mode.caption.exit".to_owned())
+                                .tooltip(crate::app::components::tooltip(gpui::SharedString::from(
+                                    tooltip,
+                                )))
+                                .on_click(cx.listener(
+                                    |this, _event, window, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_focus_mode(window, cx);
+                                    },
+                                )),
+                            ),
+                    ),
             )
         })
     }
