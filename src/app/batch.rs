@@ -116,6 +116,8 @@ pub enum BatchPage {
 pub enum BatchHostFilter {
     /// Failed or interrupted hosts.
     Failed,
+    /// Hosts specifically waiting on a host-key trust decision.
+    PendingTrust,
     /// Hosts waiting on a host-key or ProxyCommand answer.
     Waiting,
     /// Hosts currently queued, connecting or running.
@@ -126,19 +128,34 @@ pub enum BatchHostFilter {
 
 impl BatchHostFilter {
     /// Every narrowed filter pill offered beside "All".
-    pub const ALL: [Self; 4] = [Self::Failed, Self::Waiting, Self::Running, Self::Done];
+    pub const ALL: [Self; 5] = [
+        Self::Failed,
+        Self::PendingTrust,
+        Self::Waiting,
+        Self::Running,
+        Self::Done,
+    ];
 
     /// Whether a host in `state` passes this filter.
     #[must_use]
     pub fn matches(self, state: HostState) -> bool {
         match self {
             Self::Failed => matches!(state, HostState::Failed | HostState::Interrupted),
-            Self::Waiting => state == HostState::WaitingForUser,
+            Self::PendingTrust | Self::Waiting => state == HostState::WaitingForUser,
             Self::Running => matches!(
                 state,
                 HostState::Queued | HostState::Connecting | HostState::Running
             ),
             Self::Done => state == HostState::Succeeded,
+        }
+    }
+
+    /// Whether a host with `state` and optional pending `question` passes this filter.
+    #[must_use]
+    pub fn matches_host(self, state: HostState, question: Option<&BatchQuestion>) -> bool {
+        match self {
+            Self::PendingTrust => matches!(question, Some(BatchQuestion::HostKey { .. })),
+            other => other.matches(state),
         }
     }
 }
@@ -628,6 +645,54 @@ impl BatchRunPage {
             .iter()
             .filter(|host| host.state() == HostState::Failed)
             .count()
+    }
+
+    /// How many hosts are waiting specifically for a host-key trust decision.
+    #[must_use]
+    pub fn pending_trust_hosts(&self) -> usize {
+        self.run
+            .hosts()
+            .iter()
+            .filter(|host| {
+                matches!(
+                    self.questions.get(&host.target().host_id()),
+                    Some(BatchQuestion::HostKey { .. })
+                )
+            })
+            .count()
+    }
+
+    /// Fraction of hosts that have finished (`0.0..=1.0`).
+    #[must_use]
+    pub fn progress_fraction(&self) -> f32 {
+        let total = self.total_hosts();
+        if total == 0 {
+            return 0.0;
+        }
+        (self.finished_hosts() as f32 / total as f32).clamp(0.0, 1.0)
+    }
+
+    /// Hosts matching both `filter` and case-insensitive substring `query`.
+    #[must_use]
+    pub fn matching_hosts(
+        &self,
+        filter: Option<BatchHostFilter>,
+        query: &str,
+    ) -> Vec<&shellune_core::HostRun> {
+        let needle = query.trim().to_lowercase();
+        self.run
+            .hosts()
+            .iter()
+            .filter(|host| {
+                let id = host.target().host_id();
+                let passes_filter =
+                    filter.is_none_or(|f| f.matches_host(host.state(), self.questions.get(&id)));
+                let passes_query = needle.is_empty()
+                    || host.target().label().to_lowercase().contains(&needle)
+                    || host.target().destination().to_lowercase().contains(&needle);
+                passes_filter && passes_query
+            })
+            .collect()
     }
 
     /// The host whose output the page shows.
@@ -1398,7 +1463,10 @@ impl BatchCenter {
                 .run
                 .hosts()
                 .iter()
-                .filter(|host| filter.is_none_or(|f| f.matches(host.state())))
+                .filter(|host| {
+                    let id = host.target().host_id();
+                    filter.is_none_or(|f| f.matches_host(host.state(), page.questions.get(&id)))
+                })
                 .map(|host| host.target().host_id())
                 .collect();
             if let Some(first) = visible.first().copied()
@@ -1409,7 +1477,17 @@ impl BatchCenter {
         }
     }
 
+    /// Switches the active run host filter to pending host-key trust and selects the
+    /// first host waiting for trust, returning its row index when one exists.
+    pub fn jump_to_pending_trust(&mut self) -> Option<usize> {
+        self.set_run_host_filter(Some(BatchHostFilter::PendingTrust));
+        let page = self.active.as_ref()?;
+        let hosts = page.matching_hosts(Some(BatchHostFilter::PendingTrust), "");
+        if hosts.is_empty() { None } else { Some(0) }
+    }
+
     /// Steps the selected host in the active run up or down across visible hosts.
+    #[allow(dead_code)]
     pub fn step_run_host(&mut self, delta: isize, limit: usize) -> bool {
         let filter = self.run_host_filter;
         let Some(page) = self.active.as_mut() else {
@@ -1419,7 +1497,10 @@ impl BatchCenter {
             .run
             .hosts()
             .iter()
-            .filter(|host| filter.is_none_or(|f| f.matches(host.state())))
+            .filter(|host| {
+                let id = host.target().host_id();
+                filter.is_none_or(|f| f.matches_host(host.state(), page.questions.get(&id)))
+            })
             .take(limit)
             .map(|host| host.target().host_id())
             .collect();
@@ -1435,7 +1516,30 @@ impl BatchCenter {
         true
     }
 
+    /// Steps the selected host across all hosts matching the active filter and search query,
+    /// returning the new index in the filtered list so the virtualized list can scroll to it.
+    pub fn step_run_host_filtered(&mut self, delta: isize, query: &str) -> Option<usize> {
+        let filter = self.run_host_filter;
+        let page = self.active.as_mut()?;
+        let ids: Vec<HostId> = page
+            .matching_hosts(filter, query)
+            .into_iter()
+            .map(|host| host.target().host_id())
+            .collect();
+        if ids.is_empty() {
+            return None;
+        }
+        let at = page
+            .selected
+            .and_then(|sel| ids.iter().position(|id| *id == sel))
+            .unwrap_or(0);
+        let next = crate::app::palette::step(at, delta, ids.len());
+        page.selected = Some(ids[next]);
+        Some(next)
+    }
+
     /// Steps the selected host in an open stored run up or down.
+    #[allow(dead_code)]
     pub fn next_stored_host(&self, delta: isize, limit: usize) -> Option<HostId> {
         let run = self.stored_summary()?;
         let ids: Vec<HostId> = run
@@ -1453,6 +1557,62 @@ impl BatchCenter {
             .unwrap_or(0);
         let next = crate::app::palette::step(at, delta, ids.len());
         Some(ids[next])
+    }
+
+    /// Steps the selected host in an open stored run across all hosts, returning `(host_id, index)`.
+    pub fn next_stored_host_index(&self, delta: isize) -> Option<(HostId, usize)> {
+        let run = self.stored_summary()?;
+        let ids: Vec<HostId> = run
+            .hosts()
+            .iter()
+            .map(|host| host.target().host_id())
+            .collect();
+        if ids.is_empty() {
+            return None;
+        }
+        let at = self
+            .history_host
+            .and_then(|sel| ids.iter().position(|id| *id == sel))
+            .unwrap_or(0);
+        let next = crate::app::palette::step(at, delta, ids.len());
+        Some((ids[next], next))
+    }
+
+    /// Saved tasks matching a case-insensitive keyword on name or step commands.
+    #[must_use]
+    pub fn library_filtered(&self, query: &str) -> Vec<&BatchTask> {
+        let needle = query.trim().to_lowercase();
+        self.library
+            .tasks()
+            .iter()
+            .filter(|task| {
+                needle.is_empty()
+                    || task
+                        .name()
+                        .is_some_and(|name| name.to_lowercase().contains(&needle))
+                    || task
+                        .steps()
+                        .iter()
+                        .any(|step| step.command().to_lowercase().contains(&needle))
+            })
+            .collect()
+    }
+
+    /// Stored runs matching both the active state filter and a case-insensitive keyword.
+    #[must_use]
+    pub fn history_filtered(&self, query: &str) -> Vec<&HistoryEntry> {
+        let needle = query.trim().to_lowercase();
+        self.history_visible()
+            .into_iter()
+            .filter(|entry| {
+                needle.is_empty()
+                    || entry.id().to_string().to_lowercase().contains(&needle)
+                    || entry
+                        .summary()
+                        .and_then(|run| run.task().name())
+                        .is_some_and(|name| name.to_lowercase().contains(&needle))
+            })
+            .collect()
     }
 
     /// Records why an action was refused, for the page to show.

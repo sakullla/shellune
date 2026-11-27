@@ -14,14 +14,19 @@
 //! * cancel is not drawn as a stop: while the remote command has not ended the page says
 //!   cancelling, and the run's own end is what turns it into cancelled.
 
+use std::rc::Rc;
+
 use gpui::prelude::*;
-use gpui::{Context, Div, FontWeight, SharedString, Stateful, Window, div, px};
+use gpui::{
+    AnyElement, Context, Div, FontWeight, ScrollStrategy, SharedString, Stateful, WeakEntity,
+    Window, div, px, uniform_list,
+};
 use shellune_core::{BatchTarget, FailurePolicy, HostId, HostState, RunState, StepState};
 
 use super::ShelluneView;
 use super::shell::{ModalContent, NoticeForm};
 use crate::app::batch::{BatchHostFilter, BatchRunPage, MAX_PREVIEW_ROWS};
-use crate::app::components::{self, Variant};
+use crate::app::components::{self, ControlState, Variant};
 use crate::app::copy::{self, UxStrings};
 use crate::app::hosts::SelectionScope;
 use crate::app::icons::Icon;
@@ -31,14 +36,22 @@ use crate::app::theme::{self, Metrics, Tone, palette, radius, spacing};
 ///
 /// Wide enough for a host row with its steps on one line and an output pane beside the
 /// list; the dialog falls back to the viewport minus its margin at 720 pixels.
-const BATCH_DIALOG_WIDTH: f32 = 880.0;
+const BATCH_DIALOG_WIDTH: f32 = components::MODAL_WIDTH_LG;
 
 /// The tallest the saved tasks and the stored runs grow before they scroll.
 const LIST_MAX_HEIGHT: f32 = 320.0;
+/// Fixed row height for virtualized saved tasks in the library.
+const LIBRARY_ROW_HEIGHT: f32 = 56.0;
+/// Fixed row height for virtualized stored runs in history.
+const HISTORY_ROW_HEIGHT: f32 = 56.0;
 /// The tallest the hosts of a stored run grow before they scroll.
 const HOSTS_MAX_HEIGHT: f32 = 160.0;
+/// Fixed row height for virtualized hosts in a stored run.
+const HISTORY_HOST_ROW_HEIGHT: f32 = 64.0;
 /// The height of a stored run's output.
 const OUTPUT_HEIGHT: f32 = 140.0;
+/// The expanded height of a stored run's output.
+const HISTORY_OUTPUT_EXPANDED_HEIGHT: f32 = 320.0;
 /// The tallest the targets of the editor grow before they scroll.
 const TARGETS_MAX_HEIGHT: f32 = 140.0;
 /// The width of a step's number before its command.
@@ -51,30 +64,14 @@ const NAME_MIN_WIDTH: f32 = 160.0;
 const RUN_HOSTS_MIN_WIDTH: f32 = 320.0;
 /// The tallest the running hosts column grows before it scrolls.
 const RUN_HOSTS_MAX_HEIGHT: f32 = 300.0;
+/// Fixed row height for virtualized hosts in an active run.
+const RUN_HOST_ROW_HEIGHT: f32 = 72.0;
 /// The least width of the output column of a run.
 const RUN_SIDE_MIN_WIDTH: f32 = 300.0;
 /// The height of a running host's output.
 const RUN_OUTPUT_HEIGHT: f32 = 170.0;
-
-/// How many host rows a run page lists before it counts the rest.
-///
-/// A task can hold thousands of hosts. The count above the list is exact, so a row that
-/// is not drawn is still counted; drawing thousands of rows inside a dialog would make
-/// the page unusable instead.
-const MAX_RUN_ROWS: usize = 200;
-
-/// How many saved tasks a library lists before it counts the rest.
-///
-/// The library is a list of definitions a person picks from, not a table to scroll
-/// through: the count above it is exact, and a row that is not drawn is still counted,
-/// so thousands of saved tasks stay inside one dialog (R5).
-const MAX_LIBRARY_ROWS: usize = 60;
-
-/// How many stored runs a history lists before it counts the rest.
-const MAX_HISTORY_ROWS: usize = 60;
-
-/// How many hosts of one stored run its detail lists before it counts the rest.
-const MAX_HISTORY_HOSTS: usize = 120;
+/// The expanded height of a running host's output.
+const RUN_OUTPUT_EXPANDED_HEIGHT: f32 = 340.0;
 
 /// The states the history can be narrowed to, in the order the filter lists them.
 ///
@@ -589,28 +586,35 @@ impl ShelluneView {
         use crate::app::batch::BatchCenterView;
         match self.batch.view() {
             BatchCenterView::Library => {
-                // The mark can only be on a row that was drawn: a list longer than the
-                // rows on screen says how many it left out, and Enter may not open one
-                // of those, because a person cannot see what they would be opening.
-                let count = self.batch.library().tasks().len().min(MAX_LIBRARY_ROWS);
+                let query = self.batch_library_search.read(cx).text().to_owned();
+                let visible: Vec<_> = self
+                    .batch
+                    .library_filtered(&query)
+                    .into_iter()
+                    .map(shellune_core::BatchTask::id)
+                    .collect();
+                let count = visible.len();
                 let current = self.batch.library_selected();
                 match event.keystroke.key.as_str() {
                     "down" if count > 0 => {
                         let next = crate::app::palette::step(current, 1, count);
                         self.batch.select_library_row(next);
+                        self.batch_library_scroll
+                            .scroll_to_item(next, ScrollStrategy::Center);
                         cx.notify();
                         true
                     }
                     "up" if count > 0 => {
                         let next = crate::app::palette::step(current, -1, count);
                         self.batch.select_library_row(next);
+                        self.batch_library_scroll
+                            .scroll_to_item(next, ScrollStrategy::Center);
                         cx.notify();
                         true
                     }
                     "enter" if count > 0 => {
                         let index = current.min(count - 1);
-                        if let Some(task) = self.batch.library().tasks().get(index) {
-                            let id = task.id();
+                        if let Some(id) = visible.get(index).copied() {
                             self.edit_saved_batch(id, cx);
                         }
                         true
@@ -618,23 +622,32 @@ impl ShelluneView {
                     _ => false,
                 }
             }
-            BatchCenterView::ActiveRun => match event.keystroke.key.as_str() {
-                "down" if !event.keystroke.modifiers.modified() => {
-                    let moved = self.batch.step_run_host(1, MAX_RUN_ROWS);
-                    if moved {
-                        cx.notify();
+            BatchCenterView::ActiveRun => {
+                let query = self.batch_run_search.read(cx).text().to_owned();
+                match event.keystroke.key.as_str() {
+                    "down" if !event.keystroke.modifiers.modified() => {
+                        if let Some(next) = self.batch.step_run_host_filtered(1, &query) {
+                            self.batch_run_hosts_scroll
+                                .scroll_to_item(next, ScrollStrategy::Center);
+                            cx.notify();
+                            true
+                        } else {
+                            false
+                        }
                     }
-                    moved
-                }
-                "up" if !event.keystroke.modifiers.modified() => {
-                    let moved = self.batch.step_run_host(-1, MAX_RUN_ROWS);
-                    if moved {
-                        cx.notify();
+                    "up" if !event.keystroke.modifiers.modified() => {
+                        if let Some(next) = self.batch.step_run_host_filtered(-1, &query) {
+                            self.batch_run_hosts_scroll
+                                .scroll_to_item(next, ScrollStrategy::Center);
+                            cx.notify();
+                            true
+                        } else {
+                            false
+                        }
                     }
-                    moved
+                    _ => false,
                 }
-                _ => false,
-            },
+            }
             BatchCenterView::History => {
                 if self.batch.stored_open().is_some() {
                     if event.keystroke.modifiers.modified() {
@@ -642,16 +655,20 @@ impl ShelluneView {
                     }
                     return match event.keystroke.key.as_str() {
                         "down" => {
-                            if let Some(host) = self.batch.next_stored_host(1, MAX_HISTORY_HOSTS) {
+                            if let Some((host, next)) = self.batch.next_stored_host_index(1) {
                                 self.select_stored_host(host, cx);
+                                self.batch_history_hosts_scroll
+                                    .scroll_to_item(next, ScrollStrategy::Center);
                                 true
                             } else {
                                 false
                             }
                         }
                         "up" => {
-                            if let Some(host) = self.batch.next_stored_host(-1, MAX_HISTORY_HOSTS) {
+                            if let Some((host, next)) = self.batch.next_stored_host_index(-1) {
                                 self.select_stored_host(host, cx);
+                                self.batch_history_hosts_scroll
+                                    .scroll_to_item(next, ScrollStrategy::Center);
                                 true
                             } else {
                                 false
@@ -660,28 +677,35 @@ impl ShelluneView {
                         _ => false,
                     };
                 }
-                let visible = self.batch.history_visible();
-                // The same rule as the library: the mark stays on a row that was drawn,
-                // so Enter never opens a run the list did not show.
-                let count = visible.len().min(MAX_HISTORY_ROWS);
+                let query = self.batch_history_search.read(cx).text().to_owned();
+                let visible: Vec<_> = self
+                    .batch
+                    .history_filtered(&query)
+                    .into_iter()
+                    .map(crate::app::batch::HistoryEntry::id)
+                    .collect();
+                let count = visible.len();
                 let current = self.batch.history_selected();
                 match event.keystroke.key.as_str() {
                     "down" if count > 0 => {
                         let next = crate::app::palette::step(current, 1, count);
                         self.batch.select_history_row(next);
+                        self.batch_history_scroll
+                            .scroll_to_item(next, ScrollStrategy::Center);
                         cx.notify();
                         true
                     }
                     "up" if count > 0 => {
                         let next = crate::app::palette::step(current, -1, count);
                         self.batch.select_history_row(next);
+                        self.batch_history_scroll
+                            .scroll_to_item(next, ScrollStrategy::Center);
                         cx.notify();
                         true
                     }
                     "enter" if count > 0 => {
                         let index = current.min(count - 1);
-                        let id = visible.get(index).map(|entry| entry.id());
-                        if let Some(id) = id {
+                        if let Some(id) = visible.get(index).copied() {
                             self.open_stored_batch(id, cx);
                         }
                         true
@@ -914,8 +938,8 @@ impl ShelluneView {
                     .child(SharedString::from(problem.to_owned())),
             );
         }
-        let tasks = self.batch.library().tasks();
-        if tasks.is_empty() {
+        let all_tasks = self.batch.library().tasks();
+        if all_tasks.is_empty() {
             body = body.child(
                 components::state_card(
                     Tone::Accent,
@@ -926,29 +950,79 @@ impl ShelluneView {
                 )
                 .debug_selector(|| "batch.library.empty".to_owned()),
             );
-        }
-        let mut rows = div()
-            .id("batch.library.rows")
-            .flex()
-            .flex_col()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .max_h(metrics.scale(LIST_MAX_HEIGHT))
-            .overflow_y_scroll()
-            .debug_selector(|| "batch.library.rows".to_owned());
-        for (index, task) in tasks.iter().take(MAX_LIBRARY_ROWS).enumerate() {
-            rows = rows.child(self.batch_library_row(index, task, cx));
-        }
-        body = body.child(rows);
-        let hidden = tasks.len().saturating_sub(MAX_LIBRARY_ROWS);
-        if hidden > 0 {
+        } else {
             body = body.child(
                 div()
-                    .flex_none()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .debug_selector(|| "batch.library.more".to_owned())
-                    .child(library_more_line(ux, hidden)),
+                    .debug_selector(|| "batch.library.search".to_owned())
+                    .child(self.batch_library_search.clone()),
             );
+            let query = self.batch_library_search.read(cx).text().to_owned();
+            let filtered: Rc<Vec<shellune_core::BatchTask>> = Rc::new(
+                self.batch
+                    .library_filtered(&query)
+                    .into_iter()
+                    .cloned()
+                    .collect(),
+            );
+            if filtered.is_empty() {
+                body = body.child(
+                    components::empty_state(
+                        Icon::Search,
+                        ux.batch_filtered_empty,
+                        None,
+                        Some(
+                            components::compact_button(
+                                ux.batch_clear_filters,
+                                Variant::Secondary,
+                                metrics,
+                            )
+                            .id("batch.library.clear_filters")
+                            .debug_selector(|| "batch.library.clear_filters".to_owned())
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.batch_library_search
+                                    .update(cx, |field, cx| field.set_text("", cx));
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                        ),
+                        metrics,
+                    )
+                    .debug_selector(|| "batch.library.filtered_empty".to_owned()),
+                );
+            } else {
+                let count = filtered.len();
+                let selected_index = self.batch.library_selected();
+                let delete_asked = self.batch.delete_asked();
+                let row_height = metrics.scale(LIBRARY_ROW_HEIGHT);
+                let list_height = (row_height * count as f32).min(metrics.scale(LIST_MAX_HEIGHT));
+                let weak: WeakEntity<Self> = cx.entity().downgrade();
+                let vlist =
+                    uniform_list("batch.library.rows", count, move |range, _window, _cx| {
+                        let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
+                        for index in range {
+                            let task = &filtered[index];
+                            items.push(
+                                batch_library_row_element(
+                                    index,
+                                    task,
+                                    selected_index == index,
+                                    delete_asked == Some(task.id()),
+                                    row_height,
+                                    &weak,
+                                    metrics,
+                                    ux,
+                                )
+                                .into_any_element(),
+                            );
+                        }
+                        items
+                    })
+                    .track_scroll(self.batch_library_scroll.clone())
+                    .h(list_height)
+                    .w_full()
+                    .debug_selector(|| "batch.library.rows".to_owned());
+                body = body.child(vlist);
+            }
         }
         let footer = components::modal_footer_noted(
             div()
@@ -990,151 +1064,6 @@ impl ShelluneView {
                 footer: Some(footer),
             },
         )
-    }
-
-    /// One saved definition: what it would run on, and the three things to do with it.
-    fn batch_library_row(
-        &self,
-        index: usize,
-        task: &shellune_core::BatchTask,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let ux = copy::ux();
-        let metrics = self.metrics();
-        let id = task.id();
-        let selected = self.batch.library_selected() == index;
-        let name = task.name().unwrap_or(ux.batch_untitled).to_owned();
-        let meta = copy::fill(
-            ux.batch_library_row_meta,
-            &[
-                ("hosts", &task.targets().len().to_string()),
-                ("steps", &task.steps().len().to_string()),
-                ("concurrency", &task.concurrency().to_string()),
-            ],
-        );
-        let asking = self.batch.delete_asked() == Some(id);
-        let mut row = components::list_row_frame(
-            if selected {
-                components::ControlState::Selected
-            } else {
-                components::ControlState::Resting
-            },
-            metrics,
-        )
-        .id(SharedString::from(format!("batch.library.row.{index}")))
-        .debug_selector(move || format!("batch.library.row.{index}"))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w_0()
-                .gap(metrics.scale(spacing::HAIRLINE))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(metrics.label_size())
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                        .child(SharedString::from(name)),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_MUTED))
-                        .child(SharedString::from(meta)),
-                ),
-        );
-        if asking {
-            row = row
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::DANGER))
-                        .debug_selector(move || format!("batch.library.delete_ask.{index}"))
-                        .child(ux.batch_library_delete_ask),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .gap(metrics.scale(spacing::TIGHT))
-                        .child(
-                            components::compact_button(
-                                ux.batch_library_delete_no,
-                                Variant::Ghost,
-                                metrics,
-                            )
-                            .id(SharedString::from(format!(
-                                "batch.library.delete_no.{index}"
-                            )))
-                            .debug_selector(move || format!("batch.library.delete_no.{index}"))
-                            .on_click(cx.listener(
-                                |this, _event, _window, cx| {
-                                    this.batch.cancel_delete_saved();
-                                    cx.notify();
-                                },
-                            )),
-                        )
-                        .child(
-                            components::compact_button(
-                                ux.batch_library_delete_yes,
-                                Variant::Danger,
-                                metrics,
-                            )
-                            .id(SharedString::from(format!(
-                                "batch.library.delete_yes.{index}"
-                            )))
-                            .debug_selector(move || format!("batch.library.delete_yes.{index}"))
-                            .on_click(cx.listener(
-                                move |this, _event, _window, cx| {
-                                    this.delete_saved_batch(id, cx);
-                                },
-                            )),
-                        ),
-                );
-        } else {
-            row = row.child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        components::compact_button(
-                            ux.batch_library_edit,
-                            Variant::Secondary,
-                            metrics,
-                        )
-                        .id(SharedString::from(format!("batch.library.edit.{index}")))
-                        .debug_selector(move || format!("batch.library.edit.{index}"))
-                        .on_click(cx.listener(
-                            move |this, _event, _window, cx| {
-                                this.edit_saved_batch(id, cx);
-                            },
-                        )),
-                    )
-                    .child(
-                        components::compact_button(
-                            ux.batch_library_delete,
-                            Variant::Ghost,
-                            metrics,
-                        )
-                        .id(SharedString::from(format!("batch.library.delete.{index}")))
-                        .debug_selector(move || format!("batch.library.delete.{index}"))
-                        .on_click(cx.listener(
-                            move |this, _event, _window, cx| {
-                                this.batch.ask_delete_saved(id);
-                                cx.notify();
-                            },
-                        )),
-                    ),
-            );
-        }
-        row
     }
 
     /// The stored runs: a list to scan, and the detail of the one that was opened.
@@ -1284,35 +1213,99 @@ impl ShelluneView {
                     .flex_wrap()
                     .gap(metrics.scale(spacing::TIGHT))
                     .child(components::section_label(ux.batch_history_filter, metrics))
-                    .child(filters),
+                    .child(filters)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(metrics.scale(180.0))
+                            .debug_selector(|| "batch.history.search".to_owned())
+                            .child(self.batch_history_search.clone()),
+                    ),
             );
-        let entries = self.batch.history_visible();
+        let query = self.batch_history_search.read(cx).text().to_owned();
+        let entries: Rc<Vec<crate::app::batch::HistoryEntry>> = Rc::new(
+            self.batch
+                .history_filtered(&query)
+                .into_iter()
+                .cloned()
+                .collect(),
+        );
         if entries.is_empty() {
-            column = column.child(
-                components::state_card(
-                    Tone::Neutral,
-                    ux.batch_history_empty,
-                    ux.batch_history_subtitle,
-                    None,
-                    metrics,
-                )
-                .debug_selector(|| "batch.history.empty".to_owned()),
-            );
-        }
-        let mut rows = div()
-            .id("batch.history.rows")
-            .flex()
-            .flex_col()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .max_h(metrics.scale(LIST_MAX_HEIGHT))
-            .overflow_y_scroll()
+            let has_filter = !query.trim().is_empty() || self.batch.history_filter().is_some();
+            if has_filter && !self.batch.history().entries().is_empty() {
+                column = column.child(
+                    components::empty_state(
+                        Icon::Search,
+                        ux.batch_filtered_empty,
+                        None,
+                        Some(
+                            components::compact_button(
+                                ux.batch_clear_filters,
+                                Variant::Secondary,
+                                metrics,
+                            )
+                            .id("batch.history.clear_filters")
+                            .debug_selector(|| "batch.history.clear_filters".to_owned())
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.batch_history_search
+                                    .update(cx, |field, cx| field.set_text("", cx));
+                                this.batch.set_history_filter(None);
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                        ),
+                        metrics,
+                    )
+                    .debug_selector(|| "batch.history.empty".to_owned()),
+                );
+            } else {
+                column = column.child(
+                    components::state_card(
+                        Tone::Neutral,
+                        ux.batch_history_empty,
+                        ux.batch_history_subtitle,
+                        None,
+                        metrics,
+                    )
+                    .debug_selector(|| "batch.history.empty".to_owned()),
+                );
+            }
+        } else {
+            let count = entries.len();
+            let selected_index = self.batch.history_selected();
+            let locale = self.workspace.locale();
+            let now = crate::app::remote::now_unix();
+            let row_height = metrics.scale(HISTORY_ROW_HEIGHT);
+            let list_height = (row_height * count as f32).min(metrics.scale(LIST_MAX_HEIGHT));
+            let weak: WeakEntity<Self> = cx.entity().downgrade();
+            let vlist = uniform_list("batch.history.rows", count, move |range, _window, _cx| {
+                let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
+                for index in range {
+                    let entry = &entries[index];
+                    items.push(
+                        batch_history_row_element(
+                            index,
+                            entry,
+                            selected_index == index,
+                            locale,
+                            now,
+                            row_height,
+                            &weak,
+                            metrics,
+                            ux,
+                        )
+                        .into_any_element(),
+                    );
+                }
+                items
+            })
+            .track_scroll(self.batch_history_scroll.clone())
+            .h(list_height)
+            .w_full()
             .debug_selector(|| "batch.history.rows".to_owned());
-        for (index, entry) in entries.iter().take(MAX_HISTORY_ROWS).enumerate() {
-            rows = rows.child(self.batch_history_row(index, entry.id(), entry, cx));
+            column = column.child(vlist);
         }
-        column = column.child(rows);
-        let hidden =
-            entries.len().saturating_sub(MAX_HISTORY_ROWS) + self.batch.history().omitted();
+        let hidden = self.batch.history().omitted();
         if hidden > 0 {
             column = column.child(
                 div()
@@ -1327,117 +1320,6 @@ impl ShelluneView {
             );
         }
         column
-    }
-
-    /// One stored run: when it started, what it ended as, and how to read it.
-    fn batch_history_row(
-        &self,
-        index: usize,
-        id: shellune_core::BatchRunId,
-        entry: &crate::app::batch::HistoryEntry,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let ux = copy::ux();
-        let metrics = self.metrics();
-        let selected = self.batch.history_selected() == index;
-        let mut row = components::list_row_frame(
-            if selected {
-                components::ControlState::Selected
-            } else {
-                components::ControlState::Resting
-            },
-            metrics,
-        )
-        .id(SharedString::from(format!("batch.history.row.{index}")))
-        .debug_selector(move || format!("batch.history.row.{index}"));
-        let Some(run) = entry.summary() else {
-            return row.child(
-                div()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(metrics.label_size())
-                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .child(SharedString::from(id.to_string())),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::DANGER))
-                            .debug_selector(move || format!("batch.history.damaged.{index}"))
-                            .child(entry.problem().map_or_else(
-                                || ux.batch_history_damaged.to_owned(),
-                                str::to_owned,
-                            )),
-                    ),
-            );
-        };
-        let name = run
-            .task()
-            .name()
-            .map_or_else(|| ux.batch_untitled.to_owned(), str::to_owned);
-        let when = copy::fill(
-            ux.batch_history_when,
-            &[(
-                "time",
-                &copy::relative_time(
-                    run.started_at_unix(),
-                    crate::app::remote::now_unix(),
-                    self.workspace.locale(),
-                ),
-            )],
-        );
-        row = row
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(metrics.scale(spacing::HAIRLINE))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(metrics.label_size())
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .child(SharedString::from(name)),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(SharedString::from(format!(
-                                "{when} · {}",
-                                copy::fill(
-                                    ux.batch_history_hosts,
-                                    &[
-                                        ("done", &run.finished_hosts().to_string()),
-                                        ("total", &run.hosts().len().to_string()),
-                                    ],
-                                )
-                            ))),
-                    ),
-            )
-            .child(components::chip(
-                run_state_text(run.state(), ux),
-                run_state_tone(run.state()),
-                metrics,
-            ))
-            .child(
-                components::compact_button(ux.batch_history_open, Variant::Secondary, metrics)
-                    .id(SharedString::from(format!("batch.history.open.{index}")))
-                    .debug_selector(move || format!("batch.history.open.{index}"))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.open_stored_batch(id, cx);
-                    })),
-            );
-        row
     }
 
     /// One stored run in full: its hosts, their steps, the exit statuses, the timeline
@@ -1542,107 +1424,116 @@ impl ShelluneView {
                     .child(ux.batch_retry_confirm),
             );
         let selected = self.batch.stored_host();
-        let mut hosts = div()
-            .id("batch.history.hosts")
-            .flex()
-            .flex_col()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .max_h(metrics.scale(HOSTS_MAX_HEIGHT))
-            .overflow_y_scroll()
-            .debug_selector(|| "batch.history.hosts".to_owned());
-        for (index, host) in run.hosts().iter().take(MAX_HISTORY_HOSTS).enumerate() {
-            let host_id = host.target().host_id();
-            let mut steps = div()
-                .flex()
-                .items_center()
-                .flex_wrap()
-                .gap(metrics.scale(spacing::HAIRLINE))
-                .debug_selector(move || format!("batch.history.steps.{index}"));
-            for step in host.steps() {
-                let exit = step
-                    .exit()
-                    .map(|code| copy::fill(ux.batch_exit, &[("code", &code.to_string())]))
-                    .unwrap_or_default();
-                let label = if exit.is_empty() {
-                    step_state_text(step.state(), ux).to_owned()
-                } else {
-                    format!("{} {exit}", step_state_text(step.state(), ux))
-                };
-                steps = steps.child(components::chip(
-                    label,
-                    step_state_tone(step.state()),
-                    metrics,
-                ));
-            }
-            let mut row = components::list_row_frame(
-                if selected == Some(host_id) {
-                    components::ControlState::Selected
-                } else {
-                    components::ControlState::Resting
-                },
-                metrics,
-            )
-            .flex_col()
-            .items_start()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .id(SharedString::from(format!("batch.history.host.{index}")))
-            .cursor_pointer()
-            .debug_selector(move || format!("batch.history.host.{index}"))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.select_stored_host(host_id, cx);
-            }))
-            .child(
-                div()
+        let hosts_vec: Rc<Vec<shellune_core::HostRun>> = Rc::new(run.hosts().to_vec());
+        let count = hosts_vec.len();
+        let row_height = metrics.scale(HISTORY_HOST_ROW_HEIGHT);
+        let list_height = (row_height * count as f32).min(metrics.scale(HOSTS_MAX_HEIGHT));
+        let weak: WeakEntity<Self> = cx.entity().downgrade();
+        let hosts = uniform_list("batch.history.hosts", count, move |range, _window, _cx| {
+            let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
+            for index in range {
+                let host = &hosts_vec[index];
+                let host_id = host.target().host_id();
+                let mut steps = div()
                     .flex()
                     .items_center()
                     .flex_wrap()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(metrics.label_size())
-                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .child(SharedString::from(host.target().label().to_owned())),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(SharedString::from(host.target().destination())),
-                    )
-                    .child(components::chip(
-                        host_state_text(host.state(), ux),
-                        host_state_tone(host.state()),
+                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .debug_selector(move || format!("batch.history.steps.{index}"));
+                for step in host.steps() {
+                    let exit = step
+                        .exit()
+                        .map(|code| copy::fill(ux.batch_exit, &[("code", &code.to_string())]))
+                        .unwrap_or_default();
+                    let label = if exit.is_empty() {
+                        step_state_text(step.state(), ux).to_owned()
+                    } else {
+                        format!("{} {exit}", step_state_text(step.state(), ux))
+                    };
+                    steps = steps.child(components::chip(
+                        label,
+                        step_state_tone(step.state()),
                         metrics,
-                    )),
-            )
-            .child(steps);
-            if let Some(reason) = host.detail() {
-                row = row.child(
+                    ));
+                }
+                let weak_click = weak.clone();
+                let mut row = components::list_row_frame(
+                    if selected == Some(host_id) {
+                        ControlState::Selected
+                    } else {
+                        ControlState::Resting
+                    },
+                    metrics,
+                )
+                .flex_col()
+                .items_start()
+                .justify_center()
+                .h(row_height - metrics.scale(spacing::HAIRLINE))
+                .overflow_hidden()
+                .gap(metrics.scale(spacing::HAIRLINE))
+                .id(SharedString::from(format!("batch.history.host.{index}")))
+                .cursor_pointer()
+                .debug_selector(move || format!("batch.history.host.{index}"))
+                .on_click(move |_event, _window, cx| {
+                    let _ = weak_click.update(cx, |this, cx| {
+                        this.select_stored_host(host_id, cx);
+                    });
+                })
+                .child(
                     div()
-                        .flex_none()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                        .child(SharedString::from(redact_batch_text(reason))),
+                        .flex()
+                        .items_center()
+                        .gap(metrics.scale(spacing::TIGHT))
+                        .w_full()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(metrics.label_size())
+                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                .child(SharedString::from(host.target().label().to_owned())),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .child(SharedString::from(host.target().destination())),
+                        )
+                        .child(components::chip(
+                            host_state_text(host.state(), ux),
+                            host_state_tone(host.state()),
+                            metrics,
+                        )),
+                )
+                .child(steps);
+                if let Some(reason) = host.detail() {
+                    row = row.child(
+                        div()
+                            .flex_none()
+                            .w_full()
+                            .truncate()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .child(SharedString::from(redact_batch_text(reason))),
+                    );
+                }
+                items.push(
+                    div()
+                        .h(row_height)
+                        .pb(metrics.scale(spacing::HAIRLINE))
+                        .child(row)
+                        .into_any_element(),
                 );
             }
-            hosts = hosts.child(row);
-        }
-        let hidden = run.hosts().len().saturating_sub(MAX_HISTORY_HOSTS);
-        if hidden > 0 {
-            hosts = hosts.child(
-                div()
-                    .flex_none()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .debug_selector(|| "batch.history.hosts.more".to_owned())
-                    .child(copy::fill(
-                        ux.batch_targets_more,
-                        &[("count", &hidden.to_string())],
-                    )),
-            );
-        }
+            items
+        })
+        .track_scroll(self.batch_history_hosts_scroll.clone())
+        .h(list_height)
+        .w_full()
+        .debug_selector(|| "batch.history.hosts".to_owned());
         column = column.child(hosts);
         column = column.child(self.batch_history_output(run, cx));
         column
@@ -1672,11 +1563,16 @@ impl ShelluneView {
                     .join("\n")
             })
             .filter(|text| !text.is_empty());
+        let output_height = if self.batch_output_expanded {
+            metrics.scale(HISTORY_OUTPUT_EXPANDED_HEIGHT)
+        } else {
+            metrics.scale(OUTPUT_HEIGHT)
+        };
         let mut output = div()
             .id("batch.history.output")
             .flex()
             .flex_col()
-            .h(metrics.scale(OUTPUT_HEIGHT))
+            .h(output_height)
             .overflow_y_scroll()
             .gap(metrics.scale(spacing::HAIRLINE))
             .p(metrics.scale(spacing::TIGHT))
@@ -1822,15 +1718,12 @@ impl ShelluneView {
                 );
             }
         }
-        let mut heading = div()
+        let mut actions = div()
             .flex()
             .items_center()
-            .justify_between()
-            .flex_wrap()
-            .gap(metrics.scale(spacing::TIGHT))
-            .child(components::section_label(ux.batch_run_output, metrics));
+            .gap(metrics.scale(spacing::HALF));
         if let Some(copy_text) = copy_text {
-            heading = heading.child(
+            actions = actions.child(
                 self.icon_text_button(
                     SharedString::from("batch.history.output.copy"),
                     Icon::Copy,
@@ -1845,6 +1738,36 @@ impl ShelluneView {
                 .h(metrics.compact_control_height()),
             );
         }
+        actions = actions.child(
+            self.icon_text_button(
+                SharedString::from("batch.history.output.expand"),
+                if self.batch_output_expanded {
+                    Icon::Minimize
+                } else {
+                    Icon::Maximize
+                },
+                if self.batch_output_expanded {
+                    ux.batch_output_collapse
+                } else {
+                    ux.batch_output_expand
+                },
+                Variant::Ghost,
+                cx,
+                |this, cx| {
+                    this.batch_output_expanded = !this.batch_output_expanded;
+                    cx.notify();
+                },
+            )
+            .h(metrics.compact_control_height()),
+        );
+        let heading = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::TIGHT))
+            .child(components::section_label(ux.batch_run_output, metrics))
+            .child(actions);
         div()
             .flex()
             .flex_col()
@@ -2147,6 +2070,27 @@ impl ShelluneView {
                             }),
                     )
                     .child(
+                        components::compact_button(
+                            ux.batch_step_from_snippet,
+                            Variant::Ghost,
+                            metrics,
+                        )
+                        .id(SharedString::from(format!("batch.step.snippet.{index}")))
+                        .debug_selector(move || format!("batch.step.snippet.{index}"))
+                        .on_click(cx.listener(
+                            move |this, _event, _window, cx| {
+                                if this.batch_snippet_picker == Some(index) {
+                                    this.batch_snippet_picker = None;
+                                } else {
+                                    this.batch_snippet_search
+                                        .update(cx, |field, cx| field.set_text("", cx));
+                                    this.batch_snippet_picker = Some(index);
+                                }
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(
                         components::button_with_state(
                             ux.batch_step_remove,
                             Variant::Ghost,
@@ -2164,12 +2108,18 @@ impl ShelluneView {
                         .debug_selector(move || format!("batch.step.remove.{index}"))
                         .when(count > 1, |button| {
                             button.on_click(cx.listener(move |this, _event, _window, cx| {
+                                if this.batch_snippet_picker == Some(index) {
+                                    this.batch_snippet_picker = None;
+                                }
                                 let _ = this.batch.remove_step(index);
                                 cx.notify();
                             }))
                         }),
                     ),
             );
+            if self.batch_snippet_picker == Some(index) {
+                fields = fields.child(self.batch_snippet_picker_card(index, cx));
+            }
         }
         div()
             .flex()
@@ -2201,6 +2151,150 @@ impl ShelluneView {
                     ),
             )
             .child(fields)
+    }
+
+    /// Inline snippet picker opened from a batch step row to insert a saved command.
+    fn batch_snippet_picker_card(&self, step_index: usize, cx: &mut Context<Self>) -> Div {
+        let ux = copy::ux();
+        let metrics = self.metrics();
+        let query = self
+            .batch_snippet_search
+            .read(cx)
+            .text()
+            .trim()
+            .to_lowercase();
+        let matching: Vec<_> = self
+            .snippets
+            .snippets()
+            .iter()
+            .filter(|snippet| {
+                query.is_empty()
+                    || snippet.name().to_lowercase().contains(&query)
+                    || snippet.body().to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect();
+        let mut list = div()
+            .id("batch.snippet.options")
+            .flex()
+            .flex_col()
+            .max_h(metrics.scale(160.0))
+            .overflow_y_scroll()
+            .gap(metrics.scale(spacing::HAIRLINE));
+        if matching.is_empty() {
+            list = list.child(
+                div()
+                    .debug_selector(|| "batch.snippet.empty".to_owned())
+                    .px(metrics.scale(spacing::TIGHT))
+                    .py(metrics.scale(spacing::TIGHT))
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(if self.snippets.snippets().is_empty() {
+                        ux.batch_snippet_empty
+                    } else {
+                        ux.batch_filtered_empty
+                    }),
+            );
+        } else {
+            let hover = theme::swatch(palette::SURFACE_HOVER);
+            for (s_index, snippet) in matching.into_iter().enumerate() {
+                let name = snippet.name().to_owned();
+                let preview = crate::app::snippets::body_preview(snippet.body(), 64);
+                let body = snippet.body().to_owned();
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "batch.snippet.option.{s_index}"
+                        )))
+                        .debug_selector(move || format!("batch.snippet.option.{s_index}"))
+                        .flex()
+                        .items_center()
+                        .gap(metrics.scale(spacing::TIGHT))
+                        .px(metrics.scale(spacing::TIGHT))
+                        .py(metrics.scale(spacing::HALF))
+                        .rounded(px(radius::SMALL))
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(hover))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(metrics.label_size())
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                .truncate()
+                                .child(SharedString::from(name)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .font_family(crate::app::terminal::monospace_family())
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .truncate()
+                                .child(SharedString::from(preview)),
+                        )
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.insert_snippet_into_batch_step(step_index, &body, cx);
+                        })),
+                );
+            }
+        }
+        components::menu_card("batch.snippet.picker", metrics)
+            .w_full()
+            .min_w_0()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .debug_selector(|| "batch.snippet.search".to_owned())
+                            .child(self.batch_snippet_search.clone()),
+                    )
+                    .child(
+                        components::icon_button("×", metrics)
+                            .id("batch.snippet.close")
+                            .debug_selector(|| "batch.snippet.close".to_owned())
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.batch_snippet_picker = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(list)
+    }
+
+    fn insert_snippet_into_batch_step(
+        &mut self,
+        step_index: usize,
+        snippet_body: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let command = snippet_body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" && ");
+        if let Some(field) = self.batch.steps().get(step_index).cloned() {
+            field.update(cx, |field, cx| {
+                let existing = field.text().trim().to_owned();
+                let next = if existing.is_empty() {
+                    command
+                } else if command.is_empty() {
+                    existing
+                } else {
+                    format!("{existing} && {command}")
+                };
+                field.set_text(next, cx);
+            });
+        }
+        self.batch_snippet_picker = None;
+        cx.notify();
     }
 
     /// The concurrency, the failure policy and the optional name.
@@ -2317,7 +2411,7 @@ impl ShelluneView {
             .px(metrics.scale(spacing::LOOSE))
             .pb(metrics.scale(spacing::SNUG))
             .child(self.batch_surface_switch(cx))
-            .child(self.batch_run_status(page));
+            .child(self.batch_run_status(page, cx));
         if let Some(problem) = page.problem() {
             body = body.child(
                 components::banner(Tone::Danger, metrics)
@@ -2326,7 +2420,14 @@ impl ShelluneView {
                     .child(SharedString::from(problem.to_owned())),
             );
         }
-        body = body.child(
+        body = body.child(if self.batch_output_expanded {
+            div()
+                .flex()
+                .flex_col()
+                .gap(metrics.scale(spacing::SNUG))
+                .child(self.batch_run_side(page, cx))
+                .child(self.batch_run_hosts(page, cx))
+        } else {
             div()
                 .flex()
                 .flex_row()
@@ -2334,8 +2435,8 @@ impl ShelluneView {
                 .items_start()
                 .gap(metrics.scale(spacing::SNUG))
                 .child(self.batch_run_hosts(page, cx))
-                .child(self.batch_run_side(page, cx)),
-        );
+                .child(self.batch_run_side(page, cx))
+        });
         let footer = components::modal_footer_noted(
             div()
                 .debug_selector(|| "batch.run.note".to_owned())
@@ -2356,11 +2457,12 @@ impl ShelluneView {
         )
     }
 
-    /// The state line, the progress and the explanation of a state that is not obvious.
-    fn batch_run_status(&self, page: &BatchRunPage) -> Div {
+    /// The state line, determinate progress bar, quick trust jump, and state explanation.
+    fn batch_run_status(&self, page: &BatchRunPage, cx: &mut Context<Self>) -> Div {
         let ux = copy::ux();
         let metrics = self.metrics();
         let tone = run_state_tone(page.state());
+        let pending_trust = page.pending_trust_hosts();
         let text = copy::fill(
             ux.batch_run_progress,
             &[
@@ -2411,7 +2513,42 @@ impl ShelluneView {
                             Tone::Danger,
                             metrics,
                         ))
+                    })
+                    .when(pending_trust > 0, |row| {
+                        row.child(
+                            components::compact_button(
+                                copy::fill(
+                                    ux.batch_pending_trust_jump,
+                                    &[("count", &pending_trust.to_string())],
+                                ),
+                                Variant::Secondary,
+                                metrics,
+                            )
+                            .id("batch.run.pending_trust")
+                            .debug_selector(|| "batch.run.pending_trust".to_owned())
+                            .on_click(cx.listener(
+                                |this, _event, _window, cx| {
+                                    this.batch_run_search
+                                        .update(cx, |field, cx| field.set_text("", cx));
+                                    if let Some(idx) = this.batch.jump_to_pending_trust() {
+                                        this.batch_run_hosts_scroll
+                                            .scroll_to_item(idx, ScrollStrategy::Top);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        )
                     }),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .debug_selector(|| "batch.run.progress.bar".to_owned())
+                    .child(components::progress_bar(
+                        "batch.run.progress.bar",
+                        components::Progress::Determinate(page.progress_fraction()),
+                        metrics,
+                    )),
             );
         // The state's own sentence, where it changes what the user expects: a pause is
         // not a stop, and a cancel is a request until the remote command has ended.
@@ -2443,6 +2580,7 @@ impl ShelluneView {
             .gap(metrics.scale(spacing::TIGHT))
             .debug_selector(|| "batch.run.controls".to_owned());
         if !finished {
+            let cancelling = page.state() == RunState::Cancelling;
             if page.state() == RunState::Paused {
                 controls = controls.child(
                     components::compact_button(ux.batch_run_resume, Variant::Primary, metrics)
@@ -2454,30 +2592,53 @@ impl ShelluneView {
                 );
             } else {
                 controls = controls.child(
-                    components::compact_button(ux.batch_run_pause, Variant::Secondary, metrics)
-                        .id("batch.run.pause")
-                        .debug_selector(|| "batch.run.pause".to_owned())
-                        .on_click(cx.listener(|this, _event, _window, cx| {
+                    components::button_with_state(
+                        ux.batch_run_pause,
+                        Variant::Secondary,
+                        if cancelling {
+                            ControlState::Disabled
+                        } else {
+                            ControlState::Resting
+                        },
+                        metrics,
+                    )
+                    .h(metrics.compact_control_height())
+                    .px(metrics.scale(spacing::SNUG))
+                    .text_size(metrics.caption_size())
+                    .id("batch.run.pause")
+                    .debug_selector(|| "batch.run.pause".to_owned())
+                    .when(!cancelling, |button| {
+                        button.on_click(cx.listener(|this, _event, _window, cx| {
                             this.pause_batch(cx);
-                        })),
+                        }))
+                    }),
                 );
             }
-            let cancelling = page.state() == RunState::Cancelling;
             controls = controls.child(
-                components::compact_button(
+                components::button_with_state(
                     if cancelling {
                         run_state_text(RunState::Cancelling, ux)
                     } else {
                         ux.batch_run_cancel
                     },
                     Variant::Ghost,
+                    if cancelling {
+                        ControlState::Disabled
+                    } else {
+                        ControlState::Resting
+                    },
                     metrics,
                 )
+                .h(metrics.compact_control_height())
+                .px(metrics.scale(spacing::SNUG))
+                .text_size(metrics.caption_size())
                 .id("batch.run.cancel")
                 .debug_selector(|| "batch.run.cancel".to_owned())
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.cancel_batch(cx);
-                })),
+                .when(!cancelling, |button| {
+                    button.on_click(cx.listener(|this, _event, _window, cx| {
+                        this.cancel_batch(cx);
+                    }))
+                }),
             );
         }
         if page.can_retry() {
@@ -2531,14 +2692,15 @@ impl ShelluneView {
         controls
     }
 
-    /// One row per host, with its steps, its exit results and its reason.
+    /// One row per host (virtualized via `uniform_list`), with search, status/trust filters,
+    /// its steps, its exit results and its reason.
     fn batch_run_hosts(&self, page: &BatchRunPage, cx: &mut Context<Self>) -> Div {
         let ux = copy::ux();
         let metrics = self.metrics();
         let selected = page.selected();
         let active_filter = self.batch.run_host_filter();
         let mut filter_bar = None;
-        if page.total_hosts() > 1 {
+        if page.total_hosts() > 1 || page.pending_trust_hosts() > 0 {
             let pill = |selector: &'static str,
                         label: &'static str,
                         choice: Option<BatchHostFilter>,
@@ -2552,11 +2714,15 @@ impl ShelluneView {
                     }))
             };
             let mut pills = components::segmented(metrics)
+                .flex_wrap()
                 .debug_selector(|| "batch.run.filters".to_owned())
                 .child(pill("batch.run.filter.all", ux.batch_filter_all, None, cx));
             for filter in BatchHostFilter::ALL {
                 let (sel, label) = match filter {
                     BatchHostFilter::Failed => ("batch.run.filter.failed", ux.batch_filter_failed),
+                    BatchHostFilter::PendingTrust => {
+                        ("batch.run.filter.trust", ux.batch_filter_trust)
+                    }
                     BatchHostFilter::Waiting => {
                         ("batch.run.filter.waiting", ux.batch_filter_waiting)
                     }
@@ -2569,193 +2735,233 @@ impl ShelluneView {
             }
             filter_bar = Some(pills);
         }
-        let matching_hosts: Vec<_> = page
-            .run()
-            .hosts()
-            .iter()
-            .filter(|host| active_filter.is_none_or(|f| f.matches(host.state())))
-            .collect();
-        let mut list = div()
-            .id("batch.run.hosts")
-            .flex()
-            .flex_col()
-            .w_full()
-            .max_h(metrics.scale(RUN_HOSTS_MAX_HEIGHT))
-            .overflow_y_scroll()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .debug_selector(|| "batch.run.hosts".to_owned());
-        for (index, host) in matching_hosts.iter().take(MAX_RUN_ROWS).enumerate() {
-            let id = host.target().host_id();
-            let is_selected = selected == Some(id);
-            let tone = host_state_tone(host.state());
-            let mut steps = div()
-                .flex()
-                .items_center()
-                .flex_wrap()
-                .gap(metrics.scale(spacing::HAIRLINE))
-                .debug_selector(move || format!("batch.run.steps.{index}"));
-            for step in host.steps() {
-                let exit = step
-                    .exit()
-                    .map(|code| copy::fill(ux.batch_exit, &[("code", &code.to_string())]))
-                    .unwrap_or_default();
-                let label = if exit.is_empty() {
-                    step_state_text(step.state(), ux).to_owned()
-                } else {
-                    format!("{} {exit}", step_state_text(step.state(), ux))
-                };
-                steps = steps.child(components::chip(
-                    label,
-                    step_state_tone(step.state()),
-                    metrics,
-                ));
-            }
-            let question = page.question(id);
-            let reason = host
-                .detail()
-                .map(str::to_owned)
-                .or_else(|| question.map(|question| question.text(ux)));
-            // A flat list row (ADR-7): the chosen host has the selected fill and the
-            // accent bar, the others light under the pointer.
-            let mut row = components::list_row_frame(
-                if is_selected {
-                    components::ControlState::Selected
-                } else {
-                    components::ControlState::Resting
-                },
+        let search_box = (page.total_hosts() > 1).then(|| {
+            div()
+                .w_full()
+                .debug_selector(|| "batch.run.search".to_owned())
+                .child(self.batch_run_search.clone())
+        });
+        let query = self.batch_run_search.read(cx).text().to_owned();
+        let matching_hosts: Rc<
+            Vec<(
+                shellune_core::HostRun,
+                Option<crate::app::batch::BatchQuestion>,
+            )>,
+        > = Rc::new(
+            page.matching_hosts(active_filter, &query)
+                .into_iter()
+                .map(|host| {
+                    let id = host.target().host_id();
+                    (host.clone(), page.question(id).cloned())
+                })
+                .collect(),
+        );
+        let list_el: AnyElement = if matching_hosts.is_empty() {
+            components::empty_state(
+                Icon::Search,
+                ux.batch_filtered_empty,
+                None,
+                Some(
+                    components::compact_button(ux.batch_clear_filters, Variant::Secondary, metrics)
+                        .id("batch.run.clear_filters")
+                        .debug_selector(|| "batch.run.clear_filters".to_owned())
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.batch_run_search
+                                .update(cx, |field, cx| field.set_text("", cx));
+                            this.batch.set_run_host_filter(None);
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                ),
                 metrics,
             )
-            .flex_col()
-            .items_start()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .id(SharedString::from(format!("batch.run.host.{index}")))
-            .cursor_pointer()
-            .debug_selector(move || format!("batch.run.host.{index}"))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.batch.select_host(id);
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(metrics.label_size())
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .child(SharedString::from(host.target().label().to_owned())),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(SharedString::from(host.target().destination())),
-                    )
-                    .child(components::chip(
-                        host_state_text(host.state(), ux),
-                        tone,
-                        metrics,
-                    ))
-                    .when(host.target().starts_at() > 0, |row| {
-                        row.child(components::chip(
-                            copy::fill(
-                                ux.batch_from_step,
-                                &[(
-                                    "step",
-                                    &(host.target().starts_at() as usize + 1).to_string(),
-                                )],
-                            ),
-                            Tone::Neutral,
-                            metrics,
-                        ))
-                    }),
-            )
-            .child(steps);
-            if let Some(reason) = reason {
-                row = row.child(
-                    div()
-                        .flex_none()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                        .child(SharedString::from(reason)),
-                );
-            }
-            if let Some(question) = question {
-                // Only this host is waiting; the answer goes straight back to the
-                // runner, and nothing is accepted on the user's behalf.
-                row = row.child(
-                    div()
+            .debug_selector(|| "batch.run.hosts.empty".to_owned())
+            .into_any_element()
+        } else {
+            let count = matching_hosts.len();
+            let row_height = metrics.scale(RUN_HOST_ROW_HEIGHT);
+            let list_height = (row_height * count as f32).min(metrics.scale(RUN_HOSTS_MAX_HEIGHT));
+            let weak: WeakEntity<Self> = cx.entity().downgrade();
+            uniform_list("batch.run.hosts", count, move |range, _window, _cx| {
+                let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
+                for index in range {
+                    let (host, question) = &matching_hosts[index];
+                    let id = host.target().host_id();
+                    let is_selected = selected == Some(id);
+                    let tone = host_state_tone(host.state());
+                    let mut steps = div()
                         .flex()
                         .items_center()
                         .flex_wrap()
+                        .gap(metrics.scale(spacing::HAIRLINE))
+                        .debug_selector(move || format!("batch.run.steps.{index}"));
+                    for step in host.steps() {
+                        let exit = step
+                            .exit()
+                            .map(|code| copy::fill(ux.batch_exit, &[("code", &code.to_string())]))
+                            .unwrap_or_default();
+                        let label = if exit.is_empty() {
+                            step_state_text(step.state(), ux).to_owned()
+                        } else {
+                            format!("{} {exit}", step_state_text(step.state(), ux))
+                        };
+                        steps = steps.child(components::chip(
+                            label,
+                            step_state_tone(step.state()),
+                            metrics,
+                        ));
+                    }
+                    let reason = host
+                        .detail()
+                        .map(str::to_owned)
+                        .or_else(|| question.as_ref().map(|q| q.text(ux)));
+                    let weak_select = weak.clone();
+                    let mut top_row = div()
+                        .flex()
+                        .items_center()
                         .gap(metrics.scale(spacing::TIGHT))
-                        .debug_selector(move || format!("batch.run.question.{index}"))
-                        .child(
-                            components::compact_button(
-                                ux.batch_trust_accept,
-                                Variant::Secondary,
-                                metrics,
-                            )
-                            .id(SharedString::from(format!("batch.run.accept.{index}")))
-                            .debug_selector(move || format!("batch.run.accept.{index}"))
-                            .on_click(cx.listener(
-                                move |this, _event, _window, cx| {
-                                    this.answer_batch_trust(id, true, cx);
-                                },
-                            )),
-                        )
-                        .child(
-                            components::compact_button(
-                                ux.batch_trust_decline,
-                                Variant::Ghost,
-                                metrics,
-                            )
-                            .id(SharedString::from(format!("batch.run.decline.{index}")))
-                            .debug_selector(move || format!("batch.run.decline.{index}"))
-                            .on_click(cx.listener(
-                                move |this, _event, _window, cx| {
-                                    this.answer_batch_trust(id, false, cx);
-                                },
-                            )),
-                        )
+                        .w_full()
+                        .min_w_0()
                         .child(
                             div()
                                 .flex_none()
+                                .text_size(metrics.label_size())
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                .child(SharedString::from(host.target().label().to_owned())),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
                                 .text_size(metrics.caption_size())
                                 .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .child(question.text(ux)),
-                        ),
-                );
-            }
-            list = list.child(row);
-        }
-        let hidden = matching_hosts.len().saturating_sub(MAX_RUN_ROWS);
-        if hidden > 0 {
-            list = list.child(
-                div()
-                    .flex_none()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .debug_selector(|| "batch.run.more".to_owned())
-                    .child(copy::fill(
-                        ux.batch_targets_more,
-                        &[("count", &hidden.to_string())],
-                    )),
-            );
-        }
+                                .child(SharedString::from(host.target().destination())),
+                        )
+                        .child(components::chip(
+                            host_state_text(host.state(), ux),
+                            tone,
+                            metrics,
+                        ))
+                        .when(host.target().starts_at() > 0, |row| {
+                            row.child(components::chip(
+                                copy::fill(
+                                    ux.batch_from_step,
+                                    &[(
+                                        "step",
+                                        &(host.target().starts_at() as usize + 1).to_string(),
+                                    )],
+                                ),
+                                Tone::Neutral,
+                                metrics,
+                            ))
+                        });
+                    if question.is_some() {
+                        let weak_accept = weak.clone();
+                        let weak_decline = weak.clone();
+                        top_row = top_row.child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .gap(metrics.scale(spacing::HAIRLINE))
+                                .debug_selector(move || format!("batch.run.question.{index}"))
+                                .child(
+                                    components::compact_button(
+                                        ux.batch_trust_accept,
+                                        Variant::Secondary,
+                                        metrics,
+                                    )
+                                    .id(SharedString::from(format!("batch.run.accept.{index}")))
+                                    .debug_selector(move || format!("batch.run.accept.{index}"))
+                                    .on_click(
+                                        move |_event, _window, cx| {
+                                            let _ = weak_accept.update(cx, |this, cx| {
+                                                this.answer_batch_trust(id, true, cx);
+                                            });
+                                        },
+                                    ),
+                                )
+                                .child(
+                                    components::compact_button(
+                                        ux.batch_trust_decline,
+                                        Variant::Ghost,
+                                        metrics,
+                                    )
+                                    .id(SharedString::from(format!("batch.run.decline.{index}")))
+                                    .debug_selector(move || format!("batch.run.decline.{index}"))
+                                    .on_click(
+                                        move |_event, _window, cx| {
+                                            let _ = weak_decline.update(cx, |this, cx| {
+                                                this.answer_batch_trust(id, false, cx);
+                                            });
+                                        },
+                                    ),
+                                ),
+                        );
+                    }
+                    let mut row = components::list_row_frame(
+                        if is_selected {
+                            ControlState::Selected
+                        } else {
+                            ControlState::Resting
+                        },
+                        metrics,
+                    )
+                    .flex_col()
+                    .items_start()
+                    .justify_center()
+                    .h(row_height - metrics.scale(spacing::HAIRLINE))
+                    .overflow_hidden()
+                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .id(SharedString::from(format!("batch.run.host.{index}")))
+                    .cursor_pointer()
+                    .debug_selector(move || format!("batch.run.host.{index}"))
+                    .on_click(move |_event, _window, cx| {
+                        let _ = weak_select.update(cx, |this, cx| {
+                            this.batch.select_host(id);
+                            cx.notify();
+                        });
+                    })
+                    .child(top_row)
+                    .child(steps);
+                    if let Some(reason) = reason {
+                        row = row.child(
+                            div()
+                                .flex_none()
+                                .w_full()
+                                .truncate()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                .child(SharedString::from(reason)),
+                        );
+                    }
+                    items.push(
+                        div()
+                            .h(row_height)
+                            .pb(metrics.scale(spacing::HAIRLINE))
+                            .child(row)
+                            .into_any_element(),
+                    );
+                }
+                items
+            })
+            .track_scroll(self.batch_run_hosts_scroll.clone())
+            .h(list_height)
+            .w_full()
+            .debug_selector(|| "batch.run.hosts".to_owned())
+            .into_any_element()
+        };
         div()
             .flex()
             .flex_col()
             .flex_1()
             .min_w(metrics.scale(RUN_HOSTS_MIN_WIDTH))
             .gap(metrics.scale(spacing::TIGHT))
+            .children(search_box)
             .children(filter_bar)
-            .child(list)
+            .child(list_el)
     }
 
     /// The output of one host and the times of its steps.
@@ -2773,15 +2979,12 @@ impl ShelluneView {
                     .join("\n")
             })
             .filter(|text| !text.is_empty());
-        let mut heading = div()
+        let mut actions = div()
             .flex()
             .items_center()
-            .justify_between()
-            .flex_wrap()
-            .gap(metrics.scale(spacing::TIGHT))
-            .child(components::section_label(ux.batch_run_output, metrics));
+            .gap(metrics.scale(spacing::HALF));
         if let Some(copy_text) = copy_text {
-            heading = heading.child(
+            actions = actions.child(
                 self.icon_text_button(
                     SharedString::from("batch.run.output.copy"),
                     Icon::Copy,
@@ -2796,22 +2999,109 @@ impl ShelluneView {
                 .h(metrics.compact_control_height()),
             );
         }
+        actions = actions.child(
+            self.icon_text_button(
+                SharedString::from("batch.run.output.expand"),
+                if self.batch_output_expanded {
+                    Icon::Minimize
+                } else {
+                    Icon::Maximize
+                },
+                if self.batch_output_expanded {
+                    ux.batch_output_collapse
+                } else {
+                    ux.batch_output_expand
+                },
+                Variant::Ghost,
+                cx,
+                |this, cx| {
+                    this.batch_output_expanded = !this.batch_output_expanded;
+                    cx.notify();
+                },
+            )
+            .h(metrics.compact_control_height()),
+        );
+        let heading = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::TIGHT))
+            .child(components::section_label(ux.batch_run_output, metrics))
+            .child(actions);
         let mut column = div()
             .flex()
             .flex_col()
-            .flex_1()
-            .min_w(metrics.scale(RUN_SIDE_MIN_WIDTH))
+            .when(self.batch_output_expanded, |el| el.w_full())
+            .when(!self.batch_output_expanded, |el| {
+                el.flex_1().min_w(metrics.scale(RUN_SIDE_MIN_WIDTH))
+            })
             .gap(metrics.scale(spacing::TIGHT))
             .debug_selector(|| "batch.run.side".to_owned())
             .child(heading);
         let Some(host) = page.selected() else {
             return column;
         };
+        if let Some(question) = page.question(host) {
+            column = column.child(
+                components::banner(Tone::Warning, metrics)
+                    .debug_selector(|| "batch.run.side.question".to_owned())
+                    .flex_col()
+                    .items_start()
+                    .gap(metrics.scale(spacing::HALF))
+                    .child(
+                        div()
+                            .whitespace_normal()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(question.text(ux))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(metrics.scale(spacing::TIGHT))
+                            .child(
+                                components::compact_button(
+                                    ux.batch_trust_accept,
+                                    Variant::Secondary,
+                                    metrics,
+                                )
+                                .id("batch.run.side.accept")
+                                .debug_selector(|| "batch.run.side.accept".to_owned())
+                                .on_click(cx.listener(
+                                    move |this, _event, _window, cx| {
+                                        this.answer_batch_trust(host, true, cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                components::compact_button(
+                                    ux.batch_trust_decline,
+                                    Variant::Ghost,
+                                    metrics,
+                                )
+                                .id("batch.run.side.decline")
+                                .debug_selector(|| "batch.run.side.decline".to_owned())
+                                .on_click(cx.listener(
+                                    move |this, _event, _window, cx| {
+                                        this.answer_batch_trust(host, false, cx);
+                                    },
+                                )),
+                            ),
+                    ),
+            );
+        }
+        let output_height = if self.batch_output_expanded {
+            metrics.scale(RUN_OUTPUT_EXPANDED_HEIGHT)
+        } else {
+            metrics.scale(RUN_OUTPUT_HEIGHT)
+        };
         let mut output = div()
             .id("batch.run.output")
             .flex()
             .flex_col()
-            .h(metrics.scale(RUN_OUTPUT_HEIGHT))
+            .h(output_height)
             .overflow_y_scroll()
             .gap(metrics.scale(spacing::HAIRLINE))
             .p(metrics.scale(spacing::TIGHT))
@@ -2946,6 +3236,7 @@ impl ShelluneView {
 /// sentence about "还有 N 台" would count machines. It is a function rather than an
 /// expression inside the drawing code so that a test can hold the drawn row to that
 /// sentence instead of only to the wording of the constant.
+#[cfg(test)]
 pub(crate) fn library_more_line(ux: &UxStrings, hidden: usize) -> SharedString {
     SharedString::from(copy::fill(
         ux.batch_library_more,
@@ -3423,6 +3714,49 @@ impl ShelluneView {
         self.open_batch_history(cx);
     }
 
+    /// Sets the batch library search text, for a test.
+    #[cfg(test)]
+    pub fn set_batch_library_search_for_test(&mut self, query: &str, cx: &mut Context<Self>) {
+        self.batch_library_search
+            .update(cx, |field, cx| field.set_text(query, cx));
+        cx.notify();
+    }
+
+    /// Sets the batch history search text, for a test.
+    #[cfg(test)]
+    pub fn set_batch_history_search_for_test(&mut self, query: &str, cx: &mut Context<Self>) {
+        self.batch_history_search
+            .update(cx, |field, cx| field.set_text(query, cx));
+        cx.notify();
+    }
+
+    /// Sets the batch run host search text, for a test.
+    #[cfg(test)]
+    pub fn set_batch_run_search_for_test(&mut self, query: &str, cx: &mut Context<Self>) {
+        self.batch_run_search
+            .update(cx, |field, cx| field.set_text(query, cx));
+        cx.notify();
+    }
+
+    /// Whether the batch output pane is currently expanded, for a test.
+    #[cfg(test)]
+    pub fn batch_output_expanded_for_test(&self) -> bool {
+        self.batch_output_expanded
+    }
+
+    /// Whether the batch step snippet picker is currently open, for a test.
+    #[cfg(test)]
+    pub fn batch_snippet_picker_open_for_test(&self) -> bool {
+        self.batch_snippet_picker.is_some()
+    }
+
+    /// Number of batch library tasks matching the current search query, for a test.
+    #[cfg(test)]
+    pub fn batch_library_visible_count_for_test(&self, cx: &gpui::App) -> usize {
+        let query = self.batch_library_search.read(cx).text().to_owned();
+        self.batch.library_filtered(&query).len()
+    }
+
     /// Opens the detail of one stored run, by its place in the list the filter keeps.
     pub fn capture_batch_stored(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
         let id = self
@@ -3510,4 +3844,280 @@ impl ShelluneView {
         }
         arrived
     }
+}
+
+/// Renders one saved task row inside the virtualized batch library `uniform_list`.
+#[allow(clippy::too_many_arguments)]
+fn batch_library_row_element(
+    index: usize,
+    task: &shellune_core::BatchTask,
+    selected: bool,
+    asking: bool,
+    row_height: gpui::Pixels,
+    weak: &WeakEntity<ShelluneView>,
+    metrics: Metrics,
+    ux: &UxStrings,
+) -> Div {
+    let id = task.id();
+    let name = task.name().unwrap_or(ux.batch_untitled).to_owned();
+    let meta = copy::fill(
+        ux.batch_library_row_meta,
+        &[
+            ("hosts", &task.targets().len().to_string()),
+            ("steps", &task.steps().len().to_string()),
+            ("concurrency", &task.concurrency().to_string()),
+        ],
+    );
+    let mut row = components::list_row_frame(
+        if selected {
+            ControlState::Selected
+        } else {
+            ControlState::Resting
+        },
+        metrics,
+    )
+    .h(row_height - metrics.scale(spacing::HAIRLINE))
+    .overflow_hidden()
+    .id(SharedString::from(format!("batch.library.row.{index}")))
+    .debug_selector(move || format!("batch.library.row.{index}"))
+    .child(
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .child(
+                div()
+                    .flex_none()
+                    .truncate()
+                    .text_size(metrics.label_size())
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(SharedString::from(name)),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .truncate()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(SharedString::from(meta)),
+            ),
+    );
+    if asking {
+        let weak_no = weak.clone();
+        let weak_yes = weak.clone();
+        row = row
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::DANGER))
+                    .debug_selector(move || format!("batch.library.delete_ask.{index}"))
+                    .child(ux.batch_library_delete_ask),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        components::compact_button(
+                            ux.batch_library_delete_no,
+                            Variant::Ghost,
+                            metrics,
+                        )
+                        .id(SharedString::from(format!(
+                            "batch.library.delete_no.{index}"
+                        )))
+                        .debug_selector(move || format!("batch.library.delete_no.{index}"))
+                        .on_click(move |_event, _window, cx| {
+                            let _ = weak_no.update(cx, |this, cx| {
+                                this.batch.cancel_delete_saved();
+                                cx.notify();
+                            });
+                        }),
+                    )
+                    .child(
+                        components::compact_button(
+                            ux.batch_library_delete_yes,
+                            Variant::Danger,
+                            metrics,
+                        )
+                        .id(SharedString::from(format!(
+                            "batch.library.delete_yes.{index}"
+                        )))
+                        .debug_selector(move || format!("batch.library.delete_yes.{index}"))
+                        .on_click(move |_event, _window, cx| {
+                            let _ = weak_yes.update(cx, |this, cx| {
+                                this.delete_saved_batch(id, cx);
+                            });
+                        }),
+                    ),
+            );
+    } else {
+        let weak_edit = weak.clone();
+        let weak_delete = weak.clone();
+        row = row.child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(metrics.scale(spacing::TIGHT))
+                .child(
+                    components::compact_button(ux.batch_library_edit, Variant::Secondary, metrics)
+                        .id(SharedString::from(format!("batch.library.edit.{index}")))
+                        .debug_selector(move || format!("batch.library.edit.{index}"))
+                        .on_click(move |_event, _window, cx| {
+                            let _ = weak_edit.update(cx, |this, cx| {
+                                this.edit_saved_batch(id, cx);
+                            });
+                        }),
+                )
+                .child(
+                    components::compact_button(ux.batch_library_delete, Variant::Ghost, metrics)
+                        .id(SharedString::from(format!("batch.library.delete.{index}")))
+                        .debug_selector(move || format!("batch.library.delete.{index}"))
+                        .on_click(move |_event, _window, cx| {
+                            let _ = weak_delete.update(cx, |this, cx| {
+                                this.batch.ask_delete_saved(id);
+                                cx.notify();
+                            });
+                        }),
+                ),
+        );
+    }
+    div()
+        .h(row_height)
+        .pb(metrics.scale(spacing::HAIRLINE))
+        .child(row)
+}
+
+/// Renders one stored run row inside the virtualized batch history `uniform_list`.
+#[allow(clippy::too_many_arguments)]
+fn batch_history_row_element(
+    index: usize,
+    entry: &crate::app::batch::HistoryEntry,
+    selected: bool,
+    locale: crate::app::copy::Locale,
+    now_unix: u64,
+    row_height: gpui::Pixels,
+    weak: &WeakEntity<ShelluneView>,
+    metrics: Metrics,
+    ux: &UxStrings,
+) -> Div {
+    let id = entry.id();
+    let mut row = components::list_row_frame(
+        if selected {
+            ControlState::Selected
+        } else {
+            ControlState::Resting
+        },
+        metrics,
+    )
+    .h(row_height - metrics.scale(spacing::HAIRLINE))
+    .overflow_hidden()
+    .id(SharedString::from(format!("batch.history.row.{index}")))
+    .debug_selector(move || format!("batch.history.row.{index}"));
+    let Some(run) = entry.summary() else {
+        row = row.child(
+            div()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .flex_none()
+                        .truncate()
+                        .text_size(metrics.label_size())
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .child(SharedString::from(id.to_string())),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .truncate()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::DANGER))
+                        .debug_selector(move || format!("batch.history.damaged.{index}"))
+                        .child(
+                            entry
+                                .problem()
+                                .map_or_else(|| ux.batch_history_damaged.to_owned(), str::to_owned),
+                        ),
+                ),
+        );
+        return div()
+            .h(row_height)
+            .pb(metrics.scale(spacing::HAIRLINE))
+            .child(row);
+    };
+    let name = run
+        .task()
+        .name()
+        .map_or_else(|| ux.batch_untitled.to_owned(), str::to_owned);
+    let when = copy::fill(
+        ux.batch_history_when,
+        &[(
+            "time",
+            &copy::relative_time(run.started_at_unix(), now_unix, locale),
+        )],
+    );
+    let weak_open = weak.clone();
+    row = row
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .gap(metrics.scale(spacing::HAIRLINE))
+                .child(
+                    div()
+                        .flex_none()
+                        .truncate()
+                        .text_size(metrics.label_size())
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .child(SharedString::from(name)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .truncate()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .child(SharedString::from(format!(
+                            "{when} · {}",
+                            copy::fill(
+                                ux.batch_history_hosts,
+                                &[
+                                    ("done", &run.finished_hosts().to_string()),
+                                    ("total", &run.hosts().len().to_string()),
+                                ],
+                            )
+                        ))),
+                ),
+        )
+        .child(components::chip(
+            run_state_text(run.state(), ux),
+            run_state_tone(run.state()),
+            metrics,
+        ))
+        .child(
+            components::compact_button(ux.batch_history_open, Variant::Secondary, metrics)
+                .id(SharedString::from(format!("batch.history.open.{index}")))
+                .debug_selector(move || format!("batch.history.open.{index}"))
+                .on_click(move |_event, _window, cx| {
+                    let _ = weak_open.update(cx, |this, cx| {
+                        this.open_stored_batch(id, cx);
+                    });
+                }),
+        );
+    div()
+        .h(row_height)
+        .pb(metrics.scale(spacing::HAIRLINE))
+        .child(row)
 }

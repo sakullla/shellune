@@ -28372,25 +28372,24 @@ async fn a_keyboard_mark_never_lands_on_a_row_the_list_did_not_draw(cx: &mut Tes
     });
     cx.run_until_parked();
     assert!(
-        cx.debug_bounds("batch.library.row.59").is_some(),
-        "sixty rows are drawn"
+        cx.debug_bounds("batch.library.row.0").is_some(),
+        "virtualized library draws visible rows"
     );
     assert!(
-        cx.debug_bounds("batch.library.row.60").is_none(),
-        "the sixty-first is only counted, not drawn"
+        cx.debug_bounds("batch.library.more").is_none(),
+        "virtualized library removes the 60-row hard truncation"
     );
-    // Sixty-one presses down: with the count of the whole list the mark would walk past
-    // the last row that was drawn, onto a row the list only counts.
+    // Sixty-one presses down reach the 62nd task (index 61), scrolling it into view.
     for _ in 0..61 {
         cx.simulate_keystrokes("down");
     }
     cx.run_until_parked();
     let selected = cx.update(|_window, app| view.read(app).batch_panel().library_selected());
-    assert!(
-        selected < 60,
-        "the mark stays on a row that was drawn: {selected}"
+    assert_eq!(
+        selected, 61,
+        "keyboard navigation reaches tasks beyond the old 60-row cap: {selected}"
     );
-    // Enter opens the marked row, so the row it opens is one the list showed.
+    // Enter opens the marked row beyond 60.
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     let (marked, opened) = cx.update(|_window, app| {
@@ -28404,26 +28403,44 @@ async fn a_keyboard_mark_never_lands_on_a_row_the_list_did_not_draw(cx: &mut Tes
     assert_eq!(
         opened,
         vec![marked],
-        "the keyboard opened the marked task, not one the list did not draw"
+        "the keyboard opened the marked task beyond row 60"
     );
 
-    // The same rule on the stored runs.
+    // Search narrows the library to task 64.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_library(cx);
+            view.set_batch_library_search_for_test("task 64", cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("batch.library.row.0").is_some(),
+        "searching for task 64 shows it as row 0"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).batch_library_visible_count_for_test(app)),
+        1,
+        "only the matching task is shown"
+    );
+
+    // The same rule on the stored runs: all 65 are reachable without hard truncation.
     cx.update(|_window, app| {
         view.update(app, |view, cx| view.capture_batch_history(cx));
     });
     cx.run_until_parked();
     assert!(
-        cx.debug_bounds("batch.history.row.59").is_some(),
-        "sixty stored runs are drawn"
+        cx.debug_bounds("batch.history.row.0").is_some(),
+        "virtualized history draws visible rows"
     );
     for _ in 0..61 {
         cx.simulate_keystrokes("down");
     }
     cx.run_until_parked();
     let selected = cx.update(|_window, app| view.read(app).batch_panel().history_selected());
-    assert!(
-        selected < 60,
-        "the mark of the history stays on a drawn row: {selected}"
+    assert_eq!(
+        selected, 61,
+        "keyboard navigation reaches stored runs beyond the old 60-row cap: {selected}"
     );
     let marked = cx.update(|_window, app| {
         view.read(app)
@@ -28437,8 +28454,23 @@ async fn a_keyboard_mark_never_lands_on_a_row_the_list_did_not_draw(cx: &mut Tes
     let opened = cx.update(|_window, app| view.read(app).batch_panel().stored_open());
     assert_eq!(
         opened, marked,
-        "the keyboard opened the marked run, not one the list did not draw"
+        "the keyboard opened the marked stored run beyond row 60"
     );
+
+    // History search narrows the stored runs list.
+    click(cx, "batch.history.back");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.set_batch_history_search_for_test("nonexistent-run-xyz", cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("batch.history.clear_filters").is_some(),
+        "non-matching history search offers a Clear filters CTA"
+    );
+    click(cx, "batch.history.clear_filters");
+    assert!(cx.debug_bounds("batch.history.row.0").is_some());
 }
 
 #[gpui::test]
@@ -28759,8 +28791,12 @@ async fn the_library_row_that_counts_the_rest_uses_the_library_sentence(cx: &mut
     });
     cx.run_until_parked();
     assert!(
-        cx.debug_bounds("batch.library.more").is_some(),
-        "sixty rows are drawn and the five left over are counted"
+        cx.debug_bounds("batch.library.more").is_none(),
+        "virtualized library renders all tasks without hard truncation"
+    );
+    assert!(
+        cx.debug_bounds("batch.library.search").is_some(),
+        "library search input is visible for narrowing large task books"
     );
 
     // The row is drawn with this text: the library's own sentence, filled with the
@@ -53479,4 +53515,282 @@ async fn t4_terminal_pane_mixed_drop_uploads_folders_recursively_and_warns_unsup
             .any(|title| title == crate::app::copy::ux().drop_unsupported_items),
         "unsupported dropped entries produce an explicit warning toast: {toasts:?}"
     );
+}
+
+#[gpui::test]
+async fn t5_forwards_label_search_filters_save_and_start_action_error_and_inline_confirm(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("t5-forwards");
+    let host_a = HostConfig::new("prod-api", "10.0.0.10", 22, "ops").expect("host a");
+    let host_b = HostConfig::new("staging-db", "10.0.0.20", 22, "ops").expect("host b");
+    let missing_host = HostId::new();
+    seed(&dir.store(), vec![host_a.clone(), host_b.clone()]);
+
+    let orphan_rule = ForwardRule::local(
+        missing_host,
+        Endpoint::loopback(46001).expect("listen"),
+        Endpoint::new("10.0.0.99", 5432).expect("target"),
+    )
+    .with_label(Some("Orphan DB"));
+    let rule_b = ForwardRule::local(
+        host_b.id(),
+        Endpoint::loopback(46002).expect("listen"),
+        Endpoint::new("127.0.0.1", 6379).expect("target"),
+    )
+    .with_label(Some("Staging Redis"));
+    let mut book = ForwardBook::new();
+    book.insert(orphan_rule.clone()).expect("insert orphan");
+    book.insert(rule_b.clone()).expect("insert b");
+    ForwardStore::at(dir.store().root())
+        .save(&book)
+        .expect("save forwards");
+
+    let (view, cx) = hosts_view(cx, dir.store());
+    focus_root(&view, cx);
+    cx.dispatch_action(GoToForwards);
+    cx.run_until_parked();
+
+    // Create a labeled rule with Save & start; since no carrier is connected yet,
+    // it saves with its label and triggers the connection flow.
+    click(cx, "forwards.new");
+    assert!(cx.debug_bounds("forwards.label").is_some());
+    assert!(cx.debug_bounds("forwards.save_start").is_some());
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.set_forward_label_for_test("Prod Postgres", cx);
+            view.set_forward_listen_for_test("127.0.0.1", "46003", cx);
+            view.set_forward_target_for_test("db.internal", "5432", cx);
+        });
+    });
+    click(cx, "forwards.save_start");
+    // Re-open forwards dialog to inspect saved list (Save & start parked/dialed host_a).
+    focus_root(&view, cx);
+    cx.dispatch_action(GoToForwards);
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("forwards.label.2").is_some(),
+        "saved custom label renders on the new row"
+    );
+
+    // Search filters by custom label.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.set_forward_search_for_test("Prod Postgres", cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("forwards.row.0").is_some());
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).forward_visible_count_for_test(app)),
+        1,
+        "searching by custom label narrows to the 1 matching tunnel"
+    );
+
+    // Non-matching search shows filtered empty state + clear CTA.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.set_forward_search_for_test("no-such-tunnel-xyz", cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("forwards.filtered_empty").is_some());
+    click(cx, "forwards.clear_filters");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).forward_visible_count_for_test(app)),
+        3,
+        "clearing filters restores all 3 tunnels"
+    );
+
+    // Starting a rule whose host was deleted surfaces an explicit list-level error banner.
+    click(cx, "forwards.start.0");
+    assert!(
+        cx.debug_bounds("forwards.action_error").is_some(),
+        "missing-host start error is shown on the list instead of silently dropped"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).forward_action_error_for_test().is_some()),
+        "action error text is recorded"
+    );
+    click(cx, "forwards.action_error.dismiss");
+    assert!(
+        cx.update(|_window, app| view.read(app).forward_action_error_for_test().is_none()),
+        "dismissing clears the list-level action error"
+    );
+
+    // Inline delete confirmation renders directly beneath the target row (row 2).
+    click(cx, "forwards.delete.2");
+    let row_bounds = bounds_of(cx, "forwards.row.2");
+    let confirm_bounds = bounds_of(cx, "forwards.confirm");
+    assert!(
+        confirm_bounds.origin.y >= row_bounds.origin.y + row_bounds.size.height - px(1.0),
+        "inline confirm appears directly below its target row: row={row_bounds:?} confirm={confirm_bounds:?}"
+    );
+    click(cx, "forwards.confirm.no");
+
+    // Marking a rule as CarrierLost surfaces the one-click Restart dropped button
+    // and filters cleanly under the Failed status filter.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.note_forward_carrier_lost_for_test(rule_b.id(), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("forwards.restart_dropped").is_some(),
+        "dropped rules expose one-click restart button"
+    );
+    click(cx, "forwards.filter.failed");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).forward_visible_count_for_test(app)),
+        1,
+        "Failed status filter keeps only the 1 dropped rule"
+    );
+    click(cx, "forwards.filter.all");
+
+    // Host filter narrows to host_b and exposes per-host Start all / Stop all.
+    click(cx, "forwards.host_filter.1");
+    assert!(
+        cx.debug_bounds("forwards.host.start_all").is_some(),
+        "per-host Start all appears when filtering a host with inactive rules"
+    );
+}
+
+#[gpui::test]
+async fn t5_batch_virtualized_run_search_progress_expand_cancelling_trust_and_snippet(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("t5-batch-features");
+    // Seed 205 hosts to verify virtualized run hosts (>200) have no hard truncation.
+    let hosts: Vec<HostConfig> = (0..205)
+        .map(|i| {
+            HostConfig::new(
+                format!("node-{i:03}"),
+                format!("10.20.{}.{}", i / 250, (i % 250) + 1),
+                22,
+                "ops",
+            )
+            .expect("host")
+        })
+        .collect();
+    seed(&dir.store(), hosts);
+
+    // Seed a saved snippet for step-editor insertion.
+    let snippet_store = shellune_storage::SnippetStore::at(dir.store().root());
+    let mut snippet_lib = crate::app::snippets::SnippetLibrary::load(snippet_store);
+    snippet_lib
+        .create("Check Disk", "df -h /\nuptime")
+        .expect("create snippet");
+
+    let (view, cx) = hosts_view(cx, dir.store());
+    preview_batch(cx, &view, 205);
+
+    // Step editor: open "From snippet" picker and insert saved snippet into step 0.
+    click(cx, "batch.step.snippet.0");
+    assert!(
+        cx.debug_bounds("batch.snippet.picker").is_some(),
+        "snippet picker opens inside step editor"
+    );
+    click(cx, "batch.snippet.option.0");
+    assert!(
+        !cx.update(|_window, app| view.read(app).batch_snippet_picker_open_for_test()),
+        "snippet picker closes after inserting"
+    );
+    let commands = cx.update(|_window, app| view.read(app).batch_panel().commands(app));
+    assert_eq!(
+        commands,
+        vec!["df -h / && uptime".to_owned()],
+        "snippet body is inserted into the step field"
+    );
+
+    // Start a run with all 205 hosts gated in flight so we can inspect virtualized list,
+    // search beyond 200, progress bar, trust filter, output expand, and cancelling state.
+    use crate::app::view::batch::fixture::{HostScript, Plan, StepScript};
+    let labels: Vec<String> = (0..205).map(|i| format!("node-{i:03}")).collect();
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let plan = Plan::new().every(
+        &label_refs,
+        HostScript::new(vec![StepScript::holding("started\n")]),
+    );
+    let (_factory, gate) =
+        cx.update(|_window, app| view.update(app, |view, cx| view.capture_batch_start(plan, cx)));
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .active_run()
+            .is_some_and(|page| page.running_hosts() > 0)
+    }));
+
+    // Determinate progress bar is drawn.
+    assert!(
+        cx.debug_bounds("batch.run.progress.bar").is_some(),
+        "determinate progress bar is shown in active run"
+    );
+    // No 200-host truncation banner.
+    assert!(
+        cx.debug_bounds("batch.run.more").is_none(),
+        "virtualized host list removes the 200-host hard cap"
+    );
+
+    // Search for host 204 (beyond old 200 cap) and verify it appears as row 0.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.set_batch_run_search_for_test("node-204", cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("batch.run.host.0").is_some(),
+        "host 204 beyond old 200-row cap is reachable via search"
+    );
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.set_batch_run_search_for_test("", cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // Pending trust filter pill is present.
+    assert!(
+        cx.debug_bounds("batch.run.filter.trust").is_some(),
+        "dedicated Pending trust filter pill is rendered"
+    );
+
+    // Expand output pane toggle increases output height.
+    let collapsed_h = bounds_of(cx, "batch.run.output").size.height;
+    assert!(!cx.update(|_window, app| view.read(app).batch_output_expanded_for_test()));
+    click(cx, "batch.run.output.expand");
+    assert!(cx.update(|_window, app| view.read(app).batch_output_expanded_for_test()));
+    let expanded_h = bounds_of(cx, "batch.run.output").size.height;
+    assert!(
+        expanded_h > collapsed_h,
+        "expanding output increases output pane height: {collapsed_h:?} -> {expanded_h:?}"
+    );
+    click(cx, "batch.run.output.expand");
+    assert!(!cx.update(|_window, app| view.read(app).batch_output_expanded_for_test()));
+
+    // Cancelling disables the cancel button while the run is still winding down.
+    click(cx, "batch.run.cancel");
+    assert!(
+        settle_batch(cx, &view, |view| {
+            view.batch_panel().active_run().is_some_and(|page| {
+                matches!(
+                    page.state(),
+                    shellune_core::RunState::Cancelling | shellune_core::RunState::Cancelled
+                )
+            })
+        }),
+        "cancel transitions run to Cancelling/Cancelled"
+    );
+    gate.release();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            let _ = view.capture_batch_wait(cx, |v| {
+                v.batch_panel()
+                    .active_run()
+                    .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+            });
+        });
+    });
+    cx.run_until_parked();
 }

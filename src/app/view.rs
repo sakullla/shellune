@@ -639,6 +639,23 @@ pub struct ShelluneView {
     batch: crate::app::batch::BatchPanel,
     /// Whether the batch page is already asking the runner what happened.
     batch_polling: bool,
+    /// Search field for saved batch tasks.
+    batch_library_search: Entity<TextField>,
+    /// Search field for stored batch runs.
+    batch_history_search: Entity<TextField>,
+    /// Search field for hosts in the active batch run.
+    batch_run_search: Entity<TextField>,
+    /// Search field for the snippet picker inside the batch step editor.
+    batch_snippet_search: Entity<TextField>,
+    /// Step index currently showing the "Insert from snippet" picker.
+    batch_snippet_picker: Option<usize>,
+    /// Whether the batch output pane is expanded for easier reading.
+    batch_output_expanded: bool,
+    /// Virtualized scroll handles for batch lists.
+    batch_library_scroll: gpui::UniformListScrollHandle,
+    batch_history_scroll: gpui::UniformListScrollHandle,
+    batch_history_hosts_scroll: gpui::UniformListScrollHandle,
+    batch_run_hosts_scroll: gpui::UniformListScrollHandle,
     hosts_search: Entity<TextField>,
     /// Independent sidebar group locator input (R9).
     group_search: Entity<TextField>,
@@ -804,6 +821,8 @@ pub struct ShelluneView {
     /// The manager's own keyboard target, so its list answers the arrow keys while no
     /// field of the editor is open.
     snippet_focus: FocusHandle,
+    forward_label: Entity<TextField>,
+    forward_search: Entity<TextField>,
     forward_listen_host: Entity<TextField>,
     forward_listen_port: Entity<TextField>,
     forward_target_host: Entity<TextField>,
@@ -2977,10 +2996,37 @@ impl ShelluneView {
         });
         // Examples, not labels: the form names each field above it, and an address
         // reads the same in every language.
+        let ux_init = copy::ux_for(workspace.locale());
+        let forward_label = cx.new(|cx| TextField::new(ux_init.fwd_label_placeholder, cx));
+        let forward_search = cx.new(|cx| {
+            let mut field = TextField::new(ux_init.fwd_search_placeholder, cx);
+            field.set_leading_icon(Icon::Search, cx);
+            field
+        });
         let forward_listen_host = cx.new(|cx| TextField::new("127.0.0.1", cx));
         let forward_listen_port = cx.new(|cx| TextField::new("8080", cx));
         let forward_target_host = cx.new(|cx| TextField::new("db.internal", cx));
         let forward_target_port = cx.new(|cx| TextField::new("5432", cx));
+        let batch_library_search = cx.new(|cx| {
+            let mut field = TextField::new(ux_init.batch_library_search, cx);
+            field.set_leading_icon(Icon::Search, cx);
+            field
+        });
+        let batch_history_search = cx.new(|cx| {
+            let mut field = TextField::new(ux_init.batch_history_search, cx);
+            field.set_leading_icon(Icon::Search, cx);
+            field
+        });
+        let batch_run_search = cx.new(|cx| {
+            let mut field = TextField::new(ux_init.batch_run_search, cx);
+            field.set_leading_icon(Icon::Search, cx);
+            field
+        });
+        let batch_snippet_search = cx.new(|cx| {
+            let mut field = TextField::new(ux_init.batch_snippet_search, cx);
+            field.set_leading_icon(Icon::Search, cx);
+            field
+        });
         // The saved commands live beside the hosts, in the same data directory. Reading
         // them here starts nothing; a damaged file is kept and reported by the library.
         let snippet_store = SnippetStore::at(store.root());
@@ -3032,6 +3078,16 @@ impl ShelluneView {
             hosts: HostsPanel::new(),
             batch: crate::app::batch::BatchPanel::new(),
             batch_polling: false,
+            batch_library_search,
+            batch_history_search,
+            batch_run_search,
+            batch_snippet_search,
+            batch_snippet_picker: None,
+            batch_output_expanded: false,
+            batch_library_scroll: gpui::UniformListScrollHandle::new(),
+            batch_history_scroll: gpui::UniformListScrollHandle::new(),
+            batch_history_hosts_scroll: gpui::UniformListScrollHandle::new(),
+            batch_run_hosts_scroll: gpui::UniformListScrollHandle::new(),
             hosts_search,
             group_search,
             host_fields: None,
@@ -3132,6 +3188,8 @@ impl ShelluneView {
             }),
             key_presence: crate::app::hosts::KeyPresence::new(),
             snippet_focus: cx.focus_handle(),
+            forward_label,
+            forward_search,
             forward_listen_host,
             forward_listen_port,
             forward_target_host,
@@ -10214,7 +10272,17 @@ impl ShelluneView {
     /// Wires Tab and Shift+Tab across the visible Port Forwarding form fields, with the
     /// through-host control as the stop before the first of them (ADR-7).
     fn bind_forward_fields(&mut self, cx: &mut Context<Self>) {
+        for search in [
+            &self.forward_search,
+            &self.batch_library_search,
+            &self.batch_history_search,
+            &self.batch_run_search,
+            &self.batch_snippet_search,
+        ] {
+            cx.observe(search, |_view, _field, cx| cx.notify()).detach();
+        }
         let candidates = [
+            self.forward_label.clone(),
             self.forward_listen_host.clone(),
             self.forward_listen_port.clone(),
             self.forward_target_host.clone(),
@@ -10253,6 +10321,7 @@ impl ShelluneView {
     /// The text fields of the tunnel form the keyboard walks, in visual order.
     fn forward_tab_fields(&self) -> Vec<Entity<TextField>> {
         let mut visible = vec![
+            self.forward_label.clone(),
             self.forward_listen_host.clone(),
             self.forward_listen_port.clone(),
         ];

@@ -2692,6 +2692,38 @@ pub struct UxStrings {
     pub fwd_no_hosts: &'static str,
     /// Cancel
     pub fwd_cancel: &'static str,
+    /// Optional custom label field heading in forward editor
+    pub fwd_label: &'static str,
+    /// Optional custom label placeholder in forward editor
+    pub fwd_label_placeholder: &'static str,
+    /// Save and immediately start the tunnel
+    pub fwd_save_and_start: &'static str,
+    /// Search placeholder in forwards list
+    pub fwd_search_placeholder: &'static str,
+    /// Status filter: all tunnels
+    pub fwd_filter_all: &'static str,
+    /// Status filter: active (listening or starting) tunnels
+    pub fwd_filter_active: &'static str,
+    /// Status filter: inactive (saved or stopped) tunnels
+    pub fwd_filter_inactive: &'static str,
+    /// Status filter: failed tunnels
+    pub fwd_filter_failed: &'static str,
+    /// Host filter: all hosts
+    pub fwd_filter_all_hosts: &'static str,
+    /// Empty state title when search/filters match no tunnels
+    pub fwd_filtered_empty_title: &'static str,
+    /// Empty state body when search/filters match no tunnels
+    pub fwd_filtered_empty_body: &'static str,
+    /// Clear active filters in forwards list
+    pub fwd_clear_filters: &'static str,
+    /// Start all tunnels for a host
+    pub fwd_start_all: &'static str,
+    /// Stop all active tunnels for a host
+    pub fwd_stop_all: &'static str,
+    /// Restart dropped tunnels after carrier disconnect
+    pub fwd_restart_dropped: &'static str,
+    /// Error banner when a list-level forward action fails
+    pub fwd_action_failed: &'static str,
     /// Question before a running tunnel is stopped
     pub fwd_stop_title: &'static str,
     /// The confirm button's own action, not the question it answers.
@@ -3239,6 +3271,7 @@ pub struct UxStrings {
     /// Row meta: the hosts, steps and concurrency of a saved task
     pub batch_library_row_meta: &'static str,
     /// How many saved tasks the library does not list, with the number filled in
+    #[allow(dead_code)]
     pub batch_library_more: &'static str,
     /// A saved task that has no name
     pub batch_untitled: &'static str,
@@ -3462,6 +3495,30 @@ pub struct UxStrings {
     pub batch_filter_running: &'static str,
     /// Batch host filter: succeeded
     pub batch_filter_done: &'static str,
+    /// Batch host filter: pending host-key trust
+    pub batch_filter_trust: &'static str,
+    /// Quick-jump badge for hosts awaiting host-key trust
+    pub batch_pending_trust_jump: &'static str,
+    /// Search placeholder in batch library
+    pub batch_library_search: &'static str,
+    /// Search placeholder in batch history
+    pub batch_history_search: &'static str,
+    /// Search placeholder in batch run hosts list
+    pub batch_run_search: &'static str,
+    /// Empty state when batch search/filters match nothing
+    pub batch_filtered_empty: &'static str,
+    /// Clear active batch search/filters
+    pub batch_clear_filters: &'static str,
+    /// Expand batch output pane
+    pub batch_output_expand: &'static str,
+    /// Collapse batch output pane
+    pub batch_output_collapse: &'static str,
+    /// Insert command from saved snippet in batch step editor
+    pub batch_step_from_snippet: &'static str,
+    /// Search placeholder in batch snippet picker
+    pub batch_snippet_search: &'static str,
+    /// Empty message in batch snippet picker
+    pub batch_snippet_empty: &'static str,
     /// Placeholder for shortcut command search box
     pub snippet_search_placeholder: &'static str,
     /// Empty state when shortcut command search matches nothing
@@ -3675,6 +3732,22 @@ impl UxStrings {
             self.fwd_empty_body,
             self.fwd_no_hosts,
             self.fwd_cancel,
+            self.fwd_label,
+            self.fwd_label_placeholder,
+            self.fwd_save_and_start,
+            self.fwd_search_placeholder,
+            self.fwd_filter_all,
+            self.fwd_filter_active,
+            self.fwd_filter_inactive,
+            self.fwd_filter_failed,
+            self.fwd_filter_all_hosts,
+            self.fwd_filtered_empty_title,
+            self.fwd_filtered_empty_body,
+            self.fwd_clear_filters,
+            self.fwd_start_all,
+            self.fwd_stop_all,
+            self.fwd_restart_dropped,
+            self.fwd_action_failed,
             self.fwd_stop_title,
             self.fwd_stop_action,
             self.fwd_stop_body,
@@ -4075,6 +4148,18 @@ impl UxStrings {
             self.batch_filter_waiting,
             self.batch_filter_running,
             self.batch_filter_done,
+            self.batch_filter_trust,
+            self.batch_pending_trust_jump,
+            self.batch_library_search,
+            self.batch_history_search,
+            self.batch_run_search,
+            self.batch_filtered_empty,
+            self.batch_clear_filters,
+            self.batch_output_expand,
+            self.batch_output_collapse,
+            self.batch_step_from_snippet,
+            self.batch_snippet_search,
+            self.batch_snippet_empty,
             self.snippet_search_placeholder,
             self.snippet_search_empty,
             self.snippet_keys_hint,
@@ -4241,6 +4326,22 @@ included",
     fwd_empty_body: "A tunnel carries one port through an SSH host, so a service on one side can be used from the other.",
     fwd_no_hosts: "Save a host first: every tunnel runs through an SSH host.",
     fwd_cancel: "Cancel",
+    fwd_label: "Label (optional)",
+    fwd_label_placeholder: "e.g. Prod Postgres",
+    fwd_save_and_start: "Save & start",
+    fwd_search_placeholder: "Search tunnels by label, host or port\u{2026}",
+    fwd_filter_all: "All",
+    fwd_filter_active: "Active",
+    fwd_filter_inactive: "Inactive",
+    fwd_filter_failed: "Failed",
+    fwd_filter_all_hosts: "All hosts",
+    fwd_filtered_empty_title: "No matching tunnels",
+    fwd_filtered_empty_body: "Try another keyword or clear the active filters.",
+    fwd_clear_filters: "Clear filters",
+    fwd_start_all: "Start all",
+    fwd_stop_all: "Stop all",
+    fwd_restart_dropped: "Restart dropped ({count})",
+    fwd_action_failed: "Action failed: {reason}",
     fwd_stop_title: "Stop this tunnel?",
     fwd_stop_action: "Stop tunnel",
     fwd_stop_body: "{endpoint} stops listening now. The rule stays saved and can be started again; nothing on either machine is removed.",
@@ -4641,6 +4742,18 @@ included",
     batch_filter_waiting: "Needs answer",
     batch_filter_running: "Running",
     batch_filter_done: "Succeeded",
+    batch_filter_trust: "Pending trust",
+    batch_pending_trust_jump: "{count} awaiting trust",
+    batch_library_search: "Search saved tasks\u{2026}",
+    batch_history_search: "Search runs by task or ID\u{2026}",
+    batch_run_search: "Search hosts by name or address\u{2026}",
+    batch_filtered_empty: "No matching items.",
+    batch_clear_filters: "Clear filters",
+    batch_output_expand: "Expand",
+    batch_output_collapse: "Collapse",
+    batch_step_from_snippet: "From snippet",
+    batch_snippet_search: "Search snippets\u{2026}",
+    batch_snippet_empty: "No saved snippets yet.",
     snippet_search_placeholder: "Filter shortcut commands\u{2026}",
     snippet_search_empty: "No matching shortcut commands.",
     snippet_keys_hint: "↑↓ select · Enter fill in · {run_key} run · Esc close",
@@ -4802,6 +4915,22 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     fwd_empty_body: "端口转发经由一台 SSH 主机传递一个端口，让一侧的服务可以在另一侧使用。",
     fwd_no_hosts: "请先保存一台主机：每条端口转发都要经由 SSH 主机。",
     fwd_cancel: "取消",
+    fwd_label: "名称标签（可选）",
+    fwd_label_placeholder: "例如：生产库 Postgres",
+    fwd_save_and_start: "保存并启动",
+    fwd_search_placeholder: "按标签、主机或端口搜索转发\u{2026}",
+    fwd_filter_all: "全部",
+    fwd_filter_active: "运行中",
+    fwd_filter_inactive: "未运行",
+    fwd_filter_failed: "失败",
+    fwd_filter_all_hosts: "全部主机",
+    fwd_filtered_empty_title: "没有匹配的端口转发",
+    fwd_filtered_empty_body: "请尝试其他关键词，或清除当前筛选条件。",
+    fwd_clear_filters: "清除筛选",
+    fwd_start_all: "全部启动",
+    fwd_stop_all: "全部停止",
+    fwd_restart_dropped: "一键重启已掉线 ({count})",
+    fwd_action_failed: "操作失败：{reason}",
     fwd_stop_title: "停止这条隧道？",
     fwd_stop_action: "停止隧道",
     fwd_stop_body: "{endpoint} 会立即停止监听。规则仍然保存，可以再次启动；两侧机器上都不会删除任何内容。",
@@ -5202,6 +5331,18 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     batch_filter_waiting: "待确认",
     batch_filter_running: "运行中",
     batch_filter_done: "已完成",
+    batch_filter_trust: "待信任",
+    batch_pending_trust_jump: "{count} 台待信任",
+    batch_library_search: "搜索已保存任务\u{2026}",
+    batch_history_search: "按任务名或 ID 搜索历史记录\u{2026}",
+    batch_run_search: "按主机名或地址搜索主机\u{2026}",
+    batch_filtered_empty: "没有匹配项。",
+    batch_clear_filters: "清除筛选",
+    batch_output_expand: "展开",
+    batch_output_collapse: "收起",
+    batch_step_from_snippet: "从片段插入",
+    batch_snippet_search: "搜索代码片段\u{2026}",
+    batch_snippet_empty: "暂无已保存的代码片段。",
     snippet_search_placeholder: "搜索快捷命令\u{2026}",
     snippet_search_empty: "没有匹配的快捷命令。",
     snippet_keys_hint: "↑↓ 选择 · Enter 填入 · {run_key} 执行 · Esc 关闭",

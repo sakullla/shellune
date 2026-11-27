@@ -20,6 +20,36 @@ pub enum ForwardScope {
     Host(HostId),
 }
 
+/// Runtime status filter for the forwarding list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ForwardStatusFilter {
+    /// Every rule regardless of runtime phase.
+    #[default]
+    All,
+    /// Rules currently starting or listening.
+    Active,
+    /// Saved or stopped rules.
+    Inactive,
+    /// Rules whose last start or carrier failed.
+    Failed,
+}
+
+impl ForwardStatusFilter {
+    /// All status filter pills in display order.
+    pub const ALL: [Self; 4] = [Self::All, Self::Active, Self::Inactive, Self::Failed];
+
+    /// Whether `phase` matches this filter.
+    #[must_use]
+    pub fn matches(self, phase: &ForwardPhase) -> bool {
+        match self {
+            Self::All => true,
+            Self::Active => phase.is_active(),
+            Self::Inactive => matches!(phase, ForwardPhase::Saved | ForwardPhase::Stopped),
+            Self::Failed => matches!(phase, ForwardPhase::Failed { .. }),
+        }
+    }
+}
+
 /// What a rule is doing, apart from the configuration that was saved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ForwardPhase {
@@ -149,11 +179,14 @@ pub struct ForwardCenter {
     generation: HashMap<ForwardId, u64>,
     carriers: HashMap<SessionId, ForwardLink>,
     scope: ForwardScope,
+    status_filter: ForwardStatusFilter,
     editor: Option<ForwardEditor>,
     /// A non-loopback start the user has confirmed and not yet consumed.
     exposure: Option<ForwardId>,
     /// Why the rule file could not be read. The book is left as it was.
     load_error: Option<String>,
+    /// Why a list-level forward action (start, copy, delete) failed.
+    action_error: Option<String>,
 }
 
 impl ForwardCenter {
@@ -167,9 +200,11 @@ impl ForwardCenter {
             generation: HashMap::new(),
             carriers: HashMap::new(),
             scope: ForwardScope::All,
+            status_filter: ForwardStatusFilter::All,
             editor: None,
             exposure: None,
             load_error: None,
+            action_error: None,
         }
     }
 
@@ -187,6 +222,33 @@ impl ForwardCenter {
     /// Clears a read failure after a successful load.
     pub fn clear_load_error(&mut self) {
         self.load_error = None;
+    }
+
+    /// Why the last list-level action failed.
+    #[must_use]
+    pub fn action_error(&self) -> Option<&str> {
+        self.action_error.as_deref()
+    }
+
+    /// Records a list-level action failure so it is shown on the forwards page.
+    pub fn note_action_error(&mut self, error: String) {
+        self.action_error = Some(error);
+    }
+
+    /// Clears the list-level action failure.
+    pub fn clear_action_error(&mut self) {
+        self.action_error = None;
+    }
+
+    /// Current runtime status filter.
+    #[must_use]
+    pub fn status_filter(&self) -> ForwardStatusFilter {
+        self.status_filter
+    }
+
+    /// Sets the runtime status filter.
+    pub fn set_status_filter(&mut self, filter: ForwardStatusFilter) {
+        self.status_filter = filter;
     }
 
     /// Replaces the saved book. Listeners that are already up are left alone.
@@ -287,6 +349,7 @@ impl ForwardCenter {
     ///
     /// The center's book is unchanged, so a failed write keeps the previous file
     /// and the form.
+    #[allow(dead_code)]
     pub fn preview(
         &self,
         listen_host: &str,
@@ -294,6 +357,20 @@ impl ForwardCenter {
         target_host: &str,
         target_port: &str,
     ) -> Result<ForwardBook, String> {
+        self.preview_with_label("", listen_host, listen_port, target_host, target_port)
+            .map(|(book, _)| book)
+    }
+
+    /// A book with the form (including optional label) applied, returning the
+    /// resulting book and the created/updated rule id.
+    pub fn preview_with_label(
+        &self,
+        label: &str,
+        listen_host: &str,
+        listen_port: &str,
+        target_host: &str,
+        target_port: &str,
+    ) -> Result<(ForwardBook, ForwardId), String> {
         let editor = self.editor.as_ref().ok_or("no forward is being edited")?;
         let host = editor.host.ok_or("choose the host this forward uses")?;
         let listen = endpoint(listen_host, listen_port, true)?;
@@ -305,14 +382,16 @@ impl ForwardCenter {
         let rule = match editor.id {
             Some(id) => rule_with_id(id, host, editor.kind, listen, target)?,
             None => new_rule(host, editor.kind, listen, target)?,
-        };
+        }
+        .with_label(Some(label));
+        let id = rule.id();
         let mut book = self.book.clone();
         if editor.id.is_some() {
             book.update(rule).map_err(|error| error.to_string())?;
         } else {
             book.insert(rule).map_err(|error| error.to_string())?;
         }
-        Ok(book)
+        Ok((book, id))
     }
 
     /// Stores a book that was just written to disk.
@@ -343,13 +422,71 @@ impl ForwardCenter {
         }
         self.replace_book(book);
         self.editor = None;
+        self.action_error = None;
     }
 
-    /// Remembers why the form could not be saved.
+    /// Remembers why the form could not be saved, or records a list-level error
+    /// when no form is open.
     pub fn fail_editor(&mut self, error: String) {
         if let Some(editor) = self.editor.as_mut() {
             editor.error = Some(error);
+        } else {
+            self.action_error = Some(error);
         }
+    }
+
+    /// Rules in the current scope whose carrier connection was lost.
+    #[must_use]
+    pub fn dropped_rules(&self) -> Vec<ForwardRule> {
+        self.book
+            .rules()
+            .iter()
+            .filter(|rule| {
+                self.matches(rule)
+                    && matches!(
+                        self.phase.get(&rule.id()),
+                        Some(ForwardPhase::Failed {
+                            failure: ForwardFailure::CarrierLost,
+                            ..
+                        })
+                    )
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Active rule ids belonging to one host.
+    #[must_use]
+    pub fn active_ids_for_host(&self, host: HostId) -> Vec<ForwardId> {
+        self.book
+            .rules()
+            .iter()
+            .filter(|rule| {
+                rule.host() == host
+                    && self
+                        .phase
+                        .get(&rule.id())
+                        .is_some_and(ForwardPhase::is_active)
+            })
+            .map(ForwardRule::id)
+            .collect()
+    }
+
+    /// Non-active rule ids belonging to one host.
+    #[must_use]
+    pub fn startable_ids_for_host(&self, host: HostId) -> Vec<ForwardId> {
+        self.book
+            .rules()
+            .iter()
+            .filter(|rule| {
+                rule.host() == host
+                    && !self
+                        .phase
+                        .get(&rule.id())
+                        .is_some_and(ForwardPhase::is_active)
+            })
+            .map(ForwardRule::id)
+            .collect()
     }
 
     /// A copy of a rule, not listening, ready to insert.
@@ -655,6 +792,18 @@ impl ForwardCenter {
     #[cfg(test)]
     pub fn is_listening_for_test(&self, id: ForwardId) -> bool {
         matches!(self.phase.get(&id), Some(ForwardPhase::Listening { .. }))
+    }
+
+    /// Marks one rule as failed due to carrier loss, for tests.
+    #[cfg(test)]
+    pub fn note_carrier_lost_for_test(&mut self, id: ForwardId) {
+        self.phase.insert(
+            id,
+            ForwardPhase::Failed {
+                generation: 1,
+                failure: ForwardFailure::CarrierLost,
+            },
+        );
     }
 
     fn mark_carrier_lost(&mut self, session: SessionId) {
