@@ -3465,6 +3465,8 @@ pub struct UxStrings {
     pub terminal_link_refused_scheme: &'static str,
     /// Toast when an OSC 8 link target was malformed and not opened
     pub terminal_link_refused_malformed: &'static str,
+    /// Toast when an OSC 8 file link named another computer and was not opened; {host}
+    pub terminal_link_refused_remote_file: &'static str,
     /// Terminal menu/palette: start logging output as plain text
     pub terminal_log_start_plain: &'static str,
     /// Terminal menu/palette: start logging output byte for byte
@@ -4038,6 +4040,7 @@ impl UxStrings {
             self.terminal_copy_link,
             self.terminal_link_refused_scheme,
             self.terminal_link_refused_malformed,
+            self.terminal_link_refused_remote_file,
             self.terminal_log_start_plain,
             self.terminal_log_start_raw,
             self.terminal_log_stop,
@@ -4588,6 +4591,7 @@ included",
     terminal_copy_link: "Copy link",
     terminal_link_refused_scheme: "Didn't open a {scheme}: link",
     terminal_link_refused_malformed: "Didn't open a link with an unusable address",
+    terminal_link_refused_remote_file: "Didn't open a file on another computer ({host})",
     terminal_log_start_plain: "Start session log (plain text)…",
     terminal_log_start_raw: "Start session log (raw)…",
     terminal_log_stop: "Stop session log",
@@ -5133,6 +5137,7 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     terminal_copy_link: "复制链接",
     terminal_link_refused_scheme: "未打开 {scheme}: 链接",
     terminal_link_refused_malformed: "链接地址无法使用，未打开",
+    terminal_link_refused_remote_file: "未打开其他计算机（{host}）上的文件",
     terminal_log_start_plain: "开始记录会话（纯文本）…",
     terminal_log_start_raw: "开始记录会话（原始）…",
     terminal_log_stop: "停止记录会话",

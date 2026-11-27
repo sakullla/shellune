@@ -6213,13 +6213,17 @@ impl ShelluneView {
                 self.toast(Tone::Danger, title, Some(reason), cx);
                 return;
             }
-            terminal::PaneRequest::LinkRefused(scheme) => {
+            terminal::PaneRequest::LinkRefused(refusal) => {
+                use shellune_terminal::LinkRefusal;
                 let ux = copy::ux();
-                let title = match scheme {
-                    Some(scheme) => {
+                let title = match refusal {
+                    LinkRefusal::Scheme(scheme) => {
                         copy::fill(ux.terminal_link_refused_scheme, &[("scheme", &scheme)])
                     }
-                    None => ux.terminal_link_refused_malformed.to_owned(),
+                    LinkRefusal::RemoteFile(host) => {
+                        copy::fill(ux.terminal_link_refused_remote_file, &[("host", &host)])
+                    }
+                    LinkRefusal::Malformed => ux.terminal_link_refused_malformed.to_owned(),
                 };
                 self.toast(Tone::Warning, title, None, cx);
                 return;

@@ -596,8 +596,8 @@ pub enum PaneRequest {
         /// Why writing failed.
         reason: String,
     },
-    /// An OSC 8 link was not opened: its scheme (named), or a malformed target (R1).
-    LinkRefused(Option<String>),
+    /// An OSC 8 link was not opened, and why (R1).
+    LinkRefused(LinkRefusal),
 }
 
 impl gpui::EventEmitter<PaneRequest> for TerminalPane {}
@@ -3884,14 +3884,11 @@ impl TerminalPane {
     /// Opens a link target, or refuses it and says so (R1).
     ///
     /// Recognized text is always an `http(s)://` address. An OSC 8 target is the
-    /// program's choice, so only web, mail and local-file targets are opened; any
+    /// program's choice, so only web, mail and this computer's files are opened; any
     /// other is named in a message and nothing is launched.
     fn open_link(&mut self, url: &str, cx: &mut Context<Self>) -> bool {
         if let Err(refusal) = osc8_target_allowed(url) {
-            cx.emit(PaneRequest::LinkRefused(match refusal {
-                LinkRefusal::Scheme(scheme) => Some(scheme),
-                LinkRefusal::Malformed => None,
-            }));
+            cx.emit(PaneRequest::LinkRefused(refusal));
             return false;
         }
         #[cfg(test)]

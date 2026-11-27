@@ -49322,7 +49322,9 @@ async fn osc8_links_show_their_target_on_hover_and_open_only_when_allowed(cx: &m
     let content = "\x1b]8;;https://example.com/docs\x1b\\docs here\x1b]8;;\x1b\\  \
                    \x1b]8;;javascript:alert(1)\x1b\\evil\x1b]8;;\x1b\\";
     let (pane, cx) = pane_with(content, cx);
-    let refused = std::rc::Rc::new(std::cell::RefCell::new(Vec::<Option<String>>::new()));
+    let refused = std::rc::Rc::new(std::cell::RefCell::new(
+        Vec::<shellune_terminal::LinkRefusal>::new(),
+    ));
     let seen = refused.clone();
     let _subscription = cx.update(|_window, app| {
         app.subscribe(
@@ -49402,7 +49404,9 @@ async fn osc8_links_show_their_target_on_hover_and_open_only_when_allowed(cx: &m
     assert_eq!(opened(cx).len(), 1, "javascript: must not open");
     assert_eq!(
         refused.borrow().as_slice(),
-        &[Some("javascript".to_owned())]
+        &[shellune_terminal::LinkRefusal::Scheme(
+            "javascript".to_owned()
+        )]
     );
     assert!(
         cx.update(|_window, app| pane.read(app).sent().is_empty()),

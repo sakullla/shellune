@@ -82,13 +82,17 @@ pub enum LinkRefusal {
     Scheme(String),
     /// The target has no scheme, is empty, or holds whitespace or control characters.
     Malformed,
+    /// A `file://` target names another computer; opening it would reach a network
+    /// share or let the system run whatever it finds there.
+    RemoteFile(String),
 }
 
 /// Decides whether an OSC 8 target may be opened (R1).
 ///
 /// A program chooses these targets freely, and a link's text need not resemble it,
 /// so only schemes whose handlers merely show something are allowed: web pages,
-/// a mail draft, a local file. Everything else - `javascript:`, a custom protocol
+/// a mail draft, a file on this computer (`file:///path` or `file://localhost/path`).
+/// A `file://` target naming another host is refused. Everything else - `javascript:`, a custom protocol
 /// handler, a target without a scheme - is refused and named, never opened.
 ///
 /// # Errors
@@ -115,8 +119,20 @@ pub fn osc8_target_allowed(uri: &str) -> Result<(), LinkRefusal> {
         "http" | "https" if is_openable_http_url(uri) => Ok(()),
         "http" | "https" => Err(LinkRefusal::Malformed),
         "mailto" if !rest.is_empty() => Ok(()),
-        "file" if rest.starts_with("//") => Ok(()),
-        "mailto" | "file" => Err(LinkRefusal::Malformed),
+        "file" => match rest.strip_prefix("//") {
+            Some(authority_and_path) => {
+                let host = authority_and_path
+                    .split_once('/')
+                    .map_or(authority_and_path, |(host, _)| host);
+                if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+                    Ok(())
+                } else {
+                    Err(LinkRefusal::RemoteFile(host.to_owned()))
+                }
+            }
+            None => Err(LinkRefusal::Malformed),
+        },
+        "mailto" => Err(LinkRefusal::Malformed),
         other => Err(LinkRefusal::Scheme(other.to_owned())),
     }
 }
@@ -250,7 +266,20 @@ mod tests {
         assert_eq!(osc8_target_allowed("HTTP://example.com/a"), Ok(()));
         assert_eq!(osc8_target_allowed("mailto:ops@example.com"), Ok(()));
         assert_eq!(osc8_target_allowed("file:///var/log/syslog"), Ok(()));
-        assert_eq!(osc8_target_allowed("file://host/etc/hosts"), Ok(()));
+        assert_eq!(osc8_target_allowed("file://localhost/etc/hosts"), Ok(()));
+        assert_eq!(osc8_target_allowed("file://LOCALHOST/etc/hosts"), Ok(()));
+        assert_eq!(
+            osc8_target_allowed("file://host/etc/hosts"),
+            Err(LinkRefusal::RemoteFile("host".into()))
+        );
+        assert_eq!(
+            osc8_target_allowed("file://attacker.example/share/run.exe"),
+            Err(LinkRefusal::RemoteFile("attacker.example".into()))
+        );
+        assert_eq!(
+            osc8_target_allowed("file://evil"),
+            Err(LinkRefusal::RemoteFile("evil".into()))
+        );
         assert_eq!(
             osc8_target_allowed("javascript:alert(1)"),
             Err(LinkRefusal::Scheme("javascript".into()))
