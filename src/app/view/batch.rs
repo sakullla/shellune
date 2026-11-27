@@ -991,7 +991,7 @@ impl ShelluneView {
                 );
             } else {
                 let count = filtered.len();
-                let selected_index = self.batch.library_selected();
+                let selected_index = self.batch.library_selected().min(count.saturating_sub(1));
                 let delete_asked = self.batch.delete_asked();
                 let row_height = metrics.scale(LIBRARY_ROW_HEIGHT);
                 let list_height = (row_height * count as f32).min(metrics.scale(LIST_MAX_HEIGHT));
@@ -1018,10 +1018,21 @@ impl ShelluneView {
                         items
                     })
                     .track_scroll(self.batch_library_scroll.clone())
-                    .h(list_height)
+                    .h_full()
                     .w_full()
                     .debug_selector(|| "batch.library.rows".to_owned());
-                body = body.child(vlist);
+                body = body.child(
+                    div()
+                        .relative()
+                        .h(list_height)
+                        .w_full()
+                        .overflow_hidden()
+                        .child(vlist)
+                        .child(crate::app::scrollbar::for_list(
+                            "batch.library.rows.scrollbar",
+                            &self.batch_library_scroll,
+                        )),
+                );
             }
         }
         let footer = components::modal_footer_noted(
@@ -1272,7 +1283,7 @@ impl ShelluneView {
             }
         } else {
             let count = entries.len();
-            let selected_index = self.batch.history_selected();
+            let selected_index = self.batch.history_selected().min(count.saturating_sub(1));
             let locale = self.workspace.locale();
             let now = crate::app::remote::now_unix();
             let row_height = metrics.scale(HISTORY_ROW_HEIGHT);
@@ -1300,10 +1311,21 @@ impl ShelluneView {
                 items
             })
             .track_scroll(self.batch_history_scroll.clone())
-            .h(list_height)
+            .h_full()
             .w_full()
             .debug_selector(|| "batch.history.rows".to_owned());
-            column = column.child(vlist);
+            column = column.child(
+                div()
+                    .relative()
+                    .h(list_height)
+                    .w_full()
+                    .overflow_hidden()
+                    .child(vlist)
+                    .child(crate::app::scrollbar::for_list(
+                        "batch.history.rows.scrollbar",
+                        &self.batch_history_scroll,
+                    )),
+            );
         }
         let hidden = self.batch.history().omitted();
         if hidden > 0 {
@@ -1531,10 +1553,21 @@ impl ShelluneView {
             items
         })
         .track_scroll(self.batch_history_hosts_scroll.clone())
-        .h(list_height)
+        .h_full()
         .w_full()
         .debug_selector(|| "batch.history.hosts".to_owned());
-        column = column.child(hosts);
+        column = column.child(
+            div()
+                .relative()
+                .h(list_height)
+                .w_full()
+                .overflow_hidden()
+                .child(hosts)
+                .child(crate::app::scrollbar::for_list(
+                    "batch.history.hosts.scrollbar",
+                    &self.batch_history_hosts_scroll,
+                )),
+        );
         column = column.child(self.batch_history_output(run, cx));
         column
     }
@@ -2048,6 +2081,7 @@ impl ShelluneView {
                             .when(index > 0, |button| {
                                 button.cursor_pointer().on_click(cx.listener(
                                     move |this, _event, _window, cx| {
+                                        this.batch_snippet_picker = None;
                                         let _ = this.batch.move_step_up(index);
                                         cx.notify();
                                     },
@@ -2063,6 +2097,7 @@ impl ShelluneView {
                             .when(index + 1 < count, |button| {
                                 button.cursor_pointer().on_click(cx.listener(
                                     move |this, _event, _window, cx| {
+                                        this.batch_snippet_picker = None;
                                         let _ = this.batch.move_step_down(index);
                                         cx.notify();
                                     },
@@ -2108,9 +2143,7 @@ impl ShelluneView {
                         .debug_selector(move || format!("batch.step.remove.{index}"))
                         .when(count > 1, |button| {
                             button.on_click(cx.listener(move |this, _event, _window, cx| {
-                                if this.batch_snippet_picker == Some(index) {
-                                    this.batch_snippet_picker = None;
-                                }
+                                this.batch_snippet_picker = None;
                                 let _ = this.batch.remove_step(index);
                                 cx.notify();
                             }))
@@ -2782,7 +2815,7 @@ impl ShelluneView {
             let row_height = metrics.scale(RUN_HOST_ROW_HEIGHT);
             let list_height = (row_height * count as f32).min(metrics.scale(RUN_HOSTS_MAX_HEIGHT));
             let weak: WeakEntity<Self> = cx.entity().downgrade();
-            uniform_list("batch.run.hosts", count, move |range, _window, _cx| {
+            let vlist = uniform_list("batch.run.hosts", count, move |range, _window, _cx| {
                 let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
                 for index in range {
                     let (host, question) = &matching_hosts[index];
@@ -2948,10 +2981,20 @@ impl ShelluneView {
                 items
             })
             .track_scroll(self.batch_run_hosts_scroll.clone())
-            .h(list_height)
+            .h_full()
             .w_full()
-            .debug_selector(|| "batch.run.hosts".to_owned())
-            .into_any_element()
+            .debug_selector(|| "batch.run.hosts".to_owned());
+            div()
+                .relative()
+                .h(list_height)
+                .w_full()
+                .overflow_hidden()
+                .child(vlist)
+                .child(crate::app::scrollbar::for_list(
+                    "batch.run.hosts.scrollbar",
+                    &self.batch_run_hosts_scroll,
+                ))
+                .into_any_element()
         };
         div()
             .flex()
@@ -3755,6 +3798,19 @@ impl ShelluneView {
     pub fn batch_library_visible_count_for_test(&self, cx: &gpui::App) -> usize {
         let query = self.batch_library_search.read(cx).text().to_owned();
         self.batch.library_filtered(&query).len()
+    }
+
+    /// Current placeholder text of the 6 persistent forwarding/batch fields, for locale switch tests.
+    #[cfg(test)]
+    pub fn t5_field_placeholders_for_test(&self, cx: &gpui::App) -> [String; 6] {
+        [
+            self.forward_label.read(cx).placeholder().to_owned(),
+            self.forward_search.read(cx).placeholder().to_owned(),
+            self.batch_library_search.read(cx).placeholder().to_owned(),
+            self.batch_history_search.read(cx).placeholder().to_owned(),
+            self.batch_run_search.read(cx).placeholder().to_owned(),
+            self.batch_snippet_search.read(cx).placeholder().to_owned(),
+        ]
     }
 
     /// Opens the detail of one stored run, by its place in the list the filter keeps.

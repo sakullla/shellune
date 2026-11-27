@@ -1652,8 +1652,8 @@ impl ShelluneView {
     ///
     /// A run states its own language, so each shot's manifest entry names the strings
     /// that shot really rendered. Nothing here is written to the preferences file.
-    #[cfg(feature = "ui-capture")]
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[cfg(any(test, feature = "ui-capture"))]
+    #[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
     pub fn set_capture_locale(&mut self, locale: Locale, cx: &mut Context<Self>) {
         self.workspace.set_locale(locale);
         self.relabel_fields(cx);
@@ -5678,6 +5678,30 @@ impl ShelluneView {
             (
                 &self.host_cred_search,
                 copy::ux_for(self.workspace.locale()).picker_search_credentials,
+            ),
+            (
+                &self.forward_label,
+                copy::ux_for(self.workspace.locale()).fwd_label_placeholder,
+            ),
+            (
+                &self.forward_search,
+                copy::ux_for(self.workspace.locale()).fwd_search_placeholder,
+            ),
+            (
+                &self.batch_library_search,
+                copy::ux_for(self.workspace.locale()).batch_library_search,
+            ),
+            (
+                &self.batch_history_search,
+                copy::ux_for(self.workspace.locale()).batch_history_search,
+            ),
+            (
+                &self.batch_run_search,
+                copy::ux_for(self.workspace.locale()).batch_run_search,
+            ),
+            (
+                &self.batch_snippet_search,
+                copy::ux_for(self.workspace.locale()).batch_snippet_search,
             ),
         ];
         for (field, label) in labels {
@@ -15849,6 +15873,10 @@ impl ShelluneView {
         // see, while the commands it started go on, and the page's own background
         // action is what leaves it (R19, R13).
         if self.batch.view().is_open() {
+            if self.batch_snippet_picker.take().is_some() {
+                cx.notify();
+                return true;
+            }
             self.dismiss_batch(cx);
             return true;
         }

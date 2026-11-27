@@ -53794,3 +53794,59 @@ async fn t5_batch_virtualized_run_search_progress_expand_cancelling_trust_and_sn
     });
     cx.run_until_parked();
 }
+
+#[gpui::test]
+async fn t5_relabel_fields_and_snippet_picker_escape(cx: &mut TestAppContext) {
+    let dir = TempDir::new("t5-relabel-escape");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+
+    // Switching locale updates placeholders on all 6 persistent T5 fields.
+    let en = crate::app::copy::ux_for(Locale::English);
+    let zh = crate::app::copy::ux_for(Locale::Chinese);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.set_capture_locale(Locale::English, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).t5_field_placeholders_for_test(app)),
+        [
+            en.fwd_label_placeholder.to_owned(),
+            en.fwd_search_placeholder.to_owned(),
+            en.batch_library_search.to_owned(),
+            en.batch_history_search.to_owned(),
+            en.batch_run_search.to_owned(),
+            en.batch_snippet_search.to_owned(),
+        ]
+    );
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.set_capture_locale(Locale::Chinese, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).t5_field_placeholders_for_test(app)),
+        [
+            zh.fwd_label_placeholder.to_owned(),
+            zh.fwd_search_placeholder.to_owned(),
+            zh.batch_library_search.to_owned(),
+            zh.batch_history_search.to_owned(),
+            zh.batch_run_search.to_owned(),
+            zh.batch_snippet_search.to_owned(),
+        ]
+    );
+
+    // Escape closes the snippet picker first without dismissing the batch editor.
+    preview_batch(cx, &view, 2);
+    click(cx, "batch.step.snippet.0");
+    assert!(cx.update(|_window, app| view.read(app).batch_snippet_picker_open_for_test()));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).batch_snippet_picker_open_for_test()),
+        "Escape closes the open snippet picker first"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).batch_panel().view().is_editor()),
+        "batch editor stays open after Escape closes the snippet picker"
+    );
+}
