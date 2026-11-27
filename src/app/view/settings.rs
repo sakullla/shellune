@@ -609,8 +609,8 @@ impl ShelluneView {
             .scroll_to_top_of_item(self.settings_nav.category.index());
     }
 
-    /// Zero-height anchor element that records an item's content-space Y position inside
-    /// `settings.scroll` so clicking a sub-item in the sidebar scrolls directly to it.
+    /// Zero-height absolutely-positioned anchor that records an item's content-space Y
+    /// position inside `settings.scroll` without contributing flex layout gaps.
     fn settings_item_anchor(&self, item: Item) -> gpui::AnyElement {
         let scroll = self.settings_scroll.clone();
         let offsets = self.settings_item_offsets.clone();
@@ -624,9 +624,11 @@ impl ShelluneView {
             },
             |_bounds, (), _window, _cx| {},
         )
+        .absolute()
+        .top_0()
+        .left_0()
         .h(px(0.0))
         .w(px(0.0))
-        .flex_none()
         .into_any_element()
     }
 
@@ -699,6 +701,7 @@ impl ShelluneView {
                 let card_id = format!("settings.card.{}", item.id());
                 card = card.child(
                     div()
+                        .relative()
                         .flex()
                         .w_full()
                         .min_w_0()
@@ -742,6 +745,7 @@ impl ShelluneView {
             };
             section = section.child(
                 div()
+                    .relative()
                     .flex()
                     .flex_col()
                     .w_full()

@@ -8356,11 +8356,19 @@ impl ShelluneView {
         TextField::wire_tab_ring(&ring, cx);
     }
 
+    /// Marks the open host or connection draft as having unsaved edits and clears any
+    /// pending discard confirmation banner.
+    pub(super) fn mark_host_draft_dirty(&mut self) {
+        self.host_draft_dirty = true;
+        self.host_confirm_discard = false;
+    }
+
     /// Chooses what a host says about its own keepalive (R20).
     fn set_host_connection_choice(&mut self, choice: ConnectionChoice, cx: &mut Context<Self>) {
         if let Some(draft) = self.hosts.draft_mut()
             && draft.connection_mut().set_choice(choice)
         {
+            self.mark_host_draft_dirty();
             self.clear_resolved_host_validation(cx);
             cx.notify();
         }
@@ -8376,6 +8384,7 @@ impl ShelluneView {
         if let Some(draft) = self.hosts.draft_mut()
             && draft.connection_mut().set_text(field, text)
         {
+            self.mark_host_draft_dirty();
             self.set_host_field_invalid(Err(field), false, cx);
             self.clear_stale_host_validation(Err(field), false, cx);
             cx.notify();

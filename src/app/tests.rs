@@ -53036,3 +53036,48 @@ async fn t3_toast_escape_dismisses_and_settings_notify_disables_threshold(cx: &m
         "threshold segments are non-interactive while long-command notification is off"
     );
 }
+
+#[gpui::test]
+async fn t3_non_primary_dialog_controls_mark_draft_dirty(cx: &mut TestAppContext) {
+    let dir = TempDir::new("t3-non-primary-dirty");
+    seed(&dir.store(), Vec::new());
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    // 1. SSH host dialog: changing auth method (non-text control) marks draft dirty.
+    click(cx, "hosts.new");
+    click(cx, "hosts.auth.remote.method.key");
+    press_key(cx, "escape");
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().is_editing()),
+        "toggling SSH auth method marks draft dirty so Escape does not close immediately"
+    );
+    assert!(
+        cx.debug_bounds("hosts.discard.confirm").is_some(),
+        "discard confirmation banner appears after Escape on dirty SSH auth change"
+    );
+    click(cx, "hosts.discard.ok");
+    assert!(
+        !cx.update(|_window, app| view.read(app).hosts_state().is_editing()),
+        "confirming Discard closes dirty SSH host dialog"
+    );
+
+    // 2. Non-SSH connection dialog (RDP): toggling clipboard checkbox marks draft dirty.
+    click(cx, "hosts.new");
+    click(cx, "connection.protocol.rdp");
+    scroll_into_view(cx, "hosts.editor.body", "connection.field.clipboard");
+    click(cx, "connection.field.clipboard");
+    press_key(cx, "escape");
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().is_editing_connection()),
+        "toggling RDP clipboard marks connection draft dirty"
+    );
+    assert!(
+        cx.debug_bounds("connection.discard.confirm").is_some(),
+        "discard confirmation banner appears after Escape on dirty RDP toggle"
+    );
+    click(cx, "connection.discard.ok");
+    assert!(
+        !cx.update(|_window, app| view.read(app).hosts_state().is_editing_connection()),
+        "confirming Discard closes dirty RDP connection dialog"
+    );
+}

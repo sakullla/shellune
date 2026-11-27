@@ -222,6 +222,7 @@ impl ShelluneView {
         if let Some(draft) = self.hosts.draft_mut()
             && draft.set_auth(kind)
         {
+            self.mark_host_draft_dirty();
             self.clear_resolved_host_validation(cx);
             cx.notify();
         }
@@ -231,6 +232,7 @@ impl ShelluneView {
         if let Some(draft) = self.hosts.draft_mut() {
             let remember = !draft.remember();
             draft.set_remember(remember);
+            self.mark_host_draft_dirty();
             cx.notify();
         }
     }
@@ -239,6 +241,7 @@ impl ShelluneView {
         if let Some(draft) = self.hosts.draft_mut()
             && draft.add_jump(id)
         {
+            self.mark_host_draft_dirty();
             self.clear_resolved_host_validation(cx);
         }
         cx.notify();
@@ -247,6 +250,7 @@ impl ShelluneView {
     fn remove_host_jump(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(draft) = self.hosts.draft_mut() {
             draft.remove_jump(index);
+            self.mark_host_draft_dirty();
             self.clear_resolved_host_validation(cx);
         }
         cx.notify();
@@ -255,6 +259,7 @@ impl ShelluneView {
     fn move_host_jump(&mut self, index: usize, up: bool, cx: &mut Context<Self>) {
         if let Some(draft) = self.hosts.draft_mut() {
             draft.move_jump(index, up);
+            self.mark_host_draft_dirty();
         }
         cx.notify();
     }
@@ -1193,6 +1198,7 @@ impl ShelluneView {
                         if let Some(draft) = this.hosts.draft_mut()
                             && draft.set_credential(None)
                         {
+                            this.mark_host_draft_dirty();
                             this.clear_resolved_host_validation(cx);
                         }
                         cx.notify();
@@ -1374,8 +1380,11 @@ impl ShelluneView {
                     .id(selector)
                     .debug_selector(move || selector.to_owned())
                     .on_click(cx.listener(move |view, _event, _window, cx| {
-                        if let Some(draft) = view.hosts.draft_mut() {
+                        if let Some(draft) = view.hosts.draft_mut()
+                            && draft.protocol() != protocol
+                        {
                             draft.set_protocol(protocol);
+                            view.mark_host_draft_dirty();
                         }
                         cx.notify();
                     })),
@@ -1433,8 +1442,11 @@ impl ShelluneView {
                     .id(selector)
                     .debug_selector(move || selector.to_owned())
                     .on_click(cx.listener(move |view, _event, _window, cx| {
-                        if let Some(draft) = view.hosts.draft_mut() {
+                        if let Some(draft) = view.hosts.draft_mut()
+                            && draft.x11() != mode
+                        {
                             draft.set_x11(mode);
+                            view.mark_host_draft_dirty();
                         }
                         cx.notify();
                     })),
@@ -1914,6 +1926,7 @@ impl ShelluneView {
                 group_field.update(cx, |f, cx| f.set_text(next, cx));
             }
             if changed {
+                self.mark_host_draft_dirty();
                 self.set_host_field_invalid(Ok(HostField::Group), false, cx);
                 self.clear_stale_host_validation(Ok(HostField::Group), false, cx);
             }
@@ -1928,6 +1941,7 @@ impl ShelluneView {
                 group_field.update(cx, |f, cx| f.set_text(next, cx));
             }
             if changed {
+                self.mark_host_draft_dirty();
                 self.set_protocol_field_invalid(ConnectionFormField::Group, false, cx);
                 self.clear_stale_protocol_validation(ConnectionFormField::Group, false, cx);
             }
@@ -2510,6 +2524,7 @@ impl ShelluneView {
                                                 .is_some_and(|draft| !draft.remember());
                                             if let Some(draft) = this.hosts.protocol_draft_mut() {
                                                 draft.set_remember(next);
+                                                this.mark_host_draft_dirty();
                                             }
                                             cx.notify();
                                         },
@@ -2711,6 +2726,7 @@ impl ShelluneView {
                                     if let Some(draft) = this.hosts.protocol_draft_mut()
                                         && draft.set_credential(None)
                                     {
+                                        this.mark_host_draft_dirty();
                                         this.clear_resolved_protocol_validation(cx);
                                     }
                                     cx.notify();
@@ -2738,8 +2754,11 @@ impl ShelluneView {
                             })
                             .on_click(cx.listener(
                                 move |this, _event, _window, cx| {
-                                    if let Some(draft) = this.hosts.protocol_draft_mut() {
+                                    if let Some(draft) = this.hosts.protocol_draft_mut()
+                                        && draft.certificate() != policy
+                                    {
                                         draft.set_certificate(policy);
+                                        this.mark_host_draft_dirty();
                                     }
                                     cx.notify();
                                 },
@@ -2781,8 +2800,11 @@ impl ShelluneView {
                             })
                             .on_click(cx.listener(
                                 move |this, _event, _window, cx| {
-                                    if let Some(draft) = this.hosts.protocol_draft_mut() {
+                                    if let Some(draft) = this.hosts.protocol_draft_mut()
+                                        && draft.security() != security
+                                    {
                                         draft.set_security(security);
+                                        this.mark_host_draft_dirty();
                                     }
                                     cx.notify();
                                 },
@@ -2827,6 +2849,7 @@ impl ShelluneView {
                                     .is_some_and(|draft| !draft.clipboard());
                                 if let Some(draft) = this.hosts.protocol_draft_mut() {
                                     draft.set_clipboard(next);
+                                    this.mark_host_draft_dirty();
                                 }
                                 cx.notify();
                             },
@@ -2859,8 +2882,11 @@ impl ShelluneView {
                                     parity_id(parity)
                                 )))
                                 .on_click(cx.listener(move |this, _event, _window, cx| {
-                                    if let Some(draft) = this.hosts.protocol_draft_mut() {
+                                    if let Some(draft) = this.hosts.protocol_draft_mut()
+                                        && draft.parity() != parity
+                                    {
                                         draft.set_parity(parity);
+                                        this.mark_host_draft_dirty();
                                     }
                                     cx.notify();
                                 })),
@@ -2898,8 +2924,11 @@ impl ShelluneView {
                             )))
                             .on_click(cx.listener(
                                 move |this, _event, _window, cx| {
-                                    if let Some(draft) = this.hosts.protocol_draft_mut() {
+                                    if let Some(draft) = this.hosts.protocol_draft_mut()
+                                        && draft.stop_bits() != stop_bits
+                                    {
                                         draft.set_stop_bits(stop_bits);
+                                        this.mark_host_draft_dirty();
                                     }
                                     cx.notify();
                                 },
@@ -2933,8 +2962,11 @@ impl ShelluneView {
                                     flow_id(flow)
                                 )))
                                 .on_click(cx.listener(move |this, _event, _window, cx| {
-                                    if let Some(draft) = this.hosts.protocol_draft_mut() {
+                                    if let Some(draft) = this.hosts.protocol_draft_mut()
+                                        && draft.flow() != flow
+                                    {
                                         draft.set_flow(flow);
+                                        this.mark_host_draft_dirty();
                                     }
                                     cx.notify();
                                 })),
@@ -2976,6 +3008,7 @@ impl ShelluneView {
                                     .is_some_and(|draft| !draft.local_echo());
                                 if let Some(draft) = this.hosts.protocol_draft_mut() {
                                     draft.set_local_echo(next);
+                                    this.mark_host_draft_dirty();
                                 }
                                 cx.notify();
                             },
