@@ -31,6 +31,7 @@ use alacritty_terminal::term::{Config, Term, TermMode, point_to_viewport, viewpo
 use alacritty_terminal::vte::ansi::{CursorShape, Processor, Rgb, StdSyncHandler};
 use regex::{Regex, RegexBuilder};
 use shellune_core::TerminalMode;
+use smol_str::SmolStr;
 
 use crate::blocks::{
     BlockBook, BlockFilter, GridAnchor, IntegrationEvent, IntegrationSplitter, Segment,
@@ -197,7 +198,7 @@ pub struct CellAttributes {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RenderedCell {
     /// The character, with any combining characters appended.
-    pub text: String,
+    pub text: SmolStr,
     /// Resolved foreground.
     pub foreground: Rgb,
     /// Resolved background.
@@ -364,6 +365,17 @@ pub struct HistoryMatch {
     pub text: String,
 }
 
+/// A non-empty scrollback match used for navigation and painting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryPosition {
+    /// Grid line, negative above the live screen.
+    pub line: i32,
+    /// Byte offset within the line.
+    pub column: usize,
+    /// Length in UTF-8 bytes.
+    pub length: usize,
+}
+
 /// A grid row that still names the same content after lines scroll into history.
 ///
 /// `stable` is `history_size + line + lines_dropped`, the same quantity a command
@@ -466,12 +478,11 @@ impl Matcher {
     /// An empty match is dropped: a pattern such as `a*` matches the gap before
     /// every character, and counting those would report places with nothing in
     /// them as results.
-    pub(crate) fn find_all(&self, text: &str) -> Vec<(usize, usize)> {
+    fn find_all<'a>(&'a self, text: &'a str) -> impl Iterator<Item = (usize, usize)> + 'a {
         self.pattern
             .find_iter(text)
             .filter(|found| !found.is_empty())
             .map(|found| (found.start(), found.end()))
-            .collect()
     }
 
     /// Whether `text` holds at least one non-empty match.
@@ -1315,8 +1326,12 @@ impl TerminalCore {
             .collect();
         // Which cells the program left in the default ink: only those may be
         // highlighted, so a program's own colours always win.
-        let mut plain: Vec<Vec<bool>> = vec![Vec::new(); self.grid.rows];
         let highlight = self.highlight && !content.mode.contains(TermMode::ALT_SCREEN);
+        let mut plain = if highlight {
+            vec![false; self.grid.rows * self.grid.cols]
+        } else {
+            Vec::new()
+        };
 
         for indexed in content.display_iter {
             let point = indexed.point;
@@ -1342,15 +1357,14 @@ impl TerminalCore {
                 push_link_span(&mut row.links, point.column.0, width, &link);
             }
 
-            if highlight && let Some(flags) = plain.get_mut(viewport.line) {
-                flags.push(
+            if highlight {
+                plain[viewport.line * self.grid.cols + row.cells.len()] =
                     matches!(
                         cell.fg,
                         alacritty_terminal::vte::ansi::Color::Named(
                             alacritty_terminal::vte::ansi::NamedColor::Foreground
                         )
-                    ) && !cell.flags.contains(Flags::INVERSE),
-                );
+                    ) && !cell.flags.contains(Flags::INVERSE);
             }
             let mut foreground = palette::resolve(cell.fg, content.colors);
             let mut background = palette::resolve(cell.bg, content.colors);
@@ -1359,24 +1373,20 @@ impl TerminalCore {
             }
             let hidden = cell.flags.contains(Flags::HIDDEN);
 
-            let mut text = if hidden {
-                String::from(" ")
+            let text = if hidden {
+                SmolStr::new_inline(" ")
             } else {
-                String::new()
-            };
-            if !hidden {
                 // A tab is the marker the grid keeps for the stop it covers: the
                 // cells after it are already blank, so it is drawn as the blank it
                 // stands for. Drawn as a tab, its width is not a cell's — a tab
                 // inside a run of text is not one advance wide — and every column
                 // after it in the line drifts. "ls" pads its columns with tabs.
-                text.push(if cell.c == '\t' { ' ' } else { cell.c });
-                if let Some(zerowidth) = cell.zerowidth() {
-                    for character in zerowidth {
-                        text.push(*character);
-                    }
+                let base = if cell.c == '\t' { ' ' } else { cell.c };
+                match cell.zerowidth() {
+                    Some(marks) => std::iter::once(base).chain(marks.iter().copied()).collect(),
+                    None => SmolStr::new_inline(base.encode_utf8(&mut [0; 4])),
                 }
-            }
+            };
 
             row.cells.push(RenderedCell {
                 text,
@@ -1403,7 +1413,7 @@ impl TerminalCore {
         }
 
         if highlight {
-            for (row, plain) in rows.iter_mut().zip(&plain) {
+            for (row, plain) in rows.iter_mut().zip(plain.chunks(self.grid.cols)) {
                 highlight_row(row, plain);
             }
         }
@@ -1591,6 +1601,29 @@ impl TerminalCore {
         query: &str,
         options: SearchOptions,
     ) -> Result<Vec<HistoryMatch>, SearchFailure> {
+        self.collect_history_matches(query, options, |hit, text| HistoryMatch {
+            line: hit.line,
+            column: hit.column,
+            length: hit.length,
+            text: text.to_owned(),
+        })
+    }
+
+    /// Searches in grid order and retains only coordinates, even for repeated hits on a line.
+    pub fn search_history_positions(
+        &self,
+        query: &str,
+        options: SearchOptions,
+    ) -> Result<Vec<HistoryPosition>, SearchFailure> {
+        self.collect_history_matches(query, options, |hit, _| hit)
+    }
+
+    fn collect_history_matches<T>(
+        &self,
+        query: &str,
+        options: SearchOptions,
+        mut matched: impl FnMut(HistoryPosition, &str) -> T,
+    ) -> Result<Vec<T>, SearchFailure> {
         if query.is_empty() {
             return Ok(Vec::new());
         }
@@ -1601,12 +1634,14 @@ impl TerminalCore {
         for line in top..=bottom {
             let text = self.line_text(Line(line));
             for (column, end) in matcher.find_all(&text) {
-                matches.push(HistoryMatch {
-                    line,
-                    column,
-                    length: end - column,
-                    text: text.clone(),
-                });
+                matches.push(matched(
+                    HistoryPosition {
+                        line,
+                        column,
+                        length: end - column,
+                    },
+                    &text,
+                ));
             }
         }
         Ok(matches)
@@ -1940,10 +1975,9 @@ impl TerminalCore {
     fn line_text(&self, line: Line) -> String {
         let start = Point::new(line, Column(0));
         let end = Point::new(line, self.term.grid().last_column());
-        self.term
-            .bounds_to_string(start, end)
-            .trim_end_matches(['\n', '\r'])
-            .to_owned()
+        let mut text = self.term.bounds_to_string(start, end);
+        text.truncate(text.trim_end_matches(['\n', '\r']).len());
+        text
     }
 
     fn screen_rows(&self) -> usize {
@@ -2531,6 +2565,14 @@ mod tests {
         assert_eq!(snapshot.rows[0].cells[1].text, "文");
         assert_eq!(snapshot.rows[0].cells[2].width, 1);
         assert_eq!(snapshot.cursor.expect("cursor").column, 4);
+    }
+
+    #[test]
+    fn snapshots_keep_a_grapheme_that_exceeds_inline_storage() {
+        let mut terminal = core();
+        let text = format!("x{}", "\u{301}".repeat(16));
+        terminal.feed(text.as_bytes());
+        assert_eq!(terminal.snapshot().rows[0].cells[0].text.as_str(), text);
     }
 
     #[test]

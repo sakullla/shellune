@@ -3902,6 +3902,32 @@ async fn the_find_bar_counts_the_places_and_steps_both_ways(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+async fn the_find_bar_steps_between_matches_inside_a_single_cell(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("x\u{301}\u{301} 文y\u{301}", cx);
+    click(cx, "terminal.search");
+    cx.simulate_input("\u{301}");
+    cx.run_until_parked();
+    let current = |cx: &mut VisualTestContext| {
+        cx.debug_bounds("terminal.search.match.current")
+            .expect("highlighted cell")
+    };
+    let first = current(cx);
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 2,
+            total: 3
+        }
+    );
+    assert_eq!(current(cx), first);
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(current(cx).origin.x > first.origin.x);
+}
+
+#[gpui::test]
 async fn closing_the_find_bar_restores_the_scroll_position_and_the_keyboard(
     cx: &mut TestAppContext,
 ) {

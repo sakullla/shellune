@@ -12,6 +12,7 @@ shellune-core = { path = "../core" }
 alacritty_terminal = { workspace = true }
 portable-pty = { workspace = true }
 regex = { workspace = true }
+smol_str = { version = "0.2.2", default-features = false }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

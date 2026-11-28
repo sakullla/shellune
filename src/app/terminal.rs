@@ -30,12 +30,12 @@ use std::ops::Range;
 
 use shellune_core::{EventTag, LocalShell, SessionFailure, TerminalMode};
 use shellune_ssh::{ChainEvent, ChainSession, RemoteEvent, RemoteSession, X11Status};
-use shellune_terminal::core::{LineAnchor, SearchOptions};
+use shellune_terminal::core::{HistoryPosition, LineAnchor, SearchOptions};
 use shellune_terminal::highlight::{LinkRefusal, is_openable_http_url, osc8_target_allowed};
 use shellune_terminal::shell::ShellEnvironmentNote;
 use shellune_terminal::{
     BlockFilter, BlockStatus, CellSize, CommandBlock, CommandBlockId, CursorShape, DetectedLink,
-    ExitReport, GridSize, HistoryMatch, Key, KeyModifiers, LocalSession, MouseAction,
+    ExitReport, GridSize, Key, KeyModifiers, LocalSession, MouseAction,
     MouseButton as TerminalMouseButton, MouseModifiers, PtyEvent, RenderedCell, Rgb, SelectionType,
     Side, Snapshot, TermMode, TerminalCore, TerminalEffects, encode_alternate_scroll, encode_key,
     encode_mouse, encode_paste, encode_text, grid_for, mouse_reporting, palette,
@@ -809,7 +809,7 @@ pub struct TerminalPane {
     output_repaint: OutputRepaint,
     output_search_at: Option<std::time::Instant>,
     output_search_pending: bool,
-    search_hits: Vec<HistoryMatch>,
+    search_hits: Vec<HistoryPosition>,
     /// Index of the match the viewport was last put on, counted from zero.
     search_at: usize,
     /// The current hit as a stable row, so a recount can find it after the grid
@@ -3249,13 +3249,11 @@ impl TerminalPane {
         let Some(command) = self.core.rerun_command(id) else {
             return;
         };
-        let before = self.core.command_blocks();
         let mut bytes = encode_text(&command);
         if !bytes.ends_with(b"\r") {
             bytes.push(b'\r');
         }
         self.write_input(&bytes, cx);
-        debug_assert_eq!(self.core.command_blocks(), before);
         cx.notify();
     }
 
@@ -3510,7 +3508,7 @@ impl TerminalPane {
         self.search_cursor = 0;
         self.search_selection = None;
         self.marked = None;
-        self.search_hits.clear();
+        self.search_hits = Vec::new();
         self.search_at = 0;
         self.search_mark = None;
         self.search_error = None;
@@ -3547,7 +3545,7 @@ impl TerminalPane {
                 .line_of(anchor)
                 .map(|line| (line, anchor.column()))
         });
-        self.search_hits.clear();
+        self.search_hits = Vec::new();
         self.search_at = 0;
         self.search_error = None;
         if self.search_query.is_empty() {
@@ -3556,7 +3554,7 @@ impl TerminalPane {
         }
         match self
             .core
-            .search_history(&self.search_query, self.search_options)
+            .search_history_positions(&self.search_query, self.search_options)
         {
             Ok(hits) => {
                 self.search_hits = hits;
@@ -3570,11 +3568,8 @@ impl TerminalPane {
                 self.search_at = match previous {
                     Some((line, column)) => self
                         .search_hits
-                        .iter()
-                        .position(|hit| {
-                            hit.line > line || (hit.line == line && hit.column >= column)
-                        })
-                        .unwrap_or(last),
+                        .partition_point(|hit| (hit.line, hit.column) < (line, column))
+                        .min(last),
                     None => 0,
                 };
                 self.note_search_hit();
@@ -6020,14 +6015,12 @@ impl TerminalPane {
                 } else {
                     flush_text(&mut run, &mut pieces, cell, self.font_size, index);
                     if !blank || style.underline || style.strike {
-                        let glyphs = if ascii {
-                            RunGlyphs::Ascii(rendered.text.clone())
+                        let mut glyphs = if ascii {
+                            RunGlyphs::Ascii(String::new())
                         } else {
-                            RunGlyphs::Centered(vec![(
-                                SharedString::from(rendered.text.clone()),
-                                span,
-                            )])
+                            RunGlyphs::Centered(Vec::with_capacity(1))
                         };
+                        glyphs.push(&rendered.text, span);
                         run = Some(TextRun {
                             glyphs,
                             style,
@@ -6052,33 +6045,31 @@ impl TerminalPane {
         }
         let grid_line = i32::try_from(row_index).unwrap_or(0)
             - i32::try_from(self.core.display_offset()).unwrap_or(0);
-        let mut marks = vec![None; cells.len()];
-        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(cells.len());
+        let first = self.search_hits.partition_point(|hit| hit.line < grid_line);
+        let remaining = &self.search_hits[first..];
+        let row_hits = &remaining[..remaining.partition_point(|hit| hit.line == grid_line)];
+        if row_hits.is_empty() {
+            return Vec::new();
+        }
+        let current = self
+            .search_hits
+            .get(self.search_at)
+            .filter(|hit| hit.line == grid_line);
+        let mut hits = row_hits.iter().peekable();
+        let mut marks = Vec::with_capacity(cells.len());
         let mut byte_pos = 0;
         for cell in cells {
-            let len = if cell.text.is_empty() {
-                1
-            } else {
-                cell.text.len()
-            };
-            ranges.push((byte_pos, byte_pos + len));
-            byte_pos += len;
-        }
-        for (hit_index, hit) in self.search_hits.iter().enumerate() {
-            if hit.line != grid_line || hit.length == 0 {
-                continue;
-            }
-            let hit_start = hit.column;
-            let hit_end = hit.column.saturating_add(hit.length);
-            let is_current = hit_index == self.search_at;
-            for (cell_index, &(start, end)) in ranges.iter().enumerate() {
-                if start < hit_end && end > hit_start {
-                    marks[cell_index] = match marks[cell_index] {
-                        Some(true) => Some(true),
-                        _ => Some(is_current),
-                    };
-                }
-            }
+            let end = byte_pos + cell.text.len().max(1);
+            while hits
+                .next_if(|hit| hit.column + hit.length <= byte_pos)
+                .is_some()
+            {}
+            let matched = hits.peek().is_some_and(|hit| hit.column < end);
+            // More than one match can fall in a single displayed grapheme.
+            marks.push(matched.then(|| {
+                current.is_some_and(|hit| hit.column < end && hit.column + hit.length > byte_pos)
+            }));
+            byte_pos = end;
         }
         marks
     }
@@ -7632,7 +7623,10 @@ impl RunGlyphs {
     fn push(&mut self, text: &str, columns: usize) {
         match self {
             Self::Ascii(run) => run.push_str(text),
-            Self::Centered(cells) => cells.push((SharedString::from(text.to_owned()), columns)),
+            Self::Centered(cells) => cells.push((
+                SharedString::from(std::sync::Arc::<str>::from(text)),
+                columns,
+            )),
         }
     }
 }
